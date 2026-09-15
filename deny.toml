@@ -1,0 +1,113 @@
+# cargo-deny configuration for broccoli.
+# Scaffolded with `cargo deny init` (cargo-deny 0.20.2), then hand-tuned.
+# All four checks (advisories, bans, licenses, sources) are run by the single
+# command `cargo deny check` — locally and in CI (.github/workflows/deny.yml).
+
+# The graph table configures how the dependency graph is constructed and thus
+# which crates the checks are performed against.
+[graph]
+targets = [
+    # broccoli only builds and ships for x86_64-pc-windows-msvc, so restrict the
+    # checked graph to that target. Crates pulled in exclusively by other
+    # platforms (r-efi on UEFI, rustix/linux-raw-sys on Linux, objc2-* on macOS,
+    # zbus on Unix, ...) are pruned, so the license/bans policy applies exactly
+    # to what we ship. It also makes the graph identical no matter what host CI
+    # runs on. Cargo.lock may still contain other-target versions (e.g.
+    # getrandom 0.2/0.3, toml_edit, syn 1.x): those are below the check line by
+    # design and must NOT be "fixed" in the lockfile.
+    "x86_64-pc-windows-msvc",
+]
+
+# advisories: cargo-deny defaults (any unpatched advisory fails the check).
+# This is the project's advisory gate — the former cargo-audit scan
+# (.github/workflows/audit.yml) was removed 2026-08-28 as redundant (same
+# RustSec advisory DB, same fail policy, and cargo-deny also catches yanked
+# crates). Note the check covers only the windows-target graph below, not
+# every crate in Cargo.lock; non-shipping crates are intentionally below the
+# line.
+# The advisory database is fetched automatically at run time.
+
+[licenses]
+# License allow-list. Derived from `cargo deny check licenses` output on the
+# current tree (windows-target graph, 342 crates): every identifier below was
+# observed in the actual dependency graph, none are guessed. If a dependency
+# change adds a license, the check fails and the new identifier must be
+# evaluated deliberately before being added here.
+allow = [
+    "0BSD",                          # adler2
+    "Apache-2.0",                    # dominant license (253 crates)
+    "BSD-2-Clause",                  # zerocopy, zerocopy-derive
+    "BSD-3-Clause",                  # aws-lc-sys, matchit, moxcms, pxfm, subtle
+    "BSL-1.0",                       # clipboard-win, error-code, ryu
+    "CC0-1.0",                       # dunce
+    "CDLA-Permissive-2.0",           # webpki-roots
+    "ISC",                           # rustls family, aws-lc-rs, untrusted, libloading
+    "MIT",                           # dominant license (293 crates)
+    "MIT-0",                         # aws-lc-sys, dunce
+    "OFL-1.1",                       # epaint_default_fonts (bundled fonts)
+    "Ubuntu-font-1.0",               # epaint_default_fonts (bundled fonts)
+    "Unicode-3.0",                   # ICU4X crates (unicode-ident, icu_*, zerovec, ...)
+    "Unlicense",                     # memchr, byteorder-lite
+    "Zlib",                          # bytemuck, glow, miniz_oxide, foldhash, ...
+    # Note: self_cell declares "Apache-2.0 OR GPL-2.0-only"; the OR alternative
+    # Apache-2.0 above satisfies it, so no copyleft license is allowed here.
+    # Note: Apache-2.0 WITH LLVM-exception (rustix/wasi family), LGPL-2.1-or-later
+    # (r-efi) and MPL-2.0 (option-ext) exist in the all-target graph but not in
+    # the windows-target graph, so they are intentionally absent from this list.
+    # Note: broccoli itself declares MIT (see Cargo.toml); it satisfies the
+    # MIT allow entry above like any other dependency.
+]
+
+# If a license above is no longer used by any crate in the graph, warn so the
+# allow-list can be pruned (default, made explicit on purpose).
+unused-allowed-license = "warn"
+
+# Config v2 (cargo-deny >= 0.14) removed the old `unlicensed = "deny"` lint
+# field: licenses are denied by default and any crate with no determinable
+# license fails the check. broccoli used to be the only such crate; it now
+# declares MIT in Cargo.toml, which satisfies the MIT allow entry above, so
+# no clarification entry is needed. Every crate in the graph carries a
+# declared license.
+
+[bans]
+# Duplicate-version policy. The lockfile intentionally contains several
+# version families (windows-sys x4, syn x3, getrandom x3, toml_edit x3).
+# Those are normal Rust
+# ecosystem splits; they must not be "fixed" by forcing dependency upgrades.
+#
+# Policy: multiple-versions = "warn", NOT "deny" + skip list. A deny+skips
+# config would need one skip entry per extra version, and the windows-* family
+# (windows-sys, windows-targets, windows_x86_64_msvc) gains a new member with
+# every windows-rs release — the skip list would churn on every dependency
+# bump for zero benefit to the shipped binary. Warnings keep every duplicate
+# visible in CI output without gating on noise. If a new duplicate appears
+# that is not a plain ecosystem split, investigate it.
+#
+# Duplicates present on the current tree (windows-target graph, from cargo-deny
+# output); each set is an independent cross-crate version split:
+#   - foldhash 0.1.5 / 0.2.0        - hashbrown 0.15 vs 0.16+ (foldhash >= 0.2)
+#   - hashbrown 0.15.5 / 0.16.1 / 0.17.1 - major-version split (indexmap/ahash/egui)
+#   - itertools 0.14.0 / 0.15.0    - major-version split
+#   - rustc-hash 1.1.0 / 2.1.3     - major-version split
+#   - syn 2.0.119 / 3.0.3          - proc-macro ecosystem split (syn 1.x stays
+#                                    below the windows-target graph line)
+#   - windows-sys 0.52.0 / 0.59.0 / 0.60.2 / 0.61.2 - windows-rs release pins
+#                                    (documented Key Decision)
+#   - windows-targets 0.52.6 / 0.53.5 - windows-sys companion crate
+#   - windows_x86_64_msvc 0.52.6 / 0.53.1 - windows-sys companion crate
+#   - winreg 0.55.0 / 0.56.0       - our direct 0.56 vs transitive 0.55
+multiple-versions = "warn"
+
+# No crate may require a bare `*` version. Verified clean on the current tree;
+# stays a hard error if one ever appears.
+wildcards = "deny"
+
+# Crates banned outright. Kept deliberately small.
+deny = [
+    # ring was removed from the build graph by the TLS migration
+    # (aws-lc-rs is the replacement); ban it so it cannot silently reappear as
+    # a transitive dependency.
+    { crate = "ring", reason = "removed by the TLS migration; aws-lc-rs replaces it" },
+]
+
+# sources: cargo-deny defaults (crates.io registry only; anything else warns).

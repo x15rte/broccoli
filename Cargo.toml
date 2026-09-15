@@ -1,0 +1,134 @@
+[package]
+name = "broccoli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+build = "build.rs"
+
+[package.metadata.broccoli.release]
+target = "x86_64-pc-windows-msvc"
+xray_version = "v26.7.28"
+xray_archive = "Xray-windows-64.zip"
+xray_sha256 = "c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1"
+xray_executable_sha256 = "1d9674327972a21afd4c906a7a72bb0856935aa9e0227c87f34f03d11a88bddf"
+wintun_sha256 = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+geoip_sha256 = "cdf411fce977a1f48adb6a3b224e3e2bd7eccfcd4d6e2e30c6dc443f1a0e8e52"
+geosite_sha256 = "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef1942e"
+
+[patch.crates-io]
+# Vendored with two local fixes:
+# - eframe: don't persist window size while minimized (0x0 client area)
+# - egui-winit: clamp restored window size to min/max inner size
+eframe = { path = "vendor/eframe" }
+egui-winit = { path = "vendor/egui-winit" }
+
+[features]
+# Release builds require the vendored-protoc feature or a PROTOC env var verified
+# as a known-good protoc (libprotoc 27.1, see build.rs); debug builds fall back to
+# an unverified PATH/PROTOC protoc with a loud warning. Vendored protoc is compiled
+# from source (slow, no network fetch).
+#
+# NOTE: protobuf-src 2.1.1+27.1 cannot compile on Windows/MSVC (upstream LNK2038
+# runtime-library mismatch), so the vendored-protoc feature is unusable there —
+# on Windows use the verified PROTOC env route instead (official protoc-27.1
+# win64 binary, sha256-pinned; see .github/workflows/test.yml and build.yml).
+vendored-protoc = ["dep:protobuf-src"]
+
+[dependencies]
+eframe = { version = "0.36", features = ["persistence"] } # default renderer (wgpu)
+egui = "0.36"
+egui_plot = "0.37"
+tray-icon = "0.24"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "sync", "macros", "net"] }
+tempfile = "3"
+windows = { version = "0.62", features = [
+    "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading",
+    "Win32_Networking_WinInet", "Win32_Security", "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Rpc",
+    "Win32_Networking_WinSock", "Win32_System_Diagnostics_Debug",
+    "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_Graphics_Dwm", "Win32_System_LibraryLoader",
+    "Win32_Devices_DeviceAndDriverInstallation",
+] }
+winreg = "0.56"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+# reqwest 0.12 has no aws-lc-rs feature (its rustls features are provider-agnostic;
+# the "-no-provider" variants select no crypto provider at all). This direct rustls
+# dependency enables the aws-lc-rs provider feature on the single shared rustls build
+# via feature unification — the same stack reqwest 0.13's `rustls` feature uses
+# (migrating the rustls crypto provider from ring to aws-lc-rs). Enabling the
+# provider feature only compiles it in: reqwest's -no-provider backend resolves the
+# provider via CryptoProvider::get_default() and panics if none is installed, so
+# rt::ensure_tls_provider() installs it as the process default at startup.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+# In-app QUIC certificate capture for the pin tool: `xray tls ping` is
+# TCP-only, so a QUIC-only server (Hysteria2) is unreachable by the core
+# tool. quinn 0.11 pairs with the rustls 0.23/aws-lc-rs stack
+# above; the rustls-aws-lc-rs feature (not `rustls`, which aliases
+# rustls-ring) keeps ring out of the graph (deny.toml bans it), and
+# runtime-tokio rides the tokio/net feature added above.
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio", "log"] }
+# DER parsing for the captured chain (CN, SANs) so the QUIC transcript
+# mirrors `xray tls ping` output line-for-line.
+x509-parser = "0.16"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+url = "2"
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+human-panic = "2"
+
+[target.'cfg(windows)'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+embed-resource = "3"
+which = "6"
+protobuf-src = { version = "2", optional = true } # vendored-protoc fallback, see build.rs
+
+# build.rs hosts unit tests under `cargo test --test build`; the test target
+# compiles the file standalone as a test crate (via the tests/build.rs wrapper
+# include! so cargo does not warn about build.rs being in two targets), and
+# test targets cannot see [build-dependencies]. The crates below mirror the
+# build-dependencies so the test binary links; dev-dependencies never enter
+# the shipped binary. Keep versions in sync with [build-dependencies].
+# protobuf-src is deliberately absent: optional dev-dependencies are invalid,
+# and the vendored-protoc branch is cfg-gated out of the test compilation in
+# build.rs.
+[[test]]
+name = "build"
+path = "tests/build.rs"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }
+# Test certificates for the quic_probe transcript tests; aws_lc_rs keeps the
+# ring crate out of the dev graph too (deny.toml bans it).
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+tiny_http = "0.12"
+parking_lot = "0.12"
+tonic-prost-build = "0.14"
+embed-resource = "3"
+which = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

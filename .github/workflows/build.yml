@@ -1,0 +1,221 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Tag pushes and manual builds serialize per ref name; runs for different
+  # refs run concurrently. Manual runs never publish (see the publish step),
+  # so two publish-capable runs can never overlap.
+  group: broccoli-build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Package and publish Windows release
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the repository at the triggering ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Configure stable Rust for the declared target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
+          rustup target add x86_64-pc-windows-msvc --toolchain stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup target add failed with exit code $LASTEXITCODE" }
+
+      # Publishing is tag-push-only: on tag pushes the release tag must be
+      # stable SemVer, exactly equal the Cargo package version, and point at
+      # the commit being built. Manual dispatch builds the portable zip but
+      # never publishes, so those assertions (and BROCCOLI_RELEASE_TAG) apply
+      # to tag pushes only. The Cargo version and the release contract are
+      # validated on every run.
+      - name: Validate Cargo version and artifact contract
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $metadata = ($metadataJson -join [Environment]::NewLine) | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq 'broccoli' })
+          if ($packages.Count -ne 1) {
+              throw "expected exactly one broccoli package, found $($packages.Count)"
+          }
+          $package = $packages[0]
+          $version = [string]$package.version
+          $release = $package.metadata.broccoli.release
+          if ($null -eq $release) { throw 'Cargo release metadata is missing' }
+          $target = [string]$release.target
+          if ($target -cne 'x86_64-pc-windows-msvc') {
+              throw "release target must be x86_64-pc-windows-msvc (got $target)"
+          }
+
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+              $tag = $env:GITHUB_REF_NAME
+              if ($tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+                  throw "release tag must be stable SemVer prefixed with v (got '$tag')"
+              }
+              if ($tag -cne "v$version") {
+                  throw "release tag $tag does not match Cargo package version $version"
+              }
+              $tagCommit = (& git rev-parse "$tag^{commit}").Trim()
+              if ($LASTEXITCODE -ne 0) { throw "release tag $tag is not present in the checkout" }
+              $headCommit = (& git rev-parse 'HEAD').Trim()
+              if ($LASTEXITCODE -ne 0) { throw 'could not resolve the checked-out commit' }
+              if ($tagCommit -cne $headCommit) {
+                  throw "checked-out commit $headCommit is not release tag $tag ($tagCommit)"
+              }
+              "BROCCOLI_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+          $zipName = "broccoli-v$version-win64.zip"
+          "BROCCOLI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BROCCOLI_TARGET=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BROCCOLI_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BROCCOLI_ZIP_PATH=dist/$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # protobuf-src 2.1.1+27.1 cannot compile on Windows/MSVC (upstream
+      # LNK2038 runtime-library mismatch), so CI pins a verified protoc 27.1
+      # (build.rs KNOWN_GOOD_PROTOC_VERSION) and exports it as PROTOC for
+      # every subsequent build instead of using the vendored-protoc feature.
+      - name: Download and verify pinned protoc 27.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $protocVersion = '27.1'
+          $expectedSha256 = 'da531c51ccd1290d8d34821f0ce4e219c7fbaa6f9825f5a3fb092a9d03fe6206'
+          $zipUrl = "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP 'protoc-27.1-win64.zip'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'protoc-27.1'
+          Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zipPath
+          $actualSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256) {
+              throw "protoc $protocVersion win64 SHA2-256 mismatch: pinned $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $protocPath = Join-Path $extractDir 'bin\protoc.exe'
+          if (-not (Test-Path -LiteralPath $protocPath -PathType Leaf)) {
+              throw "extracted protoc is missing: $protocPath"
+          }
+          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # No test suite in this workflow: the test workflow already ran on this
+      # exact commit. The smoke test below still validates the release binary
+      # itself, which is the build-specific check that matters.
+      - name: Build the release executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --target $env:BROCCOLI_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit code $LASTEXITCODE" }
+
+      # The published binary is the one being smoke-tested: the release build
+      # (LTO thin, codegen-units 1) is executed with --core-helper and must
+      # exit 2 with the guard message. No separate debug build is needed.
+      - name: Smoke-test the release executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $broccoli = Join-Path $PWD "target\$env:BROCCOLI_TARGET\release\broccoli.exe"
+          if (-not (Test-Path -LiteralPath $broccoli -PathType Leaf)) {
+              throw "smoke-test executable is missing: $broccoli"
+          }
+          $stderrPath = Join-Path $env:RUNNER_TEMP 'broccoli-smoke-stderr.txt'
+          Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+          $process = Start-Process -FilePath $broccoli `
+              -ArgumentList '--core-helper' `
+              -RedirectStandardError $stderrPath `
+              -NoNewWindow -Wait -PassThru
+          $stderr = if (Test-Path -LiteralPath $stderrPath) {
+              [IO.File]::ReadAllText($stderrPath)
+          } else {
+              ''
+          }
+          if ($process.ExitCode -ne 2 -or
+              $stderr -notmatch 'missing or invalid authenticated launch parameters') {
+              throw "broccoli helper-guard smoke test failed (exit $($process.ExitCode)): $stderr"
+          }
+
+      - name: Assemble the portable zip
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+
+          $stageDir = Join-Path $env:RUNNER_TEMP 'broccoli-release-stage'
+          Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          $broccoli = "target\$env:BROCCOLI_TARGET\release\broccoli.exe"
+          if (-not (Test-Path -LiteralPath $broccoli -PathType Leaf)) {
+              throw "release executable is missing: $broccoli"
+          }
+          Copy-Item -LiteralPath $broccoli -Destination $stageDir
+
+          # The zip must ship the license text (MIT): fail loudly when the
+          # repo root has no LICENSE* file instead of silently publishing an
+          # exe-only archive.
+          $licenseFiles = @(Get-ChildItem -LiteralPath $PWD -File -Filter 'LICENSE*')
+          if ($licenseFiles.Count -eq 0) {
+              throw "release zip must include the LICENSE file(s); none found in the repository root"
+          }
+          foreach ($license in $licenseFiles) {
+              Copy-Item -LiteralPath $license.FullName -Destination $stageDir
+          }
+
+          $zipPath = "dist\$env:BROCCOLI_ZIP_NAME"
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+              throw "expected release artifact is missing: $zipPath"
+          }
+          $actualNames = @(Get-ChildItem -LiteralPath 'dist' -File |
+              ForEach-Object { $_.Name })
+          if ($actualNames.Count -ne 1 -or $actualNames[0] -cne $env:BROCCOLI_ZIP_NAME) {
+              throw "dist must contain exactly $env:BROCCOLI_ZIP_NAME; found $($actualNames -join ', ')"
+          }
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: broccoli-windows-${{ env.BROCCOLI_VERSION }}
+          path: ${{ env.BROCCOLI_ZIP_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      # Manual dispatch builds but never publishes: only tag pushes create the
+      # GitHub Release. Re-publishing requires deleting the existing release
+      # and the tag, then re-pushing the tag — which re-triggers this workflow
+      # on the same commit.
+      - name: Publish the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arguments = @(
+              'release', 'create', $env:BROCCOLI_RELEASE_TAG,
+              '--repo', $env:GITHUB_REPOSITORY,
+              '--verify-tag',
+              '--title', "Broccoli $env:BROCCOLI_VERSION",
+              '--generate-notes',
+              '--latest',
+              $env:BROCCOLI_ZIP_PATH
+          )
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release publication failed with exit code $LASTEXITCODE" }

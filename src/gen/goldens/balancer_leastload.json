@@ -1,0 +1,152 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService",
+      "ObservatoryService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1"
+      },
+      {
+        "address": "8.8.8.8"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "observatory": {
+    "probeInterval": "10s",
+    "probeURL": "https://www.google.com/generate_204",
+    "subjectSelector": [
+      "srv-01234567"
+    ]
+  },
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "address": "10.0.0.8",
+        "encryption": "none",
+        "id": "11111111-2222-3333-4444-555555555555",
+        "port": 443
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "balancers": [
+      {
+        "fallbackTag": "direct",
+        "selector": [
+          "srv-"
+        ],
+        "strategy": {
+          "settings": {
+            "baselines": [
+              "1s"
+            ],
+            "costs": [
+              {
+                "match": "srv-",
+                "regexp": true,
+                "value": 2.0
+              }
+            ],
+            "expected": 1,
+            "maxRTT": "5s",
+            "tolerance": 0.5
+          },
+          "type": "leastload"
+        },
+        "tag": "bal"
+      }
+    ],
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      },
+      {
+        "balancerTag": "bal",
+        "domain": [
+          "geosite:cn"
+        ],
+        "ruleTag": "11111111-2222-3333-4444-555555555555"
+      }
+    ]
+  },
+  "stats": {}
+}

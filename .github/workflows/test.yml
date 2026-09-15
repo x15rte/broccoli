@@ -1,0 +1,175 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lint, and test (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Configure stable Rust for the declared target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
+          rustup target add x86_64-pc-windows-msvc --toolchain stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup target add failed with exit code $LASTEXITCODE" }
+
+      # Every-commit runs make cold Windows builds the expensive default; the
+      # cargo registry and target cache turn them incremental. The key hashes
+      # Cargo.toml too, not just Cargo.lock: the Xray core pins live in
+      # [package.metadata.broccoli.release], which the lockfile never sees, so
+      # a pin bump must invalidate the cache even when the lock is unchanged.
+      - name: Cache cargo registry and target directory
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Single source of truth for the build target stays
+      # [package.metadata.broccoli.release].target; this run reads it instead
+      # of hardcoding the triple here.
+      - name: Load the declared release target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $metadata = ($metadataJson -join [Environment]::NewLine) | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq 'broccoli' })
+          if ($packages.Count -ne 1) {
+              throw "expected exactly one broccoli package, found $($packages.Count)"
+          }
+          $release = $packages[0].metadata.broccoli.release
+          if ($null -eq $release -or [string]::IsNullOrWhiteSpace([string]$release.target)) {
+              throw 'Cargo release metadata must declare a target'
+          }
+          "BROCCOLI_TARGET=$([string]$release.target)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # protobuf-src 2.1.1+27.1 cannot compile on Windows/MSVC (upstream
+      # LNK2038 runtime-library mismatch), so CI pins a verified protoc 27.1
+      # (build.rs KNOWN_GOOD_PROTOC_VERSION) and exports it as PROTOC for
+      # every subsequent build instead of using the vendored-protoc feature.
+      - name: Download and verify pinned protoc 27.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $protocVersion = '27.1'
+          $expectedSha256 = 'da531c51ccd1290d8d34821f0ce4e219c7fbaa6f9825f5a3fb092a9d03fe6206'
+          $zipUrl = "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP 'protoc-27.1-win64.zip'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'protoc-27.1'
+          Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zipPath
+          $actualSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256) {
+              throw "protoc $protocVersion win64 SHA2-256 mismatch: pinned $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $protocPath = Join-Path $extractDir 'bin\protoc.exe'
+          if (-not (Test-Path -LiteralPath $protocPath -PathType Leaf)) {
+              throw "extracted protoc is missing: $protocPath"
+          }
+          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # The live-core suites (tests/golden_validation.rs,
+      # tests/trial_rules_live_core.rs, tests/dns_inbound_live_core.rs,
+      # tests/proxy_e2e.rs,
+      # tests/traffic_totals_e2e.rs, tests/latency_probe_e2e.rs) are
+      # #[ignore]d by default, so CI must supply the core and lift the ignore
+      # for those targets or they never run. Pin the same verified release the
+      # app downloads (Cargo.toml [package.metadata.broccoli.release] —
+      # xray_version, xray_archive, xray_sha256), verify the archive SHA-256
+      # before extraction, and export it as XRAY_EXE for the test step.
+      - name: Download and verify pinned Xray core
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $metadata = ($metadataJson -join [Environment]::NewLine) | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq 'broccoli' })
+          if ($packages.Count -ne 1) {
+              throw "expected exactly one broccoli package, found $($packages.Count)"
+          }
+          $release = $packages[0].metadata.broccoli.release
+          if ($null -eq $release) { throw 'Cargo release metadata is missing' }
+          $xrayVersion = [string]$release.xray_version
+          $xrayArchive = [string]$release.xray_archive
+          $expectedSha256 = [string]$release.xray_sha256
+          if ([string]::IsNullOrWhiteSpace($xrayVersion) -or
+              [string]::IsNullOrWhiteSpace($xrayArchive) -or
+              [string]::IsNullOrWhiteSpace($expectedSha256)) {
+              throw 'Cargo release metadata must pin xray_version, xray_archive, and xray_sha256'
+          }
+          $zipUrl = "https://github.com/XTLS/Xray-core/releases/download/$xrayVersion/$xrayArchive"
+          $zipPath = Join-Path $env:RUNNER_TEMP $xrayArchive
+          $extractDir = Join-Path $env:RUNNER_TEMP 'xray-core'
+          Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zipPath
+          $actualSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256.ToLowerInvariant()) {
+              throw "Xray $xrayVersion ($xrayArchive) SHA2-256 mismatch: pinned $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $xrayPath = Join-Path $extractDir 'xray.exe'
+          if (-not (Test-Path -LiteralPath $xrayPath -PathType Leaf)) {
+              throw "extracted xray.exe is missing: $xrayPath"
+          }
+          "XRAY_EXE=$xrayPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # cargo fmt must pass 100%; CI never enforced it
+      # before the test workflow existed.
+      - name: Check formatting
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed with exit code $LASTEXITCODE" }
+
+      # cargo clippy must pass 100%; CI never enforced it
+      # before the test workflow existed.
+      - name: Run clippy with warnings denied
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo clippy --locked --all-targets --target $env:BROCCOLI_TARGET -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed with exit code $LASTEXITCODE" }
+
+      - name: Run the Windows test suite
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked --all-targets --target $env:BROCCOLI_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
+          # Default runs never execute #[ignore]d tests, so re-run the
+          # live-core targets with the ignore lifted (XRAY_EXE is exported
+          # above, and the extracted core dir also holds geoip.dat/geosite.dat
+          # for the trial suite's asset assertion). Two ignored suites stay
+          # out: geodata_dat_pin_suspension needs a real installed managed
+          # core, and core_update_e2e needs BROCCOLI_TEST_XRAY_ARCHIVE (a
+          # pinned ZIP path) for its archive-import case and downloads a
+          # release in its update cases; enable it once that fixture is wired.
+          cargo test --locked --target $env:BROCCOLI_TARGET `
+              --test golden_validation --test trial_rules_live_core `
+              --test dns_inbound_live_core `
+              --test proxy_e2e --test traffic_totals_e2e `
+              --test latency_probe_e2e -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw "cargo test (live-core suites) failed with exit code $LASTEXITCODE" }

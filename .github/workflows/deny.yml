@@ -1,0 +1,84 @@
+name: Dependency policy
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly: keep the advisory database fresh without code churn. cargo-deny
+    # checks advisories (its advisories check is the project's advisory gate;
+    # the cargo-audit scan was removed 2026-08-28 as redundant), so the
+    # weekly run is as useful here as there.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo deny (locked tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      # Pinned tool version: official prebuilt binary (static musl) with the
+      # SHA-256 published in the release's .sha256 sidecar, hardcoded here
+      # (cross-verified against the sidecar on 2026-08-28). dependabot cannot
+      # see this pin (the github-actions ecosystem watches `uses:` refs; the
+      # cargo ecosystem watches manifests) — bumps are manual: verify a new
+      # cargo-deny locally, then update the version and hash here.
+      - name: Download and verify pinned cargo-deny
+        run: |
+          set -euo pipefail
+          version='0.20.2'
+          expectedSha256='9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f'
+          asset="cargo-deny-$version-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$version/$asset"
+          mkdir -p "$RUNNER_TEMP"
+          curl -fL "$url" -o "$RUNNER_TEMP/$asset"
+          actualSha256="$(sha256sum "$RUNNER_TEMP/$asset" | cut -d' ' -f1)"
+          if [ "$actualSha256" != "$expectedSha256" ]; then
+            echo "cargo-deny $version SHA-256 mismatch: pinned $expectedSha256, got $actualSha256" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/cargo-deny-bin"
+          tar -xzf "$RUNNER_TEMP/$asset" --strip-components=1 -C "$RUNNER_TEMP/cargo-deny-bin"
+          if [ ! -x "$RUNNER_TEMP/cargo-deny-bin/cargo-deny" ]; then
+            echo "extracted cargo-deny is missing" >&2
+            exit 1
+          fi
+          # cargo-deny 0.20 rejects path-based argv[0] ("command not found:
+          # <path>") — invoke via PATH with the bare name for the version assert.
+          versionOut="$(PATH="$RUNNER_TEMP/cargo-deny-bin:$PATH" cargo-deny --version)"
+          if [ "$versionOut" != "cargo-deny $version" ]; then
+            echo "unexpected cargo-deny version output: $versionOut" >&2
+            exit 1
+          fi
+          echo "$RUNNER_TEMP/cargo-deny-bin" >> "$GITHUB_PATH"
+
+      # Fail the run if Cargo.lock is out of sync with the manifests.
+      # cargo-deny has no --locked flag; the explicit metadata guard provides
+      # the lock-sync guarantee (kept for consistency with vet.yml) and
+      # gives a clear, independent failure point for lockfile drift.
+      - name: Verify lockfile is in sync with the manifest
+        run: cargo metadata --locked --no-deps
+
+      # deny.toml restricts the checked graph to x86_64-pc-windows-msvc (the
+      # only target broccoli ships for), so the graph is identical on this
+      # Ubuntu runner and on Windows. `cargo deny check` runs all four checks
+      # (advisories, bans, licenses, sources) and exits nonzero on any error:
+      # unpatched advisories, duplicate-version policy violations, banned
+      # crates, licenses outside the allow-list, and non-crates.io sources all
+      # fail the build loudly. The advisory database is fetched automatically.
+      - name: Check licenses, bans, sources, and advisories
+        run: cargo deny check

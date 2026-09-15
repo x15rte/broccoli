@@ -1,0 +1,6 @@
+# Text files are stored as LF and checked out as LF on every platform.
+# rustfmt's newline_style = "Auto" follows the line endings it finds in a
+# file, so a CRLF checkout would keep reformatting CRLF files and split the
+# tree between Windows and other checkouts. Binary files (icons, images) are
+# still detected as binary by `text=auto`.
+* text=auto eol=lf

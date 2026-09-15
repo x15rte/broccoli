@@ -1,0 +1,59 @@
+name: Dependency provenance
+
+on:
+  push:
+  pull_request:
+  # No weekly schedule: `cargo vet --locked` is deterministic against the
+  # committed imports.lock, so an unchanged tree gives an identical result
+  # every run — every tree change is a push and already triggers this
+  # workflow. (deny.yml keeps its weekly cron: the RustSec DB is fetched
+  # fresh per run, so a weekly run catches new advisories on a quiet tree.)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-vet:
+    name: cargo vet (locked tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      # Pinned tool version, source-installed: cargo-vet 0.10.2 has no
+      # official prebuilt binaries (Mozilla publishes assets only for
+      # v0.10.0; 0.10.1/0.10.2 are crates.io-only patches), and downgrading
+      # the gate to adopt prebuilt was rejected (decision 2026-08-28).
+      # dependabot cannot see this pin (github-actions watches `uses:` refs;
+      # cargo watches manifests) — bumps are manual: verify a new cargo-vet
+      # locally, then update the version here.
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --version 0.10.2
+
+      # Fail the run if Cargo.lock is out of sync with the manifests.
+      # cargo-vet computes its graph from `cargo metadata`, so this guard
+      # (kept for consistency with deny.yml) makes the lock
+      # sync failure point explicit and independent.
+      - name: Verify lockfile is in sync with the manifest
+        run: cargo metadata --locked --no-deps
+
+      # Unlike cargo-deny, cargo-vet has a real --locked
+      # flag: it verifies the tree against the committed imports.lock
+      # instead of fetching fresh upstream audits. That makes CI fully
+      # deterministic (no network, no silently changed import sets) and
+      # fails loudly whenever a dependency change is not covered by the
+      # committed audits, exemptions, or imports. New or changed
+      # dependencies must be certified (or a new import added) and checked
+      # in before this job passes.
+      - name: Verify dependency provenance
+        run: cargo vet --locked
