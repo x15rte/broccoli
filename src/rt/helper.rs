@@ -3499,16 +3499,35 @@ mod tests {
         );
     }
 
+    /// The GUI binary these probes spawn: the running test executable lives in
+    /// `target/<triple>/debug/deps`, so the bin target sits one directory up.
+    /// `CARGO_BIN_EXE_*` is set for integration tests only, and
+    /// `CARGO_MANIFEST_DIR/target/debug` misses the per-target layout that
+    /// `--target` produces — the layout CI builds, where that path never
+    /// exists.
+    fn gui_binary() -> std::path::PathBuf {
+        let exe = std::env::current_exe()
+            .expect("locate the running test executable")
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the test executable lives in target/<triple>/debug/deps")
+            .join("broccoli.exe");
+        assert!(
+            exe.is_file(),
+            "these probes spawn the GUI binary; build it for the same target first — \
+             `cargo test` and `cargo test --all-targets` build it, `cargo test --lib` does not: {}",
+            exe.display()
+        );
+        exe
+    }
+
     #[test]
     fn probe_spawn_exe_held_open_with_share_read_only() {
         use std::fs::{self, OpenOptions};
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-        let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("broccoli.exe");
+        let exe = gui_binary();
         let probe_dir =
             std::env::temp_dir().join(format!("broccoli-spawn-share-probe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&probe_dir);
@@ -3587,10 +3606,7 @@ mod tests {
         let _env_lock = crate::sys::elevation::lock_helper_token_env();
         let pipe_id = uuid::Uuid::new_v4().simple().to_string();
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let helper_exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("broccoli.exe");
+        let helper_exe = gui_binary();
         let parent_pid = std::process::id();
         // Stage the credential the way the production GUI does, then spawn
         // the helper WITHOUT the env token — the cross-user UAC case where
@@ -3704,10 +3720,7 @@ mod tests {
     fn live_helper_accepts_its_genuine_parent() {
         let pipe_id = uuid::Uuid::new_v4().simple().to_string();
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let helper_exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("broccoli.exe");
+        let helper_exe = gui_binary();
         let parent_pid = std::process::id();
         // Same-user elevation channel: the env token the child inherits. No
         // start command is sent, so this exercises the full authentication
