@@ -1,7 +1,10 @@
 name: Dependency provenance
 
 on:
+  # Only main earns a push run: branch pushes already arrive as
+  # pull_request events, so `push` for every branch just doubles the runs.
   push:
+    branches: [main]
   pull_request:
   # No weekly schedule: `cargo vet --locked` is deterministic against the
   # committed imports.lock, so an unchanged tree gives an identical result
@@ -13,9 +16,11 @@ on:
 permissions:
   contents: read
 
+# Grouped per ref: cancellation is meant for superseded refs (rapid pushes on
+# one branch), never for main, which a pull-request run must not kill.
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   cargo-vet:
