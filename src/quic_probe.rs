@@ -300,7 +300,9 @@ fn render_ip_bytes(bytes: &[u8]) -> String {
     match bytes {
         [a, b, c, d] => format!("{a}.{b}.{c}.{d}"),
         bytes if bytes.len() == 16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
             .collect::<Vec<_>>()
             .join(":"),
