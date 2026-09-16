@@ -122,7 +122,7 @@ path = "tests/build.rs"
 egui_kittest = { version = "0.36", features = ["eframe"] }
 # Test certificates for the quic_probe transcript tests; aws_lc_rs keeps the
 # ring crate out of the dev graph too (deny.toml bans it).
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 tiny_http = "0.12"
 parking_lot = "0.12"
 tonic-prost-build = "0.14"
