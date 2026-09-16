@@ -22,6 +22,16 @@ user-id = 1281
 user-login = "nical"
 user-name = "Nicolas Silva"
 
+[[publisher.rand]]
+version = "0.10.2"
+when = "2026-07-02"
+trusted-publisher = "github:rust-random/rand"
+
+[[publisher.rand_core]]
+version = "0.10.1"
+when = "2026-04-13"
+trusted-publisher = "github:rust-random/rand_core"
+
 [[publisher.unicode-segmentation]]
 version = "1.13.3"
 when = "2026-06-01"
@@ -296,15 +306,6 @@ delta = "1.0.39 -> 1.0.40"
 notes = """
 The delta is just a simplification of how `tokens.extend(...)` call is made.
 Still no `unsafe` anywhere.
-"""
-aggregated-from = "https://chromium.googlesource.com/chromium/src/+/main/third_party/rust/chromium_crates_io/supply-chain/audits.toml?format=TEXT"
-
-[[audits.google.audits.rand_core]]
-who = "Lukasz Anforowicz <lukasza@chromium.org>"
-criteria = "safe-to-deploy"
-version = "0.6.4"
-notes = """
-For more detailed unsafe review notes please see https://crrev.com/c/6362797
 """
 aggregated-from = "https://chromium.googlesource.com/chromium/src/+/main/third_party/rust/chromium_crates_io/supply-chain/audits.toml?format=TEXT"
 
