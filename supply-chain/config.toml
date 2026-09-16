@@ -10,6 +10,12 @@ url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
 [imports.mozilla]
 url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 
+[policy.eframe]
+audit-as-crates-io = false
+
+[policy.egui-winit]
+audit-as-crates-io = false
+
 [[exemptions.quinn]]
 version = "0.11.11"
 criteria = "safe-to-deploy"

@@ -19,6 +19,12 @@ geosite_sha256 = "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef194
 # Vendored with two local fixes:
 # - eframe: don't persist window size while minimized (0x0 client area)
 # - egui-winit: clamp restored window size to min/max inner size
+# Bump both forks in lockstep with the egui family: a fork left at an older
+# version than the family makes cargo drop the patch (the lock then records
+# it under `[[patch.unused]]`) and the fixes are silently lost — that is
+# what a bare egui_kittest bump did. supply-chain/config.toml marks both
+# `audit-as-crates-io = false`, since cargo-vet must not treat these patched
+# forks as the published crates.
 eframe = { path = "vendor/eframe" }
 egui-winit = { path = "vendor/egui-winit" }
 

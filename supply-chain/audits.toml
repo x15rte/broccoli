@@ -450,7 +450,7 @@ version = "1.0.5"
 
 [[audits.ecolor]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.eframe]]
 criteria = "safe-to-deploy"
@@ -458,11 +458,11 @@ version = "0.36.1"
 
 [[audits.egui]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.egui-wgpu]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.egui-winit]]
 criteria = "safe-to-deploy"
@@ -474,11 +474,15 @@ version = "0.36.1"
 
 [[audits.egui_glow]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.egui_kittest]]
 criteria = "safe-to-run"
 version = "0.36.1"
+
+[[audits.egui_kittest]]
+criteria = "safe-to-run"
+version = "0.36.2"
 
 [[audits.egui_plot]]
 criteria = "safe-to-deploy"
@@ -490,7 +494,7 @@ version = "1.17.0"
 
 [[audits.emath]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.embed-resource]]
 criteria = "safe-to-deploy"
@@ -514,11 +518,11 @@ version = "0.1.14"
 
 [[audits.epaint]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.epaint_default_fonts]]
 criteria = "safe-to-deploy"
-version = "0.36.1"
+version = "0.36.2"
 
 [[audits.errno]]
 criteria = "safe-to-deploy"
