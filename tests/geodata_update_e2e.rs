@@ -122,7 +122,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hasher.update(bytes);
     // digest 0.11 no longer formats its output through `LowerHex`, so the
     // bytes are written out explicitly.
-    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Parse the runtime's `[broccoli] core started (direct, pid N)` log line.
