@@ -99,7 +99,7 @@ base64 = "0.22"
 url = "2"
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
-rfd = "0.15"
+rfd = "0.17"
 human-panic = "2"
 
 [target.'cfg(windows)'.dependencies]
