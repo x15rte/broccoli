@@ -4,7 +4,17 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # A new release is not proposed until it has been public for a week, so a
+    # compromised or immediately-yanked release is skipped instead of adopted.
+    # Security updates ignore the cooldown by design: an advisory fix lands as
+    # soon as it exists.
+    cooldown:
+      default-days: 7
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    # Same quarantine window for crates; combined with the cargo-vet store
+    # this makes a version bump a matter of waiting, not of per-crate review.
+    cooldown:
+      default-days: 7
