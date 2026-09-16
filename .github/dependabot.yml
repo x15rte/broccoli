@@ -18,3 +18,11 @@ updates:
     # this makes a version bump a matter of waiting, not of per-crate review.
     cooldown:
       default-days: 7
+    # glib reaches the lockfile only through tray-icon's Linux gtk backend and
+    # is absent from the Windows dependency graph the project ships. The
+    # advisory on glib 0.18.5 is fixed in 0.20.0, which only moves together
+    # with the whole gtk-rs 0.18 stack — so every security-update run ends in
+    # "security update not possible" for a crate that no user build compiles.
+    # `ignore` also applies to security updates, which is intended here.
+    ignore:
+      - dependency-name: glib
