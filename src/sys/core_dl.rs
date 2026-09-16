@@ -1382,7 +1382,17 @@ async fn stream_download(
 
 fn sha256_reader(reader: &mut impl std::io::Read) -> Result<String, DiagError> {
     let mut hasher = Sha256::new();
-    std::io::copy(reader, &mut hasher).diag(Key::CoreDlHashingFailed)?;
+    // digest 0.11 dropped the `io::Write` impl this used to hash through, so
+    // the bytes are fed explicitly. The buffer is heap-allocated to keep the
+    // 64 KiB off the stack, as in the helper's `sha256_handle`.
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).diag(Key::CoreDlHashingFailed)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     let digest = hasher.finalize();
     let mut output = String::with_capacity(64);
     for byte in digest {
