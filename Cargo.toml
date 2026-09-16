@@ -102,7 +102,7 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 [build-dependencies]
 tonic-prost-build = "0.14"
 embed-resource = "3"
-which = "6"
+which = "8"
 protobuf-src = { version = "2", optional = true } # vendored-protoc fallback, see build.rs
 
 # build.rs hosts unit tests under `cargo test --test build`; the test target
@@ -127,7 +127,7 @@ tiny_http = "0.12"
 parking_lot = "0.12"
 tonic-prost-build = "0.14"
 embed-resource = "3"
-which = "6"
+which = "8"
 
 [profile.release]
 lto = "thin"
