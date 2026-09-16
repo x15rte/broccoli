@@ -120,7 +120,9 @@ fn copy_installed_core(source_root: &std::path::Path, destination_root: &std::pa
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    // digest 0.11 no longer formats its output through `LowerHex`, so the
+    // bytes are written out explicitly.
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Parse the runtime's `[broccoli] core started (direct, pid N)` log line.
