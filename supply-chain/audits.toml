@@ -3123,7 +3123,7 @@ version = "0.6.2"
 notes = "ASN.1 parsing core of x509-parser; no build script, pure parsing"
 
 [[audits.asn1-rs]]
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 version = "0.7.2"
 
 [[audits.asn1-rs-derive]]
@@ -3132,7 +3132,7 @@ version = "0.5.1"
 notes = "proc-macro for asn1-rs; no build script"
 
 [[audits.asn1-rs-derive]]
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 version = "0.6.0"
 
 [[audits.asn1-rs-impl]]
@@ -3397,7 +3397,7 @@ version = "9.0.0"
 notes = "DER parser under x509-parser; no build script"
 
 [[audits.der-parser]]
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 version = "10.0.0"
 
 [[audits.derive_arbitrary]]
@@ -4175,7 +4175,7 @@ version = "0.7.1"
 notes = "OID registry; build.rs only writes generated tables to OUT_DIR"
 
 [[audits.oid-registry]]
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 version = "0.8.1"
 
 [[audits.once_cell]]
