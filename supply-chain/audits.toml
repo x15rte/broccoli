@@ -3248,6 +3248,10 @@ version = "2.13.1"
 criteria = "safe-to-deploy"
 version = "0.10.4"
 
+[[audits.block-buffer]]
+criteria = "safe-to-deploy"
+version = "0.12.1"
+
 [[audits.block2]]
 criteria = "safe-to-deploy"
 version = "0.5.1"
@@ -3349,6 +3353,10 @@ version = "4.6.7"
 criteria = "safe-to-deploy"
 version = "2.5.0"
 
+[[audits.const-oid]]
+criteria = "safe-to-deploy"
+version = "0.10.2"
+
 [[audits.core-graphics]]
 criteria = "safe-to-deploy"
 version = "0.23.2"
@@ -3382,6 +3390,10 @@ version = "0.2.4"
 criteria = "safe-to-deploy"
 version = "0.1.7"
 
+[[audits.crypto-common]]
+criteria = "safe-to-deploy"
+version = "0.2.2"
+
 [[audits.cursor-icon]]
 criteria = "safe-to-deploy"
 version = "1.2.0"
@@ -3407,6 +3419,10 @@ version = "1.4.2"
 [[audits.digest]]
 criteria = "safe-to-deploy"
 version = "0.10.7"
+
+[[audits.digest]]
+criteria = "safe-to-deploy"
+version = "0.11.3"
 
 [[audits.dirs]]
 criteria = "safe-to-deploy"
@@ -3783,6 +3799,10 @@ version = "1.10.1"
 [[audits.human-panic]]
 criteria = "safe-to-deploy"
 version = "2.0.8"
+
+[[audits.hybrid-array]]
+criteria = "safe-to-deploy"
+version = "0.4.15"
 
 [[audits.hyper]]
 criteria = "safe-to-deploy"
