@@ -86,7 +86,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio", "log"] }
 # DER parsing for the captured chain (CN, SANs) so the QUIC transcript
 # mirrors `xray tls ping` output line-for-line.
-x509-parser = "0.16"
+x509-parser = "0.18"
 sha2 = "0.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 tracing = "0.1"
