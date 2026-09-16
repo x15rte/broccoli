@@ -36,10 +36,45 @@ user-id = 27789
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.accesskit_windows]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 143177
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.accesskit_winit]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 143177
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.adler2]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4968
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.ahash]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 25353
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.aho-corasick]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 189
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.allocator-api2]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 945
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -90,6 +125,27 @@ who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 3618
 start = "2019-10-05"
+end = "2027-09-16"
+
+[[wildcard-audits.arboard]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 104931
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.arrayvec]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 356
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.ash]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 110371
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.ashpd]]
@@ -211,10 +267,45 @@ user-id = 6741
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.axum-core]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 6913
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.backtrace]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 55123
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.base64]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 5563
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bit-set]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1367
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bit-vec]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1367
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bitflags]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3204
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -229,6 +320,34 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 33035
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bumpalo]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 696
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bytemuck]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7211
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.bytemuck_derive]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7211
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.byteorder-lite]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 5862
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -274,6 +393,13 @@ user-id = 55123
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.clipboard-win]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1551
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.cmake]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -288,6 +414,13 @@ trusted-publisher = "github:brendanzab/codespan"
 start = "2025-10-15"
 end = "2027-09-16"
 
+[[wildcard-audits.color]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 106440
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.colorchoice]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -299,6 +432,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 69526
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.crc32fast]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1546
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -323,6 +463,20 @@ user-id = 42583
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.data-encoding]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3036
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.deranged]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 15682
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.dispatch2]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -341,6 +495,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 4118
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.document-features]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 24285
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -449,6 +610,20 @@ user-id = 6825
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.error-code]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1551
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.euclid]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1281 # Nicolas Silva (nical)
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.event-listener]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -470,6 +645,20 @@ user-id = 33035
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.fdeflate]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 5862
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.fearless_simd]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 288469
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.find-msvc-tools]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -477,11 +666,39 @@ trusted-publisher = "github:rust-lang/cc-rs"
 start = "2025-09-05"
 end = "2027-09-16"
 
+[[wildcard-audits.flate2]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 980
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.fnv]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2020-05-14"
+end = "2027-09-16"
+
+[[wildcard-audits.foldhash]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 24326
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.font-types]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 81909
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.form_urlencoded]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 72883
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.futures-channel]]
@@ -575,6 +792,13 @@ user-id = 3623
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.generic-array]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 5704
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.getrandom]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -614,6 +838,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 54339
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.glow]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 9941
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -659,6 +890,13 @@ user-id = 54339
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.gpu-allocator]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 160693
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.gtk]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -680,10 +918,31 @@ user-id = 3623
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.guillotiere]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1281 # Nicolas Silva (nical)
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.h2]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 359
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.half]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3416
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.harfrust]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 299582
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -722,6 +981,13 @@ user-id = 359
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.httpdate]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 982
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.human-panic]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -733,6 +999,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 359
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.hyper-timeout]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 813
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -792,10 +1065,38 @@ user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.idna]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 72883
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.idna_adapter]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4484 # Henri Sivonen (hsivonen)
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.image]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 11453
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.indexmap]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 539
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.ipnet]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 8197
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -804,6 +1105,13 @@ who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 6743
 start = "2024-05-02"
+end = "2027-09-16"
+
+[[wildcard-audits.itertools]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1442
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.itoa]]
@@ -855,10 +1163,31 @@ trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
 start = "2026-04-28"
 end = "2027-09-16"
 
+[[wildcard-audits.keyboard-types]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 36629
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.khronos-egl]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 52759
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.kittest]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 197939
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.kurbo]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 106440
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -876,10 +1205,24 @@ user-id = 55123
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.libloading]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 726
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.libm]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 55123
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.linebender_resource_handle]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 109051
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -897,10 +1240,45 @@ user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.litrs]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 915
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.lock_api]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 2915
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.log]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3204
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.lru-slab]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 5298
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.matchers]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1249
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.matchit]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 103448
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -918,6 +1296,41 @@ user-id = 359
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.minimal-lexical]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 31684
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.miniz_oxide]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4968
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.mio]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 6025
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.moxcms]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 266802
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.muda]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 95389
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.naga]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -932,10 +1345,45 @@ user-id = 53780
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.nohash-hasher]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 2332
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.nom]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 959
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.ntapi]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 27926
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.nu-ansi-term]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 152486
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.num-bigint]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 539
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.num-conv]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 15682
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1100,11 +1548,25 @@ user-id = 36629
 start = "2024-04-18"
 end = "2027-09-16"
 
+[[wildcard-audits.once_cell]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 2699
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.once_cell_polyfill]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 6743
 start = "2025-05-22"
+end = "2027-09-16"
+
+[[wildcard-audits.ordered-float]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 2017
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.pango]]
@@ -1139,6 +1601,20 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 2915
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.peniko]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4033
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.percent-encoding]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 72883
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1177,10 +1653,31 @@ user-id = 3623
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.png]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 11453
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.polling]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 33035
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.pollster]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 21853
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.polycool]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 2423
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1205,6 +1702,20 @@ user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.powerfmt]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 15682
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.presser]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 52553
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.prettyplease]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1217,6 +1728,41 @@ who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 3618
 start = "2019-04-23"
+end = "2027-09-16"
+
+[[wildcard-audits.profiling]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 54231
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.prost]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 98531
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.prost-derive]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 98531
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.pxfm]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 266802
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.qrcode]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 500
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.quote]]
@@ -1247,10 +1793,24 @@ trusted-publisher = "github:rust-random/rand_core"
 start = "2026-01-20"
 end = "2027-09-16"
 
+[[wildcard-audits.rand_pcg]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1234
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.range-alloc]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 53780
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.raw-window-handle]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7211
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1259,6 +1819,13 @@ who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 36629
 start = "2024-09-09"
+end = "2027-09-16"
+
+[[wildcard-audits.read-fonts]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 16939
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.regex]]
@@ -1282,6 +1849,13 @@ user-id = 189
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.renderdoc-sys]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3177
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.reqwest]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1289,10 +1863,38 @@ user-id = 359
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.rfd]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 89114
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.ron]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 133457
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.rustc-demangle]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 55123
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.rustc-hash]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 130181
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.rusticata-macros]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4791
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1328,6 +1930,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 2915
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.self_cell]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 18325
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1387,10 +1996,59 @@ user-id = 6743
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.serde_urlencoded]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3100
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.sharded-slab]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1249
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.simd-adler32]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 100904
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.skrifa]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 16939
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.slab]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 6741
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.smallvec]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3788
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.smol_str]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 16374
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.socket2]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 6025
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1401,11 +2059,53 @@ trusted-publisher = "github:gfx-rs/rspirv"
 start = "2026-03-13"
 end = "2027-09-16"
 
+[[wildcard-audits.stable_deref_trait]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4492
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.static_assertions]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3832
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.syn]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 3618
 start = "2019-03-01"
+end = "2027-09-16"
+
+[[wildcard-audits.sync_wrapper]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 86681
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.synstructure]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1947
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.sysinfo]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 111
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.tempfile]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 280
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.termcolor]]
@@ -1443,6 +2143,13 @@ trusted-publisher = "github:time-rs/time"
 start = "2026-06-30"
 end = "2027-09-16"
 
+[[wildcard-audits.time-core]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 15682
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.time-macros]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1454,6 +2161,20 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 1139 # Manish Goregaokar (Manishearth)
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.tinyvec]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7211
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.tinyvec_macros]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 94492
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1569,6 +2290,20 @@ user-id = 359
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.tower-layer]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3959
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.tower-service]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3959
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.tracing]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1597,10 +2332,24 @@ user-id = 172786
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.tracing-log]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 1249
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.tracing-subscriber]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 172786
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.tray-icon]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 95389
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1611,6 +2360,20 @@ user-id = 359
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.type-map]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3953
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.typed-path]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 67779
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.typeid]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1618,10 +2381,24 @@ user-id = 3618
 start = "2024-05-13"
 end = "2027-09-16"
 
+[[wildcard-audits.typenum]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 243
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.unicase]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 359
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.unicode-general-category]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 2516
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1653,10 +2430,45 @@ user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.utf8_iter]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 4484 # Henri Sivonen (hsivonen)
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.utf8parse]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 8732
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.uuid]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3204
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.valuable]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 33035
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.vello_common]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 288469
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.vello_cpu]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 288469
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1765,6 +2577,20 @@ trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
 start = "2026-04-28"
 end = "2027-09-16"
 
+[[wildcard-audits.web-time]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 34642
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.webbrowser]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 3050
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.wgpu]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -1825,6 +2651,13 @@ end = "2027-09-16"
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 53780
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.winapi]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 63
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1996,6 +2829,13 @@ user-id = 6743
 start = "2023-02-22"
 end = "2027-09-16"
 
+[[wildcard-audits.winreg]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 530
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.wit-bindgen]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -2066,6 +2906,27 @@ user-id = 6423
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.zerocopy]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7178
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.zerocopy-derive]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 7178
+start = "2026-09-16"
+end = "2027-09-16"
+
+[[wildcard-audits.zerofrom]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 128408
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.zerofrom-derive]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
@@ -2094,11 +2955,25 @@ user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2026-09-16"
 end = "2027-09-16"
 
+[[wildcard-audits.zlib-rs]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 256011
+start = "2026-09-16"
+end = "2027-09-16"
+
 [[wildcard-audits.zmij]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 user-id = 3618
 start = "2025-12-18"
+end = "2027-09-16"
+
+[[wildcard-audits.zopfli]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+user-id = 111932
+start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zvariant]]
