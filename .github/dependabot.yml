@@ -21,8 +21,11 @@ updates:
     # glib reaches the lockfile only through tray-icon's Linux gtk backend and
     # is absent from the Windows dependency graph the project ships. The
     # advisory on glib 0.18.5 is fixed in 0.20.0, which only moves together
-    # with the whole gtk-rs 0.18 stack — so every security-update run ends in
+    # with the whole gtk-rs 0.18 stack — so every security-update run ended in
     # "security update not possible" for a crate that no user build compiles.
     # `ignore` also applies to security updates, which is intended here.
+    # Revisit when libappindicator or muda publishes against gtk-rs 0.19+
+    # (both still pin gtk ^0.18 at their latest release): the bump then becomes
+    # a normal version update and this entry can go.
     ignore:
       - dependency-name: glib
