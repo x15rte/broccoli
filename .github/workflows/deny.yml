@@ -17,11 +17,12 @@ on:
 permissions:
   contents: read
 
-# Grouped per ref: cancellation is meant for superseded refs (rapid pushes on
-# one branch), never for main, which a pull-request run must not kill.
+# One group per ref, so cancellation only ever touches superseded runs of the
+# same ref: a pull-request run can never cancel main, while a second push to
+# main still supersedes the run it replaces.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 jobs:
   cargo-deny:
