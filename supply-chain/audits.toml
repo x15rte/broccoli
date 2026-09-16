@@ -126,10 +126,18 @@ criteria = "safe-to-deploy"
 version = "0.6.2"
 notes = "ASN.1 parsing core of x509-parser; no build script, pure parsing"
 
+[[audits.asn1-rs]]
+criteria = "safe-to-run"
+version = "0.7.2"
+
 [[audits.asn1-rs-derive]]
 criteria = "safe-to-deploy"
 version = "0.5.1"
 notes = "proc-macro for asn1-rs; no build script"
+
+[[audits.asn1-rs-derive]]
+criteria = "safe-to-run"
+version = "0.6.0"
 
 [[audits.asn1-rs-impl]]
 criteria = "safe-to-deploy"
@@ -387,6 +395,10 @@ notes = "encoding library; no build script"
 criteria = "safe-to-deploy"
 version = "9.0.0"
 notes = "DER parser under x509-parser; no build script"
+
+[[audits.der-parser]]
+criteria = "safe-to-run"
+version = "10.0.0"
 
 [[audits.derive_arbitrary]]
 criteria = "safe-to-deploy"
@@ -872,6 +884,10 @@ version = "0.3.104"
 criteria = "safe-to-deploy"
 version = "0.7.0"
 
+[[audits.keyboard-types]]
+criteria = "safe-to-deploy"
+version = "0.8.3"
+
 [[audits.khronos-egl]]
 criteria = "safe-to-deploy"
 version = "6.0.0"
@@ -1005,6 +1021,10 @@ version = "0.8.1"
 [[audits.muda]]
 criteria = "safe-to-deploy"
 version = "0.19.3"
+
+[[audits.muda]]
+criteria = "safe-to-deploy"
+version = "0.20.0"
 
 [[audits.multimap]]
 criteria = "safe-to-deploy"
@@ -1149,6 +1169,10 @@ version = "0.37.3"
 criteria = "safe-to-deploy"
 version = "0.7.1"
 notes = "OID registry; build.rs only writes generated tables to OUT_DIR"
+
+[[audits.oid-registry]]
+criteria = "safe-to-run"
+version = "0.8.1"
 
 [[audits.once_cell]]
 criteria = "safe-to-deploy"
@@ -1401,6 +1425,10 @@ version = "0.9.5"
 [[audits.range-alloc]]
 criteria = "safe-to-deploy"
 version = "0.1.5"
+
+[[audits.rcgen]]
+criteria = "safe-to-run"
+version = "0.14.10"
 
 [[audits.redox_syscall]]
 criteria = "safe-to-deploy"
@@ -1822,6 +1850,10 @@ version = "0.3.23"
 criteria = "safe-to-deploy"
 version = "0.24.2"
 
+[[audits.tray-icon]]
+criteria = "safe-to-deploy"
+version = "0.25.0"
+
 [[audits.try-lock]]
 criteria = "safe-to-deploy"
 version = "0.2.5"
@@ -1833,6 +1865,10 @@ version = "0.25.1"
 [[audits.type-map]]
 criteria = "safe-to-deploy"
 version = "0.5.1"
+
+[[audits.typed-path]]
+criteria = "safe-to-deploy"
+version = "0.12.3"
 
 [[audits.typeid]]
 criteria = "safe-to-deploy"
@@ -1857,6 +1893,10 @@ version = "1.1.0"
 [[audits.unicode-ident]]
 criteria = "safe-to-deploy"
 version = "1.0.24"
+
+[[audits.untrusted]]
+criteria = "safe-to-deploy"
+version = "0.7.1"
 
 [[audits.untrusted]]
 criteria = "safe-to-deploy"
@@ -2021,6 +2061,10 @@ version = "30.0.0"
 [[audits.which]]
 criteria = "safe-to-deploy"
 version = "6.0.3"
+
+[[audits.which]]
+criteria = "safe-to-deploy"
+version = "8.0.6"
 
 [[audits.winapi]]
 criteria = "safe-to-deploy"
@@ -2218,6 +2262,10 @@ version = "0.13.2"
 criteria = "safe-to-deploy"
 version = "0.13.2"
 
+[[audits.x509-parser]]
+criteria = "safe-to-run"
+version = "0.18.1"
+
 [[audits.xcursor]]
 criteria = "safe-to-deploy"
 version = "0.3.11"
@@ -2233,6 +2281,10 @@ version = "0.2.1"
 [[audits.xml-rs]]
 criteria = "safe-to-deploy"
 version = "0.8.29"
+
+[[audits.yasna]]
+criteria = "safe-to-run"
+version = "0.6.0"
 
 [[audits.yoke]]
 criteria = "safe-to-deploy"
@@ -2297,6 +2349,14 @@ version = "0.11.6"
 [[audits.zerovec-derive]]
 criteria = "safe-to-deploy"
 version = "0.11.3"
+
+[[audits.zip]]
+criteria = "safe-to-deploy"
+version = "8.6.0"
+
+[[audits.zlib-rs]]
+criteria = "safe-to-deploy"
+version = "0.6.8"
 
 [[audits.zmij]]
 criteria = "safe-to-deploy"
