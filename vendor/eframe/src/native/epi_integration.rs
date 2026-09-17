@@ -169,6 +169,14 @@ pub struct EpiIntegration {
     can_drag_window: bool,
     #[cfg(feature = "persistence")]
     persist_window: bool,
+    /// The geometry the window had when it was last measurable (visible, not
+    /// minimized). A minimized window reports an empty (0x0) client area on
+    /// Windows, so [`Self::save`] persists this snapshot while the window is
+    /// minimized instead of skipping the window key: without it, a resize made
+    /// just before minimizing is never written, and the next launch restores
+    /// the older size.
+    #[cfg(feature = "persistence")]
+    last_window_settings: Option<WindowSettings>,
     app_icon_setter: super::app_icon::AppTitleIconSetter,
 }
 
@@ -226,6 +234,8 @@ impl EpiIntegration {
             can_drag_window: false,
             #[cfg(feature = "persistence")]
             persist_window: native_options.persist_window,
+            #[cfg(feature = "persistence")]
+            last_window_settings: None,
             app_icon_setter,
             beginning: Instant::now()
                 .checked_sub(web_time::Duration::from_secs_f64(egui_ctx.time()))
@@ -383,6 +393,31 @@ impl EpiIntegration {
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
             window.set_visible(true);
         }
+
+        // Every geometry change paints: a resize repaints synchronously on
+        // Windows and a move schedules a repaint, so a snapshot per painted
+        // frame is the newest geometry the window can be measured in.
+        #[cfg(feature = "persistence")]
+        self.capture_window_settings(window);
+    }
+
+    /// Snapshot the window geometry for window persistence.
+    ///
+    /// Only measurable states are recorded: a minimized window reports an
+    /// empty (0x0) client area on Windows, and persisting that snapshot would
+    /// make the next launch restore a tiny window.
+    #[cfg(feature = "persistence")]
+    fn capture_window_settings(&mut self, window: &winit::window::Window) {
+        if window.is_minimized() == Some(true) {
+            return;
+        }
+        let settings = WindowSettings::from_window(self.egui_ctx.zoom_factor(), window);
+        if settings
+            .inner_size_points()
+            .is_some_and(|size| size.x > 0.0 && size.y > 0.0)
+        {
+            self.last_window_settings = Some(settings);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -413,17 +448,17 @@ impl EpiIntegration {
             {
                 profiling::scope!("native_window");
                 // A minimized window reports an empty (0x0) client area on
-                // Windows, so persisting it would overwrite the last good
-                // size and make the next launch restore a tiny window
-                // (0x0 -> sanity-clamped to 64x64 -> applied below the
-                // app's min_inner_size). Keep the previously persisted
-                // settings while the window is minimized.
-                if !matches!(window.is_minimized(), Some(true)) {
-                    epi::set_value(
-                        storage,
-                        STORAGE_WINDOW_KEY,
-                        &WindowSettings::from_window(self.egui_ctx.zoom_factor(), window),
-                    );
+                // Windows, so it cannot be measured: persist the geometry from
+                // before the minimize instead of skipping the key. Skipping
+                // loses a resize made since the last save, and the next launch
+                // silently restores the older size.
+                let settings = if window.is_minimized() == Some(true) {
+                    self.last_window_settings
+                } else {
+                    Some(WindowSettings::from_window(self.egui_ctx.zoom_factor(), window))
+                };
+                if let Some(settings) = settings {
+                    epi::set_value(storage, STORAGE_WINDOW_KEY, &settings);
                 }
             }
             if app.persist_egui_memory() {
