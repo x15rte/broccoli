@@ -1,11 +1,7 @@
-# Build outputs
 /target/
 /dist/
 
-# Local-only working material: repo docs, agent instructions, and scratch
-# tickets/specs/reports are never committed.
 /.scratch/
 /docs/
 /CONTEXT.md
 /AGENTS.md
-/.cause_keys.txt
