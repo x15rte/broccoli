@@ -222,6 +222,12 @@ fn main() {
         eprintln!("broccoli GUI failed: {e:?}");
         std::process::exit(1);
     }
+
+    // The process's own teardown is done: state flushed, core and helper
+    // stopped, exit-time maintenance finished. What is left is the OS exit
+    // path, where third-party code in this process can stall for many seconds
+    // and leave the window on screen after Quit. Bound it.
+    broccoli::sys::exit_bound::arm(broccoli::sys::exit_bound::TEARDOWN_BOUND);
 }
 
 #[cfg(test)]
