@@ -208,12 +208,49 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $tag = $env:BROCCOLI_RELEASE_TAG
+
+          # Release notes come from the commit history. GitHub's own generator
+          # only lists merged pull requests, which on this repository means the
+          # Dependabot bumps — none of the actual changes, since they land as
+          # commits. A note file for the tag overrides the generated list.
+          $override = ".github/release-notes/$tag.md"
+          if (Test-Path -LiteralPath $override -PathType Leaf) {
+              $notesArguments = @('--notes-file', $override)
+          } else {
+              # `git describe` fails on the first release, which is the case
+              # with no previous tag to compare against.
+              $previous = (git describe --tags --abbrev=0 --match 'v*.*.*' "$tag^" 2>$null)
+              if ([string]::IsNullOrWhiteSpace($previous)) {
+                  $range = $tag
+                  $compare = "https://github.com/$env:GITHUB_REPOSITORY/commits/$tag"
+              } else {
+                  $previous = $previous.Trim()
+                  $range = "$previous..$tag"
+                  $compare = "https://github.com/$env:GITHUB_REPOSITORY/compare/$previous...$tag"
+              }
+              # Dependency bumps are not changes a user reads about; they arrive
+              # as squash merges titled "Bump …".
+              $bullets = git log --no-merges --invert-grep --grep='^Bump ' `
+                  --pretty=format:'- %s (%h)' $range
+              $notes = @(
+                  "## What's Changed",
+                  '',
+                  ($bullets -join "`n"),
+                  '',
+                  "**Full Changelog**: $compare"
+              ) -join "`n"
+              $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+              Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+              $notesArguments = @('--notes-file', $notesPath)
+          }
+
           $arguments = @(
-              'release', 'create', $env:BROCCOLI_RELEASE_TAG,
+              'release', 'create', $tag,
               '--repo', $env:GITHUB_REPOSITORY,
               '--verify-tag',
-              '--title', "Broccoli $env:BROCCOLI_VERSION",
-              '--generate-notes',
+              '--title', "Broccoli $env:BROCCOLI_VERSION"
+          ) + $notesArguments + @(
               '--latest',
               $env:BROCCOLI_ZIP_PATH
           )
