@@ -24,7 +24,7 @@ use crate::ui::{self, PhaseAction, Screen, UiCtx, UiCtxParts, UiCtxSnapshot, UiC
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
@@ -3461,26 +3461,50 @@ fn build_tray(
     )
 }
 
-fn load_cjk_fonts(ctx: &egui::Context) {
-    for cand in [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simsun.ttc"] {
-        if let Ok(bytes) = std::fs::read(cand) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "cjk".to_string(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(fam)
-                    .or_default()
-                    .push("cjk".to_string());
+/// Process-lifetime bytes of the first CJK fallback font this machine ships,
+/// or `None` when it ships neither.
+///
+/// The bytes must outlive egui: [`egui::FontData::from_static`] borrows them,
+/// whereas an owned `FontData` is cloned wholesale when the fonts are built —
+/// that clone kept a second copy of the ~19 MB `msyh.ttc` resident for the
+/// process lifetime. CP936 Windows installs otherwise have no font covering
+/// Chinese server names, log lines, or paths, which would paint as tofu.
+static CJK_FONT_BYTES: LazyLock<Option<Vec<u8>>> = LazyLock::new(|| {
+    [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simsun.ttc"]
+        .into_iter()
+        .find_map(|candidate| match std::fs::read(candidate) {
+            Ok(bytes) => Some(bytes),
+            // A missing candidate is expected — plenty of Windows installs
+            // ship neither font — but an unreadable one (lock, ACL, I/O
+            // error) is worth a word: with no font loaded, CJK text paints
+            // as tofu.
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("CJK fallback font {candidate} unreadable: {error}");
+                None
             }
-            ctx.set_fonts(fonts);
-            return;
-        }
+            Err(_) => None,
+        })
+});
+
+fn load_cjk_fonts(ctx: &egui::Context) {
+    let Some(bytes) = CJK_FONT_BYTES.as_ref() else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(bytes)),
+    );
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(fam)
+            .or_default()
+            .push("cjk".to_string());
     }
+    ctx.set_fonts(fonts);
 }
+
 /// Escape control characters in a line about to be persisted to `app.log` so
 /// a crafted core line cannot inject ANSI terminal sequences, carriage
 /// returns, or fake log records into the plaintext file (CWE-117).
@@ -4542,6 +4566,36 @@ mod repaint_policy_tests {
         assert_eq!(
             repaint_follow_up(&CorePhase::Running, false, DrainOutcome::Drained),
             RepaintFollowUp::Nothing
+        );
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::{CJK_FONT_BYTES, load_cjk_fonts};
+
+    #[test]
+    fn cjk_text_is_renderable_exactly_when_a_fallback_font_loaded() {
+        // Chinese server names, log lines, and paths must not paint as tofu,
+        // so the loader has to leave a family that covers CJK codepoints.
+        // egui's default families carry none, which makes the implication
+        // exact in both directions: on a machine shipping neither fallback
+        // font file, nothing is renderable.
+        let ctx = egui::Context::default();
+        load_cjk_fonts(&ctx);
+        let mut renderable = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            renderable = ui
+                .ctx()
+                .fonts_mut(|fonts| fonts.has_glyphs(&egui::FontId::proportional(14.0), "服务"));
+        });
+        // A headless run has no renderer to apply texture deltas to; drop
+        // them explicitly instead of panicking in the TexturesDelta guard.
+        output.textures_delta.clear();
+        assert_eq!(
+            renderable,
+            CJK_FONT_BYTES.is_some(),
+            "CJK glyph coverage must follow the fallback font load"
         );
     }
 }
