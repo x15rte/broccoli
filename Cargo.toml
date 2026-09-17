@@ -16,10 +16,12 @@ geoip_sha256 = "cdf411fce977a1f48adb6a3b224e3e2bd7eccfcd4d6e2e30c6dc443f1a0e8e52
 geosite_sha256 = "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef1942e"
 
 [patch.crates-io]
-# Vendored with two local fixes:
+# Vendored with three local fixes:
 # - eframe: persist the last measurable window geometry while the window is
 #   minimized (a minimized window's client area cannot be read, and skipping
 #   the save loses a resize made just before minimizing)
+# - eframe: re-arm a repaint egui still owes when nothing is scheduled, so one
+#   wake lost while a native menu ran cannot silence every later request
 # - egui-winit: clamp restored window size to min/max inner size
 # Bump both forks in lockstep with the egui family: a fork left at an older
 # version than the family makes cargo drop the patch (the lock then records

@@ -242,6 +242,30 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             }
         }
 
+        // Safety net against a muted wake. egui only invokes the repaint
+        // callback while the new delay is strictly lower than the recorded one
+        // (`Context::request_repaint`), and this scheduler can consume a
+        // window's pending repaint without re-arming it — the `and_modify`
+        // above cannot insert into a vacant slot. A wake that never reaches
+        // this loop at all (a request issued while a native popup menu runs
+        // its own modal loop, for instance) therefore leaves egui recording
+        // "repaint pending" with nothing scheduled, and every later request
+        // from every thread — a tray action, a runtime poke — is silently
+        // swallowed until an unrelated window message happens to run a pass.
+        // Re-arm here instead: one extra pass, only while egui itself reports
+        // a repaint is owed for the root viewport.
+        if let Some(ctx) = self.winit_app.egui_ctx()
+            && ctx.has_requested_repaint_for(&egui::ViewportId::ROOT)
+            && let Some(window_id) = self
+                .winit_app
+                .window_id_from_viewport_id(egui::ViewportId::ROOT)
+            && !self.windows_next_repaint_times.contains_key(&window_id)
+        {
+            log::trace!("re-arming a repaint egui still owes for {window_id:?}");
+            self.windows_next_repaint_times
+                .insert(window_id, Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL);
+        }
+
         // Always set an explicit, sleeping control flow. Previously we only set
         // `WaitUntil` when a repaint was already scheduled, which meant that a
         // `ControlFlow::Poll` set earlier was never undone once the last timed
