@@ -6,11 +6,11 @@ on:
   push:
     branches: [main]
   pull_request:
-  # No weekly schedule: `cargo vet --locked` is deterministic against the
+  # No schedule: `cargo vet --locked` is deterministic against the
   # committed imports.lock, so an unchanged tree gives an identical result
   # every run — every tree change is a push and already triggers this
-  # workflow. (deny.yml keeps its weekly cron: the RustSec DB is fetched
-  # fresh per run, so a weekly run catches new advisories on a quiet tree.)
+  # workflow. (deny.yml keeps its three-day cron: the RustSec DB is fetched
+  # fresh per run, so that run catches new advisories on a quiet tree.)
   workflow_dispatch:
 
 permissions:

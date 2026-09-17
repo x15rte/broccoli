@@ -7,11 +7,12 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Weekly: keep the advisory database fresh without code churn. cargo-deny
-    # checks advisories (its advisories check is the project's advisory gate;
-    # the cargo-audit scan was removed 2026-08-28 as redundant), so the
-    # weekly run is as useful here as there.
-    - cron: "0 6 * * 1"
+    # Every three days: the advisory database changes without any commit here,
+    # so this interval is the window in which a shipped crate can sit on a
+    # published advisory between pushes. cargo-deny's advisories check is the
+    # project's advisory gate (the cargo-audit scan was removed 2026-08-28 as
+    # redundant — same database, same fail policy).
+    - cron: "0 6 */3 * *"
   workflow_dispatch:
 
 permissions:
