@@ -1034,8 +1034,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        GrpcClient, HealthPingView, Network, TrialRuleAddOutcome, add_rule_outcome,
-        balancer_info_view, balancer_status_diag, format_route,
+        CONNECT_TIMEOUT, GrpcClient, HealthPingView, Network, TrialRuleAddOutcome,
+        add_rule_outcome, balancer_info_view, balancer_status_diag, format_route,
         pb::xray::app::router::command as router_cmd, router_cfg, routing_context,
         trial_rule_to_pb,
     };
@@ -1089,10 +1089,14 @@ mod tests {
             drop(accepted);
         });
 
+        // The connect timeout must stay above the local deadline under test —
+        // the production ordering, `CONNECT_TIMEOUT` against `RPC_TIMEOUT`. A
+        // shorter one lets a loaded runner return the transport error before
+        // the deadline fires, which made this test load-dependent.
         let client = GrpcClient::with_timeouts(
             port,
-            Duration::from_millis(75),
-            Duration::from_millis(75),
+            CONNECT_TIMEOUT,
+            Duration::from_millis(100),
             Duration::from_millis(100),
         );
         let started = Instant::now();
@@ -1105,8 +1109,11 @@ mod tests {
         server.join().expect("stall server thread");
 
         assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        // A sanity bound, not a latency assertion: the deadline is 100 ms, and
+        // a loaded runner overshoots it. The bound only has to catch a deadline
+        // that never fires.
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(2),
             "local deadline was not enforced: {elapsed:?}"
         );
     }
