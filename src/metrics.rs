@@ -57,6 +57,9 @@ pub enum WorkCounter {
     /// Servers editor / add-draft validation-sweep rebuilds:
     /// one sweep per draft (generation, language) change, never per frame.
     EditorValidationRebuilds,
+    /// Advanced-tab chain-target option rebuilds: one pass per
+    /// profile-set (or edited-profile) change, never per frame.
+    AdvancedTagRebuilds,
     /// Top-bar speed-readout string rebuilds: formatted once per stats
     /// tick / traffic-unit / language / version / viewport change, never
     /// per frame.
@@ -113,6 +116,7 @@ pub struct Metrics {
     pub routing_tag_rebuilds: u64,
     pub routing_rule_formats: u64,
     pub editor_validation_rebuilds: u64,
+    pub advanced_tag_rebuilds: u64,
     pub topbar_speed_rebuilds: u64,
 
     // -- resource counters (current collection sizes) ------------------------
@@ -161,6 +165,7 @@ impl Metrics {
             WorkCounter::RoutingTagRebuilds => self.routing_tag_rebuilds += 1,
             WorkCounter::RoutingRuleFormats => self.routing_rule_formats += 1,
             WorkCounter::EditorValidationRebuilds => self.editor_validation_rebuilds += 1,
+            WorkCounter::AdvancedTagRebuilds => self.advanced_tag_rebuilds += 1,
             WorkCounter::TopbarSpeedRebuilds => self.topbar_speed_rebuilds += 1,
         }
     }

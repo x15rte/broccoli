@@ -13,6 +13,7 @@ use egui::{Color32, RichText, Stroke, StrokeKind};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
 use crate::metrics::{MetricsHandle, ResourceCounter, WorkCounter};
+use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
     WireguardPeer, blackhole_custom_response_data_decodes, blackhole_response_is_custom,
@@ -781,6 +782,11 @@ fn sockopt_editor(
     lang: Language,
     sockopt: &mut SockoptModel,
     usage: SockoptUsage,
+    // The stream block is the chain surface: its `dialerProxy` renders as a
+    // picker over the caller's chain-target options. The ECH DNS-query block
+    // and the mask blocks embed the same struct but sit in editors with no
+    // profile list, so they keep the free-text field (`None`).
+    dialer_proxy_options: Option<&[String]>,
     // The block's memoized `validate_sockopt` verdicts (its usage's wire
     // path in the message), rendered under the fields.
     errors: &[String],
@@ -794,7 +800,17 @@ fn sockopt_editor(
         t(lang, Key::SrvDefault),
         false,
     );
-    changed |= widgets::text_field(ui, "dialerProxy", &mut sockopt.dialer_proxy, "outbound tag");
+    changed |= match dialer_proxy_options {
+        Some(options) => widgets::combo_str_labeled(
+            ui,
+            "dialerProxy",
+            &mut sockopt.dialer_proxy,
+            options,
+            t(lang, Key::NoneSelected),
+            true,
+        ),
+        None => widgets::text_field(ui, "dialerProxy", &mut sockopt.dialer_proxy, "outbound tag"),
+    };
     changed |= widgets::text_field(
         ui,
         t(lang, Key::SrvInterfaceBindNic),
@@ -1043,7 +1059,7 @@ fn ech_sockopt_editor(
     if let Some(sockopt) = sockopt.as_mut() {
         ui.indent("ech-dns-query-sockopt", |ui| {
             ui.weak(t(lang, Key::SrvEchSockoptNote));
-            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::EchDnsQuery, errors);
+            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::EchDnsQuery, None, errors);
         });
     }
     changed
@@ -1067,7 +1083,7 @@ fn mask_sockopt_editor(
     if let Some(sockopt) = sockopt.as_mut() {
         ui.indent("mask-sockopt", |ui| {
             ui.weak(t(lang, Key::SrvMaskSockoptNote));
-            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::Mask, &[]);
+            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::Mask, None, &[]);
         });
     }
     changed
@@ -1501,14 +1517,68 @@ struct AddDraftValidationCache {
     changed_from_source: bool,
 }
 
+/// The chain-target (`dialerProxy`) picker's options for one editor: every
+/// other profile's `srv-<id8>` tag in server-list order, then the built-in
+/// `direct`/`block` targets validation accepts. Memoized per editor — a
+/// rebuild costs one tag format per profile — so it reruns only when the
+/// profile-set signal `(config_revision, dirty, profile count)` or the
+/// rendered profile advances; idle repaint frames reuse the snapshot.
+struct DialerProxyOptions {
+    generation: (u64, bool, usize),
+    /// The profile whose own tag the options exclude — a chain to itself
+    /// could only produce a cycle.
+    own_id: String,
+    options: Vec<String>,
+}
+
+/// Refresh `slot` when its signal moved and hand back the options it holds.
+/// Each editor keeps its own slot: the existing-draft editor and the
+/// add-server dialog may render in one frame, and they exclude different
+/// profiles.
+fn refresh_dialer_proxy_options<'a>(
+    slot: &'a mut Option<DialerProxyOptions>,
+    set_key: (u64, bool, usize),
+    own_id: &str,
+    profiles: &[ServerProfile],
+    metrics: &MetricsHandle,
+) -> &'a [String] {
+    let unchanged = slot
+        .as_ref()
+        .is_some_and(|cached| cached.generation == set_key && cached.own_id.as_str() == own_id);
+    if !unchanged {
+        let options = profiles
+            .iter()
+            .filter(|profile| profile.id.as_str() != own_id)
+            .map(ServerProfile::tag)
+            .chain([
+                DIRECT_OUTBOUND_TAG.to_string(),
+                BLOCK_OUTBOUND_TAG.to_string(),
+            ])
+            .collect();
+        metrics.bump_work(WorkCounter::AdvancedTagRebuilds);
+        *slot = Some(DialerProxyOptions {
+            generation: set_key,
+            own_id: own_id.to_owned(),
+            options,
+        });
+    }
+    slot.as_ref()
+        .map_or(&[], |cached| cached.options.as_slice())
+}
+
 /// Trailing context for [`ServersScreen::advanced_tab`]:
-/// the memoized finalmask verdicts, the memoized `stream.sockopt` verdict,
-/// and the per-editor raw JSON/PEM buffers plus metrics. Bundled so the tab
-/// stays under clippy's argument-count ceiling without a lint suppression
+/// the profile-set signal the chain-target options memoize on, the memoized
+/// finalmask verdicts, the memoized `stream.sockopt` verdict, and the
+/// per-editor raw JSON/PEM buffers plus metrics. Bundled so the tab stays
+/// under clippy's argument-count ceiling without a lint suppression
 /// (zero-suppression repo contract).
 struct AdvancedTabCtx<'a> {
+    set_key: (u64, bool, usize),
     finalmask_errors: &'a [String],
     stream_sockopt_errors: &'a [String],
+    /// The chain-target picker's memo slot for the editor rendering this
+    /// tab (see [`DialerProxyOptions`]).
+    dialer_proxy_options: &'a mut Option<DialerProxyOptions>,
     finalmask_raw: &'a mut std::collections::HashMap<egui::Id, JsonBuf>,
     pem_buffers: &'a mut std::collections::HashMap<egui::Id, PemBuf>,
     metrics: &'a MetricsHandle,
@@ -1819,6 +1889,12 @@ pub struct ServersScreen {
     draft_tab: EditorTab,
     existing_draft: Option<ExistingProfileDraft>,
     editor_validation_cache: Option<EditorValidationCache>,
+    /// The chain-target picker's option memo for the existing-draft editor
+    /// and the add-server dialog — one slot each, since both may render in
+    /// one frame and they exclude different profiles (see
+    /// [`DialerProxyOptions`]).
+    dialer_proxy_options: Option<DialerProxyOptions>,
+    add_dialer_proxy_options: Option<DialerProxyOptions>,
     add_draft: Option<ServerProfile>,
     add_draft_generation: u64,
     add_draft_validation_cache: Option<AddDraftValidationCache>,
@@ -3854,9 +3930,16 @@ impl ServersScreen {
                             ui,
                             lang,
                             &mut draft.profile,
+                            &ctx.servers.profiles,
                             AdvancedTabCtx {
+                                set_key: (
+                                    ctx.config_revision,
+                                    *ctx.dirty,
+                                    ctx.servers.profiles.len(),
+                                ),
                                 finalmask_errors,
                                 stream_sockopt_errors,
+                                dialer_proxy_options: &mut self.dialer_proxy_options,
                                 finalmask_raw: &mut self.finalmask_raw,
                                 pem_buffers: &mut self.pem_buffers,
                                 metrics: ctx.metrics,
@@ -5983,11 +6066,16 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         p: &mut ServerProfile,
+        // The sibling profiles the chain-target picker may offer: their tags
+        // (minus `p`'s own) plus the built-in targets.
+        profiles: &[ServerProfile],
         ctx: AdvancedTabCtx<'_>,
     ) -> bool {
         let AdvancedTabCtx {
+            set_key,
             finalmask_errors,
             stream_sockopt_errors,
+            dialer_proxy_options,
             finalmask_raw,
             pem_buffers,
             metrics,
@@ -5998,6 +6086,11 @@ impl ServersScreen {
         // it per frame, and cloning the 36-char String would allocate on
         // every repaint of the Advanced tab.
         let key = p.id.as_str();
+        // The chain-target picker's options memoize on the profile-set
+        // signal: idle frames reuse the cached snapshot, and a rebuild costs
+        // O(profiles) only when the set actually changed.
+        let dialer_proxy_options =
+            refresh_dialer_proxy_options(dialer_proxy_options, set_key, key, profiles, metrics);
 
         widgets::section(ui, t(lang, Key::SrvEnvelope), |ui| {
             changed |= opt_string(
@@ -6238,6 +6331,7 @@ impl ServersScreen {
                 lang,
                 &mut sockopt,
                 SockoptUsage::Stream,
+                Some(dialer_proxy_options),
                 stream_sockopt_errors,
             );
             if had_sockopt || !sockopt.is_empty() {
@@ -6359,9 +6453,16 @@ impl ServersScreen {
                                     ui,
                                     lang,
                                     &mut draft,
+                                    &uictx.servers.profiles,
                                     AdvancedTabCtx {
+                                        set_key: (
+                                            uictx.config_revision,
+                                            *uictx.dirty,
+                                            uictx.servers.profiles.len(),
+                                        ),
                                         finalmask_errors,
                                         stream_sockopt_errors,
+                                        dialer_proxy_options: &mut self.add_dialer_proxy_options,
                                         finalmask_raw: &mut self.finalmask_raw,
                                         pem_buffers: &mut self.pem_buffers,
                                         metrics: uictx.metrics,
@@ -9463,9 +9564,12 @@ TLS ping finished"#;
                     ui,
                     Language::En,
                     &mut profile,
+                    &[],
                     AdvancedTabCtx {
+                        set_key: (0, false, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
+                        dialer_proxy_options: &mut screen.dialer_proxy_options,
                         finalmask_raw: &mut screen.finalmask_raw,
                         pem_buffers: &mut screen.pem_buffers,
                         metrics: &crate::metrics::MetricsHandle::new(),
@@ -10259,9 +10363,12 @@ TLS ping finished"#;
                 ui,
                 Language::En,
                 profile,
+                &[],
                 AdvancedTabCtx {
+                    set_key: (0, false, 0),
                     finalmask_errors: &[],
                     stream_sockopt_errors: &[],
+                    dialer_proxy_options: &mut screen.dialer_proxy_options,
                     finalmask_raw: &mut screen.finalmask_raw,
                     pem_buffers: &mut screen.pem_buffers,
                     metrics,
@@ -10290,9 +10397,12 @@ TLS ping finished"#;
                     ui,
                     Language::En,
                     &mut profile,
+                    &[],
                     AdvancedTabCtx {
+                        set_key: (0, false, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
+                        dialer_proxy_options: &mut screen.dialer_proxy_options,
                         finalmask_raw: &mut screen.finalmask_raw,
                         pem_buffers: &mut screen.pem_buffers,
                         metrics: &metrics,
@@ -11373,8 +11483,8 @@ TLS ping finished"#;
         // A stored profile from a build that still wrote `proxySettings`:
         // the editor opens on it (the load does not fail), the blocking list
         // names the replacement, and the Advanced tab carries exactly one
-        // control for the chain target — the sockopt field.
-        let (rig, _tokyo, osaka) = retired_key_rig();
+        // control for the chain target — the sockopt picker.
+        let (rig, tokyo, osaka) = retired_key_rig();
         let mut harness = unsaved_harness(rig);
         harness.run();
         assert!(
@@ -11438,28 +11548,53 @@ TLS ping finished"#;
             "the finding must survive an unrelated edit"
         );
 
-        // Setting the target with the chain control is the decision: the key
+        // Setting the target with the chain picker is the decision: the key
         // is dropped from the draft, the finding leaves the blocking list,
-        // and the profile serializes without the key. The name field now
-        // carries text, so the empty input is the dialerProxy field; it sits
-        // at the bottom of the tab, so scroll it into view first.
+        // and the profile serializes without the key. The picker starts on
+        // the empty meaning ("(none)") and sits at the bottom of the tab, so
+        // scroll it into view first.
+        let empty_label = t(Language::En, Key::NoneSelected);
         harness
-            .get_all_by_role(egui::accesskit::Role::TextInput)
-            .find(|node| node.value().as_deref() == Some(""))
-            .expect("the dialerProxy field is the empty input")
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some(empty_label))
+            .expect("the chain-target picker starts empty")
             .scroll_to_me();
         harness.run();
         harness
-            .get_all_by_role(egui::accesskit::Role::TextInput)
-            .find(|node| node.value().as_deref() == Some(""))
-            .expect("the dialerProxy field is the empty input")
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some(empty_label))
+            .expect("the chain-target picker starts empty")
             .click();
         harness.run();
+        // The open popup offers every other profile's tag in list order,
+        // then the built-in targets — and never the edited profile's own tag
+        // (a chain to itself could only produce a cycle). The popup's option
+        // rows are the only buttons carrying a tag label in this frame
+        // (the editor's other buttons are icon or action labels).
+        use egui_kittest::kittest::NodeT as _;
+        let button_labels: Vec<String> = harness
+            .root()
+            .children_recursive()
+            .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
+            .filter_map(|node| node.accesskit_node().label())
+            .collect();
+        let listed: Vec<&str> = button_labels
+            .iter()
+            .map(String::as_str)
+            .filter(|label| label.starts_with("srv-") || matches!(*label, "direct" | "block"))
+            .collect();
+        assert_eq!(
+            listed,
+            [osaka.tag().as_str(), "direct", "block"],
+            "the picker offers the other profiles' tags, then direct and block"
+        );
+        assert!(
+            !button_labels.iter().any(|label| label == &tokyo.tag()),
+            "the edited profile's own tag must not be a chain option"
+        );
         harness
-            .get_all_by_role(egui::accesskit::Role::TextInput)
-            .find(|node| node.is_focused())
-            .expect("the dialerProxy field takes focus")
-            .type_text(&osaka.tag());
+            .get_by_role_and_label(egui::accesskit::Role::Button, &osaka.tag())
+            .click();
         harness.run();
         let state = harness.state();
         let draft = state
@@ -11476,7 +11611,7 @@ TLS ping finished"#;
                 .as_ref()
                 .map(|sockopt| sockopt.dialer_proxy.as_str()),
             Some(osaka.tag().as_str()),
-            "the field must edit the chain target"
+            "the picker must edit the chain target"
         );
         assert!(
             draft.profile.outbound.retired_proxy_settings.is_none(),
@@ -11493,6 +11628,156 @@ TLS ping finished"#;
                 .all(|error| !error.contains("proxySettings")),
             "{:#?}",
             editor_errors(&harness)
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_picker_clears_the_chain_and_keeps_a_stored_unknown_tag() {
+        // A stored target naming no profile must keep displaying and stay
+        // untouched until the user picks another option: validation — not
+        // the editor — reports the dangling reference, so the picker must
+        // never silently rewrite it into a resolvable tag.
+        let stored = "srv-stale";
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.outbound.stream.sockopt = Some(SockoptModel {
+            dialer_proxy: stored.into(),
+            ..Default::default()
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(tokyo.clone());
+        rig.servers.profiles.push(ServerProfile::new(
+            "Osaka",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        rig.servers.active = Some(tokyo.id.clone());
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+
+        // The raw value is the picker's selection even though no option
+        // matches it, and idle frames keep it verbatim (the draft's own
+        // value and what it serializes to).
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .any(|node| node.value().as_deref() == Some(stored)),
+            "the picker must display the stored chain target"
+        );
+        harness.run();
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .clone();
+        assert_eq!(
+            draft
+                .outbound
+                .stream
+                .sockopt
+                .as_ref()
+                .map(|sockopt| sockopt.dialer_proxy.as_str()),
+            Some(stored),
+            "an idle frame must not rewrite the stored chain target"
+        );
+        assert_eq!(
+            serde_json::to_value(&draft).expect("the draft serializes")["outbound"]["streamSettings"]
+                ["sockopt"]["dialerProxy"],
+            json!(stored),
+            "the stored spelling must round-trip unchanged"
+        );
+
+        // The empty entry clears the chain. The picker sits at the bottom of
+        // the tab, so scroll it into view before opening it.
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some(stored))
+            .expect("the picker shows the stored tag")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some(stored))
+            .expect("the picker shows the stored tag")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::NoneSelected),
+            )
+            .click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .existing_draft
+                .as_ref()
+                .expect("the editor stays open")
+                .profile
+                .outbound
+                .stream
+                .sockopt
+                .as_ref()
+                .map(|sockopt| sockopt.dialer_proxy.as_str()),
+            Some(""),
+            "the empty entry must clear the chain"
+        );
+    }
+
+    #[test]
+    fn advanced_chain_target_options_rebuild_once_per_set_change_and_never_on_idle_frames() {
+        let mut rig = UiTestRig::default();
+        let alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom));
+        rig.servers.profiles.push(alpha.clone());
+        rig.servers.profiles.push(ServerProfile::new(
+            "beta",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        rig.servers.active = Some(alpha.id.clone());
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
+            1,
+            "the first Advanced frame builds the chain-target options once"
+        );
+        harness.run();
+        harness.run();
+        assert_eq!(
+            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
+            1,
+            "idle frames must not rebuild the chain-target options"
+        );
+        // A profile-set change rebuilds exactly once; idle frames after it
+        // stay quiet.
+        harness
+            .state_mut()
+            .1
+            .servers
+            .profiles
+            .push(ServerProfile::new(
+                "gamma",
+                OutboundModel::new(Protocol::Freedom),
+            ));
+        harness.run();
+        assert_eq!(
+            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
+            2,
+            "a profile-set change must rebuild the chain-target options exactly once"
+        );
+        harness.run();
+        harness.run();
+        assert_eq!(
+            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
+            2,
+            "idle frames after the set change must not rebuild"
         );
     }
 
