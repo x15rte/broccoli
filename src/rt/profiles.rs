@@ -9,7 +9,10 @@
 //! place (restoring the file when the candidate is rejected), generates a
 //! config, writes that config to a scratch file in the config
 //! directory and runs the file through `xray run -test`
-//! ([`super::apply::validate`]). The accepted/rejected verdict travels back on
+//! ([`super::apply::validate`]). Siblings whose outbound carries an `Error`
+//! finding are stood in for while a candidate is tested
+//! ([`prepared_snapshot`]), so an unresolved row cannot veto another row's
+//! save. The accepted/rejected verdict travels back on
 //! the request's own reply channel; nothing is ever persisted, and a rejected
 //! profile never reaches the caller's model.
 //!
@@ -32,7 +35,8 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::links;
 use crate::model::settings::Language;
-use crate::model::{ServerProfile, ServersFile, Settings};
+use crate::model::validation::{Severity, validate_outbound};
+use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 
 use super::apply;
 
@@ -71,7 +75,9 @@ pub struct ProfileValidationRequest {
     /// The import paste the request was staged from, echoed back so the screen
     /// can discard a verdict whose paste has changed.
     pub import_source: Option<String>,
-    /// Servers-file snapshot the staged profile is generated into.
+    /// Servers-file snapshot the staged profile is generated into. The
+    /// worker generates against a clone of it with gated siblings stood in
+    /// for ([`prepared_snapshot`]); this value is never mutated.
     pub servers: ServersFile,
     /// Scratch settings for the generated config: the caller's settings with
     /// `raw_override` cleared, so the staged profile is exercised instead of
@@ -104,6 +110,39 @@ pub(crate) fn validation_cancelled() -> DiagError {
     DiagError::from(Diag::new(Key::SeatValidationCancelled))
 }
 
+/// The working snapshot the worker stages candidates into: a clone of the
+/// request's own servers file with every profile whose outbound carries an
+/// `Error` finding replaced by a stand-in that keeps the row's identity —
+/// same `id` (its generated tag and any chain, routing, or balancer
+/// reference still resolve), same `name` (labels keep naming the row the user
+/// sees), same position, and the file's `active` choice — but carries a
+/// default `freedom` outbound. Generation refuses while *any* profile in the
+/// set has an `Error` finding, so one unresolved sibling (a stored
+/// `proxySettings` mark, a hand-edited invalid value) would otherwise veto
+/// every other row's candidate before that candidate's own test ran, leaving
+/// the user unable to save the row they just fixed. The candidate itself is
+/// staged per iteration from the request's own `profiles`, so a candidate
+/// carrying its own gate is still real and is rejected with its own message.
+/// The request's snapshot is never mutated; this clone is the only working
+/// copy.
+fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
+    let mut snapshot = servers.clone();
+    for profile in &mut snapshot.profiles {
+        if validate_outbound(&profile.outbound)
+            .iter()
+            .any(|finding| finding.severity == Severity::Error)
+        {
+            *profile = ServerProfile {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+                outbound: OutboundModel::new(Protocol::Freedom),
+                ..ServerProfile::default()
+            };
+        }
+    }
+    snapshot
+}
+
 /// Run one accepted request to its terminal: per profile, stage it, generate
 /// a config, validate the generated config with `xray run -test`, and
 /// accumulate the verdict. `cancel` is observed before the first profile and
@@ -124,7 +163,7 @@ pub(crate) async fn validate(
     } = request;
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
-    let mut staged_servers = servers;
+    let mut staged_servers = prepared_snapshot(&servers);
     for profile in profiles {
         // Cooperative cancel boundary: the previous iteration's staging was
         // either committed or already reverted, so nothing is left behind
@@ -436,11 +475,13 @@ mod tests {
     use super::{
         ProfileValidationOrigin, ProfileValidationRequest, SCRATCH_CONFIG_MAX_AGE,
         ScratchConfigGuard, cleanup_old_scratch_configs, is_scratch_config_file_name,
-        scratch_config_file_name, stage_and_validate, stage_profile, validate,
+        prepared_snapshot, scratch_config_file_name, stage_and_validate, stage_profile, validate,
     };
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
+    use crate::model::validation::{Severity, validate_outbound, validate_profiles};
     use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
+    use crate::sys::appdata::with_appdata_async;
 
     fn request(profiles: Vec<ServerProfile>) -> ProfileValidationRequest {
         ProfileValidationRequest {
@@ -805,6 +846,208 @@ mod tests {
         );
         assert_eq!(staged.profiles[0].id, "0123456789abcdef");
         assert_eq!(staged.active.as_deref(), Some("0123456789abcdef"));
+    }
+
+    // ---------- sibling gates ----------
+
+    /// A profile carrying the retired `proxySettings` mark a stale stored
+    /// file loads: an `Error`-severity finding on its outbound.
+    fn marked_profile(name: &str, id: &str) -> ServerProfile {
+        let mut profile = import_profile(name, id);
+        profile.outbound.retired_proxy_settings = Some(serde_json::json!({"tag": "direct"}));
+        profile
+    }
+
+    #[test]
+    fn a_marked_sibling_does_not_veto_an_unrelated_candidate() {
+        // `gen` refuses to generate while *any* profile in the set carries an
+        // `Error` finding, so one unresolved row (a stored `proxySettings`
+        // mark) would veto every other row's draft save with the sibling's
+        // message. The worker therefore prepares a snapshot with such
+        // siblings stood in for; this drives the same stage-then-generate
+        // sequence the worker runs.
+        let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+        let servers = ServersFile {
+            profiles: vec![sibling.clone()],
+            active: Some(sibling.id.clone()),
+            ..ServersFile::default()
+        };
+        let candidate = import_profile("candidate", "fedcba9876543210");
+
+        let mut snapshot = prepared_snapshot(&servers);
+        stage_profile(&mut snapshot, &candidate);
+
+        match crate::r#gen::generate(&snapshot, &Settings::default()) {
+            Ok(_) => {}
+            Err(error) => panic!(
+                "a sibling's mark must not veto an unrelated candidate's generation: {}",
+                error.text(Language::En)
+            ),
+        }
+
+        // The stand-in sits in the sibling's own slot and keeps its identity,
+        // so its generated tag still resolves for chain, routing, and
+        // balancer references, while carrying no gate of its own.
+        assert_eq!(snapshot.profiles.len(), 2);
+        let stand_in = &snapshot.profiles[0];
+        assert_eq!(stand_in.id, sibling.id);
+        assert_eq!(stand_in.name, sibling.name);
+        assert_eq!(stand_in.tag(), sibling.tag());
+        assert!(
+            validate_outbound(&stand_in.outbound).is_empty(),
+            "the stand-in must carry no gate"
+        );
+        assert_eq!(
+            snapshot.active.as_deref(),
+            Some(sibling.id.as_str()),
+            "the file's active choice must survive the stand-in"
+        );
+
+        // The request's own snapshot keeps the real marked sibling: the
+        // worker must never mutate the caller's data.
+        assert_eq!(servers.profiles.len(), 1);
+        assert_eq!(servers.profiles[0].id, sibling.id);
+        assert_eq!(
+            servers.profiles[0].outbound.retired_proxy_settings,
+            Some(serde_json::json!({"tag": "direct"})),
+            "the request's snapshot must stay untouched"
+        );
+    }
+
+    #[test]
+    fn a_chain_to_a_stood_in_sibling_keeps_its_target_and_the_real_set_stays_gated() {
+        // A dial-through profile aims at another row's generated tag. The
+        // stand-in keeps that row's id, so the tag still resolves and the
+        // chain is not falsely rejected; the real set still yields the
+        // sibling's own finding, which is what keeps apply blocked until the
+        // user repairs that row.
+        let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+        let mut candidate = import_profile("dial-through", "fedcba9876543210");
+        candidate.outbound.chain_via(sibling.tag());
+        let servers = ServersFile {
+            profiles: vec![sibling.clone()],
+            active: Some(sibling.id.clone()),
+            ..ServersFile::default()
+        };
+
+        let mut snapshot = prepared_snapshot(&servers);
+        stage_profile(&mut snapshot, &candidate);
+        let config = crate::r#gen::generate(&snapshot, &Settings::default())
+            .expect("a chain to a stood-in sibling must still generate");
+        let text = serde_json::to_string(&config).expect("the config serializes");
+        assert!(
+            text.contains(&format!("\"dialerProxy\":\"{}\"", sibling.tag())),
+            "the emitted chain target must stay the sibling's tag: {text}"
+        );
+
+        assert!(
+            validate_profiles(std::slice::from_ref(&sibling), Some(&sibling.id), true)
+                .iter()
+                .any(|finding| finding.severity == Severity::Error),
+            "the real set must keep the sibling's blocking finding for apply"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_candidate_carrying_its_own_mark_is_still_rejected() {
+        // The stand-in covers siblings only: the candidate is staged from the
+        // request's own profiles, so its own retired-key mark still rejects
+        // it — with its own label, not the sibling's.
+        let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+        let candidate = marked_profile("marked-candidate", "fedcba9876543210");
+        let mut request = request(vec![candidate]);
+        // The draft flow: the import flow's share-link check would reject a
+        // freedom candidate before generation ever sees its mark.
+        request.origin = ProfileValidationOrigin::Draft;
+        request.servers = ServersFile {
+            profiles: vec![sibling],
+            active: Some("0123456789abcdef".to_string()),
+            ..ServersFile::default()
+        };
+        let verdict = validate(request, &AtomicBool::new(false))
+            .await
+            .expect("the worker walks the profile list");
+        assert!(verdict.accepted.is_empty(), "{:?}", verdict.accepted);
+        assert_eq!(verdict.rejected.len(), 1, "{:?}", verdict.rejected);
+        let (label, message) = &verdict.rejected[0];
+        assert_eq!(label, "marked-candidate");
+        assert_eq!(
+            message,
+            &format!(
+                "marked-candidate: {}",
+                t(Language::En, Key::SrvProxySettingsRemoved)
+            ),
+            "the candidate must fail on its own finding"
+        );
+    }
+
+    // ---------- the real core ----------
+
+    /// The five managed-core files the release verify hashes before the
+    /// validation child runs. The managed core is user-local state; the test
+    /// below seeds a redirected core dir from the real one and skips when the
+    /// machine never installed it.
+    const MANAGED_CORE_FILES: [&str; 5] = [
+        ".broccoli-official-release.json",
+        "xray.exe",
+        "wintun.dll",
+        "geoip.dat",
+        "geosite.dat",
+    ];
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_sibling_does_not_veto_a_draft_save_through_the_real_core() {
+        // The worker's full path: with the marked sibling stood in for, a
+        // healthy candidate reaches `xray run -test` and comes back accepted
+        // — the trapped draft save of the reported deadlock now commits.
+        let managed_core = crate::sys::paths::core_dir();
+        let missing: Vec<&str> = MANAGED_CORE_FILES
+            .iter()
+            .copied()
+            .filter(|name| !managed_core.join(name).is_file())
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "skipping the marked-sibling draft-save test: the managed core at {} lacks {}",
+                managed_core.display(),
+                missing.join(", ")
+            );
+            return;
+        }
+        with_appdata_async(async {
+            let seeded_core = crate::sys::paths::core_dir();
+            std::fs::create_dir_all(&seeded_core).expect("create redirected core dir");
+            for name in MANAGED_CORE_FILES {
+                let target = seeded_core.join(name);
+                std::fs::copy(managed_core.join(name), &target)
+                    .unwrap_or_else(|error| panic!("seed {name}: {error}"));
+            }
+
+            let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+            let candidate = import_profile("candidate", "fedcba9876543210");
+            let mut request = request(vec![candidate.clone()]);
+            request.origin = ProfileValidationOrigin::Draft;
+            request.draft_target = Some(super::ToolTarget::AddDraft {
+                profile_id: candidate.id.clone(),
+                generation: 1,
+            });
+            request.servers = ServersFile {
+                profiles: vec![sibling.clone()],
+                active: Some(sibling.id.clone()),
+                ..ServersFile::default()
+            };
+            let verdict = validate(request, &AtomicBool::new(false))
+                .await
+                .expect("the worker walks the profile list");
+            assert!(
+                verdict.rejected.is_empty(),
+                "the healthy candidate must reach the core and pass: {:?}",
+                verdict.rejected
+            );
+            assert_eq!(verdict.accepted.len(), 1, "{:?}", verdict.accepted);
+            assert_eq!(verdict.accepted[0].id, candidate.id);
+        })
+        .await;
     }
 
     // ---------- cooperative cancellation ----------
