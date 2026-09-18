@@ -2545,11 +2545,25 @@ impl RoutingScreen {
         };
 
         let old_tag = bal.tag.as_str();
-        widgets::validated_field(
+        // The duplicate verdict reads every other row's committed tag, so the
+        // memoized verdict must follow that list: recompute whenever any tag
+        // changes — including a sibling removed below — even though this
+        // row's buffer text stays put. The row index is part of the revision
+        // because the rule excludes the row's own tag.
+        let tags_revision = widgets::context_revision((
+            index,
+            &self
+                .view_cache
+                .as_ref()
+                .expect("view cache populated above")
+                .balancer_tags,
+        ));
+        widgets::validated_field_with_revision(
             ui,
             t(lang, Key::Tag),
             &mut self.balancer_tag_buf,
             t(lang, Key::BalancerNameHint),
+            tags_revision,
             |candidate| {
                 let candidate = candidate.trim();
                 if candidate.is_empty() {

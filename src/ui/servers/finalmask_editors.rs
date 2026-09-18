@@ -11,9 +11,9 @@ use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, pinned_peer_cert_sha256_valid};
 use crate::model::{
     FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
-    FinalmaskRealmTls, FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform,
-    FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXmc,
-    FinalmaskXmcProfile, Int32Range, TlsCert,
+    FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku, FinalmaskTcpItem,
+    FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem,
+    FinalmaskUdpMask, FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -1185,6 +1185,36 @@ pub(super) fn finalmask_udp_settings_editor(
                 &mut settings.stun_servers,
                 "stun.example.com:3478",
             );
+            changed |= widgets::combo_str_labeled(
+                ui,
+                "ipMode",
+                &mut settings.ip_mode,
+                &["dual", "v4", "v6"],
+                t(lang, Key::SrvDefault),
+                true,
+            );
+            ui.weak(t(lang, Key::SrvRealmIpModeNote));
+            let mut has_mapping = settings.port_mapping.is_some();
+            if ui.checkbox(&mut has_mapping, "portMapping").changed() {
+                settings.port_mapping = has_mapping.then(FinalmaskRealmPortMapping::default);
+                changed = true;
+            }
+            if let Some(mapping) = settings.port_mapping.as_mut() {
+                changed |= ui.checkbox(&mut mapping.enabled, "enabled").changed();
+                changed |= widgets::opt_num(
+                    ui,
+                    t(lang, Key::SrvTimeoutS),
+                    &mut mapping.timeout,
+                    0..=i64::MAX,
+                );
+                changed |= widgets::opt_num(
+                    ui,
+                    t(lang, Key::SrvLifetimeS),
+                    &mut mapping.lifetime,
+                    0..=i64::MAX,
+                );
+                ui.weak(t(lang, Key::SrvRealmPortMappingNote));
+            }
             let mut has_tls = settings.tls_config.is_some();
             if ui.checkbox(&mut has_tls, "tlsConfig").changed() {
                 settings.tls_config = has_tls.then(FinalmaskRealmTls::default);
@@ -1241,6 +1271,12 @@ pub(super) fn finalmask_quic_editor(
     );
     changed |= widgets::text_field(ui, "brutalUp", &mut quic.brutal_up, "50 mbps");
     changed |= widgets::text_field(ui, "brutalDown", &mut quic.brutal_down, "100 mbps");
+    changed |= widgets::opt_bool(
+        ui,
+        "brutalDisableLossCompensation",
+        &mut quic.brutal_disable_loss_compensation,
+        t(lang, Key::SrvUnset),
+    );
     changed |= widgets::opt_num(
         ui,
         "initStreamReceiveWindow",
@@ -1283,11 +1319,29 @@ pub(super) fn finalmask_quic_editor(
         &mut quic.disable_path_mtu_discovery,
         t(lang, Key::SrvUnset),
     );
+    changed |= widgets::opt_bool(
+        ui,
+        "disableChromeParrot",
+        &mut quic.disable_chrome_parrot,
+        t(lang, Key::SrvUnset),
+    );
+    changed |= widgets::opt_bool(
+        ui,
+        "disableGSO",
+        &mut quic.disable_gso,
+        t(lang, Key::SrvUnset),
+    );
     changed |= widgets::opt_num(
         ui,
         "maxIncomingStreams",
         &mut quic.max_incoming_streams,
         0..=i64::MAX,
+    );
+    changed |= widgets::opt_bool(
+        ui,
+        "disableStatelessReset",
+        &mut quic.disable_stateless_reset,
+        t(lang, Key::SrvUnset),
     );
     changed
 }

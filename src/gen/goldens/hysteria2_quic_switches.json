@@ -20,6 +20,13 @@
       },
       {
         "address": "8.8.8.8"
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:hy2.example.com"
+        ],
+        "skipFallback": true
       }
     ]
   },
@@ -64,80 +71,37 @@
   },
   "outbounds": [
     {
-      "protocol": "wireguard",
+      "protocol": "hysteria",
       "settings": {
-        "address": [
-          "10.0.0.1/32"
-        ],
-        "domainStrategy": "forceip",
-        "mtu": 1420,
-        "peers": [
-          {
-            "allowedIPs": [
-              "0.0.0.0/0",
-              "::/0"
-            ],
-            "endpoint": "203.0.113.10:51820",
-            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+        "address": "hy2.example.com",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "finalmask": {
+          "quicParams": {
+            "brutalDisableLossCompensation": true,
+            "brutalDown": "200 mbps",
+            "brutalUp": "50 mbps",
+            "congestion": "brutal",
+            "disableChromeParrot": true,
+            "disableGSO": true,
+            "disableStatelessReset": true
           }
-        ],
-        "remoteDNS": [
-          "1.1.1.1",
-          "2606:4700:4700::1111"
-        ],
-        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
+        },
+        "hysteriaSettings": {
+          "auth": "hy2password",
+          "udpIdleTimeout": 60,
+          "version": 2
+        },
+        "network": "hysteria",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {}
       },
       "tag": "srv-01234567"
-    },
-    {
-      "protocol": "wireguard",
-      "settings": {
-        "address": [
-          "10.0.0.2/32"
-        ],
-        "domainStrategy": "forceip",
-        "mtu": 1420,
-        "peers": [
-          {
-            "allowedIPs": [
-              "0.0.0.0/0",
-              "::/0"
-            ],
-            "endpoint": "203.0.113.11:51820",
-            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
-          }
-        ],
-        "remoteDNS": [
-          "local"
-        ],
-        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
-      },
-      "tag": "srv-fedcba98"
-    },
-    {
-      "protocol": "wireguard",
-      "settings": {
-        "address": [
-          "10.0.0.3/32"
-        ],
-        "domainStrategy": "forceip",
-        "mtu": 1420,
-        "peers": [
-          {
-            "allowedIPs": [
-              "0.0.0.0/0",
-              "::/0"
-            ],
-            "endpoint": "203.0.113.12:51820",
-            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
-          }
-        ],
-        "remoteDNS": [
-          "fe80::1%eth0"
-        ],
-        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
-      },
-      "tag": "srv-00112233"
     },
     {
       "protocol": "freedom",

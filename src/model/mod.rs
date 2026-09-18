@@ -43,13 +43,13 @@ pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, Settings};
 pub use stream::{
     CustomSockopt, FinalmaskFragment, FinalmaskHeaderCustomTcp, FinalmaskHeaderCustomUdp,
     FinalmaskMkcpLegacy, FinalmaskModel, FinalmaskNoise, FinalmaskNoiseItem, FinalmaskPortList,
-    FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskRealmTls, FinalmaskSalamander,
-    FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg,
-    FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXicmp,
-    FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings, HappyEyeballs, HttpCamouflageRequest,
-    HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport, KcpSettings, Network,
-    RawHeader, RawSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-    WsSettings, XhttpSettings, XmuxConfig,
+    FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskRealmPortMapping,
+    FinalmaskRealmTls, FinalmaskSalamander, FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask,
+    FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask,
+    FinalmaskXdns, FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings, HappyEyeballs,
+    HttpCamouflageRequest, HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport,
+    KcpSettings, Network, RawHeader, RawSettings, RealityModel, Security, SockoptModel,
+    StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings, XmuxConfig,
 };
 pub use validation::{ValidationCode, ValidationIssue};
 

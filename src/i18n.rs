@@ -1013,6 +1013,8 @@ keys! {
     SrvUdpN,
     SrvAddTcpMask,
     SrvAddUdpMask,
+    SrvTcpMaskOrderCaption,
+    SrvUdpMaskOrderCaption,
     SrvSockopt,
     SrvAddServerWindow,
     SrvProtocol,
@@ -1328,6 +1330,9 @@ keys! {
     FinalmaskUdpHopIntervalTooSmall,
     FinalmaskUdpHopIpInvalid,
     FinalmaskUdpHopDialerProxyConflict,
+    FinalmaskUdpMaskNotLast,
+    FinalmaskUdpMaskNotFirst,
+    FinalmaskUdpHopIntervalTransportConflict,
     FinalmaskQuicReceiveWindowTooSmall,
     FinalmaskQuicMaxIdleTimeoutInvalid,
     FinalmaskQuicKeepAlivePeriodInvalid,
@@ -2053,6 +2058,14 @@ keys! {
     GeodataOperationInspect,
     GeodataOperationRead,
     DashboardLatencyNoObservation,
+    SrvBlackholeCustomDataInvalid,
+    SrvRealmIpModeNote,
+    SrvRealmPortMappingNote,
+    SrvTimeoutS,
+    SrvLifetimeS,
+    SrvXForwarded,
+    SrvXForwardedNote,
+    SrvCustomResponseData,
 }
 
 /// Look up `key` in `language`'s locale table.
@@ -2140,6 +2153,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         TlsAllowInsecureRemoved => t(lang, Key::SrvAllowInsecureRemoved),
         ShadowsocksLevelRange => t(lang, Key::SrvShadowsocksLevelRangeShort),
         BlackholeResponseInvalid => t(lang, Key::SrvBlackholeResponseInvalidShort),
+        BlackholeCustomResponseDataInvalid => t(lang, Key::SrvBlackholeCustomDataInvalid),
         VisionRequiresTlsOrReality => t(lang, Key::OutboundVisionRequiresTls),
         PublicVlessRequiresTlsOrEncryption => t(lang, Key::OutboundPublicVlessNeedsTls),
         PublicTrojanRequiresTlsOrReality => t(lang, Key::OutboundPublicTrojanNeedsTls),
@@ -2215,6 +2229,11 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
         FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
         FinalmaskUdpHopDialerProxyConflict => t(lang, Key::FinalmaskUdpHopDialerProxyConflict),
+        FinalmaskUdpMaskNotLast(_) => t(lang, Key::FinalmaskUdpMaskNotLast),
+        FinalmaskUdpMaskNotFirst(_) => t(lang, Key::FinalmaskUdpMaskNotFirst),
+        FinalmaskUdpHopIntervalTransportConflict => {
+            t(lang, Key::FinalmaskUdpHopIntervalTransportConflict)
+        }
         FinalmaskQuicReceiveWindowTooSmall => t(lang, Key::FinalmaskQuicReceiveWindowTooSmall),
         FinalmaskQuicMaxIdleTimeoutInvalid => t(lang, Key::FinalmaskQuicMaxIdleTimeoutInvalid),
         FinalmaskQuicKeepAlivePeriodInvalid => t(lang, Key::FinalmaskQuicKeepAlivePeriodInvalid),
@@ -2323,6 +2342,8 @@ pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> Stri
         | ValidationCode::FinalmaskUnknownByteSyntax(arg)
         | ValidationCode::FinalmaskRealmUrlSyntax(arg)
         | ValidationCode::FinalmaskQuicBandwidthUnitInvalid(arg)
+        | ValidationCode::FinalmaskUdpMaskNotLast(arg)
+        | ValidationCode::FinalmaskUdpMaskNotFirst(arg)
         | ValidationCode::XhttpExtraShadowsSettings(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => {
             fill_placeholders(validation_message(&issue.code, lang), &[arg])
@@ -3621,7 +3642,9 @@ mod en {
             Key::SrvFragmentationInvalid => {
                 "fragmentation requires valid packets plus non-empty length and interval"
             }
-            Key::SrvBlackholeResponseInvalid => "Blackhole response type must be none or http.",
+            Key::SrvBlackholeResponseInvalid => {
+                "Blackhole response type must be none, http or custom."
+            }
             Key::SrvDnsRuleActionRequired => "A valid DNS rule action is required.",
             Key::SrvAddDnsRule => "+ DNS rule",
             Key::SrvSniffing => "sniffing",
@@ -3729,6 +3752,12 @@ mod en {
             Key::SrvUdpN => "UDP {}",
             Key::SrvAddTcpMask => "+ TCP mask",
             Key::SrvAddUdpMask => "+ UDP mask",
+            Key::SrvTcpMaskOrderCaption => {
+                "No TCP mask type has a fixed position. The core accepts any TCP mask order"
+            }
+            Key::SrvUdpMaskOrderCaption => {
+                "udphop, realm, and xicmp must be the last entries. sudoku must be the first entry"
+            }
             Key::SrvSockopt => "sockopt",
             Key::SrvAddServerWindow => "Add server",
             Key::SrvProtocol => "protocol",
@@ -3871,7 +3900,9 @@ mod en {
                 "every Freedom noise requires a valid type, packet, and applyTo"
             }
             Key::SrvFreedomFinalRuleInvalid => "every Freedom final rule requires allow or block",
-            Key::SrvBlackholeResponseInvalidShort => "Blackhole response type must be none or http",
+            Key::SrvBlackholeResponseInvalidShort => {
+                "Blackhole response type must be none, http or custom"
+            }
             Key::SrvDnsRuleActionInvalidShort => "every DNS outbound rule requires a valid action",
             Key::SrvLoopbackTagRequired => "Loopback inbound tag is required",
             Key::SrvHysteriaVersion => "Hysteria version must be 2",
@@ -4293,6 +4324,16 @@ mod en {
             Key::FinalmaskUdpHopDialerProxyConflict => {
                 "The udphop mask cannot run with sockopt.dialerProxy. Remove the mask or the \
                  chain"
+            }
+            Key::FinalmaskUdpMaskNotLast => {
+                "{} must be the last UDP mask entry. Move it to the end of the list"
+            }
+            Key::FinalmaskUdpMaskNotFirst => {
+                "{} must be the first UDP mask entry. Move it to the beginning of the list"
+            }
+            Key::FinalmaskUdpHopIntervalTransportConflict => {
+                "The udphop interval modes need a QUIC-based transport (hysteria2 or xhttp) or \
+                 WireGuard. Other transports work only with perConnRemote"
             }
             Key::FinalmaskQuicReceiveWindowTooSmall => {
                 "use 0 or a receive window of at least 16384 bytes"
@@ -5676,6 +5717,25 @@ mod en {
             Key::GeodataOperationInspect => "inspect",
             Key::GeodataOperationRead => "read",
             Key::DashboardLatencyNoObservation => "no observation data",
+            Key::SrvBlackholeCustomDataInvalid => {
+                "Blackhole custom response data must be standard base64 with the = padding."
+            }
+            Key::SrvCustomResponseData => "custom response data",
+            Key::SrvRealmIpModeNote => {
+                "The core resolves STUN and filters punch candidates with this family. An unset \
+                 value uses dual."
+            }
+            Key::SrvRealmPortMappingNote => {
+                "The core maps the realm UDP port on the local gateway. An unset timeout or \
+                 lifetime uses 10 seconds or 10 minutes."
+            }
+            Key::SrvTimeoutS => "timeout (s)",
+            Key::SrvLifetimeS => "lifetime (s)",
+            Key::SrvXForwarded => "set X-Forwarded-* headers",
+            Key::SrvXForwardedNote => {
+                "The core adds X-Forwarded-For, X-Forwarded-Host, and X-Forwarded-Proto to the \
+                 proxied request."
+            }
         }
     }
 }
@@ -5947,7 +6007,7 @@ mod tests {
                     .into_iter()
                     .map(|issue| issue.code)
                     .collect(),
-                vec!["Blackhole response type must be none or http"],
+                vec!["Blackhole response type must be none, http or custom"],
             ),
             (
                 validate_sockopt(&bad_sockopt, "stream.sockopt")
@@ -6130,6 +6190,7 @@ mod tests {
              transports cannot run interval hops"
         );
     }
+
     #[test]
     fn english_table_matches_hand_written_literals() {
         // Expected values written by hand, never computed from the table.

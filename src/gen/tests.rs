@@ -10,6 +10,7 @@ use crate::model::dns::{
 use crate::model::inbound::{
     DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
+use crate::model::stream::MasqueradeCfg;
 use crate::model::validation::ValidationCode;
 use crate::model::*;
 use serde_json::{Map, Value, json};
@@ -3392,14 +3393,284 @@ fn golden_wireguard_remote_dns() {
             outbound
         })
     };
+    let zoned = ServerProfile {
+        id: "0011223344556677".into(),
+        ..ServerProfile::new("dns-zone", {
+            let mut outbound = OutboundModel::new(Protocol::Wireguard);
+            outbound.settings = ProtocolSettings::Wireguard(WireguardSettings {
+                secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
+                address: vec!["10.0.0.3/32".into()],
+                peers: vec![WireguardPeer {
+                    public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
+                    endpoint: "203.0.113.12:51820".into(),
+                    allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                    ..Default::default()
+                }],
+                // Go's netip keeps the zone on the IPv6 form, so the core
+                // accepts this entry; the emitted document must carry it
+                // verbatim.
+                remote_dns: vec!["fe80::1%eth0".into()],
+                ..Default::default()
+            });
+            outbound
+        })
+    };
     let servers = ServersFile {
         version: 1,
         active: Some(explicit.id.clone()),
-        profiles: vec![explicit, sentinel],
+        profiles: vec![explicit, sentinel, zoned],
         extra: Map::new(),
     };
     golden!(
         "goldens/wireguard_remote_dns.json",
         generate_deterministic(&servers, &base_settings())
     );
+}
+
+/// The four QUIC switches reach the wire under their upstream spellings:
+/// `infra/conf/transport_finalmask.go:993-1011` reads
+/// `brutalDisableLossCompensation`, `disableChromeParrot`, `disableGSO`
+/// (acronym casing), and `disableStatelessReset`. The unset shape is
+/// `goldens/hysteria2.json`, which must stay byte-identical.
+#[test]
+fn golden_hysteria2_quic_switches() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "hy2.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "hy2password".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        quic_params: Some(FinalmaskQuicParams {
+            congestion: "brutal".into(),
+            brutal_up: "50 mbps".into(),
+            brutal_down: "200 mbps".into(),
+            brutal_disable_loss_compensation: Some(true),
+            disable_chrome_parrot: Some(true),
+            disable_gso: Some(true),
+            disable_stateless_reset: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_quic_switches.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// The blackhole response's `custom` type reaches the wire as
+/// `settings.response.customResponseData`, the base64 payload Xray decodes
+/// with `base64.StdEncoding` before writing it back
+/// (infra/conf/blackhole.go:21-42). The `http` profile in the same config
+/// pins the untouched shapes: a type that ignores the payload never grows
+/// the key, and the built-in `block` outbound still emits no settings.
+#[test]
+fn golden_blackhole_custom_response() {
+    let custom = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("custom-response", {
+            let mut outbound = OutboundModel::new(Protocol::Blackhole);
+            outbound.settings = ProtocolSettings::Blackhole(BlackholeSettings {
+                response: Some(BlackholeResponse {
+                    r#type: "custom".into(),
+                    custom_response_data: "PGh0bWw+YmxvY2tlZDwvaHRtbD4=".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            outbound
+        })
+    };
+    let http = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("http-response", {
+            let mut outbound = OutboundModel::new(Protocol::Blackhole);
+            outbound.settings = ProtocolSettings::Blackhole(BlackholeSettings {
+                response: Some(BlackholeResponse {
+                    r#type: "http".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            outbound
+        })
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(custom.id.clone()),
+        profiles: vec![custom, http],
+        extra: Map::new(),
+    };
+    golden!(
+        "goldens/blackhole_custom_response.json",
+        generate_deterministic(&servers, &base_settings())
+    );
+}
+
+#[test]
+fn golden_hysteria2_realm_masquerade() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "realm.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "realmpassword".into(),
+        udp_idle_timeout: Some(60),
+        masquerade: Some(MasqueradeCfg {
+            r#type: "proxy".into(),
+            url: "https://masq.example.com".into(),
+            rewrite_host: true,
+            x_forwarded: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Realm {
+            settings: Box::new(FinalmaskRealm {
+                url: "realm://token@realm.example/id".into(),
+                stun_servers: vec!["stun.example.com:3478".into()],
+                ip_mode: "v4".into(),
+                port_mapping: Some(FinalmaskRealmPortMapping {
+                    enabled: true,
+                    timeout: Some(15),
+                    lifetime: Some(300),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_realm_masquerade.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// The UDP mask list order is load-bearing: while the manager wraps, it
+/// pins `sudoku` to the first list entry and `udphop`/`realm`/`xicmp` to
+/// the last. This chain puts both pinned ends where the wrap demands them
+/// and proves the emitted list keeps the model order through the pinned
+/// core's `run -test`.
+#[test]
+fn golden_hysteria2_ordered_mask_chain() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "chain.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "chainpassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![
+            FinalmaskUdpMask::Sudoku {
+                settings: FinalmaskSudoku {
+                    password: "sudoku-password".into(),
+                    ascii: "prefer_ascii".into(),
+                    padding_min: 1,
+                    padding_max: 64,
+                    ..Default::default()
+                },
+                extra: Map::new(),
+            },
+            FinalmaskUdpMask::Udphop {
+                settings: Box::new(FinalmaskUdpHop {
+                    mode: "intervalLocal,intervalRemote".into(),
+                    interval: Int32Range::new(5, 10),
+                    remote_ports: FinalmaskPortList::Text("443,10000-10010".into()),
+                    remote_ips: vec!["203.0.113.10".into()],
+                    ..Default::default()
+                }),
+                extra: Map::new(),
+            },
+        ],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_ordered_mask_chain.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// The interval-hop advisory never refuses generation: a `udphop` interval
+/// mode over a transport that cannot migrate connections is xray-legal, so
+/// only the configuration warning fires and the configuration still
+/// generates. The compatible-transport shape stays warning-free and
+/// generates too.
+#[test]
+fn interval_hop_advisory_never_gates_generation() {
+    let hop = |settings: serde_json::Value| FinalmaskModel {
+        udp: vec![
+            serde_json::from_value(json!({
+                "type": "udphop",
+                "settings": settings,
+            }))
+            .expect("the udphop envelope loads"),
+        ],
+        ..Default::default()
+    };
+    let vless_over_tls = || {
+        let mut ob = OutboundModel::new(Protocol::Vless);
+        ob.settings = ProtocolSettings::Vless(VlessSettings {
+            address: "vless.example.com".into(),
+            port: 443,
+            id: "11111111-2222-3333-4444-555555555555".into(),
+            encryption: "none".into(),
+            ..Default::default()
+        });
+        let _ = ob.stream.select_security(Security::Tls);
+        ob
+    };
+
+    // A raw transport cannot migrate connections: the advisory fires and
+    // generation proceeds.
+    let mut ob = vless_over_tls();
+    ob.stream.finalmask = Some(hop(
+        json!({"mode": "intervalLocal,intervalRemote", "interval": "5-10"}),
+    ));
+    let servers = single_server(ob);
+    let issues = validate_profiles(&servers.profiles, servers.active.as_deref(), false);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopIntervalTransportConflict),
+        "{issues:#?}"
+    );
+    assert!(
+        invalid_model_error(issues).is_none(),
+        "a warning-only profile must generate"
+    );
+    generate_deterministic(&servers, &base_settings()).expect("a warning-only profile must apply");
+
+    // The same mask over a migrating transport carries no advisory at all.
+    let mut ob = vless_over_tls();
+    ob.stream.network = Network::Xhttp;
+    ob.stream.xhttp_settings = Some(XhttpSettings::default());
+    ob.stream.finalmask = Some(hop(json!({"mode": "intervalLocal", "interval": "5-10"})));
+    let servers = single_server(ob);
+    let issues = validate_profiles(&servers.profiles, servers.active.as_deref(), false);
+    assert!(
+        !issues
+            .iter()
+            .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopIntervalTransportConflict),
+        "{issues:#?}"
+    );
+    generate_deterministic(&servers, &base_settings()).expect("the xhttp shape must generate");
 }

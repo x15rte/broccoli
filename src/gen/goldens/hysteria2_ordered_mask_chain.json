@@ -1,0 +1,153 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1"
+      },
+      {
+        "address": "8.8.8.8"
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:chain.example.com"
+        ],
+        "skipFallback": true
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "hysteria",
+      "settings": {
+        "address": "chain.example.com",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "finalmask": {
+          "udp": [
+            {
+              "type": "sudoku",
+              "settings": {
+                "password": "sudoku-password",
+                "ascii": "prefer_ascii",
+                "paddingMin": 1,
+                "paddingMax": 64
+              }
+            },
+            {
+              "type": "udphop",
+              "settings": {
+                "mode": "intervalLocal,intervalRemote",
+                "interval": "5-10",
+                "remotePorts": "443,10000-10010",
+                "remoteIPs": [
+                  "203.0.113.10/32"
+                ]
+              }
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "auth": "chainpassword",
+          "udpIdleTimeout": 60,
+          "version": 2
+        },
+        "network": "hysteria",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {}
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      }
+    ]
+  },
+  "stats": {}
+}

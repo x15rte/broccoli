@@ -19,8 +19,8 @@ use super::inbound::{
     LocalInboundCfg, LocalInboundProtocol, Sniffing, TUN_INBOUND_TAG, listen_addresses_overlap,
 };
 use super::outbound::{
-    MuxModel, OutboundModel, ProtocolSettings, endpoint_requires_transport_security,
-    wireguard_remote_dns_supported,
+    MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
+    endpoint_requires_transport_security, wireguard_remote_dns_supported,
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
@@ -71,6 +71,12 @@ pub enum ValidationCode {
     // ---- protocol-level invariants (validate_outbound) ----
     ShadowsocksLevelRange,
     BlackholeResponseInvalid,
+    /// `settings.response.customResponseData` that Xray's conf load cannot
+    /// decode as standard base64 while `response.type` is `custom`
+    /// (infra/conf/blackhole.go:31-34 returns the decode error, so the whole
+    /// config fails to build). The payload is kept verbatim — the gate is the
+    /// user's fix-it prompt, not a rewrite.
+    BlackholeCustomResponseDataInvalid,
     // ---- protocol-settings vocabulary / required values (validate_outbound) ----
     /// VLESS `settings.flow` outside {``, `xtls-rprx-vision`,
     /// `xtls-rprx-vision-udp443`}: Xray's conf load rejects unknown flows
@@ -209,6 +215,33 @@ pub enum ValidationCode {
     /// starts and every dial fails, so this is a configuration warning,
     /// never a gate.
     FinalmaskUdpHopDialerProxyConflict,
+    /// A `udphop` / `realm` / `xicmp` UDP mask sits anywhere but the last
+    /// list entry: the UDP mask manager reverses the list at construction
+    /// and wraps forward, so the JSON list's last entry is wrapped first
+    /// (`transport/internet/finalmask/finalmask.go:21-25,28-31`), and those
+    /// wraps demand that first slot — level 0
+    /// (`.../udphop/config.go:11-13`, `.../realm/config.go:11-20`,
+    /// `.../xicmp/config.go:11-20`). The core starts and every dial fails,
+    /// so this gates. Carries the mask type name.
+    FinalmaskUdpMaskNotLast(String),
+    /// A `sudoku` UDP mask sits anywhere but the first list entry: its wrap
+    /// demands the last-wrapped slot — level `levelCount`
+    /// (`transport/internet/finalmask/sudoku/config.go:39-49`), which the
+    /// reversed-and-forward manager maps to the JSON list's first entry. The
+    /// core starts and every dial fails, so this gates. Carries the mask
+    /// type name.
+    FinalmaskUdpMaskNotFirst(String),
+    /// A `udphop` mask carries an interval mode on a transport whose
+    /// connection cannot move to the hopped socket: `intervalLocal` dials a
+    /// fresh local socket per hop and `intervalRemote` re-rolls the remote
+    /// address (`transport/internet/finalmask/udphop/conn.go:96-135`), which
+    /// only a connection that migrates survives — the QUIC-based hysteria2
+    /// and splithttp transports, or the WireGuard outbound, whose client
+    /// applies the same mask manager to its own packet conn
+    /// (`proxy/wireguard/client.go:309-310`). Every other transport works
+    /// only with `perConnRemote`. The core starts either way, so this is a
+    /// configuration warning, never a gate.
+    FinalmaskUdpHopIntervalTransportConflict,
     FinalmaskQuicReceiveWindowTooSmall,
     FinalmaskQuicMaxIdleTimeoutInvalid,
     FinalmaskQuicKeepAlivePeriodInvalid,
@@ -1283,15 +1316,22 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
         ));
     }
     if let ProtocolSettings::Blackhole(settings) = &o.settings
-        && settings
-            .response
-            .as_ref()
-            .is_some_and(|response| !matches!(response.r#type.as_str(), "none" | "http"))
+        && let Some(response) = settings.response.as_ref()
     {
-        issues.push(issue(
-            ValidationCode::BlackholeResponseInvalid,
-            Some("settings.response.type".into()),
-        ));
+        if !matches!(response.r#type.as_str(), "none" | "http" | "custom") {
+            issues.push(issue(
+                ValidationCode::BlackholeResponseInvalid,
+                Some("settings.response.type".into()),
+            ));
+        }
+        if response.r#type == "custom"
+            && !blackhole_custom_response_data_decodes(&response.custom_response_data)
+        {
+            issues.push(issue(
+                ValidationCode::BlackholeCustomResponseDataInvalid,
+                Some("settings.response.customResponseData".into()),
+            ));
+        }
     }
     if let ProtocolSettings::Hysteria(settings) = &o.settings
         && settings.version != 2
@@ -1636,6 +1676,22 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
             .any(|rule| !dns_out_action_supported(&rule.action))
     {
         issues.push(issue(ValidationCode::DnsRuleActionInvalid, None));
+    }
+
+    // Advisory: a `udphop` interval mode moves the outbound's socket, and
+    // only a connection that migrates survives the move. The QUIC-based
+    // transports migrate connections (hysteria2 — quic-go in
+    // `transport/internet/hysteria/dialer.go` — and the splithttp HTTP/3
+    // mode), and the WireGuard outbound applies the same mask manager to its
+    // own packet conn and follows endpoint changes
+    // (`proxy/wireguard/client.go:309-310`). Every other transport keeps one
+    // four-tuple, so only `perConnRemote` works there. The core starts
+    // either way, so this is a configuration warning, never a gate.
+    if finalmask_udp_hop_interval_mode(&o.stream) && !hop_transport_migrates_connections(o) {
+        issues.push(warning(
+            ValidationCode::FinalmaskUdpHopIntervalTransportConflict,
+            None,
+        ));
     }
 
     issues.extend(validate_stream(&o.stream));
@@ -2371,6 +2427,7 @@ pub fn validate_finalmask(fm: &FinalmaskModel) -> Vec<ValidationIssue> {
     for (index, mask) in fm.tcp.iter().enumerate() {
         finalmask_validate_tcp_mask(index, mask, &mut issues);
     }
+    finalmask_validate_udp_order(&fm.udp, &mut issues);
     for (index, mask) in fm.udp.iter().enumerate() {
         finalmask_validate_udp_mask(index, mask, &mut issues);
     }
@@ -2378,6 +2435,79 @@ pub fn validate_finalmask(fm: &FinalmaskModel) -> Vec<ValidationIssue> {
         finalmask_validate_quic_params("finalmask.quicParams", quic, &mut issues);
     }
     issues
+}
+
+/// Gate the UDP mask positions the wrap refuses. The manager reverses the
+/// list at construction and wraps forward
+/// (`transport/internet/finalmask/finalmask.go:21-25,28-31` at v26.9.9), so
+/// the JSON list's last entry wraps first and the first entry wraps last.
+/// `udphop`, `realm`, and `xicmp` demand the first-wrapped slot — level 0
+/// (`.../udphop/config.go:11-13`, `.../realm/config.go:11-20`,
+/// `.../xicmp/config.go:11-20`) — so they belong at the end of the list, and
+/// `sudoku` demands the last-wrapped slot — level `levelCount`
+/// (`.../sudoku/config.go:39-49`) — so it belongs at the start. A
+/// single-entry list fills both slots, and no TCP mask type is pinned. The
+/// core enforces this only while it wraps a connection, so the config build
+/// accepts a misordered chain and every dial fails; the app gates it instead.
+fn finalmask_validate_udp_order(masks: &[FinalmaskUdpMask], issues: &mut Vec<ValidationIssue>) {
+    let Some(last) = masks.len().checked_sub(1) else {
+        return;
+    };
+    for (index, mask) in masks.iter().enumerate() {
+        match mask {
+            FinalmaskUdpMask::Sudoku { .. } if index != 0 => issues.push(issue(
+                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
+                Some(format!("finalmask.udp[{index}]")),
+            )),
+            FinalmaskUdpMask::Realm { .. }
+            | FinalmaskUdpMask::Xicmp { .. }
+            | FinalmaskUdpMask::Udphop { .. }
+                if index != last =>
+            {
+                issues.push(issue(
+                    ValidationCode::FinalmaskUdpMaskNotLast(
+                        mask.known_type()
+                            .expect("the match arm only admits known mask types")
+                            .into(),
+                    ),
+                    Some(format!("finalmask.udp[{index}]")),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when a `udphop` UDP mask selects an interval mode (`intervalLocal`
+/// or `intervalRemote`, comma-combinable and case-insensitive, as the mask
+/// build parses it). Each interval hop moves or re-rolls the outbound's
+/// socket, unlike the per-connection `perConnRemote` roll.
+fn finalmask_udp_hop_interval_mode(stream: &StreamModel) -> bool {
+    stream.finalmask.as_ref().is_some_and(|finalmask| {
+        finalmask.udp.iter().any(|mask| {
+            let FinalmaskUdpMask::Udphop { settings, .. } = mask else {
+                return false;
+            };
+            settings.mode.split(',').any(|mode| {
+                matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "intervallocal" | "intervalremote"
+                )
+            })
+        })
+    })
+}
+
+/// True when the outbound's connection survives a hop to another socket:
+/// the QUIC-based transports migrate connections (hysteria2, and the
+/// splithttp HTTP/3 mode), and the WireGuard outbound reads the mask from
+/// its stream settings and wraps its own packet conn
+/// (`proxy/wireguard/client.go:309-310`). Every other transport keeps one
+/// four-tuple, so an interval hop breaks it and only `perConnRemote`
+/// applies.
+fn hop_transport_migrates_connections(outbound: &OutboundModel) -> bool {
+    matches!(&outbound.settings, ProtocolSettings::Wireguard(_))
+        || matches!(outbound.stream.network, Network::Hysteria | Network::Xhttp)
 }
 
 fn finalmask_valid_var_name(value: &str) -> bool {
@@ -2819,9 +2949,10 @@ fn finalmask_validate_quic_params(
     if quic.retired_udp_hop.is_some() {
         // The retired `quicParams.udpHop` key left this mark behind: the
         // core now ignores the key and the hop would die silently, so the
-        // profile gates until the user rebuilds it as a `udphop` UDP mask
-        // (ADR-0050 — nothing is migrated). Carries no path: the key is a
-        // settings-file fact, not a field of the generated document.
+        // profile gates until the user rebuilds it as a `udphop` UDP mask.
+        // Nothing is migrated — the raw value stays for the settings file.
+        // Carries no path: the key is a settings-file fact, not a field of
+        // the generated document.
         issues.push(issue(ValidationCode::FinalmaskQuicHopMoved, None));
     }
     for (name, value) in [
@@ -3123,12 +3254,13 @@ fn finalmask_validate_udphop(
     settings: &super::stream::FinalmaskUdpHop,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    // The build splits on ',' and refuses every component outside the three
-    // names, case-insensitively; an empty mode splits to one empty component
-    // and is refused too.
+    // The build splits on ',' and lowercases each component, then refuses
+    // every one outside the three names; it never trims, so leading or
+    // trailing space is a load error, and an empty mode splits to one empty
+    // component that is refused too.
     if settings.mode.split(',').any(|mode| {
         !matches!(
-            mode.trim().to_ascii_lowercase().as_str(),
+            mode.to_ascii_lowercase().as_str(),
             "intervallocal" | "intervalremote" | "perconnremote"
         )
     }) {
@@ -4119,7 +4251,7 @@ mod tests {
         for settings in [
             r#"{"mode":"perConnRemote","interval":"5-10"}"#,
             r#"{"mode":"intervalLocal,intervalRemote","interval":"5-5"}"#,
-            r#"{"mode":"INTERVALREMOTE, intervallocal","interval":"5-30"}"#,
+            r#"{"mode":"INTERVALREMOTE,INTERVALLOCAL","interval":"5-30"}"#,
             r#"{"mode":"perConnRemote","interval":"30-60"}"#,
         ] {
             assert!(
@@ -4129,7 +4261,17 @@ mod tests {
             );
         }
 
-        for mode in ["", "banana", "intervalLocal,banana", "perConnLocal"] {
+        // The core lowercases but never trims, so a space around a component
+        // is a load error, exactly like an unknown name.
+        for mode in [
+            "",
+            "banana",
+            "intervalLocal,banana",
+            "perConnLocal",
+            "intervalLocal, intervalRemote",
+            " intervalLocal",
+            "intervalLocal ",
+        ] {
             let found = codes_for(&format!(r#"{{"mode":"{mode}","interval":"5-10"}}"#));
             assert_eq!(
                 found,
@@ -4223,6 +4365,252 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
         );
+    }
+
+    /// The UDP mask manager reverses the list at construction and wraps
+    /// forward (`transport/internet/finalmask/finalmask.go:21-25,28-31` at
+    /// v26.9.9), so the wrap pins `udphop`/`realm`/`xicmp` to the last list
+    /// entry and `sudoku` to the first. A misplaced entry gates with its
+    /// path and the required end; the previously valid `[realm, sudoku]`
+    /// chain errors both ways and the editor's move operation repairs it.
+    /// Single-mask chains and unconstrained chains stay clean.
+    #[test]
+    fn udp_mask_order_gates_each_pinned_type_and_the_previous_chain_shape() {
+        let order_findings = |list: &str| -> Vec<ValidationIssue> {
+            let fm: FinalmaskModel = serde_json::from_str(&format!(r#"{{"udp":{list}}}"#))
+                .expect("fixture is valid finalmask JSON");
+            validate_finalmask(&fm)
+                .into_iter()
+                .filter(|issue| {
+                    matches!(
+                        issue.code,
+                        ValidationCode::FinalmaskUdpMaskNotLast(_)
+                            | ValidationCode::FinalmaskUdpMaskNotFirst(_)
+                    )
+                })
+                .collect()
+        };
+        let paths = |findings: &[ValidationIssue]| -> Vec<Option<String>> {
+            findings.iter().map(|issue| issue.path.clone()).collect()
+        };
+
+        const SALAMANDER: &str = r#"{"type":"salamander","settings":{"password":"pw"}}"#;
+        const HEADER: &str = r#"{"type":"header-custom","settings":{}}"#;
+        const SUDOKU: &str = r#"{"type":"sudoku","settings":{"password":"pw"}}"#;
+        const REALM: &str = r#"{"type":"realm","settings":{"url":"realm://token@203.0.113.10:443/id","stunServers":["stun.example.com:3478"]}}"#;
+        const XICMP: &str = r#"{"type":"xicmp","settings":{"ips":["192.0.2.1"]}}"#;
+        const UDPHOP: &str =
+            r#"{"type":"udphop","settings":{"mode":"perConnRemote","interval":"5-10"}}"#;
+
+        // Single-entry chains fill the pinned slot for every type.
+        for mask in [SALAMANDER, HEADER, SUDOKU, REALM, XICMP, UDPHOP] {
+            assert!(
+                order_findings(&format!("[{mask}]")).is_empty(),
+                "a single-entry chain is legal for {mask}"
+            );
+        }
+
+        // Both pinned ends at once: sudoku first, the last-slot type last.
+        for chain in [
+            format!("[{SUDOKU},{UDPHOP}]"),
+            format!("[{SUDOKU},{REALM}]"),
+            format!("[{SUDOKU},{XICMP}]"),
+            format!("[{SUDOKU},{SALAMANDER},{UDPHOP}]"),
+            format!("[{SUDOKU},{HEADER},{REALM}]"),
+        ] {
+            assert!(
+                order_findings(&chain).is_empty(),
+                "chain {chain} is correctly ordered"
+            );
+        }
+
+        // Unconstrained types wrap in any order.
+        for chain in [
+            format!("[{SALAMANDER},{HEADER}]"),
+            format!("[{HEADER},{SALAMANDER}]"),
+            format!("[{HEADER},{SALAMANDER},{HEADER}]"),
+        ] {
+            assert!(
+                order_findings(&chain).is_empty(),
+                "chain {chain} has no pinned type"
+            );
+        }
+
+        // The previously valid shape: realm was first, sudoku last. Both
+        // entries now sit at the wrong end.
+        let previous = order_findings(&format!("[{REALM},{SUDOKU}]"));
+        assert_eq!(
+            codes(&previous),
+            vec![
+                ValidationCode::FinalmaskUdpMaskNotLast("realm".into()),
+                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
+            ],
+            "{previous:#?}"
+        );
+        assert_eq!(
+            paths(&previous),
+            vec![
+                Some("finalmask.udp[0]".to_string()),
+                Some("finalmask.udp[1]".to_string())
+            ]
+        );
+        assert!(
+            previous
+                .iter()
+                .all(|issue| issue.severity == Severity::Error)
+        );
+
+        // Each last-pinned type misordered at each non-last position.
+        for (mask, name) in [(REALM, "realm"), (XICMP, "xicmp"), (UDPHOP, "udphop")] {
+            let chain = format!("[{mask},{SALAMANDER}]");
+            let found = order_findings(&chain);
+            assert_eq!(
+                codes(&found),
+                vec![ValidationCode::FinalmaskUdpMaskNotLast(name.into())],
+                "chain {chain}"
+            );
+            assert_eq!(paths(&found), vec![Some("finalmask.udp[0]".to_string())]);
+
+            let chain = format!("[{SALAMANDER},{mask},{HEADER}]");
+            let found = order_findings(&chain);
+            assert_eq!(
+                codes(&found),
+                vec![ValidationCode::FinalmaskUdpMaskNotLast(name.into())],
+                "chain {chain}"
+            );
+            assert_eq!(paths(&found), vec![Some("finalmask.udp[1]".to_string())]);
+        }
+
+        // The last-slot type directly before the end and sudoku anywhere but
+        // the start each report on their own entry.
+        let found = order_findings(&format!("[{SALAMANDER},{UDPHOP},{REALM}]"));
+        assert_eq!(
+            codes(&found),
+            vec![ValidationCode::FinalmaskUdpMaskNotLast("udphop".into())],
+            "{found:#?}"
+        );
+        let found = order_findings(&format!("[{SALAMANDER},{SUDOKU}]"));
+        assert_eq!(
+            codes(&found),
+            vec![ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into())],
+            "{found:#?}"
+        );
+        let found = order_findings(&format!("[{UDPHOP},{SUDOKU}]"));
+        assert_eq!(
+            codes(&found),
+            vec![
+                ValidationCode::FinalmaskUdpMaskNotLast("udphop".into()),
+                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
+            ],
+            "{found:#?}"
+        );
+
+        // The editor's move buttons swap neighbouring entries: the old
+        // shape becomes the new legal shape with one move.
+        let mut fm: FinalmaskModel =
+            serde_json::from_str(&format!(r#"{{"udp":[{REALM},{SUDOKU}]}}"#))
+                .expect("fixture is valid finalmask JSON");
+        assert!(!validate_finalmask(&fm).is_empty());
+        fm.udp.swap(0, 1);
+        assert!(
+            validate_finalmask(&fm).iter().all(|issue| !matches!(
+                issue.code,
+                ValidationCode::FinalmaskUdpMaskNotLast(_)
+                    | ValidationCode::FinalmaskUdpMaskNotFirst(_)
+            )),
+            "one move must repair the chain"
+        );
+    }
+
+    /// An interval hop mode moves the outbound's socket, so only a transport
+    /// whose connection migrates survives it: the QUIC-based hysteria2 and
+    /// xhttp transports, or the WireGuard outbound. Everything else is a
+    /// configuration warning (never a gate) and `perConnRemote` is always
+    /// fine.
+    #[test]
+    fn udphop_interval_modes_warn_only_on_transports_that_cannot_migrate() {
+        let interval_mask = |mode: &str| FinalmaskModel {
+            udp: vec![
+                serde_json::from_value(json!({
+                    "type": "udphop",
+                    "settings": {"mode": mode, "interval": "5-10"}
+                }))
+                .expect("the udphop envelope loads"),
+            ],
+            ..Default::default()
+        };
+
+        let advisory = |outbound: &OutboundModel| -> usize {
+            validate_outbound(outbound)
+                .iter()
+                .filter(|issue| {
+                    issue.code == ValidationCode::FinalmaskUdpHopIntervalTransportConflict
+                })
+                .count()
+        };
+
+        // Every interval spelling on a transport that keeps one four-tuple.
+        for mode in [
+            "intervalLocal",
+            "intervalRemote",
+            "intervalLocal,intervalRemote",
+            "INTERVALREMOTE, intervallocal",
+        ] {
+            let mut outbound = OutboundModel::new(Protocol::Vless);
+            outbound.stream.finalmask = Some(interval_mask(mode));
+            let issues = validate_outbound(&outbound);
+            let found: Vec<_> = issues
+                .iter()
+                .filter(|issue| {
+                    issue.code == ValidationCode::FinalmaskUdpHopIntervalTransportConflict
+                })
+                .collect();
+            assert_eq!(found.len(), 1, "mode {mode:?}: {issues:#?}");
+            assert_eq!(found[0].severity, Severity::Warning);
+            assert_eq!(found[0].path, None);
+        }
+
+        // A non-QUIC transport other than raw warns the same way.
+        for network in [Network::Ws, Network::Kcp, Network::Grpc] {
+            let mut outbound = OutboundModel::new(Protocol::Vless);
+            outbound.stream.network = network;
+            outbound.stream.finalmask = Some(interval_mask("intervalLocal"));
+            assert_eq!(advisory(&outbound), 1, "network {network:?}");
+        }
+
+        // The transports whose connections migrate never warn.
+        for network in [Network::Hysteria, Network::Xhttp] {
+            let mut outbound = OutboundModel::new(Protocol::Vless);
+            outbound.stream.network = network;
+            outbound.stream.finalmask = Some(interval_mask("intervalLocal"));
+            assert_eq!(advisory(&outbound), 0, "network {network:?}");
+        }
+        let mut wireguard = OutboundModel::new(Protocol::Wireguard);
+        wireguard.stream.finalmask = Some(interval_mask("intervalLocal,intervalRemote"));
+        assert_eq!(advisory(&wireguard), 0);
+
+        // `perConnRemote`, a mask-free stream, and an unparsable mode never
+        // raise the advisory.
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(interval_mask("perConnRemote"));
+        assert_eq!(advisory(&outbound), 0);
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(interval_mask("banana"));
+        assert_eq!(advisory(&outbound), 0);
+        assert_eq!(advisory(&OutboundModel::new(Protocol::Vless)), 0);
+
+        // A non-hop mask with an unrelated mode-shaped extra stays quiet.
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![
+                serde_json::from_value(json!({
+                    "type": "salamander", "settings": {"password": "pw", "mode": "intervalLocal"}
+                }))
+                .expect("the salamander envelope loads"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(advisory(&outbound), 0);
     }
 
     /// The realm TLS allow-list is the canonical fingerprint vocabulary
@@ -5035,6 +5423,56 @@ mod tests {
                 ..Default::default()
             });
         }
+        assert!(codes(&validate_outbound(&bh)).contains(&ValidationCode::BlackholeResponseInvalid));
+    }
+
+    #[test]
+    fn blackhole_custom_response_base64_gates_only_for_the_custom_type() {
+        fn set(bh: &mut OutboundModel, r#type: &str, data: &str) {
+            let ProtocolSettings::Blackhole(settings) = &mut bh.settings else {
+                unreachable!()
+            };
+            settings.response = Some(crate::model::outbound::BlackholeResponse {
+                r#type: r#type.into(),
+                custom_response_data: data.into(),
+                ..Default::default()
+            });
+        }
+
+        let mut bh = OutboundModel::new(Protocol::Blackhole);
+
+        set(&mut bh, "custom", "aGk=");
+        assert!(validate_outbound(&bh).is_empty());
+
+        // An absent payload is a valid empty response body, not a decode error.
+        set(&mut bh, "custom", "");
+        assert!(validate_outbound(&bh).is_empty());
+
+        set(&mut bh, "custom", "not base64!");
+        let issues = validate_outbound(&bh);
+        assert!(codes(&issues).contains(&ValidationCode::BlackholeCustomResponseDataInvalid));
+        let finding = issues
+            .iter()
+            .find(|issue| issue.code == ValidationCode::BlackholeCustomResponseDataInvalid)
+            .expect("custom payload finding");
+        assert_eq!(
+            finding.path.as_deref(),
+            Some("settings.response.customResponseData")
+        );
+        assert_eq!(
+            crate::i18n::validation_issue_message(finding, crate::model::settings::Language::En),
+            "settings.response.customResponseData: Blackhole custom response data must be \
+             standard base64 with the = padding."
+        );
+
+        // Xray only decodes the payload for the custom type (blackhole.go
+        // conf build), so a stray value under none/http must not gate.
+        set(&mut bh, "none", "not base64!");
+        assert!(validate_outbound(&bh).is_empty());
+        set(&mut bh, "http", "not base64!");
+        assert!(validate_outbound(&bh).is_empty());
+
+        set(&mut bh, "future", "");
         assert!(codes(&validate_outbound(&bh)).contains(&ValidationCode::BlackholeResponseInvalid));
     }
 
@@ -5858,10 +6296,15 @@ mod tests {
         ))
         .expect("fixture is valid finalmask JSON");
         let issues = validate_finalmask(&fm);
-        assert_eq!(issues.len(), 7, "{issues:#?}");
+        // The chain is deliberately misordered (`realm` sits before the last,
+        // `udphop`, entry), so the order gate reports `realm` between the TCP
+        // findings and the UDP per-mask findings; every entry still renders
+        // bounded.
+        assert_eq!(issues.len(), 8, "{issues:#?}");
 
         let payloads = [
             Some(&excerpted), // FinalmaskUnknownTcpMask
+            None,             // FinalmaskUdpMaskNotLast (the chain is misordered)
             Some(&excerpted), // FinalmaskUnknownUdpMask
             Some(&quoted),    // FinalmaskUnknownByteSyntax
             Some(&excerpted), // FinalmaskBytesValueRequired
@@ -5889,6 +6332,11 @@ mod tests {
                     | ValidationCode::FinalmaskPortListInvalid(payload),
                     Some(expected),
                 ) => assert_eq!(payload, expected, "{issue:?}"),
+                (
+                    ValidationCode::FinalmaskUdpMaskNotLast(name)
+                    | ValidationCode::FinalmaskUdpMaskNotFirst(name),
+                    None,
+                ) => assert_eq!(name, "realm", "{issue:?}"),
                 (ValidationCode::FinalmaskRealmUrlSyntax(payload), None) => assert!(
                     payload.len() < 256
                         && payload.chars().count() <= crate::links::MAX_ERROR_EXCERPT_CHARS + 1,

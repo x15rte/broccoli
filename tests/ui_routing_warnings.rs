@@ -332,3 +332,76 @@ fn route_test_dialog_hides_user_field_and_unix_network() {
         );
     }
 }
+
+/// Two balancers, both with a selector matching the built-in `direct` tag so
+/// only the tag field's verdict can render.
+fn settings_with_two_balancers(first: &str, second: &str) -> Settings {
+    Settings {
+        routing: RoutingCfg {
+            balancers: vec![
+                Balancer::new(first.into(), "direct".into()),
+                Balancer::new(second.into(), "direct".into()),
+            ],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// The balancer tag verdict reads every other row's committed tag, so it must
+/// follow the list: renaming the buffer to a sibling's tag reports the
+/// duplicate, and removing that sibling clears the verdict — although the
+/// buffer's text never changed after the rename.
+#[test]
+fn balancer_tag_duplicate_verdict_follows_the_other_rows() {
+    let duplicate = t(Language::En, Key::TagDuplicate);
+    let (_lock, _tmp, mut h) = boot_routing(&settings_with_two_balancers("bal-a", "bal-x"), None);
+
+    // Open the first balancer's editor: its buffer holds its own tag, so no
+    // duplicate verdict shows.
+    h.get_all_by_role_and_label(Role::Button, "▸")
+        .next()
+        .expect("the first balancer row's editor button")
+        .click();
+    h.run();
+    assert!(
+        h.query_by_label(duplicate).is_none(),
+        "a balancer's own tag must not report as a duplicate"
+    );
+
+    // Typing a sibling's tag reports the duplicate.
+    replace_text(&mut h, "bal-a", "bal-x");
+    assert!(
+        h.query_by_label(duplicate).is_some(),
+        "a tag another balancer already carries must report"
+    );
+
+    // Delete the sibling: the open editor's buffer still holds "bal-x", but
+    // no other balancer carries it any more, so the verdict must clear. The
+    // sibling's header tag locates its row; its delete button shares that
+    // line (the open editor also renders its selector list's row button).
+    let sibling_y = h
+        .query_by_label("bal-x")
+        .expect("the sibling balancer's row header")
+        .rect()
+        .center()
+        .y;
+    h.get_all_by_label("🗑")
+        .find(|node| (node.rect().center().y - sibling_y).abs() < 12.0)
+        .expect("the sibling row's delete button")
+        .click();
+    h.run_steps(2);
+    assert!(
+        h.get_all_by_role(Role::TextInput)
+            .any(|node| node.value().as_deref() == Some("bal-x")),
+        "the open editor's buffer must survive the sibling's removal"
+    );
+    assert!(
+        h.query_by_label("bal-x").is_none(),
+        "the sibling balancer row must be gone from the list"
+    );
+    assert!(
+        h.query_by_label(duplicate).is_none(),
+        "the duplicate verdict must clear with the row that carried the tag"
+    );
+}

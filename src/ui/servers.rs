@@ -15,7 +15,7 @@ use crate::links;
 use crate::metrics::{MetricsHandle, ResourceCounter, WorkCounter};
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
-    WireguardPeer, is_valid_wireguard_key,
+    WireguardPeer, blackhole_custom_response_data_decodes, is_valid_wireguard_key,
 };
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
@@ -1596,6 +1596,24 @@ fn retired_udp_hop_present(profile: &ServerProfile) -> bool {
         .as_ref()
         .and_then(|finalmask| finalmask.quic_params.as_ref())
         .is_some_and(|quic| quic.retired_udp_hop.is_some())
+}
+
+/// True when the profile's UDP mask list carries a `udphop` entry. The
+/// cheap repaint-path form of the hop state: [`udphop_masks`] serializes the
+/// entries for the mutation-time comparison, which is too much work for an
+/// idle frame of the finding row.
+fn profile_has_udphop_mask(profile: &ServerProfile) -> bool {
+    profile
+        .outbound
+        .stream
+        .finalmask
+        .as_ref()
+        .is_some_and(|finalmask| {
+            finalmask
+                .udp
+                .iter()
+                .any(|mask| matches!(mask, FinalmaskUdpMask::Udphop { .. }))
+        })
 }
 
 /// The `udphop` masks a profile carries, serialized the way the settings
@@ -3927,7 +3945,7 @@ impl ServersScreen {
             // finding row's own and never appears for any other rule.
             if retired_udp_hop_present(&draft.profile) {
                 ui.horizontal(|ui| {
-                    if udphop_masks(&draft.profile).is_empty() {
+                    if !profile_has_udphop_mask(&draft.profile) {
                         ui.weak(t(lang, Key::SrvRemoveUdpHopKeyNote));
                     }
                     if ui.button(t(lang, Key::SrvRemoveUdpHopKey)).clicked() {
@@ -4284,16 +4302,15 @@ impl ServersScreen {
                     &mut settings.address,
                     "10.0.0.2/32",
                 );
-                // The entry count feeds the sentinel verdict, so it is read
-                // before the list itself is borrowed mutably.
-                let dns_entry_count = settings.remote_dns.len();
+                // The widget hands each row the list length, so the sentinel
+                // verdict follows the list as rows come and go.
                 changed |= widgets::validated_string_list(
                     ui,
                     lang,
                     t(lang, Key::SrvWgRemoteDns),
                     &mut settings.remote_dns,
                     t(lang, Key::SrvWgRemoteDnsHint),
-                    |entry| v_wg_remote_dns_entry(lang, entry, dns_entry_count),
+                    |entry, list_len| v_wg_remote_dns_entry(lang, entry, list_len),
                 );
                 ui.small(t(lang, Key::SrvWgRemoteDnsNote));
                 let mut mtu = (settings.mtu != 0).then_some(settings.mtu);
@@ -4482,14 +4499,32 @@ impl ServersScreen {
                         ui,
                         t(lang, Key::SrvResponseType),
                         &mut response.r#type,
-                        &["none", "http"],
+                        &["none", "http", "custom"],
                         t(lang, Key::SrvDefault),
                         false,
                     );
-                    if !matches!(response.r#type.as_str(), "none" | "http") {
+                    if !matches!(response.r#type.as_str(), "none" | "http" | "custom") {
                         ui.colored_label(
                             status_colors_of(ui).err,
                             t(lang, Key::SrvBlackholeResponseInvalid),
+                        );
+                    }
+                    if response.r#type == "custom" {
+                        // The payload is a base64 string of arbitrary length;
+                        // the field's verdict is the core's own decode rule
+                        // (infra/conf/blackhole.go:31), so an invalid payload
+                        // reports inline before the finding sweep.
+                        changed |= widgets::validated_field(
+                            ui,
+                            t(lang, Key::SrvCustomResponseData),
+                            &mut response.custom_response_data,
+                            "base64 (standard alphabet, = padded)",
+                            |value| {
+                                if blackhole_custom_response_data_decodes(value) {
+                                    return None;
+                                }
+                                Some(t(lang, Key::SrvBlackholeCustomDataInvalid).to_string())
+                            },
                         );
                     }
                 }
@@ -5259,6 +5294,10 @@ impl ServersScreen {
                                 .checkbox(&mut m.rewrite_host, t(lang, Key::SrvRewriteHost))
                                 .changed();
                             changed |= ui
+                                .checkbox(&mut m.x_forwarded, t(lang, Key::SrvXForwarded))
+                                .changed();
+                            ui.weak(t(lang, Key::SrvXForwardedNote));
+                            changed |= ui
                                 .checkbox(&mut m.insecure, t(lang, Key::SrvSkipTlsVerify))
                                 .changed();
                         }
@@ -5996,6 +6035,7 @@ impl ServersScreen {
             let mut fm = o.stream.finalmask.take().unwrap_or_default();
 
             ui.heading(t(lang, Key::SrvTcpMasks));
+            ui.weak(t(lang, Key::SrvTcpMaskOrderCaption));
             let tcp_len = fm.tcp.len();
             let mut tcp_remove = None;
             let mut tcp_move = None;
@@ -6084,6 +6124,7 @@ impl ServersScreen {
 
             ui.separator();
             ui.heading(t(lang, Key::SrvUdpMasks));
+            ui.weak(t(lang, Key::SrvUdpMaskOrderCaption));
             let udp_len = fm.udp.len();
             let mut udp_remove = None;
             let mut udp_move = None;
@@ -7043,22 +7084,25 @@ mod tests {
     use super::{
         AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog,
         DraftTargetKind, EditorTab, EditorValidationCache, ExistingProfileDraft, FINGERPRINTS,
-        FeedbackLevel, JsonBuf, Language, LatencyBadge, LeaveAction, Request, RowProbeState,
-        STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen, SockoptUsage, StatusLine,
-        drag_scroll_delta, ech_sockopt_editor, editor_validation_errors, final_rules_editor,
-        fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        sockopt_validation_errors, status_colors_of, status_toast_expired,
+        FeedbackLevel, FieldKey, JsonBuf, Language, LatencyBadge, LeaveAction, RawField, Request,
+        RowProbeState, STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen, SockoptUsage,
+        StatusLine, drag_scroll_delta, ech_sockopt_editor, editor_validation_errors,
+        final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed, mux_tab,
+        noises_editor, reorder_target, server_list_row, sockopt_validation_errors,
+        status_colors_of, status_toast_expired,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_message};
     use crate::links;
     use crate::metrics::MetricsHandle;
+    use crate::model::stream::MasqueradeCfg;
     use crate::model::validation::ValidationCode;
     use crate::model::{
-        CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskQuicParams,
-        FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask, FreedomFinalRule, Network, Noise,
-        OutboundModel, Protocol, ProtocolSettings, RealityModel, Security, SockoptModel,
-        StreamModel, TlsModel, WsSettings, XhttpSettings,
+        BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
+        FinalmaskQuicParams, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask,
+        FreedomFinalRule, HysteriaTransport, Network, Noise, OutboundModel, Protocol,
+        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsModel, WsSettings,
+        XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -9835,6 +9879,102 @@ TLS ping finished"#;
     }
 
     #[test]
+    fn blackhole_custom_response_payload_field_and_inline_verdict_follow_the_type() {
+        fn blackhole_profile(r#type: &str, data: &str) -> ServerProfile {
+            let mut profile = ServerProfile::new("block", OutboundModel::new(Protocol::Blackhole));
+            let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.response = Some(BlackholeResponse {
+                r#type: r#type.into(),
+                custom_response_data: data.into(),
+                ..Default::default()
+            });
+            profile
+        }
+
+        for (kind, data, shows_invalid) in [
+            ("custom", "aGk=", false),
+            ("custom", "not base64!", true),
+            ("http", "not base64!", false),
+        ] {
+            let mut profile = blackhole_profile(kind, data);
+            let mut screen = ServersScreen::default();
+            let mut harness = Harness::new_ui(|ui| {
+                let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+            });
+            harness.run();
+            assert_eq!(
+                harness
+                    .query_by_label(t(Language::En, Key::SrvCustomResponseData))
+                    .is_some(),
+                kind == "custom",
+                "{kind}: the payload field belongs to the custom type only"
+            );
+            assert_eq!(
+                harness
+                    .query_by_label(t(Language::En, Key::SrvBlackholeCustomDataInvalid))
+                    .is_some(),
+                shows_invalid,
+                "{kind} with {data:?}: inline payload verdict"
+            );
+            drop(harness);
+        }
+    }
+
+    #[test]
+    fn blackhole_custom_response_base64_blocks_editor_commit_with_the_field_named() {
+        let mut profile = ServerProfile::new("block", OutboundModel::new(Protocol::Blackhole));
+        let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+            unreachable!()
+        };
+        // Unpadded base64: the padded standard alphabet is what Xray's
+        // `base64.StdEncoding` decodes (infra/conf/blackhole.go:31).
+        settings.response = Some(BlackholeResponse {
+            r#type: "custom".into(),
+            custom_response_data: "aGk".into(),
+            ..Default::default()
+        });
+        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("settings.response.customResponseData")),
+            "the blocking finding must name the payload field: {errors:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("customResponseData")),
+            "the payload rule gates, it never advises: {warnings:?}"
+        );
+
+        let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+            unreachable!()
+        };
+        settings.response = Some(BlackholeResponse {
+            r#type: "custom".into(),
+            custom_response_data: "aGk=".into(),
+            ..Default::default()
+        });
+        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // The payload is only decoded for the custom type, so a stray value
+        // under the other types must not block the commit.
+        let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+            unreachable!()
+        };
+        settings.response = Some(BlackholeResponse {
+            r#type: "http".into(),
+            custom_response_data: "not base64!".into(),
+            ..Default::default()
+        });
+        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn over_limit_xhttp_download_nesting_blocks_editor_commit() {
         let mut profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
         let mut current = &mut profile.outbound.stream;
@@ -9989,6 +10129,49 @@ TLS ping finished"#;
                 },
             );
         });
+    }
+
+    #[test]
+    fn mask_lists_render_their_order_captions() {
+        // Both mask lists carry an order caption. The UDP list names the
+        // types the wrap pins to the last entry and the type it pins to the
+        // first; the TCP list states that no type is pinned, because only the
+        // UDP masks check their level while they wrap
+        // (`transport/internet/finalmask/sudoku/config.go` and the other
+        // per-type checks are UDP-only).
+        let mut screen = ServersScreen::default();
+        let metrics = MetricsHandle::new();
+        let mut profile =
+            ServerProfile::new("caption-order", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel::default());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 2000.0))
+            .build_ui(|ui| {
+                let _ = ServersScreen::advanced_tab(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    AdvancedTabCtx {
+                        finalmask_errors: &[],
+                        stream_sockopt_errors: &[],
+                        finalmask_raw: &mut screen.finalmask_raw,
+                        pem_buffers: &mut screen.pem_buffers,
+                        metrics: &metrics,
+                    },
+                );
+            });
+        harness.run();
+        for key in [Key::SrvTcpMaskOrderCaption, Key::SrvUdpMaskOrderCaption] {
+            let caption = t(Language::En, key);
+            assert!(
+                harness.query_by_label(caption).is_some(),
+                "the mask lists must render {key:?}: {caption:?}"
+            );
+        }
+        let udp = t(Language::En, Key::SrvUdpMaskOrderCaption);
+        for name in ["udphop", "realm", "xicmp", "sudoku"] {
+            assert!(udp.contains(name), "{udp:?} must name {name}");
+        }
     }
 
     #[test]
@@ -11504,6 +11687,150 @@ TLS ping finished"#;
         );
     }
 
+    /// The combo control an `opt_bool` row renders: the switch label and its
+    /// combo sit in one horizontal row, and the combo carries no accessible
+    /// name of its own, so it is found as the single combo in the label's
+    /// row — the nearest ancestor whose subtree holds exactly one.
+    fn quic_switch_combo<'a>(
+        harness: &'a Harness<'static, (ServersScreen, UiTestRig)>,
+        label: &str,
+    ) -> egui_kittest::Node<'a> {
+        use egui_kittest::kittest::NodeT as _;
+        let label_node = harness
+            .root()
+            .children_recursive()
+            .find(|node| {
+                // egui text labels carry their text as the accesskit value,
+                // not as the node label.
+                let node = node.accesskit_node();
+                node.label().as_deref() == Some(label)
+                    || (node.role() == egui::accesskit::Role::Label
+                        && node.value().as_deref() == Some(label))
+            })
+            .unwrap_or_else(|| panic!("the {label} switch must render: {:?}", harness.root()));
+        let mut ancestor = label_node.parent();
+        while let Some(row) = ancestor {
+            let mut combos = row
+                .children_recursive()
+                .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::ComboBox);
+            if let Some(combo) = combos.next()
+                && combos.next().is_none()
+            {
+                return combo;
+            }
+            ancestor = row.parent();
+        }
+        panic!("no row pairs the {label} switch label with exactly one combo");
+    }
+
+    #[test]
+    fn quic_switch_rows_edit_and_round_trip_through_the_settings_file() {
+        // The four switches upstream added to `quicParams`
+        // (`infra/conf/transport_finalmask.go:993-1011`): each row is an
+        // "(unset)/true/false" control, an unset switch never reaches the
+        // generated configuration, and a set one survives a save/load cycle
+        // under its upstream key.
+        const SWITCH_KEYS: [&str; 4] = [
+            "brutalDisableLossCompensation",
+            "disableChromeParrot",
+            "disableGSO",
+            "disableStatelessReset",
+        ];
+        let mut profile = ServerProfile::new("Hy", OutboundModel::new(Protocol::Hysteria));
+        profile.outbound.settings = ProtocolSettings::Hysteria(crate::model::HysteriaSettings {
+            address: "hy.example.com".into(),
+            port: 443,
+            ..Default::default()
+        });
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            quic_params: Some(FinalmaskQuicParams::default()),
+            ..Default::default()
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id.clone());
+        let mut harness = wide_servers_harness(rig);
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+
+        // Untouched, none of the four keys is emitted.
+        let unset = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .outbound
+            .to_wire("srv-01234567");
+        let unset_quic = &unset["streamSettings"]["finalmask"]["quicParams"];
+        for key in SWITCH_KEYS {
+            assert!(
+                unset_quic.get(key).is_none(),
+                "an unset {key} must not reach the wire: {unset_quic}"
+            );
+        }
+
+        // Set all four through their editor rows.
+        for key in SWITCH_KEYS {
+            quic_switch_combo(&harness, key).scroll_to_me();
+            harness.run();
+            quic_switch_combo(&harness, key).click();
+            harness.run();
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, "true")
+                .click();
+            harness.run();
+        }
+        let edited = draft_quic_params(&harness);
+        assert_eq!(edited.brutal_disable_loss_compensation, Some(true));
+        assert_eq!(edited.disable_chrome_parrot, Some(true));
+        assert_eq!(edited.disable_gso, Some(true));
+        assert_eq!(edited.disable_stateless_reset, Some(true));
+
+        // The settings file keeps every set switch, and the reloaded profile
+        // still holds it.
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .clone();
+        let persisted = serde_json::to_value(&draft).expect("the draft serializes");
+        let persisted_quic = &persisted["outbound"]["streamSettings"]["finalmask"]["quicParams"];
+        for key in SWITCH_KEYS {
+            assert_eq!(
+                persisted_quic[key],
+                json!(true),
+                "{key} must survive the save: {persisted_quic}"
+            );
+        }
+        let reloaded: ServerProfile =
+            serde_json::from_value(persisted).expect("the saved profile loads");
+        let reloaded_quic = reloaded
+            .outbound
+            .stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| finalmask.quic_params.clone())
+            .expect("the reloaded profile keeps quicParams");
+        assert_eq!(reloaded_quic.brutal_disable_loss_compensation, Some(true));
+        assert_eq!(reloaded_quic.disable_chrome_parrot, Some(true));
+        assert_eq!(reloaded_quic.disable_gso, Some(true));
+        assert_eq!(reloaded_quic.disable_stateless_reset, Some(true));
+
+        // And the generated configuration (what the preview shows) carries
+        // them under the same keys.
+        let wire = draft.outbound.to_wire("srv-01234567");
+        let wire_quic = &wire["streamSettings"]["finalmask"]["quicParams"];
+        for key in SWITCH_KEYS {
+            assert_eq!(wire_quic[key], json!(true), "{wire_quic}");
+        }
+    }
+
     #[test]
     fn udphop_mask_editor_edits_the_combinable_mode_set_and_the_settings() {
         // The mode is one comma-separated set: the three checkboxes rewrite
@@ -12070,6 +12397,26 @@ TLS ping finished"#;
         assert_eq!(settings.remote_dns, vec!["8.8.8.8".to_owned()]);
     }
 
+    /// The in-network DNS list's own "+ Add" button: the one directly under
+    /// the list's rows (the local-address list above carries its own, and the
+    /// peer fields only render once a peer exists).
+    fn remote_dns_add_button<'a>(
+        harness: &'a Harness<'static, (ServersScreen, UiTestRig)>,
+        below_y: f32,
+    ) -> egui_kittest::Node<'a> {
+        harness
+            .get_all_by_label(t(Language::En, Key::AddRow))
+            .filter(|node| node.rect().center().y > below_y)
+            .min_by(|a, b| {
+                a.rect()
+                    .center()
+                    .y
+                    .partial_cmp(&b.rect().center().y)
+                    .expect("finite rects")
+            })
+            .expect("the in-network DNS list renders its + Add button under its rows")
+    }
+
     #[test]
     fn wireguard_remote_dns_sentinel_renders_alone_and_reports_a_mixed_list() {
         // The sentinel reads as the list's only entry. Alone it is valid and
@@ -12096,8 +12443,38 @@ TLS ping finished"#;
             "{:#?}",
             editor_errors(&harness)
         );
+
+        // Adding a row makes the sentinel invalid, although its own text
+        // never changed: the verdict must follow the list length, not sit
+        // frozen on the frame it was first computed.
+        remote_dns_row(&harness, "local").scroll_to_me();
+        harness.run();
+        let sentinel_y = remote_dns_row(&harness, "local").rect().center().y;
+        remote_dns_add_button(&harness, sentinel_y).click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
+                .is_some(),
+            "the sentinel row must gain its verdict when another row joins the list"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .is_some(),
+            "the empty new row must report its own verdict"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .any(|error| error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+            "{:#?}",
+            editor_errors(&harness)
+        );
         drop(harness);
 
+        // The seeded mixed list reports on the sentinel row, and removing the
+        // address row clears it.
         let mut harness = wide_servers_harness(wireguard_rig(&["local", "1.1.1.1"]));
         harness.run();
         remote_dns_row(&harness, "local").scroll_to_me();
@@ -12114,6 +12491,197 @@ TLS ping finished"#;
                 .any(|error| error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
             "{:#?}",
             editor_errors(&harness)
+        );
+
+        // Removing the address row leaves the sentinel alone in the list. The
+        // surviving row's text never changed, so its verdict must key on the
+        // list length too — a verdict frozen from the longer list would keep
+        // reporting here (and keep the profile gated) forever.
+        let row_y = remote_dns_row(&harness, "1.1.1.1").rect().center().y;
+        harness
+            .get_all_by_label(t(Language::En, Key::DeleteRow))
+            .find(|node| (node.rect().center().y - row_y).abs() < 8.0)
+            .expect("the address row renders its delete button")
+            .click();
+        harness.run_steps(2);
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
+            panic!("the draft stays a WireGuard profile");
+        };
+        assert_eq!(
+            settings.remote_dns,
+            vec!["local".to_owned()],
+            "the deleted row must leave the model"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
+                .is_none(),
+            "the surviving sentinel row's verdict must clear with the list"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .is_none(),
+            "no row may keep a verdict from the longer list"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("remoteDNS")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+    }
+
+    #[test]
+    fn realm_mask_editor_writes_ip_mode_and_port_mapping_through() {
+        fn realm(mask: &FinalmaskUdpMask) -> &FinalmaskRealm {
+            match mask {
+                FinalmaskUdpMask::Realm { settings, .. } => settings,
+                other => panic!("the harness renders a realm mask, got {other:?}"),
+            }
+        }
+
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Realm {
+            settings: Box::new(FinalmaskRealm {
+                url: "realm://token@realm.example/id".into(),
+                stun_servers: vec!["stun.example.com:3478".into()],
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let pem_buffers = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let pem_buffers_for_ui = Rc::clone(&pem_buffers);
+        let metrics = MetricsHandle::new();
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("realm-editor-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+                &mut pem_buffers_for_ui.borrow_mut(),
+                &metrics,
+            );
+        });
+        harness.run();
+
+        // An untouched frame emits neither key, so a profile that never set
+        // them keeps its exact wire shape.
+        assert_eq!(
+            serde_json::to_value(&*mask.borrow()).unwrap()["settings"],
+            json!({
+                "url": "realm://token@realm.example/id",
+                "stunServers": ["stun.example.com:3478"]
+            })
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvRealmIpModeNote))
+                .is_some(),
+            "the ipMode note must render"
+        );
+
+        // The combo shows the core default and offers the three wire values.
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some(t(Language::En, Key::SrvDefault)))
+            .expect("the ipMode combo shows the default")
+            .click();
+        harness.run();
+        harness.get_by_label("v4").click();
+        harness.run();
+        assert_eq!(realm(&mask.borrow()).ip_mode, "v4");
+
+        // `portMapping` materializes the object; `enabled` and the two
+        // seconds fields then write into it.
+        harness.get_by_label("portMapping").click();
+        harness.run();
+        assert!(
+            realm(&mask.borrow()).port_mapping.is_some(),
+            "the portMapping toggle must add the object"
+        );
+        harness.get_by_label("enabled").click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTimeoutS))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvLifetimeS))
+            .click();
+        harness.run();
+        let emitted = serde_json::to_value(&*mask.borrow()).unwrap();
+        assert_eq!(
+            emitted["settings"]["portMapping"],
+            json!({"enabled": true, "timeout": 0, "lifetime": 0}),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn hysteria_masquerade_editor_toggles_x_forwarded() {
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Hysteria,
+            hysteria_settings: Some(HysteriaTransport {
+                auth: "hy2password".into(),
+                masquerade: Some(MasqueradeCfg {
+                    r#type: "proxy".into(),
+                    url: "https://masq.example.com".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().transport_tab(
+                ui,
+                Language::En,
+                &mut stream_for_ui.borrow_mut(),
+                0,
+            );
+        });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvXForwardedNote))
+                .is_some(),
+            "the xForwarded switch must render its note"
+        );
+        // Unset emits nothing; the switch writes the camelCase key.
+        assert_eq!(
+            serde_json::to_value(stream.borrow().hysteria_settings.as_ref().unwrap()).unwrap()["masquerade"],
+            json!({"type": "proxy", "url": "https://masq.example.com"})
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvXForwarded))
+            .click();
+        harness.run();
+        let emitted =
+            serde_json::to_value(stream.borrow().hysteria_settings.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            emitted["masquerade"]["xForwarded"],
+            json!(true),
+            "{emitted}"
         );
     }
 }

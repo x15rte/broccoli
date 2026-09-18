@@ -11,17 +11,30 @@ use crate::model::Int32Range;
 use crate::model::settings::Language;
 use crate::ui::status::status_colors_of;
 
-/// One validated field's memoized verdict: the buffer text
-/// a verdict was computed from, plus the verdict itself. Validators are
-/// pure parses of the text, so an unchanged buffer (idle repaint frames)
-/// reuses the memoized verdict — validation runs only on the frame the text
-/// first appears or changed (typed, or rewritten by the model). Stored in
-/// egui temp data (never persisted) keyed by the TextEdit's own id, the
-/// `timeout_editor` buffer precedent.
+/// One validated field's memoized verdict: the buffer text and the revision
+/// value the validator saw beside it (see [`validated_field_with_revision`]),
+/// plus the verdict itself. Validators are pure functions of that pair, so an
+/// unchanged pair (idle repaint frames) reuses the memoized verdict —
+/// validation runs only on the frame the text first appears or changed
+/// (typed, or rewritten by the model) or the revision changed (a row added,
+/// another row's value committed). Stored in egui temp data (never persisted)
+/// keyed by the TextEdit's own id, the `timeout_editor` buffer precedent.
 #[derive(Clone)]
 struct ValidationMemo {
     value: String,
+    revision: u64,
     error: Option<String>,
+}
+
+/// Revision value for [`validated_field_with_revision`]: a fixed-seed hash of
+/// everything the validator reads beside the buffer text (the other rows'
+/// values, the row's index, a length). Equal inputs hash equal; any change in
+/// that state changes the revision, so the memoized verdict recomputes.
+pub fn context_revision(value: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Label + single-line text field with a hint. Grows to fill the row.
@@ -50,7 +63,24 @@ pub fn validated_field(
     hint: &str,
     validate: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    validated_field_impl(ui, label, value, hint, validate, None)
+    validated_field_impl(ui, label, value, hint, 0, validate, None)
+}
+
+/// Label + validated single-line text field whose verdict also reads state
+/// beside the buffer — the other rows of a table, a row's index, a length.
+/// `revision` must change whenever that state changes: pass
+/// [`context_revision`] of it. The memoized verdict recomputes when either
+/// the text or the revision changes, so a verdict can never outlive the state
+/// it was computed from. Rendering is identical to [`validated_field`].
+pub fn validated_field_with_revision(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    revision: u64,
+    validate: impl Fn(&str) -> Option<String>,
+) -> bool {
+    validated_field_impl(ui, label, value, hint, revision, validate, None)
 }
 
 /// Label + validated single-line text field with an additional amber warning
@@ -67,22 +97,24 @@ pub fn validated_field_with_warning(
     validate: impl Fn(&str) -> Option<String>,
     warning: Option<&str>,
 ) -> bool {
-    validated_field_impl(ui, label, value, hint, validate, warning)
+    validated_field_impl(ui, label, value, hint, 0, validate, warning)
 }
 
-/// The verdict cache behind [`validated_field`] and
-/// [`validated_string_list`]: the validator is a pure parse of the buffer
-/// (every call site's contract), so the verdict is memoized per widget id and
-/// recomputed only when the text no longer matches the memo — the frame the
-/// user typed, the field's first display, or an external rewrite of the
-/// buffer — never on idle repaint frames. Temp data (the `timeout_editor`
-/// buffer precedent) keys off the TextEdit's own id, so the memo follows egui
-/// focus semantics for free; a stale memo from a recycled widget slot
-/// self-heals through the value comparison.
+/// The verdict cache behind every validated field: the validator is a pure
+/// function of the field's text and its revision ([`context_revision`] of
+/// whatever else it reads, `0` for a text-only field, the list length for a
+/// list row) — every call site's contract — so the verdict is memoized per
+/// widget id and recomputed only when either input no longer matches the
+/// memo: the frame the user typed, the field's first display, an external
+/// rewrite of the buffer, or a change in the state the revision covers. Temp
+/// data (the `timeout_editor` buffer precedent) keys off the TextEdit's own
+/// id, so the memo follows egui focus semantics for free; a stale memo from a
+/// recycled widget slot self-heals through the input comparison.
 fn validation_verdict(
     ui: &mut egui::Ui,
     response: &egui::Response,
     value: &str,
+    revision: u64,
     validate: &impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     ui.data_mut(|data| {
@@ -92,10 +124,11 @@ fn validation_verdict(
             ))
             .and_then(|slot| slot.downcast_mut::<ValidationMemo>())
         {
-            Some(memo) if memo.value == *value => memo.error.clone(),
+            Some(memo) if memo.value == *value && memo.revision == revision => memo.error.clone(),
             Some(memo) => {
                 *memo = ValidationMemo {
                     value: value.to_owned(),
+                    revision,
                     error: validate(value),
                 };
                 memo.error.clone()
@@ -106,6 +139,7 @@ fn validation_verdict(
                     response.id,
                     ValidationMemo {
                         value: value.to_owned(),
+                        revision,
                         error: error.clone(),
                     },
                 );
@@ -154,13 +188,15 @@ fn paint_validation(
     }
 }
 
-/// Shared body of [`validated_field`] and [`validated_field_with_warning`]:
-/// renders the labeled field, then the error/warning lines.
+/// Shared body of [`validated_field`], [`validated_field_with_revision`], and
+/// [`validated_field_with_warning`]: renders the labeled field, then the
+/// error/warning lines.
 fn validated_field_impl(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut String,
     hint: &str,
+    revision: u64,
     validate: impl Fn(&str) -> Option<String>,
     warning: Option<&str>,
 ) -> bool {
@@ -172,7 +208,7 @@ fn validated_field_impl(
                     .hint_text(hint)
                     .desired_width(f32::INFINITY),
             );
-            let error = validation_verdict(ui, &r, value, &validate);
+            let error = validation_verdict(ui, &r, value, revision, &validate);
             let r = match error.as_deref().or(warning) {
                 Some(message) => r.on_hover_text(message),
                 None => r,
@@ -479,18 +515,27 @@ pub fn string_list(
 /// same list shape — a label above, a 🗑 pinning each row's right edge, and a
 /// "+ Add" button appending an empty entry. Only row edits count as
 /// "changed"; a verdict never does.
+///
+/// `validate` receives the row's text plus the list length, and the memo keys
+/// on the text and the length: a rule that reads the list (say, one entry is
+/// valid only as the sole entry) must not keep the verdict it computed for a
+/// longer list after a row is added or removed, even though the surviving
+/// row's text never changed.
 pub fn validated_string_list(
     ui: &mut egui::Ui,
     lang: Language,
     label: &str,
     items: &mut Vec<String>,
     hint: &str,
-    validate: impl Fn(&str) -> Option<String>,
+    validate: impl Fn(&str, usize) -> Option<String>,
 ) -> bool {
     let mut changed = false;
     if !label.is_empty() {
         ui.label(label);
     }
+    // Read before the rows borrow the list: this frame's length is both the
+    // verdict's context and the rows' memo revision.
+    let list_len = items.len();
     let mut remove = None;
     for (i, item) in items.iter_mut().enumerate() {
         let (row_changed, rect, error) = ui
@@ -504,7 +549,9 @@ pub fn validated_string_list(
                             .hint_text(hint)
                             .desired_width(f32::INFINITY),
                     );
-                    let error = validation_verdict(ui, &r, item, &validate);
+                    let error = validation_verdict(ui, &r, item, list_len as u64, &|text: &str| {
+                        validate(text, list_len)
+                    });
                     let r = match error.as_deref() {
                         Some(message) => r.on_hover_text(message),
                         None => r,
@@ -833,6 +880,59 @@ mod tests {
                 .next()
                 .is_some(),
             "the error message renders from the memoized verdict"
+        );
+    }
+
+    /// A verdict that reads state beside the buffer must not outlive that
+    /// state: the memo keys on the caller's revision too, so a rule whose
+    /// other input changes — while the buffer text stays put — recomputes in
+    /// both directions.
+    #[test]
+    fn validated_field_with_revision_follows_the_context_both_ways() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(360.0, 160.0))
+            .build_ui_state(
+                |ui, state: &mut (String, Vec<String>)| {
+                    let (value, others) = state;
+                    let revision = context_revision(&*others);
+                    let _ = validated_field_with_revision(
+                        ui,
+                        "tag",
+                        value,
+                        "",
+                        revision,
+                        |candidate| {
+                            others
+                                .iter()
+                                .any(|other| other == candidate)
+                                .then(|| "already used".to_owned())
+                        },
+                    );
+                },
+                ("mine".to_owned(), Vec::<String>::new()),
+            );
+
+        harness.run();
+        assert!(
+            harness.query_by_label("already used").is_none(),
+            "a value no other row holds must stay clean"
+        );
+
+        // Another row takes the same value: the verdict appears although the
+        // buffer text never changed.
+        harness.state_mut().1.push("mine".to_owned());
+        harness.run();
+        assert!(
+            harness.query_by_label("already used").is_some(),
+            "the verdict must follow the context that changed, not just the text"
+        );
+
+        // The other row is renamed away: the verdict clears the same way.
+        harness.state_mut().1.clear();
+        harness.run();
+        assert!(
+            harness.query_by_label("already used").is_none(),
+            "clearing the context must clear the verdict"
         );
     }
 }

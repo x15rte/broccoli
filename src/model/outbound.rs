@@ -277,8 +277,9 @@ pub struct WireguardSettings {
     /// In-network resolvers (`remoteDNS`, wireguard.go:69): an empty list
     /// keeps the core's built-in resolver list, and the single entry `local`
     /// uses the core's own DNS client instead
-    /// (proxy/wireguard/client.go:113-124). Every other entry must be an IP
-    /// literal there — the core builds the resolver set with
+    /// (proxy/wireguard/client.go:113-124). Every other entry must be an
+    /// address literal there — an IPv6 literal may carry a zone
+    /// (`fe80::1%eth0`) — and the core builds the resolver set with
     /// `netip.MustParseAddr`, which panics the process during outbound
     /// creation on anything else, so [`wireguard_remote_dns_supported`] is
     /// the validity predicate for this field.
@@ -305,16 +306,31 @@ impl Default for WireguardSettings {
 }
 
 /// True when one `remoteDNS` entry is acceptable in a list of `list_len`
-/// entries: an IP literal, or the exact `local` sentinel as the list's only
-/// entry. The comparison is case-sensitive and does not trim — the core reads
-/// the sentinel with `dns[0] == "local"` and parses every other entry
-/// verbatim (proxy/wireguard/client.go:117-124), so a near-miss spelling must
-/// be rejected rather than normalized.
+/// entries: an address literal the core's `netip.ParseAddr` accepts (an IPv6
+/// literal may carry a zone, e.g. `fe80::1%eth0`), or the exact `local`
+/// sentinel as the list's only entry. The sentinel comparison is
+/// case-sensitive and does not trim — the core reads it with
+/// `dns[0] == "local"` and parses every other entry verbatim
+/// (proxy/wireguard/client.go:117-124), so a near-miss spelling must be
+/// rejected rather than normalized.
 pub fn wireguard_remote_dns_entry_supported(entry: &str, list_len: usize) -> bool {
     if entry == "local" {
         return list_len == 1;
     }
-    entry.parse::<std::net::IpAddr>().is_ok()
+    parses_as_remote_dns_address(entry)
+}
+
+/// Parse one `remoteDNS` entry the way the core's `netip.ParseAddr` does. The
+/// Rust address parser has no zone concept, so a `%` splits the literal from
+/// its zone: the zone must be non-empty and the literal must be IPv6 (Go's
+/// netip keeps a zone only on the IPv6 form, and rejects `1.2.3.4%eth0` with
+/// "unexpected character"). Everything without a zone must parse as a plain
+/// IPv4/IPv6 literal.
+fn parses_as_remote_dns_address(entry: &str) -> bool {
+    match entry.split_once('%') {
+        Some((address, zone)) => !zone.is_empty() && address.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => entry.parse::<std::net::IpAddr>().is_ok(),
+    }
 }
 
 /// True when a whole `remoteDNS` list is one the pinned core can build: every
@@ -459,9 +475,15 @@ pub struct BlackholeSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BlackholeResponse {
-    /// none | http
+    /// none | http | custom
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub r#type: String,
+    /// Payload written back to the client for `type: "custom"`, as standard
+    /// base64 (Xray decodes it with `base64.StdEncoding` before serving it —
+    /// infra/conf/blackhole.go:30-35). Ignored by Xray for the other types;
+    /// empty means an empty response body.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub custom_response_data: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -470,9 +492,33 @@ impl Default for BlackholeResponse {
     fn default() -> Self {
         Self {
             r#type: "none".into(),
+            custom_response_data: String::new(),
             extra: Map::new(),
         }
     }
+}
+
+/// Whether Xray's `base64.StdEncoding.DecodeString` accepts this payload
+/// (the decode at infra/conf/blackhole.go:31): the standard alphabet with the
+/// canonical `=` padding, `\r`/`\n` ignored anywhere, and non-zero trailing
+/// bits tolerated because Go's decoder is not strict. The bundled engine's
+/// strict trailing-bit check is relaxed here so the two agree on every input.
+pub(crate) fn blackhole_custom_response_data_decodes(value: &str) -> bool {
+    use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
+
+    const GO_STANDARD: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
+
+    let stripped;
+    let encoded = if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        stripped = value.replace(['\r', '\n'], "");
+        stripped.as_str()
+    } else {
+        value
+    };
+    GO_STANDARD.decode(encoded).is_ok()
 }
 
 /// DNS outbound (dns_proxy.go:60-71). nonIPQuery/blockTypes deprecated → not modeled.
@@ -1021,7 +1067,8 @@ impl<'de> Deserialize<'de> for OutboundModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutboundModel, Protocol, ProtocolSettings, WireguardPeer, WireguardSettings,
+        BlackholeSettings, OutboundModel, Protocol, ProtocolSettings, WireguardPeer,
+        WireguardSettings, blackhole_custom_response_data_decodes,
         endpoint_requires_transport_security, is_valid_wireguard_key,
     };
     use crate::model::settings::Language;
@@ -1071,6 +1118,61 @@ mod tests {
         ] {
             assert!(!is_valid_wireguard_key(&value), "{value}");
         }
+    }
+
+    #[test]
+    fn blackhole_custom_response_data_matches_the_cores_base64_decoder() {
+        // Every accepted form below passed `xray run -test` on the pinned
+        // v26.9.9 binary; every rejected form made it exit before loading.
+        for value in [
+            "", "aGk=", "a+R/", "AAA=", "aR==", "aG\nk=", "aG\r\nk=", "\r\n",
+        ] {
+            assert!(blackhole_custom_response_data_decodes(value), "{value:?}");
+        }
+        for value in [
+            "aGk",
+            "aGk==",
+            "a-R_",
+            "=",
+            "AA",
+            "AAAAA",
+            "aGk= ",
+            "aG k=",
+            "AA=A",
+            "aGk=\r\n=",
+        ] {
+            assert!(!blackhole_custom_response_data_decodes(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn blackhole_custom_response_round_trips_and_stays_absent_when_unset() {
+        let custom: BlackholeSettings = serde_json::from_value(json!({
+            "response": {"type": "custom", "customResponseData": "aGk="}
+        }))
+        .expect("custom response profile");
+        let response = custom.response.as_ref().expect("response");
+        assert_eq!(response.r#type, "custom");
+        assert_eq!(response.custom_response_data, "aGk=");
+        assert_eq!(
+            serde_json::to_value(&custom).unwrap(),
+            json!({"response": {"type": "custom", "customResponseData": "aGk="}})
+        );
+
+        // The two pre-existing types emit exactly what they did before the
+        // payload field existed, and an unset payload never appears.
+        let http: BlackholeSettings =
+            serde_json::from_value(json!({"response": {"type": "http"}})).expect("http profile");
+        assert_eq!(
+            serde_json::to_value(&http).unwrap(),
+            json!({"response": {"type": "http"}})
+        );
+        let none: BlackholeSettings =
+            serde_json::from_value(json!({"response": {"type": "none"}})).expect("none profile");
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            json!({"response": {"type": "none"}})
+        );
     }
 
     #[test]
@@ -1679,6 +1781,11 @@ mod tests {
             Some(vec!["local".into()]),
             Some(vec!["1.1.1.1".into()]),
             Some(vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()]),
+            // Go's netip keeps an optional zone on the IPv6 form; the pinned
+            // core builds these (`run -test` exits 0) and the app must not
+            // gate them.
+            Some(vec!["fe80::1%eth0".into()]),
+            Some(vec!["2001:db8::1%eth0".into(), "1.1.1.1".into()]),
         ] {
             assert!(
                 !codes(buildable.clone()).contains(&ValidationCode::WireguardRemoteDnsInvalid),
@@ -1694,6 +1801,11 @@ mod tests {
             vec![" 1.1.1.1"],
             vec!["local", "1.1.1.1"],
             vec!["1.1.1.1", "local"],
+            // Zone shapes the core refuses: an empty zone, a zone on the IPv4
+            // form, and a zone without an address.
+            vec!["fe80::1%"],
+            vec!["1.2.3.4%eth0"],
+            vec!["%eth0"],
         ] {
             let entries = Some(
                 unbuildable

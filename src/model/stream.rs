@@ -406,6 +406,11 @@ pub struct MasqueradeCfg {
     pub url: String,
     #[serde(skip_serializing_if = "skip_false")]
     pub rewrite_host: bool,
+    /// `proxy` mode: add the `X-Forwarded-*` request headers. The core calls
+    /// `httputil.ProxyRequest.SetXForwarded` when the flag is set
+    /// (`transport/internet/hysteria/hub.go` at v26.9.9).
+    #[serde(skip_serializing_if = "skip_false")]
+    pub x_forwarded: bool,
     #[serde(skip_serializing_if = "skip_false")]
     pub insecure: bool,
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -1145,8 +1150,35 @@ pub struct FinalmaskRealm {
     pub url: String,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub stun_servers: Vec<String>,
+    /// `"dual"` | `"v4"` | `"v6"`; empty keeps the core's dual-stack
+    /// default. The core lowercases the value and falls back to dual for
+    /// anything else (`transport/internet/finalmask/realm/client.go`).
+    #[serde(rename = "ipMode", skip_serializing_if = "skip_empty_str")]
+    pub ip_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_mapping: Option<FinalmaskRealmPortMapping>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_config: Option<FinalmaskRealmTls>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `portMapping` of the Realm mask (`infra/conf/transport_finalmask.go`
+/// Realm struct at v26.9.9, proto `realm.PortMapping`). While `enabled` is
+/// true, the mask asks the local gateway over UPnP or NAT-PMP to map its
+/// UDP port. `timeout` and `lifetime` are seconds; the core substitutes its
+/// own defaults (10 and 600) when either is 0, and a negative value fails
+/// the mapping init, which the core logs before it runs without a mapping
+/// (`transport/internet/finalmask/realm/portmap.go`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FinalmaskRealmPortMapping {
+    #[serde(skip_serializing_if = "skip_false")]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<i64>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1237,6 +1269,11 @@ pub struct FinalmaskQuicParams {
     pub brutal_up: String,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub brutal_down: String,
+    /// `brutalDisableLossCompensation`: passed to the brutal congestion
+    /// controller (`transport/internet/hysteria/dialer.go:204`), false/absent
+    /// leaves compensation on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brutal_disable_loss_compensation: Option<bool>,
     /// The raw value of the retired `quicParams.udpHop` key the stored
     /// object carried, when it did (any JSON shape). The hop moved to the
     /// `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`) and the
@@ -1264,8 +1301,22 @@ pub struct FinalmaskQuicParams {
     pub keep_alive_period: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_path_mtu_discovery: Option<bool>,
+    /// `disableChromeParrot`: the dialer passes `!disable_chrome_parrot` as
+    /// `ChromeParrot` (`transport/internet/hysteria/dialer.go:90`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_chrome_parrot: Option<bool>,
+    /// `disableGSO`: quic-go's `Transport.DisableGSO`
+    /// (`transport/internet/hysteria/dialer.go:142`). The upstream key keeps
+    /// the acronym's casing, so it needs an explicit rename (camelCase would
+    /// spell it `disableGso`).
+    #[serde(rename = "disableGSO", skip_serializing_if = "Option::is_none")]
+    pub disable_gso: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_incoming_streams: Option<i64>,
+    /// `disableStatelessReset`: suppresses the QUIC stateless-reset key
+    /// (`transport/internet/hysteria/hub.go:334`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_stateless_reset: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1282,6 +1333,7 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
             bbr_profile: String,
             brutal_up: String,
             brutal_down: String,
+            brutal_disable_loss_compensation: Option<bool>,
             init_stream_receive_window: Option<u64>,
             max_stream_receive_window: Option<u64>,
             init_connection_receive_window: Option<u64>,
@@ -1289,7 +1341,11 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
             max_idle_timeout: Option<i64>,
             keep_alive_period: Option<i64>,
             disable_path_mtu_discovery: Option<bool>,
+            disable_chrome_parrot: Option<bool>,
+            #[serde(rename = "disableGSO")]
+            disable_gso: Option<bool>,
             max_incoming_streams: Option<i64>,
+            disable_stateless_reset: Option<bool>,
             #[serde(flatten)]
             extra: Map<String, Value>,
         }
@@ -1327,6 +1383,7 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
             bbr_profile: object.bbr_profile,
             brutal_up: object.brutal_up,
             brutal_down: object.brutal_down,
+            brutal_disable_loss_compensation: object.brutal_disable_loss_compensation,
             retired_udp_hop,
             init_stream_receive_window: object.init_stream_receive_window,
             max_stream_receive_window: object.max_stream_receive_window,
@@ -1335,7 +1392,10 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
             max_idle_timeout: object.max_idle_timeout,
             keep_alive_period: object.keep_alive_period,
             disable_path_mtu_discovery: object.disable_path_mtu_discovery,
+            disable_chrome_parrot: object.disable_chrome_parrot,
+            disable_gso: object.disable_gso,
             max_incoming_streams: object.max_incoming_streams,
+            disable_stateless_reset: object.disable_stateless_reset,
             extra,
         })
     }
@@ -1993,8 +2053,8 @@ impl StreamModel {
 mod tests {
     use super::{
         CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs,
-        MAX_XHTTP_DOWNLOAD_DEPTH, RawSettings, Security, SockoptModel, StreamModel, TlsCert,
-        TlsModel, WsSettings, XhttpSettings,
+        HysteriaTransport, MAX_XHTTP_DOWNLOAD_DEPTH, RawSettings, Security, SockoptModel,
+        StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -2173,6 +2233,7 @@ mod tests {
                 }}
             ],
             "udp": [
+                {"type": "sudoku", "settings": {"password": "pw"}},
                 {"type": "header-custom", "settings": {
                     "mode": "prefix",
                     "client": [{"rand": 8, "randRange": "1-254", "capture": "saved"}],
@@ -2184,19 +2245,8 @@ mod tests {
                     "noise": [{"rand": "4-8", "randRange": "0-255", "delay": "1-3"}]
                 }},
                 {"type": "salamander", "settings": {"password": "pw", "packetSize": "1200-1400"}},
-                {"type": "sudoku", "settings": {"password": "pw"}},
                 {"type": "xdns", "settings": {
                     "domains": ["dns.example"], "resolvers": ["dns.example+udp://1.1.1.1:53"]
-                }},
-                {"type": "xicmp", "settings": {"dgram": true, "ips": ["198.51.100.1"]}},
-                {"type": "realm", "settings": {
-                    "url": "realm://token@realm.example/id",
-                    "stunServers": ["stun.example:3478"],
-                    "tlsConfig": {
-                        "serverName": "realm.example",
-                        "echSockopt": {"domainStrategy": "UseIPv4"},
-                        "futureTls": "kept"
-                    }
                 }},
                 {"type": "udphop", "settings": {
                     "mode": "intervalLocal,intervalRemote",
@@ -2216,7 +2266,11 @@ mod tests {
                 "initConnectionReceiveWindow": 65536,
                 "maxConnectionReceiveWindow": 131072,
                 "maxIdleTimeout": 30, "keepAlivePeriod": 10,
-                "disablePathMTUDiscovery": false, "maxIncomingStreams": 8,
+                "disablePathMTUDiscovery": false,
+                "brutalDisableLossCompensation": true,
+                "disableChromeParrot": true, "disableGSO": true,
+                "disableStatelessReset": false,
+                "maxIncomingStreams": 8,
                 "futureQuic": {"kept": true}
             },
             "futureFinalmask": [1, 2, 3]
@@ -2225,7 +2279,72 @@ mod tests {
         assert_eq!(serde_json::to_value(&model).unwrap(), value);
         assert!(crate::model::validation::validate_finalmask(&model).is_empty());
         assert_eq!(model.tcp.len(), 4);
-        assert_eq!(model.udp.len(), 9);
+        assert_eq!(model.udp.len(), 7);
+
+        // `realm` and `xicmp` demand the same wrap slot as `udphop` — the
+        // last list entry — so their official envelopes round-trip in their
+        // own chains, each led by the `sudoku` mask that must wrap first.
+        for tail in [
+            json!({"udp": [
+                {"type": "sudoku", "settings": {"password": "pw"}},
+                {"type": "xicmp", "settings": {"dgram": true, "ips": ["198.51.100.1"]}},
+            ]}),
+            json!({"udp": [
+                {"type": "sudoku", "settings": {"password": "pw"}},
+                {"type": "realm", "settings": {
+                    "url": "realm://token@realm.example/id",
+                    "stunServers": ["stun.example:3478"],
+                    "tlsConfig": {
+                        "serverName": "realm.example",
+                        "echSockopt": {"domainStrategy": "UseIPv4"},
+                        "futureTls": "kept"
+                    }
+                }},
+            ]}),
+        ] {
+            let tail_model: FinalmaskModel = serde_json::from_value(tail.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&tail_model).unwrap(), tail);
+            assert!(crate::model::validation::validate_finalmask(&tail_model).is_empty());
+        }
+    }
+
+    #[test]
+    fn quic_switches_are_absent_until_set_and_keep_their_upstream_spellings() {
+        // The core's QuicParamsConfig reads this block with plain
+        // `encoding/json` (`infra/conf/transport_finalmask.go:993-1011`):
+        // an absent switch is the false zero value, and each set key must
+        // re-emit under the exact spelling — `disableGSO` keeps its acronym
+        // casing where camelCase would spell `disableGso`.
+        let defaults: super::FinalmaskQuicParams =
+            serde_json::from_value(json!({})).expect("an empty quicParams block loads");
+        let wire = serde_json::to_value(&defaults).expect("the defaults serialize");
+        assert_eq!(wire, json!({}), "unset switches must not emit anything");
+
+        let loaded: super::FinalmaskQuicParams = serde_json::from_value(json!({
+            "brutalDisableLossCompensation": true,
+            "disableChromeParrot": true,
+            "disableGSO": true,
+            "disableStatelessReset": false
+        }))
+        .expect("the switches load");
+        assert_eq!(loaded.brutal_disable_loss_compensation, Some(true));
+        assert_eq!(loaded.disable_chrome_parrot, Some(true));
+        assert_eq!(loaded.disable_gso, Some(true));
+        assert_eq!(
+            loaded.disable_stateless_reset,
+            Some(false),
+            "an explicit false is a value, not the unset state"
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded).expect("the switches serialize"),
+            json!({
+                "brutalDisableLossCompensation": true,
+                "disableChromeParrot": true,
+                "disableGSO": true,
+                "disableStatelessReset": false
+            }),
+            "each switch must keep its upstream spelling"
+        );
     }
 
     #[test]
@@ -2571,6 +2690,106 @@ mod tests {
             wire["finalmask"]["udp"][0]["settings"]["remoteIPs"],
             json!(["203.0.113.10/32", "2001:db8::/48", "not-an-ip"])
         );
+    }
+
+    #[test]
+    fn realm_ip_mode_and_port_mapping_round_trip_and_stay_absent_when_unset() {
+        use crate::model::validation::validate_finalmask;
+
+        // A mask that sets neither key keeps its exact stored shape: the
+        // envelope carries no `ipMode` and no `portMapping`.
+        let bare: StreamModel = serde_json::from_value(json!({
+            "network": "hysteria",
+            "finalmask": {"udp": [{"type": "realm", "settings": {
+                "url": "realm://token@realm.example/id",
+                "stunServers": ["stun.example.com:3478"]
+            }}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["finalmask"]["udp"][0]["settings"],
+            json!({
+                "url": "realm://token@realm.example/id",
+                "stunServers": ["stun.example.com:3478"]
+            })
+        );
+
+        // Both settings survive a settings-file round trip exactly, with the
+        // core's own spelling preserved: `ipMode` keeps the case the user
+        // typed (the core lowercases it at build), and unknown keys stay.
+        let value = json!({
+            "network": "hysteria",
+            "finalmask": {"udp": [{"type": "realm", "settings": {
+                "url": "realm://token@realm.example/id",
+                "stunServers": ["stun.example.com:3478"],
+                "ipMode": "V6",
+                "portMapping": {"enabled": true, "timeout": 15, "lifetime": 300},
+                "futureRealm": {"kept": true}
+            }}]}
+        });
+        let stream: StreamModel = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&stream).unwrap(), value);
+        assert!(validate_finalmask(stream.finalmask.as_ref().unwrap()).is_empty());
+
+        // A partial `portMapping` keeps only the keys it carries. `enabled:
+        // false` is the core's zero value, so the model drops it like every
+        // other boolean and the object stays empty.
+        for (mapping, expected) in [
+            (json!({"enabled": false}), json!({})),
+            (json!({"timeout": 30}), json!({"timeout": 30})),
+            (json!({"lifetime": 300}), json!({"lifetime": 300})),
+        ] {
+            let stream: StreamModel = serde_json::from_value(json!({
+                "network": "hysteria",
+                "finalmask": {"udp": [{"type": "realm", "settings": {
+                    "url": "realm://token@realm.example/id",
+                    "stunServers": ["stun.example.com:3478"],
+                    "portMapping": mapping
+                }}]}
+            }))
+            .unwrap();
+            let stored = serde_json::to_value(&stream).unwrap();
+            assert_eq!(
+                stored["finalmask"]["udp"][0]["settings"]["portMapping"], expected,
+                "{stored}"
+            );
+            assert!(
+                validate_finalmask(stream.finalmask.as_ref().unwrap()).is_empty(),
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn hysteria_masquerade_x_forwarded_round_trips_and_stays_absent_when_unset() {
+        // An unset switch emits nothing, so profiles that never touched it
+        // keep their exact wire shape.
+        let bare: HysteriaTransport = serde_json::from_value(json!({
+            "version": 2,
+            "auth": "pw",
+            "masquerade": {
+                "type": "proxy", "url": "https://masq.example.com", "rewriteHost": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["masquerade"],
+            json!({
+                "type": "proxy", "url": "https://masq.example.com", "rewriteHost": true
+            })
+        );
+
+        let value = json!({
+            "version": 2,
+            "auth": "pw",
+            "masquerade": {
+                "type": "proxy", "url": "https://masq.example.com",
+                "rewriteHost": true, "xForwarded": true, "insecure": true
+            }
+        });
+        let transport: HysteriaTransport = serde_json::from_value(value.clone()).unwrap();
+        assert!(transport.masquerade.as_ref().unwrap().x_forwarded);
+        assert_eq!(serde_json::to_value(&transport).unwrap(), value);
     }
 
     #[test]
