@@ -207,14 +207,14 @@ pub enum ValidationCode {
     /// prefix — the mask build refuses the entry at config load
     /// (`infra/conf/transport_finalmask.go:950-960`).
     FinalmaskUdpHopIpInvalid,
-    /// A `udphop` mask and a dial-through chain on the same outbound: the
-    /// hop wraps the outbound's own UDP socket, and its wrap refuses a
-    /// proxied packet connection — an `internet.FakePacketConn`, which is
-    /// what `sockopt.dialerProxy` yields
-    /// (`transport/internet/finalmask/udphop/config.go:11-13`). The core
-    /// starts and every dial fails, so this is a configuration warning,
-    /// never a gate.
-    FinalmaskUdpHopDialerProxyConflict,
+    /// A mask that wraps the outbound's own packet connection (`udphop`,
+    /// `realm`, or `xicmp`) and a dial-through chain on the same outbound:
+    /// each of those client wraps refuses a proxied packet connection — an
+    /// `internet.FakePacketConn`, which is what `sockopt.dialerProxy` yields
+    /// (`transport/internet/finalmask/{udphop,realm,xicmp}/config.go:11-13`).
+    /// The core starts and every dial fails, so this is a configuration
+    /// warning, never a gate.
+    FinalmaskDialerProxyConflict,
     /// A `udphop` / `realm` / `xicmp` UDP mask sits anywhere but the last
     /// list entry: the UDP mask manager reverses the list at construction
     /// and wraps forward, so the JSON list's last entry is wrapped first
@@ -2045,25 +2045,27 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
         }
         if let Some(finalmask) = &stream.finalmask {
             issues.extend(validate_finalmask(finalmask));
-            // The hop mask wraps the outbound's own UDP socket, and its wrap
-            // refuses a proxied packet connection
-            // (`transport/internet/finalmask/udphop/config.go:11-13` rejects
-            // an `internet.FakePacketConn`, which is what a dialerProxy dial
-            // yields). The core starts, and every dial fails, so this is a
-            // configuration warning, never a gate.
-            if finalmask
-                .udp
-                .iter()
-                .any(|mask| matches!(mask, FinalmaskUdpMask::Udphop { .. }))
+            // The outermost masks wrap the outbound's own packet connection,
+            // and their client wraps refuse a proxied packet connection
+            // (`transport/internet/finalmask/{udphop,realm,xicmp}/config.go:
+            // 11-13` reject an `internet.FakePacketConn`, which is what a
+            // dialerProxy dial yields). The core starts, and every dial
+            // fails, so this is a configuration warning, never a gate.
+            let wraps_the_dialed_connection = finalmask.udp.iter().any(|mask| {
+                matches!(
+                    mask,
+                    FinalmaskUdpMask::Udphop { .. }
+                        | FinalmaskUdpMask::Realm { .. }
+                        | FinalmaskUdpMask::Xicmp { .. }
+                )
+            });
+            if wraps_the_dialed_connection
                 && stream
                     .sockopt
                     .as_ref()
                     .is_some_and(|sockopt| !sockopt.dialer_proxy.is_empty())
             {
-                issues.push(warning(
-                    ValidationCode::FinalmaskUdpHopDialerProxyConflict,
-                    None,
-                ));
+                issues.push(warning(ValidationCode::FinalmaskDialerProxyConflict, None));
             }
         }
         // XHTTP enum vocabularies and cross-field rules: every value below is
@@ -4352,78 +4354,90 @@ mod tests {
         }
 
         // A `remoteIPs` entry that parses as neither an address nor a prefix
-        // is refused at build time, one finding per entry.
+        // is refused at build time, one finding per entry. An IPv6 zone is
+        // legal in both forms — Go's ParseAddr keeps it and both
+        // ParsePrefix and PrefixFrom strip it again, and a form that fails
+        // the prefix parse falls through to the address parse (verified
+        // against the pinned core: `fe80::1%eth0`, `2001:db8::1%en0`,
+        // `fe80::1%eth0/64`, `fe80::1%eth0%more`, and
+        // `fe80::1%eth0/64%x` all load) — while an empty zone, a zone on
+        // IPv4, an out-of-range bit count, and a padded entry do not.
         assert_eq!(
             codes_for(
-                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","nope","2001:db8::/129"]}"#
+                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","nope","2001:db8::/129","fe80::1%","1.2.3.4%eth0"," fe80::1","fe80::1/ 64"]}"#
             ),
             vec![
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                ValidationCode::FinalmaskUdpHopIpInvalid,
                 ValidationCode::FinalmaskUdpHopIpInvalid,
                 ValidationCode::FinalmaskUdpHopIpInvalid,
             ]
         );
         assert!(
             codes_for(
-                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","2001:db8::/48","::1"]}"#
+                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","2001:db8::/48","::1","fe80::1%eth0","2001:db8::1%en0","fe80::1%eth0/64","fe80::1%eth0%more","fe80::1%eth0/64%x"]}"#
             )
             .is_empty()
         );
     }
 
-    /// The hop mask and a dial-through chain cannot run together: the hop
-    /// wrap refuses the proxied packet connection, so the advisory names the
-    /// pair while every other combination stays quiet.
+    /// The outermost UDP masks wrap the outbound's own packet connection, so
+    /// a dial-through chain cannot run with `udphop`, `realm`, or `xicmp`:
+    /// each of those client wraps refuses the proxied packet connection, and
+    /// the advisory names the pair while every other combination stays quiet.
     #[test]
-    fn udphop_mask_with_a_dialer_proxy_chain_warns_without_gating() {
-        let mask = FinalmaskModel {
-            udp: vec![
-                serde_json::from_value(json!({
-                    "type": "udphop",
-                    "settings": {"mode": "perConnRemote", "interval": "5-10"}
-                }))
-                .expect("the udphop envelope loads"),
-            ],
+    fn proxied_chains_warn_for_every_outermost_mask_without_gating() {
+        let mask = |envelope: serde_json::Value| FinalmaskModel {
+            udp: vec![serde_json::from_value(envelope).expect("the mask envelope loads")],
             ..Default::default()
         };
-        let plain_mask = FinalmaskModel {
-            udp: vec![
-                serde_json::from_value(json!({
-                    "type": "salamander", "settings": {"password": "pw"}
-                }))
-                .expect("the salamander envelope loads"),
-            ],
-            ..Default::default()
+        let conflicts = |outbound: &OutboundModel| -> usize {
+            validate_outbound(outbound)
+                .iter()
+                .filter(|issue| issue.code == ValidationCode::FinalmaskDialerProxyConflict)
+                .count()
         };
 
-        let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.stream.finalmask = Some(mask.clone());
-        outbound.chain_via("srv-exit");
-        let issues = validate_outbound(&outbound);
-        let found: Vec<_> = issues
-            .iter()
-            .filter(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
-            .collect();
-        assert_eq!(found.len(), 1, "{issues:#?}");
-        assert_eq!(found[0].severity, Severity::Warning);
-        assert_eq!(found[0].path, None);
-
-        // The mask without a chain never warns.
-        let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.stream.finalmask = Some(mask);
-        assert!(
-            !validate_outbound(&outbound)
+        for (envelope, label) in [
+            (
+                json!({"type": "udphop", "settings": {"mode": "perConnRemote", "interval": "5-10"}}),
+                "udphop",
+            ),
+            (json!({"type": "realm", "settings": {}}), "realm"),
+            (json!({"type": "xicmp", "settings": {}}), "xicmp"),
+        ] {
+            let mut outbound = OutboundModel::new(Protocol::Vless);
+            outbound.stream.finalmask = Some(mask(envelope.clone()));
+            assert_eq!(
+                conflicts(&outbound),
+                0,
+                "{label} without a chain must stay quiet"
+            );
+            outbound.chain_via("srv-exit");
+            let issues = validate_outbound(&outbound);
+            let found: Vec<_> = issues
                 .iter()
-                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
-        );
+                .filter(|issue| issue.code == ValidationCode::FinalmaskDialerProxyConflict)
+                .collect();
+            assert_eq!(found.len(), 1, "{label}: {issues:#?}");
+            assert_eq!(found[0].severity, Severity::Warning, "{label}");
+            assert_eq!(found[0].path, None, "{label}");
+        }
 
-        // A chain with any other mask never warns.
+        // A chain with a mask that never wraps the packet connection stays
+        // quiet.
         let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.stream.finalmask = Some(plain_mask);
+        outbound.stream.finalmask = Some(mask(
+            json!({"type": "salamander", "settings": {"password": "pw"}}),
+        ));
         outbound.chain_via("srv-exit");
-        assert!(
-            !validate_outbound(&outbound)
-                .iter()
-                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
+        assert_eq!(
+            conflicts(&outbound),
+            0,
+            "{:#?}",
+            validate_outbound(&outbound)
         );
     }
 

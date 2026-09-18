@@ -1168,6 +1168,47 @@ fn golden_wireguard() {
 }
 
 #[test]
+fn golden_chain_dialer_proxy() {
+    // The one dial-through chain spelling the pinned core reads: the hop's
+    // `streamSettings.sockopt.dialerProxy` names the exit profile's tag, and
+    // only the direct-dial exit outbound joins the bootstrap scope. This
+    // golden is the shape the core oracle runs `xray run -test` over.
+    //
+    // The VLESS encryption is the client shape `xray vlessenc` emits — a
+    // four-part `mlkem768x25519plus` string ending in a 32-byte url-safe key
+    // — because the pinned core parses that string at build time (the
+    // shared fixture helper's shorter placeholder is not core-valid).
+    fn chain_server(host: &str) -> OutboundModel {
+        let mut outbound = vless_server(host, 443);
+        if let ProtocolSettings::Vless(settings) = &mut outbound.settings {
+            settings.encryption =
+                "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
+        }
+        outbound
+    }
+    let mut hop_outbound = chain_server("hop.example.com");
+    hop_outbound.chain_via("srv-fedcba98");
+    let hop = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("hop", hop_outbound)
+    };
+    let exit = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("exit", chain_server("exit.example.com"))
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(hop.id.clone()),
+        profiles: vec![hop, exit],
+        extra: Map::new(),
+    };
+    golden!(
+        "goldens/chain_dialer_proxy.json",
+        generate_deterministic(&servers, &base_settings())
+    );
+}
+
+#[test]
 fn golden_hysteria2() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);
     ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
@@ -1711,8 +1752,7 @@ fn dns_and_dokodemo_use_exact_core_wire_types() {
 }
 
 const GEOIP_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geoip.dat";
-const GEOSITE_URL: &str =
-    "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geosite.dat";
+const GEOSITE_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geosite.dat";
 
 #[test]
 fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {

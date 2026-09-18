@@ -1241,19 +1241,53 @@ impl Default for FinalmaskUdpHop {
 /// (`infra/conf/transport_finalmask.go:950-960`). `None` when neither form
 /// parses — the mask build rejects that entry.
 pub fn finalmask_udphop_remote_ip(value: &str) -> Option<String> {
-    let value = value.trim();
-    if let Some((address, bits)) = value.split_once('/') {
-        let address: std::net::IpAddr = address.trim().parse().ok()?;
-        let bits: u8 = bits.trim().parse().ok()?;
-        let width = if address.is_ipv4() { 32 } else { 128 };
-        if bits > width {
+    // Go tries `netip.ParsePrefix` first: it splits at the LAST '/', parses
+    // the address part with ParseAddr and strips the zone, then reads the
+    // bit count with ParseUint (digits only, no sign). `fe80::1%eth0/64`
+    // builds the prefix `fe80::1/64`, and a form that fails any of those
+    // steps falls through to the address parse below, exactly like the
+    // build's two attempts.
+    if let Some(prefix) = value.rsplit_once('/').and_then(|(address, bits)| {
+        let address = go_ip_addr(address)?;
+        if bits.is_empty() || !bits.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        return Some(format!("{address}/{bits}"));
+        let bits: u8 = bits.parse().ok()?;
+        let width = if address.is_ipv4() { 32 } else { 128 };
+        (bits <= width).then(|| format!("{address}/{bits}"))
+    }) {
+        return Some(prefix);
     }
-    let address: std::net::IpAddr = value.parse().ok()?;
+    // Then `netip.ParseAddr` over the whole entry: an IPv6 zone (everything
+    // after the first '%', which may itself contain '/' and '%') is kept
+    // and `PrefixFrom` drops it before the width is attached, so
+    // `fe80::1%eth0` and `fe80::1%eth0/64%x` both build `fe80::1/128`.
+    // Neither parser trims, so a padded entry is refused like every other
+    // malformed one.
+    let address = go_ip_addr(value)?;
     let width = if address.is_ipv4() { 32 } else { 128 };
     Some(format!("{address}/{width}"))
+}
+
+/// Parse one address with Go's `netip.ParseAddr` semantics: an IPv6 address
+/// may carry a zone (everything after its first `%`, non-empty, `%` allowed
+/// inside), and the zone never reaches the prefix; an IPv4 address never
+/// takes a zone (`1.2.3.4%eth0` is a parse error there).
+fn go_ip_addr(value: &str) -> Option<std::net::IpAddr> {
+    let (address, zone) = match value.split_once('%') {
+        Some((address, zone)) => (address, Some(zone)),
+        None => (value, None),
+    };
+    if let Some(zone) = zone {
+        if zone.is_empty() {
+            return None;
+        }
+        return address
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(std::net::IpAddr::V6);
+    }
+    value.parse::<std::net::IpAddr>().ok()
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2708,27 +2742,56 @@ mod tests {
     fn udphop_wire_normalizes_remote_ips_to_prefixes() {
         // The hop socket takes prefixes: an address entry gains its width and
         // a prefix keeps its length, the way the mask build normalizes both
-        // (`infra/conf/transport_finalmask.go:950-960`). The stored settings
-        // keep the text the user typed.
+        // (`infra/conf/transport_finalmask.go:950-960`). An IPv6 zone is
+        // accepted in either form — Go's ParseAddr keeps it and both
+        // ParsePrefix and PrefixFrom strip it again — so `fe80::1%eth0`
+        // becomes `fe80::1/128` and `fe80::1%eth0/64` becomes
+        // `fe80::1/64`. The stored settings keep the text the user typed,
+        // and an entry that parses as neither form stays verbatim (the gate
+        // names it before the wire is ever built).
         let mut stream: StreamModel = serde_json::from_value(json!({
             "network": "hysteria",
             "finalmask": {"udp": [{"type": "udphop", "settings": {
                 "mode": "perConnRemote",
                 "interval": "5-10",
-                "remoteIPs": ["203.0.113.10", "2001:0db8::/48", "not-an-ip"]
+                "remoteIPs": [
+                    "203.0.113.10", "2001:0db8::/48", "not-an-ip",
+                    "fe80::1%eth0", "fe80::1%eth0/64", "fe80::1%eth0%more",
+                    "fe80::1%eth0/64%x", "fe80::1%", "1.2.3.4%eth0"
+                ]
             }}]}
         }))
         .unwrap();
         let stored = serde_json::to_value(&stream).expect("the stream serializes");
         assert_eq!(
             stored["finalmask"]["udp"][0]["settings"]["remoteIPs"],
-            json!(["203.0.113.10", "2001:0db8::/48", "not-an-ip"])
+            json!([
+                "203.0.113.10",
+                "2001:0db8::/48",
+                "not-an-ip",
+                "fe80::1%eth0",
+                "fe80::1%eth0/64",
+                "fe80::1%eth0%more",
+                "fe80::1%eth0/64%x",
+                "fe80::1%",
+                "1.2.3.4%eth0"
+            ])
         );
         stream.retain_selected_stream_blocks_for_wire();
         let wire = serde_json::to_value(&stream).expect("the stream serializes");
         assert_eq!(
             wire["finalmask"]["udp"][0]["settings"]["remoteIPs"],
-            json!(["203.0.113.10/32", "2001:db8::/48", "not-an-ip"])
+            json!([
+                "203.0.113.10/32",
+                "2001:db8::/48",
+                "not-an-ip",
+                "fe80::1/128",
+                "fe80::1/64",
+                "fe80::1/128",
+                "fe80::1/128",
+                "fe80::1%",
+                "1.2.3.4%eth0"
+            ])
         );
     }
 

@@ -24,7 +24,7 @@
       {
         "address": "localhost",
         "domains": [
-          "domain:hop.example.com"
+          "domain:exit.example.com"
         ],
         "skipFallback": true
       }
@@ -71,46 +71,35 @@
   },
   "outbounds": [
     {
-      "protocol": "hysteria",
+      "protocol": "vless",
       "settings": {
         "address": "hop.example.com",
-        "port": 443,
-        "version": 2
+        "encryption": "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+        "id": "11111111-2222-3333-4444-555555555555",
+        "port": 443
       },
       "streamSettings": {
-        "finalmask": {
-          "udp": [
-            {
-              "settings": {
-                "interval": "5-10",
-                "mode": "intervalLocal,intervalRemote",
-                "remoteIPs": [
-                  "203.0.113.10/32",
-                  "2001:db8::/48"
-                ],
-                "remotePorts": "443,10000-10010",
-                "sockopt": {
-                  "domainStrategy": "useip",
-                  "interface": "eth0"
-                }
-              },
-              "type": "udphop"
-            }
-          ]
-        },
-        "hysteriaSettings": {
-          "auth": "hoppassword",
-          "udpIdleTimeout": 60,
-          "version": 2
-        },
-        "network": "hysteria",
-        "security": "tls",
+        "network": "raw",
         "sockopt": {
-          "domainStrategy": "useip"
-        },
-        "tlsSettings": {}
+          "dialerProxy": "srv-fedcba98"
+        }
       },
       "tag": "srv-01234567"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "address": "exit.example.com",
+        "encryption": "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+        "id": "11111111-2222-3333-4444-555555555555",
+        "port": 443
+      },
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "useip"
+        }
+      },
+      "tag": "srv-fedcba98"
     },
     {
       "protocol": "freedom",

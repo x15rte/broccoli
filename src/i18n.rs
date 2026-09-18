@@ -1329,7 +1329,7 @@ keys! {
     FinalmaskUdpHopModeInvalid,
     FinalmaskUdpHopIntervalTooSmall,
     FinalmaskUdpHopIpInvalid,
-    FinalmaskUdpHopDialerProxyConflict,
+    FinalmaskDialerProxyConflict,
     FinalmaskUdpMaskNotLast,
     FinalmaskUdpMaskNotFirst,
     FinalmaskUdpHopIntervalTransportConflict,
@@ -2228,7 +2228,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         FinalmaskUdpHopModeInvalid => t(lang, Key::FinalmaskUdpHopModeInvalid),
         FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
         FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
-        FinalmaskUdpHopDialerProxyConflict => t(lang, Key::FinalmaskUdpHopDialerProxyConflict),
+        FinalmaskDialerProxyConflict => t(lang, Key::FinalmaskDialerProxyConflict),
         FinalmaskUdpMaskNotLast(_) => t(lang, Key::FinalmaskUdpMaskNotLast),
         FinalmaskUdpMaskNotFirst(_) => t(lang, Key::FinalmaskUdpMaskNotFirst),
         FinalmaskUdpHopIntervalTransportConflict => {
@@ -4321,9 +4321,9 @@ mod en {
                 "set each interval endpoint to at least 5 seconds"
             }
             Key::FinalmaskUdpHopIpInvalid => "enter an IP address or a CIDR prefix",
-            Key::FinalmaskUdpHopDialerProxyConflict => {
-                "The udphop mask cannot run with sockopt.dialerProxy. Remove the mask or the \
-                 chain"
+            Key::FinalmaskDialerProxyConflict => {
+                "The udphop, realm, and xicmp masks cannot dial through another server. Remove \
+                 the mask or clear sockopt.dialerProxy"
             }
             Key::FinalmaskUdpMaskNotLast => {
                 "{} must be the last UDP mask entry. Move it to the end of the list"
