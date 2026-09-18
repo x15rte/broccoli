@@ -578,7 +578,7 @@ pub struct SockoptModel {
     /// asis | useip* | forceip*
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub domain_strategy: String,
-    /// dial via another outbound tag (conflicts with proxySettings.tag)
+    /// the outbound tag this server dials through (the chain target)
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub dialer_proxy: String,
     /// bind to NIC (Windows: IP_UNICAST_IF)

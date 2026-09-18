@@ -1616,8 +1616,10 @@ fn validate_vless_encryption(value: &str) -> bool {
 }
 
 /// The REALITY grammar's fingerprint accept-set, derived from the canonical
-/// model vocabulary (`src/model/fingerprint.rs`): every editor option except
-/// `""` / `unsafe` / `hellogolang`.
+/// model vocabulary (`src/model/fingerprint.rs`): every canonical table name
+/// except `""` / `unsafe` / `hellogolang`. The editor's trimmed REALITY
+/// option list does not narrow this grammar — a link naming any other
+/// canonical fingerprint imports as before.
 fn supported_reality_fingerprint(value: &str) -> bool {
     crate::model::fingerprint::reality_import_supported(value)
 }
@@ -2304,8 +2306,11 @@ fn validate_exportable(profile: &ServerProfile) -> Result<(), LinkError> {
     if !profile.extra.is_empty() {
         return Err(lossy("profile.extra", Key::LinkLossyProfileExtra));
     }
-    if profile.outbound.proxy_tag.is_some() {
-        return Err(lossy("proxySettings", Key::LinkLossyProxySettings));
+    if profile.chain_target().is_some() {
+        return Err(lossy(
+            "streamSettings.sockopt.dialerProxy",
+            Key::LinkLossyDialerProxy,
+        ));
     }
     if profile.outbound.send_through.is_some() {
         return Err(lossy("sendThrough", Key::LinkLossySendThrough));
@@ -2552,6 +2557,25 @@ mod tests {
         assert_eq!(r.spider_x, "/");
         assert!(canonical.contains("spx=%2F"));
         assert!(canonical.contains("security=reality"));
+    }
+
+    /// The editor's REALITY fingerprint option list is trimmed; the share
+    /// grammar still accepts every other canonical name a link may carry.
+    #[test]
+    fn reality_import_accepts_fingerprints_outside_the_editor_options() {
+        let public_key = reality_public_key();
+        for fingerprint in ["ios", "edge", "qq"] {
+            let link = format!(
+                "vless://{UUID}@reality.example.com:443?security=reality&sni=www.microsoft.com&fp={fingerprint}&pbk={public_key}&type=tcp#Trim"
+            );
+            let (profile, canonical) = round_trip(&link);
+            let reality = profile.outbound.stream.reality_settings.as_ref().unwrap();
+            assert_eq!(reality.fingerprint, fingerprint);
+            assert!(
+                canonical.contains(&format!("fp={fingerprint}")),
+                "the exported link must keep {fingerprint:?}: {canonical}"
+            );
+        }
     }
 
     #[test]
@@ -3877,9 +3901,12 @@ mod tests {
         ))
         .unwrap();
 
+        // A dial-through chain is local configuration: every share-link
+        // grammar stops at the outbound itself. The check names the surviving
+        // spelling's wire path.
         let mut profile = base.clone();
-        profile.outbound.proxy_tag = Some("dial-via".into());
-        expect_lossy(&profile, "proxySettings");
+        profile.outbound.chain_via("dial-via");
+        expect_lossy(&profile, "streamSettings.sockopt.dialerProxy");
 
         let mut profile = base.clone();
         profile.outbound.send_through = Some("192.0.2.1".into());

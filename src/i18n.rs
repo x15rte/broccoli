@@ -1056,8 +1056,6 @@ keys! {
     SrvListenerOnlySockoptNote,
     SrvPenetrateNote,
     SrvPenetrateEchNote,
-    SrvDialerProxyConflict,
-    SrvRemoveDialerProxy,
     SrvEchDnsQuerySockopt,
     SrvEchSockoptNote,
     SrvHappyEyeballs,
@@ -1122,6 +1120,9 @@ keys! {
     SrvXhttpHeaderValueString,
     SrvDownloadNestingExceeds,
     SrvMasterKeyLogNotSupported,
+    SrvProxySettingsRemoved,
+    SrvRemoveProxySettingsKey,
+    SrvRemoveProxySettingsKeyNote,
     SrvWsHeaderValueString,
     SrvHttpupgradeHeaderValueString,
     SrvFromMitmOnlyAlpnShort,
@@ -1129,7 +1130,6 @@ keys! {
     SrvRealitySettingsMissing,
     SrvTlsSettingsMissing,
     SrvSendThroughInvalidShort,
-    SrvProxyTagDialerProxyConflict,
     SrvNetwork,
     SrvSecurity,
     SrvName,
@@ -1190,7 +1190,6 @@ keys! {
     SrvMaxVersion,
     SrvShowDebug,
     SrvOfficialSourceToken,
-    SrvProxySettingsTagChainVia,
     SrvConcurrencyLegacy,
     SrvDelayMs,
     SrvBlockDelayMs,
@@ -1267,6 +1266,7 @@ keys! {
     OutboundRealityMldsa65Invalid,
     OutboundTlsFingerprintUnsupported,
     OutboundRealityFingerprintUnsupported,
+    OutboundRealityFingerprintUntested,
     OutboundPinnedPeerCertSha256Invalid,
     OutboundTlsVersionRangeInvalid,
     // Stream/sockopt/strategy enum rules (xhttp vocabulary + cross-field
@@ -1442,7 +1442,6 @@ keys! {
     SettingsProfileTagInvalid,
     SettingsProfileTagReserved,
     SettingsProfileTagDuplicated,
-    SettingsOutboundChainConflict,
     SettingsOutboundChainMissing,
     SettingsOutboundChainCycle,
     SettingsBalancerNoTag,
@@ -1680,7 +1679,7 @@ keys! {
     LinkLossyTransportUnselected,
     LinkLossySsStream,
     LinkLossyProfileExtra,
-    LinkLossyProxySettings,
+    LinkLossyDialerProxy,
     LinkLossySendThrough,
     LinkLossyTargetStrategy,
     LinkLossyMux,
@@ -2121,6 +2120,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
         StreamOneNoDownload => t(lang, Key::SrvStreamOneNoDownload),
         MasterKeyLogNotSupported => t(lang, Key::SrvMasterKeyLogNotSupported),
+        OutboundProxySettingsRemoved => t(lang, Key::SrvProxySettingsRemoved),
         TlsAllowInsecureRemoved => t(lang, Key::SrvAllowInsecureRemoved),
         ShadowsocksLevelRange => t(lang, Key::SrvShadowsocksLevelRangeShort),
         BlackholeResponseInvalid => t(lang, Key::SrvBlackholeResponseInvalidShort),
@@ -2144,6 +2144,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         RealityMldsa65Invalid => t(lang, Key::OutboundRealityMldsa65Invalid),
         TlsFingerprintUnsupported => t(lang, Key::OutboundTlsFingerprintUnsupported),
         RealityFingerprintUnsupported => t(lang, Key::OutboundRealityFingerprintUnsupported),
+        RealityFingerprintUntested(_) => t(lang, Key::OutboundRealityFingerprintUntested),
         PinnedPeerCertSha256Invalid => t(lang, Key::OutboundPinnedPeerCertSha256Invalid),
         TlsVersionRangeInvalid => t(lang, Key::OutboundTlsVersionRangeInvalid),
         TlsMinExceedsMax => t(lang, Key::SrvMinVersionExceedsMax),
@@ -2262,7 +2263,6 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         ProfileTagInvalid(_, _, _) => t(lang, Key::SettingsProfileTagInvalid),
         ProfileTagReserved(_, _, _) => t(lang, Key::SettingsProfileTagReserved),
         ProfileTagDuplicated(_, _, _, _, _) => t(lang, Key::SettingsProfileTagDuplicated),
-        OutboundChainConflict(_) => t(lang, Key::SettingsOutboundChainConflict),
         OutboundChainMissing(_, _) => t(lang, Key::SettingsOutboundChainMissing),
         OutboundChainCycle(_) => t(lang, Key::SettingsOutboundChainCycle),
         BalancerTagMissing(_) => t(lang, Key::SettingsBalancerNoTag),
@@ -2302,7 +2302,8 @@ pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> Stri
         | ValidationCode::FinalmaskUnknownByteSyntax(arg)
         | ValidationCode::FinalmaskRealmUrlSyntax(arg)
         | ValidationCode::FinalmaskQuicBandwidthUnitInvalid(arg)
-        | ValidationCode::XhttpExtraShadowsSettings(arg) => {
+        | ValidationCode::XhttpExtraShadowsSettings(arg)
+        | ValidationCode::RealityFingerprintUntested(arg) => {
             fill_placeholders(validation_message(&issue.code, lang), &[arg])
         }
         ValidationCode::FinalmaskUnknownTcpMask(arg)
@@ -2352,10 +2353,6 @@ pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> Stri
                 ],
             )
         }
-        ValidationCode::OutboundChainConflict(source) => fill_placeholders(
-            validation_message(&issue.code, lang),
-            &[&format!("{source:?}")],
-        ),
         ValidationCode::OutboundChainMissing(source, target) => fill_placeholders(
             validation_message(&issue.code, lang),
             &[&format!("{source:?}"), &format!("{target:?}")],
@@ -3780,10 +3777,6 @@ mod en {
                 "penetrate only copies stream sockopt into XHTTP downloadSettings. The ECH DNS query \
                  calls DialSystem directly."
             }
-            Key::SrvDialerProxyConflict => {
-                "dialerProxy conflicts with proxySettings.tag. Remove one."
-            }
-            Key::SrvRemoveDialerProxy => "Remove dialerProxy",
             Key::SrvEchDnsQuerySockopt => "ECH DNS-query socket options",
             Key::SrvEchSockoptNote => {
                 "Used only when echConfigList requests DNS (https://, h2c://, or udp://). \
@@ -3867,6 +3860,14 @@ mod en {
             Key::SrvMasterKeyLogNotSupported => {
                 "masterKeyLog is not supported (TLS session key file writes are refused)"
             }
+            Key::SrvProxySettingsRemoved => {
+                "Xray removed the proxySettings key from outbounds. Set \
+                 streamSettings.sockopt.dialerProxy to the outbound tag this server dials through."
+            }
+            Key::SrvRemoveProxySettingsKey => "Remove the proxySettings key",
+            Key::SrvRemoveProxySettingsKeyNote => {
+                "The app removes the retired key. The server dials directly."
+            }
             Key::SrvWsHeaderValueString => "every WebSocket header value must be a string",
             Key::SrvHttpupgradeHeaderValueString => {
                 "every HTTPUpgrade header value must be a string"
@@ -3877,9 +3878,6 @@ mod en {
             Key::SrvTlsSettingsMissing => "TLS settings are missing",
             Key::SrvSendThroughInvalidShort => {
                 "sendThrough must be an IP address, CIDR, origin, or srcip"
-            }
-            Key::SrvProxyTagDialerProxyConflict => {
-                "proxySettings.tag conflicts with sockopt.dialerProxy"
             }
             Key::SrvNetwork => "network",
             Key::SrvSecurity => "security",
@@ -3948,7 +3946,6 @@ mod en {
             Key::SrvMaxVersion => "max version",
             Key::SrvShowDebug => "show (debug)",
             Key::SrvOfficialSourceToken => "official source token",
-            Key::SrvProxySettingsTagChainVia => "proxySettings.tag (chain via)",
             Key::SrvConcurrencyLegacy => "concurrency (-1 = legacy single-stream)",
             Key::SrvDelayMs => "delay (ms)",
             Key::SrvBlockDelayMs => "blockDelay (ms)",
@@ -3996,8 +3993,8 @@ mod en {
             }
             Key::SrvRealityFingerprintHint => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
-                 names. Xray rejects unsafe and hellogolang for REALITY, so they are not offered \
-                 here"
+                 names. The list offers only the browser names the Xray project tests: chrome, \
+                 firefox, safari. A saved server keeps any other fingerprint Xray accepts"
             }
             Key::SrvVisionUdp443Hint => {
                 "xtls-rprx-vision alone intercepts UDP/443 (QUIC) client-side. Xray then logs \"XTLS \
@@ -4115,6 +4112,11 @@ mod en {
             Key::OutboundRealityFingerprintUnsupported => {
                 "REALITY fingerprint must be one of the uTLS fingerprints Xray accepts for REALITY. \
                  Xray rejects unsafe and hellogolang there"
+            }
+            Key::OutboundRealityFingerprintUntested => {
+                "REALITY fingerprint {} is not one of the browser names the Xray project exercises. \
+                 The Xray project exercises chrome, firefox, and safari for REALITY. The core still \
+                 accepts this value"
             }
             Key::OutboundPinnedPeerCertSha256Invalid => {
                 "each pinnedPeerCertSha256 pin must be a 32-byte SHA-256 fingerprint in hex \
@@ -4447,9 +4449,6 @@ mod en {
             Key::SettingsProfileTagDuplicated => {
                 "server profiles {} ({}) and {} ({}) generate duplicate outbound tag {}. IDs must \
                  differ within their first 8 characters"
-            }
-            Key::SettingsOutboundChainConflict => {
-                "outbound {} sets both proxySettings.tag and sockopt.dialerProxy"
             }
             Key::SettingsOutboundChainMissing => {
                 "outbound {} references missing chained outbound {}"
@@ -4884,8 +4883,8 @@ mod en {
                  links cannot carry it."
             }
             Key::LinkLossyProfileExtra => "The profile metadata field {} has no share-link field.",
-            Key::LinkLossyProxySettings => {
-                "The profile sets dial-via routing in {}, which is local configuration."
+            Key::LinkLossyDialerProxy => {
+                "The profile dials through another server in {}, which is local configuration."
             }
             Key::LinkLossySendThrough => {
                 "The profile binds a local source address in {}, which is not shareable."
@@ -5998,6 +5997,79 @@ mod tests {
         }
     }
 
+    /// The REALITY fingerprint advisory names the stored value, the three
+    /// names upstream's REALITY scenarios exercise, and the acceptance; the
+    /// inline editor verdict fills the same template without the path, so
+    /// the editor and the warnings list can never disagree.
+    #[test]
+    fn reality_fingerprint_advisory_names_the_value_and_the_exercised_names() {
+        use crate::model::validation::{Severity, ValidationIssue};
+
+        let issue = ValidationIssue {
+            code: ValidationCode::RealityFingerprintUntested("ios".into()),
+            path: Some("stream.realitySettings.fingerprint".into()),
+            severity: Severity::Warning,
+        };
+        let rendered = validation_issue_message(&issue, Language::En);
+        for needle in ["ios", "chrome", "firefox", "safari"] {
+            assert!(rendered.contains(needle), "{rendered}");
+        }
+        assert!(rendered.contains("still accepts"), "{rendered}");
+        assert!(
+            !rendered.contains("rejects"),
+            "the advisory must not read as a rejection: {rendered}"
+        );
+        assert_eq!(
+            rendered.strip_prefix("stream.realitySettings.fingerprint: "),
+            Some(
+                t_fmt(
+                    Language::En,
+                    Key::OutboundRealityFingerprintUntested,
+                    &[&"ios"]
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// The mask-order findings name the mask type, the required end, and the
+    /// move that repairs the chain; the interval-hop advisory names the
+    /// constraint and the `perConnRemote` fallback.
+    #[test]
+    fn mask_order_and_interval_hop_messages_name_the_fix() {
+        use crate::model::validation::{Severity, ValidationIssue};
+
+        let not_last = ValidationIssue {
+            code: ValidationCode::FinalmaskUdpMaskNotLast("realm".into()),
+            path: Some("finalmask.udp[0]".into()),
+            severity: Severity::Error,
+        };
+        assert_eq!(
+            validation_issue_message(&not_last, Language::En),
+            "finalmask.udp[0]: realm must be the last UDP mask entry. Move it to the end of the \
+             list"
+        );
+        let not_first = ValidationIssue {
+            code: ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
+            path: Some("finalmask.udp[1]".into()),
+            severity: Severity::Error,
+        };
+        assert_eq!(
+            validation_issue_message(&not_first, Language::En),
+            "finalmask.udp[1]: sudoku must be the first UDP mask entry. Move it to the \
+             beginning of the list"
+        );
+        let interval = ValidationIssue {
+            code: ValidationCode::FinalmaskUdpHopIntervalTransportConflict,
+            path: None,
+            severity: Severity::Warning,
+        };
+        assert_eq!(
+            validation_issue_message(&interval, Language::En),
+            "The udphop interval modes need hysteria2, HTTP/3 xhttp, or WireGuard. Other \
+             transports cannot run interval hops"
+        );
+    }
     #[test]
     fn english_table_matches_hand_written_literals() {
         // Expected values written by hand, never computed from the table.

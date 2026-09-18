@@ -333,14 +333,68 @@ fn roundtrip_stream() {
     assert_eq!(out["tlsSettings"]["allowInsecure"], json!(true)); // passthrough only
 }
 
+/// The REALITY editor offers a trimmed fingerprint option list; a profile
+/// that already stores a name outside it must load with the value intact and
+/// save it unchanged.
+#[test]
+fn reality_fingerprint_outside_the_editor_options_survives_a_profile_round_trip() {
+    for fingerprint in ["ios", "edge", "qq"] {
+        let mut profile = ServerProfile::new("trim-retention", OutboundModel::new(Protocol::Vless));
+        profile.outbound.stream = StreamModel {
+            network: Network::Raw,
+            security: Security::Reality,
+            reality_settings: Some(RealityModel {
+                server_name: "reality.example.com".into(),
+                fingerprint: fingerprint.into(),
+                password: "pub".into(),
+                short_id: "ab12".into(),
+                spider_x: "/".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let file = ServersFile {
+            version: 1,
+            active: Some(profile.id.clone()),
+            profiles: vec![profile],
+            extra: Default::default(),
+        };
+        let stored = serde_json::to_value(&file).unwrap();
+        assert_eq!(
+            stored["profiles"][0]["outbound"]["streamSettings"]["realitySettings"]["fingerprint"],
+            json!(fingerprint),
+            "a save must keep the stored fingerprint"
+        );
+        let reloaded: ServersFile = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(
+            reloaded.profiles[0]
+                .outbound
+                .stream
+                .reality_settings
+                .as_ref()
+                .unwrap()
+                .fingerprint,
+            fingerprint,
+            "a load must keep the stored fingerprint"
+        );
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            stored,
+            "the reloaded profile set must serialize unchanged"
+        );
+    }
+}
+
 #[test]
 fn roundtrip_outbound_envelope() {
+    // The retired `proxySettings` key is deliberately absent: it is not part
+    // of the envelope any more (a stored value is dropped at load, never
+    // written back).
     check::<OutboundModel>(json!({
         "protocol": "trojan",
         "settings": {"address": "t.example.com", "port": 443, "password": "pw"},
         "streamSettings": {"network": "raw", "security": "tls",
                            "tlsSettings": {"serverName": "t.example.com"}},
-        "proxySettings": {"tag": "srv-deadbeef"},
         "sendThrough": "192.168.1.10",
         "targetStrategy": "useip",
         "mux": {"enabled": true, "concurrency": 8}

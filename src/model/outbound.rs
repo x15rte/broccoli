@@ -654,8 +654,16 @@ pub struct OutboundModel {
     pub protocol: Protocol,
     pub settings: ProtocolSettings,
     pub stream: StreamModel,
-    /// "dial via" another outbound tag → proxySettings.tag
-    pub proxy_tag: Option<String>,
+    /// The raw value of the retired `proxySettings` key the stored object
+    /// carried, when it did (any JSON shape). Xray's outbound build refuses a
+    /// configuration that carries the key (infra/conf/xray.go:262), so the
+    /// profile stays gated until the user resolves it; the value is kept only
+    /// so the settings file round-trips it and is re-emitted with no
+    /// migration. Generated configurations never carry it: [`Self::to_wire`]
+    /// clears the field, while the gating finding
+    /// `crate::model::validation::ValidationCode::OutboundProxySettingsRemoved`
+    /// holds until the user resolves the key.
+    pub retired_proxy_settings: Option<Value>,
     /// local IP/CIDR to bind
     pub send_through: Option<String>,
     /// asis | useip* | forceip*
@@ -780,6 +788,16 @@ impl OutboundModel {
         model
     }
 
+    /// Make this outbound dial through `tag` — the one chain spelling the
+    /// pinned core reads, `streamSettings.sockopt.dialerProxy`. Test-only:
+    /// every chain fixture in the suite states the target through here.
+    #[cfg(test)]
+    pub(crate) fn chain_via(&mut self, tag: impl Into<String>) {
+        let mut sockopt = self.stream.sockopt.take().unwrap_or_default();
+        sockopt.dialer_proxy = tag.into();
+        self.stream.sockopt = Some(sockopt);
+    }
+
     /// Switch protocol and normalize the transport state that Hysteria2 owns.
     pub fn select_protocol(&mut self, protocol: Protocol) {
         let leaving_hysteria = self.protocol == Protocol::Hysteria
@@ -820,11 +838,6 @@ impl OutboundModel {
                 settings.version = 2;
             }
         }
-        if self.proxy_tag.is_some()
-            && let Some(sockopt) = self.stream.sockopt.as_mut()
-        {
-            sockopt.dialer_proxy.clear();
-        }
         self.stream.enforce_invariants();
     }
 
@@ -832,6 +845,11 @@ impl OutboundModel {
     pub fn to_wire(&self, tag: &str) -> Value {
         let mut normalized = self.clone();
         normalized.enforce_invariants();
+        // The retired key is a settings-file fact only: it round-trips
+        // through `servers.json` so the user still sees the profile's state,
+        // and the generated document never carries it (the pinned core
+        // refuses an outbound that does — infra/conf/xray.go:262).
+        normalized.retired_proxy_settings = None;
         normalized.stream.retain_selected_stream_blocks_for_wire();
         let mut value = serde_json::to_value(&normalized).expect(
             "model serialization is infallible: the OutboundModel subtree serializes with \
@@ -853,8 +871,8 @@ impl Serialize for OutboundModel {
         if !self.stream.is_default() {
             m.serialize_entry("streamSettings", &self.stream)?;
         }
-        if let Some(t) = &self.proxy_tag {
-            m.serialize_entry("proxySettings", &serde_json::json!({ "tag": t }))?;
+        if let Some(raw) = &self.retired_proxy_settings {
+            m.serialize_entry("proxySettings", raw)?;
         }
         if let Some(v) = &self.send_through {
             m.serialize_entry("sendThrough", v)?;
@@ -870,20 +888,6 @@ impl Serialize for OutboundModel {
         }
         m.end()
     }
-}
-
-/// The wire shape of `proxySettings` (infra/conf/xray.go `ProxyConfig`): a
-/// single `tag` string naming the outbound this one dials through. Every
-/// other envelope field (`settings`, `streamSettings`, `mux`) is fatal when
-/// malformed, so this one is too instead of consuming and dropping the value:
-/// Go binds `Tag`/`tag` case-insensitively, so silently ignoring a
-/// case-variant or wrong-typed key would change the dial chain without
-/// telling the user.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProxySettingsWire {
-    #[serde(default)]
-    tag: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for OutboundModel {
@@ -922,14 +926,27 @@ impl<'de> Deserialize<'de> for OutboundModel {
         // express it is fatal with the field path (the sibling fields above
         // follow the same rule), never consumed and dropped. JSON `null` is
         // the Go zero shape — an absent pointer field — so it stays legal.
-        let proxy_tag = match take(&mut obj, "proxySettings") {
-            Some(value) => from_value_path::<Option<ProxySettingsWire>>(value)
-                .map_err(|error| {
-                    serde::de::Error::custom(format!("invalid proxySettings: {error}"))
-                })?
-                .and_then(|settings| settings.tag),
-            None => None,
-        };
+        //
+        // `proxySettings` is the exception: Xray's outbound build refuses a
+        // configuration that carries it (infra/conf/xray.go:262, `outbound
+        // "proxySettings"` → `"streamSettings.sockopt.dialerProxy"`), so the
+        // key never fails the load — the profile is marked instead. Its raw
+        // value is kept so the settings file round-trips the key unchanged
+        // (nothing is migrated) while the gate stands. The value takes any
+        // JSON shape (`json.RawMessage` upstream is not validated), and Go
+        // binds the name case-insensitively: the first case variant is kept
+        // and every other is dropped, so none can survive as an unknown key.
+        let mut retired_proxy_settings = None;
+        obj.retain(|key, value| {
+            if key.eq_ignore_ascii_case("proxySettings") {
+                if retired_proxy_settings.is_none() {
+                    retired_proxy_settings = Some(value.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
         let send_through = match take(&mut obj, "sendThrough") {
             Some(value) => from_value_path::<Option<String>>(value).map_err(|error| {
                 serde::de::Error::custom(format!("invalid sendThrough: {error}"))
@@ -951,7 +968,7 @@ impl<'de> Deserialize<'de> for OutboundModel {
             protocol,
             settings,
             stream,
-            proxy_tag,
+            retired_proxy_settings,
             send_through,
             target_strategy,
             mux,
@@ -1310,23 +1327,9 @@ mod tests {
         assert!(mux_error.contains("mux"), "{mux_error}");
         assert!(mux_error.contains("concurrency"), "{mux_error}");
 
-        // The three dial-policy fields are fatal on a shape that cannot
-        // express them, exactly like the envelope fields above — including a
-        // case-variant `proxySettings.tag` key, which Go's case-insensitive
-        // unmarshal would bind and the model would otherwise drop silently.
+        // The two dial-policy fields are fatal on a shape that cannot
+        // express them, exactly like the envelope fields above.
         for (fixture, field) in [
-            (
-                json!({"protocol": "freedom", "proxySettings": "srv-x"}),
-                "proxySettings",
-            ),
-            (
-                json!({"protocol": "freedom", "proxySettings": {"tag": 7}}),
-                "proxySettings",
-            ),
-            (
-                json!({"protocol": "freedom", "proxySettings": {"Tag": "srv-x"}}),
-                "proxySettings",
-            ),
             (
                 json!({"protocol": "freedom", "sendThrough": 7}),
                 "sendThrough",
@@ -1348,27 +1351,106 @@ mod tests {
     }
 
     #[test]
+    fn retired_proxy_settings_key_round_trips_in_settings_and_never_reaches_the_wire() {
+        // Xray's outbound build refuses a configuration that carries
+        // `proxySettings` (infra/conf/xray.go:262), and the field upstream is
+        // a `json.RawMessage`: every JSON shape loads and is kept verbatim
+        // for the settings file, while the generated wire never carries it.
+        // Go binds the name case-insensitively, so case variants are caught
+        // too.
+        for (fixture, key) in [
+            (json!({"tag": "srv-x"}), "proxySettings"),
+            (json!("srv-x"), "proxySettings"),
+            (json!(7), "proxySettings"),
+            (json!(true), "proxySettings"),
+            (json!(["srv-x"]), "proxySettings"),
+            (json!(null), "proxySettings"),
+            (json!({"tag": 7, "extra": {"keep": 1}}), "ProxySettings"),
+            (json!("srv-x"), "proxysettings"),
+        ] {
+            let mut object = serde_json::Map::new();
+            object.insert("protocol".into(), json!("freedom"));
+            object.insert("futureKey".into(), json!("kept"));
+            object.insert(key.into(), fixture.clone());
+            let model: OutboundModel = serde_json::from_value(serde_json::Value::Object(object))
+                .unwrap_or_else(|error| panic!("{key} = {fixture} must load: {error}"));
+
+            assert_eq!(
+                model.retired_proxy_settings.as_ref(),
+                Some(&fixture),
+                "the raw value must be kept ({key} = {fixture})"
+            );
+            assert_eq!(
+                model.extra.keys().collect::<Vec<_>>(),
+                vec!["futureKey"],
+                "the key must not survive as an unknown key ({key} = {fixture})"
+            );
+
+            // The settings file keeps the key exactly as loaded, so an
+            // unrelated save cannot silently drop the user's chain.
+            let persisted = serde_json::to_value(&model).expect("model serializes");
+            assert_eq!(
+                persisted.get("proxySettings"),
+                Some(&fixture),
+                "the settings file must round-trip the key ({key} = {fixture})"
+            );
+            assert_eq!(
+                persisted.get("futureKey"),
+                Some(&json!("kept")),
+                "an unknown sibling must survive ({key} = {fixture})"
+            );
+            let reloaded: OutboundModel =
+                serde_json::from_value(persisted).expect("the persisted model reloads");
+            assert_eq!(reloaded.retired_proxy_settings.as_ref(), Some(&fixture));
+
+            // The generated outbound never carries it.
+            let wire = model.to_wire("srv-01234567");
+            assert!(
+                wire.get("proxySettings").is_none(),
+                "the wire must not carry the key ({key} = {fixture}): {wire}"
+            );
+            assert_eq!(wire.get("futureKey"), Some(&json!("kept")));
+        }
+
+        // Several case variants: the first value is kept, the rest never
+        // survive anywhere.
+        let mixed = serde_json::json!({
+            "protocol": "freedom",
+            "ProxySettings": {"tag": "first"},
+            "proxySettings": {"tag": "second"}
+        });
+        let model: OutboundModel = serde_json::from_value(mixed).expect("mixed case variants load");
+        assert_eq!(
+            model.retired_proxy_settings.as_ref(),
+            Some(&json!({"tag": "first"}))
+        );
+        let persisted = serde_json::to_value(&model).expect("model serializes");
+        assert_eq!(
+            persisted.get("proxySettings"),
+            Some(&json!({"tag": "first"}))
+        );
+        assert!(persisted.get("ProxySettings").is_none());
+    }
+
+    #[test]
     fn envelope_dial_fields_accept_their_wire_shapes() {
         let model: OutboundModel = serde_json::from_value(json!({
             "protocol": "freedom",
-            "proxySettings": {"tag": "srv-x"},
             "sendThrough": "192.0.2.7",
             "targetStrategy": "useip"
         }))
         .unwrap();
-        assert_eq!(model.proxy_tag.as_deref(), Some("srv-x"));
+        assert!(model.retired_proxy_settings.is_none());
         assert_eq!(model.send_through.as_deref(), Some("192.0.2.7"));
         assert_eq!(model.target_strategy.as_deref(), Some("useip"));
 
-        // JSON `null` is Go's nil pointer for all three: absent, not an error.
+        // JSON `null` is Go's nil pointer for both: absent, not an error.
         let absent: OutboundModel = serde_json::from_value(json!({
             "protocol": "freedom",
-            "proxySettings": null,
             "sendThrough": null,
             "targetStrategy": null
         }))
         .unwrap();
-        assert!(absent.proxy_tag.is_none());
         assert!(absent.send_through.is_none());
         assert!(absent.target_strategy.is_none());
     }

@@ -1,7 +1,7 @@
 //! Servers screen: profile list with latency badges on the
 //! left, tabbed full-coverage outbound editor on the right. Covers all 12
 //! protocols, all 7 transports, TLS/REALITY, mux, and the advanced envelope
-//! (sendThrough / targetStrategy / proxySettings.tag / finalmask / sockopt).
+//! (sendThrough / targetStrategy / finalmask / sockopt).
 
 use base64::Engine as _;
 use std::fmt::Write as _;
@@ -63,10 +63,10 @@ use validators::{
     v_vless_encryption_required, v_wg_key,
 };
 
-/// Editor-selectable uTLS fingerprint options, in display order — the
-/// canonical model vocabulary's editor table (src/model/fingerprint.rs),
-/// which excludes the wire-only names the editor has never offered. The
-/// REALITY context filters out its two rejected names at the call sites
+/// Editor-selectable uTLS fingerprint options for the TLS and realm-TLS
+/// combos, in display order — the canonical model vocabulary's editor table
+/// (src/model/fingerprint.rs), which excludes the wire-only names the editor
+/// has never offered. The REALITY combo offers its own trimmed option set
 /// ([`fingerprint_allowed`]).
 const FINGERPRINTS: &[&str] = crate::model::fingerprint::FINGERPRINTS;
 const TARGET_STRATEGIES: &[&str] = &[
@@ -145,12 +145,6 @@ fn server_reference_paths(
         } else {
             profile.name.clone()
         };
-        if profile.outbound.proxy_tag.as_deref() == Some(tag.as_str()) {
-            references.push(format!(
-                "servers[{}] ({label}).proxySettings.tag",
-                index + 1
-            ));
-        }
         if profile
             .outbound
             .stream
@@ -476,26 +470,22 @@ fn editor_validation_errors(
 
     // `sendThrough` is a model rule now (validate_outbound, rendered in the
     // loop above); the inline field hint below calls the same predicate.
-    if profile.outbound.proxy_tag.is_some()
-        && stream
-            .sockopt
-            .as_ref()
-            .is_some_and(|sockopt| !sockopt.dialer_proxy.is_empty())
-    {
-        errors.push(t(lang, Key::SrvProxyTagDialerProxyConflict).into());
-    }
     (errors, warnings, inline_errors)
 }
 
-/// Editor combo membership for one fingerprint value: the canonical
-/// vocabulary's editor table (`src/model/fingerprint.rs`), minus the two
-/// names REALITY never offers. This filters which options the combo lists —
-/// validation itself is the model pass (the fingerprint codes) and the
-/// inline verdict in [`fingerprint_editor`] uses the same wire predicates
-/// the model runs.
+/// Editor combo membership for one fingerprint value: the TLS and realm-TLS
+/// combos list the canonical vocabulary's editor table
+/// (`src/model/fingerprint.rs`); the REALITY combo lists only
+/// [`REALITY_EDITOR_OPTIONS`](crate::model::fingerprint::REALITY_EDITOR_OPTIONS),
+/// the empty default plus the browser names upstream's own tests exercise.
+/// This filters which options the combo lists — validation itself is the
+/// model pass (the fingerprint codes) and the inline verdict in
+/// [`fingerprint_editor`] uses the same wire predicates the model runs, so a
+/// stored name outside the option set still displays and round-trips
+/// unchanged.
 fn fingerprint_allowed(name: &str, reality: bool) -> bool {
     if reality {
-        crate::model::fingerprint::reality_editor_supported(name)
+        crate::model::fingerprint::REALITY_EDITOR_OPTIONS.contains(&name)
     } else {
         crate::model::fingerprint::FINGERPRINTS.contains(&name)
     }
@@ -508,7 +498,10 @@ fn fingerprint_allowed(name: &str, reality: bool) -> bool {
 /// `unsafe`/`hellogolang`), or the finalmask realm-TLS block
 /// (`FinalmaskRealmFingerprintUnknown`). The inline hint renders that code's
 /// own message (the single i18n text), so the combo can never disagree with
-/// the model about a loaded value.
+/// the model about a loaded value. The REALITY context additionally shows
+/// the `RealityFingerprintUntested` advisory for a wire-valid value outside
+/// the known-good set the combo offers — amber, never a gate, with the same
+/// message the editor's warnings list renders.
 fn fingerprint_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -551,6 +544,16 @@ fn fingerprint_editor(
                 changed = true;
             }
         });
+    } else if reality && crate::model::fingerprint::reality_fingerprint_outside_known_good(v) {
+        // Advisory verdict (Severity::Warning, never a gate): the wire
+        // accepts the name and the profile keeps it, but upstream's REALITY
+        // scenarios exercise only the known-good three, so the field shows
+        // the same model message the editor's warnings list renders.
+        let stored: &dyn std::fmt::Display = v;
+        ui.colored_label(
+            status_colors_of(ui).warn,
+            t_fmt(lang, Key::OutboundRealityFingerprintUntested, &[stored]),
+        );
     }
     changed
 }
@@ -581,49 +584,6 @@ fn opt_combo_str(
                     let sel = v.as_deref() == Some(*opt);
                     if ui.selectable_label(sel, *opt).clicked() {
                         *v = Some((*opt).to_string());
-                        changed = true;
-                    }
-                }
-            });
-    });
-    changed
-}
-
-/// The `proxySettings.tag (chain via)` combo: every other profile's
-/// `srv-<id8>` tag, drawn from the memoized [`AdvancedTagOptions`] entries —
-/// the popup iterates the cached rows, so idle (popup-closed) frames pay
-/// nothing beyond the shared memo lookup. Mirrors
-/// [`opt_combo_str`]'s row semantics, including "(unset)".
-fn proxy_tag_combo(
-    ui: &mut egui::Ui,
-    lang: Language,
-    v: &mut Option<String>,
-    own_id: &str,
-    entries: &[(String, String)],
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(t(lang, Key::SrvProxySettingsTagChainVia));
-        let shown = v.as_deref().unwrap_or_else(|| t(lang, Key::SrvUnset));
-        egui::ComboBox::from_id_salt(ui.auto_id_with(t(lang, Key::SrvProxySettingsTagChainVia)))
-            .selected_text(shown)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(v.is_none(), t(lang, Key::SrvUnset))
-                    .clicked()
-                {
-                    *v = None;
-                    changed = true;
-                }
-                for (id, tag) in entries {
-                    if id == own_id {
-                        continue;
-                    }
-                    if ui
-                        .selectable_label(v.as_deref() == Some(tag.as_str()), tag.as_str())
-                        .clicked()
-                    {
-                        *v = Some(tag.clone());
                         changed = true;
                     }
                 }
@@ -794,25 +754,18 @@ fn tcp_fast_open_editor(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SockoptUsage {
-    Stream { proxy_tag_set: bool },
+    Stream,
     EchDnsQuery,
 }
 
 impl SockoptUsage {
-    /// The stream block's usage tag where only the wire path matters (the
-    /// memoized validation sweep): the dialer-proxy hint is a render-time
-    /// concern.
-    const STREAM: Self = Self::Stream {
-        proxy_tag_set: false,
-    };
-
     /// The wire path prefix the block's findings are scoped with. The ECH
     /// DNS-query block lives under the TLS settings, not `stream.sockopt`
     /// (the model's `validate_outbound` sweep scopes it the same way), so
     /// the inline verdict names the field the user can actually find.
     fn path_prefix(self) -> &'static str {
         match self {
-            Self::Stream { .. } => "stream.sockopt",
+            Self::Stream => "stream.sockopt",
             Self::EchDnsQuery => "stream.tlsSettings.echSockopt",
         }
     }
@@ -837,27 +790,6 @@ fn sockopt_editor(
         false,
     );
     changed |= widgets::text_field(ui, "dialerProxy", &mut sockopt.dialer_proxy, "outbound tag");
-    if matches!(
-        usage,
-        SockoptUsage::Stream {
-            proxy_tag_set: true
-        }
-    ) && !sockopt.dialer_proxy.is_empty()
-    {
-        ui.horizontal(|ui| {
-            ui.colored_label(
-                status_colors_of(ui).err,
-                t(lang, Key::SrvDialerProxyConflict),
-            );
-            if ui
-                .small_button(t(lang, Key::SrvRemoveDialerProxy))
-                .clicked()
-            {
-                sockopt.dialer_proxy.clear();
-                changed = true;
-            }
-        });
-    }
     changed |= widgets::text_field(
         ui,
         t(lang, Key::SrvInterfaceBindNic),
@@ -962,7 +894,7 @@ fn sockopt_editor(
         });
 
     match usage {
-        SockoptUsage::Stream { .. } => {
+        SockoptUsage::Stream => {
             changed |= widgets::opt_bool(
                 ui,
                 t(lang, Key::SrvPenetrateInherit),
@@ -1529,29 +1461,14 @@ struct AddDraftValidationCache {
     changed_from_source: bool,
 }
 
-/// The Advanced tab's proxy-tag options: the `proxySettings.tag (chain via)`
-/// rows (every profile's `srv-<id8>` tag). Rebuilt only when the profile-set
-/// signal `(config_revision, dirty, profile count)` advances — never on idle
-/// repaint frames. The draft's own row is excluded when the
-/// popup renders, not here: the existing-draft editor and the add-draft
-/// dialog (both renderable in one frame) exclude different profiles.
-struct AdvancedTagOptions {
-    generation: (u64, bool, usize),
-    /// (profile id, tag) for every profile, in list order.
-    entries: Vec<(String, String)>,
-}
-
 /// Trailing context for [`ServersScreen::advanced_tab`]:
-/// the profile-set signal the tag options memoize on, the memoized finalmask
-/// verdicts, the memoized `stream.sockopt` verdict, and the per-editor raw
-/// JSON/PEM buffers plus metrics. Bundled so the tab stays under clippy's
-/// argument-count ceiling without a lint suppression (zero-suppression repo
-/// contract).
+/// the memoized finalmask verdicts, the memoized `stream.sockopt` verdict,
+/// and the per-editor raw JSON/PEM buffers plus metrics. Bundled so the tab
+/// stays under clippy's argument-count ceiling without a lint suppression
+/// (zero-suppression repo contract).
 struct AdvancedTabCtx<'a> {
-    set_key: (u64, bool, usize),
     finalmask_errors: &'a [String],
     stream_sockopt_errors: &'a [String],
-    tag_options: &'a mut Option<AdvancedTagOptions>,
     finalmask_raw: &'a mut std::collections::HashMap<egui::Id, JsonBuf>,
     pem_buffers: &'a mut std::collections::HashMap<egui::Id, PemBuf>,
     metrics: &'a MetricsHandle,
@@ -1581,7 +1498,7 @@ fn sockopt_error_messages(lang: Language, profile: &ServerProfile) -> (Vec<Strin
     let stream_errors = stream
         .sockopt
         .as_ref()
-        .map(|sockopt| sockopt_validation_errors(lang, sockopt, SockoptUsage::STREAM))
+        .map(|sockopt| sockopt_validation_errors(lang, sockopt, SockoptUsage::Stream))
         .unwrap_or_default();
     // Only the TLS security mode renders the ECH block, mirroring the model
     // sweep's condition in `validate_outbound`.
@@ -1614,6 +1531,19 @@ fn existing_changed_from_source(
             .unwrap_or(true),
         None => false,
     }
+}
+
+/// The chain target the draft was loaded with: the dial-through tag the
+/// committed profile carried (`streamSettings.sockopt.dialerProxy`), read
+/// from the draft's serialized source. `None` when the source had none.
+fn source_chain_target(source: &serde_json::Value) -> Option<&str> {
+    source
+        .get("outbound")?
+        .get("streamSettings")?
+        .get("sockopt")?
+        .get("dialerProxy")?
+        .as_str()
+        .filter(|tag| !tag.is_empty())
 }
 
 /// The existing draft's uncommitted state: the draft differs from its source
@@ -1779,9 +1709,6 @@ pub struct ServersScreen {
     add_draft: Option<ServerProfile>,
     add_draft_generation: u64,
     add_draft_validation_cache: Option<AddDraftValidationCache>,
-    /// Advanced-tab proxy-tag options, rebuilt only when the profile-set
-    /// signal changes — see [`AdvancedTagOptions`].
-    advanced_tag_options: Option<AdvancedTagOptions>,
     import_open: bool,
     import_text: String,
     import_parsed: Vec<Result<ServerProfile, links::LinkError>>,
@@ -3814,16 +3741,9 @@ impl ServersScreen {
                             ui,
                             lang,
                             &mut draft.profile,
-                            ctx.servers.profiles.as_slice(),
                             AdvancedTabCtx {
-                                set_key: (
-                                    ctx.config_revision,
-                                    *ctx.dirty,
-                                    ctx.servers.profiles.len(),
-                                ),
                                 finalmask_errors,
                                 stream_sockopt_errors,
-                                tag_options: &mut self.advanced_tag_options,
                                 finalmask_raw: &mut self.finalmask_raw,
                                 pem_buffers: &mut self.pem_buffers,
                                 metrics: ctx.metrics,
@@ -3833,6 +3753,15 @@ impl ServersScreen {
                 };
             });
         if changed {
+            // The retired `proxySettings` key needs a chain decision, not any
+            // edit: the profile stops gating when its chain target differs
+            // from the loaded source's, or when the user dismisses the key on
+            // the finding row. An unrelated edit (a rename, a port) leaves
+            // the gate in place, so a save can never drop a chain the user
+            // never looked at.
+            if draft.profile.chain_target() != source_chain_target(&draft.source) {
+                draft.profile.outbound.retired_proxy_settings = None;
+            }
             draft.generation = draft.generation.wrapping_add(1);
             self.profile_validation_report = None;
         }
@@ -3848,6 +3777,7 @@ impl ServersScreen {
         let validation_warnings = &cached.validation_warnings;
         let changed_from_source = cached.changed_from_source;
 
+        let mut dismissed_retired_key = false;
         if !validation_errors.is_empty() {
             ui.separator();
             ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvFixBeforeValidate));
@@ -3865,6 +3795,18 @@ impl ServersScreen {
                         );
                     }
                 });
+            // The retired `proxySettings` finding's other way out: a user who
+            // wants no chain at all drops the key here instead of setting a
+            // target. The note states what that costs, and the control is the
+            // finding row's own — it never appears for any other rule.
+            if draft.profile.outbound.retired_proxy_settings.is_some() {
+                ui.horizontal(|ui| {
+                    ui.weak(t(lang, Key::SrvRemoveProxySettingsKeyNote));
+                    if ui.button(t(lang, Key::SrvRemoveProxySettingsKey)).clicked() {
+                        dismissed_retired_key = true;
+                    }
+                });
+            }
         }
         // Configuration warnings render amber under their own header;
         // unlike the error block above they never gate Validate-and-save.
@@ -3925,6 +3867,14 @@ impl ServersScreen {
                 ui.weak(t(lang, Key::SrvValidatingXrayTest));
             }
         });
+        // Dismissing the retired key changes the draft without touching any
+        // field: the next frame's sweep drops the finding, and the next save
+        // writes the profile without the key.
+        if dismissed_retired_key {
+            draft.profile.outbound.retired_proxy_settings = None;
+            draft.generation = draft.generation.wrapping_add(1);
+            self.profile_validation_report = None;
+        }
         // The whole-profile snapshot is needed only when the user actually
         // clicks "Validate and save", not on every repaint.
         let validation_profile = validate_clicked.then(|| draft.profile.clone());
@@ -5840,14 +5790,11 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         p: &mut ServerProfile,
-        profiles: &[ServerProfile],
         ctx: AdvancedTabCtx<'_>,
     ) -> bool {
         let AdvancedTabCtx {
-            set_key,
             finalmask_errors,
             stream_sockopt_errors,
-            tag_options,
             finalmask_raw,
             pem_buffers,
             metrics,
@@ -5858,24 +5805,6 @@ impl ServersScreen {
         // it per frame, and cloning the 36-char String would allocate on
         // every repaint of the Advanced tab.
         let key = p.id.as_str();
-        // The proxy-tag options (the other profiles' tags) memoize on the
-        // profile-set signal: idle frames reuse the cached snapshot, and a
-        // rebuild costs O(profiles) only when the set actually changed.
-        if !matches!(tag_options, Some(cached) if cached.generation == set_key) {
-            let entries = profiles
-                .iter()
-                .map(|profile| (profile.id.clone(), profile.tag()))
-                .collect();
-            metrics.bump_work(WorkCounter::AdvancedTagRebuilds);
-            *tag_options = Some(AdvancedTagOptions {
-                generation: set_key,
-                entries,
-            });
-        }
-        let tag_entries: &[(String, String)] = tag_options
-            .as_ref()
-            .map(|cached| cached.entries.as_slice())
-            .unwrap_or(&[]);
 
         widgets::section(ui, t(lang, Key::SrvEnvelope), |ui| {
             changed |= opt_string(
@@ -5907,7 +5836,6 @@ impl ServersScreen {
                 &mut o.target_strategy,
                 TARGET_STRATEGIES,
             );
-            changed |= proxy_tag_combo(ui, lang, &mut o.proxy_tag, p.id.as_str(), tag_entries);
         });
 
         widgets::section(ui, t(lang, Key::SrvFinalmask), |ui| {
@@ -6114,9 +6042,7 @@ impl ServersScreen {
                 ui,
                 lang,
                 &mut sockopt,
-                SockoptUsage::Stream {
-                    proxy_tag_set: o.proxy_tag.is_some(),
-                },
+                SockoptUsage::Stream,
                 stream_sockopt_errors,
             );
             if had_sockopt || !sockopt.is_empty() {
@@ -6238,16 +6164,9 @@ impl ServersScreen {
                                     ui,
                                     lang,
                                     &mut draft,
-                                    uictx.servers.profiles.as_slice(),
                                     AdvancedTabCtx {
-                                        set_key: (
-                                            uictx.config_revision,
-                                            *uictx.dirty,
-                                            uictx.servers.profiles.len(),
-                                        ),
                                         finalmask_errors,
                                         stream_sockopt_errors,
-                                        tag_options: &mut self.advanced_tag_options,
                                         finalmask_raw: &mut self.finalmask_raw,
                                         pem_buffers: &mut self.pem_buffers,
                                         metrics: uictx.metrics,
@@ -6978,9 +6897,10 @@ mod tests {
         sockopt_validation_errors, status_colors_of, status_toast_expired,
     };
     use crate::diag::{Diag, DiagError};
-    use crate::i18n::{Key, t};
+    use crate::i18n::{Key, t, t_fmt, validation_message};
     use crate::links;
     use crate::metrics::MetricsHandle;
+    use crate::model::validation::ValidationCode;
     use crate::model::{
         CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskTcpItem,
         FinalmaskTcpMask, FreedomFinalRule, Network, Noise, OutboundModel, Protocol,
@@ -7333,18 +7253,141 @@ TLS ping finished"#;
     }
 
     #[test]
-    fn reality_fingerprints_exclude_exactly_the_two_core_rejections() {
-        assert!(
-            FINGERPRINTS
-                .iter()
-                .all(|fingerprint| fingerprint_allowed(fingerprint, false))
-        );
-        let rejected = FINGERPRINTS
+    fn reality_fingerprint_options_are_the_trimmed_known_good_set() {
+        use crate::model::fingerprint::REALITY_EDITOR_OPTIONS;
+        // The REALITY combo filters the same candidate table the TLS combos
+        // use down to the trimmed option set; the visible list equals the
+        // option set, so every option is reachable and nothing else leaks in.
+        let offered = FINGERPRINTS
             .iter()
             .copied()
-            .filter(|fingerprint| !fingerprint_allowed(fingerprint, true))
+            .filter(|name| fingerprint_allowed(name, true))
             .collect::<Vec<_>>();
-        assert_eq!(rejected, vec!["unsafe", "hellogolang"]);
+        assert_eq!(offered, REALITY_EDITOR_OPTIONS);
+        // The TLS and realm-TLS contexts keep the full editor table,
+        // including every name the REALITY trim dropped.
+        for &name in FINGERPRINTS {
+            assert!(fingerprint_allowed(name, false), "TLS combo hides {name:?}");
+        }
+        for name in ["ios", "edge", "qq", "randomized"] {
+            assert!(fingerprint_allowed(name, false));
+            assert!(
+                !fingerprint_allowed(name, true),
+                "the REALITY combo must not offer {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reality_fingerprint_combo_keeps_a_stored_name_outside_the_option_set() {
+        // A profile that already stores a dropped name must show it and save
+        // it untouched: the trimmed combo never blanks or rewrites a loaded
+        // value.
+        for stored in ["ios", "edge", "qq"] {
+            let stream = Rc::new(RefCell::new(StreamModel {
+                security: Security::Reality,
+                reality_settings: Some(RealityModel {
+                    fingerprint: stored.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            let before = serde_json::to_value(&*stream.borrow()).unwrap();
+            let stream_for_ui = Rc::clone(&stream);
+            let screen = Rc::new(RefCell::new(ServersScreen::default()));
+            let screen_for_ui = Rc::clone(&screen);
+            let changed = Rc::new(RefCell::new(false));
+            let changed_for_ui = Rc::clone(&changed);
+            let mut harness = Harness::new_ui(move |ui| {
+                *changed_for_ui.borrow_mut() = screen_for_ui.borrow_mut().security_tab(
+                    ui,
+                    Language::En,
+                    None,
+                    &mut stream_for_ui.borrow_mut(),
+                    None,
+                    &[],
+                );
+            });
+            harness.run();
+            assert!(
+                harness
+                    .get_all_by_role(egui::accesskit::Role::ComboBox)
+                    .into_iter()
+                    .any(|node| node.value().as_deref() == Some(stored)),
+                "the REALITY combo must display the stored fingerprint {stored:?}"
+            );
+            assert!(
+                !*changed.borrow(),
+                "an untouched frame must not report an edit for {stored:?}"
+            );
+            drop(harness);
+            assert_eq!(
+                serde_json::to_value(&*stream.borrow()).unwrap(),
+                before,
+                "saving a profile must not rewrite {stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reality_fingerprint_combo_lists_only_the_trimmed_options() {
+        use crate::model::fingerprint::REALITY_EDITOR_OPTIONS;
+        use egui_kittest::kittest::NodeT as _;
+        let stream = Rc::new(RefCell::new(StreamModel {
+            security: Security::Reality,
+            reality_settings: Some(RealityModel {
+                fingerprint: "ios".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().security_tab(
+                ui,
+                Language::En,
+                None,
+                &mut stream_for_ui.borrow_mut(),
+                None,
+                &[],
+            );
+        });
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some("ios"))
+            .expect("the REALITY combo shows the stored fingerprint")
+            .click();
+        harness.run();
+        // The open popup's option rows are buttons; every row that names a
+        // canonical fingerprint must be one of the trimmed options, and the
+        // stored value itself is displayed, never offered.
+        let rows = harness
+            .root()
+            .children_recursive()
+            .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
+            .filter_map(|node| node.accesskit_node().label())
+            .collect::<Vec<_>>();
+        let default = t(Language::En, Key::SrvDefault);
+        for &option in REALITY_EDITOR_OPTIONS {
+            let label = if option.is_empty() { default } else { option };
+            assert!(
+                rows.iter().any(|row| row == label),
+                "the REALITY popup must offer {option:?}"
+            );
+        }
+        for &name in FINGERPRINTS {
+            if name.is_empty() {
+                continue;
+            }
+            assert!(
+                !rows.iter().any(|row| row == name) || REALITY_EDITOR_OPTIONS.contains(&name),
+                "the REALITY popup offers {name:?} outside the trimmed option set"
+            );
+        }
     }
 
     #[test]
@@ -8068,13 +8111,13 @@ TLS ping finished"#;
 
     #[test]
     fn row_probe_button_includes_chain_dependencies_in_the_child() {
-        // A profile chaining via proxySettings.tag references another
+        // A profile chaining via sockopt.dialerProxy references another
         // profile's outbound tag; the isolated probe child must contain the
         // whole chain or the core refuses to start.
         let mut rig = UiTestRig::default();
         let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
-        tokyo.outbound.proxy_tag = Some(osaka.tag());
+        tokyo.outbound.chain_via(osaka.tag());
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
         let mut harness = Harness::new_ui_state(
@@ -8327,7 +8370,7 @@ TLS ping finished"#;
             ..Default::default()
         };
         let before = serde_json::to_value(&modeled).unwrap();
-        let errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::STREAM);
+        let errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream);
         assert!(errors.iter().any(|error| error.contains("domainStrategy")));
         assert!(errors.iter().any(|error| error.contains("tcpFastOpen")));
         assert!(errors.iter().any(|error| error.contains("opposite signs")));
@@ -8364,7 +8407,7 @@ TLS ping finished"#;
             tcp_fast_open: Some(json!(12.75)),
             ..Default::default()
         };
-        assert!(sockopt_validation_errors(Language::En, &modeled, SockoptUsage::STREAM).is_empty());
+        assert!(sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream).is_empty());
 
         let rendered = Rc::new(RefCell::new(Some(modeled)));
         let rendered_for_ui = Rc::clone(&rendered);
@@ -8388,7 +8431,7 @@ TLS ping finished"#;
             domain_strategy: "future-strategy".into(),
             ..Default::default()
         };
-        let stream_errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::STREAM);
+        let stream_errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream);
         assert!(
             stream_errors
                 .iter()
@@ -8919,6 +8962,102 @@ TLS ping finished"#;
         }
     }
 
+    /// A stored REALITY fingerprint outside the known-good set renders the
+    /// advisory inline under its combo — amber and never blocking — while
+    /// the empty default and the three known-good names render nothing and
+    /// `unsafe` keeps its blocking message alone.
+    #[test]
+    fn security_tab_warns_inline_for_a_reality_fingerprint_outside_the_known_good_set() {
+        let advisory = t_fmt(
+            Language::En,
+            Key::OutboundRealityFingerprintUntested,
+            &[&"ios"],
+        );
+        let mut stream = StreamModel {
+            security: Security::Reality,
+            reality_settings: Some(RealityModel {
+                fingerprint: "ios".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(|ui| {
+            let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(advisory.as_str()).is_some(),
+            "a wire-valid REALITY fingerprint outside the known-good set must show the advisory"
+        );
+        drop(harness);
+
+        for fingerprint in ["", "chrome", "firefox", "safari", "Chrome"] {
+            stream.reality_settings.as_mut().unwrap().fingerprint = fingerprint.into();
+            let mut harness = Harness::new_ui(|ui| {
+                let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
+            });
+            harness.run();
+            assert!(
+                harness.query_by_label(advisory.as_str()).is_none(),
+                "REALITY fingerprint {fingerprint:?} must not show the advisory"
+            );
+        }
+
+        // `unsafe` stays a conf-load Error: its message renders and the
+        // advisory never joins it.
+        stream.reality_settings.as_mut().unwrap().fingerprint = "unsafe".into();
+        let blocking =
+            validation_message(&ValidationCode::RealityFingerprintUnsupported, Language::En);
+        let mut harness = Harness::new_ui(|ui| {
+            let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(blocking).is_some(),
+            "unsafe must keep its blocking message"
+        );
+        assert!(
+            harness.query_by_label(advisory.as_str()).is_none(),
+            "the advisory must never accompany the blocking finding"
+        );
+    }
+
+    /// The advisory rides the editor sweep's warning half — what the
+    /// editor's warnings list renders — and never the blocking half, so a
+    /// profile the core accepts stays validatable and saveable.
+    #[test]
+    fn reality_fingerprint_advisory_rides_the_editor_warning_half() {
+        let mut profile =
+            ServerProfile::new("ios-fingerprint", OutboundModel::new(Protocol::Vless));
+        {
+            let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
+                unreachable!("Vless is the default protocol");
+            };
+            settings.address = "example.com".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.encryption = "none".into();
+        }
+        let _ = profile.outbound.stream.select_security(Security::Reality);
+        profile.outbound.stream.reality_settings = Some(RealityModel {
+            fingerprint: "ios".into(),
+            password: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into(),
+            ..Default::default()
+        });
+        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        assert!(
+            errors.is_empty(),
+            "a wire-valid fingerprint must not block: {errors:#?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].starts_with("stream.realitySettings.fingerprint: ")
+                && warnings[0].contains("ios"),
+            "{warnings:#?}"
+        );
+    }
+
     #[test]
     fn info_hints_render_under_security_tab_rows() {
         // Static informational copy (no validation, no gating): the
@@ -9083,12 +9222,8 @@ TLS ping finished"#;
         }
 
         let mut profile = ServerProfile::new("advanced", OutboundModel::new(Protocol::Freedom));
-        profile.outbound.proxy_tag = Some("chain".into());
         profile.outbound.stream.finalmask = Some(FinalmaskModel::default());
-        profile.outbound.stream.sockopt = Some(SockoptModel {
-            dialer_proxy: "dialer".into(),
-            ..Default::default()
-        });
+        profile.outbound.chain_via("dialer");
         let before = serde_json::to_value(&profile).unwrap();
         let mut screen = ServersScreen {
             tab: EditorTab::Advanced,
@@ -9101,12 +9236,9 @@ TLS ping finished"#;
                     ui,
                     Language::En,
                     &mut profile,
-                    &[],
                     AdvancedTabCtx {
-                        set_key: (0, false, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
-                        tag_options: &mut screen.advanced_tag_options,
                         finalmask_raw: &mut screen.finalmask_raw,
                         pem_buffers: &mut screen.pem_buffers,
                         metrics: &crate::metrics::MetricsHandle::new(),
@@ -9695,12 +9827,9 @@ TLS ping finished"#;
                 ui,
                 Language::En,
                 profile,
-                &[],
                 AdvancedTabCtx {
-                    set_key: (0, false, 0),
                     finalmask_errors: &[],
                     stream_sockopt_errors: &[],
-                    tag_options: &mut screen.advanced_tag_options,
                     finalmask_raw: &mut screen.finalmask_raw,
                     pem_buffers: &mut screen.pem_buffers,
                     metrics,
@@ -10739,6 +10868,221 @@ TLS ping finished"#;
         );
     }
 
+    /// A rig whose active profile carries the retired `proxySettings` key in
+    /// the shape a stored file would hold, with a second profile to chain to.
+    fn retired_key_rig() -> (UiTestRig, ServerProfile, ServerProfile) {
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.outbound.retired_proxy_settings = Some(json!({"tag": "srv-exit"}));
+        let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(tokyo.clone());
+        rig.servers.profiles.push(osaka.clone());
+        rig.servers.active = Some(tokyo.id.clone());
+        (rig, tokyo, osaka)
+    }
+
+    /// The draft's blocking list as the editor renders it.
+    fn editor_errors(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> Vec<String> {
+        harness
+            .state()
+            .0
+            .editor_validation_cache
+            .as_ref()
+            .expect("the editor validates the draft")
+            .validation_errors
+            .clone()
+    }
+
+    #[test]
+    fn retired_proxy_settings_finding_lists_the_chain_fix_and_clears_on_a_chain_decision() {
+        // A stored profile from a build that still wrote `proxySettings`:
+        // the editor opens on it (the load does not fail), the blocking list
+        // names the replacement, and the Advanced tab carries exactly one
+        // control for the chain target — the sockopt field.
+        let (rig, _tokyo, osaka) = retired_key_rig();
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        assert!(
+            harness.state().0.existing_draft.is_some(),
+            "a profile with the retired key must stay editable"
+        );
+        assert!(
+            editor_errors(&harness).iter().any(|error| {
+                error.contains("proxySettings")
+                    && error.contains("streamSettings.sockopt.dialerProxy")
+            }),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+
+        harness.get_by_label("Advanced").click();
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label("dialerProxy").count(),
+            1,
+            "exactly one editor control edits the chain target"
+        );
+        assert!(
+            harness
+                .query_by_label("proxySettings.tag (chain via)")
+                .is_none(),
+            "the retired chain combo must be gone"
+        );
+
+        // An unrelated edit (the name) must leave the gate in place: only a
+        // chain decision resolves the retired key.
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.value().as_deref() == Some("Tokyo"))
+            .expect("the name field")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the name field keeps focus")
+            .type_text("-2");
+        harness.run();
+        let state = harness.state();
+        assert!(
+            state
+                .0
+                .existing_draft
+                .as_ref()
+                .expect("the editor stays open")
+                .profile
+                .outbound
+                .retired_proxy_settings
+                .is_some(),
+            "a rename must not dismiss the retired key"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .any(|error| error.contains("proxySettings")),
+            "the finding must survive an unrelated edit"
+        );
+
+        // Setting the target with the chain control is the decision: the key
+        // is dropped from the draft, the finding leaves the blocking list,
+        // and the profile serializes without the key. The name field now
+        // carries text, so the empty input is the dialerProxy field; it sits
+        // at the bottom of the tab, so scroll it into view first.
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.value().as_deref() == Some(""))
+            .expect("the dialerProxy field is the empty input")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.value().as_deref() == Some(""))
+            .expect("the dialerProxy field is the empty input")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the dialerProxy field takes focus")
+            .type_text(&osaka.tag());
+        harness.run();
+        let state = harness.state();
+        let draft = state
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        assert_eq!(
+            draft
+                .profile
+                .outbound
+                .stream
+                .sockopt
+                .as_ref()
+                .map(|sockopt| sockopt.dialer_proxy.as_str()),
+            Some(osaka.tag().as_str()),
+            "the field must edit the chain target"
+        );
+        assert!(
+            draft.profile.outbound.retired_proxy_settings.is_none(),
+            "the chain decision clears the retired key"
+        );
+        let persisted = serde_json::to_value(&draft.profile).expect("the draft serializes");
+        assert!(
+            persisted["outbound"].get("proxySettings").is_none(),
+            "the resolved profile must serialize without the key: {persisted}"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("proxySettings")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+    }
+
+    #[test]
+    fn retired_proxy_settings_dismissal_drops_the_key_without_a_chain() {
+        // A user who wants no chain resolves the finding with the dismissal
+        // control on the finding row: the key is dropped, no field changes,
+        // and the profile serializes without it.
+        let (rig, _tokyo, _osaka) = retired_key_rig();
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        let before = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the draft opens")
+            .profile
+            .clone();
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "Remove the proxySettings key",
+            )
+            .click();
+        harness.run();
+        harness.run();
+        let state = harness.state();
+        let draft = state
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        assert!(
+            draft.profile.outbound.retired_proxy_settings.is_none(),
+            "the dismissal must clear the retired key"
+        );
+        assert_eq!(
+            draft.profile.chain_target(),
+            None,
+            "the dismissal must not invent a chain"
+        );
+        assert_eq!(
+            draft.profile.name, before.name,
+            "the dismissal must not touch other fields"
+        );
+        assert_eq!(
+            draft.profile.outbound.settings.protocol(),
+            before.outbound.settings.protocol()
+        );
+        let persisted = serde_json::to_value(&draft.profile).expect("the draft serializes");
+        assert!(
+            persisted["outbound"].get("proxySettings").is_none(),
+            "the dismissed profile must serialize without the key: {persisted}"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("proxySettings")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+    }
+
     #[test]
     fn add_draft_validation_sweeps_once_per_generation_change_and_never_on_idle_frames() {
         let rig = UiTestRig::default();
@@ -10796,114 +11140,6 @@ TLS ping finished"#;
                 .editor_validation_rebuilds,
             2,
             "idle frames after the add-draft edit must not re-validate"
-        );
-    }
-
-    #[test]
-    fn advanced_proxy_tag_options_rebuild_once_per_set_change_and_never_on_idle_frames() {
-        let mut rig = UiTestRig::default();
-        let alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom));
-        let beta = ServerProfile::new("beta", OutboundModel::new(Protocol::Freedom));
-        rig.servers.profiles.push(alpha.clone());
-        rig.servers.profiles.push(beta.clone());
-        rig.servers.active = Some(alpha.id.clone());
-        // A concrete target strategy keeps the Envelope section's own
-        // strategy combo off "(unset)", so the proxy-tag combo below it is
-        // the only ComboBox showing that value.
-        if let Some(profile) = rig.servers.profiles.iter_mut().find(|p| p.id == alpha.id) {
-            profile.outbound.target_strategy = Some("origin".to_string());
-        }
-        let mut harness = wide_servers_harness(rig);
-        harness.run();
-        harness.get_by_label("Advanced").click();
-        harness.run();
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            1,
-            "the first Advanced frame builds the tag options once"
-        );
-        harness.run();
-        harness.run();
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            1,
-            "idle frames must not rebuild the tag options"
-        );
-        // The popup lists every OTHER profile's tag and nothing of the
-        // edited draft's own.
-        let alpha_tag = alpha.tag();
-        let beta_tag = beta.tag();
-        harness
-            .get_all_by_role(egui::accesskit::Role::ComboBox)
-            .into_iter()
-            .find(|node| node.value().as_deref() == Some(t(Language::En, Key::SrvUnset)))
-            .expect("the proxy-tag combo shows '(unset)'")
-            .click();
-        harness.run();
-        // The open popup's option rows are the only Buttons carrying a tag
-        // label in this frame (row/editor buttons are icons); scan their
-        // accesskit labels rather than values.
-        use egui_kittest::kittest::NodeT as _;
-        let button_labels: Vec<String> = harness
-            .root()
-            .children_recursive()
-            .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
-            .filter_map(|node| node.accesskit_node().label())
-            .collect();
-        assert!(
-            !button_labels.iter().any(|label| label == &alpha_tag),
-            "the edited draft's own tag must not be a proxy-tag option"
-        );
-        assert!(
-            button_labels.iter().any(|label| label == &beta_tag),
-            "another profile's tag must be offered in the popup"
-        );
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, &beta_tag)
-            .click();
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .existing_draft
-                .as_ref()
-                .expect("the editor stays open")
-                .profile
-                .outbound
-                .proxy_tag
-                .as_deref(),
-            Some(beta_tag.as_str()),
-            "clicking another profile's tag must set proxySettings.tag"
-        );
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            1,
-            "choosing an option must not rebuild the cached options"
-        );
-        // One profile-set change (a new profile committed) → exactly one
-        // rebuild; idle frames after it stay quiet.
-        harness
-            .state_mut()
-            .1
-            .servers
-            .profiles
-            .push(ServerProfile::new(
-                "gamma",
-                OutboundModel::new(Protocol::Freedom),
-            ));
-        harness.run();
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            2,
-            "a profile-set change must rebuild the tag options exactly once"
-        );
-        harness.run();
-        harness.run();
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            2,
-            "idle frames after the set change must not rebuild the tag options"
         );
     }
 

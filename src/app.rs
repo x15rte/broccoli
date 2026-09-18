@@ -2455,6 +2455,28 @@ fn show_safety_ack_modal(
     });
 }
 
+/// The index of the first raw-override outbound that carries the retired
+/// `proxySettings` key, when one does. Xray's outbound build refuses a
+/// configuration that carries it (infra/conf/xray.go:262), so the override
+/// must be refused with the same finding the profile model produces — it can
+/// never reach the core. Every case variant counts (Go binds the name
+/// case-insensitively), the value's shape is never inspected, and a
+/// non-array `outbounds` (or a non-object entry) simply carries no outbound
+/// to check.
+fn raw_override_retired_proxy_settings(config: &serde_json::Value) -> Option<usize> {
+    config
+        .get("outbounds")?
+        .as_array()?
+        .iter()
+        .position(|outbound| {
+            outbound.as_object().is_some_and(|outbound| {
+                outbound
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("proxySettings"))
+            })
+        })
+}
+
 /// Raw Override bypasses every typed listener guarantee. Keep it in direct
 /// child mode and prove the exact control plane the runtime will poll before
 /// any candidate is sent.
@@ -2465,6 +2487,17 @@ fn validate_raw_override_candidate(
 ) -> Result<(), String> {
     if settings.raw_override.is_none() {
         return Ok(());
+    }
+    // The retired key is the one thing the override may not carry: the pinned
+    // core fails the whole config build on it, and the profile model reports
+    // the same finding under the same code, so the message is rendered once.
+    if let Some(index) = raw_override_retired_proxy_settings(config) {
+        let issue = crate::model::validation::ValidationIssue {
+            code: crate::model::validation::ValidationCode::OutboundProxySettingsRemoved,
+            path: Some(format!("outbounds[{}]", index + 1)),
+            severity: crate::model::validation::Severity::Error,
+        };
+        return Err(crate::i18n::validation_issue_message(&issue, lang));
     }
     if settings.mode != crate::model::Mode::Off {
         return Err(t(lang, Key::RawOverrideOffMode).into());
@@ -2863,6 +2896,66 @@ mod safety_tests {
                 .unwrap_err()
                 .contains("StatsService")
         );
+    }
+
+    #[test]
+    fn raw_override_carrying_the_retired_key_never_reaches_the_core() {
+        // Story: the raw override stays unrestricted for everything except
+        // the retired `proxySettings` key. Any case variant and any shape is
+        // refused with the same finding the profile model produces, before
+        // the candidate can be written or applied.
+        let settings = Settings {
+            raw_override: Some("{}".into()),
+            ..Default::default()
+        };
+        let mut config = json!({
+            "api": {"tag": "api", "listen": "127.0.0.1:10853", "services": ["StatsService"]},
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+        });
+        for (key, value) in [
+            ("proxySettings", json!({"tag": "srv-y"})),
+            ("ProxySettings", json!("srv-y")),
+            ("proxysettings", json!(7)),
+            ("proxySettings", json!(null)),
+        ] {
+            let mut outbound = serde_json::Map::new();
+            outbound.insert("protocol".into(), json!("vless"));
+            outbound.insert("tag".into(), json!("srv-x"));
+            outbound.insert(key.into(), value.clone());
+            config["outbounds"] = json!([{"protocol": "freedom", "tag": "direct"}, outbound]);
+
+            let message =
+                validate_raw_override_candidate(&settings, &config, Language::En).unwrap_err();
+            assert!(
+                message.contains("outbounds[2]"),
+                "{key} = {value}: {message}"
+            );
+            assert!(
+                message.contains("proxySettings"),
+                "{key} = {value}: {message}"
+            );
+            assert!(
+                message.contains("streamSettings.sockopt.dialerProxy"),
+                "{key} = {value}: {message}"
+            );
+
+            // The same refusal gates the whole candidate path: `generate`
+            // returns an override verbatim, so this check is all that stands
+            // between the text and the core.
+            let mut overridden = settings.clone();
+            overridden.raw_override = Some(config.to_string());
+            let message =
+                generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En)
+                    .expect_err("the retired key must gate the candidate");
+            assert!(
+                message.contains("streamSettings.sockopt.dialerProxy"),
+                "{key} = {value}: {message}"
+            );
+        }
+
+        // A clean override passes the retired-key rule.
+        config["outbounds"] = json!([{"protocol": "freedom", "tag": "direct"}]);
+        assert!(validate_raw_override_candidate(&settings, &config, Language::En).is_ok());
     }
 
     #[test]

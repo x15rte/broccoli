@@ -10,10 +10,15 @@
 //!
 //! - the full vocabulary is [`FINGERPRINTS`] followed by
 //!   [`VALIDATION_ONLY_FINGERPRINTS`];
-//! - editor options and the share-link TLS grammar: [`FINGERPRINTS`]
-//!   verbatim;
-//! - share-link REALITY grammar: [`reality_import_supported`], the editor
-//!   set minus the names the REALITY grammar never carries;
+//! - the server editor's TLS and realm-TLS combos, and the share-link TLS
+//!   grammar: [`FINGERPRINTS`] verbatim;
+//! - the server editor's REALITY combo options: [`REALITY_EDITOR_OPTIONS`],
+//!   the empty default plus the known-good browser names (`chrome`,
+//!   `firefox`, `safari`). The trim is an option-list decision only — every
+//!   other canonical name stays accepted in a stored profile and a share
+//!   link;
+//! - share-link REALITY grammar: [`reality_import_supported`], the canonical
+//!   table minus the names the REALITY grammar never carries;
 //! - wire validation: [`wire_validation_supported`], the full vocabulary —
 //!   the stream TLS block's accept-set (and the finalmask realm-TLS
 //!   allow-list);
@@ -22,22 +27,28 @@
 //!   [`reality_wire_supported`], the wire vocabulary minus the private
 //!   `REALITY_REJECTED_FINGERPRINTS` (`unsafe`, `hellogolang`), compared
 //!   ASCII case-insensitively;
-//! - the server editor's REALITY combo options: [`reality_editor_supported`]
-//!   (the exact-case editor table minus the two rejected names).
+//! - the untested-value advisory (the stream REALITY block's
+//!   `RealityFingerprintUntested` warning and the editor's REALITY inline
+//!   verdict): [`reality_fingerprint_outside_known_good`], the complement of
+//!   [`REALITY_EDITOR_OPTIONS`], compared ASCII case-insensitively.
 //!
 //! Adding a fingerprint from a future Xray release is one row in
 //! [`FINGERPRINTS`] when it belongs in the editor (the common case — it then
-//! lands in every context), or in [`VALIDATION_ONLY_FINGERPRINTS`] when the
-//! wire accepts it but the editor must not offer it.
+//! lands in every context except the REALITY combo options), or in
+//! [`VALIDATION_ONLY_FINGERPRINTS`] when the wire accepts it but the editor
+//! must not offer it. Add a row to [`REALITY_EDITOR_OPTIONS`] once upstream's
+//! own tests exercise the new name for REALITY.
 //!
 //! Every entry is the exact string stored in profiles — profiles round-trip
 //! unchanged. The whole-config raw override stays unrestricted
 //! and never consults this table.
 
 /// Canonical fingerprint table in the server editor's historical display
-/// order: every name broccoli renders or imports, with the exact strings
-/// stored in profiles. Together with [`VALIDATION_ONLY_FINGERPRINTS`] (the
-/// trailing wire-only names) it is the full vocabulary.
+/// order: every name broccoli renders in the TLS and realm-TLS combos,
+/// imports, or validates on the wire, with the exact strings stored in
+/// profiles. Together with [`VALIDATION_ONLY_FINGERPRINTS`] (the trailing
+/// wire-only names) it is the full vocabulary. The REALITY combo offers
+/// [`REALITY_EDITOR_OPTIONS`] instead.
 pub const FINGERPRINTS: &[&str] = &[
     "",
     "chrome",
@@ -114,21 +125,39 @@ pub const VALIDATION_ONLY_FINGERPRINTS: &[&str] = &["randomizedalpn"];
 /// Fingerprint names REALITY refuses wherever the wire is concerned —
 /// `unsafe` and `hellogolang` (they have no uTLS ClientHello and make
 /// REALITY fingerprinting pointless). The single exclusion list: every
-/// REALITY context derives from it instead of re-listing the names.
+/// REALITY accept-set derives from it instead of re-listing the names.
 const REALITY_REJECTED_FINGERPRINTS: &[&str] = &["unsafe", "hellogolang"];
 
-/// The server editor's REALITY combo accept-set: [`FINGERPRINTS`] minus
-/// [`REALITY_REJECTED_FINGERPRINTS`] (empty is tolerated here — the
-/// REALITY default option — unlike the share-link grammar).
-pub fn reality_editor_supported(name: &str) -> bool {
-    FINGERPRINTS.contains(&name) && !REALITY_REJECTED_FINGERPRINTS.contains(&name)
+/// The server editor's REALITY combo options: the empty default plus the
+/// known-good browser names (`chrome`, `firefox`, `safari`) upstream's own
+/// scenario suite exercises. The list is trimmed to these — every other
+/// canonical name stays accepted in a stored profile, a share link
+/// ([`reality_import_supported`]), and wire validation
+/// ([`reality_wire_supported`]).
+pub const REALITY_EDITOR_OPTIONS: &[&str] = &["", "chrome", "firefox", "safari"];
+
+/// True when a REALITY fingerprint is outside the known-good set the editor
+/// offers ([`REALITY_EDITOR_OPTIONS`]: the empty default plus `chrome`,
+/// `firefox`, and `safari`). The value is wire-valid and Xray still accepts
+/// it, but upstream's REALITY scenarios no longer exercise it, so it
+/// warrants the advisory. Compared ASCII case-insensitively, matching the
+/// wire predicates — Xray lowercases the fingerprint before its checks
+/// (conf/transport_security.go client branch).
+pub fn reality_fingerprint_outside_known_good(name: &str) -> bool {
+    !REALITY_EDITOR_OPTIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
-/// The share-link REALITY grammar's fingerprint accept-set: every editor
-/// option except the three names the REALITY grammar never carries — `""`
-/// (a REALITY fingerprint is required), `unsafe`, and `hellogolang`.
+/// The share-link REALITY grammar's fingerprint accept-set: [`FINGERPRINTS`]
+/// minus the three names the REALITY grammar never carries — `""` (a
+/// REALITY fingerprint is required), `unsafe`, and `hellogolang`. The set is
+/// independent of the trimmed [`REALITY_EDITOR_OPTIONS`]: a link naming any
+/// other canonical fingerprint imports as before.
 pub fn reality_import_supported(name: &str) -> bool {
-    !name.is_empty() && reality_editor_supported(name)
+    !name.is_empty()
+        && FINGERPRINTS.contains(&name)
+        && !REALITY_REJECTED_FINGERPRINTS.contains(&name)
 }
 
 /// The wire-validation accept-set: the full canonical vocabulary (editor
@@ -179,21 +208,14 @@ mod tests {
                 wire_validation_supported(&name.to_ascii_uppercase()),
                 "wire validation rejects upper-cased {name:?}"
             );
-            // REALITY import accepts editor options except the three names
-            // the REALITY grammar never carries; wire-only names stay out.
+            // REALITY import accepts the canonical table except the three
+            // names the REALITY grammar never carries; wire-only names stay
+            // out. The trimmed REALITY combo options never narrow this set.
             let expected = editor_option && !matches!(name, "" | "unsafe" | "hellogolang");
             assert_eq!(
                 reality_import_supported(name),
                 expected,
                 "REALITY import mismatch for {name:?}"
-            );
-            // The REALITY editor filter only excludes the two core
-            // rejections (empty is a valid option there).
-            let editor_expected = editor_option && !REALITY_REJECTED_FINGERPRINTS.contains(&name);
-            assert_eq!(
-                reality_editor_supported(name),
-                editor_expected,
-                "REALITY editor mismatch for {name:?}"
             );
             // REALITY wire validation accepts everything the wire accepts
             // except the two core rejections — wire-only names included.
@@ -214,13 +236,87 @@ mod tests {
             }
         }
         // The exclusion is case-insensitive on the wire (Xray lowercases
-        // first) and exact in the editor/import predicates.
+        // first) and exact in the import predicate.
         for rejected in REALITY_REJECTED_FINGERPRINTS {
             assert!(!reality_wire_supported(&rejected.to_ascii_uppercase()));
-            assert!(!reality_editor_supported(rejected));
             assert!(!reality_import_supported(rejected));
         }
         assert!(!reality_wire_supported("not-a-fingerprint"));
+    }
+
+    /// The REALITY combo is the one context trimmed to a positive option
+    /// list: the empty default plus the browser names upstream's own tests
+    /// exercise. The trim is an option-list decision only — acceptance
+    /// (import, wire validation) never consults it.
+    #[test]
+    fn reality_editor_options_are_the_empty_default_plus_the_tested_browsers() {
+        assert_eq!(
+            REALITY_EDITOR_OPTIONS,
+            ["", "chrome", "firefox", "safari"],
+            "the REALITY combo option set"
+        );
+        for &option in REALITY_EDITOR_OPTIONS {
+            assert!(
+                FINGERPRINTS.contains(&option),
+                "REALITY combo option {option:?} is outside the canonical table"
+            );
+            assert!(
+                !REALITY_REJECTED_FINGERPRINTS.contains(&option),
+                "REALITY combo option {option:?} is one of the wire rejections"
+            );
+        }
+        // Names the trim dropped stay wire-valid and importable: a stored
+        // profile or a share link carrying one is accepted as before.
+        for name in ["ios", "edge", "qq", "android", "random", "randomized"] {
+            assert!(!REALITY_EDITOR_OPTIONS.contains(&name));
+            assert!(
+                reality_wire_supported(name),
+                "{name:?} must stay wire-valid"
+            );
+            assert!(
+                reality_import_supported(name),
+                "{name:?} must stay importable"
+            );
+        }
+        // The wire-only name stays wire-valid and out of the share-link
+        // grammar, exactly as before the trim.
+        assert!(reality_wire_supported("randomizedalpn"));
+        assert!(!reality_import_supported("randomizedalpn"));
+    }
+
+    /// The advisory predicate is the complement of the REALITY option set:
+    /// the empty default and every ASCII casing of the three names sit
+    /// inside, every other table name sits outside, and the wire-rejected
+    /// names sit outside too — the model pairs this predicate with the wire
+    /// accept-set, so a rejected name never also warns.
+    #[test]
+    fn advisory_predicate_is_the_complement_of_the_reality_option_set() {
+        for name in ["", "chrome", "firefox", "safari", "Chrome", "FIREFOX"] {
+            assert!(
+                !reality_fingerprint_outside_known_good(name),
+                "{name:?} is inside the known-good set"
+            );
+        }
+        for name in [
+            "ios",
+            "edge",
+            "qq",
+            "android",
+            "random",
+            "randomized",
+            "randomizedalpn",
+        ] {
+            assert!(
+                reality_fingerprint_outside_known_good(name),
+                "{name:?} is outside the known-good set"
+            );
+        }
+        for rejected in REALITY_REJECTED_FINGERPRINTS {
+            assert!(
+                reality_fingerprint_outside_known_good(rejected),
+                "{rejected:?} is outside the known-good set (the model fires its Error instead)"
+            );
+        }
     }
 
     #[test]

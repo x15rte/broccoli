@@ -696,7 +696,7 @@ fn latency_probe_generator_is_minimal_and_preserves_profile_chains() {
     first.id = ID.into();
     let mut second = ServerProfile::new("second", OutboundModel::new(Protocol::Freedom));
     second.id = "fedcba9876543210".into();
-    second.outbound.proxy_tag = Some(first.tag());
+    second.outbound.chain_via(first.tag());
     let profiles = vec![first.clone(), second.clone()];
 
     let cfg = generate_latency_probe(&profiles, " https://probe.example/health ", 45678, None)
@@ -739,7 +739,10 @@ fn latency_probe_generator_is_minimal_and_preserves_profile_chains() {
         json!({"loglevel": "warning", "access": "none"}),
         "probe stdout feeds failure diagnostics; its access channel must stay pinned off"
     );
-    assert_eq!(outbounds[1]["proxySettings"]["tag"], json!(first.tag()));
+    assert_eq!(
+        outbounds[1]["streamSettings"]["sockopt"]["dialerProxy"],
+        json!(first.tag())
+    );
     assert_eq!(outbounds[2]["protocol"], json!("freedom"));
     assert_eq!(outbounds[3]["protocol"], json!("blackhole"));
     for key in [
@@ -934,7 +937,7 @@ fn latency_probe_generator_rejects_invalid_inputs() {
     invalid(&duplicate, "http://127.0.0.1:1", 45678);
 
     let mut broken_chain = valid.clone();
-    broken_chain[0].outbound.proxy_tag = Some("srv-missing".into());
+    broken_chain[0].outbound.chain_via("srv-missing");
     invalid(&broken_chain, "http://127.0.0.1:1", 45678);
 
     let mut invalid_tag = valid;
@@ -2034,6 +2037,7 @@ fn vless_server(host: &str, port: u16) -> OutboundModel {
     });
     ob
 }
+
 #[test]
 fn tun_without_dns_module_keeps_plaintext_adapter_dns() {
     // No DNS module, TUN on: pinning the adapter to the gateway address
@@ -2528,13 +2532,16 @@ fn chained_outbound_defers_the_bootstrap_scope_to_its_direct_dial_outbound() {
     // A profile that dials through another never dials its own server from
     // this machine — the hop's address travels through the chain and resolves
     // on the far side — so only the chain's direct-dial outbound joins the
-    // bootstrap scope and takes useip.
+    // bootstrap scope and takes useip. The hop's `dialerProxy` is resolved
+    // locally before the redirect, so an injection there would resolve the
+    // hop's server on this machine.
     let exit = ServerProfile {
         id: "fedcba9876543210".into(),
         ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
     };
+    let exit_tag = exit.tag();
     let mut hop_outbound = vless_server("hop.example.com", 443);
-    hop_outbound.proxy_tag = Some(exit.tag());
+    hop_outbound.chain_via(&exit_tag);
     let hop = ServerProfile {
         id: ID.into(),
         ..ServerProfile::new("hop", hop_outbound)
@@ -2561,59 +2568,16 @@ fn chained_outbound_defers_the_bootstrap_scope_to_its_direct_dial_outbound() {
         ]),
         "only the direct-dial outbound's domain may be scoped"
     );
-    assert!(
-        cfg["outbounds"][0].get("streamSettings").is_none(),
-        "a chained outbound must not take useip: {}",
+    assert_eq!(
+        cfg["outbounds"][0]["streamSettings"]["sockopt"],
+        json!({ "dialerProxy": exit_tag }),
+        "a chained outbound carries the chain and nothing else: {}",
         cfg["outbounds"][0]
     );
     assert_eq!(
         cfg["outbounds"][1]["streamSettings"]["sockopt"]["domainStrategy"],
         json!("useip"),
         "the direct-dial outbound still resolves through the module"
-    );
-}
-
-#[test]
-fn dialer_proxy_hop_is_not_scoped_and_takes_no_useip() {
-    // The same rule through the sockopt.dialerProxy spelling — the one Xray
-    // resolves locally when useip is present (before the dialerProxy
-    // redirect), so an injection here would resolve the hop's server on this
-    // machine.
-    let exit = ServerProfile {
-        id: "fedcba9876543210".into(),
-        ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
-    };
-    let mut hop_outbound = vless_server("hop.example.com", 443);
-    hop_outbound.stream.sockopt = Some(SockoptModel {
-        dialer_proxy: exit.tag(),
-        ..Default::default()
-    });
-    let hop = ServerProfile {
-        id: ID.into(),
-        ..ServerProfile::new("hop", hop_outbound)
-    };
-    let servers = ServersFile {
-        version: 1,
-        active: Some(hop.id.clone()),
-        profiles: vec![hop, exit],
-        extra: Map::new(),
-    };
-
-    let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
-
-    assert_eq!(cfg["dns"]["servers"].as_array().unwrap().len(), 3);
-    assert_eq!(
-        cfg["dns"]["servers"][2]["domains"],
-        json!(["domain:exit.example.com"])
-    );
-    assert_eq!(
-        cfg["outbounds"][0]["streamSettings"]["sockopt"].get("domainStrategy"),
-        None,
-        "the dialerProxy hop must not take useip"
-    );
-    assert_eq!(
-        cfg["outbounds"][1]["streamSettings"]["sockopt"]["domainStrategy"],
-        json!("useip")
     );
 }
 
@@ -2625,14 +2589,16 @@ fn bootstrap_scope_follows_a_transitive_chain_to_its_far_end() {
         id: "fedcba9876543210".into(),
         ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
     };
+    let exit_tag = exit.tag();
     let mut mid_outbound = vless_server("mid.example.com", 443);
-    mid_outbound.proxy_tag = Some(exit.tag());
+    mid_outbound.chain_via(&exit_tag);
     let mid = ServerProfile {
         id: "1111222233334444".into(),
         ..ServerProfile::new("mid", mid_outbound)
     };
+    let mid_tag = mid.tag();
     let mut hop_outbound = vless_server("hop.example.com", 443);
-    hop_outbound.proxy_tag = Some(mid.tag());
+    hop_outbound.chain_via(&mid_tag);
     let hop = ServerProfile {
         id: ID.into(),
         ..ServerProfile::new("hop", hop_outbound)
@@ -2651,8 +2617,14 @@ fn bootstrap_scope_follows_a_transitive_chain_to_its_far_end() {
         cfg["dns"]["servers"][2]["domains"],
         json!(["domain:exit.example.com"])
     );
-    assert!(cfg["outbounds"][0].get("streamSettings").is_none());
-    assert!(cfg["outbounds"][1].get("streamSettings").is_none());
+    assert_eq!(
+        cfg["outbounds"][0]["streamSettings"]["sockopt"],
+        json!({ "dialerProxy": mid_tag })
+    );
+    assert_eq!(
+        cfg["outbounds"][1]["streamSettings"]["sockopt"],
+        json!({ "dialerProxy": exit_tag })
+    );
     assert_eq!(
         cfg["outbounds"][2]["streamSettings"]["sockopt"]["domainStrategy"],
         json!("useip")
@@ -2705,7 +2677,7 @@ fn chain_to_an_ip_literal_outbound_closes_the_bootstrap_gate() {
         ..ServerProfile::new("exit", vless_server("1.2.3.4", 443))
     };
     let mut hop_outbound = vless_server("hop.example.com", 443);
-    hop_outbound.proxy_tag = Some(exit.tag());
+    hop_outbound.chain_via(exit.tag());
     let hop = ServerProfile {
         id: ID.into(),
         ..ServerProfile::new("hop", hop_outbound)
@@ -2724,8 +2696,13 @@ fn chain_to_an_ip_literal_outbound_closes_the_bootstrap_gate() {
         json!([{ "address": "1.1.1.1" }, { "address": "8.8.8.8" }]),
         "no scoped entry without a domain-addressed direct-dial outbound"
     );
-    assert!(cfg["outbounds"][0].get("streamSettings").is_none());
-    assert!(cfg["outbounds"][1].get("streamSettings").is_none());
+    for index in 0..2 {
+        assert_eq!(
+            cfg["outbounds"][index]["streamSettings"]["sockopt"].get("domainStrategy"),
+            None,
+            "outbound {index} must not take useip"
+        );
+    }
 }
 
 #[test]
@@ -2733,7 +2710,7 @@ fn chain_to_a_builtin_outbound_keeps_the_direct_dial_scope() {
     // A chain reference naming a builtin (`direct`) has no profile server to
     // reach: the walk ends at this outbound, whose server the OS dials.
     let mut outbound = vless_server("hop.example.com", 443);
-    outbound.proxy_tag = Some("direct".into());
+    outbound.chain_via("direct");
     let servers = single_server(outbound);
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -2745,6 +2722,62 @@ fn chain_to_a_builtin_outbound_keeps_the_direct_dial_scope() {
     assert_eq!(
         cfg["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
         json!("useip")
+    );
+}
+
+#[test]
+fn a_chain_profile_emits_the_dialer_proxy_spelling_only() {
+    // The one chain spelling the pinned core reads: `outbound
+    // "proxySettings"` is refused at build (infra/conf/xray.go:262). The
+    // chain rides `streamSettings.sockopt.dialerProxy` in the runtime
+    // config, and the retired key appears nowhere in the document.
+    let exit = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
+    };
+    let exit_tag = exit.tag();
+    let mut hop_outbound = vless_server("hop.example.com", 443);
+    hop_outbound.chain_via(&exit_tag);
+    let hop = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("hop", hop_outbound)
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(hop.id.clone()),
+        profiles: vec![hop, exit],
+        extra: Map::new(),
+    };
+
+    let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
+    assert_eq!(
+        cfg["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"],
+        json!(exit_tag)
+    );
+    assert!(
+        !cfg.to_string().contains("proxySettings"),
+        "the retired spelling must not appear anywhere: {cfg}"
+    );
+
+    // The isolated latency-probe child carries the same chain.
+    let probe =
+        generate_latency_probe(&servers.profiles, "", 45678, None).expect("generate probe config");
+    assert_eq!(
+        probe["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"],
+        json!(exit_tag)
+    );
+    assert!(!probe.to_string().contains("proxySettings"));
+
+    // A profile that still carries the retired key gates generation outright:
+    // the core never sees the key, and the message names the replacement.
+    let mut marked = servers.clone();
+    marked.profiles[0].outbound.retired_proxy_settings = Some(json!({"tag": "srv-exit"}));
+    let error = generate_deterministic(&marked, &base_settings())
+        .expect_err("an unresolved retired key must gate generation");
+    let message = error.text(Language::En);
+    assert!(
+        message.contains("proxySettings") && message.contains("streamSettings.sockopt.dialerProxy"),
+        "{message}"
     );
 }
 

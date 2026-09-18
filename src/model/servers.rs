@@ -112,22 +112,16 @@ impl ServerProfile {
             .map_or(self.id.len(), |(index, _)| index);
         format!("srv-{}", &self.id[..end])
     }
-    /// The outbound tag this profile dials through, if any — the
-    /// `proxySettings.tag` and `sockopt.dialerProxy` spellings. Validation
-    /// rejects a profile that sets both, and any target naming no outbound.
+    /// The outbound tag this profile dials through, if any —
+    /// `streamSettings.sockopt.dialerProxy`, the one spelling the pinned core
+    /// still reads. Validation rejects a chain target naming no outbound.
     pub fn chain_target(&self) -> Option<&str> {
         self.outbound
-            .proxy_tag
-            .as_deref()
+            .stream
+            .sockopt
+            .as_ref()
+            .map(|sockopt| sockopt.dialer_proxy.as_str())
             .filter(|tag| !tag.is_empty())
-            .or_else(|| {
-                self.outbound
-                    .stream
-                    .sockopt
-                    .as_ref()
-                    .map(|sockopt| sockopt.dialer_proxy.as_str())
-                    .filter(|tag| !tag.is_empty())
-            })
     }
     /// The remote server endpoint as `host:port` (IPv6 bracketed), or `None`
     /// when the protocol carries no usable address. WireGuard's endpoint is
@@ -202,6 +196,125 @@ mod tests {
         assert_eq!(profile_with_address("1.2.3.4", 0).server_address(), None);
         let freedom = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
         assert_eq!(freedom.server_address(), None);
+    }
+
+    #[test]
+    fn chain_target_reads_the_dialer_proxy_spelling_only() {
+        let mut profile = ServerProfile::new("hop", OutboundModel::new(Protocol::Freedom));
+        assert_eq!(profile.chain_target(), None);
+        profile.outbound.chain_via("srv-exit");
+        assert_eq!(profile.chain_target(), Some("srv-exit"));
+        // An empty value is no chain.
+        if let Some(sockopt) = profile.outbound.stream.sockopt.as_mut() {
+            sockopt.dialer_proxy.clear();
+        }
+        assert_eq!(profile.chain_target(), None);
+    }
+
+    #[test]
+    fn stored_retired_proxy_settings_key_survives_an_unrelated_save_and_the_gate() {
+        use crate::model::validation::{Severity, ValidationCode, validate_profiles};
+        use crate::sys::appdata::with_appdata;
+
+        with_appdata(|| {
+            // A stored profile from a build that still used the retired key:
+            // Xray refuses to build it now, and the model must not fail the
+            // load over it.
+            let stored = serde_json::json!({
+                "version": 1,
+                "active": "aaaaaaaa11111111",
+                "profiles": [{
+                    "id": "aaaaaaaa11111111",
+                    "name": "hop",
+                    "outbound": {"protocol": "freedom", "proxySettings": {"tag": "srv-exit"}}
+                }]
+            });
+            save_state("servers.json", &stored).expect("write the stored file");
+
+            let mut servers = ServersFile::load().expect("a retired key must not fail the load");
+            assert_eq!(
+                servers.profiles[0].outbound.retired_proxy_settings,
+                Some(serde_json::json!({"tag": "srv-exit"}))
+            );
+            assert_eq!(
+                servers.profiles[0].chain_target(),
+                None,
+                "the retired key is never converted into a chain"
+            );
+            let gated = |servers: &ServersFile| {
+                validate_profiles(&servers.profiles, servers.active.as_deref(), false)
+                    .iter()
+                    .any(|issue| {
+                        issue.code == ValidationCode::OutboundProxySettingsRemoved
+                            && issue.severity == Severity::Error
+                    })
+            };
+            assert!(gated(&servers), "the profile must gate until resolved");
+
+            // An unrelated edit (the display name) saves the file and the
+            // gate survives the reload: the key stays on disk until the user
+            // resolves the profile.
+            servers.profiles[0].name = "hop-renamed".into();
+            servers.save().expect("save servers.json");
+            let saved: Value = load_state("servers.json").expect("reload the saved file");
+            assert_eq!(
+                saved["profiles"][0]["outbound"]["proxySettings"],
+                serde_json::json!({"tag": "srv-exit"}),
+                "an unrelated save must keep the retired key: {saved}"
+            );
+            let reloaded = ServersFile::load().expect("reload the saved file");
+            assert_eq!(reloaded.profiles[0].name, "hop-renamed");
+            assert!(gated(&reloaded), "the gate must survive the reload");
+
+            // A duplicated profile inherits the raw key (the list's Duplicate
+            // action clones the stored profile): the copy stays gated and its
+            // saved file carries the key until the user resolves it.
+            let mut duplicated = reloaded.clone();
+            let mut copy = duplicated.profiles[0].clone();
+            copy.id = "cccccccc33333333".into();
+            copy.name = "hop copy".into();
+            duplicated.profiles.push(copy);
+            assert!(gated(&duplicated), "the copy must stay gated");
+            duplicated.save().expect("save the duplicated profile set");
+            let saved: Value = load_state("servers.json").expect("reload the saved file");
+            assert_eq!(
+                saved["profiles"][1]["outbound"]["proxySettings"],
+                serde_json::json!({"tag": "srv-exit"}),
+                "the copy's file must keep the retired key: {saved}"
+            );
+
+            // The user resolves the chain — the editor clears the key — and
+            // the next save drops it.
+            let mut resolved = reloaded;
+            resolved.profiles[0].outbound.chain_via("srv-exit");
+            resolved.profiles[0].outbound.retired_proxy_settings = None;
+            resolved.save().expect("save servers.json");
+            let saved: Value = load_state("servers.json").expect("reload the saved file");
+            assert_eq!(
+                saved["profiles"][0]["outbound"]["streamSettings"]["sockopt"]["dialerProxy"],
+                serde_json::json!("srv-exit")
+            );
+            let key_present =
+                saved["profiles"][0]["outbound"]
+                    .as_object()
+                    .is_some_and(|outbound| {
+                        outbound
+                            .keys()
+                            .any(|key| key.eq_ignore_ascii_case("proxySettings"))
+                    });
+            assert!(
+                !key_present,
+                "the resolved profile must drop the key: {saved}"
+            );
+            let reloaded = ServersFile::load().expect("reload the saved file");
+            assert_eq!(reloaded.profiles[0].chain_target(), Some("srv-exit"));
+            assert!(
+                reloaded.profiles[0]
+                    .outbound
+                    .retired_proxy_settings
+                    .is_none()
+            );
+        });
     }
 
     #[test]

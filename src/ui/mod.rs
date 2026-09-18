@@ -381,7 +381,7 @@ impl<'a> UiCtx<'a> {
 
     /// Launch an isolated one-shot probe over one server profile (probe
     /// scope "one"). Any profiles the probed profile chains
-    /// through (`proxySettings.tag` / `sockopt.dialerProxy`) ride along in
+    /// through (`sockopt.dialerProxy`) ride along in
     /// the probe child so the referenced outbounds exist; the probed profile
     /// stays first and its status is the reported one. Unresolvable targets
     /// are left out — builtins resolve inside the child, anything else fails
@@ -1491,7 +1491,9 @@ mod tests {
 
     fn chained_profile(target: Option<String>) -> ServerProfile {
         let mut profile = ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom));
-        profile.outbound.proxy_tag = target;
+        if let Some(target) = target {
+            profile.outbound.chain_via(target);
+        }
         profile
     }
 
@@ -1525,7 +1527,7 @@ mod tests {
         let mut rig = UiTestRig::default();
         let leaf = ServerProfile::new("Nagoya", OutboundModel::new(Protocol::Freedom));
         let mut middle = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
-        middle.outbound.proxy_tag = Some(leaf.tag());
+        middle.outbound.chain_via(leaf.tag());
         let main = chained_profile(Some(middle.tag()));
         rig.servers.profiles.push(main.clone());
         rig.servers.profiles.push(middle.clone());
@@ -1579,7 +1581,7 @@ mod tests {
         let b = ServerProfile::new("B", OutboundModel::new(Protocol::Freedom));
         let a = chained_profile(Some(b.tag()));
         let mut b = b;
-        b.outbound.proxy_tag = Some(a.tag());
+        b.outbound.chain_via(a.tag());
         rig.servers.profiles.push(a.clone());
         rig.servers.profiles.push(b.clone());
         rig.ctx()

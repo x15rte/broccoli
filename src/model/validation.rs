@@ -142,6 +142,17 @@ pub enum ValidationCode {
     /// wire-valid uTLS vocabulary — the conf build rejects both classes
     /// explicitly (conf/transport_security.go, client branch).
     RealityFingerprintUnsupported,
+    /// REALITY `fingerprint` wire-valid but outside the known-good set the
+    /// editor offers (empty — the uTLS Chrome_Auto default — plus `chrome`,
+    /// `firefox`, `safari`): Xray still accepts the value, but upstream's
+    /// REALITY scenario suite exercises only those three
+    /// (testing/scenarios/vless_test.go TestVlessRealityFingerprints, the
+    /// private `REALITY_EDITOR_OPTIONS` table is the single source) — the
+    /// stored value is never rewritten, so the advisory tells the user
+    /// instead of leaving them to diagnose a handshake failure
+    /// (Severity::Warning). The code carries the stored name for the
+    /// message.
+    RealityFingerprintUntested(String),
     /// TLS `pinnedPeerCertSha256` holds an entry that is not a 32-byte
     /// SHA-256 fingerprint written as hex (colons optional, entries
     /// comma-separated) — Xray's conf build errors on non-hex or
@@ -268,9 +279,13 @@ pub enum ValidationCode {
     /// Two server profiles generate the same outbound tag (indices, IDs,
     /// tag).
     ProfileTagDuplicated(usize, String, usize, String, String),
-    /// A profile sets both `proxySettings.tag` and `sockopt.dialerProxy`
-    /// (source tag) — one outbound chain, two spellings.
-    OutboundChainConflict(String),
+    /// A profile's stored outbound carried the retired `proxySettings` key:
+    /// Xray's outbound build refuses a configuration that carries it
+    /// (infra/conf/xray.go:262, `outbound "proxySettings"` →
+    /// `"streamSettings.sockopt.dialerProxy"`), so the config cannot apply
+    /// until the user edits the profile. The key is dropped at load, never
+    /// serialized, and never migrated.
+    OutboundProxySettingsRemoved,
     /// A profile's chained outbound reference names no known outbound
     /// (source tag, missing target).
     OutboundChainMissing(String, String),
@@ -1212,6 +1227,15 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Vec<ValidationIss
 pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
+    // The retired `proxySettings` key left this mark behind: the pinned core
+    // refuses to build the outbound while the stored profile carries it
+    // (infra/conf/xray.go:262), so the profile gates until the user resolves
+    // it — the key is kept verbatim for the settings file and is never
+    // migrated. Carries no path: the key is not a field of the model, and
+    // the servers-level pass scopes the finding with the profile's location.
+    if o.retired_proxy_settings.is_some() {
+        issues.push(issue(ValidationCode::OutboundProxySettingsRemoved, None));
+    }
     if let ProtocolSettings::Shadowsocks(settings) = &o.settings
         && settings.level.is_some_and(|level| level > u8::MAX.into())
     {
@@ -1855,6 +1879,17 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
             if !crate::model::fingerprint::reality_wire_supported(&reality.fingerprint) {
                 issues.push(issue(
                     ValidationCode::RealityFingerprintUnsupported,
+                    Some("stream.realitySettings.fingerprint".into()),
+                ));
+            } else if crate::model::fingerprint::reality_fingerprint_outside_known_good(
+                &reality.fingerprint,
+            ) {
+                // The wire accepts the name and Xray runs it, but upstream's
+                // REALITY scenarios exercise only the known-good three, so
+                // the stored value is an untested shape rather than a broken
+                // one — advisory (Severity::Warning), never a gate.
+                issues.push(warning(
+                    ValidationCode::RealityFingerprintUntested(excerpt(&reality.fingerprint)),
                     Some("stream.realitySettings.fingerprint".into()),
                 ));
             }
@@ -3315,26 +3350,8 @@ fn profile_set_verdict(
     let mut outbound_chains = BTreeMap::<String, String>::new();
     for profile in profiles {
         let source = profile.tag();
-        let proxy = profile
-            .outbound
-            .proxy_tag
-            .as_deref()
-            .filter(|tag| !tag.is_empty());
-        let dialer = profile
-            .outbound
-            .stream
-            .sockopt
-            .as_ref()
-            .map(|sockopt| sockopt.dialer_proxy.as_str())
-            .filter(|tag| !tag.is_empty());
-        if proxy.is_some() && dialer.is_some() {
-            issues.push(issue(
-                ValidationCode::OutboundChainConflict(excerpt(&source)),
-                None,
-            ));
-            continue;
-        }
-        if let Some(target) = proxy.or(dialer) {
+        let target = profile.chain_target();
+        if let Some(target) = target {
             if !outbound_tags.contains(target) {
                 issues.push(issue(
                     ValidationCode::OutboundChainMissing(excerpt(&source), excerpt(target)),
@@ -6455,6 +6472,73 @@ mod tests {
         assert_eq!(finding.severity, Severity::Error);
     }
 
+    /// The REALITY fingerprint advisory: a wire-valid name outside the
+    /// known-good set the editor offers warns exactly once on the field
+    /// path, the empty default and the three names upstream's REALITY
+    /// scenarios exercise stay silent, and an invalid name keeps exactly its
+    /// blocking finding with no advisory beside it.
+    #[test]
+    fn reality_fingerprint_outside_known_good_warns_once_on_the_field_path() {
+        let pointer = || Some("stream.realitySettings.fingerprint".to_string());
+        for name in [
+            "ios",
+            "edge",
+            "qq",
+            "android",
+            "randomized",
+            "randomizedalpn",
+        ] {
+            let stream = StreamModel {
+                security: Security::Reality,
+                reality_settings: Some(reality_base_with_fingerprint(name)),
+                ..Default::default()
+            };
+            let issues = validate_stream(&stream);
+            assert_eq!(
+                issues,
+                vec![warning(
+                    ValidationCode::RealityFingerprintUntested(name.into()),
+                    pointer()
+                )],
+                "REALITY fingerprint {name:?} must warn once: {issues:#?}"
+            );
+        }
+        // The empty default (the uTLS Chrome_Auto preset) and the three
+        // names upstream's REALITY scenarios exercise are inside the
+        // known-good set; a casing of a known name is the same wire value
+        // (Xray lowercases the fingerprint before its checks).
+        for name in ["", "chrome", "firefox", "safari", "Chrome", "Firefox"] {
+            let stream = StreamModel {
+                security: Security::Reality,
+                reality_settings: Some(reality_base_with_fingerprint(name)),
+                ..Default::default()
+            };
+            let issues = validate_stream(&stream);
+            assert!(
+                issues.is_empty(),
+                "REALITY fingerprint {name:?} must not warn: {issues:#?}"
+            );
+        }
+        // `unsafe`, `hellogolang`, and unknown names stay conf-load Errors:
+        // exactly the existing finding, never a second advisory.
+        for name in ["unsafe", "hellogolang", "bogus"] {
+            let stream = StreamModel {
+                security: Security::Reality,
+                reality_settings: Some(reality_base_with_fingerprint(name)),
+                ..Default::default()
+            };
+            let issues = validate_stream(&stream);
+            assert_eq!(
+                issues,
+                vec![issue(
+                    ValidationCode::RealityFingerprintUnsupported,
+                    pointer()
+                )],
+                "REALITY fingerprint {name:?} must keep exactly its Error: {issues:#?}"
+            );
+        }
+    }
+
     #[test]
     fn pcs_rule_covers_the_whole_entry_grammar() {
         // Canonical: empty, one 64-hex pin, colon-separated OpenSSL form,
@@ -7250,14 +7334,14 @@ mod tests {
             "",
             OutboundModel::new(Protocol::Freedom),
         );
-        first.outbound.proxy_tag = Some("srv-bbbbbbbb".into());
+        first.outbound.chain_via("srv-bbbbbbbb");
         first.outbound.send_through = Some("bogus".into());
         let mut second = named_profile(
             "bbbbbbbb22222222",
             "second",
             OutboundModel::new(Protocol::Freedom),
         );
-        second.outbound.proxy_tag = Some("srv-aaaaaaaa".into());
+        second.outbound.chain_via("srv-aaaaaaaa");
         let servers = ServersFile {
             profiles: vec![first, second],
             ..Default::default()
@@ -7278,6 +7362,52 @@ mod tests {
             ),
         )
         .unwrap_or_else(|| panic!("the chain cycle must be reported: {issues:#?}"));
+    }
+
+    #[test]
+    fn retired_proxy_settings_key_gates_every_shape_with_the_profile_location() {
+        use crate::i18n::validation_issue_message;
+        use crate::model::settings::Language;
+
+        // Every JSON shape loads — a wrong-typed or malformed value must not
+        // fail the load (Xray models the key as a raw message) — and each one
+        // leaves the profile gated under its own location until the user
+        // edits it. The fix-it text names the replacement.
+        for value in [
+            json!({"tag": "srv-bbbbbbbb"}),
+            json!("srv-bbbbbbbb"),
+            json!({"tag": 7}),
+            json!(7),
+            json!(true),
+            json!(["srv-bbbbbbbb"]),
+            json!(null),
+        ] {
+            let profile: ServerProfile = serde_json::from_value(json!({
+                "id": "aaaaaaaa11111111",
+                "name": "first",
+                "outbound": {"protocol": "freedom", "proxySettings": value},
+            }))
+            .unwrap_or_else(|error| panic!("{value} must load: {error}"));
+
+            let issues = validate_profiles(std::slice::from_ref(&profile), None, false);
+            let found = finding(&issues, &ValidationCode::OutboundProxySettingsRemoved)
+                .unwrap_or_else(|| panic!("{value} must gate: {issues:#?}"));
+            assert_eq!(found.severity, Severity::Error, "{value}");
+            assert_eq!(found.path.as_deref(), Some("first"), "{value}");
+            let rendered = validation_issue_message(found, Language::En);
+            assert!(
+                rendered.contains("streamSettings.sockopt.dialerProxy"),
+                "{value}: {rendered}"
+            );
+            assert!(rendered.contains("proxySettings"), "{value}: {rendered}");
+
+            // An edit clears the mark, and the profile validates clean: the
+            // key is not part of the model, so nothing remains to report.
+            let mut edited = profile;
+            edited.outbound.retired_proxy_settings = None;
+            let issues = validate_profiles(std::slice::from_ref(&edited), None, false);
+            assert!(issues.is_empty(), "{value}: {issues:#?}");
+        }
     }
 
     #[test]
