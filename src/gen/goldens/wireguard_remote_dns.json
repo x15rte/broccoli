@@ -1,0 +1,151 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1"
+      },
+      {
+        "address": "8.8.8.8"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "settings": {
+        "address": [
+          "10.0.0.1/32"
+        ],
+        "domainStrategy": "forceip",
+        "mtu": 1420,
+        "peers": [
+          {
+            "allowedIPs": [
+              "0.0.0.0/0",
+              "::/0"
+            ],
+            "endpoint": "203.0.113.10:51820",
+            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+          }
+        ],
+        "remoteDNS": [
+          "1.1.1.1",
+          "2606:4700:4700::1111"
+        ],
+        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "wireguard",
+      "settings": {
+        "address": [
+          "10.0.0.2/32"
+        ],
+        "domainStrategy": "forceip",
+        "mtu": 1420,
+        "peers": [
+          {
+            "allowedIPs": [
+              "0.0.0.0/0",
+              "::/0"
+            ],
+            "endpoint": "203.0.113.11:51820",
+            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+          }
+        ],
+        "remoteDNS": [
+          "local"
+        ],
+        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
+      },
+      "tag": "srv-fedcba98"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      }
+    ]
+  },
+  "stats": {}
+}

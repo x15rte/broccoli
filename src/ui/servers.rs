@@ -60,7 +60,7 @@ use keygen::{
 use raw_editor::{FieldKey, JsonBuf, PemBuf, RawField, evict_owned_buffers, pem_lines_editor};
 use validators::{
     v_optional_wg_key, v_required, v_uuid, v_uuid_required, v_vless_encryption,
-    v_vless_encryption_required, v_wg_key,
+    v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
 };
 
 /// Editor-selectable uTLS fingerprint options for the TLS and realm-TLS
@@ -756,17 +756,21 @@ fn tcp_fast_open_editor(
 enum SockoptUsage {
     Stream,
     EchDnsQuery,
+    Mask,
 }
 
 impl SockoptUsage {
     /// The wire path prefix the block's findings are scoped with. The ECH
     /// DNS-query block lives under the TLS settings, not `stream.sockopt`
     /// (the model's `validate_outbound` sweep scopes it the same way), so
-    /// the inline verdict names the field the user can actually find.
+    /// the inline verdict names the field the user can actually find. A
+    /// mask's block is numbered by its mask index, which this fixed prefix
+    /// cannot name — the memoized finalmask error list carries those paths.
     fn path_prefix(self) -> &'static str {
         match self {
             Self::Stream => "stream.sockopt",
             Self::EchDnsQuery => "stream.tlsSettings.echSockopt",
+            Self::Mask => "finalmask.udp[].settings.sockopt",
         }
     }
 }
@@ -914,6 +918,17 @@ fn sockopt_editor(
             });
             ui.weak(t(lang, Key::SrvPenetrateEchNote));
         }
+        SockoptUsage::Mask => {
+            ui.add_enabled_ui(false, |ui| {
+                changed |= widgets::opt_bool(
+                    ui,
+                    t(lang, Key::SrvPenetrateDownloadOnly),
+                    &mut sockopt.penetrate,
+                    t(lang, Key::SrvUnset),
+                );
+            });
+            ui.weak(t(lang, Key::SrvPenetrateMaskNote));
+        }
     }
 
     egui::CollapsingHeader::new(t(lang, Key::SrvListenerOnlySockopt))
@@ -1028,6 +1043,30 @@ fn ech_sockopt_editor(
         ui.indent("ech-dns-query-sockopt", |ui| {
             ui.weak(t(lang, Key::SrvEchSockoptNote));
             changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::EchDnsQuery, errors);
+        });
+    }
+    changed
+}
+
+/// The per-mask socket-options block of a `udphop` UDP mask: the socket the
+/// hop dials (`settings.sockopt`). The block's findings ride the memoized
+/// finalmask sweep (`validate_finalmask` validates the same field under its
+/// mask-scoped path), which renders them under the mask list.
+fn mask_sockopt_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    sockopt: &mut Option<SockoptModel>,
+) -> bool {
+    let mut changed = false;
+    let mut enabled = sockopt.is_some();
+    if ui.checkbox(&mut enabled, "sockopt").changed() {
+        *sockopt = enabled.then(SockoptModel::default);
+        changed = true;
+    }
+    if let Some(sockopt) = sockopt.as_mut() {
+        ui.indent("mask-sockopt", |ui| {
+            ui.weak(t(lang, Key::SrvMaskSockoptNote));
+            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::Mask, &[]);
         });
     }
     changed
@@ -1544,6 +1583,61 @@ fn source_chain_target(source: &serde_json::Value) -> Option<&str> {
         .get("dialerProxy")?
         .as_str()
         .filter(|tag| !tag.is_empty())
+}
+
+/// True when the profile's `quicParams` still carries the retired `udpHop`
+/// key (any JSON shape) — the state that gates and that the finding row's
+/// dismissal control clears.
+fn retired_udp_hop_present(profile: &ServerProfile) -> bool {
+    profile
+        .outbound
+        .stream
+        .finalmask
+        .as_ref()
+        .and_then(|finalmask| finalmask.quic_params.as_ref())
+        .is_some_and(|quic| quic.retired_udp_hop.is_some())
+}
+
+/// The `udphop` masks a profile carries, serialized the way the settings
+/// file writes them — the hop state a retired `quicParams.udpHop` key
+/// resolves against. Empty when the profile has no finalmask block and no
+/// `udphop` entry.
+fn udphop_masks(profile: &ServerProfile) -> Vec<serde_json::Value> {
+    profile
+        .outbound
+        .stream
+        .finalmask
+        .iter()
+        .flat_map(|finalmask| &finalmask.udp)
+        .filter(|mask| mask.known_type() == Some("udphop"))
+        .map(|mask| {
+            serde_json::to_value(mask).expect(
+                "model serialization is infallible: a finalmask envelope holds string map \
+                 keys only",
+            )
+        })
+        .collect()
+}
+
+/// The same state read from the draft's serialized source. An entry that
+/// cannot serialize was never written by this app, so it never matches.
+fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
+    source
+        .get("outbound")
+        .and_then(|outbound| outbound.get("streamSettings"))
+        .and_then(|stream| stream.get("finalmask"))
+        .and_then(|finalmask| finalmask.get("udp"))
+        .and_then(serde_json::Value::as_array)
+        .map(|masks| {
+            masks
+                .iter()
+                .filter(|mask| {
+                    mask.get("type").and_then(serde_json::Value::as_str) == Some("udphop")
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The existing draft's uncommitted state: the draft differs from its source
@@ -3762,6 +3856,21 @@ impl ServersScreen {
             if draft.profile.chain_target() != source_chain_target(&draft.source) {
                 draft.profile.outbound.retired_proxy_settings = None;
             }
+            // The retired `quicParams.udpHop` key clears the same way: the
+            // user rebuilds the hop as a `udphop` UDP mask (the mask list
+            // moved away from the loaded source's), or dismisses the key on
+            // the finding row. Editing an unrelated mask leaves the gate.
+            if udphop_masks(&draft.profile) != source_udphop_masks(&draft.source)
+                && let Some(quic) = draft
+                    .profile
+                    .outbound
+                    .stream
+                    .finalmask
+                    .as_mut()
+                    .and_then(|finalmask| finalmask.quic_params.as_mut())
+            {
+                quic.retired_udp_hop = None;
+            }
             draft.generation = draft.generation.wrapping_add(1);
             self.profile_validation_report = None;
         }
@@ -3778,6 +3887,7 @@ impl ServersScreen {
         let changed_from_source = cached.changed_from_source;
 
         let mut dismissed_retired_key = false;
+        let mut dismissed_retired_hop = false;
         if !validation_errors.is_empty() {
             ui.separator();
             ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvFixBeforeValidate));
@@ -3797,13 +3907,31 @@ impl ServersScreen {
                 });
             // The retired `proxySettings` finding's other way out: a user who
             // wants no chain at all drops the key here instead of setting a
-            // target. The note states what that costs, and the control is the
-            // finding row's own — it never appears for any other rule.
+            // target. The note states what that costs, so it renders only
+            // when the profile will keep no chain; the control is the finding
+            // row's own and never appears for any other rule.
             if draft.profile.outbound.retired_proxy_settings.is_some() {
                 ui.horizontal(|ui| {
-                    ui.weak(t(lang, Key::SrvRemoveProxySettingsKeyNote));
+                    if draft.profile.chain_target().is_none() {
+                        ui.weak(t(lang, Key::SrvRemoveProxySettingsKeyNote));
+                    }
                     if ui.button(t(lang, Key::SrvRemoveProxySettingsKey)).clicked() {
                         dismissed_retired_key = true;
+                    }
+                });
+            }
+            // The retired `quicParams.udpHop` finding's other way out: a user
+            // who wants no hop at all drops the key here instead of building
+            // the mask. The note states what that costs, so it renders only
+            // when the profile keeps no `udphop` mask; the control is the
+            // finding row's own and never appears for any other rule.
+            if retired_udp_hop_present(&draft.profile) {
+                ui.horizontal(|ui| {
+                    if udphop_masks(&draft.profile).is_empty() {
+                        ui.weak(t(lang, Key::SrvRemoveUdpHopKeyNote));
+                    }
+                    if ui.button(t(lang, Key::SrvRemoveUdpHopKey)).clicked() {
+                        dismissed_retired_hop = true;
                     }
                 });
             }
@@ -3872,6 +4000,19 @@ impl ServersScreen {
         // writes the profile without the key.
         if dismissed_retired_key {
             draft.profile.outbound.retired_proxy_settings = None;
+            draft.generation = draft.generation.wrapping_add(1);
+            self.profile_validation_report = None;
+        }
+        if dismissed_retired_hop
+            && let Some(quic) = draft
+                .profile
+                .outbound
+                .stream
+                .finalmask
+                .as_mut()
+                .and_then(|finalmask| finalmask.quic_params.as_mut())
+        {
+            quic.retired_udp_hop = None;
             draft.generation = draft.generation.wrapping_add(1);
             self.profile_validation_report = None;
         }
@@ -4143,6 +4284,18 @@ impl ServersScreen {
                     &mut settings.address,
                     "10.0.0.2/32",
                 );
+                // The entry count feeds the sentinel verdict, so it is read
+                // before the list itself is borrowed mutably.
+                let dns_entry_count = settings.remote_dns.len();
+                changed |= widgets::validated_string_list(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvWgRemoteDns),
+                    &mut settings.remote_dns,
+                    t(lang, Key::SrvWgRemoteDnsHint),
+                    |entry| v_wg_remote_dns_entry(lang, entry, dns_entry_count),
+                );
+                ui.small(t(lang, Key::SrvWgRemoteDnsNote));
                 let mut mtu = (settings.mtu != 0).then_some(settings.mtu);
                 if widgets::opt_num(ui, "mtu", &mut mtu, 576..=1500) {
                     settings.mtu = mtu.unwrap_or_default();
@@ -6902,10 +7055,10 @@ mod tests {
     use crate::metrics::MetricsHandle;
     use crate::model::validation::ValidationCode;
     use crate::model::{
-        CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskTcpItem,
-        FinalmaskTcpMask, FreedomFinalRule, Network, Noise, OutboundModel, Protocol,
-        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsModel, WsSettings,
-        XhttpSettings,
+        CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskQuicParams,
+        FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask, FreedomFinalRule, Network, Noise,
+        OutboundModel, Protocol, ProtocolSettings, RealityModel, Security, SockoptModel,
+        StreamModel, TlsModel, WsSettings, XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -11037,6 +11190,12 @@ TLS ping finished"#;
             .expect("the draft opens")
             .profile
             .clone();
+        assert!(
+            harness
+                .query_by_label("The app removes the retired key. The server dials directly.")
+                .is_some(),
+            "the note must state the dropped chain when none is set"
+        );
 
         harness
             .get_by_role_and_label(
@@ -11080,6 +11239,346 @@ TLS ping finished"#;
                 .all(|error| !error.contains("proxySettings")),
             "{:#?}",
             editor_errors(&harness)
+        );
+    }
+
+    #[test]
+    fn retired_proxy_settings_dismissal_note_follows_the_chain_state() {
+        // A profile that still dials through another server keeps its chain
+        // when the key is dismissed, so the "dials directly" note stays off
+        // and the dismissal only drops the key.
+        let (mut rig, tokyo, osaka) = retired_key_rig();
+        let osaka_tag = osaka.tag();
+        rig.servers
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == tokyo.id)
+            .expect("the fixture profile")
+            .outbound
+            .chain_via(&osaka_tag);
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("The app removes the retired key. The server dials directly.")
+                .is_none(),
+            "the note must not claim a dropped chain while one is set"
+        );
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "Remove the proxySettings key",
+            )
+            .click();
+        harness.run();
+        harness.run();
+        let state = harness.state();
+        let draft = state
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        assert!(
+            draft.profile.outbound.retired_proxy_settings.is_none(),
+            "the dismissal must clear the retired key"
+        );
+        assert_eq!(
+            draft.profile.chain_target(),
+            Some(osaka_tag.as_str()),
+            "the dismissal must keep an existing chain"
+        );
+    }
+
+    /// A rig whose active profile carries the retired `quicParams.udpHop`
+    /// key in the shape a stored file would hold.
+    fn retired_hop_rig() -> UiTestRig {
+        let mut profile = ServerProfile::new("Hy", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            quic_params: Some(FinalmaskQuicParams {
+                retired_udp_hop: Some(json!({"ports": "443,10000-10010", "interval": "5-10"})),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id.clone());
+        rig
+    }
+
+    /// The draft's `quicParams` as the editor holds it.
+    fn draft_quic_params(
+        harness: &Harness<'static, (ServersScreen, UiTestRig)>,
+    ) -> FinalmaskQuicParams {
+        harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .outbound
+            .stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| finalmask.quic_params.clone())
+            .expect("the fixture carries quicParams")
+    }
+
+    /// The draft's first `udphop` mask mode, as the editor holds it.
+    fn draft_udphop_mode(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> String {
+        let draft = &harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile;
+        draft
+            .outbound
+            .stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| {
+                finalmask.udp.iter().find_map(|mask| match mask {
+                    FinalmaskUdpMask::Udphop { settings, .. } => Some(settings.mode.clone()),
+                    _ => None,
+                })
+            })
+            .expect("the fixture carries a udphop mask")
+    }
+
+    #[test]
+    fn retired_udp_hop_finding_lists_the_mask_fix_and_clears_on_a_rebuild() {
+        // A stored profile from a build that still wrote the hop under the
+        // QUIC parameters: the editor opens on it, the blocking list names
+        // the mask and the equivalence, and only building the mask resolves
+        // the key.
+        let mut harness = wide_servers_harness(retired_hop_rig());
+        harness.run();
+        assert!(
+            harness.state().0.existing_draft.is_some(),
+            "a profile with the retired key must stay editable"
+        );
+        let errors = editor_errors(&harness);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("udpHop") && error.contains("udphop UDP mask")),
+            "{errors:#?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("intervalLocal") && error.contains("intervalRemote")),
+            "the fix-it text must state the equivalence: {errors:#?}"
+        );
+
+        harness.get_by_label("Advanced").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("udpHop").is_none(),
+            "the retired QUIC-location control must be gone"
+        );
+
+        // An unrelated edit (the name) must leave the gate in place.
+        edit_existing_draft(&mut harness.state_mut().0);
+        harness.run();
+        let renamed = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .unwrap()
+            .profile
+            .name
+            .clone();
+        assert!(
+            draft_quic_params(&harness).retired_udp_hop.is_some(),
+            "a rename must not dismiss the retired key"
+        );
+
+        // Rebuilding the hop as a UDP mask is the decision: the new mask
+        // replaces the retired key in the same edit.
+        harness.get_by_label("+ UDP mask").click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some("header-custom"))
+            .expect("the added mask's type combo")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "udphop")
+            .click();
+        harness.run();
+        harness.run();
+        assert!(
+            draft_quic_params(&harness).retired_udp_hop.is_none(),
+            "rebuilding the hop as the mask must clear the retired key"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("udpHop")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+        let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
+        assert_eq!(
+            draft.outbound.stream.finalmask.as_ref().unwrap().udp.len(),
+            1,
+            "the rebuilt hop must stay in the mask list"
+        );
+        assert_eq!(
+            draft.name, renamed,
+            "the rebuild must not touch other fields"
+        );
+        let persisted = serde_json::to_value(draft).expect("the draft serializes");
+        assert!(
+            persisted["outbound"]["streamSettings"]["finalmask"]["quicParams"]
+                .get("udpHop")
+                .is_none(),
+            "the resolved profile must serialize without the key: {persisted}"
+        );
+    }
+
+    #[test]
+    fn retired_udp_hop_dismissal_drops_the_key_without_a_mask() {
+        // A user who wants no hop resolves the finding with the dismissal
+        // control on the finding row: the key is dropped, no field changes,
+        // and the profile serializes without it.
+        let mut harness = wide_servers_harness(retired_hop_rig());
+        harness.run();
+        let before = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the draft opens")
+            .profile
+            .clone();
+        assert!(
+            harness
+                .query_by_label("The app removes the retired key. The hop stops working.")
+                .is_some(),
+            "the note must state what the dismissed hop costs"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Remove the udpHop key")
+            .click();
+        harness.run();
+        harness.run();
+        assert!(
+            draft_quic_params(&harness).retired_udp_hop.is_none(),
+            "the dismissal must clear the retired key"
+        );
+        let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
+        assert_eq!(
+            draft.name, before.name,
+            "the dismissal must not touch other fields"
+        );
+        assert!(
+            draft
+                .outbound
+                .stream
+                .finalmask
+                .as_ref()
+                .is_none_or(|finalmask| finalmask.udp.is_empty()),
+            "the dismissal must not invent a mask"
+        );
+        let persisted = serde_json::to_value(draft).expect("the draft serializes");
+        assert!(
+            persisted["outbound"]["streamSettings"]["finalmask"]["quicParams"]
+                .get("udpHop")
+                .is_none(),
+            "the dismissed profile must serialize without the key: {persisted}"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("udpHop")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+    }
+
+    #[test]
+    fn udphop_mask_editor_edits_the_combinable_mode_set_and_the_settings() {
+        // The mode is one comma-separated set: the three checkboxes rewrite
+        // the known tokens in canonical order, and a stored token outside the
+        // three names stays in the value, so the validation finding keeps
+        // naming it instead of a checkbox edit dropping the user's text.
+        let mut profile = ServerProfile::new("Hy", OutboundModel::new(Protocol::Hysteria));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![
+                serde_json::from_value(json!({
+                    "type": "udphop",
+                    "settings": {
+                        "mode": "perConnRemote,banana",
+                        "interval": "5-10",
+                        "remotePorts": "443",
+                        "remoteIPs": ["203.0.113.10"]
+                    }
+                }))
+                .expect("the udphop envelope loads"),
+            ],
+            ..Default::default()
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id.clone());
+        let mut harness = wide_servers_harness(rig);
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+
+        // Every setting of the mask is on screen.
+        for mode in ["intervalLocal", "intervalRemote", "perConnRemote"] {
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::CheckBox, mode)
+                    .is_some(),
+                "the {mode} mode checkbox must render"
+            );
+        }
+        assert!(harness.query_by_label("interval (s)").is_some());
+        assert!(harness.query_by_label("remotePorts").is_some());
+        assert!(harness.query_by_label("remoteIPs").is_some());
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::CheckBox, "sockopt")
+                .is_some(),
+            "the per-mask socket options must render"
+        );
+
+        // intervalLocal joins the set; the stored unknown token rides along.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "intervalLocal")
+            .click();
+        harness.run();
+        assert_eq!(
+            draft_udphop_mode(&harness),
+            "intervalLocal,perConnRemote,banana"
+        );
+        // Adding intervalRemote and dropping perConnRemote leaves the old
+        // hop's equivalent pair; the unknown token still rides along.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "intervalRemote")
+            .click();
+        harness.run();
+        assert_eq!(
+            draft_udphop_mode(&harness),
+            "intervalLocal,intervalRemote,perConnRemote,banana"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "perConnRemote")
+            .click();
+        harness.run();
+        assert_eq!(
+            draft_udphop_mode(&harness),
+            "intervalLocal,intervalRemote,banana"
         );
     }
 
@@ -11477,6 +11976,144 @@ TLS ping finished"#;
             harness.state().0.selected.as_deref(),
             Some(ids[63].as_str()),
             "cancelling the delete must keep the selection"
+        );
+    }
+
+    /// A bare WireGuard profile whose in-network DNS list carries `entries`.
+    fn wireguard_rig(entries: &[&str]) -> UiTestRig {
+        let mut profile = ServerProfile::new("wg", OutboundModel::new(Protocol::Wireguard));
+        if let ProtocolSettings::Wireguard(settings) = &mut profile.outbound.settings {
+            settings.remote_dns = entries.iter().map(|entry| (*entry).to_owned()).collect();
+        }
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id.clone());
+        rig
+    }
+
+    /// The editor's `remoteDNS` row currently showing `value`.
+    fn remote_dns_row<'a>(
+        harness: &'a Harness<'static, (ServersScreen, UiTestRig)>,
+        value: &str,
+    ) -> egui_kittest::Node<'a> {
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.value().as_deref() == Some(value))
+            .unwrap_or_else(|| panic!("the remoteDNS row showing {value:?} must render"))
+    }
+
+    #[test]
+    fn wireguard_remote_dns_row_edits_and_reports_a_bad_entry_only_while_it_stands() {
+        // The list renders as editable rows, and a value the pinned core
+        // cannot build (it parses each entry with `netip.MustParseAddr`)
+        // reports inline and in the blocking list at edit time; repairing the
+        // entry clears both.
+        let mut harness = wide_servers_harness(wireguard_rig(&["1.1.1.1"]));
+        harness.run();
+        remote_dns_row(&harness, "1.1.1.1").scroll_to_me();
+        harness.run();
+        remote_dns_row(&harness, "1.1.1.1").click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the remoteDNS row takes focus")
+            .type_text("x");
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .is_some(),
+            "the bad entry must report inline under its row"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .any(|error| error.contains("settings.remoteDNS")
+                    && error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+
+        // Repair in place: the inline verdict and the gate both clear.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the remoteDNS row keeps focus")
+            .type_text("8.8.8.8");
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .is_none(),
+            "the repaired entry must not report"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("remoteDNS")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
+            panic!("the draft stays a WireGuard profile");
+        };
+        assert_eq!(settings.remote_dns, vec!["8.8.8.8".to_owned()]);
+    }
+
+    #[test]
+    fn wireguard_remote_dns_sentinel_renders_alone_and_reports_a_mixed_list() {
+        // The sentinel reads as the list's only entry. Alone it is valid and
+        // silent; next to an address the core would parse the word as an
+        // address and crash, so that entry alone carries the verdict.
+        let mut harness = wide_servers_harness(wireguard_rig(&["local"]));
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsNote))
+                .is_some(),
+            "the sentinel semantics note must render under the list"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
+                .is_none(),
+            "the sentinel alone must not report"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .all(|error| !error.contains("remoteDNS")),
+            "{:#?}",
+            editor_errors(&harness)
+        );
+        drop(harness);
+
+        let mut harness = wide_servers_harness(wireguard_rig(&["local", "1.1.1.1"]));
+        harness.run();
+        remote_dns_row(&harness, "local").scroll_to_me();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
+                .is_some(),
+            "the mixed list must report on the sentinel row"
+        );
+        assert!(
+            editor_errors(&harness)
+                .iter()
+                .any(|error| error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+            "{:#?}",
+            editor_errors(&harness)
         );
     }
 }

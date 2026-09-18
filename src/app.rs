@@ -2455,14 +2455,15 @@ fn show_safety_ack_modal(
     });
 }
 
-/// The index of the first raw-override outbound that carries the retired
-/// `proxySettings` key, when one does. Xray's outbound build refuses a
-/// configuration that carries it (infra/conf/xray.go:262), so the override
-/// must be refused with the same finding the profile model produces — it can
-/// never reach the core. Every case variant counts (Go binds the name
-/// case-insensitively), the value's shape is never inspected, and a
-/// non-array `outbounds` (or a non-object entry) simply carries no outbound
-/// to check.
+/// The index of the first raw-override outbound that carries a non-null
+/// retired `proxySettings` value, when one does. Xray's outbound build
+/// refuses a configuration that carries it (infra/conf/xray.go:262), so the
+/// override must be refused with the same finding the profile model produces
+/// — it can never reach the core. Every case variant counts (Go binds the
+/// name case-insensitively) and the value's shape is never inspected, but
+/// JSON `null` is Go's nil pointer and stays legal; a non-array `outbounds`
+/// (or a non-object entry) simply carries no outbound to check. The index is
+/// 0-based: it addresses the JSON array the user pasted.
 fn raw_override_retired_proxy_settings(config: &serde_json::Value) -> Option<usize> {
     config
         .get("outbounds")?
@@ -2470,10 +2471,49 @@ fn raw_override_retired_proxy_settings(config: &serde_json::Value) -> Option<usi
         .iter()
         .position(|outbound| {
             outbound.as_object().is_some_and(|outbound| {
-                outbound
-                    .keys()
-                    .any(|key| key.eq_ignore_ascii_case("proxySettings"))
+                outbound.iter().any(|(key, value)| {
+                    key.eq_ignore_ascii_case("proxySettings") && !value.is_null()
+                })
             })
+        })
+}
+
+/// One field of a JSON object, matched the way Go binds names: exactly or
+/// ASCII-case-insensitively.
+fn json_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    object
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
+/// The path of the first raw-override outbound that carries a non-null
+/// retired `finalmask.quicParams.udpHop` value, when one does. The pinned
+/// core ignores the key silently (`infra/conf/transport_finalmask.go:88`),
+/// so the override must be refused with the same finding the profile model
+/// produces — the hop would otherwise die without a message. Every name on
+/// the path counts case-insensitively (Go binds them that way), JSON `null`
+/// is Go's zero value and stays legal, and a non-array `outbounds` (or a
+/// non-object entry) simply carries no outbound to check. The index is
+/// 0-based: it addresses the JSON array the user pasted.
+fn raw_override_retired_udp_hop(config: &serde_json::Value) -> Option<String> {
+    config
+        .get("outbounds")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .find_map(|(index, outbound)| {
+            let outbound = outbound.as_object()?;
+            let stream = json_field(outbound, "streamSettings")?.as_object()?;
+            let finalmask = json_field(stream, "finalmask")?.as_object()?;
+            let quic_params = json_field(finalmask, "quicParams")?.as_object()?;
+            quic_params
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("udpHop") && !value.is_null())
+                .then(|| format!("outbounds[{index}].streamSettings.finalmask.quicParams.udpHop"))
         })
 }
 
@@ -2488,13 +2528,23 @@ fn validate_raw_override_candidate(
     if settings.raw_override.is_none() {
         return Ok(());
     }
-    // The retired key is the one thing the override may not carry: the pinned
-    // core fails the whole config build on it, and the profile model reports
-    // the same finding under the same code, so the message is rendered once.
+    // The retired keys are the only things the override may not carry: the
+    // pinned core fails the whole config build on `proxySettings`
+    // (infra/conf/xray.go:262) and ignores `finalmask.quicParams.udpHop`
+    // silently, and the profile model reports the same findings under the
+    // same codes, so each message is rendered once.
     if let Some(index) = raw_override_retired_proxy_settings(config) {
         let issue = crate::model::validation::ValidationIssue {
             code: crate::model::validation::ValidationCode::OutboundProxySettingsRemoved,
-            path: Some(format!("outbounds[{}]", index + 1)),
+            path: Some(format!("outbounds[{index}]")),
+            severity: crate::model::validation::Severity::Error,
+        };
+        return Err(crate::i18n::validation_issue_message(&issue, lang));
+    }
+    if let Some(path) = raw_override_retired_udp_hop(config) {
+        let issue = crate::model::validation::ValidationIssue {
+            code: crate::model::validation::ValidationCode::FinalmaskQuicHopMoved,
+            path: Some(path),
             severity: crate::model::validation::Severity::Error,
         };
         return Err(crate::i18n::validation_issue_message(&issue, lang));
@@ -2916,7 +2966,6 @@ mod safety_tests {
             ("proxySettings", json!({"tag": "srv-y"})),
             ("ProxySettings", json!("srv-y")),
             ("proxysettings", json!(7)),
-            ("proxySettings", json!(null)),
         ] {
             let mut outbound = serde_json::Map::new();
             outbound.insert("protocol".into(), json!("vless"));
@@ -2927,8 +2976,8 @@ mod safety_tests {
             let message =
                 validate_raw_override_candidate(&settings, &config, Language::En).unwrap_err();
             assert!(
-                message.contains("outbounds[2]"),
-                "{key} = {value}: {message}"
+                message.contains("outbounds[1]"),
+                "the finding must address the pasted array 0-based ({key} = {value}): {message}"
             );
             assert!(
                 message.contains("proxySettings"),
@@ -2953,9 +3002,114 @@ mod safety_tests {
             );
         }
 
-        // A clean override passes the retired-key rule.
+        // JSON `null` is Go's nil pointer: the pinned core accepts it, so the
+        // override passes this rule, and a clean override passes too.
+        for null_key in ["proxySettings", "ProxySettings", "proxysettings"] {
+            let mut outbound = serde_json::Map::new();
+            outbound.insert("protocol".into(), json!("vless"));
+            outbound.insert("tag".into(), json!("srv-x"));
+            outbound.insert(null_key.into(), json!(null));
+            config["outbounds"] = json!([{"protocol": "freedom", "tag": "direct"}, outbound]);
+            assert!(
+                validate_raw_override_candidate(&settings, &config, Language::En).is_ok(),
+                "{null_key}: null must pass"
+            );
+        }
         config["outbounds"] = json!([{"protocol": "freedom", "tag": "direct"}]);
         assert!(validate_raw_override_candidate(&settings, &config, Language::En).is_ok());
+    }
+
+    #[test]
+    fn raw_override_carrying_the_retired_udp_hop_key_never_reaches_the_core() {
+        // Story: the raw override stays unrestricted for everything except
+        // the two retired keys. The hop key would be ignored by the pinned
+        // core silently, so the override is refused with the same finding the
+        // profile model produces, before the candidate can be written or
+        // applied.
+        let settings = Settings {
+            raw_override: Some("{}".into()),
+            ..Default::default()
+        };
+        let mut config = json!({
+            "api": {"tag": "api", "listen": "127.0.0.1:10853", "services": ["StatsService"]},
+            "outbounds": [
+                {"protocol": "freedom", "tag": "direct"},
+                {"protocol": "vless", "tag": "srv-x", "streamSettings": {"finalmask": {
+                    "quicParams": {"congestion": "bbr", "udpHop": {"ports": "443"}}
+                }}}
+            ]
+        });
+        let message =
+            validate_raw_override_candidate(&settings, &config, Language::En).unwrap_err();
+        assert!(
+            message.contains("outbounds[1].streamSettings.finalmask.quicParams.udpHop"),
+            "the finding must address the pasted array 0-based: {message}"
+        );
+        assert!(message.contains("udphop UDP mask"), "{message}");
+        assert!(
+            message.contains("intervalLocal") && message.contains("intervalRemote"),
+            "the fix-it text must state the equivalence: {message}"
+        );
+
+        // Every name on the path counts case-insensitively, and any non-null
+        // shape refuses.
+        for (wrapper, value) in [
+            (
+                "StreamSettings",
+                json!({"finalmask": {"quicParams": {"UDPHOP": "hop"}}}),
+            ),
+            (
+                "streamSettings",
+                json!({"Finalmask": {"QuicParams": {"Udphop": 7}}}),
+            ),
+            (
+                "streamSettings",
+                json!({"finalmask": {"quicParams": {"udphop": true}}}),
+            ),
+            (
+                "streamSettings",
+                json!({"finalmask": {"quicParams": {"udpHop": ["hop"]}}}),
+            ),
+        ] {
+            let mut config = config.clone();
+            config["outbounds"] = json!([
+                {"protocol": "freedom", "tag": "direct"},
+                {"protocol": "vless", "tag": "srv-x", wrapper: value}
+            ]);
+            assert!(
+                validate_raw_override_candidate(&settings, &config, Language::En).is_err(),
+                "{wrapper}: {value} must refuse"
+            );
+        }
+
+        // JSON `null` is Go's zero value: the core accepts it, so the
+        // override passes this rule; a clean override passes too.
+        config["outbounds"] = json!([
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "vless", "tag": "srv-x", "streamSettings": {"finalmask": {
+                "quicParams": {"udpHop": null}
+            }}}
+        ]);
+        assert!(
+            validate_raw_override_candidate(&settings, &config, Language::En).is_ok(),
+            "null must pass"
+        );
+
+        // The same refusal gates the whole candidate path: `generate` returns
+        // an override verbatim, so this check is all that stands between the
+        // text and the core.
+        config["outbounds"] = json!([
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "vless", "tag": "srv-x", "streamSettings": {"finalmask": {
+                "quicParams": {"udpHop": {"ports": "443", "interval": "5-10"}}
+            }}}
+        ]);
+        let mut overridden = settings.clone();
+        overridden.raw_override = Some(config.to_string());
+        assert!(
+            generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En).is_err(),
+            "the retired hop key must gate the candidate"
+        );
     }
 
     #[test]

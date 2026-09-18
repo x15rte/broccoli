@@ -21,7 +21,7 @@
 use base64::Engine as _;
 
 use crate::i18n::{Key, t};
-use crate::model::outbound::is_valid_wireguard_key;
+use crate::model::outbound::{is_valid_wireguard_key, wireguard_remote_dns_entry_supported};
 use crate::model::settings::Language;
 
 // ---------- validators ----------
@@ -75,6 +75,26 @@ pub(super) fn v_optional_wg_key(lang: Language, v: &str) -> Option<String> {
         None
     } else {
         v_wg_key(lang, v)
+    }
+}
+
+/// Per-entry verdict for the WireGuard in-network DNS list. `entry_count` is
+/// the list length because the core reads `local` as the sentinel only when
+/// the list holds nothing else (proxy/wireguard/client.go:117-124); the
+/// sentinel entry itself carries the mixed-list verdict, every other
+/// unacceptable entry the format verdict.
+pub(super) fn v_wg_remote_dns_entry(
+    lang: Language,
+    entry: &str,
+    entry_count: usize,
+) -> Option<String> {
+    if wireguard_remote_dns_entry_supported(entry, entry_count) {
+        return None;
+    }
+    if entry == "local" {
+        Some(t(lang, Key::SrvWgRemoteDnsLocalOnly).to_string())
+    } else {
+        Some(t(lang, Key::SrvWgRemoteDnsEntryInvalid).to_string())
     }
 }
 

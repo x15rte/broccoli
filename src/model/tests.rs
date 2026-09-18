@@ -290,6 +290,24 @@ fn roundtrip_stream() {
             "quicParams": {"congestion": "brutal", "brutalUp": "50 mbps"}
         }
     }));
+    // The hop mask's full settings envelope: the socket options, the
+    // combinable mode list, the interval range, the remote ports, and the
+    // addresses/prefixes the hop picks from.
+    check::<StreamModel>(json!({
+        "network": "hysteria",
+        "finalmask": {"udp": [{
+            "type": "udphop",
+            "settings": {
+                "sockopt": {"domainStrategy": "UseIPv4", "interface": "eth0"},
+                "mode": "intervalLocal,perConnRemote",
+                "interval": "5-30",
+                "remotePorts": "443,10000-10010,env:HOP_PORTS",
+                "remoteIPs": ["203.0.113.10", "2001:db8::/48", "198.51.100.0/24"],
+                "futureSetting": {"kept": true}
+            },
+            "futureEnvelope": true
+        }]}
+    }));
     check::<StreamModel>(json!({
         "network": "raw", "security": "tls",
         "tlsSettings": {
@@ -387,9 +405,9 @@ fn reality_fingerprint_outside_the_editor_options_survives_a_profile_round_trip(
 
 #[test]
 fn roundtrip_outbound_envelope() {
-    // The retired `proxySettings` key is deliberately absent: it is not part
-    // of the envelope any more (a stored value is dropped at load, never
-    // written back).
+    // The retired `proxySettings` key is deliberately absent: a stored value
+    // is kept in its own field (retention until the user resolves it) and
+    // never part of the unknown-key envelope this fixture exercises.
     check::<OutboundModel>(json!({
         "protocol": "trojan",
         "settings": {"address": "t.example.com", "port": 443, "password": "pw"},

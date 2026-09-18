@@ -21,7 +21,9 @@ use crate::ui::widgets;
 use super::raw_editor::{
     FieldKey, JsonBuf, JsonEditorSpec, PemBuf, RawField, pem_lines_editor, raw_buffer_edit,
 };
-use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
+use super::{
+    TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, mask_sockopt_editor, path_field,
+};
 
 // ---------- finalmask typed editor ----------
 
@@ -543,6 +545,89 @@ fn finalmask_udp_items_editor(
         items.push(FinalmaskUdpItem::default());
         changed = true;
     }
+    changed
+}
+
+/// The `udphop` mask editor: the mode set (three combinable tokens), the
+/// seconds interval, the remote port list, the remote address/prefix list,
+/// and the mask's own socket options.
+fn finalmask_udphop_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    settings: &mut FinalmaskUdpHop,
+) -> bool {
+    // The three names the mask build accepts, case-insensitively, in the
+    // canonical order. A stored mode that carries anything else keeps those
+    // tokens: the checkboxes rewrite the known set, and the unknown tokens
+    // stay put so the validation finding keeps naming them instead of a
+    // checkbox edit dropping the user's text.
+    const MODES: [&str; 3] = ["intervalLocal", "intervalRemote", "perConnRemote"];
+    let tokens: Vec<&str> = settings
+        .mode
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut modes = MODES.map(|name| tokens.iter().any(|token| name.eq_ignore_ascii_case(token)));
+    let mut mode_changed = false;
+    ui.label("mode");
+    ui.horizontal(|ui| {
+        for (index, name) in MODES.iter().enumerate() {
+            mode_changed |= ui.checkbox(&mut modes[index], *name).changed();
+        }
+    });
+    if mode_changed {
+        let mut parts: Vec<&str> = MODES
+            .iter()
+            .zip(modes.iter())
+            .filter(|(_, on)| **on)
+            .map(|(name, _)| *name)
+            .collect();
+        parts.extend(
+            tokens
+                .iter()
+                .copied()
+                .filter(|token| !MODES.iter().any(|name| name.eq_ignore_ascii_case(token))),
+        );
+        settings.mode = parts.join(",");
+    }
+    let mut changed = mode_changed;
+    changed |= range_editor(
+        ui,
+        t(lang, Key::SrvIntervalS),
+        &mut settings.interval,
+        0..=i32::MAX,
+    );
+    // The text arm edits the model's own port list in place (the widget
+    // writes only on a real edit); only the numeric arm needs a buffer,
+    // built from the number for the widget to edit.
+    match &mut settings.remote_ports {
+        FinalmaskPortList::Number(number) => {
+            let mut text = number.to_string();
+            if widgets::text_field(ui, "remotePorts", &mut text, "443,10000-20000,env:PORT") {
+                settings.remote_ports = text
+                    .parse::<u32>()
+                    .map(FinalmaskPortList::Number)
+                    .unwrap_or(FinalmaskPortList::Text(text));
+                changed = true;
+            }
+        }
+        FinalmaskPortList::Text(text) => {
+            let edited = widgets::text_field(ui, "remotePorts", text, "443,10000-20000,env:PORT");
+            changed |= edited;
+            if edited && let Ok(number) = text.parse::<u32>() {
+                settings.remote_ports = FinalmaskPortList::Number(number);
+            }
+        }
+    }
+    changed |= widgets::string_list(
+        ui,
+        lang,
+        "remoteIPs",
+        &mut settings.remote_ips,
+        "198.51.100.0/24 or 2001:db8::1",
+    );
+    changed |= mask_sockopt_editor(ui, lang, &mut settings.sockopt);
     changed
 }
 
@@ -1110,6 +1195,7 @@ pub(super) fn finalmask_udp_settings_editor(
             }
             changed
         }
+        FinalmaskUdpMask::Udphop { settings, .. } => finalmask_udphop_editor(ui, lang, settings),
         FinalmaskUdpMask::Unknown(raw) => finalmask_unknown_editor(
             ui,
             lang,
@@ -1155,41 +1241,6 @@ pub(super) fn finalmask_quic_editor(
     );
     changed |= widgets::text_field(ui, "brutalUp", &mut quic.brutal_up, "50 mbps");
     changed |= widgets::text_field(ui, "brutalDown", &mut quic.brutal_down, "100 mbps");
-    let mut has_hop = quic.udp_hop.is_some();
-    if ui.checkbox(&mut has_hop, "udpHop").changed() {
-        quic.udp_hop = has_hop.then(FinalmaskUdpHop::default);
-        changed = true;
-    }
-    if let Some(hop) = quic.udp_hop.as_mut() {
-        // The text arm edits the model's own port list in place (the widget
-        // writes only on a real edit); only the numeric arm needs a buffer,
-        // built from the number for the widget to edit.
-        match &mut hop.ports {
-            FinalmaskPortList::Number(number) => {
-                let mut text = number.to_string();
-                if widgets::text_field(ui, "ports", &mut text, "443,10000-20000,env:PORT") {
-                    hop.ports = text
-                        .parse::<u32>()
-                        .map(FinalmaskPortList::Number)
-                        .unwrap_or(FinalmaskPortList::Text(text));
-                    changed = true;
-                }
-            }
-            FinalmaskPortList::Text(text) => {
-                let edited = widgets::text_field(ui, "ports", text, "443,10000-20000,env:PORT");
-                changed |= edited;
-                if edited && let Ok(number) = text.parse::<u32>() {
-                    hop.ports = FinalmaskPortList::Number(number);
-                }
-            }
-        }
-        changed |= range_editor(
-            ui,
-            t(lang, Key::SrvIntervalS),
-            &mut hop.interval,
-            0..=i32::MAX,
-        );
-    }
     changed |= widgets::opt_num(
         ui,
         "initStreamReceiveWindow",

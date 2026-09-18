@@ -274,6 +274,16 @@ pub struct WireguardSettings {
     pub domain_strategy: String,
     #[serde(skip_serializing_if = "skip_false")]
     pub no_kernel_tun: bool,
+    /// In-network resolvers (`remoteDNS`, wireguard.go:69): an empty list
+    /// keeps the core's built-in resolver list, and the single entry `local`
+    /// uses the core's own DNS client instead
+    /// (proxy/wireguard/client.go:113-124). Every other entry must be an IP
+    /// literal there — the core builds the resolver set with
+    /// `netip.MustParseAddr`, which panics the process during outbound
+    /// creation on anything else, so [`wireguard_remote_dns_supported`] is
+    /// the validity predicate for this field.
+    #[serde(rename = "remoteDNS", skip_serializing_if = "skip_empty_vec")]
+    pub remote_dns: Vec<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -288,9 +298,33 @@ impl Default for WireguardSettings {
             reserved: None,
             domain_strategy: "forceip".into(),
             no_kernel_tun: false,
+            remote_dns: Vec::new(),
             extra: Map::new(),
         }
     }
+}
+
+/// True when one `remoteDNS` entry is acceptable in a list of `list_len`
+/// entries: an IP literal, or the exact `local` sentinel as the list's only
+/// entry. The comparison is case-sensitive and does not trim — the core reads
+/// the sentinel with `dns[0] == "local"` and parses every other entry
+/// verbatim (proxy/wireguard/client.go:117-124), so a near-miss spelling must
+/// be rejected rather than normalized.
+pub fn wireguard_remote_dns_entry_supported(entry: &str, list_len: usize) -> bool {
+    if entry == "local" {
+        return list_len == 1;
+    }
+    entry.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// True when a whole `remoteDNS` list is one the pinned core can build: every
+/// entry is acceptable at that list length — the core reads `local` as the
+/// sentinel only when the list length is one, and otherwise parses it as an
+/// address and panics.
+pub fn wireguard_remote_dns_supported(entries: &[String]) -> bool {
+    entries
+        .iter()
+        .all(|entry| wireguard_remote_dns_entry_supported(entry, entries.len()))
 }
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key
 /// size: 64 hexadecimal digits, or raw standard/URL-safe base64 with zero or
@@ -655,7 +689,8 @@ pub struct OutboundModel {
     pub settings: ProtocolSettings,
     pub stream: StreamModel,
     /// The raw value of the retired `proxySettings` key the stored object
-    /// carried, when it did (any JSON shape). Xray's outbound build refuses a
+    /// carried, when it did (any non-null JSON shape; `null` is the Go zero
+    /// shape and stays absent). Xray's outbound build refuses a
     /// configuration that carries the key (infra/conf/xray.go:262), so the
     /// profile stays gated until the user resolves it; the value is kept only
     /// so the settings file round-trips it and is re-emitted with no
@@ -932,20 +967,24 @@ impl<'de> Deserialize<'de> for OutboundModel {
         // "proxySettings"` → `"streamSettings.sockopt.dialerProxy"`), so the
         // key never fails the load — the profile is marked instead. Its raw
         // value is kept so the settings file round-trips the key unchanged
-        // (nothing is migrated) while the gate stands. The value takes any
-        // JSON shape (`json.RawMessage` upstream is not validated), and Go
-        // binds the name case-insensitively: the first case variant is kept
-        // and every other is dropped, so none can survive as an unknown key.
+        // (nothing is migrated) while the gate stands. A null value anywhere
+        // among the case variants is the Go zero shape — the field upstream
+        // is a pointer, and null sets it to nil — so the key counts as
+        // absent: nothing is retained, marked, or written back. Otherwise
+        // the value takes any JSON shape (`json.RawMessage` upstream is not
+        // validated), and every case variant is consumed: the last match
+        // visited survives for re-emission and the rest are dropped, so none
+        // can survive as an unknown key.
+        let null_valued = obj
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("proxySettings") && value.is_null());
         let mut retired_proxy_settings = None;
         obj.retain(|key, value| {
-            if key.eq_ignore_ascii_case("proxySettings") {
-                if retired_proxy_settings.is_none() {
-                    retired_proxy_settings = Some(value.clone());
-                }
-                false
-            } else {
-                true
+            let matches = key.eq_ignore_ascii_case("proxySettings");
+            if matches && !null_valued {
+                retired_proxy_settings = Some(value.clone());
             }
+            !matches
         });
         let send_through = match take(&mut obj, "sendThrough") {
             Some(value) => from_value_path::<Option<String>>(value).map_err(|error| {
@@ -982,8 +1021,8 @@ impl<'de> Deserialize<'de> for OutboundModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutboundModel, Protocol, ProtocolSettings, endpoint_requires_transport_security,
-        is_valid_wireguard_key,
+        OutboundModel, Protocol, ProtocolSettings, WireguardPeer, WireguardSettings,
+        endpoint_requires_transport_security, is_valid_wireguard_key,
     };
     use crate::model::settings::Language;
     use crate::model::stream::{
@@ -991,7 +1030,7 @@ mod tests {
         RawSettings, Security, XhttpSettings,
     };
     use base64::Engine as _;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn wireguard_key_accepts_every_xray_32_byte_encoding() {
@@ -1364,7 +1403,6 @@ mod tests {
             (json!(7), "proxySettings"),
             (json!(true), "proxySettings"),
             (json!(["srv-x"]), "proxySettings"),
-            (json!(null), "proxySettings"),
             (json!({"tag": 7, "extra": {"keep": 1}}), "ProxySettings"),
             (json!("srv-x"), "proxysettings"),
         ] {
@@ -1412,8 +1450,9 @@ mod tests {
             assert_eq!(wire.get("futureKey"), Some(&json!("kept")));
         }
 
-        // Several case variants: the first value is kept, the rest never
-        // survive anywhere.
+        // Several case variants, all non-null: every variant is consumed and
+        // the last visited survives for re-emission ("proxySettings" sorts
+        // after "ProxySettings"), so no other variant survives anywhere.
         let mixed = serde_json::json!({
             "protocol": "freedom",
             "ProxySettings": {"tag": "first"},
@@ -1422,14 +1461,48 @@ mod tests {
         let model: OutboundModel = serde_json::from_value(mixed).expect("mixed case variants load");
         assert_eq!(
             model.retired_proxy_settings.as_ref(),
-            Some(&json!({"tag": "first"}))
+            Some(&json!({"tag": "second"}))
         );
         let persisted = serde_json::to_value(&model).expect("model serializes");
         assert_eq!(
             persisted.get("proxySettings"),
-            Some(&json!({"tag": "first"}))
+            Some(&json!({"tag": "second"}))
         );
         assert!(persisted.get("ProxySettings").is_none());
+
+        // JSON `null` is Go's nil pointer: the key is consumed as the Go zero
+        // shape, so it marks nothing and is gone from the next save. It also
+        // must not survive as an unknown key, and a null under any case
+        // variant clears the key whatever the other variants carry.
+        for fixture in [
+            json!({"proxySettings": null}),
+            json!({"ProxySettings": null}),
+            json!({"proxySettings": {"tag": "srv-x"}, "ProxySettings": null}),
+            json!({"ProxySettings": null, "proxySettings": {"tag": "srv-x"}}),
+        ] {
+            let mut object = serde_json::Map::new();
+            object.insert("protocol".into(), json!("freedom"));
+            for (key, value) in fixture.as_object().expect("an object fixture") {
+                object.insert(key.clone(), value.clone());
+            }
+            let rendered = fixture.to_string();
+            let model: OutboundModel = serde_json::from_value(serde_json::Value::Object(object))
+                .unwrap_or_else(|error| panic!("{rendered} must load: {error}"));
+            assert!(
+                model.retired_proxy_settings.is_none(),
+                "{rendered} must not mark the profile"
+            );
+            assert!(model.extra.is_empty(), "{rendered}");
+            let persisted = serde_json::to_value(&model).expect("model serializes");
+            assert!(
+                !persisted
+                    .as_object()
+                    .expect("an outbound serializes to an object")
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("proxySettings")),
+                "{rendered} must not be written back: {persisted}"
+            );
+        }
     }
 
     #[test]
@@ -1494,5 +1567,147 @@ mod tests {
                 "futureSettings": {"keep": true}
             })
         );
+    }
+
+    /// One WireGuard outbound carrying `remoteDNS` `entries` (empty = the key
+    /// is absent), through the real settings-file round trip and the real
+    /// wire emission.
+    fn wireguard_with_remote_dns(entries: Option<Vec<String>>) -> OutboundModel {
+        let mut settings = WireguardSettings {
+            secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
+            peers: vec![WireguardPeer {
+                public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
+                endpoint: "203.0.113.10:51820".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        if let Some(entries) = entries {
+            settings.remote_dns = entries;
+        }
+        OutboundModel {
+            protocol: Protocol::Wireguard,
+            settings: ProtocolSettings::Wireguard(settings),
+            ..Default::default()
+        }
+    }
+
+    /// The `settings.remoteDNS` the outbound model emits, absent-folded.
+    fn emitted_remote_dns(entries: Option<Vec<String>>) -> Option<Value> {
+        let wire = wireguard_with_remote_dns(entries).to_wire("wg");
+        wire["settings"].get("remoteDNS").cloned()
+    }
+
+    #[test]
+    fn wireguard_remote_dns_round_trips_unset_sentinel_and_list() {
+        // Unset: the key never appears in the settings file or the wire.
+        assert_eq!(emitted_remote_dns(None), None);
+        assert_eq!(emitted_remote_dns(Some(Vec::new())), None);
+        let unset: OutboundModel = serde_json::from_value(json!({
+            "protocol": "wireguard",
+            "settings": {"secretKey": "k"}
+        }))
+        .expect("unset remoteDNS loads");
+        assert_eq!(
+            serde_json::to_value(&unset).unwrap()["settings"]
+                .get("remoteDNS")
+                .cloned(),
+            None
+        );
+
+        // The sentinel, alone: the upstream key spelling, byte for byte.
+        assert_eq!(
+            emitted_remote_dns(Some(vec!["local".into()])),
+            Some(json!(["local"]))
+        );
+        let sentinel: OutboundModel = serde_json::from_value(json!({
+            "protocol": "wireguard",
+            "settings": {"secretKey": "k", "remoteDNS": ["local"]}
+        }))
+        .expect("the sentinel loads");
+        let ProtocolSettings::Wireguard(settings) = &sentinel.settings else {
+            unreachable!();
+        };
+        assert_eq!(settings.remote_dns, vec!["local".to_owned()]);
+        assert_eq!(
+            serde_json::to_value(&sentinel).unwrap()["settings"]["remoteDNS"],
+            json!(["local"])
+        );
+
+        // An explicit list, IPv4 and IPv6, order preserved.
+        let list = vec!["1.1.1.1".to_owned(), "2606:4700:4700::1111".to_owned()];
+        assert_eq!(
+            emitted_remote_dns(Some(list.clone())),
+            Some(json!(["1.1.1.1", "2606:4700:4700::1111"]))
+        );
+        let loaded: OutboundModel = serde_json::from_value(json!({
+            "protocol": "wireguard",
+            "settings": {"secretKey": "k", "remoteDNS": list}
+        }))
+        .expect("an explicit list loads");
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["settings"]["remoteDNS"],
+            json!(["1.1.1.1", "2606:4700:4700::1111"])
+        );
+
+        // A future key is untouched by the modeled field's presence.
+        let mixed: OutboundModel = serde_json::from_value(json!({
+            "protocol": "wireguard",
+            "settings": {"secretKey": "k", "remoteDNS": ["local"], "futureKey": 1}
+        }))
+        .expect("an extra sibling key loads");
+        assert_eq!(
+            serde_json::to_value(&mixed).unwrap()["settings"]["futureKey"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn wireguard_remote_dns_validation_gates_only_unbuildable_lists() {
+        use crate::model::validation::{Severity, ValidationCode, validate_outbound};
+
+        fn codes(entries: Option<Vec<String>>) -> Vec<ValidationCode> {
+            validate_outbound(&wireguard_with_remote_dns(entries))
+                .iter()
+                .map(|issue| issue.code.clone())
+                .collect()
+        }
+
+        for buildable in [
+            None,
+            Some(Vec::new()),
+            Some(vec!["local".into()]),
+            Some(vec!["1.1.1.1".into()]),
+            Some(vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()]),
+        ] {
+            assert!(
+                !codes(buildable.clone()).contains(&ValidationCode::WireguardRemoteDnsInvalid),
+                "{buildable:?} must stay buildable"
+            );
+        }
+
+        for unbuildable in [
+            vec!["bogus"],
+            vec![""],
+            vec!["1.1.1.1:53"],
+            vec!["LOCAL"],
+            vec![" 1.1.1.1"],
+            vec!["local", "1.1.1.1"],
+            vec!["1.1.1.1", "local"],
+        ] {
+            let entries = Some(
+                unbuildable
+                    .iter()
+                    .map(|entry| (*entry).to_owned())
+                    .collect(),
+            );
+            let issues = validate_outbound(&wireguard_with_remote_dns(entries));
+            let issue = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid)
+                .unwrap_or_else(|| panic!("{unbuildable:?} must be refused: {issues:?}"));
+            assert_eq!(issue.severity, Severity::Error, "{unbuildable:?}");
+            assert_eq!(issue.path.as_deref(), Some("settings.remoteDNS"));
+        }
     }
 }

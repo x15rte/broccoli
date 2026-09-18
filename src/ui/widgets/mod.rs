@@ -70,10 +70,92 @@ pub fn validated_field_with_warning(
     validated_field_impl(ui, label, value, hint, validate, warning)
 }
 
+/// The verdict cache behind [`validated_field`] and
+/// [`validated_string_list`]: the validator is a pure parse of the buffer
+/// (every call site's contract), so the verdict is memoized per widget id and
+/// recomputed only when the text no longer matches the memo — the frame the
+/// user typed, the field's first display, or an external rewrite of the
+/// buffer — never on idle repaint frames. Temp data (the `timeout_editor`
+/// buffer precedent) keys off the TextEdit's own id, so the memo follows egui
+/// focus semantics for free; a stale memo from a recycled widget slot
+/// self-heals through the value comparison.
+fn validation_verdict(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    value: &str,
+    validate: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    ui.data_mut(|data| {
+        match data
+            .get_temp_raw_mut(egui::util::id_type_map::RawKey::new::<ValidationMemo>(
+                response.id,
+            ))
+            .and_then(|slot| slot.downcast_mut::<ValidationMemo>())
+        {
+            Some(memo) if memo.value == *value => memo.error.clone(),
+            Some(memo) => {
+                *memo = ValidationMemo {
+                    value: value.to_owned(),
+                    error: validate(value),
+                };
+                memo.error.clone()
+            }
+            None => {
+                let error = validate(value);
+                data.insert_temp(
+                    response.id,
+                    ValidationMemo {
+                        value: value.to_owned(),
+                        error: error.clone(),
+                    },
+                );
+                error
+            }
+        }
+    })
+}
+
+/// Paint the verdict channels shared by [`validated_field`] and
+/// [`validated_string_list`]: the border stroke on the field's rect, then the
+/// message lines under it. Precedence: an error wins the border color, but
+/// the warning text still renders beneath the error text.
+fn paint_validation(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    error: Option<&str>,
+    warning: Option<&str>,
+) {
+    // The border is the error's channel; a warning only tints it while no
+    // error is present.
+    let stroke = match (error, warning) {
+        (Some(_), _) => Some(Stroke::new(1.5, status_colors_of(ui).err)),
+        (None, Some(_)) => Some(Stroke::new(1.5, status_colors_of(ui).warn)),
+        (None, None) => None,
+    };
+    if let Some(stroke) = stroke {
+        ui.painter().rect_stroke(
+            rect,
+            ui.style().visuals.widgets.inactive.corner_radius,
+            stroke,
+            StrokeKind::Inside,
+        );
+    }
+    if let Some(msg) = error {
+        ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().indent);
+            ui.colored_label(status_colors_of(ui).err, RichText::new(msg).small());
+        });
+    }
+    if let Some(msg) = warning {
+        ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().indent);
+            ui.colored_label(status_colors_of(ui).warn, RichText::new(msg).small());
+        });
+    }
+}
+
 /// Shared body of [`validated_field`] and [`validated_field_with_warning`]:
-/// renders the labeled field, then the error/warning lines. Precedence: an
-/// error wins the border color and the hover tooltip, but the warning text
-/// still renders beneath the error text.
+/// renders the labeled field, then the error/warning lines.
 fn validated_field_impl(
     ui: &mut egui::Ui,
     label: &str,
@@ -90,41 +172,7 @@ fn validated_field_impl(
                     .hint_text(hint)
                     .desired_width(f32::INFINITY),
             );
-            // Verdict cache: the validator is a pure parse
-            // of the buffer (every call site's contract), so the verdict is
-            // memoized per widget id and recomputed only when the text no
-            // longer matches the memo — the frame the user typed, the
-            // field's first display, or an external rewrite of the buffer —
-            // never on idle repaint frames. Temp data (the `timeout_editor`
-            // buffer precedent) keys off the TextEdit's own id, so the memo
-            // follows egui focus semantics for free; a stale memo from a
-            // recycled widget slot self-heals through the value comparison.
-            let error = ui.data_mut(|data| {
-                match data
-                    .get_temp_raw_mut(egui::util::id_type_map::RawKey::new::<ValidationMemo>(r.id))
-                    .and_then(|slot| slot.downcast_mut::<ValidationMemo>())
-                {
-                    Some(memo) if memo.value == *value => memo.error.clone(),
-                    Some(memo) => {
-                        *memo = ValidationMemo {
-                            value: value.clone(),
-                            error: validate(value),
-                        };
-                        memo.error.clone()
-                    }
-                    None => {
-                        let error = validate(value);
-                        data.insert_temp(
-                            r.id,
-                            ValidationMemo {
-                                value: value.clone(),
-                                error: error.clone(),
-                            },
-                        );
-                        error
-                    }
-                }
-            });
+            let error = validation_verdict(ui, &r, value, &validate);
             let r = match error.as_deref().or(warning) {
                 Some(message) => r.on_hover_text(message),
                 None => r,
@@ -132,33 +180,7 @@ fn validated_field_impl(
             (r.changed(), r.rect, error)
         })
         .inner;
-    // The border is the error's channel; a warning only tints it while no
-    // error is present.
-    let stroke = match (&error, warning) {
-        (Some(_), _) => Some(Stroke::new(1.5, status_colors_of(ui).err)),
-        (None, Some(_)) => Some(Stroke::new(1.5, status_colors_of(ui).warn)),
-        (None, None) => None,
-    };
-    if let Some(stroke) = stroke {
-        ui.painter().rect_stroke(
-            rect,
-            ui.style().visuals.widgets.inactive.corner_radius,
-            stroke,
-            StrokeKind::Inside,
-        );
-    }
-    if let Some(msg) = &error {
-        ui.horizontal(|ui| {
-            ui.add_space(ui.spacing().indent);
-            ui.colored_label(status_colors_of(ui).err, RichText::new(msg).small());
-        });
-    }
-    if let Some(msg) = warning {
-        ui.horizontal(|ui| {
-            ui.add_space(ui.spacing().indent);
-            ui.colored_label(status_colors_of(ui).warn, RichText::new(msg).small());
-        });
-    }
+    paint_validation(ui, rect, error.as_deref(), warning);
     changed
 }
 
@@ -439,6 +461,63 @@ pub fn string_list(
                     .changed();
             });
         });
+    }
+    if let Some(i) = remove {
+        items.remove(i);
+        changed = true;
+    }
+    if ui.button(t(lang, Key::AddRow)).clicked() {
+        items.push(String::new());
+        changed = true;
+    }
+    changed
+}
+
+/// [`string_list`] with the [`validated_field`] verdict channel per row: when
+/// `validate` returns `Some(message)` the row's field gets the red border, the
+/// hover tooltip, and the message line under the row. Layout is otherwise the
+/// same list shape — a label above, a 🗑 pinning each row's right edge, and a
+/// "+ Add" button appending an empty entry. Only row edits count as
+/// "changed"; a verdict never does.
+pub fn validated_string_list(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    items: &mut Vec<String>,
+    hint: &str,
+    validate: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let mut changed = false;
+    if !label.is_empty() {
+        ui.label(label);
+    }
+    let mut remove = None;
+    for (i, item) in items.iter_mut().enumerate() {
+        let (row_changed, rect, error) = ui
+            .horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                        remove = Some(i);
+                    }
+                    let r = ui.add(
+                        egui::TextEdit::singleline(item)
+                            .hint_text(hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    let error = validation_verdict(ui, &r, item, &validate);
+                    let r = match error.as_deref() {
+                        Some(message) => r.on_hover_text(message),
+                        None => r,
+                    };
+                    (r.changed(), r.rect, error)
+                })
+                .inner
+            })
+            .inner;
+        changed |= row_changed;
+        // The message line renders in the list's own vertical layout, under
+        // the row that carries the verdict.
+        paint_validation(ui, rect, error.as_deref(), None);
     }
     if let Some(i) = remove {
         items.remove(i);

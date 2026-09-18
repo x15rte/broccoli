@@ -705,6 +705,16 @@ fn finalmask_zero_range(value: &Int32Range) -> bool {
     value.from == 0 && value.to == 0
 }
 
+/// True for a port list that states no port: an empty/blank string, or the
+/// numeric zero — Go's `PortList.UnmarshalJSON` reads both as an empty list
+/// (`infra/conf/common.go:274-276`).
+fn finalmask_empty_port_list(value: &FinalmaskPortList) -> bool {
+    match value {
+        FinalmaskPortList::Number(port) => *port == 0,
+        FinalmaskPortList::Text(text) => text.trim().is_empty(),
+    }
+}
+
 /// Presence-preserving equivalent of Xray's `json.RawMessage`.
 ///
 /// The distinction between an omitted field and an explicit JSON `null`
@@ -1154,12 +1164,25 @@ impl Default for FinalmaskPortList {
     }
 }
 
+/// The `udphop` UDP mask settings (`infra/conf/transport_finalmask.go:911-965`
+/// at v26.9.9). The mask hops the destination of the outbound's own UDP
+/// socket: `mode` selects when a hop happens (a comma-separated, combinable
+/// set of `intervalLocal` / `intervalRemote` / `perConnRemote`), `interval`
+/// is the seconds range a period hop waits, `remotePorts` / `remoteIPs`
+/// replace the destination, and `sockopt` configures each hopped socket.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskUdpHop {
-    pub ports: FinalmaskPortList,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sockopt: Option<SockoptModel>,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub mode: String,
     #[serde(skip_serializing_if = "finalmask_zero_range")]
     pub interval: Int32Range,
+    #[serde(skip_serializing_if = "finalmask_empty_port_list")]
+    pub remote_ports: FinalmaskPortList,
+    #[serde(rename = "remoteIPs", skip_serializing_if = "skip_empty_vec")]
+    pub remote_ips: Vec<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1167,14 +1190,41 @@ pub struct FinalmaskUdpHop {
 impl Default for FinalmaskUdpHop {
     fn default() -> Self {
         Self {
-            ports: FinalmaskPortList::default(),
-            interval: Int32Range::single(0),
+            sockopt: None,
+            // The core refuses an empty mode at config load, so a fresh mask
+            // starts on the mode every UDP transport accepts. The interval
+            // starts at the core's 5-second floor.
+            mode: "perConnRemote".into(),
+            interval: Int32Range::new(5, 10),
+            remote_ports: FinalmaskPortList::default(),
+            remote_ips: Vec::new(),
             extra: Map::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Parse one `udphop` `remoteIPs` entry the way the mask build does, and
+/// return the normalized prefix: the build tries `netip.ParsePrefix` and
+/// falls back to `netip.ParseAddr`, appending the address width
+/// (`infra/conf/transport_finalmask.go:950-960`). `None` when neither form
+/// parses — the mask build rejects that entry.
+pub fn finalmask_udphop_remote_ip(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some((address, bits)) = value.split_once('/') {
+        let address: std::net::IpAddr = address.trim().parse().ok()?;
+        let bits: u8 = bits.trim().parse().ok()?;
+        let width = if address.is_ipv4() { 32 } else { 128 };
+        if bits > width {
+            return None;
+        }
+        return Some(format!("{address}/{bits}"));
+    }
+    let address: std::net::IpAddr = value.parse().ok()?;
+    let width = if address.is_ipv4() { 32 } else { 128 };
+    Some(format!("{address}/{width}"))
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskQuicParams {
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -1187,8 +1237,19 @@ pub struct FinalmaskQuicParams {
     pub brutal_up: String,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub brutal_down: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udp_hop: Option<FinalmaskUdpHop>,
+    /// The raw value of the retired `quicParams.udpHop` key the stored
+    /// object carried, when it did (any JSON shape). The hop moved to the
+    /// `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`) and the
+    /// core now ignores the old key silently, so the profile stays gated
+    /// until the user rebuilds the hop; the value is kept so the settings
+    /// file round-trips it, while the wire pass
+    /// ([`StreamModel::retain_selected_stream_blocks_for_wire`]) never emits
+    /// it. JSON `null` is the Go zero shape — the field upstream is a
+    /// pointer — and counts as absent, so the key is then dropped on the
+    /// next save. The gating finding is
+    /// `crate::model::validation::ValidationCode::FinalmaskQuicHopMoved`.
+    #[serde(rename = "udpHop", skip_serializing_if = "Option::is_none")]
+    pub retired_udp_hop: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_stream_receive_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1207,6 +1268,77 @@ pub struct FinalmaskQuicParams {
     pub max_incoming_streams: Option<i64>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for FinalmaskQuicParams {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Wire mirror of [`FinalmaskQuicParams`] without the retired-key
+        /// hook. Every field above must be mirrored here.
+        #[derive(Default, Deserialize)]
+        #[serde(rename_all = "camelCase", default)]
+        struct Object {
+            congestion: String,
+            debug: Option<bool>,
+            bbr_profile: String,
+            brutal_up: String,
+            brutal_down: String,
+            init_stream_receive_window: Option<u64>,
+            max_stream_receive_window: Option<u64>,
+            init_connection_receive_window: Option<u64>,
+            max_connection_receive_window: Option<u64>,
+            max_idle_timeout: Option<i64>,
+            keep_alive_period: Option<i64>,
+            disable_path_mtu_discovery: Option<bool>,
+            max_incoming_streams: Option<i64>,
+            #[serde(flatten)]
+            extra: Map<String, Value>,
+        }
+
+        // The retired `udpHop` key never fails the load — the profile is
+        // marked instead. Its raw value is kept so the settings file
+        // round-trips the key unchanged (nothing is migrated) while the gate
+        // stands. The value takes any JSON shape (the old Go field was a
+        // struct the loader now ignores without validation). A null value
+        // anywhere among the case variants is the Go zero shape — the field
+        // upstream is a pointer, and null sets it to nil — so the key counts
+        // as absent: nothing is retained, marked, or written back. Otherwise
+        // every case variant is consumed: the last match visited survives
+        // for re-emission and the rest are dropped, so none can survive as
+        // an unknown key.
+        let object = Object::deserialize(deserializer)?;
+        let null_valued = object
+            .extra
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("udpHop") && value.is_null());
+        let mut retired_udp_hop = None;
+        let mut extra = Map::new();
+        for (key, value) in object.extra {
+            if key.eq_ignore_ascii_case("udpHop") {
+                if !null_valued {
+                    retired_udp_hop = Some(value);
+                }
+            } else {
+                extra.insert(key, value);
+            }
+        }
+        Ok(Self {
+            congestion: object.congestion,
+            debug: object.debug,
+            bbr_profile: object.bbr_profile,
+            brutal_up: object.brutal_up,
+            brutal_down: object.brutal_down,
+            retired_udp_hop,
+            init_stream_receive_window: object.init_stream_receive_window,
+            max_stream_receive_window: object.max_stream_receive_window,
+            init_connection_receive_window: object.init_connection_receive_window,
+            max_connection_receive_window: object.max_connection_receive_window,
+            max_idle_timeout: object.max_idle_timeout,
+            keep_alive_period: object.keep_alive_period,
+            disable_path_mtu_discovery: object.disable_path_mtu_discovery,
+            max_incoming_streams: object.max_incoming_streams,
+            extra,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1314,6 +1446,10 @@ pub enum FinalmaskUdpMask {
         settings: Box<FinalmaskRealm>,
         extra: Map<String, Value>,
     },
+    Udphop {
+        settings: Box<FinalmaskUdpHop>,
+        extra: Map<String, Value>,
+    },
     /// A future discriminator unknown to this Broccoli build. The complete raw
     /// envelope is retained and shown in the editor.
     Unknown(Value),
@@ -1329,6 +1465,7 @@ impl FinalmaskUdpMask {
         "xdns",
         "xicmp",
         "realm",
+        "udphop",
     ];
 
     pub fn known_type(&self) -> Option<&'static str> {
@@ -1341,6 +1478,7 @@ impl FinalmaskUdpMask {
             Self::Xdns { .. } => Some("xdns"),
             Self::Xicmp { .. } => Some("xicmp"),
             Self::Realm { .. } => Some("realm"),
+            Self::Udphop { .. } => Some("udphop"),
             Self::Unknown(_) => None,
         }
     }
@@ -1385,6 +1523,10 @@ impl FinalmaskUdpMask {
             },
             "realm" => Self::Realm {
                 settings: Box::new(FinalmaskRealm::default()),
+                extra,
+            },
+            "udphop" => Self::Udphop {
+                settings: Box::new(FinalmaskUdpHop::default()),
                 extra,
             },
             _ => return None,
@@ -1501,6 +1643,9 @@ impl Serialize for FinalmaskUdpMask {
             Self::Realm { settings, extra } => {
                 serialize_finalmask_envelope("realm", settings, extra, serializer)
             }
+            Self::Udphop { settings, extra } => {
+                serialize_finalmask_envelope("udphop", settings, extra, serializer)
+            }
             Self::Unknown(raw) => raw.serialize(serializer),
         }
     }
@@ -1549,6 +1694,11 @@ impl<'de> Deserialize<'de> for FinalmaskUdpMask {
                 extra,
             }),
             "realm" => Ok(Self::Realm {
+                settings: serde_json::from_value(settings)
+                    .map_err(<D::Error as serde::de::Error>::custom)?,
+                extra,
+            }),
+            "udphop" => Ok(Self::Udphop {
                 settings: serde_json::from_value(settings)
                     .map_err(<D::Error as serde::de::Error>::custom)?,
                 extra,
@@ -1683,6 +1833,30 @@ impl StreamModel {
         {
             download.enforce_invariants();
             download.retain_selected_stream_blocks_for_wire();
+        }
+        if let Some(finalmask) = self.finalmask.as_mut() {
+            if let Some(quic) = finalmask.quic_params.as_mut() {
+                // The retired key is a settings-file fact only: it
+                // round-trips through `servers.json` so the user still sees
+                // the profile's state, and the generated document never
+                // carries it.
+                quic.retired_udp_hop = None;
+            }
+            for mask in finalmask.udp.iter_mut() {
+                if let FinalmaskUdpMask::Udphop { settings, .. } = mask {
+                    // The hop socket takes prefixes; an address entry is
+                    // spelled out with its width (`infra/conf/
+                    // transport_finalmask.go:950-960` normalizes the same
+                    // way). An entry that parses as neither form stays
+                    // verbatim — the validation gate names it before the
+                    // wire is ever built.
+                    for entry in settings.remote_ips.iter_mut() {
+                        if let Some(normalized) = finalmask_udphop_remote_ip(entry) {
+                            *entry = normalized;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2023,13 +2197,20 @@ mod tests {
                         "echSockopt": {"domainStrategy": "UseIPv4"},
                         "futureTls": "kept"
                     }
+                }},
+                {"type": "udphop", "settings": {
+                    "mode": "intervalLocal,intervalRemote",
+                    "interval": "5-10",
+                    "remotePorts": "443,10000-10010",
+                    "remoteIPs": ["203.0.113.10", "2001:db8::/48"],
+                    "sockopt": {"domainStrategy": "UseIPv4", "interface": "eth0"},
+                    "futureHop": {"kept": true}
                 }}
             ],
             "quicParams": {
                 "congestion": "force-brutal", "debug": false,
                 "bbrProfile": "aggressive", "brutalUp": "8 mbps",
                 "brutalDown": "16 mbps",
-                "udpHop": {"ports": "443,10000-10010", "interval": "5-10"},
                 "initStreamReceiveWindow": 16384,
                 "maxStreamReceiveWindow": 32768,
                 "initConnectionReceiveWindow": 65536,
@@ -2044,7 +2225,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&model).unwrap(), value);
         assert!(crate::model::validation::validate_finalmask(&model).is_empty());
         assert_eq!(model.tcp.len(), 4);
-        assert_eq!(model.udp.len(), 8);
+        assert_eq!(model.udp.len(), 9);
     }
 
     #[test]
@@ -2089,11 +2270,15 @@ mod tests {
                 {"type": "salamander", "settings": {"packetSize": "0-2049"}},
                 {"type": "xdns", "settings": {"resolvers": ["https://dns.example"]}},
                 {"type": "xicmp", "settings": {"ips": ["not-an-ip"]}},
-                {"type": "realm", "settings": {"url": "https://example", "stunServers": []}}
+                {"type": "realm", "settings": {"url": "https://example", "stunServers": []}},
+                {"type": "udphop", "settings": {
+                    "mode": "intervalLocal,banana", "interval": 4,
+                    "remotePorts": 70000, "remoteIPs": ["nope"]
+                }}
             ],
             "quicParams": {
                 "congestion": "force-brutal", "brutalUp": "1 kbps",
-                "bbrProfile": "turbo", "udpHop": {"ports": 70000, "interval": 4},
+                "bbrProfile": "turbo",
                 "initStreamReceiveWindow": 1, "maxIdleTimeout": 3,
                 "keepAlivePeriod": 61, "maxIncomingStreams": 7
             }
@@ -2130,16 +2315,28 @@ mod tests {
                 "finalmask.udp[4].settings.url",
             ),
             (
+                crate::model::validation::ValidationCode::FinalmaskUdpHopModeInvalid,
+                "finalmask.udp[5].settings.mode",
+            ),
+            (
+                crate::model::validation::ValidationCode::FinalmaskUdpHopIntervalTooSmall,
+                "finalmask.udp[5].settings.interval",
+            ),
+            (
+                crate::model::validation::ValidationCode::FinalmaskPortNumberRange,
+                "finalmask.udp[5].settings.remotePorts",
+            ),
+            (
+                crate::model::validation::ValidationCode::FinalmaskUdpHopIpInvalid,
+                "finalmask.udp[5].settings.remoteIPs[0]",
+            ),
+            (
                 crate::model::validation::ValidationCode::FinalmaskQuicBandwidthTooSmall,
                 "finalmask.quicParams.brutalUp",
             ),
             (
                 crate::model::validation::ValidationCode::FinalmaskQuicBbrProfileInvalid,
                 "finalmask.quicParams.bbrProfile",
-            ),
-            (
-                crate::model::validation::ValidationCode::FinalmaskPortNumberRange,
-                "finalmask.quicParams.udpHop.ports",
             ),
             (
                 crate::model::validation::ValidationCode::FinalmaskQuicReceiveWindowTooSmall,
@@ -2165,6 +2362,215 @@ mod tests {
                 "missing {code:?} at {path:?} in {issues:#?}"
             );
         }
+    }
+
+    #[test]
+    fn retired_quic_udp_hop_key_round_trips_in_settings_and_never_reaches_the_wire() {
+        // The hop moved to the `udphop` UDP mask and the core ignores the old
+        // key silently (`infra/conf/transport_finalmask.go:88`). Every
+        // non-null JSON shape loads, is kept verbatim for the settings file,
+        // gates the profile, and never reaches the generated document. Go
+        // binds the name case-insensitively, so case variants are caught too.
+        for (fixture, key) in [
+            (
+                json!({"ports": "443,10000-10010", "interval": "5-10"}),
+                "udpHop",
+            ),
+            (json!("srv-exit"), "Udphop"),
+            (json!(7), "UDPHOP"),
+            (json!(true), "udphop"),
+            (json!(["a"]), "udpHop"),
+        ] {
+            let value = json!({
+                "network": "hysteria",
+                "finalmask": {
+                    "quicParams": {"congestion": "bbr", key: fixture, "futureKey": "kept"}
+                }
+            });
+            let stream: StreamModel = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("{key} = {fixture} must load: {error}"));
+            let quic = stream
+                .finalmask
+                .as_ref()
+                .and_then(|finalmask| finalmask.quic_params.as_ref())
+                .expect("the quic params must load");
+            assert_eq!(
+                quic.retired_udp_hop.as_ref(),
+                Some(&fixture),
+                "the raw value must be kept ({key} = {fixture})"
+            );
+            assert_eq!(
+                quic.extra.keys().collect::<Vec<_>>(),
+                vec!["futureKey"],
+                "the key must not survive as an unknown key ({key} = {fixture})"
+            );
+            // Every shape gates: the finding never inspects the value.
+            assert!(
+                crate::model::validation::validate_finalmask(
+                    stream.finalmask.as_ref().expect("the finalmask loads")
+                )
+                .iter()
+                .any(|issue| issue.code
+                    == crate::model::validation::ValidationCode::FinalmaskQuicHopMoved),
+                "{key} = {fixture} must gate"
+            );
+
+            // The settings file keeps the key exactly as loaded, so an
+            // unrelated save cannot silently drop the user's hop.
+            let persisted = serde_json::to_value(&stream).expect("the stream serializes");
+            assert_eq!(
+                persisted["finalmask"]["quicParams"]["udpHop"], fixture,
+                "the settings file must round-trip the key ({key} = {fixture})"
+            );
+            let reloaded: StreamModel = serde_json::from_value(persisted)
+                .unwrap_or_else(|error| panic!("{key} = {fixture} must reload: {error}"));
+            let reloaded = reloaded
+                .finalmask
+                .and_then(|finalmask| finalmask.quic_params)
+                .unwrap();
+            assert_eq!(reloaded.retired_udp_hop.as_ref(), Some(&fixture));
+
+            // The generated document never carries it.
+            let mut wire_stream = stream.clone();
+            wire_stream.retain_selected_stream_blocks_for_wire();
+            let wire = serde_json::to_value(&wire_stream).expect("the stream serializes");
+            assert!(
+                wire["finalmask"]["quicParams"].get("udpHop").is_none(),
+                "the wire must not carry the key ({key} = {fixture}): {wire}"
+            );
+            assert_eq!(wire["finalmask"]["quicParams"]["futureKey"], "kept");
+        }
+
+        // Several case variants, all non-null: every variant is consumed and
+        // the last visited survives for re-emission ("udpHop" sorts after
+        // "Udphop"), so no other variant survives anywhere.
+        let mixed = json!({
+            "network": "hysteria",
+            "finalmask": {"quicParams": {
+                "Udphop": {"ports": "first"}, "udpHop": {"ports": "second"}
+            }}
+        });
+        let stream: StreamModel = serde_json::from_value(mixed).expect("mixed case variants load");
+        let quic = stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .unwrap();
+        assert_eq!(quic.retired_udp_hop, Some(json!({"ports": "second"})));
+        assert!(quic.extra.is_empty());
+        let persisted = serde_json::to_value(&stream).expect("the stream serializes");
+        assert_eq!(
+            persisted["finalmask"]["quicParams"]["udpHop"],
+            json!({"ports": "second"})
+        );
+        assert!(persisted["finalmask"]["quicParams"].get("Udphop").is_none());
+
+        // JSON `null` is Go's nil pointer: the key is consumed as the Go zero
+        // shape, so it marks nothing and is gone from the next save. It also
+        // must not survive as an unknown key, and a null under any case
+        // variant clears the key whatever the other variants carry.
+        for (fixture, expected_extra) in [
+            (json!({"quicParams": {"udpHop": null}}), 0),
+            (json!({"quicParams": {"UDPHOP": null}}), 0),
+            (
+                json!({"quicParams": {"udpHop": {"ports": "443"}, "Udphop": null}}),
+                0,
+            ),
+            (
+                json!({"quicParams": {"Udphop": null, "futureKey": "kept"}}),
+                1,
+            ),
+        ] {
+            let value = json!({"network": "hysteria", "finalmask": fixture});
+            let rendered = value.to_string();
+            let stream: StreamModel = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("{rendered} must load: {error}"));
+            let quic = stream
+                .finalmask
+                .as_ref()
+                .and_then(|finalmask| finalmask.quic_params.as_ref())
+                .expect("the quic params load");
+            assert!(
+                quic.retired_udp_hop.is_none(),
+                "{rendered} must not mark the profile"
+            );
+            assert_eq!(quic.extra.len(), expected_extra, "{rendered}");
+            assert!(
+                !quic
+                    .extra
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("udpHop")),
+                "{rendered}"
+            );
+            let persisted = serde_json::to_value(&stream).expect("the stream serializes");
+            assert!(
+                persisted["finalmask"]["quicParams"]
+                    .as_object()
+                    .expect("the quic params serialize to an object")
+                    .keys()
+                    .all(|key| !key.eq_ignore_ascii_case("udpHop")),
+                "{rendered} must not be written back: {persisted}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_quic_udp_hop_key_gates_with_the_mask_migration_text() {
+        use crate::model::validation::{Severity, ValidationCode, validate_finalmask};
+
+        // The retired key produces one gating finding that names the mask and
+        // the equivalence, while the hopped shape itself stays legal.
+        let stream: StreamModel = serde_json::from_value(json!({
+            "network": "hysteria",
+            "finalmask": {"quicParams": {"udpHop": {"ports": "443", "interval": 0}}}
+        }))
+        .unwrap();
+        let issues = validate_finalmask(stream.finalmask.as_ref().unwrap());
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(issues[0].code, ValidationCode::FinalmaskQuicHopMoved);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].path, None);
+
+        // A rebuilt hop mask validates clean.
+        let rebuilt: StreamModel = serde_json::from_value(json!({
+            "network": "hysteria",
+            "finalmask": {"udp": [{"type": "udphop", "settings": {
+                "mode": "intervalLocal,intervalRemote",
+                "interval": "5-10",
+                "remotePorts": "443",
+                "remoteIPs": ["203.0.113.10"]
+            }}]}
+        }))
+        .unwrap();
+        assert!(validate_finalmask(rebuilt.finalmask.as_ref().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn udphop_wire_normalizes_remote_ips_to_prefixes() {
+        // The hop socket takes prefixes: an address entry gains its width and
+        // a prefix keeps its length, the way the mask build normalizes both
+        // (`infra/conf/transport_finalmask.go:950-960`). The stored settings
+        // keep the text the user typed.
+        let mut stream: StreamModel = serde_json::from_value(json!({
+            "network": "hysteria",
+            "finalmask": {"udp": [{"type": "udphop", "settings": {
+                "mode": "perConnRemote",
+                "interval": "5-10",
+                "remoteIPs": ["203.0.113.10", "2001:0db8::/48", "not-an-ip"]
+            }}]}
+        }))
+        .unwrap();
+        let stored = serde_json::to_value(&stream).expect("the stream serializes");
+        assert_eq!(
+            stored["finalmask"]["udp"][0]["settings"]["remoteIPs"],
+            json!(["203.0.113.10", "2001:0db8::/48", "not-an-ip"])
+        );
+        stream.retain_selected_stream_blocks_for_wire();
+        let wire = serde_json::to_value(&stream).expect("the stream serializes");
+        assert_eq!(
+            wire["finalmask"]["udp"][0]["settings"]["remoteIPs"],
+            json!(["203.0.113.10/32", "2001:db8::/48", "not-an-ip"])
+        );
     }
 
     #[test]

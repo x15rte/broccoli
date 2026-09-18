@@ -1196,6 +1196,89 @@ fn golden_hysteria2() {
 }
 
 #[test]
+fn golden_hysteria2_udphop_mask() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "hop.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "hoppassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Udphop {
+            settings: Box::new(FinalmaskUdpHop {
+                sockopt: Some(SockoptModel {
+                    domain_strategy: "useip".into(),
+                    interface: "eth0".into(),
+                    ..Default::default()
+                }),
+                mode: "intervalLocal,intervalRemote".into(),
+                interval: Int32Range::new(5, 10),
+                remote_ports: FinalmaskPortList::Text("443,10000-10010".into()),
+                remote_ips: vec!["203.0.113.10".into(), "2001:db8::/48".into()],
+                ..Default::default()
+            }),
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_udphop.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+#[test]
+fn retired_quic_udp_hop_key_gates_generation_and_never_reaches_the_wire() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "hy2.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "hy2password".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    let retired = json!({"ports": "443,10000-10010", "interval": "5-10"});
+    ob.stream.finalmask = Some(FinalmaskModel {
+        quic_params: Some(FinalmaskQuicParams {
+            retired_udp_hop: Some(retired.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    // The stored hop can no longer generate: the core would drop the key
+    // silently, so the profile gates with the migration text.
+    let message = invalid_model_message(&single_server(ob.clone()));
+    assert!(message.contains("udphop"), "{message}");
+    assert!(message.contains("intervalLocal"), "{message}");
+    assert!(message.contains("intervalRemote"), "{message}");
+
+    // The settings file keeps the key; the generated document never does.
+    let persisted = serde_json::to_value(&ob).expect("the outbound serializes");
+    assert_eq!(
+        persisted["streamSettings"]["finalmask"]["quicParams"]["udpHop"],
+        retired
+    );
+    let wire = ob.to_wire("srv-01234567");
+    assert!(
+        wire["streamSettings"]["finalmask"]["quicParams"]
+            .get("udpHop")
+            .is_none(),
+        "{wire}"
+    );
+}
+
+#[test]
 fn golden_freedom_fragment_noises() {
     let mut ob = OutboundModel::new(Protocol::Freedom);
     ob.settings = ProtocolSettings::Freedom(FreedomSettings {
@@ -3242,4 +3325,81 @@ fn burst_observatory_projection_strips_enabled_and_keeps_ping_config() {
         "https://example.com/generate_204"
     );
     assert_eq!(wire["pingConfig"]["httpMethod"], "HEAD");
+}
+
+/// A routing rule carrying `localOS` emits the matcher under its upstream
+/// spelling: `infra/conf/router.go` reads `localOS` into
+/// `RoutingRule.local_os` (`app/router/config.proto` field 23), and
+/// `app/router/condition.go` matches the names against the core's own OS.
+#[test]
+fn golden_routing_local_os() {
+    let mut settings = base_settings();
+    settings.routing.rules = vec![Rule {
+        rule_tag: "11111111-2222-3333-4444-555555555555".into(),
+        domain: vec!["domain:example.com".into()],
+        local_os: vec!["windows".into(), "darwin".into()],
+        outbound_tag: "direct".into(),
+        ..Rule::default()
+    }];
+    golden!(
+        "goldens/routing_local_os.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+/// WireGuard's in-network resolver list reaches the wire under its upstream
+/// spelling: `infra/conf/wireguard.go` reads `remoteDNS` into
+/// `DeviceConfig.DNS`, and `proxy/wireguard/client.go` uses it as the
+/// resolver set. The sentinel profile proves `local` travels alone; the
+/// unset shape is `goldens/wireguard.json`, which must stay byte-identical.
+#[test]
+fn golden_wireguard_remote_dns() {
+    let explicit = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("dns-list", {
+            let mut outbound = OutboundModel::new(Protocol::Wireguard);
+            outbound.settings = ProtocolSettings::Wireguard(WireguardSettings {
+                secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
+                address: vec!["10.0.0.1/32".into()],
+                peers: vec![WireguardPeer {
+                    public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
+                    endpoint: "203.0.113.10:51820".into(),
+                    allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                    ..Default::default()
+                }],
+                remote_dns: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
+                ..Default::default()
+            });
+            outbound
+        })
+    };
+    let sentinel = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("dns-local", {
+            let mut outbound = OutboundModel::new(Protocol::Wireguard);
+            outbound.settings = ProtocolSettings::Wireguard(WireguardSettings {
+                secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
+                address: vec!["10.0.0.2/32".into()],
+                peers: vec![WireguardPeer {
+                    public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
+                    endpoint: "203.0.113.11:51820".into(),
+                    allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                    ..Default::default()
+                }],
+                remote_dns: vec!["local".into()],
+                ..Default::default()
+            });
+            outbound
+        })
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(explicit.id.clone()),
+        profiles: vec![explicit, sentinel],
+        extra: Map::new(),
+    };
+    golden!(
+        "goldens/wireguard_remote_dns.json",
+        generate_deterministic(&servers, &base_settings())
+    );
 }

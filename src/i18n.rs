@@ -553,6 +553,8 @@ keys! {
     ProtocolsHint,
     Processes,
     ProcessesHint,
+    LocalOs,
+    LocalOsHint,
     VlessRoute,
     VlessRouteHint,
     Attrs,
@@ -1101,6 +1103,9 @@ keys! {
     SrvWgPeerPublicKeyRequired,
     SrvWgPeerEndpointRequired,
     SrvWgPresharedInvalid,
+    SrvWgRemoteDnsInvalid,
+    SrvWgRemoteDnsEntryInvalid,
+    SrvWgRemoteDnsLocalOnly,
     SrvFreedomFragmentInvalid,
     SrvFreedomNoiseInvalid,
     SrvFreedomFinalRuleInvalid,
@@ -1123,6 +1128,10 @@ keys! {
     SrvProxySettingsRemoved,
     SrvRemoveProxySettingsKey,
     SrvRemoveProxySettingsKeyNote,
+    SrvRemoveUdpHopKey,
+    SrvRemoveUdpHopKeyNote,
+    SrvMaskSockoptNote,
+    SrvPenetrateMaskNote,
     SrvWsHeaderValueString,
     SrvHttpupgradeHeaderValueString,
     SrvFromMitmOnlyAlpnShort,
@@ -1168,6 +1177,9 @@ keys! {
     SrvAlpn,
     SrvIdUuid,
     SrvLocalAddresses,
+    SrvWgRemoteDns,
+    SrvWgRemoteDnsHint,
+    SrvWgRemoteDnsNote,
     SrvDomainStrategy,
     SrvReservedColon,
     SrvKeepaliveS,
@@ -1311,7 +1323,11 @@ keys! {
     FinalmaskQuicBandwidthTooLarge,
     FinalmaskQuicBandwidthUnitInvalid,
     FinalmaskQuicForceBrutalNeedsUp,
-    FinalmaskQuicHopIntervalTooSmall,
+    FinalmaskQuicHopMoved,
+    FinalmaskUdpHopModeInvalid,
+    FinalmaskUdpHopIntervalTooSmall,
+    FinalmaskUdpHopIpInvalid,
+    FinalmaskUdpHopDialerProxyConflict,
     FinalmaskQuicReceiveWindowTooSmall,
     FinalmaskQuicMaxIdleTimeoutInvalid,
     FinalmaskQuicKeepAlivePeriodInvalid,
@@ -2194,7 +2210,11 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         FinalmaskQuicBandwidthTooLarge => t(lang, Key::FinalmaskQuicBandwidthTooLarge),
         FinalmaskQuicBandwidthUnitInvalid(_) => t(lang, Key::FinalmaskQuicBandwidthUnitInvalid),
         FinalmaskQuicForceBrutalNeedsUp => t(lang, Key::FinalmaskQuicForceBrutalNeedsUp),
-        FinalmaskQuicHopIntervalTooSmall => t(lang, Key::FinalmaskQuicHopIntervalTooSmall),
+        FinalmaskQuicHopMoved => t(lang, Key::FinalmaskQuicHopMoved),
+        FinalmaskUdpHopModeInvalid => t(lang, Key::FinalmaskUdpHopModeInvalid),
+        FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
+        FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
+        FinalmaskUdpHopDialerProxyConflict => t(lang, Key::FinalmaskUdpHopDialerProxyConflict),
         FinalmaskQuicReceiveWindowTooSmall => t(lang, Key::FinalmaskQuicReceiveWindowTooSmall),
         FinalmaskQuicMaxIdleTimeoutInvalid => t(lang, Key::FinalmaskQuicMaxIdleTimeoutInvalid),
         FinalmaskQuicKeepAlivePeriodInvalid => t(lang, Key::FinalmaskQuicKeepAlivePeriodInvalid),
@@ -2251,6 +2271,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         SendThroughInvalid => t(lang, Key::SrvSendThroughInvalidShort),
         FreedomFinalRuleInvalid => t(lang, Key::SrvFreedomFinalRuleInvalid),
         DnsRuleActionInvalid => t(lang, Key::SrvDnsRuleActionInvalidShort),
+        WireguardRemoteDnsInvalid => t(lang, Key::SrvWgRemoteDnsInvalid),
         // Settings-level verdict rules (validate_settings /
         // validate_profiles). Parameterized rules return the template that
         // validation_issue_message fills with the code-carried values.
@@ -3069,6 +3090,10 @@ mod en {
             Key::ProtocolsHint => "http, tls, quic, bittorrent, fakedns",
             Key::Processes => "Processes",
             Key::ProcessesHint => "chrome.exe — xray/ = self path, self/ = self PID",
+            Key::LocalOs => "Local OS",
+            Key::LocalOsHint => {
+                "windows, darwin, linux — matches the machine's OS, case-insensitive"
+            }
             Key::VlessRoute => "VLESS route",
             Key::VlessRouteHint => "PortList — VLESS routing marker",
             Key::Attrs => "Attrs (HTTP sniff header regexps)",
@@ -3833,6 +3858,12 @@ mod en {
             Key::SrvWgPeerPublicKeyRequired => "every WireGuard peer requires a valid public key",
             Key::SrvWgPeerEndpointRequired => "every WireGuard peer requires an endpoint",
             Key::SrvWgPresharedInvalid => "a WireGuard pre-shared key is invalid",
+            Key::SrvWgRemoteDnsInvalid => {
+                "Every WireGuard remote DNS entry must be an IP address. The local entry must \
+                 be the only entry."
+            }
+            Key::SrvWgRemoteDnsEntryInvalid => "Enter an IP address or the word local.",
+            Key::SrvWgRemoteDnsLocalOnly => "The local entry must be the only entry.",
             Key::SrvFreedomFragmentInvalid => {
                 "Freedom fragmentation requires valid packets, length, and interval"
             }
@@ -3867,6 +3898,17 @@ mod en {
             Key::SrvRemoveProxySettingsKey => "Remove the proxySettings key",
             Key::SrvRemoveProxySettingsKeyNote => {
                 "The app removes the retired key. The server dials directly."
+            }
+            Key::SrvRemoveUdpHopKey => "Remove the udpHop key",
+            Key::SrvRemoveUdpHopKeyNote => {
+                "The app removes the retired key. The hop stops working."
+            }
+            Key::SrvMaskSockoptNote => {
+                "The hop socket takes these values. TCP-only fields do not affect it"
+            }
+            Key::SrvPenetrateMaskNote => {
+                "penetrate only copies the stream sockopt into XHTTP downloadSettings. The hop \
+                 socket calls DialSystem directly"
             }
             Key::SrvWsHeaderValueString => "every WebSocket header value must be a string",
             Key::SrvHttpupgradeHeaderValueString => {
@@ -3924,6 +3966,12 @@ mod en {
             Key::SrvAlpn => "ALPN",
             Key::SrvIdUuid => "id (uuid)",
             Key::SrvLocalAddresses => "local addresses",
+            Key::SrvWgRemoteDns => "in-network DNS",
+            Key::SrvWgRemoteDnsHint => "1.1.1.1 or local",
+            Key::SrvWgRemoteDnsNote => {
+                "An empty list uses the core's built-in resolvers. The single entry local uses \
+                 the core's DNS client."
+            }
             Key::SrvDomainStrategy => "domain strategy",
             Key::SrvReservedColon => "reserved:",
             Key::SrvKeepaliveS => "keepalive (s)",
@@ -4231,8 +4279,20 @@ mod en {
             Key::FinalmaskQuicForceBrutalNeedsUp => {
                 "force-brutal requires a non-zero upload bandwidth"
             }
-            Key::FinalmaskQuicHopIntervalTooSmall => {
-                "each non-zero endpoint must be at least 5 seconds"
+            Key::FinalmaskQuicHopMoved => {
+                "Xray moved the udpHop key to the udphop UDP mask. Add a udphop mask in the UDP \
+                 mask list. The old hop behaves like intervalLocal and intervalRemote combined"
+            }
+            Key::FinalmaskUdpHopModeInvalid => {
+                "choose intervalLocal, intervalRemote, or perConnRemote"
+            }
+            Key::FinalmaskUdpHopIntervalTooSmall => {
+                "set each interval endpoint to at least 5 seconds"
+            }
+            Key::FinalmaskUdpHopIpInvalid => "enter an IP address or a CIDR prefix",
+            Key::FinalmaskUdpHopDialerProxyConflict => {
+                "The udphop mask cannot run with sockopt.dialerProxy. Remove the mask or the \
+                 chain"
             }
             Key::FinalmaskQuicReceiveWindowTooSmall => {
                 "use 0 or a receive window of at least 16384 bytes"

@@ -740,6 +740,7 @@ pub fn trial_rule_to_pb(rule: &Rule) -> Result<router_cfg::RoutingRule, DiagErro
         ("protocol", !rule.protocol.is_empty()),
         ("attrs", !rule.attrs.is_empty()),
         ("vlessRoute", !rule.vless_route.is_empty()),
+        ("localOS", !rule.local_os.is_empty()),
         ("webhook", rule.webhook.is_some()),
         ("extra", !rule.extra.is_empty()),
     ];
@@ -1382,6 +1383,15 @@ mod tests {
         assert_eq!(error.diag().key(), Key::GrpcTrialRuleFieldUnsupported);
         assert!(
             error.text(Language::En).contains("webhook"),
+            "the field name must survive, got: {error}"
+        );
+
+        let mut rule = base();
+        rule.local_os = vec!["windows".into()];
+        let error = trial_rule_to_pb(&rule).expect_err("localOS is unsupported");
+        assert_eq!(error.diag().key(), Key::GrpcTrialRuleFieldUnsupported);
+        assert!(
+            error.text(Language::En).contains("localOS"),
             "the field name must survive, got: {error}"
         );
 

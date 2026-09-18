@@ -63,6 +63,11 @@ pub struct Rule {
     pub process: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook: Option<Webhook>,
+    /// OS names matched case-insensitively against the OS the core itself
+    /// runs on (`infra/conf/router.go` `localOS`, `app/router/condition.go`
+    /// `NewLocalOSMatcher`), so one imported rule set can select a platform.
+    #[serde(skip_serializing_if = "skip_empty_vec", rename = "localOS")]
+    pub local_os: Vec<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -88,6 +93,7 @@ impl Default for Rule {
             vless_route: String::new(),
             process: Vec::new(),
             webhook: None,
+            local_os: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -880,5 +886,44 @@ mod error_text_tests {
                 &[&"target", &"\"nope\""]
             )
         );
+    }
+}
+
+/// The `localOS` matcher list: modelled under its exact upstream spelling
+/// (`infra/conf/router.go` `json:"localOS"`), so an imported cross-platform
+/// rule set loads, emits, and re-loads unchanged instead of leaning on the
+/// unknown-key passthrough.
+#[cfg(test)]
+mod local_os_tests {
+    use super::Rule;
+    use serde_json::json;
+
+    #[test]
+    fn local_os_loads_emits_and_reloads_under_its_upstream_spelling() {
+        let raw = json!({
+            "ruleTag": "cross-platform",
+            "outboundTag": "direct",
+            "localOS": ["windows", "Darwin"],
+            "futureRuleKey": {"kept": true},
+        });
+        let rule: Rule =
+            serde_json::from_value(raw.clone()).expect("a rule carrying localOS loads");
+        assert_eq!(rule.local_os, ["windows", "Darwin"]);
+
+        let emitted = serde_json::to_value(&rule).expect("a rule carrying localOS serializes");
+        assert_eq!(emitted, raw, "the field and future keys must round-trip");
+
+        let reloaded: Rule = serde_json::from_value(emitted).expect("the emitted rule loads again");
+        assert_eq!(reloaded.local_os, rule.local_os);
+    }
+
+    #[test]
+    fn an_empty_local_os_list_stays_out_of_the_emitted_rule() {
+        let rule = Rule {
+            outbound_tag: "direct".into(),
+            ..Rule::default()
+        };
+        let emitted = serde_json::to_value(&rule).expect("serialize");
+        assert!(emitted.get("localOS").is_none(), "{emitted}");
     }
 }

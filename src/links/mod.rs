@@ -4482,7 +4482,7 @@ mod tests {
         // Invalid port-list text item — the Debug-quoted embed path.
         let hostile = "a".repeat(MAX_LINK_LEN - 512);
         let fm = format!(
-            r#"{{"quicParams":{{"congestion":"bbr","udpHop":{{"ports":"1-5,{hostile}","interval":0}}}}}}"#
+            r#"{{"udp":[{{"type":"udphop","settings":{{"mode":"intervalLocal","interval":"5-10","remotePorts":"1-5,{hostile}"}}}}]}}"#
         );
         let link = format!(
             "vless://{UUID}@router.local:443?encryption=none&fm={}#X",
@@ -4494,7 +4494,8 @@ mod tests {
                 assert_eq!(
                     error.text(Language::En),
                     format!(
-                        "The finalmask settings are invalid: finalmask.quicParams.udpHop.ports: \
+                        "The finalmask settings are invalid: \
+                         finalmask.udp[0].settings.remotePorts: \
                          \"{}\u{2026}\" is not a port, port range, or env:NAME entry",
                         &hostile[..MAX_ERROR_EXCERPT_CHARS]
                     )

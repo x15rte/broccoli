@@ -20,6 +20,7 @@ use super::inbound::{
 };
 use super::outbound::{
     MuxModel, OutboundModel, ProtocolSettings, endpoint_requires_transport_security,
+    wireguard_remote_dns_supported,
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
@@ -180,7 +181,34 @@ pub enum ValidationCode {
     FinalmaskQuicBandwidthTooLarge,
     FinalmaskQuicBandwidthUnitInvalid(String),
     FinalmaskQuicForceBrutalNeedsUp,
-    FinalmaskQuicHopIntervalTooSmall,
+    /// A profile's `quicParams` carried the retired `udpHop` key: the hop
+    /// moved to the `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`
+    /// at v26.9.9) and the core ignores the old key silently, so the config
+    /// applies without the hop until the user rebuilds it as a mask. The key
+    /// is kept for the settings file (JSON `null` is the Go zero shape and
+    /// counts as absent), never serialized to the wire, and never migrated.
+    FinalmaskQuicHopMoved,
+    /// The `udphop` mask `mode` is not a comma-separated set of
+    /// `intervalLocal` / `intervalRemote` / `perConnRemote` — the mask build
+    /// refuses every other component at config load
+    /// (`infra/conf/transport_finalmask.go:930-940`).
+    FinalmaskUdpHopModeInvalid,
+    /// The `udphop` mask `interval` states an endpoint below the core's
+    /// 5-second floor — including an unset zero: the wrap refuses anything
+    /// less (`transport/internet/finalmask/udphop/conn.go:71-73`).
+    FinalmaskUdpHopIntervalTooSmall,
+    /// A `udphop` mask `remoteIPs` entry is neither an address nor a CIDR
+    /// prefix — the mask build refuses the entry at config load
+    /// (`infra/conf/transport_finalmask.go:950-960`).
+    FinalmaskUdpHopIpInvalid,
+    /// A `udphop` mask and a dial-through chain on the same outbound: the
+    /// hop wraps the outbound's own UDP socket, and its wrap refuses a
+    /// proxied packet connection — an `internet.FakePacketConn`, which is
+    /// what `sockopt.dialerProxy` yields
+    /// (`transport/internet/finalmask/udphop/config.go:11-13`). The core
+    /// starts and every dial fails, so this is a configuration warning,
+    /// never a gate.
+    FinalmaskUdpHopDialerProxyConflict,
     FinalmaskQuicReceiveWindowTooSmall,
     FinalmaskQuicMaxIdleTimeoutInvalid,
     FinalmaskQuicKeepAlivePeriodInvalid,
@@ -249,6 +277,14 @@ pub enum ValidationCode {
     /// one of {direct, drop, return, hijack} — Xray's DNS build rejects
     /// unknown actions.
     DnsRuleActionInvalid,
+    /// A WireGuard `settings.remoteDNS` list holds an entry that is neither
+    /// an IP literal nor the `local` sentinel as the list's only entry. The
+    /// pinned core builds the in-network resolver set with
+    /// `netip.MustParseAddr` while it creates the outbound
+    /// (proxy/wireguard/client.go:117-124), so any other entry panics the
+    /// whole process during config load — the config can never start. Error
+    /// tier: the profile gates until the list is fixed.
+    WireguardRemoteDnsInvalid,
     // ---- settings-wide verdict rules (validate_settings /
     //      validate_profiles) ----
     //
@@ -279,12 +315,14 @@ pub enum ValidationCode {
     /// Two server profiles generate the same outbound tag (indices, IDs,
     /// tag).
     ProfileTagDuplicated(usize, String, usize, String, String),
-    /// A profile's stored outbound carried the retired `proxySettings` key:
-    /// Xray's outbound build refuses a configuration that carries it
-    /// (infra/conf/xray.go:262, `outbound "proxySettings"` →
+    /// A profile's stored outbound carries a non-null retired
+    /// `proxySettings` value: Xray's outbound build refuses a configuration
+    /// that carries it (infra/conf/xray.go:262, `outbound "proxySettings"` →
     /// `"streamSettings.sockopt.dialerProxy"`), so the config cannot apply
-    /// until the user edits the profile. The key is dropped at load, never
-    /// serialized, and never migrated.
+    /// until the user resolves it. The raw value stays in the model and in
+    /// `servers.json` — nothing is migrated, and an unrelated save keeps it —
+    /// while generated configurations never carry it; JSON `null` is the Go
+    /// zero shape and stays silent.
     OutboundProxySettingsRemoved,
     /// A profile's chained outbound reference names no known outbound
     /// (source tag, missing target).
@@ -1263,6 +1301,21 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
             Some("settings.version".into()),
         ));
     }
+    // WireGuard's in-network resolver list: the pinned core parses each entry
+    // with `netip.MustParseAddr` while it creates the outbound client and
+    // reads `local` as the sentinel only when the list length is one, so a
+    // non-address entry or a mixed list panics the whole process during
+    // config load (proxy/wireguard/client.go:117-124; verified against the
+    // pinned binary, which exits with that panic under `run -test`). Error
+    // tier, like every other WireGuard value the core cannot build.
+    if let ProtocolSettings::Wireguard(settings) = &o.settings
+        && !wireguard_remote_dns_supported(&settings.remote_dns)
+    {
+        issues.push(issue(
+            ValidationCode::WireguardRemoteDnsInvalid,
+            Some("settings.remoteDNS".into()),
+        ));
+    }
 
     // Protocol-`settings` vocabulary / required values: the out-of-vocab
     // VLESS flow/encryption, unsupported SS method, missing Trojan/SS
@@ -1934,6 +1987,26 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
         }
         if let Some(finalmask) = &stream.finalmask {
             issues.extend(validate_finalmask(finalmask));
+            // The hop mask wraps the outbound's own UDP socket, and its wrap
+            // refuses a proxied packet connection
+            // (`transport/internet/finalmask/udphop/config.go:11-13` rejects
+            // an `internet.FakePacketConn`, which is what a dialerProxy dial
+            // yields). The core starts, and every dial fails, so this is a
+            // configuration warning, never a gate.
+            if finalmask
+                .udp
+                .iter()
+                .any(|mask| matches!(mask, FinalmaskUdpMask::Udphop { .. }))
+                && stream
+                    .sockopt
+                    .as_ref()
+                    .is_some_and(|sockopt| !sockopt.dialer_proxy.is_empty())
+            {
+                issues.push(warning(
+                    ValidationCode::FinalmaskUdpHopDialerProxyConflict,
+                    None,
+                ));
+            }
         }
         // XHTTP enum vocabularies and cross-field rules: every value below is
         // refused by Xray's SplitHTTPConfig Build at config load
@@ -2743,15 +2816,13 @@ fn finalmask_validate_quic_params(
             Some(format!("{path}.brutalUp")),
         ));
     }
-    if let Some(hop) = &quic.udp_hop {
-        finalmask_validate_port_list(&format!("{path}.udpHop.ports"), &hop.ports, issues);
-        let (from, to) = finalmask_range_bounds(hop.interval);
-        if (from != 0 && from < 5) || (to != 0 && to < 5) {
-            issues.push(issue(
-                ValidationCode::FinalmaskQuicHopIntervalTooSmall,
-                Some(format!("{path}.udpHop.interval")),
-            ));
-        }
+    if quic.retired_udp_hop.is_some() {
+        // The retired `quicParams.udpHop` key left this mark behind: the
+        // core now ignores the key and the hop would die silently, so the
+        // profile gates until the user rebuilds it as a `udphop` UDP mask
+        // (ADR-0050 — nothing is migrated). Carries no path: the key is a
+        // settings-file fact, not a field of the generated document.
+        issues.push(issue(ValidationCode::FinalmaskQuicHopMoved, None));
     }
     for (name, value) in [
         ("initStreamReceiveWindow", quic.init_stream_receive_window),
@@ -3032,12 +3103,64 @@ fn finalmask_validate_udp_mask(
                 finalmask_validate_realm_tls(&format!("{path}.settings.tlsConfig"), tls, issues);
             }
         }
+        FinalmaskUdpMask::Udphop { settings, .. } => {
+            finalmask_validate_udphop(&format!("{path}.settings"), settings, issues);
+        }
         FinalmaskUdpMask::Unknown(raw) => issues.push(issue(
             ValidationCode::FinalmaskUnknownUdpMask(
                 raw.get("type").and_then(Value::as_str).map(excerpt),
             ),
             Some(path),
         )),
+    }
+}
+
+/// Validate one `udphop` UDP mask's settings against the mask build and the
+/// wrap-time checks (`infra/conf/transport_finalmask.go:911-965` and
+/// `transport/internet/finalmask/udphop/conn.go:71-73`).
+fn finalmask_validate_udphop(
+    path: &str,
+    settings: &super::stream::FinalmaskUdpHop,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    // The build splits on ',' and refuses every component outside the three
+    // names, case-insensitively; an empty mode splits to one empty component
+    // and is refused too.
+    if settings.mode.split(',').any(|mode| {
+        !matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            "intervallocal" | "intervalremote" | "perconnremote"
+        )
+    }) {
+        issues.push(issue(
+            ValidationCode::FinalmaskUdpHopModeInvalid,
+            Some(format!("{path}.mode")),
+        ));
+    }
+    // The wrap refuses either endpoint below 5 seconds, so an unset zero is
+    // refused alongside 1 through 4.
+    let (from, to) = finalmask_range_bounds(settings.interval);
+    if from < 5 || to < 5 {
+        issues.push(issue(
+            ValidationCode::FinalmaskUdpHopIntervalTooSmall,
+            Some(format!("{path}.interval")),
+        ));
+    }
+    finalmask_validate_port_list(
+        &format!("{path}.remotePorts"),
+        &settings.remote_ports,
+        issues,
+    );
+    for (index, entry) in settings.remote_ips.iter().enumerate() {
+        if crate::model::stream::finalmask_udphop_remote_ip(entry).is_none() {
+            issues.push(issue(
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                Some(format!("{path}.remoteIPs[{index}]")),
+            ));
+        }
+    }
+    if let Some(sockopt) = &settings.sockopt {
+        issues.extend(validate_sockopt(sockopt, &format!("{path}.sockopt")));
     }
 }
 
@@ -3835,11 +3958,15 @@ mod tests {
                 {"type": "salamander", "settings": {"packetSize": "0-2049"}},
                 {"type": "xdns", "settings": {"resolvers": ["https://dns.example"]}},
                 {"type": "xicmp", "settings": {"ips": ["not-an-ip"]}},
-                {"type": "realm", "settings": {"url": "https://example", "stunServers": []}}
+                {"type": "realm", "settings": {"url": "https://example", "stunServers": []}},
+                {"type": "udphop", "settings": {
+                    "mode": "intervalLocal,banana", "interval": 4,
+                    "remotePorts": 70000, "remoteIPs": ["nope"]
+                }}
             ],
             "quicParams": {
                 "congestion": "force-brutal", "brutalUp": "1 kbps",
-                "bbrProfile": "turbo", "udpHop": {"ports": 70000, "interval": 4},
+                "bbrProfile": "turbo",
                 "initStreamReceiveWindow": 1, "maxIdleTimeout": 3,
                 "keepAlivePeriod": 61, "maxIncomingStreams": 7
             }
@@ -3876,16 +4003,28 @@ mod tests {
                 "finalmask.udp[4].settings.url",
             ),
             (
+                ValidationCode::FinalmaskUdpHopModeInvalid,
+                "finalmask.udp[5].settings.mode",
+            ),
+            (
+                ValidationCode::FinalmaskUdpHopIntervalTooSmall,
+                "finalmask.udp[5].settings.interval",
+            ),
+            (
+                ValidationCode::FinalmaskPortNumberRange,
+                "finalmask.udp[5].settings.remotePorts",
+            ),
+            (
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                "finalmask.udp[5].settings.remoteIPs[0]",
+            ),
+            (
                 ValidationCode::FinalmaskQuicBandwidthTooSmall,
                 "finalmask.quicParams.brutalUp",
             ),
             (
                 ValidationCode::FinalmaskQuicBbrProfileInvalid,
                 "finalmask.quicParams.bbrProfile",
-            ),
-            (
-                ValidationCode::FinalmaskPortNumberRange,
-                "finalmask.quicParams.udpHop.ports",
             ),
             (
                 ValidationCode::FinalmaskQuicReceiveWindowTooSmall,
@@ -3960,6 +4099,129 @@ mod tests {
                 "zap".into()
             )],
             "one unparsable value must not double-report: {refused:#?}"
+        );
+    }
+
+    /// The `udphop` mask gates what the mask build and the wrap refuse: a
+    /// mode outside the three names (empty included) and an interval
+    /// endpoint below 5 seconds (unset included). The editor's fresh mask
+    /// and every accepted spelling stay clean.
+    #[test]
+    fn udphop_mask_gates_the_mode_set_and_the_five_second_floor() {
+        let codes_for = |settings: &str| {
+            let fm: FinalmaskModel = serde_json::from_str(&format!(
+                r#"{{"udp":[{{"type":"udphop","settings":{settings}}}]}}"#
+            ))
+            .expect("fixture is valid finalmask JSON");
+            codes(&validate_finalmask(&fm))
+        };
+
+        for settings in [
+            r#"{"mode":"perConnRemote","interval":"5-10"}"#,
+            r#"{"mode":"intervalLocal,intervalRemote","interval":"5-5"}"#,
+            r#"{"mode":"INTERVALREMOTE, intervallocal","interval":"5-30"}"#,
+            r#"{"mode":"perConnRemote","interval":"30-60"}"#,
+        ] {
+            assert!(
+                codes_for(settings).is_empty(),
+                "{settings} must be legal: {:#?}",
+                codes_for(settings)
+            );
+        }
+
+        for mode in ["", "banana", "intervalLocal,banana", "perConnLocal"] {
+            let found = codes_for(&format!(r#"{{"mode":"{mode}","interval":"5-10"}}"#));
+            assert_eq!(
+                found,
+                vec![ValidationCode::FinalmaskUdpHopModeInvalid],
+                "mode {mode:?}"
+            );
+        }
+
+        for interval in [json!(0), json!(4), json!("2-10"), json!("5-4")] {
+            let found = codes_for(&format!(
+                r#"{{"mode":"perConnRemote","interval":{interval}}}"#
+            ));
+            assert_eq!(
+                found,
+                vec![ValidationCode::FinalmaskUdpHopIntervalTooSmall],
+                "interval {interval}"
+            );
+        }
+
+        // A `remoteIPs` entry that parses as neither an address nor a prefix
+        // is refused at build time, one finding per entry.
+        assert_eq!(
+            codes_for(
+                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","nope","2001:db8::/129"]}"#
+            ),
+            vec![
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+                ValidationCode::FinalmaskUdpHopIpInvalid,
+            ]
+        );
+        assert!(
+            codes_for(
+                r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","2001:db8::/48","::1"]}"#
+            )
+            .is_empty()
+        );
+    }
+
+    /// The hop mask and a dial-through chain cannot run together: the hop
+    /// wrap refuses the proxied packet connection, so the advisory names the
+    /// pair while every other combination stays quiet.
+    #[test]
+    fn udphop_mask_with_a_dialer_proxy_chain_warns_without_gating() {
+        let mask = FinalmaskModel {
+            udp: vec![
+                serde_json::from_value(json!({
+                    "type": "udphop",
+                    "settings": {"mode": "perConnRemote", "interval": "5-10"}
+                }))
+                .expect("the udphop envelope loads"),
+            ],
+            ..Default::default()
+        };
+        let plain_mask = FinalmaskModel {
+            udp: vec![
+                serde_json::from_value(json!({
+                    "type": "salamander", "settings": {"password": "pw"}
+                }))
+                .expect("the salamander envelope loads"),
+            ],
+            ..Default::default()
+        };
+
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(mask.clone());
+        outbound.chain_via("srv-exit");
+        let issues = validate_outbound(&outbound);
+        let found: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
+            .collect();
+        assert_eq!(found.len(), 1, "{issues:#?}");
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].path, None);
+
+        // The mask without a chain never warns.
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(mask);
+        assert!(
+            !validate_outbound(&outbound)
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
+        );
+
+        // A chain with any other mask never warns.
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.finalmask = Some(plain_mask);
+        outbound.chain_via("srv-exit");
+        assert!(
+            !validate_outbound(&outbound)
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopDialerProxyConflict)
         );
     }
 
@@ -5588,10 +5850,11 @@ mod tests {
                         {{"type":"{hostile}","packet":"00"}},
                         {{"type":"{hostile}"}}
                     ]}}}},
-                    {{"type":"realm","settings":{{"url":"no-scheme-host","stunServers":["h:1"]}}}}
+                    {{"type":"realm","settings":{{"url":"no-scheme-host","stunServers":["h:1"]}}}},
+                    {{"type":"udphop","settings":{{"mode":"intervalLocal","interval":"5-10",
+                        "remotePorts":"1-5,{hostile}"}}}}
                 ],
-                "quicParams":{{"congestion":"bbr","brutalUp":"1 {hostile}",
-                    "udpHop":{{"ports":"1-5,{hostile}","interval":0}}}}}}"#
+                "quicParams":{{"congestion":"bbr","brutalUp":"1 {hostile}"}}}}"#
         ))
         .expect("fixture is valid finalmask JSON");
         let issues = validate_finalmask(&fm);
@@ -5603,8 +5866,8 @@ mod tests {
             Some(&quoted),    // FinalmaskUnknownByteSyntax
             Some(&excerpted), // FinalmaskBytesValueRequired
             None,             // FinalmaskRealmUrlSyntax (url crate error text)
-            Some(&excerpted), // FinalmaskQuicBandwidthUnitInvalid
             Some(&quoted),    // FinalmaskPortListInvalid
+            Some(&excerpted), // FinalmaskQuicBandwidthUnitInvalid
         ];
         for (issue, expected) in issues.iter().zip(payloads) {
             let message = validation_issue_message(issue, Language::En);
@@ -5653,9 +5916,9 @@ mod tests {
 
         assert_eq!(
             render(
-                r#"{"quicParams":{"congestion":"bbr","udpHop":{"ports":"1-5,oops","interval":0}}}"#
+                r#"{"udp":[{"type":"udphop","settings":{"mode":"intervalLocal","interval":"5-10","remotePorts":"1-5,oops"}}]}"#
             ),
-            "finalmask.quicParams.udpHop.ports: \"oops\" is not a port, port \
+            "finalmask.udp[0].settings.remotePorts: \"oops\" is not a port, port \
              range, or env:NAME entry"
         );
         assert_eq!(
@@ -7369,10 +7632,10 @@ mod tests {
         use crate::i18n::validation_issue_message;
         use crate::model::settings::Language;
 
-        // Every JSON shape loads — a wrong-typed or malformed value must not
-        // fail the load (Xray models the key as a raw message) — and each one
-        // leaves the profile gated under its own location until the user
-        // edits it. The fix-it text names the replacement.
+        // Every non-null JSON shape loads — a wrong-typed or malformed value
+        // must not fail the load (Xray models the key as a raw message) — and
+        // each one leaves the profile gated under its own location until the
+        // user resolves it. The fix-it text names the replacement.
         for value in [
             json!({"tag": "srv-bbbbbbbb"}),
             json!("srv-bbbbbbbb"),
@@ -7380,7 +7643,6 @@ mod tests {
             json!(7),
             json!(true),
             json!(["srv-bbbbbbbb"]),
-            json!(null),
         ] {
             let profile: ServerProfile = serde_json::from_value(json!({
                 "id": "aaaaaaaa11111111",
@@ -7408,6 +7670,24 @@ mod tests {
             let issues = validate_profiles(std::slice::from_ref(&edited), None, false);
             assert!(issues.is_empty(), "{value}: {issues:#?}");
         }
+
+        // JSON `null` is the Go zero shape — the pinned core accepts it — so
+        // the profile drives no finding and the key is gone from the model
+        // (and therefore from the next save).
+        let nulled: ServerProfile = serde_json::from_value(json!({
+            "id": "aaaaaaaa11111111",
+            "name": "first",
+            "outbound": {"protocol": "freedom", "proxySettings": null},
+        }))
+        .expect("a null value must load");
+        assert!(nulled.outbound.retired_proxy_settings.is_none());
+        let issues = validate_profiles(std::slice::from_ref(&nulled), None, false);
+        assert!(issues.is_empty(), "{issues:#?}");
+        let persisted = serde_json::to_value(&nulled).expect("the profile serializes");
+        assert!(
+            persisted["outbound"].get("proxySettings").is_none(),
+            "{persisted}"
+        );
     }
 
     #[test]

@@ -1638,6 +1638,15 @@ impl RoutingScreen {
                     changed = true;
                 }
                 ui.end_row();
+
+                changed |= widgets::string_list(
+                    ui,
+                    lang,
+                    t(lang, Key::LocalOs),
+                    &mut rule.local_os,
+                    t(lang, Key::LocalOsHint),
+                );
+                ui.end_row();
             });
 
         // attrs: map key → regexp matched against HTTP sniff headers.
@@ -6026,6 +6035,72 @@ mod route_test_poll_tests {
             matches!(&screen.test_result, Some(Ok(text)) if text == "verdict"),
             "the landed verdict must be adopted on reopen: {:?}",
             screen.test_result
+        );
+    }
+}
+
+/// The rule editor's `localOS` row: the model's OS names render in their own
+/// labelled field, and an edit there writes the model back.
+#[cfg(test)]
+mod routing_local_os_tests {
+    use super::{Key, Language, RoutingScreen, Rule, t};
+    use crate::ui::test_rig::UiTestRig;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable as _;
+
+    fn harness_with_local_os_rule() -> Harness<'static, (RoutingScreen, UiTestRig)> {
+        let screen = RoutingScreen {
+            edit_rule: Some(0),
+            ..RoutingScreen::default()
+        };
+        let mut rig = UiTestRig::default();
+        rig.settings.routing.rules = vec![Rule {
+            rule_tag: "local-os".into(),
+            domain: vec!["domain:example.com".into()],
+            local_os: vec!["windows".into()],
+            outbound_tag: "direct".into(),
+            ..Rule::default()
+        }];
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 1600.0))
+            .build_ui_state(
+                |ui, state: &mut (RoutingScreen, UiTestRig)| {
+                    state.0.show(ui, &mut state.1.ctx());
+                },
+                (screen, rig),
+            );
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn the_local_os_row_renders_the_model_and_writes_it_back() {
+        let mut harness = harness_with_local_os_rule();
+        let label = harness.get_by_label(t(Language::En, Key::LocalOs)).rect();
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::TextInput)
+                .any(|node| node.value().as_deref() == Some("windows")),
+            "the stored localOS name must render in its field"
+        );
+
+        // The row's remove button sits on the label's line, right of the
+        // label cell; every other remove button is on a different line.
+        harness
+            .query_all_by_label(t(Language::En, Key::DeleteRow))
+            .find(|node| {
+                let rect = node.rect();
+                rect.min.x > label.max.x && rect.min.y >= label.min.y && rect.min.y <= label.max.y
+            })
+            .expect("the localOS row's remove button")
+            .click();
+        harness.run();
+
+        assert!(
+            harness.state().1.settings.routing.rules[0]
+                .local_os
+                .is_empty(),
+            "the row's edit must land in the rule model"
         );
     }
 }
