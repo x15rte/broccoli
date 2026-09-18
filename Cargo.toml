@@ -7,13 +7,13 @@ build = "build.rs"
 
 [package.metadata.broccoli.release]
 target = "x86_64-pc-windows-msvc"
-xray_version = "v26.7.28"
+xray_version = "v26.9.9"
 xray_archive = "Xray-windows-64.zip"
-xray_sha256 = "c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1"
-xray_executable_sha256 = "1d9674327972a21afd4c906a7a72bb0856935aa9e0227c87f34f03d11a88bddf"
+xray_sha256 = "244deaba2098c2964e49bba90df3707777e5f5f428a82d2f29604015f24beec2"
+xray_executable_sha256 = "0d0fc0ea2b05641acb78c01fc36ad694e7b029861b2d5eb93da0e3e9fda9a98f"
 wintun_sha256 = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
-geoip_sha256 = "cdf411fce977a1f48adb6a3b224e3e2bd7eccfcd4d6e2e30c6dc443f1a0e8e52"
-geosite_sha256 = "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef1942e"
+geoip_sha256 = "4149e607530f91da697bad4696f8c59f0a475af38e69405e4124438c9886c721"
+geosite_sha256 = "2064a1a4074e145d5022ac49f2c30341e7b7cb6c7948da4fdca973b3fa8411b2"
 
 [patch.crates-io]
 # Vendored with three local fixes:

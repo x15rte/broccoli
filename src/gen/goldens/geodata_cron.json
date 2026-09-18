@@ -27,11 +27,11 @@
     "assets": [
       {
         "file": "geoip.dat",
-        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.7.28/geoip.dat"
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geoip.dat"
       },
       {
         "file": "geosite.dat",
-        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.7.28/geosite.dat"
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geosite.dat"
       }
     ],
     "cron": "17 3 * * 1"

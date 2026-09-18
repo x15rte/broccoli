@@ -539,12 +539,12 @@ fn broken_file_rolls_back() {
         ready_error
     );
 
-    // Phase A: the core swaps the broken payload in, fails the reload, and
-    // logs the all-files rollback. The rollback log line is emitted only
-    // after a successful swap (Xray app/geodata download.go), so it proves
-    // the swap without racing the transient swap-then-restore window — the
-    // file's mtime flips back within milliseconds each tick, which made an
-    // mtime-based swap check flaky.
+    // Broken-payload swap: the core swaps the broken payload in, fails the
+    // reload, and logs the all-files rollback. The rollback log line is
+    // emitted only after a successful swap (Xray app/geodata download.go), so
+    // it proves the swap without racing the transient swap-then-restore
+    // window — the file's mtime flips back within milliseconds each tick,
+    // which made an mtime-based swap check flaky.
     let swap_deadline = Instant::now() + Duration::from_secs(120);
     let mut saw_rollback_log = false;
     let mut saw_error = None;
@@ -575,10 +575,10 @@ fn broken_file_rolls_back() {
         "core process must still be alive after the broken-payload rollback"
     );
 
-    // Phase B: after the rollback the file is restored byte-identical to the
-    // pre-copy original. The restored state is the stable one between the
-    // recurring 1s scheduled attempts. Drain runtime events while polling so
-    // a CorePhase::Error or restart in this window fails the test instead of
+    // Rollback restore: the file comes back byte-identical to the pre-copy
+    // original. That restored state is the stable one between the recurring
+    // 1s scheduled attempts. Drain runtime events while polling so a
+    // CorePhase::Error or restart in this window fails the test instead of
     // being silently missed.
     let restore_deadline = Instant::now() + Duration::from_secs(30);
     let mut restored = false;
@@ -649,7 +649,7 @@ fn broken_file_rolls_back() {
 
 /// A frozen upstream geo data file whose bytes can never equal the geo
 /// data the pinned release bundles: the tag predates the pinned archive's
-/// snapshot (Xray v26.7.28-era) by about two months and v2ray-rules-dat's
+/// snapshot by over three months and v2ray-rules-dat's
 /// rules churn continuously, so a later pin only widens the gap. The swap
 /// this test waits for is therefore guaranteed real drift — the observable
 /// state the regression lives in. A moving
@@ -695,12 +695,12 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     let original_geosite_sha = sha256_hex(&original_geosite);
     // The drift premise the whole test stands on: the frozen upstream file
     // must differ from the pinned release bytes, or the swap counter below
-    // greens on identical re-swaps and the strict-entry heal in phase 4
-    // no-ops while every assertion still passes (silent coverage void).
+    // greens on identical re-swaps and the strict-verification heal no-ops
+    // while every assertion still passes (silent coverage void).
     assert_ne!(
         original_geoip_sha, SWAPPED_GEOIP_SHA256,
         "the frozen upstream geoip.dat must differ from the pinned release \
-         bytes or the suspension and heal phases verify nothing"
+         bytes or the suspension and heal checks verify nothing"
     );
     // The retained pin-verified pristine pair: the copy above is
     // the real installed core, whose bytes match the pins, so the managed
@@ -745,8 +745,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     );
     rt.cmd.send(CoreCmd::Start).expect("send start command");
 
-    // Phase 1: the first run with the geodata block configured reaches
-    // Running.
+    // First run: with the geodata block configured the core reaches Running.
     let (first_pid, first_start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
     assert!(
@@ -756,11 +755,11 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     );
     assert_eq!(first_start_logs, 1, "the core must be started exactly once");
 
-    // Phase 2: the core's own cron downloads the frozen upstream geoip.dat
-    // and swaps it in. The wait is byte-based: three consecutive swaps that
-    // hash to the frozen file prove the reload accepted it — a reload
-    // failure rolls the file back to the release bytes within the same
-    // tick, which would reset the counter instead of satisfying it.
+    // Scheduled download: the core's own cron fetches the frozen upstream
+    // geoip.dat and swaps it in. The wait is byte-based: three consecutive
+    // swaps that hash to the frozen file prove the reload accepted it — a
+    // reload failure rolls the file back to the release bytes within the
+    // same tick, which would reset the counter instead of satisfying it.
     let swap_deadline = Instant::now() + Duration::from_secs(120);
     let mut last_mtime = std::fs::metadata(&geoip_path)
         .expect("metadata geoip.dat")
@@ -822,11 +821,11 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         "core process must still be alive after the swap window"
     );
 
-    // Phase 3: stop and start again with the URLs still configured. The
-    // swapped bytes must survive the restart and the core must reach
-    // Running — pre-fix code died terminally at this spawn because the
-    // drifted geoip.dat failed release verification; the suspension
-    // makes the drift the expected user-managed state.
+    // Restart with URLs configured: stop and start again; the swapped bytes
+    // must survive the restart and the core must reach Running — code
+    // without the suspension died terminally at this spawn because the
+    // drifted geoip.dat failed release verification, and the suspension
+    // turns the drift into the expected user-managed state.
     rt.cmd.send(CoreCmd::Stop).expect("stop the core");
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(first_pid, Instant::now() + Duration::from_secs(10));
@@ -859,10 +858,10 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         "after the restart with URLs configured",
     );
 
-    // Phase 4: clear the geodata URLs and start again. The strict
-    // verification (no geodata block) detects the drift, restores the
-    // retained pristine pair, re-verifies, and spawns — the managed geo
-    // data ends up byte-identical to the release files.
+    // Without URLs: clear the geodata block and start again. The strict
+    // verification detects the drift, restores the retained pristine pair,
+    // re-verifies, and spawns — the managed geo data ends up byte-identical
+    // to the release files.
     rt.cmd.send(CoreCmd::Stop).expect("stop the core");
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(second_pid, Instant::now() + Duration::from_secs(10));
