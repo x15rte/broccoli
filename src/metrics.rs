@@ -64,6 +64,11 @@ pub enum WorkCounter {
     /// tick / traffic-unit / language / version / viewport change, never
     /// per frame.
     TopbarSpeedRebuilds,
+    /// Terminal-error message formats: the keyed message is rendered once
+    /// when the failure is recorded and again only when the active language
+    /// moves, never per frame — the content-area block and the status chip
+    /// borrow the rendered text.
+    TerminalErrorFormats,
 }
 
 /// Named resource counters holding current collection sizes (and the rare
@@ -118,6 +123,7 @@ pub struct Metrics {
     pub editor_validation_rebuilds: u64,
     pub advanced_tag_rebuilds: u64,
     pub topbar_speed_rebuilds: u64,
+    pub terminal_error_formats: u64,
 
     // -- resource counters (current collection sizes) ------------------------
     pub raw_editor_cache_entries: u64,
@@ -167,6 +173,7 @@ impl Metrics {
             WorkCounter::EditorValidationRebuilds => self.editor_validation_rebuilds += 1,
             WorkCounter::AdvancedTagRebuilds => self.advanced_tag_rebuilds += 1,
             WorkCounter::TopbarSpeedRebuilds => self.topbar_speed_rebuilds += 1,
+            WorkCounter::TerminalErrorFormats => self.terminal_error_formats += 1,
         }
     }
 

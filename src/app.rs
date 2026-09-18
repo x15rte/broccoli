@@ -12,7 +12,7 @@ use crate::model::safety::SafetyFinding;
 use crate::model::settings::{Language, Mode};
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
-    CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState, EVT_CHANNEL_CAPACITY,
+    AppMessage, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState, EVT_CHANNEL_CAPACITY,
     LatencyProbeResult, OperationKind, OutboundStatusView, RuntimeHandle, StatsTick, spawn_runtime,
     sweep_stale_scratch_configs,
 };
@@ -387,6 +387,21 @@ pub struct BroccoliApp {
     /// Cached fast availability state for UI render passes. Full release-pin
     /// verification remains at every launch/validation boundary.
     core_available: bool,
+    /// The installed tree's own version and its last verification failure,
+    /// for the core setup surface's mounts.
+    core_setup: ui::CoreSetupState,
+    /// The terminal message the content area renders: the failure's keyed
+    /// message plus the captured core output behind it, recorded with the
+    /// phase it describes and cleared when that phase moves on or an action
+    /// succeeds.
+    terminal_error: Option<TerminalError>,
+    /// An install this shell started has run and its transaction is still
+    /// open: set by the progress event, cleared when the terminal consumes it
+    /// or the runtime releases the exclusive record. Only such a terminal
+    /// re-derives the core facts — a command rejected up front (stop the core
+    /// first, another operation is running) never touched the tree, and a
+    /// pass taken while the core runs could even misread its open files.
+    install_in_flight: bool,
     is_elevated: bool,
     screen: Screen,
     dashboard: ui::dashboard::DashboardScreen,
@@ -760,15 +775,9 @@ impl BroccoliApp {
         let (tray, tray_menu) = build_tray(&icon_assets, settings.language, with_tray_icon);
         let (tray_registration_id, tray_action_rx) =
             install_tray_event_handlers(&cc.egui_ctx, tray.as_ref(), &tray_menu);
-        // The strict entry's drift heal must not run while the managed DATs may
-        // be user-managed: the committed config's geodata block is the same
-        // predicate every execution path applies (a raw override can carry its
-        // own geodata block), and the settings predicate covers the window
-        // before that config is first written.
-        let dat_pins_suspended =
-            sys::core_dl::dat_pins_suspended_at(&crate::rt::apply::active_path())
-                || settings.geodata.is_configured();
-        let core_version = sys::core_dl::cached_core_version(dat_pins_suspended);
+        let (core_version, core_setup) = core_facts(sys::core_dl::cached_core_presence(
+            dat_pins_suspended(&settings),
+        ));
         let core_available = core_version.is_some();
 
         let mut app = Self {
@@ -782,6 +791,8 @@ impl BroccoliApp {
                 stats: None,
                 observatory: Vec::new(),
                 core_version: core_version.clone(),
+                core_setup: core_setup.clone(),
+                terminal_error: None,
                 download: DownloadState::Idle,
                 update_check: UpdateCheckState::Idle,
                 stats_generation: 0,
@@ -806,6 +817,9 @@ impl BroccoliApp {
             probe_feedback: ui::request::ParkedSlot::default(),
             core_version,
             core_available,
+            core_setup,
+            terminal_error: None,
+            install_in_flight: false,
             is_elevated: sys::elevation::is_elevated(),
             screen: Screen::Dashboard,
             dashboard: Default::default(),
@@ -923,16 +937,31 @@ impl BroccoliApp {
             match ev {
                 CoreEvt::State(phase) => {
                     self.ui_ctx_dirty = true;
+                    // The terminal message reports one phase state: a failure
+                    // phase records its keyed headline plus the captured core
+                    // output, and any move of the live phase away from the
+                    // state the message described drops the message.
+                    match &phase {
+                        CorePhase::Error(error) => {
+                            self.terminal_error = Some(TerminalError::new(
+                                error.message.clone(),
+                                error.tail.clone(),
+                                self.settings.language,
+                                &self.metrics,
+                            ));
+                        }
+                        _ if !same_phase(&phase, &self.phase) => {
+                            self.terminal_error = None;
+                        }
+                        _ => {}
+                    }
                     match &phase {
                         CorePhase::Starting | CorePhase::Running => {
                             if let Some(transport) = self.pending_transport.take() {
                                 self.active_transport = Some(transport);
                             }
                         }
-                        CorePhase::Stopped
-                        | CorePhase::NoConfig
-                        | CorePhase::Backoff { .. }
-                        | CorePhase::Error(_) => {
+                        CorePhase::Stopped | CorePhase::Backoff { .. } | CorePhase::Error(_) => {
                             self.pending_transport = None;
                             self.active_transport = None;
                         }
@@ -1086,14 +1115,35 @@ impl BroccoliApp {
                             // event, so no UI-thread rehash is needed.
                             self.core_available = true;
                             self.core_version = Some(version.clone());
+                            // The tree that failed verification has been
+                            // replaced and pin-verified: nothing is left for
+                            // the setup surface's reason to describe, and the
+                            // terminal message an install answers is cleared
+                            // by the successful action (the attempt itself is
+                            // never resumed automatically).
+                            self.core_setup = ui::CoreSetupState::default();
+                            self.terminal_error = None;
                         }
                         DownloadState::Failed(_) => {
-                            // A failed first install leaves no core. A failed update may have
-                            // restored the last-known-good tree. The runtime sends the terminal
-                            // failure only after that transaction, so retain the previously
-                            // known availability without doing payload hashing on egui's thread.
+                            // The terminal ends an install this shell started:
+                            // the tree on disk is whatever the transaction
+                            // left (a failed first install, the retained
+                            // last-good tree restored, or a gate rollback), so
+                            // the cached facts are re-derived from that tree
+                            // instead of keeping the candidate's. Without it
+                            // the surface can read "Installed and verified"
+                            // for a tree that was replaced and the Connect
+                            // gate lets an attempt through to a spawn failure.
+                            // One verification pass pays for the truth; the
+                            // transaction already made the memo stale.
+                            if std::mem::take(&mut self.install_in_flight) {
+                                self.adopt_core_presence(sys::core_dl::verify_core_presence(
+                                    dat_pins_suspended(&self.settings),
+                                ));
+                            }
                         }
-                        DownloadState::Idle | DownloadState::Working { .. } => {}
+                        DownloadState::Working { .. } => self.install_in_flight = true,
+                        DownloadState::Idle => {}
                     }
                     self.download = download;
                 }
@@ -1104,6 +1154,12 @@ impl BroccoliApp {
                     self.ui_ctx_dirty = true;
                 }
                 CoreEvt::Operation(operation) => {
+                    if operation.is_none() {
+                        // The exclusive record is released: the install
+                        // transaction that set the flag is over, and a later
+                        // rejection must not re-derive the tree.
+                        self.install_in_flight = false;
+                    }
                     self.operation = operation;
                 }
             }
@@ -1354,9 +1410,10 @@ impl BroccoliApp {
         if let Some(error) = &self.config_error {
             return Some(error.clone());
         }
-        if !self.core_available {
-            return Some(t(lang, Key::ConnectBlockedInstallCore).into());
-        }
+        // The installed-core gate is deliberately absent here: a missing,
+        // stale or unverified core does not disable Connect — an attempt
+        // fails visibly in the terminal error block, which points at the
+        // core setup surface (see [`Self::core_gate_error`]).
         if let Some(operation) = self.operation {
             return Some(t_fmt(
                 lang,
@@ -1400,7 +1457,6 @@ impl BroccoliApp {
                 && cache.persistence_error == self.persistence_error
                 && cache.config_error == self.config_error
                 && cache.operation == self.operation
-                && cache.core_available == self.core_available
                 && cache.mode == self.settings.mode
                 && cache.raw_override == self.settings.raw_override
                 && cache.config_revision == self.config_revision
@@ -1424,7 +1480,6 @@ impl BroccoliApp {
             persistence_error: self.persistence_error.clone(),
             config_error: self.config_error.clone(),
             operation: self.operation,
-            core_available: self.core_available,
             mode: self.settings.mode,
             raw_override: self.settings.raw_override.clone(),
             config_revision: self.config_revision,
@@ -1473,6 +1528,67 @@ impl BroccoliApp {
         self.push_log(false, t_fmt(lang, Key::LogBroccoliMessage, &[&message]));
     }
 
+    /// The terminal message a Connect or Apply attempt fails with while the
+    /// managed core cannot run: no tree, a stale tree (its release metadata
+    /// names another build), or a tree that failed verification. The message
+    /// names both versions when a tree is present; the block that carries it
+    /// points at the core setup surface.
+    fn core_gate_error(&self) -> Option<TerminalError> {
+        if self.core_available {
+            return None;
+        }
+        let message = match self.core_setup.installed_version.as_deref() {
+            Some(installed) => Diag::new(Key::ConnectBlockedCoreUpdate)
+                .arg(installed)
+                .arg(sys::core_dl::pinned_core_version()),
+            None => Diag::new(Key::ConnectBlockedInstallCore),
+        };
+        Some(TerminalError::new(
+            message,
+            String::new(),
+            self.settings.language,
+            &self.metrics,
+        ))
+    }
+
+    /// Record the core gate's failure in every surface that echoes it — the
+    /// content-area block and the log — and return the message text for the
+    /// caller's `Err`.
+    fn record_core_gate_failure(&mut self, error: TerminalError) -> String {
+        let lang = self.settings.language;
+        let reason = error.text.clone();
+        self.terminal_error = Some(error);
+        // The content-area block reads the message from the UI-context
+        // snapshot, which rebuilds only when an input moved.
+        self.ui_ctx_dirty = true;
+        self.push_log(false, t_fmt(lang, Key::LogConnectBlocked, &[&reason]));
+        reason
+    }
+
+    /// Adopt one verification pass's answer as the shell's cached core facts.
+    fn adopt_core_presence(&mut self, presence: sys::core_dl::CorePresence) {
+        let (version, setup) = core_facts(presence);
+        self.core_available = version.is_some();
+        self.core_version = version;
+        self.core_setup = setup;
+        self.ui_ctx_dirty = true;
+    }
+
+    /// Re-verify the installed core on demand (the core setup surface's
+    /// Verify action): one full pinned-payload pass, bypassing the render
+    /// memo — the same work boot does once, here on an explicit click. A pass
+    /// that verifies is a successful action and clears the terminal message;
+    /// a pass that fails leaves its reason on the surface, where the user
+    /// asked for it.
+    fn verify_core(&mut self) {
+        self.adopt_core_presence(sys::core_dl::verify_core_presence(dat_pins_suspended(
+            &self.settings,
+        )));
+        if self.core_available {
+            self.terminal_error = None;
+        }
+    }
+
     fn request_connect(&mut self) -> Result<(), String> {
         let lang = self.settings.language;
         // Read the memoized reason: refresh first — the click
@@ -1488,6 +1604,13 @@ impl BroccoliApp {
             self.apply_result = Some((false, reason.clone()));
             self.push_log(false, t_fmt(lang, Key::LogConnectBlocked, &[&reason]));
             return Err(reason);
+        }
+        // The managed core cannot run yet: fail here, visibly, instead of
+        // sending a doomed start. The terminal error block carries the
+        // message and the way to the core setup surface, and nothing resumes
+        // the attempt once an install finishes (the user retries).
+        if let Some(error) = self.core_gate_error() {
+            return Err(self.record_core_gate_failure(error));
         }
         // Hazardous settings must not commit until the summary
         // dialog is explicitly acknowledged. The dialog is the response —
@@ -1506,6 +1629,13 @@ impl BroccoliApp {
     /// started.
     fn start_apply(&mut self) -> Result<(), String> {
         let lang = self.settings.language;
+        // The gate is re-checked at the commit: a hazard acknowledgment
+        // resumes here long after the request that opened it, and a core that
+        // cannot run must still fail visibly instead of starting a doomed
+        // spawn.
+        if let Some(error) = self.core_gate_error() {
+            return Err(self.record_core_gate_failure(error));
+        }
         if let Some(reason) = tun_outbound_interface_block_reason(
             lang,
             self.settings.mode,
@@ -1834,6 +1964,8 @@ impl BroccoliApp {
             stats: self.stats.clone(),
             observatory: self.observatory.clone(),
             core_version: self.core_version.clone(),
+            core_setup: self.core_setup.clone(),
+            terminal_error: self.terminal_error.as_ref().map(TerminalError::view),
             download: self.download.clone(),
             update_check: self.update_check.clone(),
             stats_generation: self.stats_generation,
@@ -1922,6 +2054,15 @@ impl eframe::App for BroccoliApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // The terminal message follows the active language: the memo
+        // re-renders only when the language moved (a key compare on every
+        // other frame), and the snapshot below carries the fresh text.
+        let language = self.settings.language;
+        if let Some(error) = self.terminal_error.as_mut()
+            && error.render_in(language, &self.metrics)
+        {
+            self.ui_ctx_dirty = true;
+        }
         // Runtime events can invalidate the generation-gated UI-context
         // snapshot; rebuild it once before this frame renders.
         if self.ui_ctx_dirty {
@@ -1939,6 +2080,9 @@ impl eframe::App for BroccoliApp {
         let mut ui_dirty = false;
         let mut connect_requested = false;
         let mut stop_requested = false;
+        let mut verify_core_requested = false;
+        let mut open_core_folder_requested = false;
+        let mut open_core_setup_requested = false;
 
         // Top bar: runtime phase/action, configured mode, persistence, and
         // active server.
@@ -2033,6 +2177,15 @@ impl eframe::App for BroccoliApp {
                     .expect("topbar labels refreshed above");
                 let apply_block = self.apply_block_text();
                 let can_apply = matches!(self.phase, CorePhase::Running) && apply_block.is_none();
+                // The terminal message's hover text: the zone shows the
+                // compact chip, the content-area block shows the wrapped
+                // message with the captured core output. Both borrow the
+                // text the shell rendered once (never per frame) from the
+                // UI-context snapshot.
+                let terminal_hover = self
+                    .terminal_error
+                    .as_ref()
+                    .map(|error| error.text.as_str());
                 let status = ui::topbar::TopbarStatus {
                     lang,
                     mode_caption: &labels.mode_caption,
@@ -2047,6 +2200,7 @@ impl eframe::App for BroccoliApp {
                         .apply_result
                         .as_ref()
                         .map(|(ok, output)| (ok, output.as_str())),
+                    terminal_error: terminal_hover,
                     config_error: self.config_error.as_deref(),
                     state_error: self.state_error.as_deref(),
                     persistence_error: self.persistence_error.as_deref(),
@@ -2080,6 +2234,12 @@ impl eframe::App for BroccoliApp {
                     // Explicit user action in a failure state: bypass the
                     // throttle and retry immediately.
                     self.persist_now(ctx.input(|input| input.time), PersistKind::Config);
+                }
+                if clicks.jump_to_error {
+                    // Jump to the message: the wrapped block with the
+                    // captured core output lives at the top of the dashboard
+                    // content area.
+                    self.screen = Screen::Dashboard;
                 }
                 if clicks.open_folder
                     && let Err(open_error) = sys::hidden_command("explorer")
@@ -2142,6 +2302,9 @@ impl eframe::App for BroccoliApp {
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
+                    verify_core_requested: &mut verify_core_requested,
+                    open_core_folder_requested: &mut open_core_folder_requested,
+                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2166,7 +2329,9 @@ impl eframe::App for BroccoliApp {
             // (the probe outcome parked by the drain).
         });
 
-        // First-run wizard over everything when the core is missing. The
+        // First-run wizard over everything while the pinned core is missing
+        // or does not match the compiled pins — the same two states the core
+        // setup surface reports as not installed and update required. The
         // wizard shares the app's `dirty` flag (it never mutated settings;
         // its UiCtx was wired to a dropped local), so any
         // future wizard edit that calls `mark_dirty` reaches the persist
@@ -2191,6 +2356,9 @@ impl eframe::App for BroccoliApp {
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
+                    verify_core_requested: &mut verify_core_requested,
+                    open_core_folder_requested: &mut open_core_folder_requested,
+                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2231,6 +2399,9 @@ impl eframe::App for BroccoliApp {
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
+                    verify_core_requested: &mut verify_core_requested,
+                    open_core_folder_requested: &mut open_core_folder_requested,
+                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2255,6 +2426,27 @@ impl eframe::App for BroccoliApp {
             let _ = self.request_stop();
         } else if connect_requested {
             let _ = self.request_connect();
+        }
+        // Core setup requests from any mount (the startup dialog, the
+        // Settings section, the terminal error block's button): the shell
+        // owns the verification pass, the Explorer launch and the screen
+        // switch these flags ask for.
+        if verify_core_requested {
+            self.verify_core();
+        }
+        if open_core_folder_requested
+            && let Err(open_error) = sys::hidden_command("explorer")
+                .arg(paths::core_dir())
+                .spawn()
+        {
+            let lang = self.settings.language;
+            self.push_log(
+                false,
+                t_fmt(lang, Key::LogOpenCoreFolderFailed, &[&open_error]),
+            );
+        }
+        if open_core_setup_requested {
+            self.screen = Screen::Settings;
         }
 
         // Exit-time action confirmations from the Settings modals: request
@@ -3251,14 +3443,108 @@ fn operation_name(operation: OperationKind) -> Diag {
     Diag::new(key)
 }
 
+/// The terminal message the content area renders: the failure's keyed
+/// message with the captured core output behind it. The shell records it with
+/// the phase it describes and drops it when that phase moves on or an action
+/// succeeds.
+///
+/// The message is rendered once per `(message, language)` pair — at record
+/// time and again only when the active language moves — and the UI-context
+/// view carries that text, so neither the content-area block nor the status
+/// chip re-formats anything per frame.
+struct TerminalError {
+    /// The keyed message, kept for the language-change re-render.
+    message: AppMessage,
+    /// Captured core output (core stdout/stderr lines); empty when the
+    /// failure is app-authored.
+    output: String,
+    /// The rendered message text and the language it was rendered in.
+    text: String,
+    language: Language,
+}
+
+impl TerminalError {
+    /// Record one failure, rendering its message for `language` (counted by
+    /// [`WorkCounter::TerminalErrorFormats`]).
+    fn new(
+        message: impl Into<AppMessage>,
+        output: String,
+        language: Language,
+        metrics: &MetricsHandle,
+    ) -> Self {
+        let message = message.into();
+        metrics.bump_work(WorkCounter::TerminalErrorFormats);
+        Self {
+            text: message.text(language),
+            message,
+            output,
+            language,
+        }
+    }
+
+    /// Re-render the message when the active language moved. True when the
+    /// text changed, so the caller can mark the UI-context snapshot dirty;
+    /// false on every other frame, at a string-compare cost of nothing.
+    fn render_in(&mut self, language: Language, metrics: &MetricsHandle) -> bool {
+        if self.language == language {
+            return false;
+        }
+        metrics.bump_work(WorkCounter::TerminalErrorFormats);
+        self.text = self.message.text(language);
+        self.language = language;
+        true
+    }
+
+    /// The message as the UI context carries it: rendered text, borrowed by
+    /// the block and the chip.
+    fn view(&self) -> ui::TerminalErrorView {
+        ui::TerminalErrorView {
+            text: self.text.clone(),
+            output: self.output.clone(),
+        }
+    }
+}
+
+/// Project one verification pass into the shell's cached core facts: the
+/// verified version — absent unless the tree matched the compiled pins — and
+/// the core setup surface's installed-version/verification-reason pair.
+fn core_facts(presence: sys::core_dl::CorePresence) -> (Option<String>, ui::CoreSetupState) {
+    match presence {
+        sys::core_dl::CorePresence::Verified { version } => {
+            (Some(version), ui::CoreSetupState::default())
+        }
+        sys::core_dl::CorePresence::Unverified { installed, failure } => (
+            None,
+            ui::CoreSetupState {
+                installed_version: installed,
+                verification_error: Some(AppMessage::Error(failure)),
+            },
+        ),
+        sys::core_dl::CorePresence::Missing => (None, ui::CoreSetupState::default()),
+    }
+}
+
+/// Whether the geo data pin compare is suspended for this configuration — the
+/// same predicate every verification site derives. The strict entry's drift
+/// heal must not run while the managed DATs may be user-managed: the
+/// committed config's geodata block is the same predicate every execution
+/// path applies (a raw override can carry its own geodata block), and the
+/// settings predicate covers the window before that config is first written.
+fn dat_pins_suspended(settings: &Settings) -> bool {
+    sys::core_dl::dat_pins_suspended_at(&crate::rt::apply::active_path())
+        || settings.geodata.is_configured()
+}
+
 fn phase_badge_text(p: &CorePhase, lang: Language) -> String {
     match p {
         CorePhase::Stopped => t(lang, Key::AppPhaseStopped).into(),
-        CorePhase::NoConfig => t(lang, Key::AppPhaseNoConfig).into(),
         CorePhase::Starting => t(lang, Key::AppPhaseStarting).into(),
         CorePhase::Running => t(lang, Key::AppPhaseRunning).into(),
         CorePhase::Backoff { attempt } => t_fmt(lang, Key::AppPhaseRetrying, &[&attempt]),
-        CorePhase::Error(error) => t_fmt(lang, Key::AppPhaseError, &[&error.message.text(lang)]),
+        // The badge is the phase readout: the failure's message is the
+        // terminal error block in the content area, so a long error can no
+        // longer stand where the phase belongs.
+        CorePhase::Error(_) => t(lang, Key::AppPhaseError).into(),
     }
 }
 
@@ -3267,7 +3553,6 @@ fn phase_badge_text(p: &CorePhase, lang: Language) -> String {
 fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> egui::Color32 {
     match p {
         CorePhase::Stopped => egui::Color32::GRAY,
-        CorePhase::NoConfig => egui::Color32::GRAY,
         CorePhase::Starting => colors.warn,
         CorePhase::Running => colors.ok,
         CorePhase::Backoff { .. } => colors.warn,
@@ -3314,7 +3599,6 @@ struct ConnectBlockCache {
     persistence_error: Option<String>,
     config_error: Option<String>,
     operation: Option<OperationKind>,
-    core_available: bool,
     mode: Mode,
     raw_override: Option<String>,
     config_revision: u64,
@@ -3345,7 +3629,6 @@ fn cached_block_reason(cache: &Option<ConnectBlockCache>) -> &Option<String> {
 fn same_phase(a: &CorePhase, b: &CorePhase) -> bool {
     match (a, b) {
         (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::NoConfig, CorePhase::NoConfig)
         | (CorePhase::Starting, CorePhase::Starting)
         | (CorePhase::Running, CorePhase::Running) => true,
         (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
@@ -4200,6 +4483,7 @@ mod unsaved_changes_tests {
             can_apply: false,
             apply_block: None,
             apply_result: None,
+            terminal_error: None,
             config_error: None,
             state_error: None,
             persistence_error: None,
@@ -4431,11 +4715,11 @@ mod config_gate_tests {
 mod tests {
     use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer};
     use super::{
-        Language, native_dark_for, phase_badge_color, phase_badge_text, same_phase,
+        Language, native_dark_for, phase_badge_text, same_phase,
         tun_outbound_interface_block_reason,
     };
     use crate::diag::Diag;
-    use crate::i18n::{Key, t, t_fmt};
+    use crate::i18n::{Key, t};
     use crate::metrics::MetricsHandle;
     use crate::model::settings::Mode;
     use crate::rt::supervisor::MAX_LINE_BYTES;
@@ -4562,21 +4846,12 @@ mod tests {
         assert_eq!(entries.len(), 4, "app.log plus three rotated segments");
     }
 
-    #[test]
-    fn no_config_badge_is_distinct_and_not_an_error() {
-        let color = phase_badge_color(&CorePhase::NoConfig, crate::ui::status::status_colors(true));
-        assert_eq!(
-            phase_badge_text(&CorePhase::NoConfig, Language::En),
-            "No config yet"
-        );
-        assert_ne!(color, egui::Color32::RED);
-    }
-
     /// Every phase maps to a badge caption, the retry and
-    /// error captions embed their payload, and unit-phase captions are the
-    /// `t()` statics the top bar paints without allocating.
+    /// error caption stays the phase word (the failure's message belongs to
+    /// the terminal error block, never to the phase readout), and the other
+    /// captions are the `t()` statics the top bar paints without allocating.
     #[test]
-    fn phase_badge_text_covers_every_phase_and_embeds_payloads() {
+    fn phase_badge_text_covers_every_phase_and_keeps_the_error_a_phase_word() {
         assert_eq!(
             phase_badge_text(&CorePhase::Stopped, Language::En),
             "Stopped"
@@ -4593,14 +4868,16 @@ mod tests {
             phase_badge_text(&CorePhase::Backoff { attempt: 3 }, Language::En),
             "Retrying (attempt 3)"
         );
+        let error = error_phase(Key::RtPhaseRestartCancelled);
+        let headline = t(Language::En, Key::RtPhaseRestartCancelled);
         assert_eq!(
-            phase_badge_text(&error_phase(Key::RtPhaseRestartCancelled), Language::En),
-            t_fmt(
-                Language::En,
-                Key::AppPhaseError,
-                &[&t(Language::En, Key::RtPhaseRestartCancelled)],
-            ),
-            "the badge must embed the keyed headline, never the diagnostics tail"
+            phase_badge_text(&error, Language::En),
+            t(Language::En, Key::AppPhaseError),
+            "the badge must read the phase word"
+        );
+        assert!(
+            !phase_badge_text(&error, Language::En).contains(headline),
+            "the failure's message must not stand where the phase belongs"
         );
     }
 

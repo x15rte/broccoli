@@ -21,7 +21,7 @@ use crate::rt::{
     CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OutboundStatusView, StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
-use crate::ui::{UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
+use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
 use std::collections::VecDeque;
 
 /// Minimal UiCtx backing shared by screen-level and app-shell-wiring tests:
@@ -48,6 +48,11 @@ pub(crate) struct UiTestRig {
     pub(crate) config_error: Option<String>,
     pub(crate) connect_requested: bool,
     pub(crate) stop_requested: bool,
+    /// Core setup requests a screen raised this frame (Verify, Open core
+    /// folder, open the core setup surface).
+    pub(crate) verify_core_requested: bool,
+    pub(crate) open_core_folder_requested: bool,
+    pub(crate) open_core_setup_requested: bool,
     /// Outcome slot of the one single-flight latency probe, mirroring the
     /// app drain: probe UI tests park results here and the servers screen
     /// adopts them through its `ShellParked` request.
@@ -63,6 +68,11 @@ pub(crate) struct UiTestRig {
     /// view never rebuilds.
     pub(crate) logs_generation: u64,
     pub(crate) core_version: Option<String>,
+    /// The installed tree's own version and its last verification failure,
+    /// as the core setup surface reads them.
+    pub(crate) core_setup: CoreSetupState,
+    /// The terminal message the content area renders.
+    pub(crate) terminal_error: Option<TerminalErrorView>,
     pub(crate) download: DownloadState,
     pub(crate) update_check: UpdateCheckState,
     pub(crate) dirty: bool,
@@ -91,6 +101,9 @@ impl Default for UiTestRig {
             config_error: None,
             connect_requested: false,
             stop_requested: false,
+            verify_core_requested: false,
+            open_core_folder_requested: false,
+            open_core_setup_requested: false,
             probe_feedback: Default::default(),
             stats: None,
             stats_history: VecDeque::new(),
@@ -98,6 +111,8 @@ impl Default for UiTestRig {
             logs: VecDeque::new(),
             logs_generation: 0,
             core_version: None,
+            core_setup: CoreSetupState::default(),
+            terminal_error: None,
             download: DownloadState::Idle,
             update_check: UpdateCheckState::Idle,
             dirty: false,
@@ -111,6 +126,8 @@ impl Default for UiTestRig {
                 stats: None,
                 observatory: Vec::new(),
                 core_version: None,
+                core_setup: CoreSetupState::default(),
+                terminal_error: None,
                 download: DownloadState::Idle,
                 update_check: UpdateCheckState::Idle,
                 stats_generation: 0,
@@ -146,6 +163,8 @@ impl UiTestRig {
             stats: self.stats.clone(),
             observatory: self.observatory.clone(),
             core_version: self.core_version.clone(),
+            core_setup: self.core_setup.clone(),
+            terminal_error: self.terminal_error.clone(),
             download: self.download.clone(),
             update_check: self.update_check.clone(),
             stats_generation: self.stats_generation,
@@ -165,6 +184,9 @@ impl UiTestRig {
                 ui_dirty: &mut self.ui_dirty,
                 connect_requested: &mut self.connect_requested,
                 stop_requested: &mut self.stop_requested,
+                verify_core_requested: &mut self.verify_core_requested,
+                open_core_folder_requested: &mut self.open_core_folder_requested,
+                open_core_setup_requested: &mut self.open_core_setup_requested,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
                 operation: None,

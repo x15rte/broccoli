@@ -39,8 +39,8 @@ pub(crate) fn classify(phase: &CorePhase, transport: Option<CoreTransport>) -> I
             detail: IconDetail::CoreError,
         },
         // Not running and not about to be: the tray must not claim the core
-        // is up. `NoConfig` is a fresh install that never connected.
-        CorePhase::Stopped | CorePhase::NoConfig => IconPresentation {
+        // is up.
+        CorePhase::Stopped => IconPresentation {
             state: IconState::Stopped,
             detail: IconDetail::None,
         },
@@ -163,12 +163,6 @@ mod tests {
             (
                 "stopped",
                 CorePhase::Stopped,
-                None,
-                expected(IconState::Stopped, IconDetail::None),
-            ),
-            (
-                "no config",
-                CorePhase::NoConfig,
                 None,
                 expected(IconState::Stopped, IconDetail::None),
             ),

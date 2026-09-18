@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Seek as _, SeekFrom, Write as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -583,12 +583,38 @@ pub fn ensure_managed_core() -> Result<(), DiagError> {
 /// still call [`open_verified_managed_core`] and rehash every payload.
 const PRESENCE_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// The managed core tree as one verification pass saw it.
+///
+/// The core setup surface needs all three answers: a tree that verified, a
+/// tree that is present but did not verify — with the version that tree names
+/// and the verification error's own message, so a stale install reads as an
+/// update instead of a missing core — and no tree at all.
+#[derive(Clone)]
+pub enum CorePresence {
+    /// No managed core tree to verify: the `core` directory is absent or
+    /// empty, so the pinned release has never been installed. Nothing is
+    /// verified in this state — an empty scaffold left by an interrupted
+    /// transaction is not a failed install.
+    Missing,
+    /// The tree passed full pinned-payload verification.
+    Verified { version: String },
+    /// The tree is present but did not verify: stale (its release metadata
+    /// names another build's release), tampered, or unreadable. `installed`
+    /// carries the version the tree's own metadata names when that file is
+    /// readable, so the surface can report both versions; `failure` is the
+    /// verification error.
+    Unverified {
+        installed: Option<String>,
+        failure: Arc<DiagError>,
+    },
+}
+
 #[derive(Clone)]
 struct PresenceCache {
     checked_at: SystemTime,
     root: PathBuf,
     dat_pins_suspended: bool,
-    version: Option<String>,
+    presence: CorePresence,
 }
 
 impl PresenceCache {
@@ -610,8 +636,8 @@ impl PresenceCache {
 
 static PRESENCE_CACHE: LazyLock<Mutex<Option<PresenceCache>>> = LazyLock::new(|| Mutex::new(None));
 
-/// Return the verified pinned release version if a recent check is available,
-/// otherwise verify the managed tree once and cache that result briefly.
+/// Return the managed core tree's presence state, verifying the tree once
+/// when no recent answer is available.
 ///
 /// This deliberately caches both absence and verification failure: an egui
 /// render frame must not SHA-256 several large payloads repeatedly while the
@@ -625,32 +651,74 @@ static PRESENCE_CACHE: LazyLock<Mutex<Option<PresenceCache>>> = LazyLock::new(||
 /// user-refreshed pair is never reverted, while false keeps the strict
 /// entry's heal of a drifted pair. The caller derives it from the same
 /// settings predicate the config generator uses.
-pub fn cached_core_version(dat_pins_suspended: bool) -> Option<String> {
+pub fn cached_core_presence(dat_pins_suspended: bool) -> CorePresence {
     let root = broccoli_root();
     if let Ok(guard) = PRESENCE_CACHE.lock()
         && let Some(entry) = guard
             .as_ref()
             .filter(|entry| entry.answers(&root, dat_pins_suspended))
     {
-        return entry.version.clone();
+        return entry.presence.clone();
     }
 
-    let version = if dat_pins_suspended {
-        open_verified_core_user_managed_dats(&core_dir())
-    } else {
-        open_verified_managed_core()
-    }
-    .ok()
-    .map(|verified| verified.version);
+    let presence = inspect_core(dat_pins_suspended);
     if let Ok(mut guard) = PRESENCE_CACHE.lock() {
         *guard = Some(PresenceCache {
             checked_at: SystemTime::now(),
             root,
             dat_pins_suspended,
-            version: version.clone(),
+            presence: presence.clone(),
         });
     }
-    version
+    presence
+}
+
+/// Verify the managed tree now, bypassing the render memo — the core setup
+/// surface's Verify action, where a user asks for a fresh answer instead of
+/// the last one. The memo is replaced with this pass's answer.
+pub fn verify_core_presence(dat_pins_suspended: bool) -> CorePresence {
+    invalidate_presence_cache();
+    cached_core_presence(dat_pins_suspended)
+}
+
+/// One verification pass over the managed tree. The installed version is read
+/// before the verification, which consumes the release metadata file.
+fn inspect_core(dat_pins_suspended: bool) -> CorePresence {
+    let core = core_dir();
+    if !tree_present(&core) {
+        return CorePresence::Missing;
+    }
+    let installed = installed_release_version(&core);
+    let verified = if dat_pins_suspended {
+        open_verified_core_user_managed_dats(&core)
+    } else {
+        open_verified_core(&core)
+    };
+    match verified {
+        Ok(verified) => CorePresence::Verified {
+            version: verified.version,
+        },
+        Err(failure) => CorePresence::Unverified {
+            installed,
+            failure: Arc::new(failure),
+        },
+    }
+}
+
+/// Whether a managed core tree exists at all: the directory holds at least
+/// one entry. An empty scaffold left by an interrupted transaction reads as
+/// missing, not as a tree that failed verification.
+fn tree_present(core: &Path) -> bool {
+    fs::read_dir(core).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// The release version the tree's own metadata names, without comparing it
+/// to the compiled pins: a stale tree must still name what is installed.
+/// `None` when the metadata file is absent or unreadable.
+fn installed_release_version(core: &Path) -> Option<String> {
+    let file = File::open(core.join(RELEASE_DIGEST_FILE)).ok()?;
+    let metadata: OfficialReleaseMetadata = serde_json::from_reader(file).ok()?;
+    Some(metadata.version)
 }
 
 /// Forget the cached presence result when one managed-core transaction leaves
@@ -661,7 +729,7 @@ pub fn cached_core_version(dat_pins_suspended: bool) -> Option<String> {
 /// write legs — forgets the cache. A failed transaction can leave the tree
 /// partially modified (a rename or copy leg that failed midway, a quarantine
 /// that was not restored), so a presence memo captured before it must never
-/// outlive it. The next [`cached_core_version`] verifies the final tree once.
+/// outlive it. The next [`cached_core_presence`] verifies the final tree once.
 struct PresenceInvalidation;
 
 impl Drop for PresenceInvalidation {
@@ -683,6 +751,13 @@ fn invalidate_presence_cache() {
 /// Return Broccoli's compile-time pinned Xray version, including its leading `v`.
 pub fn pinned_release_version() -> &'static str {
     XRAY_VERSION
+}
+
+/// Return the compiled pin in the release metadata's spelling — no leading
+/// `v` — so a surface that shows the installed and the required version side
+/// by side reads as one pair.
+pub fn pinned_core_version() -> &'static str {
+    XRAY_VERSION.strip_prefix('v').unwrap_or(XRAY_VERSION)
 }
 
 /// Return Broccoli's compile-time pinned Xray archive asset name.
@@ -1692,7 +1767,9 @@ mod tests {
             checked_at: std::time::SystemTime::now(),
             root,
             dat_pins_suspended: false,
-            version: Some("stale-version".into()),
+            presence: super::CorePresence::Verified {
+                version: "stale-version".into(),
+            },
         });
     }
 
@@ -1714,7 +1791,9 @@ mod tests {
             checked_at: std::time::SystemTime::now(),
             root: root.clone(),
             dat_pins_suspended,
-            version: Some("v0.0.0".into()),
+            presence: super::CorePresence::Verified {
+                version: "v0.0.0".into(),
+            },
         };
         assert!(memo(false).answers(&root, false));
         assert!(memo(true).answers(&root, true));
@@ -1738,6 +1817,77 @@ mod tests {
             !expired.answers(&root, false),
             "an expired memo must re-verify"
         );
+    }
+
+    #[test]
+    fn presence_reports_an_absent_or_empty_tree_as_missing() {
+        crate::sys::appdata::with_appdata(|| {
+            assert!(
+                matches!(
+                    super::cached_core_presence(false),
+                    super::CorePresence::Missing
+                ),
+                "an absent core directory must read as missing"
+            );
+            fs::create_dir_all(super::core_dir()).expect("create an empty core scaffold");
+            assert!(
+                matches!(
+                    super::verify_core_presence(false),
+                    super::CorePresence::Missing
+                ),
+                "an empty scaffold must read as missing, not as a tree that failed verification"
+            );
+        });
+    }
+
+    #[test]
+    fn presence_reports_a_stale_tree_with_the_installed_version_and_reason() {
+        // A tree written by another build must read as unverified with the
+        // version its own metadata names: the core setup surface reports
+        // "installed X, this build needs Y" from exactly these facts.
+        crate::sys::appdata::with_appdata(|| {
+            let core = super::core_dir();
+            fs::create_dir_all(&core).expect("create the core directory");
+            // The verification shape-checks every payload path before it
+            // compares the release metadata: a tree with missing payload files
+            // fails there instead of naming the pin mismatch this test is
+            // about.
+            for payload in ["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"] {
+                fs::write(core.join(payload), b"another build's payload")
+                    .expect("write a stale payload");
+            }
+            let metadata = serde_json::json!({
+                "schema": super::METADATA_SCHEMA,
+                "archive_asset": super::ZIP_ASSET,
+                "archive_sha256": super::ZIP_SHA256,
+                "xray_sha256": super::XRAY_EXE_SHA256,
+                "wintun_sha256": super::WINTUN_SHA256,
+                "geoip_sha256": super::GEOIP_SHA256,
+                "geosite_sha256": super::GEOSITE_SHA256,
+                "version": "26.7.28",
+            });
+            fs::write(
+                core.join(super::RELEASE_DIGEST_FILE),
+                serde_json::to_vec(&metadata).expect("serialize the release metadata"),
+            )
+            .expect("write the release metadata");
+
+            match super::verify_core_presence(false) {
+                super::CorePresence::Unverified { installed, failure } => {
+                    assert_eq!(
+                        installed.as_deref(),
+                        Some("26.7.28"),
+                        "a stale tree must name the version its metadata carries"
+                    );
+                    assert_eq!(
+                        failure.diag().key(),
+                        Key::CoreDlMetadataMismatch,
+                        "the reason must be the pin comparison's own error"
+                    );
+                }
+                _ => panic!("a tree written by another build must read as unverified"),
+            }
+        });
     }
 
     #[test]

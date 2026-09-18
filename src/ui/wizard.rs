@@ -1,10 +1,11 @@
 //! First-run wizard: download or import Broccoli's compiled-in pinned official
 //! Xray core.
 
-use crate::i18n::{Key, t};
+use crate::i18n::{Key, t, t_fmt};
+use crate::sys;
 use egui::RichText;
 
-use crate::ui::{UiCtx, show_core_setup};
+use crate::ui::{CoreSetupMount, UiCtx, show_core_setup};
 
 #[derive(Default)]
 pub struct WizardScreen {
@@ -27,10 +28,21 @@ impl WizardScreen {
             ui.set_max_width(560.0);
             ui.heading(t(lang, Key::WizardWelcome));
             ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(t(lang, Key::WizardCoreMissing)).weak()).wrap());
+            // The dialog names the state it is asking about: a first install
+            // when no tree exists, an update with both versions when the
+            // installed core does not match this build's pins.
+            let intro = match uictx.core_setup.installed_version.as_deref() {
+                Some(installed) if uictx.core_version.is_none() => t_fmt(
+                    lang,
+                    Key::WizardCoreUpdateRequired,
+                    &[&installed, &sys::core_dl::pinned_core_version()],
+                ),
+                _ => t(lang, Key::WizardCoreMissing).to_owned(),
+            };
+            ui.add(egui::Label::new(RichText::new(intro).weak()).wrap());
             ui.add_space(10.0);
 
-            let outcome = show_core_setup(ui, uictx, true);
+            let outcome = show_core_setup(ui, uictx, CoreSetupMount::Dialog);
             if outcome.continue_clicked {
                 self.done = true;
             }

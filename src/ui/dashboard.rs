@@ -7,7 +7,7 @@ use crate::model::settings::{Language, TrafficUnit};
 use crate::rt::{CorePhase, DownloadState, OutboundStatusView};
 use crate::ui::inbounds::protocol_label;
 use crate::ui::status::{StatusColors, status_colors_of};
-use crate::ui::{PhaseAction, UiCtx};
+use crate::ui::{PhaseAction, TerminalErrorView, UiCtx};
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
 /// (a 1 Hz stats tick — the only way the history ring changes).
@@ -319,6 +319,16 @@ impl DashboardScreen {
             .show(ui, |ui| {
                 ui.add_space(6.0);
 
+                // Terminal error block, above everything else: a message the
+                // status zone only chips (the phase badge stays the phase
+                // readout) is fully readable here, wrapped, with the captured
+                // core output behind it and the way to the core setup surface.
+                if let Some(error) = ctx.terminal_error
+                    && terminal_error_block(ui, ctx.settings.language, error)
+                {
+                    ctx.request_open_core_setup();
+                }
+
                 // State + connect row.
                 ui.horizontal(|ui| {
                     let lang = ctx.settings.language;
@@ -567,7 +577,6 @@ impl DashboardScreen {
                             CorePhase::Starting => t(lang, Key::DashboardNoStatsStarting),
                             CorePhase::Running => t(lang, Key::DashboardNoStatsRunning),
                             CorePhase::Stopped => t(lang, Key::DashboardNoStatsStopped),
-                            CorePhase::NoConfig => t(lang, Key::DashboardNoStatsNoConfig),
                             CorePhase::Backoff { .. } => t(lang, Key::DashboardNoStatsBackoff),
                             CorePhase::Error(_) => t(lang, Key::DashboardNoStatsError),
                         };
@@ -916,7 +925,6 @@ struct HeaderCache {
 fn same_phase(a: &CorePhase, b: &CorePhase) -> bool {
     match (a, b) {
         (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::NoConfig, CorePhase::NoConfig)
         | (CorePhase::Starting, CorePhase::Starting)
         | (CorePhase::Running, CorePhase::Running) => true,
         (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
@@ -931,21 +939,64 @@ fn same_phase(a: &CorePhase, b: &CorePhase) -> bool {
 fn phase_badge_text(p: &CorePhase, lang: Language) -> String {
     match p {
         CorePhase::Stopped => t(lang, Key::DashboardPhaseStopped).into(),
-        CorePhase::NoConfig => t(lang, Key::DashboardPhaseNoConfig).into(),
         CorePhase::Starting => t(lang, Key::DashboardPhaseStarting).into(),
         CorePhase::Running => t(lang, Key::DashboardPhaseRunning).into(),
         CorePhase::Backoff { attempt } => t_fmt(lang, Key::DashboardPhaseRetry, &[&attempt]),
-        CorePhase::Error(error) => {
-            t_fmt(lang, Key::DashboardPhaseError, &[&error.message.text(lang)])
-        }
+        // The phase readout stays the phase: the failure's own message is the
+        // terminal error block below this row, wrapped and complete, never a
+        // payload crammed into the badge (where a long message used to hide
+        // the state it belonged to).
+        CorePhase::Error(_) => t(lang, Key::DashboardPhaseError).into(),
     }
+}
+
+/// Render the terminal error block: the failure's headline and the captured
+/// core output behind it, both wrapped — never truncated, which is the point
+/// of the content-area surface — plus the button that opens the core setup
+/// surface. The shell owns the message's lifetime (the phase it describes
+/// moves on, or an action succeeds); this renders one frame. Returns true
+/// when the button was clicked.
+fn terminal_error_block(ui: &mut egui::Ui, lang: Language, error: &TerminalErrorView) -> bool {
+    let colors = status_colors_of(ui);
+    let mut open_core_setup = false;
+    egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.0, colors.err))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(error.text.as_str())
+                        .color(colors.err)
+                        .strong(),
+                )
+                .wrap(),
+            );
+            if !error.output.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(t(lang, Key::ProbeDiagnosticsWall))
+                        .weak()
+                        .small(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(error.output.as_str())
+                            .monospace()
+                            .small(),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_space(6.0);
+            open_core_setup = ui.button(t(lang, Key::DashboardOpenCoreSetup)).clicked();
+        });
+    ui.add_space(8.0);
+    open_core_setup
 }
 
 /// Pure phase → badge dot color.
 fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> egui::Color32 {
     match p {
         CorePhase::Stopped => egui::Color32::GRAY,
-        CorePhase::NoConfig => egui::Color32::GRAY,
         CorePhase::Starting => colors.warn,
         CorePhase::Running => colors.ok,
         CorePhase::Backoff { .. } => colors.warn,
@@ -997,8 +1048,8 @@ fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus
 mod tests {
     use super::{
         DashboardScreen, LatencyCell, ListenerStatus, TunStatus, build_latency_rows, format_axis,
-        format_bytes, listener_status, phase_badge_color, phase_badge_text, truncate_chars,
-        tun_status, y_axis_label_for,
+        format_bytes, listener_status, phase_badge_color, phase_badge_text, terminal_error_block,
+        truncate_chars, tun_status, y_axis_label_for,
     };
     use crate::diag::Diag;
     use crate::i18n::{Key, t, t_fmt};
@@ -1009,6 +1060,7 @@ mod tests {
         ServersFile, Settings,
     };
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
+    use crate::ui::TerminalErrorView;
     use crate::ui::test_rig::UiTestRig;
     use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable as _};
     use std::cell::RefCell;
@@ -1020,14 +1072,87 @@ mod tests {
         CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled)))
     }
 
+    /// The terminal error block renders the whole message, the captured core
+    /// output verbatim under the shared diagnostics header and wrapped (not
+    /// truncated, which is the point of the content-area surface), and its
+    /// button raises the shell's request to open the core setup surface.
     #[test]
-    fn no_config_badge_is_distinct_and_not_an_error() {
-        let color = phase_badge_color(&CorePhase::NoConfig, crate::ui::status::status_colors(true));
-        assert_eq!(
-            phase_badge_text(&CorePhase::NoConfig, Language::En),
-            "No config yet"
+    fn terminal_error_block_wraps_the_message_and_opens_core_setup() {
+        // Long on both halves: one verification headline naming two 64-hex
+        // hashes, and one long captured core line. A truncating surface would
+        // keep each to a single row.
+        let expected = "a".repeat(64);
+        let actual = "b".repeat(64);
+        let message = Diag::new(Key::CoreDlPayloadVerifyFailed)
+            .arg("xray.exe")
+            .arg(&expected)
+            .arg(&actual);
+        let output = "[stderr] failed to parse config: unknown field \
+            \"outbound.proxySettings\" in this build, and the captured line \
+            keeps going well past any single row";
+        let rig = UiTestRig {
+            terminal_error: Some(TerminalErrorView {
+                text: message.text(Language::En),
+                output: output.to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(420.0, 600.0))
+            .build_ui_state(
+                |ui, rig: &mut UiTestRig| {
+                    let error = rig.terminal_error.clone().expect("fixture message");
+                    let mut ctx = rig.ctx();
+                    if terminal_error_block(ui, ctx.settings.language, &error) {
+                        ctx.request_open_core_setup();
+                    }
+                },
+                rig,
+            );
+        harness.run();
+
+        let full = message.text(Language::En);
+        let headline = harness
+            .query_by_label(full.as_str())
+            .unwrap_or_else(|| panic!("the message must render in full: {full:?}"));
+        let header = harness
+            .query_by_label(t(Language::En, Key::ProbeDiagnosticsWall))
+            .expect("the captured core output must render under its shared header");
+        assert!(
+            headline.rect().height() > header.rect().height() * 3.0,
+            "the message must wrap instead of truncating, got message {:?} vs header {:?}",
+            headline.rect(),
+            header.rect()
         );
-        assert_ne!(color, egui::Color32::RED);
+        let captured = harness
+            .query_by_label_contains("outbound.proxySettings")
+            .expect("the captured core output must render verbatim");
+        assert!(
+            captured.rect().height() > header.rect().height(),
+            "the captured output must wrap instead of truncating, got {:?} vs header {:?}",
+            captured.rect(),
+            header.rect()
+        );
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::DashboardOpenCoreSetup),
+            )
+            .click();
+        harness.run();
+        assert!(
+            harness.state().open_core_setup_requested,
+            "the block's button must ask the shell to open the core setup surface"
+        );
+    }
+
+    #[test]
+    fn error_phase_badge_stays_a_phase_word() {
+        assert_eq!(phase_badge_text(&error_phase(), Language::En), "Error");
+        assert_eq!(
+            phase_badge_color(&error_phase(), crate::ui::status::status_colors(true)),
+            crate::ui::status::status_colors(true).err
+        );
     }
 
     #[test]
@@ -1781,7 +1906,6 @@ mod tests {
         );
         for phase in [
             CorePhase::Stopped,
-            CorePhase::NoConfig,
             CorePhase::Backoff { attempt: 2 },
             error_phase(),
         ] {

@@ -25,8 +25,8 @@ use crate::model::settings::{Language, Mode};
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
 use crate::rt::{
-    CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OperationKind, OutboundStatusView,
-    StatsTick,
+    AppMessage, CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OperationKind,
+    OutboundStatusView, StatsTick,
 };
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
@@ -91,7 +91,7 @@ impl PhaseAction {
         match phase {
             CorePhase::Running | CorePhase::Starting => Self::Disconnect,
             CorePhase::Backoff { .. } => Self::CancelRetry,
-            CorePhase::Stopped | CorePhase::NoConfig | CorePhase::Error(_) => Self::Connect,
+            CorePhase::Stopped | CorePhase::Error(_) => Self::Connect,
         }
     }
 
@@ -130,6 +130,9 @@ pub struct UiCtx<'a> {
     pub config_error: &'a Option<String>,
     pub(crate) connect_requested: &'a mut bool,
     pub(crate) stop_requested: &'a mut bool,
+    pub(crate) verify_core_requested: &'a mut bool,
+    pub(crate) open_core_folder_requested: &'a mut bool,
+    pub(crate) open_core_setup_requested: &'a mut bool,
     pub stats: &'a Option<StatsTick>,
     pub stats_history: &'a VecDeque<StatsTick>,
     pub observatory: &'a [OutboundStatusView],
@@ -141,6 +144,12 @@ pub struct UiCtx<'a> {
     /// even when empty lines rotate through a full ring.
     pub logs_generation: u64,
     pub core_version: &'a Option<String>,
+    /// The installed tree's own version and its last verification failure,
+    /// for the core setup surface.
+    pub(crate) core_setup: &'a CoreSetupState,
+    /// The terminal message the content area renders, and the compact chip
+    /// the status zone carries while one stands.
+    pub(crate) terminal_error: &'a Option<TerminalErrorView>,
     pub download: &'a DownloadState,
     /// Renderable state of the on-demand update check.
     pub update_check: &'a UpdateCheckState,
@@ -204,6 +213,9 @@ pub(crate) struct UiCtxParts<'a> {
     /// The shell's stored config-generation error (the same value the
     /// top-bar config chip renders), projected into [`UiCtx::config_error`].
     pub(crate) config_error: &'a Option<String>,
+    pub(crate) verify_core_requested: &'a mut bool,
+    pub(crate) open_core_folder_requested: &'a mut bool,
+    pub(crate) open_core_setup_requested: &'a mut bool,
     pub(crate) operation: Option<OperationKind>,
     pub(crate) is_elevated: bool,
     pub(crate) config_revision: u64,
@@ -258,6 +270,9 @@ impl<'a> UiCtx<'a> {
             ui_dirty,
             connect_requested,
             stop_requested,
+            verify_core_requested,
+            open_core_folder_requested,
+            open_core_setup_requested,
             connect_blocked_reason,
             config_error,
             operation,
@@ -270,6 +285,8 @@ impl<'a> UiCtx<'a> {
             stats,
             observatory,
             core_version,
+            core_setup,
+            terminal_error,
             download,
             update_check,
             stats_generation,
@@ -280,6 +297,8 @@ impl<'a> UiCtx<'a> {
                 &snapshot.stats,
                 &snapshot.observatory[..],
                 &snapshot.core_version,
+                &snapshot.core_setup,
+                &snapshot.terminal_error,
                 &snapshot.download,
                 &snapshot.update_check,
                 snapshot.stats_generation,
@@ -290,6 +309,8 @@ impl<'a> UiCtx<'a> {
                 &BLANK_STATS,
                 idle_observatory,
                 &snapshot.core_version,
+                &snapshot.core_setup,
+                &snapshot.terminal_error,
                 &snapshot.download,
                 &snapshot.update_check,
                 snapshot.stats_generation,
@@ -309,6 +330,9 @@ impl<'a> UiCtx<'a> {
             ui_dirty,
             connect_requested,
             stop_requested,
+            verify_core_requested,
+            open_core_folder_requested,
+            open_core_setup_requested,
             operation,
             connect_blocked_reason,
             config_error,
@@ -318,6 +342,8 @@ impl<'a> UiCtx<'a> {
             stats,
             observatory,
             core_version,
+            core_setup,
+            terminal_error,
             download,
             update_check,
             stats_generation,
@@ -353,6 +379,24 @@ impl<'a> UiCtx<'a> {
     /// stopped through the normal operation path.
     pub fn request_stop(&mut self) {
         *self.stop_requested = true;
+    }
+
+    /// Request a fresh pinned-payload verification of the installed core (the
+    /// core setup surface's Verify action). The shell runs the pass and
+    /// records the verdict; re-verification never touches the core itself.
+    pub fn request_core_verify(&mut self) {
+        *self.verify_core_requested = true;
+    }
+
+    /// Open the managed core directory in the shell's file browser.
+    pub fn request_open_core_folder(&mut self) {
+        *self.open_core_folder_requested = true;
+    }
+
+    /// Open the Settings screen, where the core setup surface stays mounted
+    /// in every core state.
+    pub fn request_open_core_setup(&mut self) {
+        *self.open_core_setup_requested = true;
     }
 
     /// Fire-and-forget command send. The control channel is closed only
@@ -444,6 +488,11 @@ pub(crate) struct UiCtxSnapshot {
     pub(crate) stats: Option<StatsTick>,
     pub(crate) observatory: Vec<OutboundStatusView>,
     pub(crate) core_version: Option<String>,
+    /// The installed tree's own version and its last verification failure.
+    pub(crate) core_setup: CoreSetupState,
+    /// The terminal message the content area renders (the failure's keyed
+    /// headline plus the captured core output behind it).
+    pub(crate) terminal_error: Option<TerminalErrorView>,
     pub(crate) download: DownloadState,
     pub(crate) update_check: UpdateCheckState,
     pub(crate) stats_generation: u64,
@@ -461,6 +510,8 @@ impl UiCtxSnapshot {
             && self.latency_generation == other.latency_generation
             && self.observatory == other.observatory
             && self.core_version == other.core_version
+            && self.core_setup == other.core_setup
+            && self.terminal_error == other.terminal_error
             && stats_tick_same(&self.stats, &other.stats)
             && phase_same(&self.phase, &other.phase)
             && download_same(&self.download, &other.download)
@@ -493,7 +544,6 @@ fn stats_tick_same(a: &Option<StatsTick>, b: &Option<StatsTick>) -> bool {
 fn phase_same(a: &CorePhase, b: &CorePhase) -> bool {
     match (a, b) {
         (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::NoConfig, CorePhase::NoConfig)
         | (CorePhase::Starting, CorePhase::Starting)
         | (CorePhase::Running, CorePhase::Running) => true,
         (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
@@ -528,6 +578,51 @@ pub(crate) fn core_setup_busy(ctx: &UiCtx<'_>) -> bool {
     matches!(&ctx.download, DownloadState::Working { .. }) || ctx.operation.is_some()
 }
 
+/// The managed core's setup state as the core setup surface renders it.
+///
+/// The verified version stays on [`UiCtx::core_version`] (the top-bar caption
+/// and the About screen read it); this bundle carries the two facts only the
+/// setup surface needs: the version the installed tree's own release metadata
+/// names — set even when the tree does not match the compiled pins, so a stale
+/// install can name both versions — and the verification failure for a tree
+/// that did not verify.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoreSetupState {
+    /// The version the installed tree's release metadata names, even when the
+    /// tree does not match the compiled pins.
+    pub(crate) installed_version: Option<String>,
+    /// The verification failure for a present tree, keyed so it renders in
+    /// the active language at the label site.
+    pub(crate) verification_error: Option<AppMessage>,
+}
+
+/// The terminal message the content area renders: the already-rendered
+/// message text and the captured core output behind it. The shell owns the
+/// message's lifetime (the phase it describes moves on, or an action
+/// succeeds) and renders the keyed message once per language change, so the
+/// block and the status chip only borrow these strings — no per-frame
+/// formatting on either path.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TerminalErrorView {
+    /// The failure's message text, rendered when the failure was recorded.
+    pub(crate) text: String,
+    /// Captured core output (empty for an app-authored failure).
+    pub(crate) output: String,
+}
+
+/// Which mount renders the shared core-setup surface. The component is one,
+/// mounted twice: the startup dialog adds the first-run footer, and the
+/// Settings section carries the standing explanation of what the state, the
+/// install, and the failure attribution mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreSetupMount {
+    /// The first-run dialog: "Set up later" and a "Continue" once the install
+    /// finished.
+    Dialog,
+    /// The permanent Settings section.
+    Settings,
+}
+
 /// Result of one frame of the shared core-setup surface.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CoreSetupOutcome {
@@ -544,31 +639,53 @@ pub(crate) struct CoreSetupOutcome {
 /// hint lines below their control, stock buttons, and `colored_label`
 /// status lines.
 ///
-/// `show_continue` is used only by the first-run adapter: it adds a
-/// "Set up later" footer and a "Continue" button once install finished.
+/// Both mounts render the same facts in every core state: the installed and
+/// the required version, the verification state with the failure's own
+/// reason, both install methods, and Verify / Open core folder.
+///
+/// [`CoreSetupMount::Dialog`] adds the first-run footer (a "Set up later"
+/// button and a "Continue" button once install finished);
+/// [`CoreSetupMount::Settings`] adds the note that explains the state, the
+/// install flow, and the failure attribution in place.
 pub(crate) fn show_core_setup(
     ui: &mut egui::Ui,
     ctx: &mut UiCtx<'_>,
-    show_continue: bool,
+    mount: CoreSetupMount,
 ) -> CoreSetupOutcome {
+    let show_continue = matches!(mount, CoreSetupMount::Dialog);
     let version = sys::core_dl::pinned_release_version();
+    // The pin in the release metadata's spelling (no leading `v`), so the two
+    // versions read as one pair.
+    let required = sys::core_dl::pinned_core_version();
     let archive = sys::core_dl::pinned_release_archive();
     let url = sys::core_dl::pinned_release_url();
 
     let mut outcome = CoreSetupOutcome::default();
     let lang = ctx.settings.language;
+    let verified = ctx.core_version.is_some();
+    // The verified version is the installed tree's own version when the tree
+    // passed verification (its metadata matched the compiled pins); the setup
+    // state carries the version of a tree that did not verify.
+    let installed = ctx
+        .core_setup
+        .installed_version
+        .as_deref()
+        .or(ctx.core_version.as_deref());
+    let verification_error = ctx.core_setup.verification_error.as_ref();
+    // A managed tree exists in any verified or unverified state; only the
+    // missing state has nothing to verify and shows the first-use hint.
+    let tree_present = verified || verification_error.is_some();
 
     // Core state row, same idiom as the top bar: colored dot + state text.
     let colors = crate::ui::status::status_colors(ui.visuals().dark_mode);
-    let (state_color, state_text, not_installed) = match &ctx.download {
-        DownloadState::Working { .. } => (colors.warn, t(lang, Key::CoreSetupDownloading), false),
-        DownloadState::Failed(_) => (colors.err, t(lang, Key::CoreSetupFailed), false),
-        _ if ctx.core_version.is_some() => (colors.ok, t(lang, Key::CoreSetupInstalled), false),
-        _ => (
-            egui::Color32::GRAY,
-            t(lang, Key::CoreSetupNotInstalled),
-            true,
-        ),
+    let (state_color, state_text) = match &ctx.download {
+        DownloadState::Working { .. } => (colors.warn, t(lang, Key::CoreSetupDownloading)),
+        DownloadState::Failed(_) => (colors.err, t(lang, Key::CoreSetupFailed)),
+        _ if verified => (colors.ok, t(lang, Key::CoreSetupInstalled)),
+        // A tree that names another release is an update; a tree that does
+        // not name one at all is not a managed install.
+        _ if installed.is_some() => (colors.warn, t(lang, Key::CoreSetupUpdateRequired)),
+        _ => (egui::Color32::GRAY, t(lang, Key::CoreSetupNotInstalled)),
     };
     ui.horizontal(|ui| {
         ui.colored_label(state_color, "●");
@@ -577,11 +694,57 @@ pub(crate) fn show_core_setup(
         ui.colored_label(state_color, state_text);
     });
 
+    // The standing explanation of what this state, an install, and a failure
+    // mean: the Settings mount carries it in place, right under the state
+    // row; the first-run dialog keeps its own shorter wording.
+    if matches!(mount, CoreSetupMount::Settings) {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(t(lang, Key::CoreSetupNote)).weak().small()).wrap());
+    }
+
     // First-run hint: the core is not bundled, it downloads on first use.
-    if not_installed {
+    if !tree_present {
         ui.add_space(4.0);
         ui.label(
             RichText::new(t(lang, Key::CoreSetupFirstUseHint))
+                .weak()
+                .small(),
+        );
+    }
+
+    // Versions row: what is installed and what this build needs, in every
+    // state — a stale core names both, a missing one names only the pin.
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let installed_text = match installed {
+            Some(installed) => t_fmt(lang, Key::CoreSetupInstalledVersionRow, &[&installed]),
+            None => t(lang, Key::CoreSetupNoInstalledVersion).to_owned(),
+        };
+        ui.label(RichText::new(installed_text).weak());
+        ui.label(RichText::new("·").weak());
+        ui.label(RichText::new(t_fmt(lang, Key::CoreSetupRequiredVersionRow, &[&required])).weak());
+    });
+
+    // Verification state with its reason: the verification error's own text,
+    // wrapped because a failed pin compare names the payload and its hashes.
+    if let Some(error) = verification_error {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(t_fmt(
+                    lang,
+                    Key::CoreSetupVerificationFailed,
+                    &[&error.text(lang)],
+                ))
+                .color(colors.err)
+                .small(),
+            )
+            .wrap(),
+        );
+    } else if verified {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(t(lang, Key::CoreSetupVerifiedHint))
                 .weak()
                 .small(),
         );
@@ -609,28 +772,42 @@ pub(crate) fn show_core_setup(
     });
 
     // Actions: stock buttons, like every other screen.
-    let phase_allows_install = matches!(
-        &ctx.phase,
-        CorePhase::Stopped | CorePhase::NoConfig | CorePhase::Error(_)
-    );
+    let phase_allows_install = matches!(&ctx.phase, CorePhase::Stopped | CorePhase::Error(_));
     let busy = core_setup_busy(ctx);
     let can_install = phase_allows_install && !busy;
-    let disabled_reason = if !phase_allows_install {
+    // Verify re-hashes the installed payloads; with no tree to open there is
+    // nothing for it to answer.
+    let can_verify = can_install && tree_present;
+    let install_disabled_reason = if !phase_allows_install {
         t(lang, Key::CoreSetupStopFirst)
     } else if busy {
         t(lang, Key::CoreSetupBusy)
     } else {
         ""
     };
+    let verify_disabled_reason = if !phase_allows_install {
+        t(lang, Key::CoreSetupStopFirst)
+    } else if busy {
+        t(lang, Key::CoreSetupBusy)
+    } else {
+        t(lang, Key::CoreSetupVerifyNoCore)
+    };
 
     ui.add_space(10.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(can_verify, egui::Button::new(t(lang, Key::CoreSetupVerify)))
+            .on_disabled_hover_text(verify_disabled_reason)
+            .clicked()
+        {
+            ctx.request_core_verify();
+        }
         if ui
             .add_enabled(
                 can_install,
                 egui::Button::new(t(lang, Key::CoreSetupDownloadButton)),
             )
-            .on_disabled_hover_text(disabled_reason)
+            .on_disabled_hover_text(install_disabled_reason)
             .clicked()
         {
             ctx.send(CoreCmd::UpdateCore);
@@ -638,15 +815,22 @@ pub(crate) fn show_core_setup(
         if ui
             .add_enabled(
                 can_install,
-                egui::Button::new(t(lang, Key::CoreSetupImportZip)),
+                egui::Button::new(t(lang, Key::CoreSetupImportArchive)),
             )
-            .on_disabled_hover_text(disabled_reason)
+            .on_disabled_hover_text(install_disabled_reason)
             .clicked()
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(t(lang, Key::ShellXrayArchiveFilter), &["zip"])
                 .pick_file()
         {
             ctx.send(CoreCmd::ImportCoreArchive(path));
+        }
+        if ui
+            .button(t(lang, Key::CoreSetupOpenFolder))
+            .on_hover_text(sys::paths::core_dir().display().to_string())
+            .clicked()
+        {
+            ctx.request_open_core_folder();
         }
     });
 
@@ -866,31 +1050,24 @@ pub(crate) fn format_single_latency_probe_feedback(
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedbackLevel, PhaseAction, format_latency_probe_feedback,
+        AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, format_latency_probe_feedback,
         format_single_latency_probe_feedback, show_core_setup,
     };
-    use crate::diag::Diag;
+    use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ProtocolSettings, ServerProfile};
-    use crate::rt::{CoreCmd, CorePhase, LatencyProbeResult, OutboundStatusView, ProbeFailure};
+    use crate::rt::{CoreCmd, LatencyProbeResult, OutboundStatusView, ProbeFailure};
+    use crate::sys;
     use crate::ui::test_rig::UiTestRig;
-    use egui_kittest::{Harness, kittest::Queryable as _};
-
-    #[test]
-    fn no_config_phase_offers_connect() {
-        assert_eq!(
-            PhaseAction::for_phase(&CorePhase::NoConfig),
-            PhaseAction::Connect
-        );
-    }
+    use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
 
     #[test]
     fn core_setup_not_installed_renders_first_use_hint() {
         let rig = UiTestRig::default();
         let harness = Harness::new_ui_state(
             |ui, rig: &mut UiTestRig| {
-                let _ = show_core_setup(ui, &mut rig.ctx(), false);
+                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
             },
             rig,
         );
@@ -911,7 +1088,7 @@ mod tests {
         };
         let harness = Harness::new_ui_state(
             |ui, rig: &mut UiTestRig| {
-                let _ = show_core_setup(ui, &mut rig.ctx(), false);
+                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
             },
             rig,
         );
@@ -921,6 +1098,221 @@ mod tests {
                 .query_by_label(t(Language::En, Key::CoreSetupFirstUseHint))
                 .is_none(),
             "installed state must not render the first-use hint"
+        );
+    }
+
+    /// Render the shared surface over one rig state and hand back the
+    /// harness, so each test states only the state it is about.
+    fn core_setup_harness(rig: UiTestRig) -> Harness<'static, UiTestRig> {
+        Harness::new_ui_state(
+            |ui, rig: &mut UiTestRig| {
+                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
+            },
+            rig,
+        )
+    }
+
+    /// The installed and the required version render in every core state.
+    #[test]
+    fn core_setup_states_render_both_versions() {
+        for rig in [
+            UiTestRig {
+                core_version: Some("v26.9.9".into()),
+                ..Default::default()
+            },
+            UiTestRig {
+                core_setup: CoreSetupState {
+                    installed_version: Some("26.7.28".into()),
+                    verification_error: Some(AppMessage::Message(Diag::new(
+                        Key::CoreDlMetadataMismatch,
+                    ))),
+                },
+                ..Default::default()
+            },
+            UiTestRig::default(),
+        ] {
+            let harness = core_setup_harness(rig);
+            assert!(
+                harness
+                    .query_by_label(&t_fmt(
+                        Language::En,
+                        Key::CoreSetupRequiredVersionRow,
+                        &[&sys::core_dl::pinned_core_version()],
+                    ))
+                    .is_some(),
+                "every core state must name the required version"
+            );
+        }
+    }
+
+    /// A verified core reports the verified state with its version.
+    #[test]
+    fn core_setup_verified_state_names_the_installed_version() {
+        let harness = core_setup_harness(UiTestRig {
+            core_version: Some("26.9.9".into()),
+            ..Default::default()
+        });
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::CoreSetupInstalled))
+                .is_some(),
+            "a verified core must read as installed and verified"
+        );
+        assert!(
+            harness
+                .query_by_label(&t_fmt(
+                    Language::En,
+                    Key::CoreSetupInstalledVersionRow,
+                    &[&"26.9.9"],
+                ))
+                .is_some(),
+            "the verified state must name the installed version"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::CoreSetupUpdateRequired))
+                .is_none(),
+            "a verified core must not ask for an update"
+        );
+    }
+
+    /// A stale tree is an update, not a first install: the state, both
+    /// versions and the verification reason all render.
+    #[test]
+    fn core_setup_stale_state_shows_both_versions_and_the_reason() {
+        let reason = "the release metadata does not match the compiled pins";
+        let harness = core_setup_harness(UiTestRig {
+            core_setup: CoreSetupState {
+                installed_version: Some("26.7.28".into()),
+                verification_error: Some(AppMessage::Error(std::sync::Arc::new(
+                    DiagError::new(Diag::new(Key::CoreDlMetadataMismatch)).caused_by_text(reason),
+                ))),
+            },
+            ..Default::default()
+        });
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::CoreSetupUpdateRequired))
+                .is_some(),
+            "a stale core must read as an update requirement"
+        );
+        for label in [
+            t_fmt(
+                Language::En,
+                Key::CoreSetupInstalledVersionRow,
+                &[&"26.7.28"],
+            ),
+            t_fmt(
+                Language::En,
+                Key::CoreSetupRequiredVersionRow,
+                &[&sys::core_dl::pinned_core_version()],
+            ),
+        ] {
+            assert!(
+                harness.query_by_label(label.as_str()).is_some(),
+                "a stale core must name both versions: {label:?}"
+            );
+        }
+        assert!(
+            harness.query_by_label_contains(reason).is_some(),
+            "the verification failure's own text must render"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::CoreSetupFirstUseHint))
+                .is_none(),
+            "a present tree is not a first install"
+        );
+    }
+
+    /// The four actions are reachable in the state they belong to: Verify and
+    /// Open core folder raise their shell requests, the pinned download sends
+    /// its command, and archive import is offered next to it.
+    #[test]
+    fn core_setup_actions_are_reachable() {
+        let rig = UiTestRig {
+            core_version: Some("26.9.9".into()),
+            ..Default::default()
+        };
+        let mut harness = core_setup_harness(rig);
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::CoreSetupVerify),
+            )
+            .click();
+        harness.run();
+        assert!(
+            harness.state().verify_core_requested,
+            "Verify must raise the shell's verification request"
+        );
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::CoreSetupOpenFolder),
+            )
+            .click();
+        harness.run();
+        assert!(
+            harness.state().open_core_folder_requested,
+            "Open core folder must raise the shell's folder request"
+        );
+
+        let rig = UiTestRig {
+            core_version: Some("26.9.9".into()),
+            ..Default::default()
+        };
+        let mut harness = core_setup_harness(rig);
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::CoreSetupDownloadButton),
+            )
+            .click();
+        harness.run();
+        assert!(
+            matches!(
+                harness.state_mut()._cmd_rx.try_recv(),
+                Ok(CoreCmd::UpdateCore)
+            ),
+            "the pinned download must send UpdateCore"
+        );
+        // Archive import opens a native file dialog on click, so only its
+        // reachability is asserted: the button renders and is enabled.
+        let import = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::CoreSetupImportArchive),
+            )
+            .accesskit_node()
+            .is_disabled();
+        assert!(!import, "archive import must be offered and enabled");
+    }
+
+    /// With no tree there is nothing to verify, and the surface says so on
+    /// the disabled control; the download actions stay available.
+    #[test]
+    fn core_setup_verify_is_unavailable_without_a_tree() {
+        let harness = core_setup_harness(UiTestRig::default());
+        assert!(
+            harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::CoreSetupVerify),
+                )
+                .accesskit_node()
+                .is_disabled(),
+            "a missing core has nothing to verify"
+        );
+        assert!(
+            !harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::CoreSetupDownloadButton),
+                )
+                .accesskit_node()
+                .is_disabled(),
+            "a missing core is exactly what the download action is for"
         );
     }
 

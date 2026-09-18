@@ -260,7 +260,7 @@ fn first_run_wizard_exposes_anchored_release_controls_and_copies_link() {
         "first-run modal must expose the primary download action"
     );
     assert!(
-        h.query_by_label("Import ZIP…").is_some(),
+        h.query_by_label("Import archive…").is_some(),
         "first-run modal must expose archive import"
     );
 

@@ -7,7 +7,7 @@
 
 use egui::{Color32, RichText, Ui};
 
-use super::{UiCtx, show_core_setup, status::status_colors_of, widgets};
+use super::{CoreSetupMount, UiCtx, show_core_setup, status::status_colors_of, widgets};
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::links::excerpt;
@@ -397,6 +397,7 @@ impl SettingsScreen {
         // The shell already wraps this screen in a vertical ScrollArea.
         self.appearance_section(ui, ctx);
         self.core_section(ui, ctx);
+        self.core_setup_section(ui, ctx);
         self.updates_section(ui, ctx);
         self.cleanup_section(ui, ctx);
         self.geodata_section(ui, ctx);
@@ -759,12 +760,21 @@ impl SettingsScreen {
         });
     }
 
+    /// The permanent mount of the shared core setup surface: the same
+    /// component the startup dialog shows, available in every core state —
+    /// installed and verified, missing, stale, or failed verification.
+    fn core_setup_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+        let lang = ctx.settings.language;
+        widgets::section(ui, t(lang, Key::SettingsCoreSetup), |ui| {
+            ui.set_max_width(680.0);
+            let _ = show_core_setup(ui, ctx, CoreSetupMount::Settings);
+        });
+    }
+
     fn updates_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsUpdates), |ui| {
             ui.set_max_width(680.0);
-            let _ = show_core_setup(ui, ctx, false);
-            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let checking = matches!(ctx.update_check, UpdateCheckState::Checking);
                 if ui

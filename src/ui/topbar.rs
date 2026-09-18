@@ -153,6 +153,9 @@ pub(crate) struct TopbarStatus<'a> {
     pub(crate) can_apply: bool,
     pub(crate) apply_block: Option<&'a str>,
     pub(crate) apply_result: Option<(&'a bool, &'a str)>,
+    /// The terminal message standing right now: the chip's compact label is
+    /// fixed, this is the message the hover shows and the click leads to.
+    pub(crate) terminal_error: Option<&'a str>,
     pub(crate) config_error: Option<&'a str>,
     pub(crate) state_error: Option<&'a str>,
     pub(crate) persistence_error: Option<&'a str>,
@@ -164,6 +167,8 @@ pub(crate) struct TopbarClicks {
     pub apply: bool,
     pub retry: bool,
     pub open_folder: bool,
+    /// The terminal-error chip: jump to the message in the content area.
+    pub jump_to_error: bool,
 }
 
 /// One truncated chip in the dynamic zone: a `Label` capped to its
@@ -199,6 +204,25 @@ pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -
                 .truncate()
                 .show_tooltip_when_elided(true),
         );
+    }
+    // The terminal error chip: the phase badge above keeps the phase readout
+    // (an error never replaces it), so this is the status zone's pointer at
+    // the message — a compact fixed label, the hover carrying the message's
+    // own headline, and a click that jumps to the wrapped block. A truncating
+    // label like every other chip, so the zone keeps yielding to the right
+    // cluster whatever combination of chips is live.
+    if let Some(error) = status.terminal_error {
+        ui.separator();
+        clicks.jump_to_error = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(t(lang, Key::TopbarErrorChip)).color(colors.err),
+                )
+                .truncate()
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(error)
+            .clicked();
     }
     if status.unsaved_changes {
         ui.separator();
@@ -316,6 +340,7 @@ mod tests {
             can_apply: false,
             apply_block: Some("a lifecycle operation is running"),
             apply_result: Some((&true, "Configuration applied")),
+            terminal_error: Some("the core exited before it answered"),
             config_error: Some("generation failure detail"),
             state_error: Some("load failure detail"),
             persistence_error: Some("save failure detail"),
@@ -483,6 +508,7 @@ mod tests {
         for label in [
             "mode: TUN",
             "server: very-long-server-name.example-01.com",
+            "View error",
             "Server edits not saved",
             "trial rules: 2 active",
             "Xray core not installed",
@@ -499,6 +525,27 @@ mod tests {
                 .next()
                 .unwrap_or_else(|| panic!("chip {label:?} must render"));
         }
+    }
+
+    #[test]
+    fn terminal_error_chip_reports_the_jump_to_the_message() {
+        let mut h = Harness::builder().build_ui_state(
+            move |ui, clicks: &mut TopbarClicks| {
+                // Latched: `run` may frame past the click's frame.
+                if topbar_status_zone(ui, &heavy_status()).jump_to_error {
+                    clicks.jump_to_error = true;
+                }
+            },
+            TopbarClicks::default(),
+        );
+        h.run();
+        h.get_by_label(t(Language::En, Key::TopbarErrorChip))
+            .click();
+        h.run();
+        assert!(
+            h.state().jump_to_error,
+            "the error chip must ask the shell to jump to the message"
+        );
     }
 
     #[test]

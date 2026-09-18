@@ -168,12 +168,22 @@ keys! {
     PhaseConnect,
     PhaseDisconnect,
     PhaseCancelRetry,
-    // Core-setup shared surface (Settings → Updates, first-run wizard).
+    // Core-setup shared surface (Settings → Core setup, first-run wizard).
     CoreSetupDownloading,
     CoreSetupFailed,
     CoreSetupInstalled,
     CoreSetupNotInstalled,
+    CoreSetupUpdateRequired,
+    CoreSetupInstalledVersionRow,
+    CoreSetupRequiredVersionRow,
+    CoreSetupNoInstalledVersion,
+    CoreSetupVerifiedHint,
+    CoreSetupVerificationFailed,
+    CoreSetupVerify,
+    CoreSetupVerifyNoCore,
+    CoreSetupOpenFolder,
     CoreSetupFirstUseHint,
+    CoreSetupNote,
     CoreSetupXrayCore,
     CoreSetupPinnedRelease,
     CoreSetupOpenReleaseHint,
@@ -182,7 +192,7 @@ keys! {
     CoreSetupStopFirst,
     CoreSetupBusy,
     CoreSetupDownloadButton,
-    CoreSetupImportZip,
+    CoreSetupImportArchive,
     CoreSetupHint,
     CoreSetupProgress,
     CoreSetupInstalledVersion,
@@ -206,7 +216,6 @@ keys! {
     LatencyFeedbackPartialWarn,
     // App shell: phase badge, mode label, top-bar status strip, tray.
     AppPhaseStopped,
-    AppPhaseNoConfig,
     AppPhaseStarting,
     AppPhaseRunning,
     AppPhaseRetrying,
@@ -229,6 +238,7 @@ keys! {
     TopbarSettingsNotSaved,
     TopbarRetrySave,
     TopbarOpenStateFolder,
+    TopbarErrorChip,
     // Topbar right edge: xray core + broccoli app versions.
     TopbarXrayAppVersions,
     TopbarAppVersion,
@@ -239,6 +249,7 @@ keys! {
     LogDisconnectBlocked,
     LogBroccoliMessage,
     LogOpenStateFolderFailed,
+    LogOpenCoreFolderFailed,
     CreateProfileDirsFailed,
     SaveServersFailed,
     SaveSettingsFailed,
@@ -249,6 +260,7 @@ keys! {
     ConnectBlockedSave,
     ConnectBlockedRawMode,
     ConnectBlockedInstallCore,
+    ConnectBlockedCoreUpdate,
     ConnectBlockedOperation,
     GenerationFailed,
     CoreRuntimeUnavailable,
@@ -266,6 +278,7 @@ keys! {
     // First-run wizard.
     WizardWelcome,
     WizardCoreMissing,
+    WizardCoreUpdateRequired,
     // About screen.
     AboutBroccoliVersion,
     AboutTagline,
@@ -323,7 +336,6 @@ keys! {
     DashboardNoStatsStarting,
     DashboardNoStatsRunning,
     DashboardNoStatsStopped,
-    DashboardNoStatsNoConfig,
     DashboardNoStatsBackoff,
     DashboardNoStatsError,
     DashboardPlotSecondsAgo,
@@ -340,11 +352,11 @@ keys! {
     DashboardDownloadFailed,
     ConnectUnavailable,
     DashboardPhaseStopped,
-    DashboardPhaseNoConfig,
     DashboardPhaseStarting,
     DashboardPhaseRunning,
     DashboardPhaseRetry,
     DashboardPhaseError,
+    DashboardOpenCoreSetup,
     // Logs screen.
     LogsLevelAll,
     LogsLevelInfoPlus,
@@ -375,7 +387,6 @@ keys! {
     PreviewPhaseStarting,
     PreviewPhaseRunning,
     PreviewPhaseBackoff,
-    PreviewPhaseNoConfig,
     PreviewPhaseStopped,
     // DNS screen.
     DnsSectionServers,
@@ -715,6 +726,7 @@ keys! {
     SettingsUiScale,
     SettingsScaleHint,
     SettingsCore,
+    SettingsCoreSetup,
     SettingsLogLevel,
     SettingsAccessLog,
     SettingsAccessLogHint,
@@ -1499,14 +1511,12 @@ keys! {
     RtLogCoreStartedHelper,
     RtLogConfigApplied,
     RtLogInternalStartRejected,
-    RtLogNoConfigConnect,
     RtLogHelperLaunchWait,
     RtLogTunInboundClosed,
     RtLogTunCloseTimeout,
     RtLogTunCoreExited,
     RtLogTunCoreAlive,
     RtLogDnsFlushExit,
-    RtLogStartupConfigRetry,
     RtLogCoreReady,
     RtLogExitNotReported,
     RtLogSuppressedOne,
@@ -1733,7 +1743,6 @@ keys! {
     RtLogOperationCancelled,
     RtLogUpdateFinishedAfterStop,
     RtLogApiEndpointCommitted,
-    RtLogApiEndpointRecovered,
     RtLogCoreStartedDirect,
     RtLogTunGracefulCloseFailed,
     RtLogTunCoreStopWindow,
@@ -1766,7 +1775,6 @@ keys! {
     RtFrameCoreRestored,
     RtFrameCoreNoLastGood,
     RtFrameCoreRollbackFailed,
-    RtFrameStartupRollbackFailed,
     RtFrameApplyCancelled,
     RtFrameConfigTestCancelled,
     RtFrameProfileValidationCancelled,
@@ -2601,12 +2609,31 @@ mod en {
             Key::PhaseConnect => "Connect",
             Key::PhaseDisconnect => "Disconnect",
             Key::PhaseCancelRetry => "Cancel retry",
-            // Core-setup shared surface (Settings → Updates, first-run wizard).
+            // Core-setup shared surface (Settings → Core setup, first-run wizard).
             Key::CoreSetupDownloading => "Downloading…",
             Key::CoreSetupFailed => "Setup failed",
-            Key::CoreSetupInstalled => "Installed",
+            Key::CoreSetupInstalled => "Installed and verified",
             Key::CoreSetupNotInstalled => "Not installed",
+            Key::CoreSetupUpdateRequired => "Core update required",
+            Key::CoreSetupInstalledVersionRow => "Installed: {}",
+            Key::CoreSetupRequiredVersionRow => "Required: {}",
+            Key::CoreSetupNoInstalledVersion => "Installed: none",
+            Key::CoreSetupVerifiedHint => "The installed core matches the compiled release pins.",
+            Key::CoreSetupVerificationFailed => "Verification failed: {}",
+            Key::CoreSetupVerify => "Verify",
+            Key::CoreSetupVerifyNoCore => "No installed core to verify",
+            Key::CoreSetupOpenFolder => "Open core folder",
             Key::CoreSetupFirstUseHint => "The Xray core downloads on first use.",
+            Key::CoreSetupNote => {
+                "The app reads the installed version from the release metadata of the core and \
+                 accepts it only when every payload matches the compiled pins. An install \
+                 downloads the pinned release or imports a matching archive, and the app never \
+                 starts an unverified core file. That install starts the core once with an \
+                 app-owned configuration that carries none of your profiles, and stops it once \
+                 the update is acknowledged. A configuration problem is reported as a finding \
+                 and never rolls the core back, while only a payload that cannot start restores \
+                 the last-good core."
+            }
             Key::CoreSetupXrayCore => "Xray core",
             Key::CoreSetupPinnedRelease => "Pinned release:",
             Key::CoreSetupOpenReleaseHint => {
@@ -2617,7 +2644,7 @@ mod en {
             Key::CoreSetupStopFirst => "Stop the core before replacing managed Xray files.",
             Key::CoreSetupBusy => "Another lifecycle or core operation is already running.",
             Key::CoreSetupDownloadButton => "Download pinned release",
-            Key::CoreSetupImportZip => "Import ZIP…",
+            Key::CoreSetupImportArchive => "Import archive…",
             Key::CoreSetupHint => {
                 "Download the exact pinned release above, or import the ZIP from another \
                  device when GitHub is unreachable."
@@ -2648,11 +2675,10 @@ mod en {
             Key::LatencyFeedbackPartialWarn => "{} of {} outbounds responded.",
             // App shell: phase badge, mode label, top-bar status strip, tray.
             Key::AppPhaseStopped => "Stopped",
-            Key::AppPhaseNoConfig => "No config yet",
             Key::AppPhaseStarting => "Starting…",
             Key::AppPhaseRunning => "Running",
             Key::AppPhaseRetrying => "Retrying (attempt {})",
-            Key::AppPhaseError => "Error: {}",
+            Key::AppPhaseError => "Error",
             Key::ModeOff => "off",
             Key::ModeTun => "TUN",
             Key::TrayShow => "Show broccoli",
@@ -2671,6 +2697,7 @@ mod en {
             Key::TopbarSettingsNotSaved => "settings not saved",
             Key::TopbarRetrySave => "Retry save",
             Key::TopbarOpenStateFolder => "Open state folder",
+            Key::TopbarErrorChip => "View error",
             // Topbar right edge: xray core + broccoli app versions.
             Key::TopbarXrayAppVersions => "Xray core {} · app {}",
             Key::TopbarAppVersion => "app {}",
@@ -2681,6 +2708,7 @@ mod en {
             Key::LogDisconnectBlocked => "[broccoli] disconnect blocked: {}",
             Key::LogBroccoliMessage => "[broccoli] {}",
             Key::LogOpenStateFolderFailed => "[broccoli] failed to open state folder: {}",
+            Key::LogOpenCoreFolderFailed => "[broccoli] failed to open core folder: {}",
             Key::CreateProfileDirsFailed => "failed to create profile directories: {}",
             Key::SaveServersFailed => "failed to save servers.json: {}",
             Key::SaveSettingsFailed => "failed to save settings.json: {}",
@@ -2698,6 +2726,9 @@ mod en {
                 "Raw Override can run only in Off mode. Disable TUN before connecting."
             }
             Key::ConnectBlockedInstallCore => "Install the managed Xray core before connecting",
+            Key::ConnectBlockedCoreUpdate => {
+                "Connect needs the pinned Xray core: installed {}, required {}."
+            }
             Key::ConnectBlockedOperation => "Wait for the current {} operation to finish",
             Key::GenerationFailed => "Configuration generation failed: {}",
             Key::CoreRuntimeUnavailable => "Core runtime is unavailable",
@@ -2724,6 +2755,9 @@ mod en {
             // First-run wizard.
             Key::WizardWelcome => "Welcome to broccoli",
             Key::WizardCoreMissing => "The Xray core (xray.exe) is not installed yet.",
+            Key::WizardCoreUpdateRequired => {
+                "Core update required: installed {}, this build needs {}."
+            }
             // About screen.
             Key::AboutBroccoliVersion => "broccoli {}",
             Key::AboutTagline => "A Windows GUI client for Xray core.",
@@ -2812,9 +2846,6 @@ mod en {
             Key::DashboardNoStatsStarting => "core is starting. Waiting for the first sample.",
             Key::DashboardNoStatsRunning => "core is running. No sample received yet.",
             Key::DashboardNoStatsStopped => "core stopped",
-            Key::DashboardNoStatsNoConfig => {
-                "no configuration yet. Connect generates the initial configuration."
-            }
             Key::DashboardNoStatsBackoff => "core restart pending. No live sample.",
             Key::DashboardNoStatsError => "core error. No live sample.",
             Key::DashboardPlotSecondsAgo => "seconds ago",
@@ -2833,11 +2864,11 @@ mod en {
             Key::DashboardDownloadFailed => "download failed: {}",
             Key::ConnectUnavailable => "Connect is temporarily unavailable",
             Key::DashboardPhaseStopped => "Stopped",
-            Key::DashboardPhaseNoConfig => "No config yet",
             Key::DashboardPhaseStarting => "Starting",
             Key::DashboardPhaseRunning => "Running",
             Key::DashboardPhaseRetry => "Retry #{}",
-            Key::DashboardPhaseError => "Error: {}",
+            Key::DashboardPhaseError => "Error",
+            Key::DashboardOpenCoreSetup => "Open core setup",
             // Logs screen.
             Key::LogsLevelAll => "All",
             Key::LogsLevelInfoPlus => "Info+",
@@ -2881,9 +2912,6 @@ mod en {
             Key::PreviewPhaseRunning => "The running core uses this configuration.",
             Key::PreviewPhaseBackoff => {
                 "Configuration from the current core session. Restart pending."
-            }
-            Key::PreviewPhaseNoConfig => {
-                "No configuration yet. Connect generates the initial configuration."
             }
             Key::PreviewPhaseStopped => "The most recent core start used this configuration.",
             // DNS screen.
@@ -3325,6 +3353,7 @@ mod en {
                  this value automatically."
             }
             Key::SettingsCore => "Core",
+            Key::SettingsCoreSetup => "Core setup",
             Key::SettingsLogLevel => "Log level:",
             Key::SettingsAccessLog => "Log accepted connections (xray access log):",
             Key::SettingsAccessLogHint => {
@@ -4625,9 +4654,6 @@ mod en {
                 "The app rejected an internal start because the previous core process is still \
                  alive."
             }
-            Key::RtLogNoConfigConnect => {
-                "No config.json exists yet. Connect generates the initial configuration."
-            }
             Key::RtLogHelperLaunchWait => {
                 "The app starts the elevated helper and waits for the authenticated pipe."
             }
@@ -4644,10 +4670,6 @@ mod en {
             }
             Key::RtLogDnsFlushExit => {
                 "ipconfig exited with a non-zero status during the DNS cache flush."
-            }
-            Key::RtLogStartupConfigRetry => {
-                "The startup config has an error. The app retries once with the last known-good \
-                 config."
             }
             Key::RtLogCoreReady => "The core is ready.",
             Key::RtLogExitNotReported => {
@@ -5058,9 +5080,6 @@ mod en {
                  the app health-checks it on the next start."
             }
             Key::RtLogApiEndpointCommitted => "The app committed the API endpoint as 127.0.0.1:{}.",
-            Key::RtLogApiEndpointRecovered => {
-                "The app recovered the API endpoint from the active config as 127.0.0.1:{}."
-            }
             Key::RtLogCoreStartedDirect => "The app started the core as a direct child (pid {}).",
             Key::RtLogTunGracefulCloseFailed => {
                 "The TUN graceful close failed. The app uses the process fallback: {}"
@@ -5147,7 +5166,6 @@ mod en {
             Key::RtFrameCoreRestored => "{} The app restored the retained last-good core.",
             Key::RtFrameCoreNoLastGood => "{} No retained last-good core was available.",
             Key::RtFrameCoreRollbackFailed => "{} The core rollback failed",
-            Key::RtFrameStartupRollbackFailed => "The app could not roll back the startup config",
             Key::RtFrameApplyCancelled => "The app cancelled the apply: {}",
             Key::RtFrameConfigTestCancelled => "The app cancelled the config test: {}",
             Key::RtFrameProfileValidationCancelled => {
