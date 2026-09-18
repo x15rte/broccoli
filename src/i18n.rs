@@ -3466,7 +3466,9 @@ mod en {
                 "required by Xray. Use \"none\" when encryption is disabled"
             }
             Key::SrvVlessEncryptionFormat => {
-                "\"none\" or mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys>"
+                "use none or mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys> \
+                 with at least one full key part. Padding parts come before the first key \
+                 part. Each padding part holds three numbers, for example 100-35-35"
             }
             Key::SrvAddressRequired => "server address is required",
             Key::SrvPortRequired => "server port is required",
@@ -4136,8 +4138,10 @@ mod en {
                 "VLESS flow must be empty, xtls-rprx-vision, or xtls-rprx-vision-udp443"
             }
             Key::OutboundVlessEncryptionUnsupported => {
-                "VLESS encryption must be empty, none, or the canonical \
-                 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys> form"
+                "VLESS encryption must be empty, none, or \
+                 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys> with at least one \
+                 full key part. Padding parts come before the first key part. Each padding part \
+                 holds three numbers, for example 100-35-35"
             }
             Key::OutboundShadowsocksMethodUnsupported => {
                 "Shadowsocks method must be one of the AEAD methods (aes-128-gcm, aes-256-gcm, \
@@ -4839,7 +4843,12 @@ mod en {
             Key::LinkHttpupgradeHeaderValues => "Every httpupgrade header value must be a string.",
             Key::LinkProtocolMismatch => "The outbound protocol {} does not match the {} settings.",
             Key::LinkVlessFlow => "The vless flow {} is not supported.",
-            Key::LinkVlessEncryption => "The vless encryption {} is not supported.",
+            Key::LinkVlessEncryption => {
+                "The vless encryption {} is not supported. Use none or \
+                 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys> with at least one \
+                 full key part. Padding parts come before the first key part. Each padding part \
+                 holds three numbers, for example 100-35-35."
+            }
             Key::LinkTrojanIncomplete => "The trojan link needs a host, a port, and a password.",
             Key::LinkSsIncomplete => "The ss link needs a host, a port, and a password.",
             Key::LinkSsMethod => "Xray core does not support the ss method {}.",

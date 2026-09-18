@@ -45,7 +45,7 @@ use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::outbound::{
     OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings, TrojanSettings, VlessSettings,
-    VmessSettings,
+    VmessSettings, vless_encryption_supported,
 };
 use crate::model::servers::ServerProfile;
 use crate::model::settings::Language;
@@ -1595,24 +1595,12 @@ fn ss_link(p: &ServerProfile, s: &ShadowsocksSettings) -> Result<String, LinkErr
     ))
 }
 
+/// The import grammar's `?encryption=` check, delegating to the shared model
+/// predicate (`vless_encryption_supported`) so a link never imports a value
+/// the model finding refuses. The model's empty draft seam is not a link
+/// value: empty is malformed here.
 fn validate_vless_encryption(value: &str) -> bool {
-    if value == "none" {
-        return true;
-    }
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() < 4
-        || parts[0] != "mlkem768x25519plus"
-        || !matches!(parts[1], "native" | "xorpub" | "random")
-        || !matches!(parts[2], "1rtt" | "0rtt")
-    {
-        return false;
-    }
-    parts[3..].iter().all(|part| {
-        part.len() < 20
-            || URL_SAFE_NO_PAD
-                .decode(part)
-                .is_ok_and(|decoded| matches!(decoded.len(), 32 | 1184))
-    })
+    !value.is_empty() && vless_encryption_supported(value)
 }
 
 /// The REALITY grammar's fingerprint accept-set, derived from the canonical
@@ -3025,14 +3013,20 @@ mod tests {
     #[test]
     fn vless_mlkem_encryption_round_trips_valid_core_key_material() {
         let key = URL_SAFE_NO_PAD.encode([5_u8; 32]);
-        let encryption = format!("mlkem768x25519plus.native.1rtt.{key}");
-        let link = format!("vless://{UUID}@pq.example.com:443?encryption={encryption}#PQ");
-        let (profile, canonical) = round_trip(&link);
-        let ProtocolSettings::Vless(settings) = &profile.outbound.settings else {
-            panic!("not vless")
-        };
-        assert_eq!(settings.encryption, encryption);
-        assert!(canonical.contains(&format!("encryption={encryption}")));
+        // A bare key and a key behind the core's minimal valid padding
+        // prefix (100-35-35) both round-trip verbatim.
+        for encryption in [
+            format!("mlkem768x25519plus.native.1rtt.{key}"),
+            format!("mlkem768x25519plus.native.1rtt.100-35-35.{key}"),
+        ] {
+            let link = format!("vless://{UUID}@pq.example.com:443?encryption={encryption}#PQ");
+            let (profile, canonical) = round_trip(&link);
+            let ProtocolSettings::Vless(settings) = &profile.outbound.settings else {
+                panic!("not vless")
+            };
+            assert_eq!(settings.encryption, encryption);
+            assert!(canonical.contains(&format!("encryption={encryption}")));
+        }
     }
 
     #[test]
@@ -3742,6 +3736,16 @@ mod tests {
         ));
         expect_malformed(&format!(
             "vless://{UUID}@h.example.com:443?encryption=mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAA"
+        ));
+        // A key part is required: an all-padding value panics the core's
+        // parser, and a short token after a key part breaks handler
+        // creation.
+        expect_malformed(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=mlkem768x25519plus.native.1rtt.key"
+        ));
+        let key = URL_SAFE_NO_PAD.encode([5_u8; 32]);
+        expect_malformed(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=mlkem768x25519plus.native.1rtt.{key}.ab"
         ));
         expect_malformed(&format!(
             "vless://{UUID}@h.example.com:443?flow=xtls-rprx-vision-splice"

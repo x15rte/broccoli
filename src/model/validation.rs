@@ -20,7 +20,9 @@ use super::inbound::{
 };
 use super::outbound::{
     MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
-    endpoint_requires_transport_security, wireguard_remote_dns_supported,
+    blackhole_response_is_custom, blackhole_response_type_supported,
+    endpoint_requires_transport_security, vless_encryption_supported,
+    wireguard_remote_dns_supported,
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
@@ -70,6 +72,10 @@ pub enum ValidationCode {
     TlsAllowInsecureRemoved,
     // ---- protocol-level invariants (validate_outbound) ----
     ShadowsocksLevelRange,
+    /// `settings.response.type` outside the vocabulary Xray's blackhole
+    /// conf matches after lowercasing it (infra/conf/blackhole.go:24-26):
+    /// the empty spelling and `none` (no response), `http`, `custom`. Any
+    /// case of those spellings is accepted; the stored text is untouched.
     BlackholeResponseInvalid,
     /// `settings.response.customResponseData` that Xray's conf load cannot
     /// decode as standard base64 while `response.type` is `custom`
@@ -83,10 +89,14 @@ pub enum ValidationCode {
     /// (conf/vless.go), mirroring the share-link import grammar.
     VlessFlowUnsupported,
     /// VLESS `settings.encryption` other than `` / `none` / a canonical
-    /// `mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys…>`:
-    /// Xray's conf load rejects malformed encryptions (conf/vless.go). ``
-    /// stays accepted — the state seam's default, which emit normalization
-    /// renders `none` on the wire.
+    /// `mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<parts…>` with
+    /// at least one full key part: parts shorter than 20 characters are
+    /// padding tokens, every other part must be a 32- or 1184-byte url-safe
+    /// base64 key, and the padding tokens must satisfy the core's padding
+    /// grammar (proxy/vless/encryption/common.go:223-257). Xray's conf load
+    /// panics on an all-padding value and rejects every other malformed
+    /// encryption (conf/vless.go). `` stays accepted — the state seam's
+    /// default, which emit normalization renders `none` on the wire.
     VlessEncryptionUnsupported,
     /// Shadowsocks `settings.method` outside Xray's AEAD + 2022 + legacy
     /// alias vocabulary (conf/shadowsocks.go `cipherFromString` /
@@ -806,37 +816,16 @@ pub fn server_name_implausible(value: &str) -> bool {
 // `validate_profile` whitelists in `crate::links`) and the Xray conf
 // builders they cite, so the model seam, the import grammar, and the
 // editor never disagree about a value's acceptability. Keep the two
-// mirrors in lockstep: same literals, same comparisons.
+// mirrors in lockstep: same literals, same comparisons. The VLESS
+// encryption rule is not mirrored but shared: `vless_encryption_supported`
+// lives in `super::outbound`, and the model pass, the import grammar, and
+// the editor validator all call it.
 
 /// True when a VLESS `flow` is acceptable on the wire —
 /// empty (the default) or one of the two vision (XRV) variants. Xray's conf
 /// build rejects every other flow (conf/vless.go).
 fn vless_flow_supported(flow: &str) -> bool {
     flow.is_empty() || is_vision_flow(flow)
-}
-
-/// True when a VLESS `encryption` is acceptable in the
-/// model — empty (the state seam's default; emit normalization renders it
-/// `none` on the wire), `none`, or a canonical X25519MLDSA encryption id
-/// `mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys…>` where
-/// every key part is either short padding (< 20 chars) or base64url of
-/// exactly 32 or 1184 bytes. Mirrors `links`' `validate_vless_encryption`
-/// shape checks plus the empty-state tolerance; Xray's conf build rejects
-/// every other value (conf/vless.go).
-fn vless_encryption_supported(value: &str) -> bool {
-    if value.is_empty() || value == "none" {
-        return true;
-    }
-    let parts: Vec<&str> = value.split('.').collect();
-    parts.len() >= 4
-        && parts[0] == "mlkem768x25519plus"
-        && matches!(parts[1], "native" | "xorpub" | "random")
-        && matches!(parts[2], "1rtt" | "0rtt")
-        && parts[3..].iter().all(|part| {
-            part.len() < 20
-                || base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, part)
-                    .is_ok_and(|decoded| matches!(decoded.len(), 32 | 1184))
-        })
 }
 
 /// True when a Shadowsocks `method` is in Xray's
@@ -1319,13 +1308,13 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
     if let ProtocolSettings::Blackhole(settings) = &o.settings
         && let Some(response) = settings.response.as_ref()
     {
-        if !matches!(response.r#type.as_str(), "none" | "http" | "custom") {
+        if !blackhole_response_type_supported(&response.r#type) {
             issues.push(issue(
                 ValidationCode::BlackholeResponseInvalid,
                 Some("settings.response.type".into()),
             ));
         }
-        if response.r#type == "custom"
+        if blackhole_response_is_custom(&response.r#type)
             && !blackhole_custom_response_data_decodes(&response.custom_response_data)
         {
             issues.push(issue(
@@ -5489,6 +5478,17 @@ mod tests {
             };
             settings.encryption = "mlkem768x25519plus.native.0rtt.key".into();
         }
+        assert!(
+            codes(&validate_outbound(&vless)).contains(&ValidationCode::VlessEncryptionUnsupported),
+            "an all-short-key value must be refused"
+        );
+        {
+            let ProtocolSettings::Vless(settings) = &mut vless.settings else {
+                unreachable!()
+            };
+            settings.encryption =
+                "mlkem768x25519plus.native.0rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
+        }
         assert!(validate_outbound(&vless).is_empty());
         let _ = vless.stream.select_security(Security::Tls);
         assert!(validate_outbound(&vless).is_empty());
@@ -5596,8 +5596,63 @@ mod tests {
         set(&mut bh, "http", "not base64!");
         assert!(validate_outbound(&bh).is_empty());
 
+        // The custom match is the same lowercased one (infra/conf/blackhole.go:24,31),
+        // so a case-variant custom spelling still decodes the payload.
+        set(&mut bh, "Custom", "not base64!");
+        let issues = validate_outbound(&bh);
+        assert!(codes(&issues).contains(&ValidationCode::BlackholeCustomResponseDataInvalid));
+        let finding = issues
+            .iter()
+            .find(|issue| issue.code == ValidationCode::BlackholeCustomResponseDataInvalid)
+            .expect("custom payload finding");
+        assert_eq!(
+            finding.path.as_deref(),
+            Some("settings.response.customResponseData")
+        );
+        set(&mut bh, "Custom", "aGk=");
+        assert!(validate_outbound(&bh).is_empty());
+        set(&mut bh, "HTTP", "not base64!");
+        assert!(validate_outbound(&bh).is_empty());
+
         set(&mut bh, "future", "");
         assert!(codes(&validate_outbound(&bh)).contains(&ValidationCode::BlackholeResponseInvalid));
+    }
+
+    #[test]
+    fn blackhole_response_type_accepts_the_vocabulary_in_any_case() {
+        fn set(bh: &mut OutboundModel, r#type: &str) {
+            let ProtocolSettings::Blackhole(settings) = &mut bh.settings else {
+                unreachable!()
+            };
+            settings.response = Some(crate::model::outbound::BlackholeResponse {
+                r#type: r#type.into(),
+                ..Default::default()
+            });
+        }
+
+        let mut bh = OutboundModel::new(Protocol::Blackhole);
+        // Xray lowercases the stored value before matching its vocabulary
+        // (infra/conf/blackhole.go:24-26): every spelling below loads
+        // upstream (the empty spelling alongside `none` selects no
+        // response), so none of them may gate here.
+        for spelling in [
+            "", "none", "None", "NONE", "http", "Http", "HTTP", "custom", "Custom", "CUSTOM",
+        ] {
+            set(&mut bh, spelling);
+            assert!(
+                validate_outbound(&bh).is_empty(),
+                "{spelling:?} is accepted by the core and must not gate"
+            );
+        }
+
+        // The vocabulary is closed: anything else fails the build upstream.
+        for spelling in ["future", "customs", "none ", "custom-response"] {
+            set(&mut bh, spelling);
+            assert!(
+                codes(&validate_outbound(&bh)).contains(&ValidationCode::BlackholeResponseInvalid),
+                "{spelling:?} is refused by the core and must gate"
+            );
+        }
     }
 
     #[test]
@@ -7720,6 +7775,166 @@ mod tests {
             });
             assert_eq!(issue.path.as_deref(), Some(path));
             assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+        }
+    }
+
+    #[test]
+    fn vless_encryption_rejects_every_padding_and_key_mismatch_class() {
+        // The core reads a part shorter than 20 characters as a padding
+        // token (infra/conf/vless.go:352-356). With no key part at all its
+        // padding slice runs past the end of the value and panics (:370);
+        // a short token after a key part cuts the padding out of that key,
+        // so handler creation fails with `failed to use encryption`
+        // (proxy/vless/outbound/outbound.go:95). A padding prefix must
+        // satisfy the grammar the core's client parses
+        // (proxy/vless/encryption/common.go:223-257), and a 1184-byte key
+        // must hold ML-KEM-768 coefficients below q = 3329. The model
+        // refuses every such shape. Junk in a key stays refused even where
+        // the core's decoder skips it (a newline) — the recorded deliberate
+        // strictness.
+        const X25519: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+        let mlkem = URL_SAFE_NO_PAD.encode([7_u8; 1184]);
+        // ML-KEM-768 bodies around the core's coefficient boundary: each of
+        // the 384 three-byte chunks of the first 1152 bytes holds two 12-bit
+        // little-endian coefficients, both must stay below q = 3329, and the
+        // trailing 32-byte rho is unchecked.
+        let mlkem_key = |mutate: fn(&mut [u8; 1184])| {
+            let mut body = [0_u8; 1184];
+            mutate(&mut body);
+            URL_SAFE_NO_PAD.encode(body)
+        };
+        let first_coeff_3328 = mlkem_key(|body| body[1] = 0x0d);
+        let first_coeff_3329 = mlkem_key(|body| {
+            body[0] = 0x01;
+            body[1] = 0x0d;
+        });
+        let second_coeff_3328 = mlkem_key(|body| body[2] = 0xd0);
+        let second_coeff_4080 = mlkem_key(|body| body[2] = 0xff);
+        let last_coeff_4080 = mlkem_key(|body| body[1151] = 0xff);
+        let rho_max = mlkem_key(|body| {
+            body[1] = 0x0d;
+            body[1152..].fill(0xff);
+        });
+        let body_max = mlkem_key(|body| body.fill(0xff));
+        // Go's decoder tolerates non-zero trailing bits: the spare bit in
+        // the 43rd character decodes to the same 32 bytes.
+        let trailing_bits = format!("{}B", &X25519[..42]);
+        let cases = [
+            // `none`, a real X25519 key, a real ML-KEM key, and keys behind
+            // valid padding prefixes stay accepted; only the even-index
+            // items in a padding prefix count toward the 65553 total.
+            ("none".to_string(), true),
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}"), true),
+            (format!("mlkem768x25519plus.xorpub.0rtt.{mlkem}"), true),
+            (
+                format!("mlkem768x25519plus.random.1rtt.100-35-35.{X25519}"),
+                true,
+            ),
+            (
+                format!(
+                    "mlkem768x25519plus.random.1rtt.100-111-1111.50-0-3333.200-100-2000.{X25519}"
+                ),
+                true,
+            ),
+            // A lone empty token joins to the empty padding string the core
+            // returns on before parsing (common.go:224-226), so it loads.
+            (format!("mlkem768x25519plus.native.1rtt..{X25519}"), true),
+            // A fourth `-` field is ignored, exactly as the core reads the
+            // first three and drops the rest.
+            (
+                format!("mlkem768x25519plus.native.1rtt.100-35-35-999.{X25519}"),
+                true,
+            ),
+            // ML-KEM coefficient boundaries: 3328 in either coefficient of
+            // the first chunk loads, a 0xFF-filled rho loads, and non-zero
+            // trailing bits decode to the same X25519 key.
+            (
+                format!("mlkem768x25519plus.xorpub.0rtt.{first_coeff_3328}"),
+                true,
+            ),
+            (
+                format!("mlkem768x25519plus.xorpub.0rtt.{second_coeff_3328}"),
+                true,
+            ),
+            (format!("mlkem768x25519plus.xorpub.0rtt.{rho_max}"), true),
+            (
+                format!("mlkem768x25519plus.native.1rtt.{trailing_bits}"),
+                true,
+            ),
+            // A coefficient of 3329 or larger anywhere in the first 1152
+            // bytes fails handler creation with `invalid polynomial
+            // encoding`, as does a 0xFF-filled body.
+            (
+                format!("mlkem768x25519plus.xorpub.0rtt.{first_coeff_3329}"),
+                false,
+            ),
+            (
+                format!("mlkem768x25519plus.xorpub.0rtt.{second_coeff_4080}"),
+                false,
+            ),
+            (
+                format!("mlkem768x25519plus.xorpub.0rtt.{last_coeff_4080}"),
+                false,
+            ),
+            (format!("mlkem768x25519plus.xorpub.0rtt.{body_max}"), false),
+            // Every part short: the core panics at config load.
+            ("mlkem768x25519plus.native.1rtt.key".to_string(), false),
+            ("mlkem768x25519plus.native.1rtt.KEY".to_string(), false),
+            ("mlkem768x25519plus.native.1rtt.".to_string(), false),
+            ("mlkem768x25519plus.native.1rtt.ab".to_string(), false),
+            ("mlkem768x25519plus.native.1rtt.a.b".to_string(), false),
+            (
+                "mlkem768x25519plus.native.1rtt.key.extra".to_string(),
+                false,
+            ),
+            // A short token after a key part: handler creation fails.
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}.ab"), false),
+            // A short token before the key part is padding, and this one
+            // fails the padding grammar (fewer than three `-` fields).
+            (format!("mlkem768x25519plus.native.1rtt.ab.{X25519}"), false),
+            // Two empty tokens join to a dot, not to an empty string, and
+            // the core refuses that padding item.
+            (format!("mlkem768x25519plus.native.1rtt...{X25519}"), false),
+            // Padding prefixes the core's grammar refuses: the first item
+            // is under 100, an item has two fields, and the even-index
+            // total exceeds 65553.
+            (
+                format!("mlkem768x25519plus.native.1rtt.99-35-35.{X25519}"),
+                false,
+            ),
+            (
+                format!("mlkem768x25519plus.native.1rtt.100-35.{X25519}"),
+                false,
+            ),
+            (
+                format!(
+                    "mlkem768x25519plus.native.1rtt.100-35-65535.100-35-35.100-35-65535.{X25519}"
+                ),
+                false,
+            ),
+            // A key-shaped part that decodes to neither 32 nor 1184 bytes,
+            // a real key with trailing junk, an extra character, `=` padding
+            // (not part of the raw grammar), and a key with a newline the
+            // core's decoder skips — the app refuses every byte outside the
+            // alphabet, the recorded strictness.
+            (
+                "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAA".to_string(),
+                false,
+            ),
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}!"), false),
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}A"), false),
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}="), false),
+            (format!("mlkem768x25519plus.native.1rtt.{X25519}\n"), false),
+        ];
+        let mut outbound = vless_canonical();
+        for (value, accepted) in cases {
+            let ProtocolSettings::Vless(settings) = &mut outbound.settings else {
+                unreachable!()
+            };
+            settings.encryption = value.clone();
+            let issues = validate_outbound(&outbound);
+            let reported = finding(&issues, &ValidationCode::VlessEncryptionUnsupported).is_some();
+            assert_eq!(!reported, accepted, "{value:?}: {issues:#?}");
         }
     }
 

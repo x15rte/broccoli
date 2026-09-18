@@ -18,10 +18,10 @@
 //! value, while the full `v_uuid` / `v_vless_encryption` stay
 //! for tool-output validation only.
 
-use base64::Engine as _;
-
 use crate::i18n::{Key, t};
-use crate::model::outbound::{is_valid_wireguard_key, wireguard_remote_dns_entry_supported};
+use crate::model::outbound::{
+    is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_entry_supported,
+};
 use crate::model::settings::Language;
 
 // ---------- validators ----------
@@ -98,26 +98,15 @@ pub(super) fn v_wg_remote_dns_entry(
     }
 }
 
+/// The tool-output guard for a generated encryption value. Delegates to the
+/// shared model predicate (`vless_encryption_supported`), so the keygen row,
+/// the import grammar, and the field's model finding agree about what the
+/// core loads. Empty stays a requiredness error here.
 pub(super) fn v_vless_encryption(lang: Language, v: &str) -> Option<String> {
-    if v == "none" {
-        return None;
-    }
     if v.is_empty() {
         return Some(t(lang, Key::SrvVlessEncryptionRequired).into());
     }
-    let parts: Vec<_> = v.split('.').collect();
-    let shape_ok = parts.len() >= 4
-        && parts[0] == "mlkem768x25519plus"
-        && matches!(parts[1], "native" | "xorpub" | "random")
-        && matches!(parts[2], "1rtt" | "0rtt");
-    let keys_ok = shape_ok
-        && parts[3..].iter().all(|part| {
-            part.len() < 20
-                || base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(part)
-                    .is_ok_and(|bytes| matches!(bytes.len(), 32 | 1184))
-        });
-    if keys_ok {
+    if vless_encryption_supported(v) {
         None
     } else {
         Some(t(lang, Key::SrvVlessEncryptionFormat).into())

@@ -809,10 +809,11 @@ fn latency_probe_interface_binding_preserves_existing_stream_settings() {
     vless.settings = ProtocolSettings::Vless(VlessSettings {
         address: "vless.example.com".into(),
         port: 443,
-        // Canonical UUID user id and canonical 4-part PQ encryption
-        // (Xray rejects the bare 3-part mlkem form).
+        // Canonical UUID user id and a real 4-part PQ encryption (a
+        // short key part is read as padding and panics the core's parser).
         id: "11111111-2222-3333-4444-555555555555".into(),
-        encryption: "mlkem768x25519plus.native.1rtt.key".into(),
+        encryption: "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+            .into(),
         ..Default::default()
     });
     vless.stream.security = Security::Tls;
@@ -872,9 +873,10 @@ fn latency_probe_interface_binding_skips_wireguard_outbounds() {
     vless.settings = ProtocolSettings::Vless(VlessSettings {
         address: "vless.example.com".into(),
         port: 443,
-        // Canonical UUID user id and canonical 4-part PQ encryption.
+        // Canonical UUID user id and a real 4-part PQ encryption.
         id: "11111111-2222-3333-4444-555555555555".into(),
-        encryption: "mlkem768x25519plus.native.1rtt.key".into(),
+        encryption: "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+            .into(),
         ..Default::default()
     });
     let profiles = vec![
@@ -1172,21 +1174,9 @@ fn golden_chain_dialer_proxy() {
     // The one dial-through chain spelling the pinned core reads: the hop's
     // `streamSettings.sockopt.dialerProxy` names the exit profile's tag, and
     // only the direct-dial exit outbound joins the bootstrap scope. This
-    // golden is the shape the core oracle runs `xray run -test` over.
-    //
-    // The VLESS encryption is the client shape `xray vlessenc` emits — a
-    // four-part `mlkem768x25519plus` string ending in a 32-byte url-safe key
-    // — because the pinned core parses that string at build time (the
-    // shared fixture helper's shorter placeholder is not core-valid).
-    fn chain_server(host: &str) -> OutboundModel {
-        let mut outbound = vless_server(host, 443);
-        if let ProtocolSettings::Vless(settings) = &mut outbound.settings {
-            settings.encryption =
-                "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
-        }
-        outbound
-    }
-    let mut hop_outbound = chain_server("hop.example.com");
+    // golden is the shape the core oracle runs `xray run -test` over — the
+    // fixture's VLESS encryption is the client shape `xray vlessenc` emits.
+    let mut hop_outbound = vless_server("hop.example.com", 443);
     hop_outbound.chain_via("srv-fedcba98");
     let hop = ServerProfile {
         id: ID.into(),
@@ -1194,7 +1184,7 @@ fn golden_chain_dialer_proxy() {
     };
     let exit = ServerProfile {
         id: "fedcba9876543210".into(),
-        ..ServerProfile::new("exit", chain_server("exit.example.com"))
+        ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
     };
     let servers = ServersFile {
         version: 1,
@@ -2154,9 +2144,11 @@ fn vless_server(host: &str, port: u16) -> OutboundModel {
         address: host.into(),
         port,
         id: "11111111-2222-3333-4444-555555555555".into(),
-        // Canonical 4-part PQ form: Xray's conf parser requires at least
-        // four dot-separated parts (encryption rule).
-        encryption: "mlkem768x25519plus.native.1rtt.key".into(),
+        // Canonical 4-part PQ form with a real 32-byte key: Xray's conf
+        // parser reads a shorter part as padding and panics when no key
+        // part exists (encryption rule).
+        encryption: "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+            .into(),
         ..Default::default()
     });
     ob

@@ -127,6 +127,7 @@ pub struct VlessSettings {
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub flow: String,
     /// "none" or mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<keys>
+    /// with at least one full key part (shorter parts are padding tokens).
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub encryption: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -475,7 +476,9 @@ pub struct BlackholeSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BlackholeResponse {
-    /// none | http | custom
+    /// none | http | custom. Xray lowercases the stored spelling before
+    /// matching (infra/conf/blackhole.go:24-26), so any case of the
+    /// vocabulary loads; the value is kept and emitted verbatim.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub r#type: String,
     /// Payload written back to the client for `type: "custom"`, as standard
@@ -519,6 +522,26 @@ pub(crate) fn blackhole_custom_response_data_decodes(value: &str) -> bool {
         value
     };
     GO_STANDARD.decode(encoded).is_ok()
+}
+
+/// Whether Xray's blackhole conf accepts this `response.type`. The core
+/// lowercases the stored value before matching (infra/conf/blackhole.go:24),
+/// so the vocabulary is matched case-insensitively here: the empty spelling
+/// and `none` both select no response, `http` the canned response, `custom`
+/// the decoded payload. The stored spelling is never rewritten — the core
+/// lowercases on read, and the emitted configuration carries it as stored.
+pub(crate) fn blackhole_response_type_supported(value: &str) -> bool {
+    value.is_empty()
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("http")
+        || value.eq_ignore_ascii_case("custom")
+}
+
+/// Whether Xray's conf build decodes `response.customResponseData` for this
+/// `response.type` (infra/conf/blackhole.go:29-34, matched after the same
+/// lowercasing): only `custom` reads the payload.
+pub(crate) fn blackhole_response_is_custom(value: &str) -> bool {
+    value.eq_ignore_ascii_case("custom")
 }
 
 /// DNS outbound (dns_proxy.go:60-71). nonIPQuery/blockTypes deprecated → not modeled.
@@ -859,6 +882,136 @@ pub fn endpoint_requires_transport_security(address: &str) -> bool {
     !(private_suffix || private_dotless)
 }
 
+/// True when a VLESS `encryption` value is one the pinned core loads and
+/// runs. `none` is accepted, and so is the empty string — the model's draft
+/// seam, which [`OutboundModel::enforce_invariants`] rewrites to `none` on
+/// emit. Every other value needs the
+/// `mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<parts…>` shape
+/// with at least one full key part; parts shorter than 20 characters are
+/// padding tokens.
+///
+/// Mirrors the core's conf parser (infra/conf/vless.go:336-378): a part
+/// shorter than 20 characters is padding, every other part must decode as
+/// unpadded url-safe base64 to exactly 32 or 1184 bytes (the 1184-byte form
+/// must also hold ML-KEM-768 coefficients below 3329, or handler creation
+/// fails), and at least one key part must exist — an all-padding value runs
+/// the core's padding slice past the end of the value and panics at config
+/// load. A short token after the first key part cannot be padding either:
+/// the core cuts that many bytes out of a key, so handler creation fails
+/// with `failed to use encryption`
+/// (proxy/vless/outbound/outbound.go:95). The padding tokens must satisfy
+/// the grammar the core's client parses
+/// (proxy/vless/encryption/common.go:223-257).
+///
+/// One deliberate strictness stays: the core's decoder ignores newline
+/// characters, so a key carrying one loads there; the app refuses every byte
+/// outside the alphabet rather than mirror that skip.
+pub(crate) fn vless_encryption_supported(value: &str) -> bool {
+    if value.is_empty() || value == "none" {
+        return true;
+    }
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() < 4
+        || parts[0] != "mlkem768x25519plus"
+        || !matches!(parts[1], "native" | "xorpub" | "random")
+        || !matches!(parts[2], "1rtt" | "0rtt")
+    {
+        return false;
+    }
+    let tail = &parts[3..];
+    let Some(first_key) = tail.iter().position(|part| part.len() >= 20) else {
+        return false;
+    };
+    tail[first_key..]
+        .iter()
+        .all(|part| is_vless_encryption_key_part(part))
+        && vless_encryption_padding_supported(&tail[..first_key])
+}
+
+/// One VLESS encryption key part: at least 20 characters (below that the
+/// core reads the part as padding) of unpadded url-safe base64 that decodes
+/// to exactly one X25519 public key (32 bytes) or one ML-KEM-768
+/// encapsulation key (1184 bytes) whose encoding the core accepts.
+fn is_vless_encryption_key_part(part: &str) -> bool {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
+    // Go's non-strict `base64.RawURLEncoding`: non-zero trailing bits decode
+    // to the same bytes and are tolerated, `=` padding is not part of the
+    // grammar, and the bundled engine's stricter trailing-bit check is
+    // relaxed so the two agree on every input (as the blackhole decoder
+    // above does for the standard alphabet).
+    const GO_RAW_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+
+    // Below 20 characters the core reads the part as padding; 1184 bytes of
+    // unpadded base64 is 1579 characters, so a longer part is no key either.
+    if !(20..=1579).contains(&part.len()) {
+        return false;
+    }
+    let mut key = [0_u8; 1184];
+    let Ok(len) = GO_RAW_URL_SAFE.decode_slice(part, &mut key) else {
+        return false;
+    };
+    match len {
+        32 => true,
+        1184 => is_mlkem768_key_body(&key[..1152]),
+        _ => false,
+    }
+}
+
+/// Whether the core accepts the body of an ML-KEM-768 encapsulation key
+/// (`mlkem.NewEncapsulationKey768`, which fails handler creation with
+/// `invalid polynomial encoding`): the first 1152 bytes are 384 three-byte
+/// chunks, each holding two 12-bit little-endian coefficients that must both
+/// stay below q = 3329. The trailing 32-byte rho is unconstrained.
+fn is_mlkem768_key_body(body: &[u8]) -> bool {
+    let (chunks, _) = body.as_chunks::<3>();
+    body.len() == 1152
+        && chunks.iter().all(|chunk| {
+            let low = u16::from(chunk[0]) | ((u16::from(chunk[1]) & 0x0f) << 8);
+            let high = (u16::from(chunk[1]) >> 4) | (u16::from(chunk[2]) << 4);
+            low < 3329 && high < 3329
+        })
+}
+
+/// True when the padding tokens, joined with `.`, satisfy the core's padding
+/// grammar (proxy/vless/encryption/common.go:223-257). An empty padding
+/// string returns before parsing (common.go:224-226) — the absent-padding
+/// case and a lone empty token both load. Every token holds at least three
+/// `-`-separated fields parsed as integers; the first token needs `>= 100`,
+/// `>= 35`, `>= 35`; the even-index tokens accumulate `max(y, z)` into a
+/// running total that must stay `<= 65553`. The total wraps like the core's
+/// `int` so the two agree on every in-range value.
+fn vless_encryption_padding_supported(tokens: &[&str]) -> bool {
+    // Only a lone empty token joins to ""; two tokens always hold a dot.
+    if tokens.is_empty() || matches!(tokens, [""]) {
+        return true;
+    }
+    let mut total: i64 = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        let mut fields = token.split('-');
+        let (Some(x), Some(y), Some(z)) = (fields.next(), fields.next(), fields.next()) else {
+            return false;
+        };
+        // An empty or non-numeric field fails the parse, exactly as the
+        // core's `strconv.Atoi` does.
+        let (Ok(x), Ok(y), Ok(z)) = (x.parse::<i64>(), y.parse::<i64>(), z.parse::<i64>()) else {
+            return false;
+        };
+        if index == 0 && (x < 100 || y < 35 || z < 35) {
+            return false;
+        }
+        if index % 2 == 0 {
+            total = total.wrapping_add(y.max(z));
+        }
+    }
+    total <= 65553
+}
+
 impl OutboundModel {
     pub fn new(p: Protocol) -> Self {
         let mut model = Self {
@@ -1177,6 +1330,28 @@ mod tests {
     }
 
     #[test]
+    fn blackhole_response_type_round_trips_the_stored_spelling() {
+        // Xray lowercases the value before matching its vocabulary
+        // (infra/conf/blackhole.go:24), so a mixed-case spelling is a
+        // working profile. The model keeps and emits exactly what was
+        // stored — normalizing it would be an edit the user never made.
+        for stored in [
+            json!({"response": {"type": "none"}}),
+            json!({"response": {"type": "http"}}),
+            json!({"response": {"type": "HTTP"}}),
+            json!({"response": {"type": "Custom", "customResponseData": "aGk="}}),
+        ] {
+            let settings: BlackholeSettings =
+                serde_json::from_value(stored.clone()).expect("blackhole response profile");
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                stored,
+                "the stored spelling must round-trip verbatim"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_outbound_protocol_is_not_coerced_to_vless() {
         assert!(serde_json::from_value::<Protocol>(json!("future-protocol")).is_err());
         assert!(
@@ -1234,7 +1409,8 @@ mod tests {
         let ProtocolSettings::Vless(settings) = &mut vless.settings else {
             unreachable!();
         };
-        settings.encryption = "mlkem768x25519plus.native.0rtt.key".into();
+        settings.encryption =
+            "mlkem768x25519plus.native.0rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
         assert!(validate_outbound(&vless).is_empty());
         let ProtocolSettings::Vless(settings) = &mut vless.settings else {
             unreachable!();

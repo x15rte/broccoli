@@ -15,7 +15,8 @@ use crate::links;
 use crate::metrics::{MetricsHandle, ResourceCounter, WorkCounter};
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
-    WireguardPeer, blackhole_custom_response_data_decodes, is_valid_wireguard_key,
+    WireguardPeer, blackhole_custom_response_data_decodes, blackhole_response_is_custom,
+    blackhole_response_type_supported, is_valid_wireguard_key,
 };
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
@@ -4503,13 +4504,13 @@ impl ServersScreen {
                         t(lang, Key::SrvDefault),
                         false,
                     );
-                    if !matches!(response.r#type.as_str(), "none" | "http" | "custom") {
+                    if !blackhole_response_type_supported(&response.r#type) {
                         ui.colored_label(
                             status_colors_of(ui).err,
                             t(lang, Key::SrvBlackholeResponseInvalid),
                         );
                     }
-                    if response.r#type == "custom" {
+                    if blackhole_response_is_custom(&response.r#type) {
                         // The payload is a base64 string of arbitrary length;
                         // the field's verdict is the core's own decode rule
                         // (infra/conf/blackhole.go:31), so an invalid payload
@@ -8743,6 +8744,35 @@ TLS ping finished"#;
         );
     }
 
+    /// One-channel guard for the VLESS encryption shape: a stored
+    /// all-short-key value reports exactly one error line, and that line is
+    /// the model's message naming the real constraint. The field-level
+    /// format check (`v_vless_encryption`) stays a tool-output guard.
+    #[test]
+    fn short_vless_encryption_key_reports_the_model_message_once() {
+        let mut profile = ServerProfile::new("vless", OutboundModel::new(Protocol::Vless));
+        {
+            let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.address = "1.2.3.4".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.encryption = "mlkem768x25519plus.native.1rtt.key".into();
+        }
+        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        assert!(warnings.is_empty(), "{warnings:#?}");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(
+            errors[0].contains("at least one full key part"),
+            "the message must name the real constraint: {errors:#?}"
+        );
+        assert!(
+            errors[0].contains("Padding parts come before the first key part"),
+            "the message must explain where padding belongs: {errors:#?}"
+        );
+    }
+
     /// One-channel regression guard:
     /// the UI-only error-list pushes and keystroke validators for the
     /// TLS/REALITY security formats (fingerprints, publicKey, shortId,
@@ -9896,7 +9926,14 @@ TLS ping finished"#;
         for (kind, data, shows_invalid) in [
             ("custom", "aGk=", false),
             ("custom", "not base64!", true),
+            // The custom match is case-insensitive like the core's
+            // (infra/conf/blackhole.go:24,31), so a case-variant spelling
+            // still owns the payload field and its verdict.
+            ("Custom", "not base64!", true),
             ("http", "not base64!", false),
+            // A mixed-case spelling of a payload-less type must not surface
+            // the field a second time.
+            ("HTTP", "not base64!", false),
         ] {
             let mut profile = blackhole_profile(kind, data);
             let mut screen = ServersScreen::default();
@@ -9908,7 +9945,7 @@ TLS ping finished"#;
                 harness
                     .query_by_label(t(Language::En, Key::SrvCustomResponseData))
                     .is_some(),
-                kind == "custom",
+                kind.eq_ignore_ascii_case("custom"),
                 "{kind}: the payload field belongs to the custom type only"
             );
             assert_eq!(
@@ -9920,6 +9957,89 @@ TLS ping finished"#;
             );
             drop(harness);
         }
+    }
+
+    #[test]
+    fn blackhole_response_type_combo_shows_a_stored_mixed_case_value_and_keeps_it() {
+        // Xray lowercases the stored value before matching its vocabulary
+        // (infra/conf/blackhole.go:24), so a mixed-case spelling is a
+        // working profile. Like the REALITY fingerprint combo with a name
+        // outside its option set, the combo must display it, report no edit
+        // for an untouched frame, and only rewrite the text when a canonical
+        // option is deliberately selected.
+        let profile = Rc::new(RefCell::new({
+            let mut profile = ServerProfile::new("block", OutboundModel::new(Protocol::Blackhole));
+            let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.response = Some(BlackholeResponse {
+                r#type: "HTTP".into(),
+                custom_response_data: "not base64!".into(),
+                ..Default::default()
+            });
+            profile
+        }));
+        let stored = serde_json::to_value(&profile.borrow().outbound).unwrap();
+
+        let changed = Rc::new(RefCell::new(false));
+        let (profile_for_ui, changed_for_ui) = (Rc::clone(&profile), Rc::clone(&changed));
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(move |ui| {
+            // `Harness::run` may step several frames; keep any edit a frame
+            // reports instead of letting a later quiet frame clear it.
+            *changed_for_ui.borrow_mut() |= screen.basic_tab_for_target(
+                ui,
+                Language::En,
+                &mut profile_for_ui.borrow_mut(),
+                None,
+                &[],
+            );
+        });
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .into_iter()
+                .any(|node| node.value().as_deref() == Some("HTTP")),
+            "the combo must display the stored spelling"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvBlackholeResponseInvalid))
+                .is_none(),
+            "a mixed-case spelling loads upstream and must not be flagged"
+        );
+        assert!(
+            !*changed.borrow(),
+            "an untouched frame must not report an edit"
+        );
+        assert_eq!(
+            serde_json::to_value(&profile.borrow().outbound).unwrap(),
+            stored,
+            "a save-shaped frame must not rewrite the stored spelling"
+        );
+
+        // Selecting a canonical option still edits the field.
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some("HTTP"))
+            .expect("the response-type combo shows the stored spelling")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_label("http")
+            .next()
+            .expect("the open popup offers the canonical http option")
+            .click();
+        harness.run();
+        assert!(*changed.borrow(), "selecting a canonical option is an edit");
+        drop(harness);
+        let borrowed = profile.borrow();
+        let ProtocolSettings::Blackhole(settings) = &borrowed.outbound.settings else {
+            unreachable!()
+        };
+        assert_eq!(settings.response.as_ref().expect("response").r#type, "http");
     }
 
     #[test]
@@ -9972,6 +10092,25 @@ TLS ping finished"#;
         });
         let (errors, _, _) = editor_validation_errors(Language::En, &profile);
         assert!(errors.is_empty(), "{errors:?}");
+
+        // The custom match is case-insensitive (infra/conf/blackhole.go:24,31):
+        // a case-variant spelling still decodes the payload, so the same
+        // unpadded value blocks the commit with the field named.
+        let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
+            unreachable!()
+        };
+        settings.response = Some(BlackholeResponse {
+            r#type: "Custom".into(),
+            custom_response_data: "aGk".into(),
+            ..Default::default()
+        });
+        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("settings.response.customResponseData")),
+            "the case-variant custom spelling must still gate on the payload: {errors:?}"
+        );
     }
 
     #[test]
