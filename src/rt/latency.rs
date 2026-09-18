@@ -14,7 +14,7 @@ use crate::sys::netif::ProbeUplink;
 
 use super::grpc::GrpcClient;
 use super::supervisor;
-use super::{OutboundStatusView, ProbeFailure};
+use super::{AppLogSink, OutboundStatusView, ProbeFailure};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_DEADLINE: Duration = Duration::from_secs(15);
@@ -172,6 +172,7 @@ pub(crate) async fn run(
     tun_outbound_interface: Option<String>,
     tun_adapter_name: Option<String>,
     tun_active: bool,
+    log: &AppLogSink,
 ) -> Result<Vec<OutboundStatusView>, ProbeFailure> {
     // Resolve the TUN outbound interface from a fresh enumeration
     // at probe time, so the binding is current even after an adapter rename.
@@ -224,7 +225,7 @@ pub(crate) async fn run(
     // above (no TUN/wintun, no geodata-referencing routing — see the config
     // shape test in this module), so the exe-only spawn verify is used; the
     // full four-payload verify runs on every main-core spawn instead.
-    let mut child = supervisor::spawn_probe(&config_path)
+    let mut child = supervisor::spawn_probe(&config_path, log)
         .await
         .map_err(|error| {
             ProbeFailure::plain(Diag::new(Key::ProbeChildLaunchFailed).arg(format!("{error:#}")))
@@ -397,6 +398,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// A log handle for `run` whose channel no test drains: the probe path
+    /// only writes the release-verification line to it.
+    fn log_sink() -> super::AppLogSink {
+        let (evt, _rx) = std::sync::mpsc::sync_channel(1);
+        super::AppLogSink::new(evt, egui::Context::default())
+    }
+
     #[test]
     fn with_run_diagnostics_stamps_only_dead_rows() {
         let tail = "[stderr] rejected: unknown SNI";
@@ -568,6 +576,7 @@ mod tests {
             None,
             None,
             false,
+            &log_sink(),
         )
         .await
         .expect_err("loopback probe must be rejected");

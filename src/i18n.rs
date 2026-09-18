@@ -1745,6 +1745,13 @@ keys! {
     RtLogUpdateCancelRequested,
     RtLogValidationCancelRequested,
     RtLogUpdateAckFailed,
+    RtLogPayloadsVerified,
+    RtLogSpawnConfigRegenerated,
+    RtLogSpawnConfigCommitted,
+    RtLogSpawnConfigGate,
+    RtLogSpawnConfigReplay,
+    RtLogHealthGateCompleted,
+    RtLogConfigKeptInstalledCore,
     RtFramePreviewReadFailed,
     RtPhaseHelperLaunchFailed,
     RtFrameApplyRejected,
@@ -5082,6 +5089,32 @@ mod en {
             }
             Key::RtLogUpdateAckFailed => {
                 "The core is ready. The app could not acknowledge the core update"
+            }
+            Key::RtLogPayloadsVerified => {
+                "The app verified the core payloads against the compiled release pins: {}."
+            }
+            Key::RtLogSpawnConfigRegenerated => {
+                "The app starts the core with a configuration regenerated from the saved settings \
+                 and servers."
+            }
+            Key::RtLogSpawnConfigCommitted => {
+                "The app starts the core with the configuration this session applied and \
+                 validated."
+            }
+            Key::RtLogSpawnConfigGate => {
+                "The app starts the core with the app-owned health-check configuration."
+            }
+            Key::RtLogSpawnConfigReplay => {
+                "The app starts the core with the stamp-checked configuration that the rollback \
+                 restored."
+            }
+            Key::RtLogHealthGateCompleted => {
+                "The installed core answered. The app acknowledges the update and stops the \
+                 health-check core."
+            }
+            Key::RtLogConfigKeptInstalledCore => {
+                "The app keeps the installed core. The failure is the configuration, not the \
+                 payload: {}"
             }
             Key::RtFramePreviewReadFailed => {
                 "The app could not read the active config for the preview"

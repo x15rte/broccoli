@@ -18,7 +18,10 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::core::PCWSTR;
 
+use crate::sys::core_dl::VerifyScope;
 use crate::sys::paths::core_dir;
+
+use super::AppLogSink;
 
 /// Shared sink for one captured core-output line `(text, is_stderr)`.
 pub(crate) type OutputSink = Arc<Mutex<Box<dyn Fn(String, bool) + Send>>>;
@@ -214,6 +217,19 @@ impl SpawnFlavor {
     }
 }
 
+/// The one app-authored line a spawn writes once release verification
+/// passed: the payload names of the verify scope, which is what makes this
+/// spawn trusted. Pure, so the scope-to-names mapping is unit-testable.
+pub(crate) fn verified_payloads_notice(scope: VerifyScope) -> Diag {
+    let names = scope
+        .payload_pins()
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Diag::new(Key::RtLogPayloadsVerified).arg(names)
+}
+
 /// Spawn `xray run -config <config_path>` for the main core:
 /// - hidden (`CREATE_NO_WINDOW`), cwd = core dir, `XRAY_LOCATION_ASSET` = core
 ///   dir so geoip.dat/geosite.dat/wintun.dll resolve;
@@ -228,9 +244,10 @@ impl SpawnFlavor {
 /// The one-shot latency probe uses [`spawn_probe`], which
 /// verifies only xray.exe. The verify is awaited off the executor (see
 /// [`spawn_for`]); the verified payload handles are then held through
-/// `CreateProcess` and released right after, exactly as before.
-pub async fn spawn(config_path: &Path) -> Result<Child, DiagError> {
-    spawn_for(config_path, SpawnFlavor::MainCore).await
+/// `CreateProcess` and released right after, exactly as before. `log`
+/// receives the one line naming the payload set this spawn verified.
+pub(crate) async fn spawn(config_path: &Path, log: &AppLogSink) -> Result<Child, DiagError> {
+    spawn_for(config_path, SpawnFlavor::MainCore, log).await
 }
 
 /// Spawn the one-shot latency-probe `xray run -config <config_path>` child.
@@ -243,8 +260,8 @@ pub async fn spawn(config_path: &Path) -> Result<Child, DiagError> {
 /// keep using [`spawn`]: the integrity guarantee that matters is on the core
 /// that carries traffic. The verify is awaited off the executor (see
 /// [`spawn_for`]).
-pub async fn spawn_probe(config_path: &Path) -> Result<Child, DiagError> {
-    spawn_for(config_path, SpawnFlavor::LatencyProbe).await
+pub(crate) async fn spawn_probe(config_path: &Path, log: &AppLogSink) -> Result<Child, DiagError> {
+    spawn_for(config_path, SpawnFlavor::LatencyProbe, log).await
 }
 
 /// Shared spawn implementation; `flavor` picks the release-pin verify scope
@@ -260,7 +277,11 @@ pub async fn spawn_probe(config_path: &Path) -> Result<Child, DiagError> {
 /// deny-write locks cross back to the executor, where they are held only
 /// through `CreateProcess` and released right after, the same window a
 /// synchronous verify had.
-async fn spawn_for(config_path: &Path, flavor: SpawnFlavor) -> Result<Child, DiagError> {
+async fn spawn_for(
+    config_path: &Path,
+    flavor: SpawnFlavor,
+    log: &AppLogSink,
+) -> Result<Child, DiagError> {
     let core = core_dir();
     // Hold the verified payload handles only through CreateProcess: dropping
     // them earlier would leave a replacement race before CreateProcess opens
@@ -291,6 +312,10 @@ async fn spawn_for(config_path: &Path, flavor: SpawnFlavor) -> Result<Child, Dia
                 .caused_by_text(join.to_string()));
         }
     };
+    // The verification result is consumed here, before CreateProcess: these
+    // are the payloads that passed release verification for this spawn, so
+    // this line is what makes the start below trusted. One line per spawn.
+    log.log(verified_payloads_notice(scope));
     let mut cmd = Command::new(core.join("xray.exe"));
     cmd.arg("run")
         .arg("-config")
@@ -476,6 +501,29 @@ mod tests {
             SpawnFlavor::LatencyProbe.verify_scope(),
             crate::sys::core_dl::VerifyScope::XrayExeOnly
         );
+    }
+
+    /// The line one spawn logs names exactly the payloads its verify scope
+    /// covers: the full four for a main core, xray.exe alone for a probe.
+    #[test]
+    fn verified_payload_notice_names_the_scope_payloads() {
+        use crate::diag::DiagArg;
+        use crate::i18n::Key;
+        use crate::sys::core_dl::VerifyScope;
+
+        for scope in [VerifyScope::Full, VerifyScope::XrayExeOnly] {
+            let notice = super::verified_payloads_notice(scope);
+            assert_eq!(notice.key(), Key::RtLogPayloadsVerified);
+            let names: Vec<&str> = match &notice.args()[0] {
+                DiagArg::Text(text) => text.split(", ").collect(),
+                other => panic!("the notice carries one text argument, got {other:?}"),
+            };
+            let expected: Vec<&str> = scope.payload_pins().iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                names, expected,
+                "the notice must name the payloads the scope verifies, and only those"
+            );
+        }
     }
 
     #[test]

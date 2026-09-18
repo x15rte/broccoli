@@ -1,9 +1,13 @@
-//! Candidate-config validation and atomic-ish commit/rollback. Layout under
+//! Candidate-config validation, atomic-ish commit/rollback, and the
+//! per-spawn configuration the runtime artefacts carry. Layout under
 //! Broccoli's mutable config directory:
 //! - `config.json`             — the active config the core runs;
 //! - `config.candidate.json`   — validated candidate, atomically replaces active;
 //! - `config.lastgood.json`    — previous active config, atomically replaced;
-//! - `config.rollback.json`    — transient rollback copy.
+//! - `config.rollback.json`    — transient rollback copy;
+//! - `config.meta.json`        — sidecar stamp of the active config (app
+//!   version + compiled core pin); a stored config is never replayed on a
+//!   stamp that names another build.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -14,12 +18,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::diag::{Diag, DiagError, DiagResult};
 use crate::i18n::Key;
+use crate::model::{ServersFile, Settings};
 use tokio::process::Command;
 use windows::Win32::Foundation::HANDLE;
 
 use super::{AppMessage, ApplyOutput};
 use crate::rt::supervisor::{CREATE_NO_WINDOW, Job, OutputSink, pump_stream};
 use crate::sys::paths::{config_dir, core_dir};
+
+/// Sidecar stamp written with the active configuration it describes.
+const META_NAME: &str = "config.meta.json";
+/// Stamp of the candidate, promoted over the active stamp by [`commit`].
+const META_CANDIDATE_NAME: &str = "config.meta.candidate.json";
+/// Stamp of the config [`commit`] retires to `config.lastgood.json`.
+const META_LASTGOOD_NAME: &str = "config.lastgood.meta.json";
 
 /// Bound on one `xray run -test` validation run before the child is killed
 /// and the run reported as timed out. The runtime's shutdown wait for an
@@ -43,6 +55,166 @@ pub fn active_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+/// Sidecar stamp of [`active_path`].
+pub fn meta_path() -> PathBuf {
+    config_dir().join(META_NAME)
+}
+
+fn meta_candidate_path() -> PathBuf {
+    config_dir().join(META_CANDIDATE_NAME)
+}
+
+fn meta_lastgood_path() -> PathBuf {
+    config_dir().join(META_LASTGOOD_NAME)
+}
+
+/// The build identity a stored configuration carries: the app version, the
+/// compiled core pin, and the digest of the exact configuration bytes the
+/// stamp was written for. Recorded in its sidecar stamp so a start can tell
+/// this build's artefact from one another build wrote — or from any file the
+/// stamp did not produce.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConfigStamp {
+    #[serde(rename = "appVersion")]
+    app_version: String,
+    #[serde(rename = "corePin")]
+    core_pin: String,
+    /// Lowercase hex SHA-256 of the configuration the stamp describes. Without
+    /// it a stamp's build identity could vouch for a file it never produced
+    /// (a retired pair, a hand-edited artefact, a crash window).
+    #[serde(rename = "configSha256")]
+    config_sha256: String,
+}
+
+fn current_stamp(config_sha256: String) -> ConfigStamp {
+    ConfigStamp {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        core_pin: crate::sys::core_dl::pinned_release_version().to_string(),
+        config_sha256,
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    // digest 0.11 no longer formats its output through `LowerHex`, so the
+    // bytes are written out explicitly (same rendering as the core payload
+    // verification).
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// True when `meta` is a stamp that names this build *and* describes `config`'s
+/// exact bytes. A missing/unreadable stamp, an unreadable configuration, or a
+/// digest that does not describe the file never matches: a consumer regenerates
+/// instead of replaying a file no stamp vouches for.
+fn stamp_describes(meta: &Path, config: &Path) -> bool {
+    let (Ok(stamp_bytes), Ok(config_bytes)) = (std::fs::read(meta), std::fs::read(config)) else {
+        return false;
+    };
+    let Ok(stamp) = serde_json::from_slice::<ConfigStamp>(&stamp_bytes) else {
+        return false;
+    };
+    let current = current_stamp(sha256_hex(&config_bytes));
+    stamp.app_version == current.app_version
+        && stamp.core_pin == current.core_pin
+        && stamp.config_sha256 == current.config_sha256
+}
+
+/// True when the active artefact's sidecar stamp describes this build and these
+/// exact bytes — the one gate a stored configuration must pass before it is
+/// replayed.
+pub fn stamp_is_current() -> bool {
+    stamp_describes(&meta_path(), &active_path())
+}
+
+/// One spawn's configuration: the artefact's exact bytes — what the elevated
+/// helper stages, when the start runs behind it — and the control-plane port
+/// its `api.listen` pins.
+pub struct SpawnConfig {
+    pub bytes: Vec<u8>,
+    pub api_port: u16,
+}
+
+/// Generate the runtime configuration from the saved server list and
+/// settings, write it through the candidate path, promote it with its stamp,
+/// and return what the spawn must run.
+///
+/// Every start without a fresh apply — cold boot, backoff retry, transport
+/// switch — goes through here, so a configuration another build wrote is
+/// never replayed. The generation is the only validation: the core's own
+/// config load is what the start proves.
+pub fn regenerate() -> Result<SpawnConfig, DiagError> {
+    let state_failure = |error: crate::model::StateLoadError| {
+        DiagError::new(Diag::new(Key::GenerationFailed).arg(error.to_string()))
+    };
+    let servers = ServersFile::load().map_err(state_failure)?;
+    let settings = Settings::load().map_err(state_failure)?;
+    let value = crate::r#gen::generate(&servers, &settings).map_err(generation_failure)?;
+    let api_port = api_port_from_value(&value)?;
+    let bytes = write_candidate_bytes(&value)?;
+    commit()?;
+    Ok(SpawnConfig { bytes, api_port })
+}
+
+/// Write and promote the app-owned configuration a core update's health gate
+/// starts: a direct outbound and the control-plane listener, generated for
+/// this start alone. Never the user's profiles or settings — a user's state
+/// must not decide whether an install is accepted.
+pub fn write_core_gate() -> Result<SpawnConfig, DiagError> {
+    let api_port = crate::r#gen::pick_ephemeral_api_port().map_err(generation_failure)?;
+    let value = crate::r#gen::generate_core_gate(api_port).map_err(generation_failure)?;
+    let bytes = write_candidate_bytes(&value)?;
+    commit()?;
+    Ok(SpawnConfig { bytes, api_port })
+}
+
+/// The configuration for a start that follows a deliberate rollback of a
+/// failed candidate: the restored last-known-good artefact, because
+/// regeneration would reproduce the rejected configuration. Replayed only
+/// while its stamp names this build — a foreign-stamped (or unstamped)
+/// artefact is regenerated from the saved state instead.
+pub fn replay_rolled_back() -> Result<SpawnConfig, DiagError> {
+    if !stamp_is_current() {
+        return regenerate();
+    }
+    let path = active_path();
+    let bytes = std::fs::read(&path).diag(Key::ApplyActiveReadFailed)?;
+    let api_port = api_port_from_path(&path)?;
+    Ok(SpawnConfig { bytes, api_port })
+}
+
+/// [`regenerate`], off the executor (see [`on_blocking_pool`]).
+pub async fn regenerate_offloaded() -> Result<SpawnConfig, DiagError> {
+    on_blocking_pool(regenerate).await
+}
+
+/// [`write_core_gate`], off the executor (see [`on_blocking_pool`]).
+pub async fn write_core_gate_offloaded() -> Result<SpawnConfig, DiagError> {
+    on_blocking_pool(write_core_gate).await
+}
+
+/// [`replay_rolled_back`], off the executor (see [`on_blocking_pool`]).
+pub async fn replay_rolled_back_offloaded() -> Result<SpawnConfig, DiagError> {
+    on_blocking_pool(replay_rolled_back).await
+}
+
+/// One generation refusal as the runtime's user-visible finding: the same
+/// sentence the GUI's own generation failure carries.
+fn generation_failure(error: crate::r#gen::GenerateError) -> DiagError {
+    // English in the argument: the display boundary re-renders the outer
+    // sentence in the active language, and the generator's own finding is
+    // app-authored text with no locale of its own here.
+    DiagError::new(
+        Diag::new(Key::GenerationFailed).arg(error.text(crate::model::settings::Language::En)),
+    )
+}
+
 pub fn read_active_contents() -> Result<String, DiagError> {
     std::fs::read_to_string(active_path()).diag(Key::ApplyActiveReadFailed)
 }
@@ -63,7 +235,10 @@ pub fn candidate_path() -> PathBuf {
     config_dir().join("config.candidate.json")
 }
 
-pub fn lastgood_path() -> PathBuf {
+/// `config.lastgood.json` — the artefact a candidate replaced. Replayed only
+/// after a deliberate rollback, and only while its sidecar stamp names this
+/// build; otherwise it stays diagnostic history.
+fn lastgood_path() -> PathBuf {
     config_dir().join("config.lastgood.json")
 }
 
@@ -397,19 +572,28 @@ where
     })?
 }
 
-/// Durably serialize `v` as pretty JSON to `config.candidate.json`.
+/// Durably serialize `v` as pretty JSON to `config.candidate.json`, and write
+/// the sidecar stamp naming the build that produced it. The stamp is written
+/// with the configuration it describes — never apart from it.
 pub fn write_candidate(v: &serde_json::Value) -> Result<PathBuf, DiagError> {
+    write_candidate_bytes(v)?;
+    Ok(candidate_path())
+}
+
+/// [`write_candidate`] returning the exact bytes written, so a caller that
+/// must hand the artefact to the elevated helper never re-reads the
+/// user-writable path it just wrote.
+fn write_candidate_bytes(v: &serde_json::Value) -> Result<Vec<u8>, DiagError> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).diag(Key::ApplyConfigDirCreateFailed)?;
-    let path = candidate_path();
     let json = serde_json::to_vec_pretty(v).diag(Key::ApplyCandidateSerializeFailed)?;
-    let mut file =
-        File::create(&path).diag_with(Diag::new(Key::ApplyFileCreateFailed).arg(path.display()))?;
-    file.write_all(&json)
-        .diag_with(Diag::new(Key::ApplyFileWriteFailed).arg(path.display()))?;
-    file.sync_all()
-        .diag_with(Diag::new(Key::ApplyFileFlushFailed).arg(path.display()))?;
-    Ok(path)
+    write_synced(&candidate_path(), &json)?;
+    // The stamp describes these exact bytes: its digest is the file identity
+    // no later build-identity match can fake.
+    let stamp = serde_json::to_vec_pretty(&current_stamp(sha256_hex(&json)))
+        .diag(Key::ApplyCandidateSerializeFailed)?;
+    write_synced(&meta_candidate_path(), &stamp)?;
+    Ok(json)
 }
 
 /// [`write_candidate`], off the executor (see [`on_blocking_pool`]).
@@ -417,19 +601,60 @@ pub async fn write_candidate_offloaded(v: serde_json::Value) -> Result<PathBuf, 
     on_blocking_pool(move || write_candidate(&v)).await
 }
 
+/// Create/write/flush one artefact. `sync_all` before the rename makes the
+/// bytes durable before anything promotes or executes the file.
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), DiagError> {
+    let mut file =
+        File::create(path).diag_with(Diag::new(Key::ApplyFileCreateFailed).arg(path.display()))?;
+    file.write_all(bytes)
+        .diag_with(Diag::new(Key::ApplyFileWriteFailed).arg(path.display()))?;
+    file.sync_all()
+        .diag_with(Diag::new(Key::ApplyFileFlushFailed).arg(path.display()))?;
+    Ok(())
+}
+
 /// Promote the validated candidate without an interval where `config.json`
 /// is missing. Rust's Windows `rename` uses `MoveFileExW` with
 /// `MOVEFILE_REPLACE_EXISTING`.
+///
+/// The configuration renames first and its stamp second: a crash between the
+/// two leaves the new artefact beside the stamp of the file it replaced, whose
+/// digest cannot describe the new bytes — every consumer reads that pair as
+/// "not this file's" and regenerates. The reverse order (stamp first) would
+/// leave a stamp vouching for a file another build wrote, the one direction a
+/// replay must never see.
 pub fn commit() -> Result<(), DiagError> {
+    let dir = config_dir();
     let active = active_path();
     let candidate = candidate_path();
     let lastgood = lastgood_path();
+    let meta = meta_path();
+    let meta_candidate = meta_candidate_path();
+    let meta_lastgood = meta_lastgood_path();
     if active.exists() {
-        let pending = config_dir().join("config.lastgood.pending.json");
+        let pending = dir.join("config.lastgood.pending.json");
         durable_copy(&active, &pending).diag(Key::ApplyLastgoodStageFailed)?;
         std::fs::rename(&pending, &lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
+        // The retired artefact keeps its own stamp — and only while that stamp
+        // really describes it. A mismatched or absent stamp is dropped, so the
+        // last-good pair on disk is never a lie a replay could read as one.
+        if meta.is_file() && stamp_describes(&meta, &active) {
+            let pending_meta = dir.join("config.lastgood.meta.pending.json");
+            durable_copy(&meta, &pending_meta).diag(Key::ApplyLastgoodStageFailed)?;
+            std::fs::rename(&pending_meta, meta_lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
+        } else if meta_lastgood.exists() {
+            std::fs::remove_file(&meta_lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
+        }
     }
     std::fs::rename(&candidate, &active).diag(Key::ApplyActiveReplaceFailed)?;
+    if meta_candidate.is_file() && stamp_describes(&meta_candidate, &active) {
+        std::fs::rename(&meta_candidate, &meta).diag(Key::ApplyActiveReplaceFailed)?;
+    } else if meta.is_file() {
+        // A promoted configuration with no stamp of its own (or one that does
+        // not describe it) leaves none: the previous stamp describes the file
+        // that was just replaced.
+        std::fs::remove_file(&meta).diag(Key::ApplyActiveReplaceFailed)?;
+    }
     Ok(())
 }
 
@@ -438,16 +663,31 @@ pub async fn commit_offloaded() -> Result<(), DiagError> {
     on_blocking_pool(commit).await
 }
 
-/// Atomically restore `config.lastgood.json` over `config.json`.
+/// Atomically restore `config.lastgood.json` over `config.json`, its sidecar
+/// stamp travelling with it. A last-good pair written before sidecar stamps
+/// existed has no stamp: the active stamp is then removed, so the restored
+/// artefact never reads as one this build vouches for.
 pub fn rollback() -> Result<(), DiagError> {
+    let dir = config_dir();
     let active = active_path();
     let lastgood = lastgood_path();
     if !lastgood.exists() {
         return Err(DiagError::new(Diag::new(Key::ApplyRollbackMissing)));
     }
-    let pending = config_dir().join("config.rollback.json");
+    let pending = dir.join("config.rollback.json");
     durable_copy(&lastgood, &pending).diag(Key::ApplyRollbackStageFailed)?;
     std::fs::rename(&pending, &active).diag(Key::ApplyRollbackRestoreFailed)?;
+    let lastgood_meta = meta_lastgood_path();
+    let meta = meta_path();
+    if lastgood_meta.is_file() && stamp_describes(&lastgood_meta, &active) {
+        let pending_meta = dir.join("config.rollback.meta.pending.json");
+        durable_copy(&lastgood_meta, &pending_meta).diag(Key::ApplyRollbackStageFailed)?;
+        std::fs::rename(&pending_meta, &meta).diag(Key::ApplyRollbackRestoreFailed)?;
+    } else if meta.is_file() {
+        // The restored configuration has no stamp of its own (or one that does
+        // not describe it): the active stamp describes the failed candidate.
+        std::fs::remove_file(&meta).diag(Key::ApplyRollbackRestoreFailed)?;
+    }
     Ok(())
 }
 
@@ -489,12 +729,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppMessage, ApplyOutput, OUTPUT_TAIL, TailRing, api_port_from_path, api_port_from_value,
-        carries_health_extension, settle_validation, spawn_validation_child,
+        AppMessage, ApplyOutput, META_CANDIDATE_NAME, META_LASTGOOD_NAME, OUTPUT_TAIL, TailRing,
+        active_path, api_port_from_path, api_port_from_value, carries_health_extension, commit,
+        lastgood_path, meta_path, rollback, settle_validation, spawn_validation_child,
+        stamp_is_current, write_candidate,
     };
     use crate::i18n::{Key, t, t_fmt};
     use crate::model::settings::Language;
     use crate::rt::supervisor::{MAX_LINE_BYTES, TRUNCATED_MARKER};
+    use crate::sys::paths::config_dir;
     use serde_json::json;
 
     /// The status read follows the launched config's own keys: either engine
@@ -512,6 +755,204 @@ mod tests {
             &json!({ "outbounds": [], "inbounds": [] }).to_string()
         ));
         assert!(!carries_health_extension("{not json"));
+    }
+
+    /// The candidate pair and the stamp are written together, and commit
+    /// promotes them together: the active configuration and its stamp always
+    /// describe the same build and bytes, while a retired configuration keeps
+    /// the stamp that describes it (for the rollback replay).
+    #[test]
+    fn commit_moves_each_configuration_with_its_own_stamp() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            let previous = br#"{"previous":true}"#;
+            std::fs::write(active_path(), previous).expect("write the previous active");
+            std::fs::write(
+                meta_path(),
+                format!(
+                    r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{}"}}"#,
+                    env!("CARGO_PKG_VERSION"),
+                    crate::sys::core_dl::pinned_release_version(),
+                    super::sha256_hex(previous)
+                ),
+            )
+            .expect("write the previous stamp");
+            write_candidate(&json!({"next": true})).expect("write the candidate pair");
+            assert!(
+                std::fs::read(config_dir().join(META_CANDIDATE_NAME)).is_ok(),
+                "the candidate stamp is written with the candidate"
+            );
+
+            commit().expect("commit");
+
+            assert_eq!(
+                std::fs::read(active_path()).expect("read the active config"),
+                serde_json::to_vec_pretty(&json!({"next": true})).expect("serialize the candidate"),
+                "the committed configuration is the candidate"
+            );
+            assert!(
+                stamp_is_current(),
+                "the promoted stamp describes the file it was written for"
+            );
+            assert_eq!(
+                std::fs::read(lastgood_path()).expect("read the retired config"),
+                previous,
+                "the previous configuration is retired for the rollback"
+            );
+            let retired_stamp = std::fs::read_to_string(config_dir().join(META_LASTGOOD_NAME))
+                .expect("the retired stamp travels with the configuration it describes");
+            assert!(
+                retired_stamp.contains(&super::sha256_hex(previous)),
+                "the retired stamp must describe the retired bytes: {retired_stamp}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_stamp_matches_only_the_build_that_wrote_it() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            assert!(!stamp_is_current(), "a missing stamp never matches");
+            write_candidate(&json!({})).expect("write the candidate pair");
+            commit().expect("commit the candidate");
+            assert!(stamp_is_current());
+            // Any single field naming another build breaks the match.
+            for foreign in [
+                r#"{"appVersion":"0.0.1","corePin":"v26.9.9"}"#,
+                r#"{"appVersion":"0.1.1","corePin":"v1.0.0"}"#,
+                r#"{"appVersion":"0.0.1"}"#,
+                "not json",
+            ] {
+                std::fs::write(meta_path(), foreign).expect("write the foreign stamp");
+                assert!(!stamp_is_current(), "{foreign} must not match this build");
+            }
+        });
+    }
+
+    /// A rollback restores the configuration and its stamp as one pair; a
+    /// last-good config written before stamps existed leaves no stamp, so the
+    /// restored artefact can never read as one this build vouches for.
+    #[test]
+    fn rollback_restores_the_stamp_pair_or_leaves_none() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            let lastgood_meta = config_dir().join(META_LASTGOOD_NAME);
+
+            // A pair written by another build restores with its own stamp.
+            std::fs::write(active_path(), br#"{"failed":true}"#).expect("write the failed active");
+            std::fs::write(lastgood_path(), br#"{"good":true}"#).expect("write the last-good");
+            std::fs::write(
+                &lastgood_meta,
+                br#"{"appVersion":"0.0.1","corePin":"v1.0.0"}"#,
+            )
+            .expect("write the last-good stamp");
+            write_candidate(&json!({"failed": true})).expect("write the candidate pair");
+            rollback().expect("rollback");
+            assert_eq!(
+                std::fs::read(active_path()).expect("read the restored config"),
+                br#"{"good":true}"#
+            );
+            assert!(
+                !stamp_is_current(),
+                "a foreign last-good artefact must not read as this build's"
+            );
+
+            // A last-good config with no stamp restores without one.
+            std::fs::write(meta_path(), br#"{"appVersion":"0.1.1","corePin":"v1.0.0"}"#)
+                .expect("write a matching-looking active stamp");
+            std::fs::remove_file(&lastgood_meta).expect("drop the last-good stamp");
+            rollback().expect("rollback");
+            assert!(
+                !meta_path().exists(),
+                "no stamp may survive without the configuration it describes"
+            );
+            assert!(!stamp_is_current());
+        });
+    }
+
+    /// A retired configuration with no stamp of its own must not inherit the
+    /// previous last-good stamp: that stamp would describe none of the retired
+    /// bytes, and a rollback would replay a file no stamp vouches for.
+    #[test]
+    fn a_retired_configuration_never_inherits_a_stale_stamp() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            let lastgood_meta = config_dir().join(META_LASTGOOD_NAME);
+            // A stale pair from an earlier run: a last-good stamp whose digest
+            // describes bytes no longer present, beside a hand-written active
+            // configuration with no stamp at all.
+            std::fs::write(
+                &lastgood_meta,
+                format!(
+                    r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{}"}}"#,
+                    env!("CARGO_PKG_VERSION"),
+                    crate::sys::core_dl::pinned_release_version(),
+                    "0".repeat(64)
+                ),
+            )
+            .expect("write the stale stamp");
+            std::fs::write(active_path(), br#"{"foreign":true}"#)
+                .expect("write the foreign active config");
+
+            write_candidate(&json!({"next": true})).expect("write the candidate pair");
+            commit().expect("commit");
+
+            assert!(
+                !lastgood_meta.exists(),
+                "a retired configuration with no stamp must not keep a stale one"
+            );
+            assert!(stamp_is_current(), "the promoted pair is this build's");
+
+            // The foreign configuration is now the retired one; restored by a
+            // rollback it can still never read as replayable.
+            rollback().expect("rollback");
+            assert_eq!(
+                std::fs::read(active_path()).expect("read the restored config"),
+                br#"{"foreign":true}"#
+            );
+            assert!(
+                !stamp_is_current(),
+                "a foreign configuration must never be replayable"
+            );
+        });
+    }
+
+    /// The stamp records the digest of the exact bytes it describes, so build
+    /// identity alone can never vouch for a file the stamp did not produce.
+    #[test]
+    fn a_stamp_must_describe_the_exact_configuration_bytes() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            let stamp_for = |digest: &str| {
+                format!(
+                    r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{digest}"}}"#,
+                    env!("CARGO_PKG_VERSION"),
+                    crate::sys::core_dl::pinned_release_version()
+                )
+            };
+            std::fs::write(active_path(), br#"{"here":true}"#).expect("write the active config");
+            std::fs::write(meta_path(), stamp_for(&"0".repeat(64)))
+                .expect("write a mismatched stamp");
+            assert!(
+                !stamp_is_current(),
+                "a stamp whose digest is not its file's must fail closed"
+            );
+
+            let digest = super::sha256_hex(br#"{"here":true}"#);
+            std::fs::write(meta_path(), stamp_for(&digest)).expect("write the matching stamp");
+            assert!(stamp_is_current(), "the digest of these bytes must match");
+
+            std::fs::write(active_path(), br#"{"here":false}"#).expect("edit the active config");
+            assert!(
+                !stamp_is_current(),
+                "an edited file must not keep the stamp that described it"
+            );
+
+            // A freshly written candidate carries the digest of its own bytes.
+            write_candidate(&json!({"here": false})).expect("write the candidate pair");
+            commit().expect("commit");
+            assert!(stamp_is_current());
+        });
     }
 
     #[test]

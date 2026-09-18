@@ -49,17 +49,17 @@ fn free_port() -> u16 {
 }
 
 /// Isolated runnable config; `geodata` (when Some) is the core-native block
-/// written verbatim — broccoli's own 5-field cron validation is not on this path,
-/// matching `core_update_e2e`'s raw-config approach.
-fn write_runnable_config(
-    root: &std::path::Path,
+/// passed verbatim — broccoli's own 5-field cron validation is not on this path,
+/// matching `core_update_e2e`'s raw-config approach. Configurations enter the
+/// runtime through the apply path — a start never replays a stored artefact —
+/// so the helper hands the value to `CoreCmd::ApplyConfigAndStart` instead of
+/// writing a file.
+fn runnable_config(
     socks_port: u16,
     api_port: u16,
     geodata: Option<serde_json::Value>,
     routing: Option<serde_json::Value>,
-) {
-    let config_dir = root.join("broccoli").join("config");
-    std::fs::create_dir_all(&config_dir).expect("create isolated config directory");
+) -> serde_json::Value {
     let mut config = serde_json::json!({
         "log": { "loglevel": "warning" },
         "stats": {},
@@ -91,11 +91,7 @@ fn write_runnable_config(
             .expect("config object")
             .insert("routing".into(), routing);
     }
-    std::fs::write(
-        config_dir.join("config.json"),
-        serde_json::to_vec_pretty(&config).expect("serialize isolated config"),
-    )
-    .expect("write isolated config");
+    config
 }
 
 fn copy_file(source: &std::path::Path, destination: &std::path::Path) {
@@ -129,11 +125,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Parse the runtime's `[broccoli] core started (direct, pid N)` log line.
+/// Parse the runtime's app-log event that announces a direct core start and
+/// return the pid. The needle is built from the runtime's own message key (its
+/// text up to the `{}` placeholder), so a wording change cannot silently make
+/// every start look missing while this wait keeps timing out. `CoreEvt::AppLog`
+/// carries the rendered sentence itself; the log view's `[broccoli] ` prefix is
+/// added by the GUI, not here.
 fn parse_started_pid(line: &str) -> Option<u32> {
-    line.strip_prefix("[broccoli] core started (direct, pid ")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|pid| pid.parse().ok())
+    let sentence = broccoli::i18n::t(
+        broccoli::model::settings::Language::En,
+        broccoli::i18n::Key::RtLogCoreStartedDirect,
+    );
+    let (sentence, tail) = sentence.split_once("{}")?;
+    line.strip_prefix(sentence)?
+        .strip_suffix(tail)?
+        .parse()
+        .ok()
 }
 
 /// True when the process is still running (STILL_ACTIVE), not merely that its
@@ -153,6 +160,18 @@ fn process_alive(pid: u32) -> bool {
     alive
 }
 
+/// The pid a runtime event announces for a direct core start, if it is one.
+/// The announcement travels as an app-authored message (`CoreEvt::AppLog`);
+/// plain log lines are checked too, so the wait survives either event shape.
+fn started_pid(event: &CoreEvt) -> Option<u32> {
+    let text = match event {
+        CoreEvt::AppLog(message) => message.text(broccoli::model::settings::Language::En),
+        CoreEvt::Log { line, .. } => line.clone(),
+        _ => return None,
+    };
+    parse_started_pid(&text)
+}
+
 /// Drain events until the core is gRPC-ready (Running) and the runtime has
 /// logged its pid. Returns (pid, number of "core started" log lines, error).
 fn wait_ready(
@@ -167,16 +186,13 @@ fn wait_ready(
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(CoreEvt::State(CorePhase::Running)) => running = true,
             Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::Log {
-                line,
-                from_core: false,
-            }) => {
-                if let Some(pid) = parse_started_pid(&line) {
+            Ok(event) => {
+                if let Some(pid) = started_pid(&event) {
                     core_pid = Some(pid);
                     start_logs += 1;
                 }
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped before the core became ready")
             }
@@ -232,15 +248,12 @@ fn assert_stays_up(receiver: &std::sync::mpsc::Receiver<CoreEvt>, window: Durati
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
             Ok(CoreEvt::State(CorePhase::Stopped | CorePhase::Backoff { .. })) => restarts += 1,
-            Ok(CoreEvt::Log {
-                line,
-                from_core: false,
-            }) => {
-                if parse_started_pid(&line).is_some() {
+            Ok(event) => {
+                if started_pid(&event).is_some() {
                     restarts += 1;
                 }
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped while {context}");
             }
@@ -289,13 +302,7 @@ fn downloads_and_reloads_geodata_without_restart() {
             { "type": "field", "domain": ["geosite:cn"], "outboundTag": "direct" }
         ]
     });
-    write_runnable_config(
-        isolated.path(),
-        socks_port,
-        api_port,
-        Some(geodata),
-        Some(routing),
-    );
+    let config = runnable_config(socks_port, api_port, Some(geodata), Some(routing));
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
     let mtime_before = std::fs::metadata(&geoip_path)
         .expect("copied geoip.dat")
@@ -309,7 +316,9 @@ fn downloads_and_reloads_geodata_without_restart() {
         egui::Context::default(),
         broccoli::metrics::MetricsHandle::new(),
     );
-    rt.cmd.send(CoreCmd::Start).expect("send start command");
+    rt.cmd
+        .send(CoreCmd::ApplyConfigAndStart(config))
+        .expect("apply and start the isolated configuration");
 
     let (core_pid, start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
@@ -336,15 +345,12 @@ fn downloads_and_reloads_geodata_without_restart() {
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
                 Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
-                Ok(CoreEvt::Log {
-                    line,
-                    from_core: false,
-                }) => {
-                    if parse_started_pid(&line).is_some() {
+                Ok(event) => {
+                    if started_pid(&event).is_some() {
                         restarts += 1;
                     }
                 }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("runtime stopped while waiting for the geodata swap")
                 }
@@ -362,15 +368,12 @@ fn downloads_and_reloads_geodata_without_restart() {
     while Instant::now() < settle {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::Log {
-                line,
-                from_core: false,
-            }) => {
-                if parse_started_pid(&line).is_some() {
+            Ok(event) => {
+                if started_pid(&event).is_some() {
                     restarts += 1;
                 }
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped while confirming the core stayed alive")
             }
@@ -410,7 +413,7 @@ fn payload_files_stay_replaceable_while_core_runs() {
     copy_installed_core(&installed_root, isolated.path());
     let (socks_port, api_port) = (free_port(), free_port());
     // No `geodata` block: the probe swaps the file itself, so no download.
-    write_runnable_config(isolated.path(), socks_port, api_port, None, None);
+    let config = runnable_config(socks_port, api_port, None, None);
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
     let original = std::fs::read(&geoip_path).expect("read copied geoip.dat");
     let original_sha = sha256_hex(&original);
@@ -422,7 +425,9 @@ fn payload_files_stay_replaceable_while_core_runs() {
         egui::Context::default(),
         broccoli::metrics::MetricsHandle::new(),
     );
-    rt.cmd.send(CoreCmd::Start).expect("send start command");
+    rt.cmd
+        .send(CoreCmd::ApplyConfigAndStart(config))
+        .expect("apply and start the isolated configuration");
 
     let (core_pid, _start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
@@ -455,15 +460,12 @@ fn payload_files_stay_replaceable_while_core_runs() {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
             Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
-            Ok(CoreEvt::Log {
-                line,
-                from_core: false,
-            }) => {
-                if parse_started_pid(&line).is_some() {
+            Ok(event) => {
+                if started_pid(&event).is_some() {
                     restarts += 1;
                 }
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped while confirming the core stayed alive")
             }
@@ -511,13 +513,7 @@ fn broken_file_rolls_back() {
             { "type": "field", "ip": ["geoip:cn"], "outboundTag": "direct" }
         ]
     });
-    write_runnable_config(
-        isolated.path(),
-        socks_port,
-        api_port,
-        Some(geodata),
-        Some(routing),
-    );
+    let config = runnable_config(socks_port, api_port, Some(geodata), Some(routing));
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
     let original = std::fs::read(&geoip_path).expect("read copied geoip.dat");
     let original_sha = sha256_hex(&original);
@@ -529,7 +525,9 @@ fn broken_file_rolls_back() {
         egui::Context::default(),
         broccoli::metrics::MetricsHandle::new(),
     );
-    rt.cmd.send(CoreCmd::Start).expect("send start command");
+    rt.cmd
+        .send(CoreCmd::ApplyConfigAndStart(config))
+        .expect("apply and start the isolated configuration");
 
     let (core_pid, _start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
@@ -591,15 +589,12 @@ fn broken_file_rolls_back() {
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
                 Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
-                Ok(CoreEvt::Log {
-                    line,
-                    from_core: false,
-                }) => {
-                    if parse_started_pid(&line).is_some() {
+                Ok(event) => {
+                    if started_pid(&event).is_some() {
                         restarts += 1;
                     }
                 }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("runtime stopped while waiting for the geodata restore")
                 }
@@ -618,15 +613,12 @@ fn broken_file_rolls_back() {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
             Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
-            Ok(CoreEvt::Log {
-                line,
-                from_core: false,
-            }) => {
-                if parse_started_pid(&line).is_some() {
+            Ok(event) => {
+                if started_pid(&event).is_some() {
                     restarts += 1;
                 }
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped while confirming the restore held")
             }
@@ -728,13 +720,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
             { "type": "field", "domain": ["geosite:cn"], "outboundTag": "direct" }
         ]
     });
-    write_runnable_config(
-        isolated.path(),
-        socks_port,
-        api_port,
-        Some(geodata),
-        Some(routing.clone()),
-    );
+    let config = runnable_config(socks_port, api_port, Some(geodata), Some(routing.clone()));
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
@@ -743,7 +729,9 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         egui::Context::default(),
         broccoli::metrics::MetricsHandle::new(),
     );
-    rt.cmd.send(CoreCmd::Start).expect("send start command");
+    rt.cmd
+        .send(CoreCmd::ApplyConfigAndStart(config.clone()))
+        .expect("apply and start the isolated configuration");
 
     // First run: with the geodata block configured the core reaches Running.
     let (first_pid, first_start_logs, ready_error) =
@@ -786,15 +774,12 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
                 Ok(CoreEvt::State(CorePhase::Stopped | CorePhase::Backoff { .. })) => restarts += 1,
-                Ok(CoreEvt::Log {
-                    line,
-                    from_core: false,
-                }) => {
-                    if parse_started_pid(&line).is_some() {
+                Ok(event) => {
+                    if started_pid(&event).is_some() {
                         restarts += 1;
                     }
                 }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("runtime stopped while waiting for the geodata swap")
                 }
@@ -829,7 +814,9 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     rt.cmd.send(CoreCmd::Stop).expect("stop the core");
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(first_pid, Instant::now() + Duration::from_secs(10));
-    rt.cmd.send(CoreCmd::Start).expect("restart the core");
+    rt.cmd
+        .send(CoreCmd::ApplyConfigAndStart(config.clone()))
+        .expect("restart the core");
     let (second_pid, second_start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
     assert!(
@@ -865,9 +852,13 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     rt.cmd.send(CoreCmd::Stop).expect("stop the core");
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(second_pid, Instant::now() + Duration::from_secs(10));
-    write_runnable_config(isolated.path(), socks_port, api_port, None, Some(routing));
     rt.cmd
-        .send(CoreCmd::Start)
+        .send(CoreCmd::ApplyConfigAndStart(runnable_config(
+            socks_port,
+            api_port,
+            None,
+            Some(routing),
+        )))
         .expect("start the core without URLs");
     let (third_pid, third_start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(120));

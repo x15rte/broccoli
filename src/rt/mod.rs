@@ -21,8 +21,8 @@ use policy::{
     CANDIDATE_RETRY_DELAY, CoreExitFacts, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure,
     READY_TIMEOUT, READY_TIMEOUT_APPLIED, ReadinessTimeout, TUN_BIND_RACE_RETRIES,
     candidate_retry_budget, classify_core_exit, classify_pre_readiness_exit,
-    config_error_retry_eligible, helper_state_arms_readiness, readiness_deadline_reached,
-    readiness_timeout, readiness_timeout_verdict, spend_retry_attempt, update_retries_bind_race,
+    helper_state_arms_readiness, readiness_deadline_reached, readiness_timeout,
+    readiness_timeout_verdict, spend_retry_attempt, update_retries_bind_race,
 };
 use state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
 
@@ -292,6 +292,16 @@ impl AppMessage {
             Self::Error(error) => error.text(language),
         }
     }
+
+    /// The keyed headline of this message: the sentence itself, without a
+    /// cause chain. Nesting the headline into another message keeps the
+    /// chain with the outer record instead of repeating it.
+    pub fn headline(&self) -> &Diag {
+        match self {
+            Self::Message(message) => message,
+            Self::Error(error) => error.diag(),
+        }
+    }
 }
 
 /// English rendering, for the log file, tests, and `{}` sites that render
@@ -485,9 +495,6 @@ impl ProbeFailure {
 #[derive(Debug, Clone)]
 pub enum CorePhase {
     Stopped,
-    /// Core installed but no `config.json` exists yet; the initial
-    /// configuration is generated on the first Connect.
-    NoConfig,
     Starting,
     Running,
     Backoff {
@@ -658,6 +665,39 @@ enum CoreUpdateSource {
     LocalArchive(PathBuf),
 }
 
+/// Which configuration one spawn runs. Every arm yields an artefact this
+/// build produced and promoted through the candidate path; a stored
+/// configuration written by another build is never replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnConfigSource {
+    /// A fresh apply this session committed and validated the artefact: the
+    /// spawn runs exactly it, so the validated bytes are what the core gets.
+    Committed,
+    /// A core update landed and its health gate runs the app-owned
+    /// configuration, never the user's profiles.
+    CoreGate,
+    /// A failed candidate was deliberately rolled back: the restored
+    /// last-known-good artefact runs instead of a regeneration that would
+    /// reproduce the rejected configuration. Stamp-checked.
+    RolledBackReplay,
+    /// Cold boot, backoff retry, transport switch: generate from the saved
+    /// server list and settings.
+    SavedState,
+}
+
+impl SpawnConfigSource {
+    /// The one app-authored line that records which configuration this
+    /// start runs, in the user's words rather than the enum's.
+    fn notice(self) -> Diag {
+        Diag::new(match self {
+            Self::Committed => Key::RtLogSpawnConfigCommitted,
+            Self::CoreGate => Key::RtLogSpawnConfigGate,
+            Self::RolledBackReplay => Key::RtLogSpawnConfigReplay,
+            Self::SavedState => Key::RtLogSpawnConfigRegenerated,
+        })
+    }
+}
+
 /// Why a helper-connect attempt ended without a pipe: an abort raised by the
 /// shared cancel flag (Stop/Shutdown won the race with the UAC prompt or the
 /// handshake — not a failure), or the connect error itself.
@@ -809,14 +849,12 @@ struct Runtime {
     exit_policy: ExitPolicy,
     /// A just-committed config candidate plus its armed rollback.
     pending_transition: PendingTransition,
-    /// The exact config content a helper start must stage: the bytes of the
-    /// candidate the apply gate validated, captured in the same operation as
-    /// the commit. Starts without a fresh
-    /// apply in this session (cold boot, rollback restart) capture the active
-    /// file once in `start_backend`, strictly before any UAC launch. The
-    /// elevated helper never re-reads the user-writable active path, so a
-    /// same-user swap after validation cannot reach the stage; `None` means
-    /// no apply has committed and no start has captured yet.
+    /// The exact config content a helper start must stage. A start that
+    /// generated its configuration captures those bytes directly (regenerate,
+    /// gate, rollback replay); a start carrying a fresh apply's committed
+    /// artefact keeps the bytes the apply gate validated. The elevated helper
+    /// never re-reads the user-writable active path, so a same-user swap after
+    /// capture cannot reach the stage; `None` means no start has captured yet.
     helper_config_bytes: Option<Vec<u8>>,
     /// The core-swap candidate (durable health marker) plus its rollback.
     core_update: CoreUpdatePending,
@@ -835,8 +873,24 @@ struct Runtime {
 
     shutting_down: bool,
 
-    /// The single automatic retry for a non-candidate startup config error.
-    config_error_retried: bool,
+    /// The next start is a completed core update's health gate: it runs the
+    /// app-owned configuration, never the user's profiles, so the gate
+    /// answers only "does this binary run and answer". Armed when an install
+    /// lands and when a durable pending-swap marker is adopted; consumed by
+    /// the start it belongs to. A fresh apply supersedes it — the user's own
+    /// start then carries the update's verdict.
+    update_gate_start: bool,
+    /// The next start replays the restored last-known-good artefact instead of
+    /// regenerating, because regeneration would reproduce the configuration a
+    /// rolled-back candidate failed on. Set only where a deliberate rollback
+    /// completed; the replay checks the artefact's stamp first and regenerates
+    /// when it names another build.
+    replay_after_rollback: bool,
+    /// The live backend is the health gate's proof process: it runs the
+    /// app-owned configuration, so its first readiness ACKs the update and
+    /// then ends the process (the phase settles to Stopped). Set by the start
+    /// that ran `SpawnConfigSource::CoreGate`, cleared on any backend exit.
+    gate_backend_alive: bool,
     /// Automatic retry count for a TUN candidate that exits before
     /// readiness. Reset on every fresh commit and on first readiness; the
     /// budget for one exit is a single attempt for the adapter teardown
@@ -1023,6 +1077,31 @@ fn is_volatile_event(evt: &CoreEvt) -> bool {
     )
 }
 
+/// One app-authored log line written from outside the runtime loop — a
+/// spawn's release verification, a probe worker. It emits exactly what
+/// [`Runtime::app_log`] emits: the message lands on the GUI channel as an
+/// [`CoreEvt::AppLog`] event the app renders in the display language, and
+/// one repaint is requested. Cloneable, so a worker owns its own handle.
+#[derive(Clone)]
+pub(crate) struct AppLogSink {
+    evt: SyncSender<CoreEvt>,
+    repaint: egui::Context,
+}
+
+impl AppLogSink {
+    pub(crate) fn new(evt: SyncSender<CoreEvt>, repaint: egui::Context) -> Self {
+        Self { evt, repaint }
+    }
+
+    /// Queue one keyed message. Volatile by class (see
+    /// [`is_volatile_event`]): a full GUI channel drops the line instead of
+    /// blocking the worker that made the decision.
+    pub(crate) fn log(&self, message: impl Into<AppMessage>) {
+        queue_event(CoreEvt::AppLog(message.into()), &self.evt);
+        self.repaint.request_repaint();
+    }
+}
+
 /// Install the aws-lc-rs crypto provider as rustls's process default.
 ///
 /// The HTTP stack is reqwest 0.12 built with `rustls-tls-webpki-roots-no-provider`,
@@ -1082,7 +1161,9 @@ impl Runtime {
             output_ring: Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_RING))),
             log_gate: Arc::new(Mutex::new(LogGate::new())),
             shutting_down: false,
-            config_error_retried: false,
+            update_gate_start: false,
+            replay_after_rollback: false,
+            gate_backend_alive: false,
             candidate_boot_retries: 0,
             pending_restart: None,
             dns_in_listener: None,
@@ -1312,6 +1393,12 @@ impl Runtime {
         self.emit(CoreEvt::AppLog(message.into()));
     }
 
+    /// A log handle for work that runs outside the runtime loop (a spawn's
+    /// release verification, a probe worker); see [`AppLogSink`].
+    fn log_sink(&self) -> AppLogSink {
+        AppLogSink::new(self.evt.clone(), self.repaint.clone())
+    }
+
     /// Route one decoded helper log record: a keyed record becomes a runtime
     /// message (the app renders it in the display language at the drain, like
     /// every other message), and an unknown record shape stays a raw
@@ -1512,7 +1599,6 @@ impl Runtime {
                 }
                 self.pending_restart = None;
                 self.backoff.reset();
-                self.config_error_retried = false;
                 if self.exit_policy.stopping() {
                     self.app_log(Diag::new(Key::RtLogConnectRejectedStopping));
                     self.release_exclusive();
@@ -1991,6 +2077,7 @@ impl Runtime {
         // capture to bypass, and binding would let a stale adapter name fail
         // a probe nothing would have polluted.
         let tun_active = matches!(self.phase, CorePhase::Running) && self.backend.is_tun_owned();
+        let log = self.log_sink();
         let task = tokio::spawn(async move {
             let result = latency::run(
                 profiles.clone(),
@@ -1998,6 +2085,7 @@ impl Runtime {
                 tun_outbound_interface,
                 tun_adapter_name,
                 tun_active,
+                &log,
             )
             .await;
             ExclusiveOutcome::LatencyProbe {
@@ -2128,6 +2216,9 @@ impl Runtime {
                     // race the candidate before it is acknowledged or rolled
                     // back. This work still runs entirely off the UI thread.
                     self.core_update.commit_candidate();
+                    // The gate proves the installed binary with the app-owned
+                    // configuration; it starts on the next housekeeping tick.
+                    self.update_gate_start = true;
                     self.set_phase(CorePhase::Stopped);
                     self.pending_restart = Some(Instant::now());
                     return;
@@ -2236,6 +2327,68 @@ impl Runtime {
 
     // -- backend lifecycle ---------------------------------------------------
 
+    /// Which configuration this start runs, consuming the one-shot flags that
+    /// arm the gate and the post-rollback replay. A freshly committed
+    /// candidate supersedes the gate: the user's own start then carries the
+    /// update's verdict (the gate flag is consumed either way).
+    fn take_spawn_config_source(&mut self) -> SpawnConfigSource {
+        let gate = std::mem::take(&mut self.update_gate_start);
+        let replay = std::mem::take(&mut self.replay_after_rollback);
+        if self.pending_transition.is_candidate_pending() {
+            return SpawnConfigSource::Committed;
+        }
+        if gate {
+            return SpawnConfigSource::CoreGate;
+        }
+        if replay {
+            return SpawnConfigSource::RolledBackReplay;
+        }
+        SpawnConfigSource::SavedState
+    }
+
+    /// Whether this start runs behind the elevated helper. TUN sessions do;
+    /// the health gate never does: it proves the installed binary with an
+    /// app-owned direct configuration (no tun inbound), so it needs neither
+    /// the elevation ceremony nor the consent prompt a user's TUN session
+    /// justifies.
+    fn uses_elevated_helper(&self) -> bool {
+        self.requested_tun_mode && !self.gate_backend_alive
+    }
+
+    /// Land a failure to produce the spawn's configuration — the app's own
+    /// generation refusal, an unreadable state file, an unwritable artefact.
+    /// The core was never spawned, so this class never blames the installed
+    /// payload: a pending update ends as installed and the finding is the
+    /// terminal phase.
+    fn settle_spawn_config_failure(&mut self, error: DiagError) {
+        self.settle_config_failure(PhaseError::new(AppMessage::from(error)));
+    }
+
+    /// Land one configuration-class failure. While an update candidate is
+    /// unproven the payload hashes have already verified the installed tree,
+    /// so the update ends as installed — the durable marker and the retained
+    /// last-good tree are consumed — and the configuration finding is what
+    /// the user must see. Never a core rollback: replaying a tree cannot
+    /// repair a configuration.
+    fn settle_config_failure(&mut self, failure: PhaseError) {
+        // Read before the ACK consumes it: only a pending update candidate
+        // makes this failure keep the installed, hash-verified core, and the
+        // line must say so before the phase error is read.
+        let kept_installed_core = self.core_update.is_candidate_pending();
+        // A no-op when no update candidate is unproven (`ack_ready` checks).
+        if let Err(error) = self.core_update.ack_ready() {
+            self.app_log(error);
+        }
+        if kept_installed_core {
+            self.app_log(
+                Diag::new(Key::RtLogConfigKeptInstalledCore)
+                    .arg_message(failure.message.headline().clone()),
+            );
+        }
+        self.set_phase(CorePhase::Error(failure));
+        self.release_exclusive();
+    }
+
     async fn start_backend(&mut self) {
         // Begin a Restart record only when the window is empty: internal
         // starts (housekeeping, rollback) ride the record the caller left
@@ -2276,29 +2429,74 @@ impl Runtime {
         // it still needs this session's first readiness verdict. Preserve the
         // in-memory candidate set by the completed install while also adopting
         // any durable pending swap recovered at startup.
+        let update_pending_before = self.core_update.is_candidate_pending();
         self.core_update
             .adopt_durable_marker(crate::sys::core_dl::update_pending_health());
-        let config = apply::active_path();
-        if !config.exists() {
-            self.set_phase(CorePhase::NoConfig);
-            self.app_log(Diag::new(Key::RtLogNoConfigConnect));
-            self.release_exclusive();
-            return;
+        if !update_pending_before && self.core_update.is_candidate_pending() {
+            // A swap landed but was never proven: the first start of the
+            // session is its health gate, with the app-owned configuration.
+            self.update_gate_start = true;
         }
-        let active_api_port = match apply::active_api_port() {
-            Ok(port) => port,
-            Err(error) => {
-                self.set_phase(CorePhase::Error(PhaseError::new(
-                    DiagError::new(Diag::new(Key::RtPhaseApiListenerReadFailed)).caused_by(error),
-                )));
-                self.release_exclusive();
-                return;
+
+        // Every spawn runs a configuration this build produced. A stored
+        // artefact is never replayed across builds: the runtime regenerates
+        // from the saved state, the gate writes its own app-owned
+        // configuration, and the one deliberate replay (the restored
+        // last-known-good after a rolled-back candidate) is stamp-checked.
+        let source = self.take_spawn_config_source();
+        // Which configuration this start runs: one line at the decision,
+        // before any spawn (direct or behind the elevated helper).
+        self.app_log(source.notice());
+        // The gate's proof process is the one backend whose readiness does not
+        // become the user's session; its first readiness ends it.
+        self.gate_backend_alive = matches!(source, SpawnConfigSource::CoreGate);
+        let (api_port, generated_bytes) = match source {
+            SpawnConfigSource::Committed => {
+                // A fresh apply this session wrote and validated the
+                // artefact; its bytes are what runs, and its own candidate
+                // carries the start's verdict.
+                match apply::active_api_port() {
+                    Ok(port) => (port, None),
+                    Err(error) => {
+                        self.settle_spawn_config_failure(
+                            DiagError::new(Diag::new(Key::RtPhaseApiListenerReadFailed))
+                                .caused_by(error),
+                        );
+                        return;
+                    }
+                }
             }
+            SpawnConfigSource::CoreGate => match apply::write_core_gate_offloaded().await {
+                Ok(config) => (config.api_port, Some(config.bytes)),
+                Err(error) => {
+                    self.settle_spawn_config_failure(error);
+                    return;
+                }
+            },
+            SpawnConfigSource::RolledBackReplay => {
+                match apply::replay_rolled_back_offloaded().await {
+                    Ok(config) => (config.api_port, Some(config.bytes)),
+                    Err(error) => {
+                        self.settle_spawn_config_failure(error);
+                        return;
+                    }
+                }
+            }
+            SpawnConfigSource::SavedState => match apply::regenerate_offloaded().await {
+                Ok(config) => (config.api_port, Some(config.bytes)),
+                Err(error) => {
+                    self.settle_spawn_config_failure(error);
+                    return;
+                }
+            },
         };
-        if active_api_port != self.api_port {
-            self.api_port = active_api_port;
-            self.grpc = GrpcClient::new(active_api_port);
-            self.app_log(Diag::new(Key::RtLogApiEndpointRecovered).arg(active_api_port));
+        if api_port != self.api_port {
+            self.api_port = api_port;
+            self.grpc = GrpcClient::new(api_port);
+            // The listen address comes from the artefact this start wrote or
+            // committed, never from Settings: the fresh candidate's own
+            // `api.listen` is the endpoint the app must poll.
+            self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
         }
         self.backoff.reset_since();
         self.core_update.clear_last_error();
@@ -2314,23 +2512,27 @@ impl Runtime {
         // TUN always runs behind the authenticated helper, even when the GUI
         // itself happens to be elevated. That independent owner observes pipe
         // EOF and closes the inbound before its Job fallback on GUI death.
-        if self.requested_tun_mode {
-            // An apply in this session already recorded the committed
-            // candidate's exact validated bytes. Any other start (cold boot,
-            // rollback/update restarts) captures the active file once here,
-            // strictly before the UAC launch below; the elevated helper
-            // stages these captured bytes and never re-reads the
-            // user-writable path, so a same-user swap after this point
-            // cannot reach the stage.
-            if self.helper_config_bytes.is_none() {
+        // The health gate is the one exception: its app-owned configuration
+        // carries no tun inbound, so it spawns directly even when the user's
+        // session is TUN — the proof needs no elevation and must never prompt.
+        if self.uses_elevated_helper() {
+            // The bytes this start generated are the ones the helper stages,
+            // captured before the UAC launch below; the elevated helper never
+            // re-reads the user-writable active path, so a same-user swap
+            // after this point cannot reach the stage. A fresh apply in this
+            // session already captured the committed candidate's exact
+            // validated bytes; only a start without one falls back to the
+            // active file.
+            if let Some(bytes) = generated_bytes {
+                self.helper_config_bytes = Some(bytes);
+            } else if self.helper_config_bytes.is_none() {
                 self.helper_config_bytes = Some(match std::fs::read(apply::active_path()) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        self.set_phase(CorePhase::Error(PhaseError::new(
+                        self.settle_spawn_config_failure(
                             DiagError::new(Diag::new(Key::RtPhaseConfigReadFailed))
                                 .caused_by(error),
-                        )));
-                        self.release_exclusive();
+                        );
                         return;
                     }
                 });
@@ -2349,9 +2551,12 @@ impl Runtime {
         // A stopped helper is still an elevated process. Close its authenticated
         // pipe before replacing the backend with a direct child.
         self.backend.release_pipe();
-        // The release-pin verify runs on the blocking pool; the
+        // Every source above promoted its artefact to the active path, so the
+        // child the runtime spawns is exactly the configuration this start
+        // produced. The release-pin verify runs on the blocking pool; the
         // spawn resumes on the executor with the verified payload locks held.
-        match supervisor::spawn(&config).await {
+        let log = self.log_sink();
+        match supervisor::spawn(&apply::active_path(), &log).await {
             Ok(mut child) => {
                 let pid = child.pid();
                 let evt = self.evt.clone();
@@ -2644,6 +2849,7 @@ impl Runtime {
         self.pending_restart = None;
         self.pending_transition.clear();
         self.core_update.clear();
+        self.gate_backend_alive = false;
         self.exit_policy.finish();
         if self.backend.as_backend().is_none() {
             self.backend.force_release();
@@ -2699,6 +2905,7 @@ impl Runtime {
         // Same invariant as on_core_exit: a foreign in-flight user operation
         // must not be silently dropped when the helper transport dies.
         self.cancel_exclusive_for_exit(&Diag::new(Key::RtReasonHelperDisconnected));
+        self.gate_backend_alive = false;
         let explicit_stop = self.exit_policy.is_explicit_stop();
         let was_tun = self.backend.is_tun_owned();
         self.backend.force_release();
@@ -2741,6 +2948,7 @@ impl Runtime {
         // restart path would leave the operation to `start_backend`'s foreign
         // child, whose readiness would drop the JoinHandle and its result.
         self.cancel_exclusive_for_exit(&Diag::new(Key::RtReasonCoreExitedUnexpectedly));
+        self.gate_backend_alive = false;
         let was_tun = self.backend.is_tun_owned();
         self.backend.confirm_exit();
         if was_tun {
@@ -2866,48 +3074,27 @@ impl Runtime {
                 self.core_update.fail_before_readiness(reason);
                 self.complete_pending_core_rollback().await;
             }
+            ExitBranch::UpdateConfigError => {
+                // The core refused its configuration while the update's
+                // payload was still unproven. The configuration is not the
+                // payload: the installed tree stays — the durable marker and
+                // the retained last-good tree are consumed, ending the update
+                // as installed — and the core's own config error is what the
+                // user sees.
+                let failure = PhaseError::new(Diag::new(Key::RtPhaseConfigError)).with_tail(tail);
+                self.settle_config_failure(failure);
+            }
             ExitBranch::ConfigError => {
                 // The failure record is "headline + the captured core
                 // output under the shared diagnostics wall" — the same shape as
                 // probe-failure records, so connect and probe log records stay
                 // uniform. The Error phase carries it: the badge renders the
-                // keyed headline, the app's LogCoreError record on the phase
-                // transition composes the wall, and the retry path logs its own
-                // record because no Error phase follows it.
+                // keyed headline, and the app's LogCoreError record on the
+                // phase transition composes the wall. A regenerated
+                // configuration cannot be repaired by replaying an older
+                // file, so the failure is terminal — the core's own message.
                 let failure = PhaseError::new(Diag::new(Key::RtPhaseConfigError)).with_tail(tail);
-                // The rule owns the conjunction of the two facts: the
-                // one-shot flag and the presence of a last-known-good config.
-                if config_error_retry_eligible(
-                    self.config_error_retried,
-                    apply::lastgood_path().is_file(),
-                ) {
-                    self.config_error_retried = true;
-                    self.log(&failure.record(Language::En));
-                    match apply::rollback_offloaded().await {
-                        Ok(()) => {
-                            // The active config changed under us; the next start
-                            // must capture the rolled-back file instead of
-                            // resurrecting the rejected bytes.
-                            self.helper_config_bytes = None;
-                            self.app_log(Diag::new(Key::RtLogStartupConfigRetry));
-                            self.pending_restart = Some(Instant::now());
-                        }
-                        Err(error) => {
-                            self.emit(CoreEvt::RollbackResult {
-                                ok: false,
-                                output: AppMessage::from(
-                                    DiagError::new(Diag::new(Key::RtFrameStartupRollbackFailed))
-                                        .caused_by(error),
-                                ),
-                            });
-                            self.set_phase(CorePhase::Error(failure));
-                            self.release_exclusive();
-                        }
-                    }
-                } else {
-                    self.set_phase(CorePhase::Error(failure));
-                    self.release_exclusive();
-                }
+                self.settle_config_failure(failure);
             }
             ExitBranch::Backoff => {
                 // Any other unexpected exit: exponential backoff with jitter.
@@ -2944,7 +3131,10 @@ impl Runtime {
                     AppMessage::from(Diag::new(Key::RtFrameRolledBackLastGood).arg_message(reason));
                 self.app_log(output.clone());
                 self.emit(CoreEvt::RollbackResult { ok: true, output });
-                self.config_error_retried = true;
+                // The next start replays the restored last-known-good
+                // artefact instead of regenerating: regeneration would
+                // produce the configuration the candidate just failed on.
+                self.replay_after_rollback = true;
                 // The active config changed under us; the next start must
                 // capture the rolled-back file instead of the rejected
                 // candidate's bytes.
@@ -3065,7 +3255,7 @@ impl Runtime {
         match self.grpc.get_sys_stats().await {
             Ok(_) => {
                 let listener_owned = self.api_listener_owned_by_child();
-                self.complete_readiness_probe(listener_owned);
+                self.complete_readiness_probe(listener_owned).await;
                 // The in-tun DNS listener binds the TUN gateway, an address
                 // the running core's adapter owns; the owning-PID check above
                 // proves the responder is this child. The adapter may still
@@ -3142,7 +3332,7 @@ impl Runtime {
 
     /// Success branch of the readiness probe, gated on the owning-PID verdict.
     /// The gate/backup side effects run only for the verified responder.
-    fn complete_readiness_probe(&mut self, listener_owned: bool) {
+    async fn complete_readiness_probe(&mut self, listener_owned: bool) {
         if !listener_owned {
             self.core_update
                 .record_readiness_error(Diag::new(Key::RtFrameApiListenerNotOwned));
@@ -3156,11 +3346,24 @@ impl Runtime {
             self.app_log(message);
             return;
         }
+        if self.gate_backend_alive {
+            // The health gate proved the installed binary and the update is
+            // installed (the ACK above consumed the marker and the retained
+            // tree). Its process runs the app-owned configuration, which
+            // serves no session, so the proof process is ended here and the
+            // phase settles to Stopped from the confirmed exit, which also
+            // releases the update operation. The user's configuration enters
+            // through the next apply.
+            self.app_log(Diag::new(Key::RtLogHealthGateCompleted));
+            self.gate_backend_alive = false;
+            self.exit_policy.begin_stop(Instant::now());
+            self.kill_backend().await;
+            return;
+        }
         self.set_phase(CorePhase::Running);
         self.backoff.mark_ready(Instant::now());
         self.pending_transition.clear_candidate();
         self.candidate_boot_retries = 0;
-        self.config_error_retried = false;
         self.app_log(Diag::new(Key::RtLogCoreReady));
         self.release_exclusive();
     }
@@ -3423,10 +3626,8 @@ impl Runtime {
     /// marker-first swap plus `recover_interrupted_swap` keep the managed
     /// core directory consistent for the next launch.
     fn update_core(&mut self, source: CoreUpdateSource) {
-        if !matches!(
-            self.phase,
-            CorePhase::Stopped | CorePhase::NoConfig | CorePhase::Error(_)
-        ) || self.backend.is_alive()
+        if !matches!(self.phase, CorePhase::Stopped | CorePhase::Error(_))
+            || self.backend.is_alive()
         {
             self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
                 Diag::new(Key::RtFrameUpdateStopCoreFirst),
@@ -4106,7 +4307,7 @@ mod tests {
         runtime.pending_transition.commit_candidate();
         runtime.core_update.commit_candidate();
 
-        runtime.complete_readiness_probe(false);
+        runtime.complete_readiness_probe(false).await;
 
         assert!(
             runtime.pending_transition.is_candidate_pending(),
@@ -4132,7 +4333,7 @@ mod tests {
         runtime.backend.set_child_pid(4242);
         runtime.pending_transition.commit_candidate();
 
-        runtime.complete_readiness_probe(true);
+        runtime.complete_readiness_probe(true).await;
 
         assert!(!runtime.pending_transition.is_candidate_pending());
         assert!(matches!(runtime.phase, super::CorePhase::Running));
@@ -4553,27 +4754,35 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn core_rollback_failure_releases_update_operation() {
-        let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        runtime.core_update.commit_candidate();
-        runtime.core_update.arm_rollback(rollback_reason());
+        // The rollback leg renames whatever core tree the current root holds,
+        // so isolate it: a concurrent test's redirected env must never decide
+        // what this test rolls back (and this test must never touch the real
+        // config directory). With no pending swap here the rollback reports
+        // the no-last-good failure the assertions below pin.
+        with_appdata_async(async {
+            let (mut runtime, events) = runtime_with_events();
+            occupy_exclusive(&mut runtime, JobKind::UpdateCore);
+            runtime.core_update.commit_candidate();
+            runtime.core_update.arm_rollback(rollback_reason());
 
-        runtime.complete_pending_core_rollback().await;
+            runtime.complete_pending_core_rollback().await;
 
-        assert!(runtime.jobs.busy_kind().is_none());
-        assert!(matches!(runtime.phase, super::CorePhase::Stopped));
-        flush_bookends(&mut runtime);
-        let emitted: Vec<_> = events.try_iter().collect();
-        assert!(emitted.iter().any(|event| matches!(
-            event,
-            CoreEvt::Download(super::DownloadState::Failed(message))
-                if message.text(Language::En).contains(&rollback_reason().text(Language::En))
-        )));
-        assert!(
-            emitted
-                .iter()
-                .any(|event| matches!(event, CoreEvt::Operation(None)))
-        );
+            assert!(runtime.jobs.busy_kind().is_none());
+            assert!(matches!(runtime.phase, super::CorePhase::Stopped));
+            flush_bookends(&mut runtime);
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(emitted.iter().any(|event| matches!(
+                event,
+                CoreEvt::Download(super::DownloadState::Failed(message))
+                    if message.text(Language::En).contains(&rollback_reason().text(Language::En))
+            )));
+            assert!(
+                emitted
+                    .iter()
+                    .any(|event| matches!(event, CoreEvt::Operation(None)))
+            );
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6230,7 +6439,7 @@ mod tests {
         runtime.pending_transition.commit_candidate();
         runtime.candidate_boot_retries = 1;
 
-        runtime.complete_readiness_probe(true);
+        runtime.complete_readiness_probe(true).await;
 
         assert_eq!(
             runtime.candidate_boot_retries, 0,
@@ -6789,10 +6998,9 @@ mod tests {
         // lands in CorePhase::Error carrying the keyed headline plus the
         // captured core output; the app's LogCoreError record on that phase
         // renders the two as one terminal record, so the runtime must not log
-        // a duplicate alongside it. The retry path is excluded here
-        // (config_error_retried, no last-good rollback).
+        // a duplicate alongside it. A regenerated configuration cannot be
+        // repaired by replaying an older file, so no retry arm exists.
         let (mut runtime, events) = runtime_with_events();
-        runtime.config_error_retried = true;
         runtime.push_ring("[stdout] 2026/09/05 failed to parse config");
         runtime.push_ring("[stdout] invalid field 'routing'");
         runtime.on_core_exit(Some(23)).await;
@@ -6837,7 +7045,6 @@ mod tests {
         // No core output captured: the wall must not be fabricated and the
         // payload is exactly the keyed headline.
         let (mut runtime, events) = runtime_with_events();
-        runtime.config_error_retried = true;
         runtime.on_core_exit(Some(23)).await;
 
         let super::CorePhase::Error(error) = &runtime.phase else {
@@ -6865,52 +7072,6 @@ mod tests {
             )),
             "the phase event must carry the keyed headline, got: {emitted:?}"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn exit_23_retries_once_with_the_last_known_good_config() {
-        // The retry-eligible half of the exit-23 arm: the one-shot flag is
-        // unspent and a last-known-good config sits in the redirected root,
-        // so the arm must flip the flag, log the retry, drop the captured
-        // helper bytes and arm a restart — never enter the Error phase.
-        with_appdata_async(async {
-            let lastgood = super::apply::lastgood_path();
-            std::fs::create_dir_all(lastgood.parent().expect("config dir"))
-                .expect("create config dir");
-            std::fs::write(&lastgood, b"{}").expect("write last-known-good config");
-
-            let (mut runtime, events) = runtime_with_events();
-            runtime.helper_config_bytes = Some(b"stale".to_vec());
-            runtime.push_ring("[stdout] 2026/09/05 failed to parse config");
-            runtime.on_core_exit(Some(23)).await;
-
-            assert!(
-                runtime.config_error_retried,
-                "the retry must spend the one-shot flag"
-            );
-            assert!(
-                runtime.pending_restart.is_some(),
-                "the retry must arm a restart of the rolled-back config"
-            );
-            assert!(
-                runtime.helper_config_bytes.is_none(),
-                "the retry must drop the rejected bytes so the next start recaptures them"
-            );
-            assert!(
-                !matches!(runtime.phase, super::CorePhase::Error(_)),
-                "a retryable config error must not land in the Error phase, got {:?}",
-                runtime.phase
-            );
-            let emitted: Vec<_> = events.try_iter().collect();
-            assert!(
-                app_log_texts(&emitted)
-                    .iter()
-                    .any(|text| text.as_str() == t(Language::En, Key::RtLogStartupConfigRetry)),
-                "the retry must log its own record, got: {:?}",
-                app_log_texts(&emitted)
-            );
-        })
-        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7266,42 +7427,481 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fresh_core_without_config_settles_into_no_config_state() {
-        // APPDATA is process-global, not thread-local: serialize against tests
-        // that read `%APPDATA%\broccoli` paths so this redirect cannot race them.
-        let _appdata_lock = APPDATA_ENV_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("temporary AppData root");
-        let _appdata = AppDataRedirect::to(temporary.path());
-        std::fs::create_dir_all(temporary.path().join("broccoli/core"))
-            .expect("create managed core dir");
+    async fn a_landed_install_gate_start_writes_the_app_owned_configuration() {
+        with_appdata_async(async {
+            let (mut runtime, _events) = runtime_with_events();
+            occupy_exclusive(&mut runtime, JobKind::UpdateCore);
+            runtime
+                .complete_exclusive(ExclusiveOutcome::Download {
+                    state: super::DownloadState::Done("26.9.9".into()),
+                    kind: OperationKind::UpdateCore,
+                })
+                .await;
+            // The completed install arms the health gate. Its start writes
+            // and runs the app-owned configuration, so it needs no stored
+            // configuration.
+            runtime.housekeeping().await;
 
-        let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        runtime
-            .complete_exclusive(ExclusiveOutcome::Download {
-                state: super::DownloadState::Done("26.7.28".into()),
-                kind: OperationKind::UpdateCore,
+            let active: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(super::apply::active_path())
+                    .expect("the gate start must write the runtime artefact"),
+            )
+            .expect("the gate configuration parses");
+            assert!(
+                active.get("inbounds").is_none(),
+                "the gate serves no inbound: {active}"
+            );
+            assert!(super::apply::stamp_is_current());
+        })
+        .await;
+    }
+
+    /// The health gate proves the installed binary with an app-owned direct
+    /// configuration, so it never takes the elevated helper — a TUN session's
+    /// proof must not depend on an elevation ceremony or a consent prompt for
+    /// a configuration that carries no tun inbound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_health_gate_never_uses_the_elevated_helper() {
+        let mut runtime = runtime();
+        assert!(
+            !runtime.uses_elevated_helper(),
+            "a direct session never uses the helper"
+        );
+        runtime.requested_tun_mode = true;
+        assert!(
+            runtime.uses_elevated_helper(),
+            "a TUN session runs behind the helper"
+        );
+        runtime.gate_backend_alive = true;
+        assert!(
+            !runtime.uses_elevated_helper(),
+            "the gate's proof process is always a direct child"
+        );
+        runtime.gate_backend_alive = false;
+        assert!(runtime.uses_elevated_helper());
+    }
+
+    /// Seed the state a landed but unproven core update leaves: the installed
+    /// tree, the retained last-good tree, and the durable health marker.
+    fn seed_pending_swap(installed: &[u8], retained: &[u8]) {
+        let root = crate::sys::paths::broccoli_root();
+        let core = root.join("core");
+        let backup = root.join("core.bak");
+        std::fs::create_dir_all(&core).expect("create installed core dir");
+        std::fs::create_dir_all(&backup).expect("create retained core dir");
+        std::fs::write(core.join("xray.exe"), installed).expect("write installed payload");
+        std::fs::write(backup.join("xray.exe"), retained).expect("write retained payload");
+        std::fs::write(
+            root.join(".core-update.pending"),
+            b"broccoli-core-swap-v1\n",
+        )
+        .expect("write the durable swap marker");
+    }
+
+    /// A digest over every file name and byte of one tree: "the installed
+    /// payload is byte-identical" as a single value.
+    fn tree_hash(root: &std::path::Path) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(root)
+            .expect("read tree dir")
+            .map(|entry| {
+                let entry = entry.expect("tree entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("read tree file"),
+                )
             })
-            .await;
-        // The completed install arms the health-gate start; with no
-        // config.json yet, that start must settle into NoConfig, not Error.
-        runtime.housekeeping().await;
+            .collect();
+        files.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (name, bytes) in files {
+            name.hash(&mut hasher);
+            bytes.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
 
-        assert!(
-            matches!(runtime.phase, super::CorePhase::NoConfig),
-            "fresh install with no config must settle into NoConfig, got {:?}",
-            runtime.phase
+    /// Every configuration source names its own line: the log must say which
+    /// configuration the start runs, and no two sources may share a line.
+    #[test]
+    fn every_spawn_config_source_names_its_own_line() {
+        let keys = [
+            super::SpawnConfigSource::Committed,
+            super::SpawnConfigSource::CoreGate,
+            super::SpawnConfigSource::RolledBackReplay,
+            super::SpawnConfigSource::SavedState,
+        ]
+        .map(|source| source.notice().key());
+        assert_eq!(
+            keys,
+            [
+                Key::RtLogSpawnConfigCommitted,
+                Key::RtLogSpawnConfigGate,
+                Key::RtLogSpawnConfigReplay,
+                Key::RtLogSpawnConfigRegenerated,
+            ]
         );
-        let emitted: Vec<_> = events.try_iter().collect();
-        assert!(
-            emitted
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gate_start_config_error_keeps_the_installed_core() {
+        with_appdata_async(async {
+            seed_pending_swap(b"installed-v26.9.9", b"retained-v26.7.28");
+            let installed_before = tree_hash(&crate::sys::paths::core_dir());
+
+            let (mut runtime, events) = runtime_with_events();
+            runtime.core_update.commit_candidate();
+            runtime.set_phase(super::CorePhase::Starting);
+            runtime.push_ring("[stdout] 2026/09/18 failed to parse config");
+            runtime.on_core_exit(Some(23)).await;
+
+            assert_eq!(
+                tree_hash(&crate::sys::paths::core_dir()),
+                installed_before,
+                "a config-class failure must not touch the verified payload"
+            );
+            assert!(
+                !crate::sys::core_dl::update_pending_health(),
+                "the update must end as installed"
+            );
+            assert!(
+                !crate::sys::paths::broccoli_root().join("core.bak").exists(),
+                "ending the update as installed consumes the retained tree"
+            );
+            assert!(!runtime.core_update.is_candidate_pending());
+            let super::CorePhase::Error(error) = &runtime.phase else {
+                panic!(
+                    "expected the config-class Error phase, got {:?}",
+                    runtime.phase
+                );
+            };
+            assert_eq!(phase_message(error).key(), Key::RtPhaseConfigError);
+            assert!(error.tail.contains("failed to parse config"));
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, CoreEvt::Download(_))),
+                "no rollback report may reach the GUI, got: {emitted:?}"
+            );
+            let logs = app_log_texts(&emitted);
+            let kept: Vec<&String> = logs
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(super::CorePhase::NoConfig)))
-        );
-        assert!(
-            !emitted
+                .filter(|line| line.starts_with(frame_prefix(Key::RtLogConfigKeptInstalledCore)))
+                .collect();
+            assert_eq!(
+                kept.len(),
+                1,
+                "the config-class finding must reach the log once, got: {logs:?}"
+            );
+            assert!(
+                kept[0].contains(t(Language::En, Key::RtPhaseConfigError)),
+                "the kept-core line must carry the core's config error, got: {kept:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn healthy_gate_start_completes_the_update_then_ends_the_proof_process() {
+        with_appdata_async(async {
+            seed_pending_swap(b"installed-v26.9.9", b"retained-v26.7.28");
+
+            let (mut runtime, events) = runtime_with_events();
+            runtime.core_update.commit_candidate();
+            runtime.set_phase(super::CorePhase::Starting);
+            // The start that proved the binary ran the app-owned
+            // configuration; its readiness ACKs the update and ends it.
+            runtime.gate_backend_alive = true;
+            runtime.complete_readiness_probe(true).await;
+
+            assert!(
+                !crate::sys::core_dl::update_pending_health(),
+                "first readiness completes the update"
+            );
+            assert!(
+                !crate::sys::paths::broccoli_root().join("core.bak").exists(),
+                "a completed update consumes the retained tree"
+            );
+            assert!(!runtime.core_update.is_candidate_pending());
+            assert!(
+                runtime.exit_policy.stopping(),
+                "the gate's proof process must be ended, not left serving the app-owned config"
+            );
+            assert!(!runtime.gate_backend_alive);
+            assert!(
+                !matches!(runtime.phase, super::CorePhase::Running),
+                "a gate start must never become the running session, got {:?}",
+                runtime.phase
+            );
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, CoreEvt::Download(_))),
+                "a healthy gate is no rollback, got: {emitted:?}"
+            );
+            assert!(
+                app_log_texts(&emitted)
+                    .contains(&t(Language::En, Key::RtLogHealthGateCompleted).to_string()),
+                "the completed gate must say the update is acknowledged and its core stopped, \
+                 got: {emitted:?}"
+            );
+
+            // The confirmed exit settles the phase and releases the update
+            // operation.
+            runtime.on_core_exit(Some(0)).await;
+            assert!(matches!(runtime.phase, super::CorePhase::Stopped));
+            assert!(runtime.jobs.busy_kind().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_generation_refusal_during_a_pending_update_keeps_the_installed_core() {
+        with_appdata_async(async {
+            seed_pending_swap(b"installed-v26.9.9", b"retained-v26.7.28");
+            let installed_before = tree_hash(&crate::sys::paths::core_dir());
+            // The saved profiles still carry the retired spelling the pinned
+            // core refuses (infra/conf/xray.go:262), so the app's own
+            // generation refuses before any spawn.
+            let mut profile = ServerProfile {
+                id: "0123456789abcdef".into(),
+                name: "Stale edge".into(),
+                outbound: OutboundModel::new(Protocol::Freedom),
+                ..ServerProfile::new("Stale edge", OutboundModel::new(Protocol::Freedom))
+            };
+            profile.outbound.retired_proxy_settings = Some(serde_json::json!({"tag": "direct"}));
+            let servers = crate::model::ServersFile {
+                profiles: vec![profile.clone()],
+                active: Some(profile.id.clone()),
+                ..crate::model::ServersFile::default()
+            };
+            servers.save().expect("save the marked profile set");
+
+            let (mut runtime, events) = runtime_with_events();
+            runtime.core_update.commit_candidate();
+            runtime.start_backend().await;
+
+            let emitted: Vec<_> = events.try_iter().collect();
+            let logs = app_log_texts(&emitted);
+            let kept: Vec<&String> = logs
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(super::CorePhase::Error(_))))
-        );
+                .filter(|line| line.starts_with(frame_prefix(Key::RtLogConfigKeptInstalledCore)))
+                .collect();
+            assert_eq!(
+                kept.len(),
+                1,
+                "the config-class finding must reach the log once, got: {logs:?}"
+            );
+            assert!(
+                kept[0].contains(frame_prefix(Key::GenerationFailed)),
+                "the kept-core line must carry the failure that kept it, got: {kept:?}"
+            );
+            assert_eq!(
+                tree_hash(&crate::sys::paths::core_dir()),
+                installed_before,
+                "a generation refusal must not touch the verified payload"
+            );
+            assert!(
+                !crate::sys::core_dl::update_pending_health(),
+                "the update must end as installed"
+            );
+            assert!(
+                !crate::sys::paths::broccoli_root().join("core.bak").exists(),
+                "ending the update as installed consumes the retained tree"
+            );
+            assert!(!runtime.core_update.is_candidate_pending());
+            let super::CorePhase::Error(error) = &runtime.phase else {
+                panic!(
+                    "expected the configuration-finding Error phase, got {:?}",
+                    runtime.phase
+                );
+            };
+            let text = error.message.text(Language::En);
+            assert!(
+                text.contains("proxySettings")
+                    && text.contains("streamSettings.sockopt.dialerProxy"),
+                "the app's own finding must reach the user, got: {text}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_regenerates_from_the_saved_state_over_a_stored_artefact() {
+        with_appdata_async(async {
+            let profile = ServerProfile {
+                id: "0123456789abcdef".into(),
+                name: "Saved edge".into(),
+                outbound: OutboundModel::new(Protocol::Freedom),
+                ..ServerProfile::new("Saved edge", OutboundModel::new(Protocol::Freedom))
+            };
+            let servers = crate::model::ServersFile {
+                profiles: vec![profile.clone()],
+                active: Some(profile.id.clone()),
+                ..crate::model::ServersFile::default()
+            };
+            servers.save().expect("save the server list");
+            crate::model::Settings::default()
+                .save()
+                .expect("save the settings");
+            // The artefact a previous build left behind, stamp included.
+            std::fs::create_dir_all(crate::sys::paths::config_dir()).expect("config dir");
+            std::fs::write(
+                super::apply::active_path(),
+                br#"{"log":{"loglevel":"debug"},"previousBuild":true}"#,
+            )
+            .expect("write the stored artefact");
+            std::fs::write(
+                super::apply::meta_path(),
+                br#"{"appVersion":"0.0.1","corePin":"v1.0.0"}"#,
+            )
+            .expect("write the foreign stamp");
+
+            let (mut runtime, events) = runtime_with_events();
+            runtime.start_backend().await;
+
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(
+                app_log_texts(&emitted)
+                    .contains(&t(Language::En, Key::RtLogSpawnConfigRegenerated).to_string()),
+                "the start must name the configuration it runs, got: {emitted:?}"
+            );
+
+            let active: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(super::apply::active_path()).expect("read the regenerated artefact"),
+            )
+            .expect("the regenerated artefact parses");
+            assert!(
+                active.get("previousBuild").is_none(),
+                "the stored artefact must not be replayed: {active}"
+            );
+            let tag = profile.tag();
+            assert!(
+                active["outbounds"]
+                    .as_array()
+                    .expect("generated outbounds")
+                    .iter()
+                    .any(|outbound| outbound["tag"] == serde_json::json!(tag)),
+                "the configuration must come from the saved server list: {active}"
+            );
+            assert!(super::apply::stamp_is_current());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_gate_start_runs_the_app_owned_configuration_not_the_users_profiles() {
+        with_appdata_async(async {
+            let profile = ServerProfile {
+                id: "0123456789abcdef".into(),
+                name: "Tokyo edge".into(),
+                outbound: OutboundModel::new(Protocol::Freedom),
+                ..ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom))
+            };
+            let servers = crate::model::ServersFile {
+                profiles: vec![profile.clone()],
+                active: Some(profile.id.clone()),
+                ..crate::model::ServersFile::default()
+            };
+            servers.save().expect("save the server list");
+
+            let (mut runtime, events) = runtime_with_events();
+            runtime.core_update.commit_candidate();
+            runtime.update_gate_start = true;
+            runtime.start_backend().await;
+
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(
+                app_log_texts(&emitted)
+                    .contains(&t(Language::En, Key::RtLogSpawnConfigGate).to_string()),
+                "the gate start must name the app-owned configuration, got: {emitted:?}"
+            );
+
+            let active_text = std::fs::read_to_string(super::apply::active_path())
+                .expect("the gate start must write the runtime artefact");
+            let active: serde_json::Value =
+                serde_json::from_str(&active_text).expect("the gate configuration parses");
+            let mut tags: Vec<&str> = active["outbounds"]
+                .as_array()
+                .expect("gate outbounds")
+                .iter()
+                .filter_map(|outbound| outbound["tag"].as_str())
+                .collect();
+            tags.sort_unstable();
+            assert_eq!(
+                tags,
+                ["block", "direct"],
+                "a direct outbound and nothing else"
+            );
+            assert!(
+                active.get("inbounds").is_none(),
+                "the gate serves no inbound: {active}"
+            );
+            assert!(
+                !active_text.contains(&profile.tag()),
+                "no user profile may reach the gate configuration"
+            );
+            assert!(super::apply::stamp_is_current());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rolled_back_artefact_is_replayed_only_under_this_builds_stamp() {
+        with_appdata_async(async {
+            let servers = crate::model::ServersFile::default();
+            servers.save().expect("save the server list");
+            crate::model::Settings::default()
+                .save()
+                .expect("save the settings");
+            std::fs::create_dir_all(crate::sys::paths::config_dir()).expect("config dir");
+
+            // A foreign-stamped artefact is regenerated, never replayed.
+            std::fs::write(
+                super::apply::active_path(),
+                br#"{"log":{"loglevel":"debug"},"foreignArtefact":true}"#,
+            )
+            .expect("write the foreign artefact");
+            std::fs::write(
+                super::apply::meta_path(),
+                br#"{"appVersion":"0.0.1","corePin":"v1.0.0"}"#,
+            )
+            .expect("write the foreign stamp");
+            let (mut runtime, _events) = runtime_with_events();
+            runtime.replay_after_rollback = true;
+            runtime.start_backend().await;
+            let regenerated = std::fs::read_to_string(super::apply::active_path())
+                .expect("read the regenerated artefact");
+            assert!(
+                !regenerated.contains("foreignArtefact"),
+                "a foreign-stamped artefact must not be replayed: {regenerated}"
+            );
+            assert!(super::apply::stamp_is_current());
+
+            // This build's stamp replays the stored artefact byte for byte.
+            let stored = br#"{"api":{"tag":"api","listen":"127.0.0.1:45999","services":["StatsService"]},"replayedArtefact":true}"#;
+            std::fs::write(super::apply::active_path(), stored).expect("write the stored artefact");
+            let stamp = format!(
+                r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{}"}}"#,
+                env!("CARGO_PKG_VERSION"),
+                crate::sys::core_dl::pinned_release_version(),
+                super::apply::sha256_hex(stored)
+            );
+            std::fs::write(super::apply::meta_path(), stamp).expect("write this build's stamp");
+            assert!(
+                super::apply::stamp_is_current(),
+                "a stamp describing the stored bytes must match"
+            );
+            runtime.replay_after_rollback = true;
+            runtime.start_backend().await;
+            assert_eq!(
+                std::fs::read(super::apply::active_path()).expect("read the replayed artefact"),
+                stored,
+                "the deliberate rollback replay runs the stored artefact unchanged"
+            );
+        })
+        .await;
     }
 }

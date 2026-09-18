@@ -128,13 +128,6 @@ pub(super) fn spend_retry_attempt(spent: &mut u8, budget: u8) -> Option<u8> {
     Some(*spent)
 }
 
-/// Whether an exit-23 startup failure may retry once from the last known-good
-/// config: only while the one-shot retry is unspent and a last-good config
-/// exists.
-pub(super) fn config_error_retry_eligible(retry_spent: bool, lastgood_present: bool) -> bool {
-    !retry_spent && lastgood_present
-}
-
 /// Rollback-arming gate shared by the config-apply and core-update groups:
 /// only an unproven candidate may arm a rollback, and only while none is
 /// armed already (a second pre-readiness exit must not replace the retained
@@ -234,6 +227,9 @@ pub(super) enum ExitBranch {
     /// A pending config-apply candidate exited before readiness: retry or
     /// roll back per the pre-readiness rules.
     CandidatePreReadiness,
+    /// A pending core-update candidate exited with the core's config-load
+    /// code: a configuration-class failure, which keeps the installed core.
+    UpdateConfigError,
     /// A pending core-update candidate exited before readiness.
     UpdatePreReadiness,
     /// Exit 23 outside both candidate paths: the startup config error.
@@ -268,6 +264,11 @@ pub(super) struct CoreExitFacts {
 /// (config, then update), then a silenced stop, then a requested
 /// restart/stop, then the two pre-readiness candidates, then the exit-23
 /// config error, and finally the backoff restart.
+///
+/// The core's config-load code outranks the update candidate: a config-class
+/// failure is evidence about a configuration, never about the payload the
+/// hashes already verified, so it must reach the handler that keeps the
+/// installed core instead of the update rollback.
 pub(super) fn classify_core_exit(facts: CoreExitFacts) -> ExitBranch {
     if facts.config_rollback_armed {
         return ExitBranch::ConfigRollback;
@@ -285,6 +286,9 @@ pub(super) fn classify_core_exit(facts: CoreExitFacts) -> ExitBranch {
         return ExitBranch::CandidatePreReadiness;
     }
     if facts.update_candidate_pending && facts.starting {
+        if facts.code == Some(CONFIG_ERROR_EXIT_CODE) {
+            return ExitBranch::UpdateConfigError;
+        }
         return ExitBranch::UpdatePreReadiness;
     }
     if facts.code == Some(CONFIG_ERROR_EXIT_CODE) {
@@ -394,14 +398,28 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_config_error_retry_needs_a_lastgood() {
-        assert!(config_error_retry_eligible(false, true));
-        assert!(
-            !config_error_retry_eligible(true, true),
-            "the last-good retry is one-shot"
-        );
-        assert!(!config_error_retry_eligible(false, false));
-        assert!(!config_error_retry_eligible(true, false));
+    fn exit_23_during_a_pending_update_is_a_config_failure_not_an_update_failure() {
+        let mut facts = CoreExitFacts {
+            config_rollback_armed: false,
+            update_rollback_armed: false,
+            intent: ExitIntent::Idle,
+            config_candidate_pending: false,
+            update_candidate_pending: true,
+            starting: true,
+            code: None,
+        };
+        // The config-load code with an unproven update candidate: the
+        // configuration is the failure, the payload is not.
+        facts.code = Some(CONFIG_ERROR_EXIT_CODE);
+        assert_eq!(classify_core_exit(facts), ExitBranch::UpdateConfigError);
+        // Any other pre-readiness exit still blames the update candidate.
+        facts.code = Some(-1);
+        assert_eq!(classify_core_exit(facts), ExitBranch::UpdatePreReadiness);
+        // The config-load code without an update gate stays the plain startup
+        // config error.
+        facts.update_candidate_pending = false;
+        facts.code = Some(CONFIG_ERROR_EXIT_CODE);
+        assert_eq!(classify_core_exit(facts), ExitBranch::ConfigError);
     }
 
     #[test]
@@ -532,11 +550,17 @@ mod tests {
         let mut f = facts();
         f.code = Some(CONFIG_ERROR_EXIT_CODE);
         f.config_candidate_pending = true;
-        assert_eq!(classify_core_exit(f), ExitBranch::CandidatePreReadiness);
+        assert_eq!(
+            classify_core_exit(f),
+            ExitBranch::CandidatePreReadiness,
+            "a failed config candidate owns its own exit, update pending or not"
+        );
+        // The update candidate does not own the config-load code: that code is
+        // the config-class branch, which keeps the installed core.
         f.config_candidate_pending = false;
         f.update_candidate_pending = true;
         f.starting = true;
-        assert_eq!(classify_core_exit(f), ExitBranch::UpdatePreReadiness);
+        assert_eq!(classify_core_exit(f), ExitBranch::UpdateConfigError);
     }
 
     #[test]

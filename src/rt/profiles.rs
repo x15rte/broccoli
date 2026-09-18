@@ -481,7 +481,7 @@ mod tests {
     use crate::model::settings::Language;
     use crate::model::validation::{Severity, validate_outbound, validate_profiles};
     use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
-    use crate::sys::appdata::with_appdata_async;
+    use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect};
 
     fn request(profiles: Vec<ServerProfile>) -> ProfileValidationRequest {
         ProfileValidationRequest {
@@ -1000,6 +1000,12 @@ mod tests {
         // The worker's full path: with the marked sibling stood in for, a
         // healthy candidate reaches `xray run -test` and comes back accepted
         // — the trapped draft save of the reported deadlock now commits.
+        //
+        // The tree copied below lives in the real `%APPDATA%` root, so the
+        // redirect lock is held across the whole body: a concurrent test's
+        // redirect must never decide what this test copies, and this test's own
+        // redirect must never race a concurrent reader.
+        let _appdata_lock = APPDATA_ENV_LOCK.lock().await;
         let managed_core = crate::sys::paths::core_dir();
         let missing: Vec<&str> = MANAGED_CORE_FILES
             .iter()
@@ -1014,40 +1020,50 @@ mod tests {
             );
             return;
         }
-        with_appdata_async(async {
-            let seeded_core = crate::sys::paths::core_dir();
-            std::fs::create_dir_all(&seeded_core).expect("create redirected core dir");
-            for name in MANAGED_CORE_FILES {
-                let target = seeded_core.join(name);
-                std::fs::copy(managed_core.join(name), &target)
-                    .unwrap_or_else(|error| panic!("seed {name}: {error}"));
-            }
-
-            let sibling = marked_profile("stale-sibling", "0123456789abcdef");
-            let candidate = import_profile("candidate", "fedcba9876543210");
-            let mut request = request(vec![candidate.clone()]);
-            request.origin = ProfileValidationOrigin::Draft;
-            request.draft_target = Some(super::ToolTarget::AddDraft {
-                profile_id: candidate.id.clone(),
-                generation: 1,
-            });
-            request.servers = ServersFile {
-                profiles: vec![sibling.clone()],
-                active: Some(sibling.id.clone()),
-                ..ServersFile::default()
-            };
-            let verdict = validate(request, &AtomicBool::new(false))
-                .await
-                .expect("the worker walks the profile list");
-            assert!(
-                verdict.rejected.is_empty(),
-                "the healthy candidate must reach the core and pass: {:?}",
-                verdict.rejected
+        // The copied tree must verify against the compiled release pins;
+        // otherwise the worker's `xray -test` leg fails on the core, not on
+        // the candidate, and the assertion below would blame the candidate.
+        if crate::sys::core_dl::open_verified_core(&managed_core).is_err() {
+            eprintln!(
+                "skipping the marked-sibling draft-save test: the managed core at {} does not \
+                 match the compiled release pins",
+                managed_core.display()
             );
-            assert_eq!(verdict.accepted.len(), 1, "{:?}", verdict.accepted);
-            assert_eq!(verdict.accepted[0].id, candidate.id);
-        })
-        .await;
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("temporary AppData root");
+        let _appdata = AppDataRedirect::to(temporary.path());
+        let seeded_core = crate::sys::paths::core_dir();
+        std::fs::create_dir_all(&seeded_core).expect("create redirected core dir");
+        for name in MANAGED_CORE_FILES {
+            let target = seeded_core.join(name);
+            std::fs::copy(managed_core.join(name), &target)
+                .unwrap_or_else(|error| panic!("seed {name}: {error}"));
+        }
+
+        let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+        let candidate = import_profile("candidate", "fedcba9876543210");
+        let mut request = request(vec![candidate.clone()]);
+        request.origin = ProfileValidationOrigin::Draft;
+        request.draft_target = Some(super::ToolTarget::AddDraft {
+            profile_id: candidate.id.clone(),
+            generation: 1,
+        });
+        request.servers = ServersFile {
+            profiles: vec![sibling.clone()],
+            active: Some(sibling.id.clone()),
+            ..ServersFile::default()
+        };
+        let verdict = validate(request, &AtomicBool::new(false))
+            .await
+            .expect("the worker walks the profile list");
+        assert!(
+            verdict.rejected.is_empty(),
+            "the healthy candidate must reach the core and pass: {:?}",
+            verdict.rejected
+        );
+        assert_eq!(verdict.accepted.len(), 1, "{:?}", verdict.accepted);
+        assert_eq!(verdict.accepted[0].id, candidate.id);
     }
 
     // ---------- cooperative cancellation ----------

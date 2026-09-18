@@ -440,6 +440,50 @@ fn classify_latency_probe_ipv6(ip: Ipv6Addr) -> Option<&'static str> {
     None
 }
 
+/// Build the app-owned configuration the core-update health gate starts: a
+/// direct outbound plus the control-plane listener, nothing else. Like
+/// [`generate_latency_probe`], this deliberately consults neither `Settings`
+/// nor the server list — the gate answers only "does this installed core run
+/// and answer", so no user profile or setting may decide whether an install
+/// is accepted. The stats policy rides along because the gate's start is a
+/// full managed-core start that the app polls like any other.
+pub fn generate_core_gate(api_port: u16) -> Result<Value, GenerateError> {
+    if api_port == 0 {
+        return Err(GenerateError::InvalidModel(Diag::new(
+            Key::GenApiListenerPortZero,
+        )));
+    }
+    let mut root = Map::new();
+    root.insert(
+        "log".into(),
+        // Access log pinned off: the gate's captured stdout is a failure
+        // diagnostic, never a traffic record.
+        json!({ "loglevel": "warning", "access": "none" }),
+    );
+    root.insert("stats".into(), json!({}));
+    root.insert(
+        "api".into(),
+        json!({
+            "tag": API_INBOUND_TAG,
+            "listen": format!("127.0.0.1:{api_port}"),
+            "services": API_SERVICES,
+        }),
+    );
+    root.insert(
+        "policy".into(),
+        json!({ "system": {
+            "statsInboundUplink": true,
+            "statsInboundDownlink": true,
+            "statsOutboundUplink": true,
+            "statsOutboundDownlink": true,
+        } }),
+    );
+    let mut out = Vec::new();
+    append_builtin_outbounds(&mut out);
+    root.insert("outbounds".into(), Value::Array(out));
+    Ok(Value::Object(root))
+}
+
 /// Build the minimal temporary configuration used by the isolated latency
 /// probe. This deliberately does not consult `Settings`, so raw overrides and
 /// persistent observatory settings cannot leak into the one-shot child.
