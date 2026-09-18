@@ -1299,7 +1299,10 @@ pub struct FinalmaskQuicParams {
     pub max_idle_timeout: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive_period: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "disablePathMTUDiscovery",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disable_path_mtu_discovery: Option<bool>,
     /// `disableChromeParrot`: the dialer passes `!disable_chrome_parrot` as
     /// `ChromeParrot` (`transport/internet/hysteria/dialer.go:90`).
@@ -1313,8 +1316,13 @@ pub struct FinalmaskQuicParams {
     pub disable_gso: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_incoming_streams: Option<i64>,
-    /// `disableStatelessReset`: suppresses the QUIC stateless-reset key
-    /// (`transport/internet/hysteria/hub.go:334`).
+    /// `disableStatelessReset`: upstream reads it on listener sessions only —
+    /// the hubs build the QUIC transport's stateless-reset key
+    /// (`transport/internet/hysteria/hub.go:334`,
+    /// `transport/internet/splithttp/hub.go:510`) while the dialers build
+    /// theirs without one (`hysteria/dialer.go:142`). Broccoli generates
+    /// client configurations, so the editor offers no row for it; the field
+    /// stays for lossless round-trip and raw-override use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_stateless_reset: Option<bool>,
     #[serde(flatten)]
@@ -1323,32 +1331,10 @@ pub struct FinalmaskQuicParams {
 
 impl<'de> Deserialize<'de> for FinalmaskQuicParams {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// Wire mirror of [`FinalmaskQuicParams`] without the retired-key
-        /// hook. Every field above must be mirrored here.
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "camelCase", default)]
-        struct Object {
-            congestion: String,
-            debug: Option<bool>,
-            bbr_profile: String,
-            brutal_up: String,
-            brutal_down: String,
-            brutal_disable_loss_compensation: Option<bool>,
-            init_stream_receive_window: Option<u64>,
-            max_stream_receive_window: Option<u64>,
-            init_connection_receive_window: Option<u64>,
-            max_connection_receive_window: Option<u64>,
-            max_idle_timeout: Option<i64>,
-            keep_alive_period: Option<i64>,
-            disable_path_mtu_discovery: Option<bool>,
-            disable_chrome_parrot: Option<bool>,
-            #[serde(rename = "disableGSO")]
-            disable_gso: Option<bool>,
-            max_incoming_streams: Option<i64>,
-            disable_stateless_reset: Option<bool>,
-            #[serde(flatten)]
-            extra: Map<String, Value>,
-        }
+        let value = Value::deserialize(deserializer)?;
+        let Value::Object(mut object) = value else {
+            return Err(serde::de::Error::custom("quicParams must be an object"));
+        };
 
         // The retired `udpHop` key never fails the load — the profile is
         // marked instead. Its raw value is kept so the settings file
@@ -1361,42 +1347,67 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
         // every case variant is consumed: the last match visited survives
         // for re-emission and the rest are dropped, so none can survive as
         // an unknown key.
-        let object = Object::deserialize(deserializer)?;
         let null_valued = object
-            .extra
             .iter()
             .any(|(key, value)| key.eq_ignore_ascii_case("udpHop") && value.is_null());
         let mut retired_udp_hop = None;
-        let mut extra = Map::new();
-        for (key, value) in object.extra {
+        object.retain(|key, value| {
             if key.eq_ignore_ascii_case("udpHop") {
                 if !null_valued {
-                    retired_udp_hop = Some(value);
+                    retired_udp_hop = Some(value.clone());
                 }
+                false
             } else {
-                extra.insert(key, value);
+                true
+            }
+        });
+        // An older build of this app wrote the MTU switch in the plain
+        // camelCase spelling (`disablePathMtuDiscovery`); the core binds it
+        // case-insensitively either way. Fold it into the upstream key so
+        // the value stays tracked by the field instead of becoming an
+        // unknown key that the editor cannot show.
+        if let Some(value) = object.remove("disablePathMtuDiscovery") {
+            object
+                .entry("disablePathMTUDiscovery".to_string())
+                .or_insert(value);
+        }
+
+        /// One typed field of the wire object: absent takes the field's
+        /// default, and a value that cannot express the field is fatal with
+        /// the key named — the sibling blocks parse through the same
+        /// field-path seam.
+        fn take<T, E>(object: &mut Map<String, Value>, key: &str) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned + Default,
+            E: serde::de::Error,
+        {
+            match object.remove(key) {
+                Some(value) => crate::model::outbound::from_value_path(value)
+                    .map_err(|error| E::custom(format!("invalid {key}: {error}"))),
+                None => Ok(T::default()),
             }
         }
+
         Ok(Self {
-            congestion: object.congestion,
-            debug: object.debug,
-            bbr_profile: object.bbr_profile,
-            brutal_up: object.brutal_up,
-            brutal_down: object.brutal_down,
-            brutal_disable_loss_compensation: object.brutal_disable_loss_compensation,
+            congestion: take(&mut object, "congestion")?,
+            debug: take(&mut object, "debug")?,
+            bbr_profile: take(&mut object, "bbrProfile")?,
+            brutal_up: take(&mut object, "brutalUp")?,
+            brutal_down: take(&mut object, "brutalDown")?,
+            brutal_disable_loss_compensation: take(&mut object, "brutalDisableLossCompensation")?,
             retired_udp_hop,
-            init_stream_receive_window: object.init_stream_receive_window,
-            max_stream_receive_window: object.max_stream_receive_window,
-            init_connection_receive_window: object.init_connection_receive_window,
-            max_connection_receive_window: object.max_connection_receive_window,
-            max_idle_timeout: object.max_idle_timeout,
-            keep_alive_period: object.keep_alive_period,
-            disable_path_mtu_discovery: object.disable_path_mtu_discovery,
-            disable_chrome_parrot: object.disable_chrome_parrot,
-            disable_gso: object.disable_gso,
-            max_incoming_streams: object.max_incoming_streams,
-            disable_stateless_reset: object.disable_stateless_reset,
-            extra,
+            init_stream_receive_window: take(&mut object, "initStreamReceiveWindow")?,
+            max_stream_receive_window: take(&mut object, "maxStreamReceiveWindow")?,
+            init_connection_receive_window: take(&mut object, "initConnectionReceiveWindow")?,
+            max_connection_receive_window: take(&mut object, "maxConnectionReceiveWindow")?,
+            max_idle_timeout: take(&mut object, "maxIdleTimeout")?,
+            keep_alive_period: take(&mut object, "keepAlivePeriod")?,
+            disable_path_mtu_discovery: take(&mut object, "disablePathMTUDiscovery")?,
+            disable_chrome_parrot: take(&mut object, "disableChromeParrot")?,
+            disable_gso: take(&mut object, "disableGSO")?,
+            max_incoming_streams: take(&mut object, "maxIncomingStreams")?,
+            disable_stateless_reset: take(&mut object, "disableStatelessReset")?,
+            extra: object,
         })
     }
 }
@@ -2344,6 +2355,35 @@ mod tests {
                 "disableStatelessReset": false
             }),
             "each switch must keep its upstream spelling"
+        );
+    }
+
+    #[test]
+    fn quic_path_mtu_switch_keeps_the_upstream_spelling_and_folds_the_legacy_one() {
+        // `disablePathMTUDiscovery` is the upstream key. An older build of
+        // this app wrote the plain camelCase spelling for it; that value now
+        // stays tracked by the field (the core binds both spellings
+        // case-insensitively) and re-emits under the upstream key only.
+        let legacy: super::FinalmaskQuicParams = serde_json::from_value(json!({
+            "disablePathMtuDiscovery": true
+        }))
+        .expect("the legacy spelling loads");
+        assert_eq!(legacy.disable_path_mtu_discovery, Some(true));
+        assert!(legacy.extra.is_empty());
+        assert_eq!(
+            serde_json::to_value(&legacy).expect("the switch serializes"),
+            json!({"disablePathMTUDiscovery": true})
+        );
+
+        let canonical: super::FinalmaskQuicParams = serde_json::from_value(json!({
+            "disablePathMTUDiscovery": false
+        }))
+        .expect("the upstream spelling loads");
+        assert_eq!(canonical.disable_path_mtu_discovery, Some(false));
+        assert!(canonical.extra.is_empty());
+        assert_eq!(
+            serde_json::to_value(&canonical).expect("the switch serializes"),
+            json!({"disablePathMTUDiscovery": false})
         );
     }
 

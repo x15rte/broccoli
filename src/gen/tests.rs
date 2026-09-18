@@ -3659,10 +3659,16 @@ fn interval_hop_advisory_never_gates_generation() {
     );
     generate_deterministic(&servers, &base_settings()).expect("a warning-only profile must apply");
 
-    // The same mask over a migrating transport carries no advisory at all.
+    // The same mask over a transport that can run the hop carries no
+    // advisory at all: xhttp counts only in its HTTP/3 shape — TLS with ALPN
+    // exactly ["h3"] — so that is the shape asserted here.
     let mut ob = vless_over_tls();
     ob.stream.network = Network::Xhttp;
     ob.stream.xhttp_settings = Some(XhttpSettings::default());
+    ob.stream.tls_settings = Some(crate::model::stream::TlsModel {
+        alpn: vec!["h3".into()],
+        ..Default::default()
+    });
     ob.stream.finalmask = Some(hop(json!({"mode": "intervalLocal", "interval": "5-10"})));
     let servers = single_server(ob);
     let issues = validate_profiles(&servers.profiles, servers.active.as_deref(), false);
@@ -3672,5 +3678,6 @@ fn interval_hop_advisory_never_gates_generation() {
             .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopIntervalTransportConflict),
         "{issues:#?}"
     );
-    generate_deterministic(&servers, &base_settings()).expect("the xhttp shape must generate");
+    generate_deterministic(&servers, &base_settings())
+        .expect("the HTTP/3 xhttp shape must generate");
 }

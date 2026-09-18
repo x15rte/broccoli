@@ -1337,11 +1337,5 @@ pub(super) fn finalmask_quic_editor(
         &mut quic.max_incoming_streams,
         0..=i64::MAX,
     );
-    changed |= widgets::opt_bool(
-        ui,
-        "disableStatelessReset",
-        &mut quic.disable_stateless_reset,
-        t(lang, Key::SrvUnset),
-    );
     changed
 }

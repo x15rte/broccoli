@@ -4332,8 +4332,8 @@ mod en {
                 "{} must be the first UDP mask entry. Move it to the beginning of the list"
             }
             Key::FinalmaskUdpHopIntervalTransportConflict => {
-                "The udphop interval modes need a QUIC-based transport (hysteria2 or xhttp) or \
-                 WireGuard. Other transports work only with perConnRemote"
+                "The udphop interval modes need hysteria2, HTTP/3 xhttp, or WireGuard. Other \
+                 transports cannot run interval hops"
             }
             Key::FinalmaskQuicReceiveWindowTooSmall => {
                 "use 0 or a receive window of at least 16384 bytes"

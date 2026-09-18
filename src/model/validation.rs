@@ -231,15 +231,16 @@ pub enum ValidationCode {
     /// core starts and every dial fails, so this gates. Carries the mask
     /// type name.
     FinalmaskUdpMaskNotFirst(String),
-    /// A `udphop` mask carries an interval mode on a transport whose
-    /// connection cannot move to the hopped socket: `intervalLocal` dials a
-    /// fresh local socket per hop and `intervalRemote` re-rolls the remote
-    /// address (`transport/internet/finalmask/udphop/conn.go:96-135`), which
-    /// only a connection that migrates survives — the QUIC-based hysteria2
-    /// and splithttp transports, or the WireGuard outbound, whose client
-    /// applies the same mask manager to its own packet conn
-    /// (`proxy/wireguard/client.go:309-310`). Every other transport works
-    /// only with `perConnRemote`. The core starts either way, so this is a
+    /// A `udphop` mask carries an interval mode on a transport that cannot
+    /// run a hop: `intervalLocal` dials a fresh local socket per hop and
+    /// `intervalRemote` re-rolls the remote address
+    /// (`transport/internet/finalmask/udphop/conn.go:96-135`), so only a
+    /// transport that moves a live connection survives — hysteria2, the
+    /// splithttp HTTP/3 mode (TLS ALPN exactly `["h3"]`), or the WireGuard
+    /// outbound, whose client applies the same mask manager to its own
+    /// packet conn (`proxy/wireguard/client.go:309-310`). On every other
+    /// transport the mask list is either never wrapped or cannot carry the
+    /// connection across a hop. The core starts either way, so this is a
     /// configuration warning, never a gate.
     FinalmaskUdpHopIntervalTransportConflict,
     FinalmaskQuicReceiveWindowTooSmall,
@@ -1679,13 +1680,14 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
     }
 
     // Advisory: a `udphop` interval mode moves the outbound's socket, and
-    // only a connection that migrates survives the move. The QUIC-based
-    // transports migrate connections (hysteria2 — quic-go in
-    // `transport/internet/hysteria/dialer.go` — and the splithttp HTTP/3
-    // mode), and the WireGuard outbound applies the same mask manager to its
-    // own packet conn and follows endpoint changes
-    // (`proxy/wireguard/client.go:309-310`). Every other transport keeps one
-    // four-tuple, so only `perConnRemote` works there. The core starts
+    // only a transport that can move a live connection runs it: hysteria2
+    // (quic-go in `transport/internet/hysteria/dialer.go`), the splithttp
+    // HTTP/3 mode — TLS ALPN exactly `["h3"]`, which is the branch that
+    // applies the mask manager (`transport/internet/splithttp/dialer.go:216`)
+    // — and the WireGuard outbound, which applies the mask to its own packet
+    // conn and follows endpoint changes (`proxy/wireguard/client.go:309-310`).
+    // Every other transport either never wraps the mask list or cannot carry
+    // the connection across a hop, so the hop cannot run. The core starts
     // either way, so this is a configuration warning, never a gate.
     if finalmask_udp_hop_interval_mode(&o.stream) && !hop_transport_migrates_connections(o) {
         issues.push(warning(
@@ -2478,36 +2480,46 @@ fn finalmask_validate_udp_order(masks: &[FinalmaskUdpMask], issues: &mut Vec<Val
     }
 }
 
-/// True when a `udphop` UDP mask selects an interval mode (`intervalLocal`
-/// or `intervalRemote`, comma-combinable and case-insensitive, as the mask
-/// build parses it). Each interval hop moves or re-rolls the outbound's
-/// socket, unlike the per-connection `perConnRemote` roll.
+/// True when a `udphop` UDP mask selects an interval mode
+/// (`intervalLocal` or `intervalRemote`, comma-combinable and
+/// case-insensitive) over a well-formed `mode` set. Each hop moves or
+/// re-rolls the outbound's socket, unlike the per-connection `perConnRemote`
+/// roll.
 fn finalmask_udp_hop_interval_mode(stream: &StreamModel) -> bool {
-    stream.finalmask.as_ref().is_some_and(|finalmask| {
-        finalmask.udp.iter().any(|mask| {
-            let FinalmaskUdpMask::Udphop { settings, .. } = mask else {
-                return false;
-            };
-            settings.mode.split(',').any(|mode| {
-                matches!(
-                    mode.trim().to_ascii_lowercase().as_str(),
-                    "intervallocal" | "intervalremote"
-                )
-            })
-        })
-    })
+    stream
+        .finalmask
+        .as_ref()
+        .is_some_and(|finalmask| finalmask.udp.iter().any(finalmask_udphop_selects_interval))
 }
 
-/// True when the outbound's connection survives a hop to another socket:
-/// the QUIC-based transports migrate connections (hysteria2, and the
-/// splithttp HTTP/3 mode), and the WireGuard outbound reads the mask from
-/// its stream settings and wraps its own packet conn
-/// (`proxy/wireguard/client.go:309-310`). Every other transport keeps one
-/// four-tuple, so an interval hop breaks it and only `perConnRemote`
-/// applies.
+/// True when the transport can run an interval hop: hysteria2 and the
+/// splithttp HTTP/3 mode carry a QUIC connection that migrates, and the
+/// WireGuard outbound reads the mask from its stream settings and wraps its
+/// own packet conn, which follows endpoint changes
+/// (`proxy/wireguard/client.go:309-310`).
+///
+/// Splithttp dials HTTP/3 — and only that branch applies the mask manager
+/// (`transport/internet/splithttp/dialer.go:216`) — when its TLS ALPN is
+/// exactly `["h3"]`: REALITY forces HTTP/2 and a stream without TLS falls
+/// back to HTTP/1.1 (`.../splithttp/dialer.go:82-99`). Other transports
+/// either never wrap the mask list or cannot move a live connection, so an
+/// interval hop cannot run there.
 fn hop_transport_migrates_connections(outbound: &OutboundModel) -> bool {
-    matches!(&outbound.settings, ProtocolSettings::Wireguard(_))
-        || matches!(outbound.stream.network, Network::Hysteria | Network::Xhttp)
+    if matches!(&outbound.settings, ProtocolSettings::Wireguard(_)) {
+        return true;
+    }
+    match outbound.stream.network {
+        Network::Hysteria => true,
+        Network::Xhttp => {
+            outbound.stream.security == Security::Tls
+                && outbound
+                    .stream
+                    .tls_settings
+                    .as_ref()
+                    .is_some_and(|tls| tls.alpn.len() == 1 && tls.alpn[0] == "h3")
+        }
+        _ => false,
+    }
 }
 
 fn finalmask_valid_var_name(value: &str) -> bool {
@@ -3246,6 +3258,52 @@ fn finalmask_validate_udp_mask(
     }
 }
 
+/// One `udphop` `mode` name, matched the way the mask build matches it:
+/// split on `,`, lowercased, never trimmed
+/// (`infra/conf/transport_finalmask.go:925-940`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalmaskUdpHopMode {
+    IntervalLocal,
+    IntervalRemote,
+    PerConnRemote,
+}
+
+/// Classify one component of a `udphop` mask's `mode` value. `None` when the
+/// component is outside the three names — the mask build refuses that shape
+/// at config load, so the mode gate reports it and the interval-hop advisory
+/// stays silent for it rather than adding a second message for one value.
+fn finalmask_udphop_mode(component: &str) -> Option<FinalmaskUdpHopMode> {
+    match component.to_ascii_lowercase().as_str() {
+        "intervallocal" => Some(FinalmaskUdpHopMode::IntervalLocal),
+        "intervalremote" => Some(FinalmaskUdpHopMode::IntervalRemote),
+        "perconnremote" => Some(FinalmaskUdpHopMode::PerConnRemote),
+        _ => None,
+    }
+}
+
+/// True when one `udphop` mask selects an interval mode over a well-formed
+/// `mode` set. Each interval hop moves or re-rolls the outbound's socket,
+/// unlike the per-connection `perConnRemote` roll, so only a transport that
+/// moves a live connection runs it.
+fn finalmask_udphop_selects_interval(mask: &FinalmaskUdpMask) -> bool {
+    let FinalmaskUdpMask::Udphop { settings, .. } = mask else {
+        return false;
+    };
+    let mut interval = false;
+    for component in settings.mode.split(',') {
+        match finalmask_udphop_mode(component) {
+            // An invalid component is the mode gate's load error; the
+            // advisory never speaks for a mode set the profile cannot use.
+            None => return false,
+            Some(FinalmaskUdpHopMode::IntervalLocal | FinalmaskUdpHopMode::IntervalRemote) => {
+                interval = true;
+            }
+            Some(FinalmaskUdpHopMode::PerConnRemote) => {}
+        }
+    }
+    interval
+}
+
 /// Validate one `udphop` UDP mask's settings against the mask build and the
 /// wrap-time checks (`infra/conf/transport_finalmask.go:911-965` and
 /// `transport/internet/finalmask/udphop/conn.go:71-73`).
@@ -3254,16 +3312,18 @@ fn finalmask_validate_udphop(
     settings: &super::stream::FinalmaskUdpHop,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    // The build splits on ',' and lowercases each component, then refuses
-    // every one outside the three names; it never trims, so leading or
-    // trailing space is a load error, and an empty mode splits to one empty
-    // component that is refused too.
-    if settings.mode.split(',').any(|mode| {
-        !matches!(
-            mode.to_ascii_lowercase().as_str(),
-            "intervallocal" | "intervalremote" | "perconnremote"
-        )
-    }) {
+    // The build splits on ',' and refuses every component outside the three
+    // names, case-insensitively and without trimming each split part
+    // (`strings.Split` + `strings.ToLower`,
+    // `infra/conf/transport_finalmask.go:925-940`), so a whitespace-carrying
+    // component is refused too — the pinned core exits with `invalid mode
+    // intervalRemote` for `"intervalLocal, intervalRemote"`. An empty mode
+    // splits to one empty component and is refused as well.
+    if settings
+        .mode
+        .split(',')
+        .any(|component| finalmask_udphop_mode(component).is_none())
+    {
         issues.push(issue(
             ValidationCode::FinalmaskUdpHopModeInvalid,
             Some(format!("{path}.mode")),
@@ -4549,12 +4609,13 @@ mod tests {
                 .count()
         };
 
-        // Every interval spelling on a transport that keeps one four-tuple.
+        // Every interval spelling on a transport that cannot run a hop. The
+        // mode parse mirrors the load build: case-insensitive, no trimming.
         for mode in [
             "intervalLocal",
             "intervalRemote",
             "intervalLocal,intervalRemote",
-            "INTERVALREMOTE, intervallocal",
+            "INTERVALREMOTE,INTERVALLOCAL",
         ] {
             let mut outbound = OutboundModel::new(Protocol::Vless);
             outbound.stream.finalmask = Some(interval_mask(mode));
@@ -4570,24 +4631,73 @@ mod tests {
             assert_eq!(found[0].path, None);
         }
 
-        // A non-QUIC transport other than raw warns the same way.
-        for network in [Network::Ws, Network::Kcp, Network::Grpc] {
+        // A whitespace-carrying component is the mode load error's business
+        // alone: the advisory must not add a second message for one value.
+        let mut spaced = OutboundModel::new(Protocol::Vless);
+        spaced.stream.finalmask = Some(interval_mask("intervalLocal, intervalRemote"));
+        let issues = validate_outbound(&spaced);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopModeInvalid),
+            "{issues:#?}"
+        );
+        assert_eq!(advisory(&spaced), 0, "{issues:#?}");
+
+        // Transports that never wrap the mask list, or cannot move a live
+        // connection, warn the same way.
+        for network in [
+            Network::Ws,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Httpupgrade,
+        ] {
             let mut outbound = OutboundModel::new(Protocol::Vless);
             outbound.stream.network = network;
             outbound.stream.finalmask = Some(interval_mask("intervalLocal"));
             assert_eq!(advisory(&outbound), 1, "network {network:?}");
         }
 
-        // The transports whose connections migrate never warn.
-        for network in [Network::Hysteria, Network::Xhttp] {
-            let mut outbound = OutboundModel::new(Protocol::Vless);
-            outbound.stream.network = network;
-            outbound.stream.finalmask = Some(interval_mask("intervalLocal"));
-            assert_eq!(advisory(&outbound), 0, "network {network:?}");
-        }
+        // The transports that can run a hop never warn: hysteria2 and
+        // WireGuard unconditionally, xhttp only in its HTTP/3 shape (TLS
+        // with ALPN exactly ["h3"]).
+        let mut hysteria = OutboundModel::new(Protocol::Vless);
+        hysteria.stream.network = Network::Hysteria;
+        hysteria.stream.finalmask = Some(interval_mask("intervalLocal"));
+        assert_eq!(advisory(&hysteria), 0);
+
         let mut wireguard = OutboundModel::new(Protocol::Wireguard);
         wireguard.stream.finalmask = Some(interval_mask("intervalLocal,intervalRemote"));
         assert_eq!(advisory(&wireguard), 0);
+
+        let xhttp_with_tls = |alpn: Vec<String>| {
+            let mut outbound = OutboundModel::new(Protocol::Vless);
+            outbound.stream.network = Network::Xhttp;
+            outbound.stream.security = Security::Tls;
+            outbound.stream.tls_settings = Some(crate::model::stream::TlsModel {
+                alpn,
+                ..Default::default()
+            });
+            outbound.stream.finalmask = Some(interval_mask("intervalLocal"));
+            outbound
+        };
+        assert_eq!(advisory(&xhttp_with_tls(vec!["h3".into()])), 0);
+
+        // Every non-HTTP/3 xhttp shape warns: no TLS (HTTP/1.1), an empty or
+        // longer ALPN list and a non-h3 ALPN (HTTP/2), and REALITY, which
+        // forces HTTP/2 before the ALPN is read.
+        for alpn in [vec![], vec!["h2".into()], vec!["h3".into(), "h2".into()]] {
+            assert_eq!(advisory(&xhttp_with_tls(alpn.clone())), 1, "alpn {alpn:?}");
+        }
+        let mut no_tls = OutboundModel::new(Protocol::Vless);
+        no_tls.stream.network = Network::Xhttp;
+        no_tls.stream.finalmask = Some(interval_mask("intervalLocal"));
+        assert_eq!(advisory(&no_tls), 1);
+        let mut reality = OutboundModel::new(Protocol::Vless);
+        reality.stream.network = Network::Xhttp;
+        reality.stream.security = Security::Reality;
+        reality.stream.finalmask = Some(interval_mask("intervalLocal"));
+        assert_eq!(advisory(&reality), 1);
 
         // `perConnRemote`, a mask-free stream, and an unparsable mode never
         // raise the advisory.

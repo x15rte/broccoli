@@ -623,8 +623,9 @@ impl Default for ProtocolSettings {
 
 /// Deserialize a JSON value with the failing field path attached, so import
 /// errors identify the exact value the user must repair (`settings`,
-/// `streamSettings`, and `mux` all parse through this).
-fn from_value_path<T>(value: Value) -> Result<T, serde_json::Error>
+/// `streamSettings`, `mux`, and the QUIC parameter block all parse through
+/// this).
+pub(super) fn from_value_path<T>(value: Value) -> Result<T, serde_json::Error>
 where
     T: serde::de::DeserializeOwned,
 {

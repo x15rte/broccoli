@@ -11725,16 +11725,17 @@ TLS ping finished"#;
 
     #[test]
     fn quic_switch_rows_edit_and_round_trip_through_the_settings_file() {
-        // The four switches upstream added to `quicParams`
+        // The client-side switches upstream added to `quicParams`
         // (`infra/conf/transport_finalmask.go:993-1011`): each row is an
         // "(unset)/true/false" control, an unset switch never reaches the
         // generated configuration, and a set one survives a save/load cycle
-        // under its upstream key.
-        const SWITCH_KEYS: [&str; 4] = [
+        // under its upstream key. `disableStatelessReset` is listener-only
+        // upstream, so it gets no row — the model keeps it for round-trip
+        // and the raw override.
+        const SWITCH_KEYS: [&str; 3] = [
             "brutalDisableLossCompensation",
             "disableChromeParrot",
             "disableGSO",
-            "disableStatelessReset",
         ];
         let mut profile = ServerProfile::new("Hy", OutboundModel::new(Protocol::Hysteria));
         profile.outbound.settings = ProtocolSettings::Hysteria(crate::model::HysteriaSettings {
@@ -11754,7 +11755,20 @@ TLS ping finished"#;
         harness.get_by_label("Advanced").click();
         harness.run();
 
-        // Untouched, none of the four keys is emitted.
+        // The listener-only switch stays out of the editor.
+        {
+            use egui_kittest::kittest::NodeT as _;
+            assert!(
+                harness.root().children_recursive().all(|node| {
+                    let node = node.accesskit_node();
+                    node.label().as_deref() != Some("disableStatelessReset")
+                        && node.value().as_deref() != Some("disableStatelessReset")
+                }),
+                "the listener-only switch must not render an editor row"
+            );
+        }
+
+        // Untouched, none of the switches is emitted.
         let unset = harness
             .state()
             .0
@@ -11772,7 +11786,7 @@ TLS ping finished"#;
             );
         }
 
-        // Set all four through their editor rows.
+        // Set them all through their editor rows.
         for key in SWITCH_KEYS {
             quic_switch_combo(&harness, key).scroll_to_me();
             harness.run();
@@ -11787,7 +11801,10 @@ TLS ping finished"#;
         assert_eq!(edited.brutal_disable_loss_compensation, Some(true));
         assert_eq!(edited.disable_chrome_parrot, Some(true));
         assert_eq!(edited.disable_gso, Some(true));
-        assert_eq!(edited.disable_stateless_reset, Some(true));
+        assert_eq!(
+            edited.disable_stateless_reset, None,
+            "the row-less switch must stay unset"
+        );
 
         // The settings file keeps every set switch, and the reloaded profile
         // still holds it.
@@ -11820,7 +11837,6 @@ TLS ping finished"#;
         assert_eq!(reloaded_quic.brutal_disable_loss_compensation, Some(true));
         assert_eq!(reloaded_quic.disable_chrome_parrot, Some(true));
         assert_eq!(reloaded_quic.disable_gso, Some(true));
-        assert_eq!(reloaded_quic.disable_stateless_reset, Some(true));
 
         // And the generated configuration (what the preview shows) carries
         // them under the same keys.
