@@ -5,6 +5,29 @@ on:
   # pull_request events, so `push` for every branch just doubles the runs.
   push:
     branches: [main]
+    # A push that touches only source files, docs, assets, or another workflow
+    # cannot change the checked dependency graph, so it skips the run. Any path
+    # not named here still triggers, and deny.toml, the manifests, the lock, and
+    # this workflow's own file are deliberately absent from the list. Pull
+    # requests are never filtered, and the schedule below is unaffected, so the
+    # advisory window this run covers does not widen.
+    paths-ignore:
+      - ".gitignore"
+      - ".github/dependabot.yml"
+      - ".github/release-notes/**"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/vet.yml"
+      - "LICENSE"
+      - "README.md"
+      - "SECURITY.md"
+      - "assets/**"
+      - "broccoli.rc"
+      - "build.rs"
+      - "proto/**"
+      - "src/**"
+      - "supply-chain/**"
+      - "tests/**"
   pull_request:
   schedule:
     # Every three days: the advisory database changes without any commit here,

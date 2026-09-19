@@ -5,6 +5,25 @@ on:
   # pull_request events, so `push` for every branch just doubles the runs.
   push:
     branches: [main]
+    # A push that touches only material no build or test step reads skips the
+    # run. This list is the exception, not the rule: any path not named here
+    # still triggers, so a new file is covered by default, and this workflow's
+    # own file stays off the list — a change to it is only validated by running
+    # it. Pull requests are never filtered (a docs-only pull request must still
+    # report its check instead of leaving it pending), and a manual dispatch
+    # always runs the gate.
+    paths-ignore:
+      - ".gitignore"
+      - ".github/dependabot.yml"
+      - ".github/release-notes/**"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/deny.yml"
+      - ".github/workflows/vet.yml"
+      - "LICENSE"
+      - "README.md"
+      - "SECURITY.md"
+      - "deny.toml"
+      - "supply-chain/**"
   pull_request:
   workflow_dispatch:
 

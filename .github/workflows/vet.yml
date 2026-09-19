@@ -5,6 +5,28 @@ on:
   # pull_request events, so `push` for every branch just doubles the runs.
   push:
     branches: [main]
+    # A push that touches only source files, docs, assets, or another workflow
+    # cannot change the certified tree, so it skips the run. Any path not named
+    # here still triggers, and the manifests, the lock, supply-chain/, and this
+    # workflow's own file are deliberately absent from the list. Pull requests
+    # are never filtered, and a manual dispatch always runs the gate.
+    paths-ignore:
+      - ".gitignore"
+      - ".github/dependabot.yml"
+      - ".github/release-notes/**"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/vet.yml"
+      - "LICENSE"
+      - "README.md"
+      - "SECURITY.md"
+      - "assets/**"
+      - "broccoli.rc"
+      - "build.rs"
+      - "deny.toml"
+      - "proto/**"
+      - "src/**"
+      - "tests/**"
   pull_request:
   # No schedule: `cargo vet --locked` is deterministic against the
   # committed imports.lock, so an unchanged tree gives an identical result
