@@ -1,0 +1,87 @@
+name: CodeQL
+
+# Advanced code scanning setup (ADR-0047). Default setup ran the same two
+# analyses on every push with no filter and nothing to edit; this file exists
+# for the path filter below, so a push that cannot change what either analysis
+# reads does not spend twenty minutes proving it.
+on:
+  push:
+    branches: [main]
+    # A push carrying only material no analysis reads skips the run. This list
+    # is the exception, not the rule — a path nobody named here still triggers —
+    # and unlike the three gate workflows it keeps two paths as triggers:
+    # .github/workflows/ (the actions analysis reads every workflow file) and
+    # vendor/ (it holds a vendored Rust crate), so neither is listed.
+    paths-ignore:
+      - ".gitignore"
+      - ".github/dependabot.yml"
+      - ".github/release-notes/**"
+      - "LICENSE"
+      - "README.md"
+      - "SECURITY.md"
+      - "assets/**"
+      - "broccoli.rc"
+      - "deny.toml"
+      - "proto/**"
+      - "supply-chain/**"
+  pull_request:
+  schedule:
+    # Weekly, the cadence default setup used: the queries and the database move
+    # without a commit here, so an unfiltered run has to happen on a timer.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One group per ref, so cancellation only ever touches superseded runs of the
+# same ref: a pull-request run can never cancel main, while a second push to
+# main still supersedes the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    # The same check names default setup produced, so nothing that reads them
+    # changes with this file.
+    name: Analyze (${{ matrix.language }})
+    # A version-only bump changes no code and no dependency, and it carries the
+    # subject "Bump version to <version>"; the test is a prefix, so any subject
+    # that starts with that string skips the job. See the test workflow for what
+    # has to hold for that skip to be sound.
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Bump version to ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      # The actions analysis lists the repository's own workflows and their
+      # referenced actions, which is why it needs read access to Actions.
+      actions: read
+      # Uploading the analysis results is the only write this workflow needs.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Default setup analyzed these two languages in two separate runs, one
+        # check each; a matrix keeps that shape and lets one language fail
+        # without cancelling the other.
+        language: [actions, rust]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No build: both languages are analyzed from source, which is what
+      # default setup did and why this workflow needs no Rust toolchain.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e429ea58a9912cadc53f8132ad35562b54de1b30 # v3.38.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      # One category per language: without it the two matrix legs would upload
+      # into the same analysis slot and overwrite each other's results.
+      - name: Analyze
+        uses: github/codeql-action/analyze@e429ea58a9912cadc53f8132ad35562b54de1b30 # v3.38.1
+        with:
+          category: "/language:${{ matrix.language }}"
