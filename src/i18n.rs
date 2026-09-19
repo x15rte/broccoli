@@ -1397,6 +1397,7 @@ keys! {
     // Dashboard: listener traffic + sys-stats surface.
     DashboardMemory,
     DashboardInboundTraffic,
+    DashboardInboundNoListener,
     GridUp,
     GridDown,
     GridType,
@@ -4459,6 +4460,11 @@ mod en {
             }
             Key::DashboardMemory => "mem {} · sys {} · {} live objs · GC {}",
             Key::DashboardInboundTraffic => "Inbound traffic",
+            Key::DashboardInboundNoListener => {
+                "The core has no inbound listener. No local endpoint is enabled and the network \
+                 mode is Off. Enable a local endpoint on the Inbounds screen or set the network \
+                 mode to TUN."
+            }
             Key::GridUp => "Up",
             Key::GridDown => "Down",
             Key::GridType => "Type",

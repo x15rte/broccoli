@@ -3,7 +3,7 @@
 use crate::i18n::{Key, t, t_fmt};
 use crate::metrics::WorkCounter;
 use crate::model::Mode;
-use crate::model::settings::{Language, TrafficUnit};
+use crate::model::settings::{Language, Settings, TrafficUnit};
 use crate::rt::{CorePhase, DownloadState, OutboundStatusView};
 use crate::ui::inbounds::protocol_label;
 use crate::ui::status::{StatusColors, status_colors_of};
@@ -675,31 +675,41 @@ impl DashboardScreen {
                 }
 
                 // Listener traffic (per-inbound rates and cumulative
-                // totals), rendered from the memoized per-tick rows.
+                // totals), rendered from the memoized per-tick rows. A live
+                // core whose settings configure nothing to listen can never
+                // report a row, so the empty table is explained in place; an
+                // empty table with a listener configured is the first tick
+                // arriving late, not a gap, and stays silent.
                 let inbound_rows = &self.inbound_cache(ctx).rows;
-                if !inbound_rows.is_empty() {
+                let no_listener_hint =
+                    inbound_rows.is_empty() && missing_inbound_listener(ctx.phase, ctx.settings);
+                if !inbound_rows.is_empty() || no_listener_hint {
                     ui.separator();
                     let lang = ctx.settings.language;
                     ui.heading(t(lang, Key::DashboardInboundTraffic));
-                    egui::Grid::new("inbound-traffic-grid")
-                        .num_columns(5)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong(t(lang, Key::GridTag));
-                            ui.strong(t(lang, Key::GridUp));
-                            ui.strong(t(lang, Key::GridDown));
-                            ui.strong(t(lang, Key::GridUpTotal));
-                            ui.strong(t(lang, Key::GridDownTotal));
-                            ui.end_row();
-                            for (tag, up, down, up_total, down_total) in inbound_rows {
-                                ui.monospace(tag);
-                                ui.label(up);
-                                ui.label(down);
-                                ui.label(up_total);
-                                ui.label(down_total);
+                    if no_listener_hint {
+                        ui.label(t(lang, Key::DashboardInboundNoListener));
+                    } else {
+                        egui::Grid::new("inbound-traffic-grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong(t(lang, Key::GridTag));
+                                ui.strong(t(lang, Key::GridUp));
+                                ui.strong(t(lang, Key::GridDown));
+                                ui.strong(t(lang, Key::GridUpTotal));
+                                ui.strong(t(lang, Key::GridDownTotal));
                                 ui.end_row();
-                            }
-                        });
+                                for (tag, up, down, up_total, down_total) in inbound_rows {
+                                    ui.monospace(tag);
+                                    ui.label(up);
+                                    ui.label(down);
+                                    ui.label(up_total);
+                                    ui.label(down_total);
+                                    ui.end_row();
+                                }
+                            });
+                    }
                 }
             });
     }
@@ -1026,6 +1036,22 @@ enum TunStatus {
     Down,
 }
 
+/// True when a live core can never report an inbound row: the phase is one
+/// of the running ones (a starting core already holds its configuration, so
+/// the gap is real from the first frame) and the settings configure no
+/// listener at all — no enabled local endpoint, no enabled dokodemo-door
+/// inbound, and a network mode other than TUN. The generator emits an empty
+/// `inbounds` array for exactly this combination, so the dashboard explains
+/// the empty listener-traffic table instead of rendering nothing. The
+/// loopback control-plane API port is not a user listener and is
+/// deliberately not part of the decision.
+fn missing_inbound_listener(phase: &CorePhase, settings: &Settings) -> bool {
+    matches!(phase, CorePhase::Running | CorePhase::Starting)
+        && settings.mode != Mode::Tun
+        && !settings.local_inbounds.iter().any(|entry| entry.enabled)
+        && !settings.dokodemo.iter().any(|entry| entry.enabled)
+}
+
 /// Pure settings/phase → status derivation for the TUN row item. The tuple
 /// is `(mode, is_elevated)`.
 fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus {
@@ -1048,16 +1074,16 @@ fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus
 mod tests {
     use super::{
         DashboardScreen, LatencyCell, ListenerStatus, TunStatus, build_latency_rows, format_axis,
-        format_bytes, listener_status, phase_badge_color, phase_badge_text, terminal_error_block,
-        truncate_chars, tun_status, y_axis_label_for,
+        format_bytes, listener_status, missing_inbound_listener, phase_badge_color,
+        phase_badge_text, terminal_error_block, truncate_chars, tun_status, y_axis_label_for,
     };
     use crate::diag::Diag;
     use crate::i18n::{Key, t, t_fmt};
     use crate::links::excerpt;
     use crate::model::settings::{Language, TrafficUnit};
     use crate::model::{
-        LocalInboundCfg, LocalInboundProtocol, Mode, OutboundModel, Protocol, ServerProfile,
-        ServersFile, Settings,
+        DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Mode, OutboundModel, Protocol,
+        ServerProfile, ServersFile, Settings,
     };
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
     use crate::ui::TerminalErrorView;
@@ -1217,6 +1243,177 @@ mod tests {
             .get_all_by_label("↓ 2.0 MiB/s")
             .next()
             .expect("socks down rate must render");
+    }
+
+    /// A tall harness so the inbound section — the dashboard's last — renders
+    /// into the AccessKit tree without scrolling. The width also bounds the
+    /// hint's wrap: a long caption must not extend past it.
+    const HARNESS_WIDTH: f32 = 900.0;
+
+    fn harness_for(rig: Rc<RefCell<UiTestRig>>) -> Harness<'static, DashboardScreen> {
+        Harness::builder()
+            .with_size(egui::vec2(HARNESS_WIDTH, 1400.0))
+            .build_ui_state(
+                move |ui, screen: &mut DashboardScreen| {
+                    let mut rig = rig.borrow_mut();
+                    screen.show(ui, &mut rig.ctx())
+                },
+                DashboardScreen::default(),
+            )
+    }
+
+    /// Drop every local endpoint: the settings state of a user who never
+    /// enabled a listener.
+    fn without_local_endpoints(settings: &mut Settings) {
+        settings.local_inbounds.clear();
+    }
+
+    /// No inbound section at all: neither the heading nor the hint renders,
+    /// which is how the dashboard behaved before the hint existed.
+    fn assert_inbound_section_absent(harness: &Harness<'static, DashboardScreen>, case: &str) {
+        for key in [
+            Key::DashboardInboundTraffic,
+            Key::DashboardInboundNoListener,
+        ] {
+            assert!(
+                harness
+                    .query_all_by_label(t(Language::En, key))
+                    .next()
+                    .is_none(),
+                "{case}: the inbound section must stay as it was"
+            );
+        }
+    }
+
+    /// The no-listener derivation: the running phases explain themselves when
+    /// the settings configure no listener at all, while one enabled endpoint,
+    /// one enabled dokodemo-door inbound or TUN mode each provide a listener
+    /// and every other phase stays silent whatever the settings say.
+    #[test]
+    fn missing_inbound_listener_covers_the_phase_and_settings_states() {
+        let mut settings = Settings::default();
+        for entry in &mut settings.local_inbounds {
+            entry.enabled = false;
+        }
+        for phase in [CorePhase::Running, CorePhase::Starting] {
+            assert!(
+                missing_inbound_listener(&phase, &settings),
+                "{phase:?}: a live core with nothing listening must explain itself"
+            );
+        }
+        for phase in [
+            CorePhase::Stopped,
+            CorePhase::Backoff { attempt: 1 },
+            error_phase(),
+        ] {
+            assert!(
+                !missing_inbound_listener(&phase, &settings),
+                "{phase:?}: only a live core explains the empty table"
+            );
+        }
+
+        settings.local_inbounds[0].enabled = true;
+        assert!(
+            !missing_inbound_listener(&CorePhase::Running, &settings),
+            "one enabled endpoint is a listener"
+        );
+        settings.local_inbounds.clear();
+        assert!(missing_inbound_listener(&CorePhase::Running, &settings));
+        settings.dokodemo.push(DokodemoCfg {
+            enabled: true,
+            ..DokodemoCfg::default()
+        });
+        assert!(
+            !missing_inbound_listener(&CorePhase::Running, &settings),
+            "an enabled dokodemo-door inbound is a listener"
+        );
+        settings.dokodemo.clear();
+        settings.mode = Mode::Tun;
+        assert!(
+            !missing_inbound_listener(&CorePhase::Running, &settings),
+            "TUN mode adds its own listener"
+        );
+    }
+
+    /// Nothing is configured to listen: the running core shows the heading
+    /// and one hint in place of the grid, while the rest of the dashboard
+    /// stays as it was.
+    #[test]
+    fn inbound_hint_renders_when_the_running_core_has_no_listener() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            rig.phase = CorePhase::Running;
+            without_local_endpoints(&mut rig.settings);
+        }
+        let mut harness = harness_for(rig);
+        harness.run();
+
+        harness
+            .get_all_by_label(t(Language::En, Key::DashboardInboundTraffic))
+            .next()
+            .expect("the heading must render where the table would be");
+        let hint = harness
+            .get_all_by_label(t(Language::En, Key::DashboardInboundNoListener))
+            .next()
+            .expect("the hint must name the missing listener");
+        assert!(
+            hint.rect().left() >= -0.5 && hint.rect().right() <= HARNESS_WIDTH + 0.5,
+            "the hint must wrap inside the window; rect {:?}",
+            hint.rect()
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::GridUp))
+                .next()
+                .is_none(),
+            "the empty grid must give way to the hint"
+        );
+        harness
+            .get_all_by_label(t(Language::En, Key::DashboardNoServers))
+            .next()
+            .expect("the rest of the dashboard stays unchanged");
+    }
+
+    /// An enabled local endpoint is a listener: the empty table is then the
+    /// first stats tick arriving late, with nothing to announce.
+    #[test]
+    fn inbound_hint_stays_absent_when_an_endpoint_is_enabled() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        rig.borrow_mut().phase = CorePhase::Running;
+        let mut harness = harness_for(rig);
+        harness.run();
+
+        assert_inbound_section_absent(&harness, "an enabled local endpoint");
+    }
+
+    /// TUN mode carries its own listener, so an empty table there says nothing
+    /// about the configuration.
+    #[test]
+    fn inbound_hint_stays_absent_in_tun_mode() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            rig.phase = CorePhase::Running;
+            without_local_endpoints(&mut rig.settings);
+            rig.settings.mode = Mode::Tun;
+        }
+        let mut harness = harness_for(rig);
+        harness.run();
+
+        assert_inbound_section_absent(&harness, "TUN mode");
+    }
+
+    /// A stopped core has no stats to explain: the same settings stay silent
+    /// until the core is up.
+    #[test]
+    fn inbound_hint_stays_absent_when_the_core_is_stopped() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        without_local_endpoints(&mut rig.borrow_mut().settings);
+        let mut harness = harness_for(rig);
+        harness.run();
+
+        assert_inbound_section_absent(&harness, "a stopped core");
     }
 
     /// The sys-stats line renders the memory/GC figures from the tick.
