@@ -1,7 +1,7 @@
 # broccoli 🥦
 xray-core gui for windows 🦀  
   
-<img width="827" height="564" alt="broccoli dashboard" src="https://github.com/user-attachments/assets/79510dbe-094d-4e5c-8db0-a98670a9673d" />
+<img width="1513" height="964" alt="image" src="https://github.com/user-attachments/assets/ccc9ba97-0991-43d7-a4e7-43a09767d649" />
   
 ## Wiki 📖
 https://deepwiki.com/x15rte/broccoli
