@@ -40,12 +40,14 @@ concurrency:
 jobs:
   test:
     name: Format, lint, and test (x86_64-pc-windows-msvc)
-    # A version-only bump changes no code and no dependency: the release
-    # convention gives it the subject "Bump version to <version>", the gates
-    # below already ran on the content commit beneath it, and the tag-triggered
-    # build re-builds the bumped tree with --locked. GitHub's commit-message
-    # marker for this is not used on purpose: it suppresses every workflow that
-    # push would trigger, the release tag push included.
+    # A version-only bump changes no code and no dependency, and it carries
+    # the subject "Bump version to <version>"; the test is a prefix, so any
+    # subject that starts with that string skips the job. The gates below cover
+    # the content commit beneath the bump, which is pushed on its own and gated
+    # before it, and the tag-triggered build re-builds the bumped tree with
+    # --locked. GitHub's commit-message marker for this is not used on purpose:
+    # it suppresses every workflow that push would trigger, the release tag
+    # push included.
     if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Bump version to ') }}
     runs-on: windows-latest
     timeout-minutes: 120
