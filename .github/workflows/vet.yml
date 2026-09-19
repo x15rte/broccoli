@@ -15,6 +15,7 @@ on:
       - ".github/dependabot.yml"
       - ".github/release-notes/**"
       - ".github/workflows/build.yml"
+      - ".github/workflows/codeql.yml"
       - ".github/workflows/deny.yml"
       - ".github/workflows/test.yml"
       - "LICENSE"
