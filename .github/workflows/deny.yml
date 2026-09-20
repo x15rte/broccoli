@@ -17,6 +17,7 @@ on:
       - ".github/release-notes/**"
       - ".github/workflows/build.yml"
       - ".github/workflows/codeql.yml"
+      - ".github/workflows/miri.yml"
       - ".github/workflows/test.yml"
       - ".github/workflows/vet.yml"
       - "LICENSE"

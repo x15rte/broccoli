@@ -1,0 +1,341 @@
+name: Miri scan
+
+# Miri interprets the lib unit tests and reports the operations the Rust
+# abstract machine calls undefined — the UB the ordinary test run cannot see
+# (an unaligned `unsafe` read, a dangling pointer, a data race). It is the
+# only sweep of that kind the repository has, and it is slow by construction:
+# Miri re-compiles the test crate on every `cargo miri test` invocation
+# (rust-lang/miri#5013), so each test pays ~30 s before its body runs, and
+# Miri halts the whole interpreted process on the first unsupported operation.
+# A sweep of the ~1300 lib unit tests therefore takes hours and runs one
+# process per test. That is why nothing here is triggered by a push or a pull
+# request: the sweep is dispatched by hand when someone wants it, and it
+# reports rather than gates.
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "libtest filter; empty sweeps every lib unit test"
+        required: false
+        type: string
+        default: ""
+      workers:
+        description: "parallel Miri processes (one test per process)"
+        required: false
+        type: number
+        default: 4
+      test-timeout-seconds:
+        description: "wall-clock budget for one test before its process tree is killed"
+        required: false
+        type: number
+        default: 300
+      fail-on-ub:
+        description: "red run when Miri reports Undefined Behavior"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# One group per ref, so cancellation only ever touches superseded runs of the
+# same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri scan (x86_64-pc-windows-msvc)
+    # 4 vCPU: dependency metadata builds plus a sweep of every lib unit test,
+    # each in its own interpreter process. 350 minutes is the ceiling a
+    # GitHub-hosted job tolerates; a filtered sweep finishes far below it.
+    runs-on: windows-latest
+    timeout-minutes: 350
+    # No cache, unlike the gates: Miri's sysroot and the `target/miri` tree are
+    # coupled to one nightly, and a restored sysroot from a different nightly is
+    # the documented "found crate std compiled by an incompatible version of
+    # rustc" failure — a broken sweep is worse than a slow one, and this
+    # workflow is dispatched by hand anyway.
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Cargo's build-dir layout — the default in current nightlies — gives
+      # every crate its own artifact directory and emits one `-L dependency=`
+      # per crate. For a dependency graph this size that pushes the rustc
+      # command line past the Windows 32767-character limit, and cargo then
+      # retries the invocation with an argument file, which cargo-miri refuses
+      # ("cargo uses an argfile to invoke rustc", rust-lang/miri#5234). The
+      # opt-out keeps the classic `deps/` layout and a short command line.
+      __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Miri ships only for nightly, and the component needs the standard
+      # library sources to build its own sysroot. Stable stays the active
+      # toolchain; every Miri command goes through `+nightly`.
+      - name: Install nightly Rust with the Miri component
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install nightly --profile minimal --component miri,rust-src
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
+          rustc +nightly --version
+
+      # Same pin and verification as the test workflow: build.rs refuses a
+      # protoc it cannot recognize, and the runner image ships none.
+      - name: Download and verify pinned protoc 27.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $protocVersion = '27.1'
+          $expectedSha256 = 'da531c51ccd1290d8d34821f0ce4e219c7fbaa6f9825f5a3fb092a9d03fe6206'
+          $zipUrl = "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP 'protoc-27.1-win64.zip'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'protoc-27.1'
+          Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zipPath
+          $actualSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256) {
+              throw "protoc $protocVersion win64 SHA2-256 mismatch: pinned $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $protocPath = Join-Path $extractDir 'bin\protoc.exe'
+          if (-not (Test-Path -LiteralPath $protocPath -PathType Leaf)) {
+              throw "extracted protoc is missing: $protocPath"
+          }
+          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Isolation is off because the suite reads and writes real files, so
+      # every user-facing root the app resolves under test is redirected into
+      # a sandbox instead: nothing may write the runner's own profile, and the
+      # temporary roots always exist before a test resolves them. RUST_BACKTRACE
+      # is forwarded so a failing test's report carries a Rust backtrace.
+      - name: Prepare the Miri environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sandbox = Join-Path $env:RUNNER_TEMP 'miri-env'
+          foreach ($dir in @('AppData\Roaming', 'AppData\Local', 'tmp')) {
+              New-Item -ItemType Directory -Force -Path (Join-Path $sandbox $dir) | Out-Null
+          }
+          $flags = @(
+              '-Zmiri-disable-isolation'
+              '-Zmiri-env-forward=RUST_BACKTRACE'
+              "-Zmiri-env-set=APPDATA=$(Join-Path $sandbox 'AppData\Roaming')"
+              "-Zmiri-env-set=LOCALAPPDATA=$(Join-Path $sandbox 'AppData\Local')"
+              "-Zmiri-env-set=USERPROFILE=$sandbox"
+              "-Zmiri-env-set=HOME=$sandbox"
+              "-Zmiri-env-set=TEMP=$(Join-Path $sandbox 'tmp')"
+              "-Zmiri-env-set=TMP=$(Join-Path $sandbox 'tmp')"
+          ) -join ' '
+          "MIRIFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MIRI_SCAN_DIR=$env:RUNNER_TEMP\miri-scan" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Builds Miri's own sysroot from the standard library sources.
+      - name: Build the Miri sysroot
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo +nightly miri setup
+          if ($LASTEXITCODE -ne 0) { throw "cargo miri setup failed with exit code $LASTEXITCODE" }
+
+      # One `cargo miri test --exact` per test, a bounded number in parallel.
+      # A single process for the whole suite is not an option: Miri halts the
+      # interpreted process when it meets an unsupported operation or UB, which
+      # would take every not-yet-run test down with it. Verdicts are written to
+      # results.json, one log per test to logs/, and the run summary to the job
+      # summary.
+      - name: Sweep the lib unit tests under Miri
+        env:
+          MIRI_SCAN_FILTER: ${{ inputs.filter }}
+          MIRI_SCAN_WORKERS: ${{ inputs.workers }}
+          MIRI_SCAN_BUDGET_SECONDS: ${{ inputs['test-timeout-seconds'] }}
+          MIRI_SCAN_FAIL_ON_UB: ${{ inputs['fail-on-ub'] }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workspace = $env:GITHUB_WORKSPACE
+          # Steps start in the workspace on a runner, but nothing here may
+          # depend on the caller's location: the listing runs cargo, and the
+          # per-test processes get their own working directory.
+          Set-Location -LiteralPath $workspace
+          $scanDir = $env:MIRI_SCAN_DIR
+          $logDir = Join-Path $scanDir 'logs'
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          $workers = [int]$env:MIRI_SCAN_WORKERS
+          $budgetSeconds = [int]$env:MIRI_SCAN_BUDGET_SECONDS
+          $failOnUb = $env:MIRI_SCAN_FAIL_ON_UB -eq 'true'
+          $filter = [string]$env:MIRI_SCAN_FILTER
+
+          # The test list comes from the same Miri build the sweep uses, so a
+          # name that cannot run is a name that cannot be listed either.
+          Write-Host 'Listing lib unit tests through Miri...'
+          $listing = & cargo +nightly miri test --lib -- --list 2>&1
+          if ($LASTEXITCODE -ne 0) {
+              $listing | Write-Host
+              throw "listing lib unit tests failed with exit code $LASTEXITCODE"
+          }
+          $tests = @($listing |
+              Where-Object { $_ -match ': test$' } |
+              ForEach-Object { ($_ -replace ': test$', '').Trim() } |
+              Where-Object { -not $filter -or $_ -like "*$filter*" })
+          if ($tests.Count -eq 0) { throw "no lib unit test matched filter '$filter'" }
+          Write-Host "$($tests.Count) tests, $workers in parallel, $budgetSeconds s per test"
+
+          $started = Get-Date
+          $results = $tests | ForEach-Object -Parallel {
+              $name = $_
+              $logDir = $using:logDir
+              $budgetSeconds = $using:budgetSeconds
+              $workspace = $using:workspace
+
+              $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+              $startInfo.FileName = 'cargo'
+              $startInfo.WorkingDirectory = $workspace
+              $startInfo.UseShellExecute = $false
+              $startInfo.RedirectStandardOutput = $true
+              $startInfo.RedirectStandardError = $true
+              foreach ($argument in @('+nightly', 'miri', 'test', '--lib', '--', '--exact', $name, '--test-threads', '1')) {
+                  $startInfo.ArgumentList.Add($argument)
+              }
+              $process = [System.Diagnostics.Process]::Start($startInfo)
+              # Read both pipes to completion before waiting, or a chatty test
+              # fills one and deadlocks against the wait.
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              $timedOut = -not $process.WaitForExit($budgetSeconds * 1000)
+              if ($timedOut) {
+                  # cargo, cargo-miri and miri are separate processes; the tree
+                  # has to go or the interpreter keeps a core after the timeout.
+                  & taskkill.exe /F /T /PID $process.Id 2>&1 | Out-Null
+                  $process.WaitForExit()
+              }
+              $text = "$($stdout.Result)`n$($stderr.Result)"
+              $logPath = Join-Path $logDir (($name -replace '[^A-Za-z0-9_.-]', '_') + '.log')
+              Set-Content -LiteralPath $logPath -Value $text -Encoding utf8
+
+              $verdict = 'abort'
+              $detail = 'the process stopped before the harness reported a result'
+              if ($timedOut) {
+                  $verdict = 'timeout'
+                  $detail = "no result within $budgetSeconds s"
+              } elseif ($text -match '(?m)^error: Undefined Behavior: (.*)$') {
+                  $verdict = 'ub'
+                  $detail = $Matches[1]
+              } elseif ($text -match 'memory leaked') {
+                  $verdict = 'leak'
+                  $detail = 'Miri reported a memory leak at exit'
+              } elseif ($text -match 'test result: ok\.\s+1 passed') {
+                  $verdict = 'pass'
+                  $detail = ''
+              } elseif ($text -match 'can''t call foreign function `([^`]+)`') {
+                  $verdict = 'unsupported'
+                  $detail = "foreign function ``$($Matches[1])``"
+              } elseif ($text -match '(?m)^error: unsupported operation: (.*)$') {
+                  $verdict = 'unsupported'
+                  $detail = $Matches[1]
+              } elseif ($text -match '(?s)panicked at [^\r\n]+[\r\n]+([^\r\n]*)') {
+                  $verdict = 'panic'
+                  $detail = $Matches[1]
+              }
+              Write-Host "[$verdict] $name"
+              [pscustomobject]@{ name = $name; verdict = $verdict; detail = $detail; log = $logPath }
+          } -ThrottleLimit $workers
+
+          $elapsed = (Get-Date) - $started
+          $results | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $scanDir 'results.json') -Encoding utf8
+
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $summary.Add('# Miri scan')
+          $summary.Add('')
+          $scope = if ($filter) { " matching ``$filter``" } else { '' }
+          $summary.Add("Swept $($results.Count) lib unit tests$scope on ``$($env:RUNNER_OS)``: " +
+              "$workers in parallel, $([int]$elapsed.TotalMinutes) min wall clock, " +
+              "$budgetSeconds s per test. Toolchain " +
+              "$((& rustc +nightly --version) -join ' '), $((& cargo +nightly miri --version) -join ' ').")
+          $summary.Add('')
+          $summary.Add('| verdict | tests |')
+          $summary.Add('| --- | --- |')
+          foreach ($group in ($results | Group-Object verdict | Sort-Object Count -Descending)) {
+              $summary.Add("| $($group.Name) | $($group.Count) |")
+          }
+
+          $summary.Add('')
+          $summary.Add('| module | tests | pass | unsupported | panic | timeout | ub |')
+          $summary.Add('| --- | --- | --- | --- | --- | --- | --- |')
+          foreach ($group in ($results | Group-Object { $_.name.Split('::')[0] } |
+                  Sort-Object Count -Descending)) {
+              $rows = $group.Group | Group-Object verdict -AsHashtable
+              $cell = {
+                  param($verdict)
+                  if ($rows.ContainsKey($verdict)) { $rows[$verdict].Count } else { 0 }
+              }
+              $summary.Add("| $($group.Name) | $($group.Count) | $(& $cell 'pass') | " +
+                  "$(& $cell 'unsupported') | $(& $cell 'panic') | $(& $cell 'timeout') | $(& $cell 'ub') |")
+          }
+
+          $ub = @($results | Where-Object { $_.verdict -eq 'ub' })
+          $leaks = @($results | Where-Object { $_.verdict -eq 'leak' })
+          if ($ub.Count -gt 0) {
+              $summary.Add('')
+              $summary.Add('## Undefined Behavior')
+              $summary.Add('')
+              foreach ($finding in $ub) {
+                  $summary.Add("- ``$($finding.name)`` — $($finding.detail)")
+              }
+          }
+          if ($leaks.Count -gt 0) {
+              $summary.Add('')
+              $summary.Add('## Memory leaks')
+              $summary.Add('')
+              foreach ($finding in $leaks) {
+                  $summary.Add("- ``$($finding.name)`` — $($finding.detail)")
+              }
+          }
+
+          $stops = @($results | Where-Object { $_.verdict -eq 'unsupported' })
+          if ($stops.Count -gt 0) {
+              $summary.Add('')
+              $summary.Add("## Tests Miri cannot interpret ($($stops.Count))")
+              $summary.Add('')
+              $summary.Add('Each halted on the first operation Miri does not model; the log names the call.')
+              $summary.Add('')
+              foreach ($group in ($stops | Group-Object detail | Sort-Object Count -Descending | Select-Object -First 15)) {
+                  $summary.Add("- $($group.Count) × $($group.Name)")
+              }
+          }
+
+          $heavy = @($results | Where-Object { $_.verdict -eq 'timeout' })
+          if ($heavy.Count -gt 0) {
+              $summary.Add('')
+              $summary.Add("## Not swept: over the $budgetSeconds s budget ($($heavy.Count))")
+              $summary.Add('')
+              foreach ($finding in $heavy) {
+                  $summary.Add("- ``$($finding.name)``")
+              }
+          }
+
+          $summary.Add('')
+          $summary.Add('Integration suites, the binary target and the live-core oracles are out of scope:')
+          $summary.Add('they need the real core, sockets and the windowing system, none of which Miri models.')
+          $summary.Add('Per-test logs and the sweep''s `results.json` are attached to this run as the `miri-scan` artifact.')
+          $markdown = $summary -join "`n"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $markdown
+          Write-Host $markdown
+
+          foreach ($finding in $ub) {
+              Write-Host "::error title=Undefined Behavior::$($finding.name): $($finding.detail)"
+          }
+          foreach ($finding in $leaks) {
+              Write-Host "::warning title=Memory leak::$($finding.name): $($finding.detail)"
+          }
+          if ($ub.Count -gt 0 -and $failOnUb) {
+              exit 1
+          }
+
+      - name: Upload the scan results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: miri-scan
+          path: ${{ runner.temp }}/miri-scan
+          retention-days: 14
