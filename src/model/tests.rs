@@ -844,14 +844,14 @@ fn current_user_sid() -> crate::sys::security::Sid {
     crate::sys::security::Sid::token_user(&token).expect("read the current user SID")
 }
 
-/// Load `path`'s DACL (plus control bits). Returns the descriptor buffer
-/// (which owns the DACL memory), the descriptor pointer, the DACL pointer,
-/// and the control bits; the returned pointers are valid as long as the
-/// buffer is alive.
+/// Load `path`'s DACL (plus control bits). Returns the descriptor's storage —
+/// `u64` words, so the descriptor and the ACL structures inside it start
+/// 8-byte aligned — the descriptor pointer, the DACL pointer, and the control
+/// bits; the returned pointers are valid as long as the storage is alive.
 fn read_dacl(
     path: &std::path::Path,
 ) -> (
-    Vec<u8>,
+    Vec<u64>,
     PSECURITY_DESCRIPTOR,
     *mut ACL,
     SECURITY_DESCRIPTOR_CONTROL,
@@ -876,13 +876,16 @@ fn read_dacl(
         )
     };
     assert!(required > 0, "sizing query must report a descriptor size");
-    let mut bytes = vec![0u8; required as usize];
-    let descriptor = PSECURITY_DESCRIPTOR(bytes.as_mut_ptr().cast());
-    // SAFETY: `bytes` is sized exactly from the sizing query and stays alive
-    // through all reads; `descriptor` points into it, so the kernel writes at
-    // most `required` bytes; the global-allocator allocation satisfies the
-    // descriptor's alignment (MIN_ALIGN >= 8 on x64). The result is checked
-    // via `loaded.as_bool()`.
+    // A self-relative descriptor is byte-addressed but holds DWORD-aligned
+    // structures: the ACL header and every ACE inside it. Word storage keeps
+    // the base 8-byte aligned on every target instead of leaving it to what
+    // the allocator returns for a byte vector.
+    let mut words = vec![0u64; (required as usize).div_ceil(std::mem::size_of::<u64>())];
+    let descriptor = PSECURITY_DESCRIPTOR(words.as_mut_ptr().cast());
+    // SAFETY: `words` covers `required` bytes (rounded up to whole words) and
+    // stays alive through all reads; `descriptor` points into it, so the
+    // kernel writes at most `required` bytes into an 8-byte-aligned buffer.
+    // The result is checked via `loaded.as_bool()`.
     let loaded = unsafe {
         GetFileSecurityW(
             PCWSTR(wide.as_ptr()),
@@ -902,7 +905,7 @@ fn read_dacl(
     let mut control = SECURITY_DESCRIPTOR_CONTROL(0);
     let mut revision = 0u32;
     // SAFETY: `descriptor` is the valid, initialized descriptor written by
-    // `GetFileSecurityW` into the live `bytes` buffer; `control` and
+    // `GetFileSecurityW` into the live `words` buffer; `control` and
     // `revision` are valid out-parameters and the return is checked.
     unsafe { GetSecurityDescriptorControl(descriptor, &mut control.0, &mut revision) }
         .expect("read DACL control");
@@ -910,7 +913,7 @@ fn read_dacl(
     let mut dacl_present = BOOL(0);
     let mut dacl_defaulted = BOOL(0);
     let mut dacl = std::ptr::null_mut::<ACL>();
-    // SAFETY: `descriptor` is the valid descriptor in the live `bytes` buffer;
+    // SAFETY: `descriptor` is the valid descriptor in the live `words` buffer;
     // the out-parameters are valid, the return is checked, and on success
     // `dacl` (when `dacl_present`) points into the same buffer.
     unsafe {
@@ -927,7 +930,7 @@ fn read_dacl(
         "{} DACL must be present and non-null",
         path.display()
     );
-    (bytes, descriptor, dacl, control)
+    (words, descriptor, dacl, control)
 }
 
 /// Assert `dir`'s DACL grants `FILE_ALL_ACCESS` to exactly one principal —
@@ -959,7 +962,10 @@ fn assert_user_only_dacl(dir: &std::path::Path) {
     // SAFETY: `GetAce` succeeded, so `raw_ace` points at a valid ACE inside
     // the DACL; its declared `AceSize` covers the fields read here (header at
     // 0, `Mask` at 4, `SidStart` at 8 — the fixed prefix shared by all ACE
-    // types that carry a SID). The DACL buffer stays alive, and a wrong ACE
+    // types that carry a SID). The storage is `read_dacl`'s word buffer, so
+    // the descriptor is 8-byte aligned, and the kernel's self-relative
+    // descriptor keeps the ACE structs on 4-byte boundaries inside it, which
+    // is what the reference needs. The storage stays alive, and a wrong ACE
     // type is rejected by the `AceType != 0` check.
     let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
     assert_eq!(ace.Header.AceType, 0, "ACE must be access-allowed");
@@ -1018,8 +1024,12 @@ fn assert_state_file_user_only(path: &std::path::Path) {
         unsafe { GetAce(dacl, index, &mut raw_ace) }.expect("read state file ACE");
         // SAFETY: `GetAce` succeeded, so `raw_ace` points at a valid ACE
         // inside the live DACL buffer; its `AceSize` covers the fields read
-        // here (header at 0, `Mask` at 4, `SidStart` at 8). The buffer stays
-        // alive, and a non-allow ACE is rejected by the `AceType != 0` check.
+        // here (header at 0, `Mask` at 4, `SidStart` at 8). The storage is
+        // `read_dacl`'s word buffer, so the descriptor is 8-byte aligned, and
+        // the kernel's self-relative descriptor keeps the ACE structs on
+        // 4-byte boundaries inside it, which is what the reference needs. The
+        // storage stays alive, and a non-allow ACE is rejected by the
+        // `AceType != 0` check.
         let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
         if ace.Header.AceType != 0 {
             panic!("state file {} has a non-allow ACE", path.display());

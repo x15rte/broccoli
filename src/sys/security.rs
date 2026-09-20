@@ -548,7 +548,11 @@ mod tests {
                 // ACE inside the live DACL buffer; its declared `AceSize`
                 // covers the fixed prefix read here (header at 0, `Mask` at
                 // 4, `SidStart` at 8 — shared by all SID-carrying ACE
-                // types). The buffer stays alive for the test.
+                // types). The storage is `build_descriptor`'s `AclBuffer`,
+                // which is 8-byte aligned, and `AddAccessAllowedAceEx` appends
+                // each ACE at a 4-byte offset after the 8-byte ACL header
+                // (ACE size 16 + 4n), so the reference is aligned as a Rust
+                // reference must be. The buffer stays alive for the test.
                 let ace = &*raw_ace.cast::<ACCESS_ALLOWED_ACE>();
                 let sid =
                     PSID(std::ptr::addr_of!(ace.SidStart).cast::<core::ffi::c_void>() as *mut _);

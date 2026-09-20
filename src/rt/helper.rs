@@ -32,11 +32,11 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, TOKEN_QUERY,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+    SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, TOKEN_QUERY, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -641,6 +641,30 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
     })
 }
 
+/// The ACE fields the verification loops read, decoded from the bytes
+/// [`validated_ace`] checked.
+///
+/// The fields come back as values rather than behind a typed pointer because
+/// the descriptor storage is byte-addressed — the loader keeps it in `Vec<u64>`
+/// words, and the tests hand in `[u8; N]` — so no `ACE_HEADER` or
+/// `ACCESS_ALLOWED_ACE` place exists at any particular offset, and a typed
+/// pointer into it would assert an alignment the storage does not promise.
+struct ValidatedAce {
+    /// `AceType`; `0` is `ACCESS_ALLOWED_ACE_TYPE`, the only type whose fields
+    /// the callers compare.
+    ace_type: u8,
+    /// `AceFlags`; the strict shapes the callers accept carry `0`.
+    ace_flags: u8,
+    /// `Mask`, meaningful only for the allow-ACEs (`ace_type == 0`).
+    mask: u32,
+    /// `SidStart`: the embedded SID, alive as long as the validated buffer, and
+    /// the only thing handed back as a pointer (`EqualSid` walks it). For the
+    /// allow-ACEs whose `SidStart` the callers compare, the validator has also
+    /// proven the SID's header and sub-authorities fit the declared `AceSize`;
+    /// every other ACE type is rejected by the callers before any SID read.
+    sid: PSID,
+}
+
 /// Check that `ace` (as returned by `GetAce`) lies fully inside the loaded
 /// descriptor's `buffer` and declares an `AceSize` large enough for the fixed
 /// prefix the verification loops read (4-byte header + 4-byte mask + a
@@ -651,16 +675,19 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
 /// corrupt `AceSize` on disk would otherwise walk the pointer far past the
 /// buffer, and the benign-deviation path runs exactly while the DACL is
 /// user-writable.
-fn validated_ace(ace: *const core::ffi::c_void, buffer: &[u8]) -> Option<*const ACE_HEADER> {
+fn validated_ace(ace: *const core::ffi::c_void, buffer: &[u8]) -> Option<ValidatedAce> {
     let ace = ace.cast::<u8>();
     let start = buffer.as_ptr();
     let end = start.wrapping_add(buffer.len());
     if ace < start || ace > end || ace.wrapping_add(4) > end {
         return None;
     }
-    // SAFETY: `ace` is within `buffer` with at least 4 bytes to spare
-    // (checked above), so the whole 4-byte `ACE_HEADER` read is in bounds.
-    let header = unsafe { *ace.cast::<ACE_HEADER>() };
+    // SAFETY: `ace` is within `buffer` with at least 4 bytes to spare (checked
+    // above), so the whole 4-byte `ACE_HEADER` read is in bounds. The read is
+    // unaligned because the storage carries no alignment guarantee: forming an
+    // `ACE_HEADER` place here would be UB the moment the ACE sits at an odd
+    // offset, so the header is copied into a value instead.
+    let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
     let size = header.AceSize as usize;
     if size < 20 || ace.wrapping_add(size) > end {
         return None;
@@ -678,7 +705,20 @@ fn validated_ace(ace: *const core::ffi::c_void, buffer: &[u8]) -> Option<*const 
             return None;
         }
     }
-    Some(ace.cast())
+    // SAFETY: the mask occupies offsets 4..8, inside the `AceSize >= 20` bytes
+    // of `ace` checked above, and it is read unaligned for the same reason as
+    // the header.
+    let mask = unsafe { ace.add(4).cast::<u32>().read_unaligned() };
+    // `SidStart` sits at offset 8, inside the validated bytes; the pointer is
+    // arithmetic only — nothing dereferences it in Rust, and `EqualSid` owns
+    // the SID grammar behind it.
+    let sid = PSID(ace.wrapping_add(8).cast::<core::ffi::c_void>().cast_mut());
+    Some(ValidatedAce {
+        ace_type: header.AceType,
+        ace_flags: header.AceFlags,
+        mask,
+        sid,
+    })
 }
 
 fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
@@ -715,34 +755,27 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
         // `index` is 0..2, within the AceCount (== 2) just verified; `raw_ace`
         // is a valid out-parameter and the return is checked.
         unsafe { GetAce(loaded.dacl, index, &mut raw_ace) }.diag(Key::HelperAceReadFailed)?;
-        // SAFETY: `validated_ace` has just confirmed `raw_ace` lies inside
-        // the loaded descriptor buffer, that its declared `AceSize` covers
-        // the fixed prefix read here (header at 0, `Mask` at 4, `SidStart`
-        // at 8), and that an allow-ACE's embedded SID header plus its
-        // sub-authorities fit that size — so every read below, including
-        // `EqualSid`'s walk, stays inside the buffer; the buffer stays
-        // alive through the loop.
+        // `validated_ace` proved the ACE — and, for an allow-ACE, the SID it
+        // names — lies inside `loaded`'s buffer, alive through the loop.
         let Some(ace) = validated_ace(raw_ace.cast(), loaded.bytes()) else {
             return Err(DiagError::new(Diag::new(Key::HelperAceMalformed)));
         };
-        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        if ace.Header.AceType != 0 || ace.Header.AceFlags != 0 || ace.Mask != FILE_ALL_ACCESS.0 {
+        if ace.ace_type != 0 || ace.ace_flags != 0 || ace.mask != FILE_ALL_ACCESS.0 {
             return Err(DiagError::new(Diag::new(Key::HelperAceNotFullControl)));
         }
-        let sid = PSID((std::ptr::addr_of!(ace.SidStart) as *mut u32).cast::<core::ffi::c_void>());
-        // SAFETY: `sid` points at the `SidStart` of the ACE — an embedded,
+        // SAFETY: `ace.sid` points at the `SidStart` of the ACE — an embedded,
         // well-formed SID (its length fits the ACE's `AceSize`) inside the
         // live DACL buffer; `system.psid()` is the well-known SYSTEM SID
         // built above. EqualSid only reads both.
-        if unsafe { EqualSid(sid, system.psid()) }.is_ok() {
+        if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
             if saw_system {
                 return Err(DiagError::new(Diag::new(Key::HelperAceSystemRepeated)));
             }
             saw_system = true;
-            // SAFETY: as above — `sid` is the embedded SID in the live DACL
-            // buffer and `administrators.psid()` is the well-known
+            // SAFETY: as above — `ace.sid` is the embedded SID in the live
+            // DACL buffer and `administrators.psid()` is the well-known
             // Administrators SID built above; EqualSid only reads them.
-        } else if unsafe { EqualSid(sid, administrators.psid()) }.is_ok() {
+        } else if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
             if saw_administrators {
                 return Err(DiagError::new(Diag::new(
                     Key::HelperAceAdministratorsRepeated,
@@ -810,39 +843,32 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
         if unsafe { GetAce(loaded.dacl, index, &mut raw_ace) }.is_err() {
             return false;
         }
-        // SAFETY: `validated_ace` has just confirmed `raw_ace` lies inside
-        // the loaded descriptor buffer, that its declared `AceSize` covers
-        // the fixed prefix read here (header at 0, `Mask` at 4, `SidStart`
-        // at 8), and that an allow-ACE's embedded SID header plus its
-        // sub-authorities fit that size — so every read below, including
-        // `EqualSid`'s walk, stays inside the buffer; the buffer stays
-        // alive through the loop.
+        // `validated_ace` proved the ACE — and, for an allow-ACE, the SID it
+        // names — lies inside `loaded`'s buffer, alive through the loop.
         let Some(ace) = validated_ace(raw_ace.cast(), loaded.bytes()) else {
             return false;
         };
-        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        if ace.Header.AceType != 0 || ace.Mask != FILE_ALL_ACCESS.0 {
+        if ace.ace_type != 0 || ace.mask != FILE_ALL_ACCESS.0 {
             return false;
         }
-        let sid = PSID((std::ptr::addr_of!(ace.SidStart) as *mut u32).cast::<core::ffi::c_void>());
-        if ace.Header.AceFlags != 0 {
-            // SAFETY: `sid` points into the live DACL buffer and `own_sid`
+        if ace.ace_flags != 0 {
+            // SAFETY: `ace.sid` points into the live DACL buffer and `own_sid`
             // into the current user's owned SID storage; EqualSid only reads
             // both.
-            if !unsafe { EqualSid(sid, own_sid) }.is_ok() {
+            if !unsafe { EqualSid(ace.sid, own_sid) }.is_ok() {
                 return false;
             }
             extra_aces += 1;
             continue;
         }
-        // SAFETY: `sid` is the embedded SID in the live DACL buffer and the
-        // well-known SIDs are alive above; EqualSid only reads them.
-        if unsafe { EqualSid(sid, system.psid()) }.is_ok() {
+        // SAFETY: `ace.sid` is the embedded SID in the live DACL buffer and
+        // the well-known SIDs are alive above; EqualSid only reads them.
+        if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
             if saw_system {
                 return false;
             }
             saw_system = true;
-        } else if unsafe { EqualSid(sid, administrators.psid()) }.is_ok() {
+        } else if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
             if saw_administrators {
                 return false;
             }
@@ -3497,6 +3523,31 @@ mod tests {
             validated_ace(ace, &buffer).is_some(),
             "non-allow ACE must keep the size-only check"
         );
+        // The same valid allow-ACE at an odd offset of its buffer must pass
+        // too: the descriptor storage is byte-addressed (the loader's words,
+        // the fixtures here), so nothing may depend on the ACE sitting at an
+        // aligned address. The fixture base is 8-aligned, so the ACE at offset
+        // 1 is odd and the case cannot pass by luck.
+        buffer[0] = 0;
+        buffer[2] = 24;
+        buffer[9] = 2;
+        #[repr(align(8))]
+        struct AlignedPadded([u8; 25]);
+        let mut padded = AlignedPadded([0u8; 25]);
+        padded.0[1..].copy_from_slice(&buffer);
+        let shifted = &padded.0[1..];
+        assert!(
+            validated_ace(shifted.as_ptr().cast(), shifted).is_some(),
+            "an ACE at an odd offset must validate"
+        );
+        // The decoded fields come from their own offsets, not from the header:
+        // the access mask is compared by the callers, so it has to survive the
+        // decode.
+        buffer[4..8].copy_from_slice(&FILE_ALL_ACCESS.0.to_ne_bytes());
+        let decoded = validated_ace(ace, &buffer).expect("valid allow-ACE decodes");
+        assert_eq!(decoded.ace_type, 0, "allow-ACEs report their type");
+        assert_eq!(decoded.ace_flags, 0, "allow-ACEs report their flags");
+        assert_eq!(decoded.mask, FILE_ALL_ACCESS.0, "the mask is decoded");
     }
 
     /// The GUI binary these probes spawn: the running test executable lives in
