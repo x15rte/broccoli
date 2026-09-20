@@ -32,7 +32,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
-    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
+    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
     SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, TOKEN_QUERY, WinBuiltinAdministratorsSid,
@@ -649,6 +649,7 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
 /// words, and the tests hand in `[u8; N]` — so no `ACE_HEADER` or
 /// `ACCESS_ALLOWED_ACE` place exists at any particular offset, and a typed
 /// pointer into it would assert an alignment the storage does not promise.
+/// Decoding the bytes directly is also why the validator needs no `unsafe`.
 struct ValidatedAce {
     /// `AceType`; `0` is `ACCESS_ALLOWED_ACE_TYPE`, the only type whose fields
     /// the callers compare.
@@ -676,48 +677,48 @@ struct ValidatedAce {
 /// buffer, and the benign-deviation path runs exactly while the DACL is
 /// user-writable.
 fn validated_ace(ace: *const core::ffi::c_void, buffer: &[u8]) -> Option<ValidatedAce> {
-    let ace = ace.cast::<u8>();
-    let start = buffer.as_ptr();
-    let end = start.wrapping_add(buffer.len());
-    if ace < start || ace > end || ace.wrapping_add(4) > end {
+    // The ACE arrives as a pointer, but every byte of it is read through
+    // `buffer`: the offset is what the bounds checks need, and decoding the
+    // bytes as bytes keeps the whole read in safe code — no `ACE_HEADER` or
+    // `ACCESS_ALLOWED_ACE` place exists at an offset whose alignment the
+    // storage cannot promise.
+    let offset = ace.addr().checked_sub(buffer.as_ptr().addr())?;
+    if offset.checked_add(4)? > buffer.len() {
         return None;
     }
-    // SAFETY: `ace` is within `buffer` with at least 4 bytes to spare (checked
-    // above), so the whole 4-byte `ACE_HEADER` read is in bounds. The read is
-    // unaligned because the storage carries no alignment guarantee: forming an
-    // `ACE_HEADER` place here would be UB the moment the ACE sits at an odd
-    // offset, so the header is copied into a value instead.
-    let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
-    let size = header.AceSize as usize;
-    if size < 20 || ace.wrapping_add(size) > end {
+    let ace_type = buffer[offset];
+    let ace_flags = buffer[offset + 1];
+    let size = usize::from(u16::from_le_bytes([buffer[offset + 2], buffer[offset + 3]]));
+    if size < 20 || offset.checked_add(size)? > buffer.len() {
         return None;
     }
-    if header.AceType == 0 {
+    if ace_type == 0 {
         // ACCESS_ALLOWED_ACE_TYPE only: the callers compare the `SidStart` of
         // exactly these ACEs, and `EqualSid` walks the SID by its own
         // `SubAuthorityCount` — a forged count must not push that walk past
         // the validated `AceSize`. Every other ACE type keeps its previous
         // size-only treatment (the callers reject it before any SID read).
-        // SAFETY: byte 9 is inside the `AceSize >= 20` bytes of `ace` checked
-        // above, so the SID's `SubAuthorityCount` read is in bounds.
-        let sub_authorities = unsafe { *ace.add(9) } as usize;
+        // The count sits at offset 9, inside the `AceSize >= 20` bytes checked
+        // above.
+        let sub_authorities = usize::from(buffer[offset + 9]);
         if 8 + 4 * sub_authorities > size - 8 {
             return None;
         }
     }
-    // SAFETY: the mask occupies offsets 4..8, inside the `AceSize >= 20` bytes
-    // of `ace` checked above, and it is read unaligned for the same reason as
-    // the header.
-    let mask = unsafe { ace.add(4).cast::<u32>().read_unaligned() };
-    // `SidStart` sits at offset 8, inside the validated bytes; the pointer is
-    // arithmetic only — nothing dereferences it in Rust, and `EqualSid` owns
-    // the SID grammar behind it.
-    let sid = PSID(ace.wrapping_add(8).cast::<core::ffi::c_void>().cast_mut());
     Some(ValidatedAce {
-        ace_type: header.AceType,
-        ace_flags: header.AceFlags,
-        mask,
-        sid,
+        ace_type,
+        ace_flags,
+        // `Mask` occupies offsets 4..8, also inside the checked bytes; the
+        // descriptor is little-endian on every target this app builds for.
+        mask: u32::from_le_bytes([
+            buffer[offset + 4],
+            buffer[offset + 5],
+            buffer[offset + 6],
+            buffer[offset + 7],
+        ]),
+        // `SidStart` sits at offset 8, inside the validated bytes; the pointer
+        // is handed to `EqualSid` and never read here.
+        sid: PSID(buffer.as_ptr().wrapping_add(offset + 8).cast_mut().cast()),
     })
 }
 
