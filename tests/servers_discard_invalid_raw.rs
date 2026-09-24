@@ -8,12 +8,12 @@
 //! was stuck with the error text until retyping valid JSON, switching the
 //! mask type, or editing another field.
 //!
-//! Drives the real app through egui_kittest (the perf_servers harness
-//! pattern) at the app's DEFAULT window size 1100x720 (the action row stays
-//! reachable there): replace the raw text with invalid JSON,
-//! assert Discard is enabled, Discard, and assert the editor re-seeds from
-//! the persisted profile with no recommit on later keystrokes. The valid
-//! edit path is driven too: it must keep enabling Discard and reverting.
+//! Drives the real app through egui_kittest at the app's DEFAULT window size
+//! 1100x720 (the action row stays reachable there): replace the raw text with
+//! invalid JSON, assert Discard is enabled, Discard, and assert the editor
+//! re-seeds from the persisted profile with no recommit on later keystrokes.
+//! The valid edit path is driven too: it must keep enabling Discard and
+//! reverting.
 
 use broccoli::app::BroccoliApp;
 use broccoli::model::{
@@ -111,8 +111,7 @@ fn open_advanced_tab(h: &mut Harness<'static, BroccoliApp>) {
     h.run();
 }
 
-/// Replace the whole editor text with one raw document (the perf_servers
-/// select-all + type pattern).
+/// Replace the whole editor text with one raw document (select-all + type).
 fn replace_raw_text(h: &mut Harness<'static, BroccoliApp>, text: &str) {
     raw_editor(h).focus();
     h.run();

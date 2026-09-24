@@ -270,8 +270,8 @@ pub struct BroccoliApp {
     latency_generation: u64,
     /// Always-on performance instrumentation:
     /// owned by the app; the runtime thread records control-plane tick
-    /// durations through its clone. Read by kittest tests and the baseline
-    /// harness via [`Self::metrics_snapshot`].
+    /// durations through its clone. Read by the kittest tests via
+    /// [`Self::metrics_snapshot`].
     metrics: MetricsHandle,
     /// Frame-entry timestamp of the previous `logic` call, for the frame-time
     /// accumulator. `None` before the first frame.
@@ -637,8 +637,8 @@ impl BroccoliApp {
     /// The headless test boot: exactly [`Self::new`] except the tray icon. The
     /// tray menu and its action channel still exist, so the tray plumbing
     /// keeps its types and stays covered, but a test run must not light up the
-    /// notification area (`tests/perf_baseline.rs`, `tests/ui_smoke.rs` and the
-    /// other kittest suites boot the app through this constructor).
+    /// notification area (`tests/ui_smoke.rs` and the other kittest suites
+    /// boot the app through this constructor).
     pub fn new_headless(cc: &eframe::CreationContext<'_>) -> Self {
         Self::build(cc, false)
     }
@@ -1986,8 +1986,8 @@ impl BroccoliApp {
         let _ = self.evt_tx.send(ev);
     }
 
-    /// Cheap read path for kittest tests and the baseline harness: one lock
-    /// and a struct copy of the current snapshot.
+    /// Cheap read path for the kittest tests: one lock and a struct copy of
+    /// the current snapshot.
     pub fn metrics_snapshot(&self) -> Metrics {
         self.metrics.snapshot()
     }
@@ -4713,7 +4713,7 @@ mod config_gate_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer};
+    use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, TerminalError};
     use super::{
         Language, native_dark_for, phase_badge_text, same_phase,
         tun_outbound_interface_block_reason,
@@ -4986,32 +4986,55 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// The resource counter reports the resident byte total after
-    /// every push and tracks it down across evictions.
+    /// The buffer's own byte accounting is the resident total: every push
+    /// leaves it at or under the byte cap, and at max-size volumes evictions
+    /// bring it down to exactly the cap.
     #[test]
-    fn resource_counter_tracks_buffer_bytes_across_pushes_and_evictions() {
-        let metrics = MetricsHandle::new();
-        let mut buf = LogBuffer::new(metrics.clone());
-        assert_eq!(metrics.snapshot().log_buffer_bytes, 0);
+    fn byte_accounting_tracks_pushes_and_evictions() {
+        let mut buf = LogBuffer::new(MetricsHandle::new());
 
         buf.push(false, "hello".to_string());
         buf.push(false, "world".to_string());
         assert_eq!(buf.bytes(), 10);
-        assert_eq!(metrics.snapshot().log_buffer_bytes, 10);
 
-        // Max-size lines: the byte cap binds, the counter stays in lockstep
-        // with the accounted total on every push, and evictions shrink it.
+        // Max-size lines: the byte cap binds and stays bound on every push.
         let max_line = "y".repeat(MAX_LINE_BYTES);
         for _ in 0..(LOG_BYTE_CAP / MAX_LINE_BYTES + 2) {
             buf.push(true, max_line.clone());
             assert!(buf.bytes() <= LOG_BYTE_CAP);
-            assert_eq!(metrics.snapshot().log_buffer_bytes as usize, buf.bytes());
         }
         // The short lines were evicted; the ring holds exactly the byte cap
         // of max-size lines.
         assert_eq!(buf.len(), LOG_BYTE_CAP / MAX_LINE_BYTES);
         assert_eq!(buf.bytes(), LOG_BYTE_CAP);
-        assert_eq!(metrics.snapshot().log_buffer_bytes, LOG_BYTE_CAP as u64);
+    }
+
+    /// The terminal message is formatted when the failure is recorded, and
+    /// every later frame reuses that text: `render_in` is the memo — it
+    /// reports `false` while the message's language stands, so no idle frame
+    /// re-formats (or re-allocates) the message the block and the chip
+    /// render.
+    #[test]
+    fn terminal_error_renders_once_and_keeps_its_text() {
+        let metrics = MetricsHandle::new();
+        let mut error = TerminalError::new(
+            Diag::new(Key::RtPhaseRestartCancelled),
+            String::new(),
+            Language::En,
+            &metrics,
+        );
+        assert_eq!(error.text, t(Language::En, Key::RtPhaseRestartCancelled));
+        let text_ptr = error.text.as_ptr();
+
+        assert!(
+            !error.render_in(Language::En, &metrics),
+            "the recorded language must keep the memoized text"
+        );
+        assert_eq!(
+            error.text.as_ptr(),
+            text_ptr,
+            "an idle frame must reuse the formatted text allocation"
+        );
     }
 }
 

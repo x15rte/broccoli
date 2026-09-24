@@ -7,12 +7,11 @@
 //! Discard the raw-JSON field keeps showing the discarded text and the next
 //! keystroke silently re-commits it into the draft.
 //!
-//! Drives the real app through egui_kittest (the perf_servers harness
-//! pattern): boot with a seeded profile carrying an unknown preserved-raw
-//! finalmask TCP mask, open the Advanced tab, replace the raw text with
-//! valid JSON (a real discarded edit — invalid text never commits and would
-//! not enable Discard), Discard, and assert the editor holds the persisted
-//! text again.
+//! Drives the real app through egui_kittest: boot with a seeded profile
+//! carrying an unknown preserved-raw finalmask TCP mask, open the Advanced
+//! tab, replace the raw text with valid JSON (a real discarded edit — invalid
+//! text never commits and would not enable Discard), Discard, and assert the
+//! editor holds the persisted text again.
 
 use broccoli::app::BroccoliApp;
 use broccoli::model::{
@@ -101,8 +100,8 @@ fn open_advanced_tab(h: &mut Harness<'static, BroccoliApp>) {
     h.run();
 }
 
-/// Replace the whole editor text with one valid JSON document (the
-/// perf_servers select-all + type pattern), returning the new text.
+/// Replace the whole editor text with one valid JSON document (select-all +
+/// type), returning the new text.
 fn replace_raw_text(h: &mut Harness<'static, BroccoliApp>, text: &str) {
     raw_editor(h).focus();
     h.run();

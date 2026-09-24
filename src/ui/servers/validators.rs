@@ -16,13 +16,16 @@
 //! (SettingsIdNotUuid / VlessEncryptionUnsupported): the keygen rows call
 //! the `…_required` helpers below so one message channel carries each
 //! value, while the full `v_uuid` / `v_vless_encryption` stay
-//! for tool-output validation only.
+//! for tool-output validation only — each delegating its format branch to
+//! the model's one definition (`is_canonical_uuid` /
+//! `vless_encryption_supported`).
 
 use crate::i18n::{Key, t};
 use crate::model::outbound::{
     is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_entry_supported,
 };
 use crate::model::settings::Language;
+use crate::model::validation::is_canonical_uuid;
 
 // ---------- validators ----------
 
@@ -32,10 +35,14 @@ pub(super) fn v_required(lang: Language, v: &str) -> Option<String> {
         .then(|| t(lang, Key::SrvRequired).to_string())
 }
 
+/// The tool-output guard for a generated id: delegates the format branch to
+/// the model's one UUID definition ([`is_canonical_uuid`]), so this screen,
+/// the share-link grammar, and the model finding agree about which ids dial
+/// the configured account. Empty stays a requiredness error here.
 pub(super) fn v_uuid(lang: Language, v: &str) -> Option<String> {
     if v.is_empty() {
         Some(t(lang, Key::SrvUuidRequired).into())
-    } else if uuid::Uuid::parse_str(v).is_ok() {
+    } else if is_canonical_uuid(v) {
         None
     } else {
         Some(t(lang, Key::SrvMustBeUuid).into())

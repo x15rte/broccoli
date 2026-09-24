@@ -58,6 +58,24 @@ pub fn is_wildcard_listen(s: &str) -> bool {
         .is_ok_and(|address| address.is_unspecified())
 }
 
+/// The listener-collision rule, one definition, over one endpoint per side
+/// as `(port, protocol bits, address)`: two endpoints conflict when they
+/// share a port, their protocol sets intersect (a TCP+UDP listener conflicts
+/// with a TCP-only or UDP-only one), and their addresses overlap —
+/// [`listen_addresses_overlap`], so a wildcard bind conflicts with every
+/// address on its port. The model pass (`ListenerConflict`) and the inbounds
+/// screen (`Collision*`) both call this; each keeps its own concerns —
+/// invalid endpoints, a zero port, an empty UNIX path, disabled listeners,
+/// path normalization, labels, and message keys.
+pub fn listen_endpoints_conflict(
+    (port, protocols, address): (u16, u8, &str),
+    (other_port, other_protocols, other_address): (u16, u8, &str),
+) -> bool {
+    port == other_port
+        && protocols & other_protocols != 0
+        && listen_addresses_overlap(address, other_address)
+}
+
 /// A listen address is always a concrete IP literal; the
 /// validator lives in `crate::model::validation::validate_listen_address`.
 /// Inbound sniffing (xray.go:56-100).
@@ -543,7 +561,7 @@ pub(crate) fn new_dokodemo_tag(entries: &[DokodemoCfg]) -> String {
 
 #[cfg(test)]
 mod listen_address_tests {
-    use super::{is_wildcard_listen, listen_addresses_overlap};
+    use super::{is_wildcard_listen, listen_addresses_overlap, listen_endpoints_conflict};
     use crate::model::LocalInboundCfg;
     use crate::model::validation::{ValidationCode, validate_listen_address};
 
@@ -573,6 +591,43 @@ mod listen_address_tests {
         assert!(!is_wildcard_listen("127.0.0.1"));
         assert!(!is_wildcard_listen("::1"));
         assert!(!is_wildcard_listen(""));
+    }
+
+    #[test]
+    fn endpoints_conflict_only_on_shared_port_intersecting_protocols_and_overlapping_addresses() {
+        const TCP: u8 = 1;
+        const UDP: u8 = 2;
+        // Shared port, intersecting protocols, overlapping addresses.
+        assert!(listen_endpoints_conflict(
+            (10808, TCP, "127.0.0.1"),
+            (10808, TCP, "127.0.0.1")
+        ));
+        assert!(listen_endpoints_conflict(
+            (10808, TCP | UDP, "127.0.0.1"),
+            (10808, UDP, "127.0.0.1")
+        ));
+        // The wildcard address conflicts with any address on a shared port.
+        assert!(listen_endpoints_conflict(
+            (10808, TCP, "0.0.0.0"),
+            (10808, TCP, "192.168.1.5")
+        ));
+        assert!(listen_endpoints_conflict(
+            (53, UDP, "::"),
+            (53, TCP | UDP, "::1")
+        ));
+        // Any one third of the conjunction failing means no conflict.
+        assert!(!listen_endpoints_conflict(
+            (10808, TCP, "127.0.0.1"),
+            (10809, TCP, "127.0.0.1")
+        ));
+        assert!(!listen_endpoints_conflict(
+            (10808, TCP, "127.0.0.1"),
+            (10808, UDP, "127.0.0.1")
+        ));
+        assert!(!listen_endpoints_conflict(
+            (10808, TCP, "127.0.0.1"),
+            (10808, TCP, "192.168.1.5")
+        ));
     }
 
     #[test]

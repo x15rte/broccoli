@@ -566,6 +566,40 @@ mod tests {
         );
     }
 
+    /// Idle-frame purity: the worker enumerates on the 5 s cadence, so a
+    /// frame inside the interval requests nothing — the request slot stays
+    /// idle and the rendered list keeps the adapters the last enumeration
+    /// delivered. A per-frame enumeration would leave a request in flight
+    /// (and replace the fixture list).
+    #[test]
+    fn idle_frames_never_request_an_enumeration() {
+        let mut screen = TunScreen::default();
+        screen.seed_ifaces(vec![iface("Ethernet", true), iface("wired", false)]);
+        // Park the cadence well past any test runtime, so the assertion
+        // holds on a loaded machine too: the gate, not the clock, decides.
+        screen.next_refresh_at = Some(std::time::Instant::now() + REFRESH_INTERVAL * 1_000);
+        let mut rig = UiTestRig::default();
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, screen: &mut TunScreen| screen.show(ui, &mut rig.ctx()),
+            screen,
+        );
+        harness.run();
+
+        assert!(
+            !harness.state().iface_request.is_pending(),
+            "a frame inside the refresh cadence must not request an enumeration"
+        );
+        let rendered = &harness.state().ifaces;
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|iface| iface.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Ethernet", "wired"],
+            "idle frames must keep rendering the delivered adapter snapshot"
+        );
+    }
+
     #[test]
     fn a_running_tun_core_renders_the_helper_badge_not_the_uac_note() {
         // The app never runs elevated — the elevated helper owns the core —

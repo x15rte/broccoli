@@ -14,7 +14,7 @@
 //! validation immediately and renders the failure report).
 //!
 //! Tallness: the Advanced tab is the tallest with a preserved-raw finalmask
-//! (perf_servers bulk), and the Basic tab is the tallest for a Wireguard
+//! (the ~45 KiB bulk seeded below), and the Basic tab is the tallest for a Wireguard
 //! profile with several peers. The preserved-raw mask is deliberately
 //! invalid (that is what keeps it raw), so Validate stays disabled there;
 //! the clickability of an enabled Validate is exercised on the tall
@@ -40,8 +40,8 @@ const SEEDED_NAME: &str = "editor-actions";
 /// on every one of them).
 const TABS: &[&str] = &["Basic", "Transport", "Security", "Mux", "Advanced"];
 
-/// A deliberately large preserved-raw config (~45 KiB, structured), matching
-/// the bulk the perf_servers harness seeds so the Advanced tab is tall.
+/// A deliberately large preserved-raw config (~45 KiB, structured): the bulk
+/// the seeded profile needs so the Advanced tab is tall.
 fn large_raw_value(seed: u64) -> Value {
     json!({
         "type": "future-mask",

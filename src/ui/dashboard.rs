@@ -1787,6 +1787,15 @@ mod tests {
             profile("beta", Some(-1)),
             profile("gamma", None),
         ];
+        // One history entry before the first frame, so the plot cache's
+        // series owns a real allocation: an empty `Vec`'s `as_ptr` is a
+        // dangling constant, and the idle identity check below would then
+        // compare equal even across a rebuild.
+        rig.borrow_mut().stats_history.push_back(StatsTick {
+            up: 10,
+            down: 20,
+            ..Default::default()
+        });
         let rig_handle = rig.clone();
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
@@ -1796,15 +1805,20 @@ mod tests {
             DashboardScreen::default(),
         );
 
-        // First render: the initial cache fill is a one-time seed, not a
-        // rebuild (the purity contract keeps counters at absolute
-        // zero on a fresh harness), and the seeded grid rows render their
-        // stale-latency cells.
+        // First render: the plot cache is seeded from the live stats
+        // generation (a one-time fill, not a rebuild), and the seeded grid
+        // rows render their stale-latency cells.
         harness.run();
+        let seeded_generation = rig.borrow().stats_generation;
         assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            0,
-            "the first render seeds the plot cache without counting a rebuild"
+            harness
+                .state()
+                .plot_cache
+                .as_ref()
+                .unwrap()
+                .stats_generation,
+            seeded_generation,
+            "the first render must seed the plot cache from the live stats generation"
         );
         harness
             .get_all_by_label("42 ms")
@@ -1820,15 +1834,23 @@ mod tests {
             .expect("unmeasured profile latency renders as the em dash");
 
         // Idle frames: no stats tick, no observatory tick, no model change
-        // -> no rebuild, no grid work (no counter exists for the grid; its
-        // memoization is structural — the values below stay stable).
-        let expected = rig.borrow().metrics.snapshot().plot_rebuilds;
+        // -> the plot cache keeps its generation key and its series
+        // allocation (a per-frame rebuild would replace the `up` vector),
+        // and the grid keeps its memoized values.
+        let (idle_generation, idle_series) = {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            (cache.stats_generation, cache.up.as_ptr())
+        };
         harness.run_steps(30);
-        assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            expected,
-            "idle frames must not rebuild the plot series"
-        );
+        {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            assert_eq!(cache.stats_generation, idle_generation);
+            assert_eq!(
+                cache.up.as_ptr(),
+                idle_series,
+                "idle frames must not rebuild the plot series"
+            );
+        }
         harness
             .get_all_by_label("42 ms")
             .next()
@@ -1840,18 +1862,31 @@ mod tests {
             ..Default::default()
         });
         rig.borrow_mut().stats_generation += 1;
+        let ticked_generation = rig.borrow().stats_generation;
         harness.run();
-        assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            expected + 1,
-            "one stats tick must rebuild the plot series exactly once"
-        );
+        let ticked_series = {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            assert_eq!(
+                cache.stats_generation, ticked_generation,
+                "one stats tick must rebuild the plot series exactly once"
+            );
+            assert_eq!(
+                cache.up.len(),
+                2,
+                "the rebuilt series must cover the seeded entry plus the ticked one"
+            );
+            cache.up.as_ptr()
+        };
         harness.run_steps(10);
-        assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            expected + 1,
-            "frames after the tick must not rebuild again"
-        );
+        {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(
+                cache.up.as_ptr(),
+                ticked_series,
+                "frames after the tick must not rebuild again"
+            );
+        }
 
         let tag = rig.borrow().servers.profiles[0].tag();
         rig.borrow_mut().observatory = vec![OutboundStatusView {
@@ -1873,11 +1908,15 @@ mod tests {
             "the stale latency label must disappear with the observatory row"
         );
         harness.run_steps(10);
-        assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            expected + 1,
-            "an observatory tick must not rebuild the plot series"
-        );
+        {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(
+                cache.up.as_ptr(),
+                ticked_series,
+                "an observatory tick must not rebuild the plot series"
+            );
+        }
 
         rig.borrow_mut().servers.profiles[1].name = "beta-renamed".into();
         rig.borrow_mut().config_revision += 1;
@@ -1886,11 +1925,15 @@ mod tests {
             .get_all_by_label("beta-renamed")
             .next()
             .expect("a persist-generation bump rebuilds the grid rows");
-        assert_eq!(
-            rig.borrow().metrics.snapshot().plot_rebuilds,
-            expected + 1,
-            "a model change must not rebuild the plot series"
-        );
+        {
+            let cache = harness.state().plot_cache.as_ref().unwrap();
+            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(
+                cache.up.as_ptr(),
+                ticked_series,
+                "a model change must not rebuild the plot series"
+            );
+        }
     }
 
     /// Long observatory last-error text is truncated to 60 chars in the

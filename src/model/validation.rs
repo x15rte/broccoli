@@ -16,7 +16,7 @@ use super::Int32Range;
 use super::dns::parse_pool_cidr;
 use super::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DokodemoNetwork,
-    LocalInboundCfg, LocalInboundProtocol, Sniffing, TUN_INBOUND_TAG, listen_addresses_overlap,
+    LocalInboundCfg, LocalInboundProtocol, Sniffing, TUN_INBOUND_TAG, listen_endpoints_conflict,
 };
 use super::outbound::{
     MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
@@ -125,9 +125,10 @@ pub enum ValidationCode {
     /// VLESS/VMess `settings.id` that is non-empty and not a canonical
     /// UUID: Xray silently sha1-maps short strings to a deterministic v5
     /// UUID (common/uuid/uuid.go) — dialing a *different* account. Broccoli
-    /// deliberately diverges with a UUID-only policy (mirrors the import
-    /// `check_uuid` and the UI UUID validators). Empty ids stay out of
-    /// scope (draft state; the editor requires them).
+    /// deliberately diverges with a UUID-only policy (the one definition is
+    /// `is_canonical_uuid`, which the import `check_uuid`, the finalmask
+    /// validator, and the UI UUID field validator all call). Empty ids stay
+    /// out of scope (draft state; the editor requires them).
     SettingsIdNotUuid,
     // ---- transport-security formats (validate_stream) ----
     /// REALITY client `publicKey` (stored in the profile's `password`
@@ -819,7 +820,9 @@ pub fn server_name_implausible(value: &str) -> bool {
 // mirrors in lockstep: same literals, same comparisons. The VLESS
 // encryption rule is not mirrored but shared: `vless_encryption_supported`
 // lives in `super::outbound`, and the model pass, the import grammar, and
-// the editor validator all call it.
+// the editor validator all call it. The UUID rule is shared the same way:
+// `is_canonical_uuid` below is its one definition, and the import grammar,
+// the finalmask validator, and the editor validator call it.
 
 /// True when a VLESS `flow` is acceptable on the wire —
 /// empty (the default) or one of the two vision (XRV) variants. Xray's conf
@@ -888,13 +891,14 @@ fn shadowsocks_2022_key_supported(method: &str, password: &str) -> bool {
     })
 }
 
-/// True when an id is a canonical UUID under
-/// `uuid::Uuid::parse_str` — the exact policy of the import grammar's
-/// `check_uuid` and the UI UUID field validators. Xray itself sha1-maps
-/// 1-30-char strings to a deterministic v5 UUID (common/uuid/uuid.go) and
-/// accepts 32-36-char hex forms, so only a true UUID dials the configured
-/// account.
-fn is_canonical_uuid(id: &str) -> bool {
+/// The UUID format policy, one definition: true when an id is a canonical
+/// UUID under `uuid::Uuid::parse_str`. Xray itself sha1-maps 1-30-char
+/// strings to a deterministic v5 UUID (common/uuid/uuid.go) and accepts
+/// 32-36-char hex forms, so only a true UUID dials the configured account.
+/// The import grammar's `check_uuid`, the finalmask XMC validator, and the
+/// editor's UUID field validator all call this predicate, each keeping only
+/// its own message channel.
+pub(crate) fn is_canonical_uuid(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok()
 }
 
@@ -2781,7 +2785,7 @@ fn finalmask_validate_xmc(path: &str, settings: &FinalmaskXmc, issues: &mut Vec<
                 Some(format!("{profile_path}.username")),
             ));
         }
-        if uuid::Uuid::parse_str(&profile.uuid).is_err() {
+        if !is_canonical_uuid(&profile.uuid) {
             issues.push(issue(
                 ValidationCode::FinalmaskXmcUuidInvalid,
                 Some(format!("{profile_path}.uuid")),
@@ -3931,18 +3935,27 @@ pub fn validate_settings(
             ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
         }
     }
+    // The conjunction itself is one definition
+    // (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps
+    // the model-level concerns — each entry's label, the pairing against
+    // earlier listeners, and the `ListenerConflict` code. Disabled entries,
+    // invalid listen addresses, and zero ports never reach `ip_listeners`.
     for current in 0..ip_listeners.len() {
+        let (label, address, port, protocols) = &ip_listeners[current];
+        let endpoint = (*port, *protocols, address.as_str());
         if let Some(other) = ip_listeners[..current].iter().find(|other| {
-            other.2 == ip_listeners[current].2
-                && other.3 & ip_listeners[current].3 != 0
-                && listen_addresses_overlap(&other.1, &ip_listeners[current].1)
+            let (_, other_address, other_port, other_protocols) = other;
+            listen_endpoints_conflict(
+                endpoint,
+                (*other_port, *other_protocols, other_address.as_str()),
+            )
         }) {
             issues.push(issue(
                 ValidationCode::ListenerConflict(
-                    ip_listeners[current].0.clone(),
+                    label.clone(),
                     other.0.clone(),
-                    ip_listeners[current].1.clone(),
-                    ip_listeners[current].2,
+                    address.clone(),
+                    *port,
                 ),
                 None,
             ));
@@ -8181,6 +8194,34 @@ mod tests {
     }
 
     #[test]
+    fn canonical_uuid_predicate_is_parse_str_and_nothing_more() {
+        for accepted in [
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            // Hex is case-insensitive.
+            "B831381D-6324-4D53-AD4F-8CDA48B30811",
+            // `Uuid::parse_str` also accepts its unhyphenated 32-hex
+            // "simple" form, and all four callers have always shared that
+            // verdict.
+            "b10a8db164e0754105b7a99be72e3fe5",
+        ] {
+            assert!(is_canonical_uuid(accepted), "{accepted:?} must pass");
+        }
+        for rejected in [
+            // 1-30-char strings: Xray sha1-maps these to another account.
+            "some-account-name",
+            // Canonical shape cut short (the import grammar's own case).
+            "b831381d-6324-4d53-ad4f-8cda48b3081",
+            "",
+            // 32 characters, one of them not hex.
+            "b10a8db164e0754105b7a99be72e3feG",
+            // Canonical shape, non-hex digits.
+            "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+        ] {
+            assert!(!is_canonical_uuid(rejected), "{rejected:?} must be refused");
+        }
+    }
+
+    #[test]
     fn uuid_rule_fires_only_for_nonempty_noncanonical_ids() {
         for id in [
             "b831381d-6324-4d53-ad4f-8cda48b30811",
@@ -8201,8 +8242,8 @@ mod tests {
         }
         // The divergence: Xray sha1-maps 1-30-char strings to a deterministic
         // v5 UUID (different account) and accepts 32-36-char hex forms;
-        // broccoli's policy is UUID-only (mirrors the import check_uuid and
-        // the UI field validators).
+        // broccoli's policy is UUID-only (the single `is_canonical_uuid`
+        // predicate the import check_uuid and the UI field validators call).
         for id in [
             "b831381d-6324-4d53-ad4f-8cda48b3081",
             "some-account-name",

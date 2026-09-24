@@ -6,7 +6,7 @@
 use crate::i18n::{Key, safety_message_for_path, t, t_fmt, validation_message};
 use crate::model::inbound::{
     API_INBOUND_TAG, DNS_INBOUND_TAG, DokodemoNetwork, TUN_INBOUND_TAG, is_wildcard_listen,
-    listen_addresses_overlap, new_dokodemo_tag, next_local_tag,
+    listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
 };
 use crate::model::safety::assess;
 use crate::model::settings::Language;
@@ -669,6 +669,12 @@ fn listeners(settings: &Settings, lang: Language) -> Vec<ListenerView> {
     result
 }
 
+/// The row's collision verdict, or `None` when the row is appliable. The
+/// conjunction itself is one definition
+/// (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps the
+/// draft-level concerns — invalid endpoints, the zero port, the empty UNIX
+/// path, disabled listeners, path normalization, labels, and the
+/// `Collision*` keys the model pass cannot render.
 fn listener_collision(
     listeners: &[ListenerView],
     lang: Language,
@@ -695,20 +701,20 @@ fn listener_collision(
             if *port == 0 {
                 return Some(t_fmt(lang, Key::CollisionNeedsPort, &[&current.label]));
             }
+            let current_endpoint = (*port, *protocols, listen.as_str());
             let conflicts = listeners
                 .iter()
                 .filter(|other| other.key != key && other.enabled)
-                .filter(|other| {
-                    matches!(
-                        &other.endpoint,
-                        ListenerEndpoint::IpPort {
-                            listen: other_listen,
-                            port: other_port,
-                            protocols: other_protocols,
-                        } if *other_port == *port
-                            && *other_protocols & *protocols != 0
-                            && listen_addresses_overlap(other_listen, listen)
-                    )
+                .filter(|other| match &other.endpoint {
+                    ListenerEndpoint::IpPort {
+                        listen: other_listen,
+                        port: other_port,
+                        protocols: other_protocols,
+                    } => listen_endpoints_conflict(
+                        current_endpoint,
+                        (*other_port, *other_protocols, other_listen.as_str()),
+                    ),
+                    ListenerEndpoint::Unix { .. } | ListenerEndpoint::Invalid(_) => false,
                 })
                 .map(|other| other.label.as_str())
                 .collect::<Vec<_>>();
@@ -1365,6 +1371,79 @@ mod listener_validation_tests {
             "adding the first account must clear the row error"
         );
         assert_eq!(rig.borrow().settings.local_inbounds[1].accounts.len(), 1);
+    }
+
+    /// The validation references are generation-gated: a frame whose
+    /// `(config_revision, dirty, row counts)` key is unchanged re-renders the
+    /// cached verdicts (the same allocation — nothing is recomputed), and a
+    /// key move rebuilds them once. An app boot plus a frame window is not
+    /// needed to see that: the gate, its key and its cached vectors are all
+    /// reachable from the screen itself.
+    #[test]
+    fn validation_cache_is_generation_gated() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            // The seeded SOCKS/HTTP pair on one loopback port: the SOCKS row
+            // carries a collision verdict.
+            rig.settings.local_inbounds[1].port = rig.settings.local_inbounds[0].port;
+        }
+        let mut harness = harness_for(rig.clone());
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("conflicts with HTTP")
+                .is_some(),
+            "the cached SOCKS collision verdict must render on its row"
+        );
+        assert!(
+            harness
+                .query_by_label_contains("conflicts with SOCKS")
+                .is_some(),
+            "the cached HTTP collision verdict must render on its row"
+        );
+
+        let (generation, verdicts) = {
+            let cache = harness
+                .state()
+                .validation
+                .as_ref()
+                .expect("the first frame builds the cache");
+            assert!(
+                cache.local_collisions.iter().any(Option::is_some),
+                "the seeded port collision must be in the cached verdicts"
+            );
+            (cache.generation, cache.local_collisions.as_ptr())
+        };
+
+        // An idle frame keeps the key and the verdict allocation.
+        harness.run();
+        {
+            let cache = harness.state().validation.as_ref().unwrap();
+            assert_eq!(cache.generation, generation);
+            assert_eq!(
+                cache.local_collisions.as_ptr(),
+                verdicts,
+                "an unchanged generation must re-render the cached verdicts"
+            );
+        }
+
+        // One edit: the frame's dirty flag is part of the key, so the cache
+        // rebuilds once and the cleared collision is gone.
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.local_inbounds[1].port = 10899;
+            rig.dirty = true;
+        }
+        harness.run();
+        {
+            let cache = harness.state().validation.as_ref().unwrap();
+            assert_ne!(cache.generation, generation, "an edit must move the key");
+            assert!(
+                cache.local_collisions.iter().all(Option::is_none),
+                "the cleared collision must be gone from the rebuilt cache"
+            );
+        }
     }
 
     /// Unticking Require auth on the trapped row clears the error the same

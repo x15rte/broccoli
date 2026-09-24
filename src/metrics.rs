@@ -1,12 +1,11 @@
 //! Always-on performance instrumentation: one snapshot of plain integer
-//! counters, readable by kittest tests and the baseline harness.
+//! counters, readable by the kittest tests.
 //!
 //! Ownership: the app owns the [`MetricsHandle`] and records frame intervals
 //! and (in later versions) work/resource counters; the runtime thread records
-//! control-plane tick durations through its clone of the handle. Tests and
-//! the baseline harness read a copy via [`MetricsHandle::snapshot`]. The
-//! interior mutability is deliberate — the UI thread and the runtime thread
-//! genuinely share this one cell.
+//! control-plane tick durations through its clone of the handle. Tests read a
+//! copy via [`MetricsHandle::snapshot`]. The interior mutability is deliberate
+//! — the UI thread and the runtime thread genuinely share this one cell.
 //!
 //! Rules:
 //! - Counters are plain integers. Frame-time and tick duration counters
@@ -214,8 +213,7 @@ impl MetricsHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Cheap read path for tests and the baseline harness: one lock, one
-    /// struct copy.
+    /// Cheap read path for the tests: one lock, one struct copy.
     pub fn snapshot(&self) -> Metrics {
         *self.lock()
     }

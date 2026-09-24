@@ -10389,17 +10389,15 @@ TLS ping finished"#;
         let alpha_id = alpha.id.clone();
         let beta_id = beta.id.clone();
 
-        // One render per profile creates one buffer each; the counter tracks
-        // the live entry count on every add.
+        // One render per profile creates one buffer each: the raw-editor
+        // map carries one entry per rendered profile.
         render_advanced_tab(&mut screen, &mut alpha, &metrics);
         render_advanced_tab(&mut screen, &mut beta, &metrics);
         assert_eq!(screen.finalmask_raw.len(), 2);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 2);
 
         // Evicting a profile that never rendered is a no-op for the cache.
         screen.evict_raw_buffers("00000000000000000000000000000000", &metrics);
         assert_eq!(screen.finalmask_raw.len(), 2);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 2);
 
         // Deleting alpha evicts exactly its buffer; beta's stays untouched.
         screen.evict_raw_buffers(&alpha_id, &metrics);
@@ -10414,18 +10412,16 @@ TLS ping finished"#;
                 .values()
                 .all(|buffer| buffer.profile == beta_id)
         );
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 1);
 
-        // Idle re-render of the surviving profile: no growth, counter stable.
+        // Idle re-render of the surviving profile: its entry is reused, so
+        // the map does not grow.
         render_advanced_tab(&mut screen, &mut beta, &metrics);
         assert_eq!(screen.finalmask_raw.len(), 1);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 1);
 
-        // Re-rendering the deleted profile recreates its buffer; the counter
+        // Re-rendering the deleted profile recreates its buffer; the map
         // follows the live size.
         render_advanced_tab(&mut screen, &mut alpha, &metrics);
         assert_eq!(screen.finalmask_raw.len(), 2);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 2);
     }
 
     #[test]
@@ -10443,23 +10439,138 @@ TLS ping finished"#;
         let id = profile.id.clone();
         render_advanced_tab(&mut screen, &mut profile, &metrics);
         assert_eq!(screen.finalmask_raw.len(), 1);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 1);
         let seeded_text = screen.finalmask_raw.values().next().unwrap().text.clone();
 
         // A rename changes only the display name — the profile id is
         // immutable, so the buffer keys stay valid: repeated renames must
-        // not grow the cache, re-seed buffers, or move the counter.
+        // not grow the cache or re-seed buffers.
         for rename in 0..5 {
             profile.name = format!("renamed-{rename}");
             render_advanced_tab(&mut screen, &mut profile, &metrics);
         }
         assert_eq!(screen.finalmask_raw.len(), 1);
-        assert_eq!(metrics.snapshot().raw_editor_cache_entries, 1);
         let surviving = screen.finalmask_raw.values().next().unwrap();
         assert_eq!(surviving.profile, id);
         assert_eq!(
             surviving.text, seeded_text,
             "the buffer must survive renames"
+        );
+    }
+
+    #[test]
+    fn idle_advanced_frames_do_not_reparse_the_raw_editor_buffers() {
+        // The raw editor parses only on a re-seed or a text edit (the parse
+        // gate in `raw_editor.rs`); an idle re-render of the same buffer must
+        // reuse both the cached text and its parse result. The gate itself
+        // leaves no other trace: a needless reparse of unchanged text
+        // rewrites the same error string and never touches the committed
+        // value, so the parse counter is the only observable that fails when
+        // the gate is dropped — hence one delta, never an absolute count.
+        let mut screen = ServersScreen::default();
+        let metrics = MetricsHandle::new();
+        let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            tcp: vec![FinalmaskTcpMask::Unknown(json!({"type": "future-parse"}))],
+            udp: Vec::new(),
+            quic_params: None,
+            extra: Default::default(),
+        });
+        render_advanced_tab(&mut screen, &mut profile, &metrics);
+        assert_eq!(
+            screen.finalmask_raw.len(),
+            1,
+            "the rendered buffer must be in the raw-editor cache for the \
+             idle frame to have a parse to skip"
+        );
+        let parses = metrics.snapshot().raw_editor_parses;
+        render_advanced_tab(&mut screen, &mut profile, &metrics);
+        assert_eq!(
+            metrics.snapshot().raw_editor_parses,
+            parses,
+            "an idle re-render of an unchanged buffer must not reparse the JSON"
+        );
+    }
+
+    /// Editing the preserved-raw text into invalid JSON surfaces the parse
+    /// error under the editor — the memoized `JsonBuf` error, not a
+    /// per-frame re-parse — and the error keeps rendering across idle
+    /// frames; a valid replacement clears it.
+    #[test]
+    fn invalid_raw_text_renders_the_parse_error_until_repaired() {
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.outbound.stream.finalmask = Some(FinalmaskModel {
+            tcp: vec![FinalmaskTcpMask::Unknown(json!({"type": "future-raw"}))],
+            udp: Vec::new(),
+            quic_params: None,
+            extra: Default::default(),
+        });
+        rig.servers.profiles.push(tokyo.clone());
+        rig.servers.active = Some(tokyo.id.clone());
+        let mut harness = wide_servers_harness(rig);
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+
+        // The seeded buffer parses clean: nothing reports under the editor.
+        assert!(
+            harness.query_by_label_contains("invalid JSON").is_none(),
+            "the seeded raw config must parse clean"
+        );
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .next()
+            .expect("the preserved-raw editor renders on the Advanced tab")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .next()
+            .expect("the editor stays in the tree")
+            .click();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .find(|node| node.is_focused())
+            .expect("the editor keeps focus after select-all")
+            .type_text("{not json");
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .0
+                .finalmask_raw
+                .values()
+                .any(|buffer| buffer.error.is_some()),
+            "an invalid edit must leave its parse error on the buffer"
+        );
+        assert!(
+            harness.query_by_label_contains("invalid JSON").is_some(),
+            "the parse error must render under the editor"
+        );
+
+        // Idle frames keep rendering the memoized error; a valid replacement
+        // clears it.
+        harness.run_steps(4);
+        assert!(
+            harness.query_by_label_contains("invalid JSON").is_some(),
+            "the parse error must persist across idle frames"
+        );
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .find(|node| node.is_focused())
+            .expect("the editor keeps focus")
+            .type_text(r#"{"type":"custom","ok":true}"#);
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("invalid JSON").is_none(),
+            "a valid replacement must clear the parse error"
         );
     }
 
@@ -11236,59 +11347,81 @@ TLS ping finished"#;
     #[test]
     fn editor_validation_sweeps_once_per_draft_generation_and_never_on_idle_frames() {
         let mut rig = UiTestRig::default();
-        let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        // The draft carries a verdict, so the memoized cache's allocation
+        // identity is what tells a real sweep from an idle reuse.
+        let tokyo = profile_with_bad_finalmask();
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.active = Some(tokyo.id.clone());
         let mut harness = unsaved_harness(rig);
         harness.run();
         // Opening the editor seeds the fresh draft's cache before the content
         // renders — one sweep on the open frame, never again while idle.
+        let generation = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor opens the active profile's draft")
+            .generation;
+        let opened = harness
+            .state()
+            .0
+            .editor_validation_cache
+            .as_ref()
+            .expect("the draft-open frame must run the validation sweep");
         assert_eq!(
-            harness
-                .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+            opened.generation, generation,
             "the draft-open frame must run the validation sweep exactly once"
         );
+        let verdicts = opened.finalmask_errors.as_ptr();
         harness.run();
         harness.run();
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the draft stays covered by the memo")
+                .finalmask_errors
+                .as_ptr(),
+            verdicts,
             "idle frames must not re-validate the draft"
         );
         // One draft edit (generation bump, as every content edit does) →
-        // exactly one sweep.
+        // exactly one sweep, which is what replaces the memo's allocation.
         edit_existing_draft(&mut harness.state_mut().0);
         harness.run();
+        let generation = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor keeps the edited draft")
+            .generation;
+        let swept = harness
+            .state()
+            .0
+            .editor_validation_cache
+            .as_ref()
+            .expect("the edited draft must be covered by a fresh sweep");
         assert_eq!(
-            harness
-                .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+            swept.generation, generation,
             "one generation change must sweep exactly once"
         );
+        let rebuilt = swept.finalmask_errors.as_ptr();
         harness.run();
         harness.run();
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the draft stays covered by the memo")
+                .finalmask_errors
+                .as_ptr(),
+            rebuilt,
             "idle frames after an edit must not re-validate"
         );
     }
@@ -11301,6 +11434,17 @@ TLS ping finished"#;
         rig.servers.active = Some(tokyo.id.clone());
         let mut harness = unsaved_harness(rig);
         harness.run();
+        // The verdict list's allocation identity is the memo: while the
+        // draft generation holds, the Advanced frames render it without
+        // re-validating.
+        let verdicts = harness
+            .state()
+            .0
+            .editor_validation_cache
+            .as_ref()
+            .expect("the draft-open frame seeds the finalmask verdicts")
+            .finalmask_errors
+            .as_ptr();
         harness.get_by_label("Advanced").click();
         harness.run();
         // The verdict renders inline under the mask list from the cache
@@ -11313,11 +11457,13 @@ TLS ping finished"#;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the memo covers the draft")
+                .finalmask_errors
+                .as_ptr(),
+            verdicts,
             "rendering the cached verdict must not re-validate"
         );
         harness.run();
@@ -11325,11 +11471,13 @@ TLS ping finished"#;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the memo covers the draft")
+                .finalmask_errors
+                .as_ptr(),
+            verdicts,
             "idle frames on the Advanced tab must not re-validate the finalmask"
         );
         assert!(
@@ -11358,14 +11506,22 @@ TLS ping finished"#;
         });
         draft.generation = draft.generation.wrapping_add(1);
         harness.run();
+        let generation = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor keeps the edited draft")
+            .generation;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the edited draft must be covered by a fresh sweep")
+                .generation,
+            generation,
             "a draft edit must re-validate exactly once"
         );
         let second_message = "finalmask.tcp[0].settings.clients[0][1]: set exactly one of \
@@ -11381,6 +11537,14 @@ TLS ping finished"#;
             vec![BAD_TCP_ITEM_MESSAGE.to_string(), second_message.to_string()],
             "the cache must carry both verdicts in model order"
         );
+        let rebuilt = harness
+            .state()
+            .0
+            .editor_validation_cache
+            .as_ref()
+            .expect("the memo covers the edited draft")
+            .finalmask_errors
+            .as_ptr();
         assert!(
             harness.query_by_label(second_message).is_some(),
             "the edited verdict must render inline from the cache"
@@ -11389,11 +11553,13 @@ TLS ping finished"#;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the memo covers the draft")
+                .finalmask_errors
+                .as_ptr(),
+            rebuilt,
             "rendering the refreshed verdicts must not re-validate"
         );
     }
@@ -11688,40 +11854,74 @@ TLS ping finished"#;
         harness.run();
         harness.get_by_label("Advanced").click();
         harness.run();
+        // The options list's allocation identity is the memo, and its
+        // generation is the profile-set signal it was built for.
+        let built_for = harness
+            .state()
+            .0
+            .dialer_proxy_options
+            .as_ref()
+            .expect("the first Advanced frame builds the chain-target options once")
+            .generation;
         assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            1,
-            "the first Advanced frame builds the chain-target options once"
+            built_for.2, 2,
+            "the options must be built for the rendered profile set"
         );
+        let options = harness
+            .state()
+            .0
+            .dialer_proxy_options
+            .as_ref()
+            .expect("the options memo stays warm")
+            .options
+            .as_ptr();
         harness.run();
         harness.run();
         assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            1,
+            harness
+                .state()
+                .0
+                .dialer_proxy_options
+                .as_ref()
+                .expect("the options memo stays warm")
+                .options
+                .as_ptr(),
+            options,
             "idle frames must not rebuild the chain-target options"
         );
         // A profile-set change rebuilds exactly once; idle frames after it
         // stay quiet.
-        harness
-            .state_mut()
-            .1
-            .servers
-            .profiles
-            .push(ServerProfile::new(
-                "gamma",
-                OutboundModel::new(Protocol::Freedom),
-            ));
+        let gamma = ServerProfile::new("gamma", OutboundModel::new(Protocol::Freedom));
+        let gamma_tag = gamma.tag();
+        harness.state_mut().1.servers.profiles.push(gamma);
         harness.run();
-        assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            2,
-            "a profile-set change must rebuild the chain-target options exactly once"
+        let rebuilt = harness
+            .state()
+            .0
+            .dialer_proxy_options
+            .as_ref()
+            .expect("the set change must rebuild the chain-target options exactly once");
+        assert_ne!(
+            rebuilt.generation, built_for,
+            "the rebuilt options must carry the advanced profile-set signal"
         );
+        assert!(
+            rebuilt.options.iter().any(|option| option == &gamma_tag),
+            "the rebuilt options must offer the profile the set gained"
+        );
+        let rebuilt_options = rebuilt.options.as_ptr();
         harness.run();
         harness.run();
         assert_eq!(
-            harness.state().1.metrics.snapshot().advanced_tag_rebuilds,
-            2,
+            harness
+                .state()
+                .0
+                .dialer_proxy_options
+                .as_ref()
+                .expect("the options memo stays warm")
+                .options
+                .as_ptr(),
+            rebuilt_options,
             "idle frames after the set change must not rebuild"
         );
     }
@@ -12298,58 +12498,65 @@ TLS ping finished"#;
     fn add_draft_validation_sweeps_once_per_generation_change_and_never_on_idle_frames() {
         let rig = UiTestRig::default();
         let mut harness = unsaved_harness(rig);
-        harness.state_mut().0.add_draft = Some(ServerProfile::new(
-            "New Freedom server",
-            OutboundModel::new(Protocol::Freedom),
-        ));
+        // A draft the sweep finds a verdict for, so the memoized cache's
+        // allocation identity tells a real sweep from an idle reuse.
+        harness.state_mut().0.add_draft = Some(profile_with_bad_finalmask());
         harness.run();
+        let generation = harness.state().0.add_draft_generation;
+        let opened = harness
+            .state()
+            .0
+            .add_draft_validation_cache
+            .as_ref()
+            .expect("the dialog-open frame must run the validation sweep");
         assert_eq!(
-            harness
-                .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+            opened.generation, generation,
             "the dialog-open frame must run the validation sweep exactly once"
         );
+        let verdicts = opened.finalmask_errors.as_ptr();
         harness.run();
         harness.run();
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            1,
+                .0
+                .add_draft_validation_cache
+                .as_ref()
+                .expect("the add draft stays covered by the memo")
+                .finalmask_errors
+                .as_ptr(),
+            verdicts,
             "idle frames of the add dialog must not re-validate"
         );
         // One draft edit (the generation the dialog bumps after content
-        // edits) → exactly one sweep.
+        // edits) → exactly one sweep, which replaces the memo's allocation.
         let state = harness.state_mut();
         state.0.add_draft.as_mut().unwrap().name.push('-');
         state.0.add_draft_generation = state.0.add_draft_generation.wrapping_add(1);
         harness.run();
+        let generation = harness.state().0.add_draft_generation;
+        let swept = harness
+            .state()
+            .0
+            .add_draft_validation_cache
+            .as_ref()
+            .expect("the edited add draft must be covered by a fresh sweep");
         assert_eq!(
-            harness
-                .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+            swept.generation, generation,
             "one add-draft generation change must sweep exactly once"
         );
+        let rebuilt = swept.finalmask_errors.as_ptr();
         harness.run();
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+                .0
+                .add_draft_validation_cache
+                .as_ref()
+                .expect("the add draft stays covered by the memo")
+                .finalmask_errors
+                .as_ptr(),
+            rebuilt,
             "idle frames after the add-draft edit must not re-validate"
         );
     }
@@ -12406,21 +12613,30 @@ TLS ping finished"#;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            2,
+                .0
+                .editor_validation_cache
+                .as_ref()
+                .expect("the conversion edit must re-validate exactly once")
+                .generation,
+            harness
+                .state()
+                .0
+                .existing_draft
+                .as_ref()
+                .expect("the editor keeps the converted draft")
+                .generation,
             "the conversion edit must re-validate exactly once"
         );
-        // Re-picking the current type of a known mask is a no-op: no
-        // generation bump, no new sweep.
-        let sweeps_before = harness
+        // Re-picking the current type of a known mask is a no-op: the draft
+        // generation — the key every edit bumps and the memo sweeps on —
+        // must not move.
+        let generation = harness
             .state()
-            .1
-            .metrics
-            .snapshot()
-            .editor_validation_rebuilds;
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor keeps the converted draft")
+            .generation;
         harness
             .get_all_by_role(egui::accesskit::Role::ComboBox)
             .find(|node| node.value().as_deref() == Some("header-custom"))
@@ -12434,11 +12650,12 @@ TLS ping finished"#;
         assert_eq!(
             harness
                 .state()
-                .1
-                .metrics
-                .snapshot()
-                .editor_validation_rebuilds,
-            sweeps_before,
+                .0
+                .existing_draft
+                .as_ref()
+                .expect("the editor keeps the converted draft")
+                .generation,
+            generation,
             "re-picking the current type must not count as an edit"
         );
         assert_eq!(
@@ -12461,14 +12678,20 @@ TLS ping finished"#;
         );
     }
 
-    /// Read the servers-list rows-laid-out resource from a harness.
+    /// The rows the virtualized list actually laid out: the consumer-visible
+    /// band, counted from the rendered `Server {i:02}` row buttons of a
+    /// [`seeded_rig`] list (what the rows-laid-out resource reports).
     fn laid_out_list_rows(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> u64 {
-        harness
-            .state()
-            .1
-            .metrics
-            .snapshot()
-            .server_list_rows_laid_out
+        (0..harness.state().1.servers.profiles.len())
+            .filter(|index| {
+                harness
+                    .query_by_role_and_label(
+                        egui::accesskit::Role::Button,
+                        &format!("Server {index:02}"),
+                    )
+                    .is_some()
+            })
+            .count() as u64
     }
 
     /// Seed a rig with `count` freedom profiles named `Server {i:02}`.
@@ -12487,12 +12710,12 @@ TLS ping finished"#;
     }
 
     #[test]
-    fn server_list_lays_out_only_the_visible_band_and_idle_frames_keep_the_resource_flat() {
+    fn server_list_lays_out_only_the_visible_band_and_idle_frames_keep_the_same_band() {
         // The profile list must lay out only the visible
         // index band. A 64-row list in the 1100x700 harness (list viewport
         // ~500 px, row pitch 18 + 3 = 21 px) shows ~25 of 64 rows; the
-        // rows-laid-out resource must report the band, never the profile
-        // total, and idle frames (same band) must not rewrite it.
+        // rendered rows must be the band, never the profile total, and idle
+        // frames (same band) must lay out the same rows again.
         let (rig, _) = seeded_rig(64);
         let mut harness = wide_servers_harness(rig);
         harness.run();
@@ -12518,14 +12741,14 @@ TLS ping finished"#;
             "the first row must be laid out at the top of the list"
         );
 
-        // Idle frames lay out the same band again; the count did not change,
-        // so no metrics write happens and the resource stays put.
+        // Idle frames lay out the same band again: the rendered rows are the
+        // ones the first frame showed.
         harness.run();
         harness.run_steps(2);
         assert_eq!(
             laid_out_list_rows(&harness),
             band,
-            "idle frames must not rewrite the rows-laid-out resource"
+            "idle frames must lay out the same band"
         );
     }
 

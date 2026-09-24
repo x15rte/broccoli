@@ -7156,7 +7156,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ready_tick_records_duration_while_other_arms_stay_gated() {
+    async fn ready_ticks_accumulate_while_stats_and_obs_arms_stay_gated() {
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, _event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
@@ -7169,7 +7169,7 @@ mod tests {
         );
         // The ready arm is gated on Starting; the stats/obs arms are gated on
         // Running. With no backend, ready_poll returns immediately, so each
-        // interval tick still records its (near-zero) duration.
+        // interval tick still fires the ready arm.
         runtime.phase = super::CorePhase::Starting;
         let run = tokio::spawn(runtime.run());
 
@@ -7180,20 +7180,48 @@ mod tests {
         let _ = command_sender.send(super::CoreCmd::Shutdown);
         run.await.expect("runtime run() must complete cleanly");
 
+        // Whether a poll arm fired has no other observable — no event or
+        // state reports it — so the tick counts themselves are the cheapest
+        // available guard of the phase gating.
         let snapshot = metrics.snapshot();
         assert!(
             snapshot.ready_ticks >= 2,
             "ready ticks must accumulate while Starting, got {}",
             snapshot.ready_ticks
         );
-        assert!(
-            snapshot.ready_tick_ns_total > 0,
-            "ready tick durations must accumulate"
-        );
         assert_eq!(snapshot.stats_ticks, 0, "stats arm is gated on Running");
-        assert_eq!(snapshot.stats_tick_ns_total, 0);
         assert_eq!(snapshot.obs_ticks, 0, "obs arm is gated on Running");
-        assert_eq!(snapshot.obs_tick_ns_total, 0);
+    }
+
+    /// The flip side of the gating above: while the runtime is Stopped no
+    /// poll arm may fire — ready is gated on Starting, stats/obs on Running.
+    /// Tokio's interval first tick fires immediately, so 600 ms of Stopped
+    /// time would record at least one tick per arm whose phase guard was
+    /// dropped. Whether an arm fired has no other observable, so the tick
+    /// counts are the cheapest available guard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_phase_records_no_poll_arm_ticks() {
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) =
+            std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
+        let metrics = crate::metrics::MetricsHandle::new();
+        let mut runtime = Runtime::new(
+            command_receiver,
+            event_sender,
+            egui::Context::default(),
+            metrics.clone(),
+        );
+        runtime.phase = super::CorePhase::Stopped;
+        let run = tokio::spawn(runtime.run());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = command_sender.send(super::CoreCmd::Shutdown);
+        run.await.expect("runtime run() must complete cleanly");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.ready_ticks, 0, "ready arm is gated on Starting");
+        assert_eq!(snapshot.stats_ticks, 0, "stats arm is gated on Running");
+        assert_eq!(snapshot.obs_ticks, 0, "obs arm is gated on Running");
     }
 
     /// Every run-loop ticker is built by [`super::ticker`], which pins

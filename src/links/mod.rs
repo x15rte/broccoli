@@ -54,7 +54,9 @@ use crate::model::stream::{
     RawHeader, RawSettings, RealityModel, Security, StreamModel, TlsModel, WsSettings,
     XhttpSettings,
 };
-use crate::model::validation::{Severity, ValidationIssue, is_vision_flow, validate_outbound};
+use crate::model::validation::{
+    Severity, ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
+};
 
 /// A share-link failure that has no language yet. `Display` renders English
 /// for logs and tests; the display boundary renders the active language with
@@ -491,8 +493,11 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// The import grammar's UUID rule: [`is_canonical_uuid`]'s verdict mapped to
+/// the grammar's own `LinkUuidInvalid` diagnostic — the rule has one
+/// definition (the model's), and this keeps only the message channel.
 fn check_uuid(id: &str, scheme: &str) -> Result<(), LinkError> {
-    if uuid::Uuid::parse_str(id).is_err() {
+    if !is_canonical_uuid(id) {
         Err(malformed(
             Diag::new(Key::LinkUuidInvalid)
                 .arg(excerpt_debug(id))

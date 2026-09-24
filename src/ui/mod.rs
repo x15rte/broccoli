@@ -1050,15 +1050,19 @@ pub(crate) fn format_single_latency_probe_feedback(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, format_latency_probe_feedback,
-        format_single_latency_probe_feedback, show_core_setup,
+        AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, UiCtxSnapshot,
+        format_latency_probe_feedback, format_single_latency_probe_feedback, show_core_setup,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ProtocolSettings, ServerProfile};
-    use crate::rt::{CoreCmd, LatencyProbeResult, OutboundStatusView, ProbeFailure};
+    use crate::rt::{
+        CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OutboundStatusView, ProbeFailure,
+        StatsTick,
+    };
     use crate::sys;
+    use crate::sys::selfupd::UpdateCheckState;
     use crate::ui::test_rig::UiTestRig;
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
 
@@ -2027,6 +2031,124 @@ mod tests {
             assert_eq!(profiles.len(), 2, "all scope must send every profile");
         } else {
             panic!("expected ProbeLatency, got a different command");
+        }
+    }
+
+    /// The resting input set of a snapshot — phase `Stopped`, nothing in
+    /// flight — exactly as the app holds it when no runtime event moved
+    /// anything.
+    fn resting_snapshot() -> UiCtxSnapshot {
+        UiCtxSnapshot {
+            phase: CorePhase::Stopped,
+            stats: None,
+            observatory: Vec::new(),
+            core_version: None,
+            core_setup: CoreSetupState::default(),
+            terminal_error: None,
+            download: DownloadState::Idle,
+            update_check: UpdateCheckState::Idle,
+            stats_generation: 0,
+            latency_generation: 0,
+        }
+    }
+
+    /// The UI-context snapshot's memoization key
+    /// (`BroccoliApp::rebuild_ui_ctx_snapshot`'s gate): an unchanged input
+    /// set schedules no rebuild — the idle-frame invariant — and one changed
+    /// value in any input family flips the predicate. A log line changes
+    /// none of these inputs, so a drained `CoreEvt::Log` can never force a
+    /// rebuild.
+    #[test]
+    fn ui_ctx_snapshot_rebuilds_only_when_an_input_changes() {
+        let resting = resting_snapshot();
+        assert!(
+            resting.same_inputs(&resting_snapshot()),
+            "an unchanged input set must schedule no rebuild"
+        );
+
+        let changed_inputs = [
+            (
+                "stats generation",
+                UiCtxSnapshot {
+                    stats_generation: 1,
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "latency generation",
+                UiCtxSnapshot {
+                    latency_generation: 1,
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "phase",
+                UiCtxSnapshot {
+                    phase: CorePhase::Running,
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "stats tick",
+                UiCtxSnapshot {
+                    stats: Some(StatsTick {
+                        up: 1,
+                        ..Default::default()
+                    }),
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "observatory rows",
+                UiCtxSnapshot {
+                    observatory: vec![OutboundStatusView {
+                        tag: "edge".to_string(),
+                        alive: true,
+                        delay_ms: 1,
+                        last_error: None,
+                        health_ping: None,
+                        diagnostics: None,
+                    }],
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "core version",
+                UiCtxSnapshot {
+                    core_version: Some("v1.8.24".to_string()),
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "core setup",
+                UiCtxSnapshot {
+                    core_setup: CoreSetupState {
+                        installed_version: Some("v1.8.24".to_string()),
+                        ..CoreSetupState::default()
+                    },
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "download",
+                UiCtxSnapshot {
+                    download: DownloadState::Done("core.zip".to_string()),
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "update check",
+                UiCtxSnapshot {
+                    update_check: UpdateCheckState::Failed,
+                    ..resting_snapshot()
+                },
+            ),
+        ];
+        for (input, changed) in changed_inputs {
+            assert!(
+                !resting.same_inputs(&changed),
+                "a changed {input} input must schedule a rebuild"
+            );
         }
     }
 }

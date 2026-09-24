@@ -429,27 +429,25 @@ mod tests {
             h.state().cache.as_ref().is_some_and(|c| c.width > 0.0),
             "the cluster must reserve row width for the version + speed"
         );
-
-        // A stats tick (generation bump) rebuilds exactly once.
+        // A stats tick (generation bump) rebuilds exactly once: the memo
+        // carries the tick's generation.
         h.state_mut().generation = 8;
         h.step();
-        assert_eq!(
-            h.state().metrics.snapshot().topbar_speed_rebuilds,
-            1,
-            "a generation bump rebuilds exactly once"
-        );
+        let rebuilt = h.state().cache.as_ref().expect("cache populated");
+        assert_eq!(rebuilt.key.0, 8, "a generation bump rebuilds exactly once");
+        let rebuilt_speed = rebuilt.speed.as_ptr();
 
-        // Idle frames with unchanged inputs must not rebuild.
+        // Idle frames with unchanged inputs must not rebuild: the memo keeps
+        // its key and the same speed-text allocation.
         h.run_steps(5);
+        let idle = h.state().cache.as_ref().expect("cache populated");
+        assert_eq!(idle.key.0, 8, "unchanged inputs keep the memo's key");
         assert_eq!(
-            h.state().metrics.snapshot().topbar_speed_rebuilds,
-            1,
+            idle.speed.as_ptr(),
+            rebuilt_speed,
             "unchanged inputs must not rebuild the speed readout"
         );
-        assert_eq!(
-            h.state().cache.as_ref().expect("cache populated").speed,
-            "↑ 1.0 MiB/s · ↓ 2.0 MiB/s"
-        );
+        assert_eq!(idle.speed, "↑ 1.0 MiB/s · ↓ 2.0 MiB/s");
     }
 
     #[test]
