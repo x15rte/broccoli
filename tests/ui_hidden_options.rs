@@ -4,7 +4,8 @@
 //! values still round-trip — and the raw JSON override remains the only path
 //! to them. The protocol editors with hidden fields are covered here; the
 //! wireguard editor (peer email, noKernelTun) is covered by its own test
-//! below because it needs a seeded peer.
+//! below because it needs a seeded peer, and the outbound sockopt editor
+//! (Windows-inert knobs) by another because it needs the TLS/ECH mount.
 //!
 //! The harness boots the real `BroccoliApp` (the shared UI harness pattern:
 //! temp APPDATA with a pre-seeded servers.json and settings.json, first-run
@@ -20,7 +21,8 @@
 use broccoli::app::BroccoliApp;
 use broccoli::model::settings::Settings;
 use broccoli::model::{
-    OutboundModel, Protocol, ProtocolSettings, ServerProfile, ServersFile, WireguardPeer,
+    OutboundModel, Protocol, ProtocolSettings, Security, ServerProfile, ServersFile, SockoptModel,
+    TlsModel, WireguardPeer,
 };
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
@@ -164,4 +166,79 @@ fn wireguard_editor_hides_non_applicable_fields() {
         h.query_by_label("disable kernel WireGuard TUN").is_none(),
         "the wireguard editor must not render the noKernelTun knob"
     );
+}
+
+/// The outbound sockopt editor renders no widget for a value the Windows
+/// outbound path never reads: the Linux-only knobs (`mark`, `tproxy`,
+/// `tcpCongestion`, `tcpWindowClamp`, `tcpMaxSeg`, `tcpUserTimeout`),
+/// `tcpMptcp` (Go's dialer consumes it on Linux only) and the listener-only
+/// values.
+///
+/// `PINS` are the labels the editor rendered before the deletion — the two
+/// group titles and the `tcpMptcp` checkbox — so a resurrected group or
+/// checkbox fails here. `GUARDS` are the field labels those groups carried:
+/// they sat in collapsed headers, whose bodies egui never builds, so they pin
+/// the fields against a future direct widget rather than against this change.
+/// The same editor also renders inside every UDP mask's socket options
+/// (`SockoptUsage::Mask`), which this test does not reach.
+#[test]
+fn sockopt_editor_hides_fields_without_a_windows_reader() {
+    /// Labels rendered before this change: the regression pins.
+    const PINS: &[&str] = &[
+        "Non-Windows outbound socket options",
+        "Listener/server-only (no outbound effect)",
+        "tcpMptcp",
+    ];
+    /// Field labels the deleted groups carried, mirrored from the deleted
+    /// English copy.
+    const GUARDS: &[&str] = &[
+        "tcpCongestion",
+        "tcpWindowClamp",
+        "tcpMaxSeg",
+        "tcpUserTimeout (ms)",
+        "mark",
+        "tproxy",
+        "v6only",
+        "acceptProxyProtocol",
+        "trustedXForwardedFor",
+    ];
+
+    let mut profile = ServerProfile::new("sockopts", OutboundModel::new(Protocol::Vless));
+    profile.outbound.stream.security = Security::Tls;
+    profile.outbound.stream.tls_settings = Some(TlsModel {
+        ech_config_list: "https://1.1.1.1/dns-query".into(),
+        ech_sockopt: Some(SockoptModel::default()),
+        ..Default::default()
+    });
+    let (_lock, _tmp, mut h) = boot_servers(vec![profile]);
+
+    let assert_absent = |h: &Harness<'static, BroccoliApp>, mount: &str| {
+        for label in PINS.iter().chain(GUARDS) {
+            assert!(
+                h.query_by_label(label).is_none(),
+                "the {mount} sockopt block must not render {label:?}"
+            );
+        }
+    };
+
+    // The stream block sits in the Advanced tab's sockopt section, whose own
+    // editable fields must be on screen before the absence checks mean
+    // anything.
+    h.get_by_role_and_label(Role::Button, "Advanced").click();
+    h.run();
+    assert!(
+        h.query_by_label("interface (bind NIC)").is_some(),
+        "the Advanced tab must render the stream sockopt block's editable fields"
+    );
+    assert_absent(&h, "stream");
+
+    // The ECH DNS-query block renders the same editor; its checkbox is the
+    // positive evidence that the block (and the editor inside it) is mounted.
+    h.get_by_role_and_label(Role::Button, "Security").click();
+    h.run();
+    assert!(
+        h.query_by_label("ECH DNS-query socket options").is_some(),
+        "the Security tab must render the ECH DNS-query socket options block"
+    );
+    assert_absent(&h, "ECH");
 }

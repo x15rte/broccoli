@@ -1145,11 +1145,14 @@ pub(crate) fn range_has_session_room(table: &str, range: crate::model::Int32Rang
     false
 }
 
-/// Sockopt `tproxy` vocabulary — the three values the sockopt
-/// editor offers, shared with that combo so the editor vocabulary and this
-/// warning predicate can never disagree. `off` is the explicit spelling of
-/// Xray's default (SocketConfig_Off) and is honored as-is; `tproxy` and
-/// `redirect` are the two active modes (infra/conf/transport_sockopt.go).
+/// Sockopt `tproxy` vocabulary — the three values Xray accepts, shared with
+/// the warning predicate below so the accepted set and the check can never
+/// disagree. `off` is the explicit spelling of Xray's default
+/// (SocketConfig_Off) and is honored as-is; `tproxy` and `redirect` are the
+/// two active modes (infra/conf/transport_sockopt.go). The structured editor
+/// renders no widget for this field (its Linux-only readers are the only
+/// consumers), so the vocabulary is reachable only through a hand-edited
+/// profile or the raw config override.
 pub const TPROXY_MODES: &[&str] = &["off", "redirect", "tproxy"];
 
 /// True when `target_strategy` names one of Xray's
@@ -2379,7 +2382,8 @@ pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Vec<ValidationIssue> 
     // (infra/conf/transport_sockopt.go), so a misspelled mode runs without
     // transparency. Advisory: the config loads and the wire works, the
     // value silently never applies. The vocabulary is the shared
-    // [`TPROXY_MODES`] list the sockopt editor combo offers.
+    // [`TPROXY_MODES`] list; the field has no widget any more, so a value
+    // this flags came from a hand-edited profile or the raw config override.
     if s.tproxy.as_deref().is_some_and(|value| {
         !value.is_empty()
             && !TPROXY_MODES
@@ -5232,8 +5236,8 @@ mod tests {
     }
 
     #[test]
-    fn sockopt_tproxy_silently_off_warns_only_outside_the_offered_vocab() {
-        // The editor-combo vocabulary — off included (the explicit spelling
+    fn sockopt_tproxy_silently_off_warns_only_outside_the_accepted_vocab() {
+        // The accepted vocabulary — off included (the explicit spelling
         // of Xray's Off default, honored as-is) — never warns; casing is
         // tolerated because Xray lowercases the value.
         for tproxy in [

@@ -22,11 +22,11 @@ use crate::model::outbound::{
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
 use crate::model::validation::{
-    DNS_OUT_ACTIONS, Severity, TPROXY_MODES, ValidationCode, XUDP_PROXY_UDP443_MODES,
-    dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
-    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
-    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
-    validate_outbound, validate_sockopt,
+    DNS_OUT_ACTIONS, Severity, ValidationCode, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
+    freedom_final_rule_supported, mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid,
+    reality_mldsa65_verify_valid, reality_public_key_valid, send_through_supported,
+    server_name_implausible, tls_version_rank, validate_finalmask, validate_outbound,
+    validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -777,6 +777,14 @@ impl SockoptUsage {
     }
 }
 
+/// Outbound-role socket options (stream, ECH DNS query, UDP mask). Options the
+/// Windows outbound path never reads render no widget here: the Linux-only
+/// knobs (`mark`, `tproxy`, `tcpCongestion`, `tcpWindowClamp`, `tcpMaxSeg`,
+/// `tcpUserTimeout`), `tcpMptcp` (Go's dialer consumes it on Linux only), and
+/// the listener-only values (`v6only`, `acceptProxyProtocol`,
+/// `trustedXForwardedFor`, which only listeners consume). The model keeps them
+/// so a hand-edited profile round-trips unchanged. Every widget below has a
+/// reader in the core this app runs.
 fn sockopt_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -874,46 +882,6 @@ fn sockopt_editor(
         }
     }
 
-    changed |= widgets::opt_bool(
-        ui,
-        "tcpMptcp",
-        &mut sockopt.tcp_mptcp,
-        t(lang, Key::SrvUnset),
-    );
-    ui.weak(t(lang, Key::SrvTcpMptcpNote));
-
-    egui::CollapsingHeader::new(t(lang, Key::SrvNonWindowsSockopt))
-        .id_salt(ui.auto_id_with("platform-sockopt"))
-        .show(ui, |ui| {
-            ui.weak(t(lang, Key::SrvNonWindowsSockoptNote));
-            ui.add_enabled_ui(false, |ui| {
-                ui.weak(t(lang, Key::SrvKeepAliveNote));
-                changed |=
-                    widgets::text_field(ui, "tcpCongestion", &mut sockopt.tcp_congestion, "bbr");
-                changed |= widgets::opt_num(
-                    ui,
-                    "tcpWindowClamp",
-                    &mut sockopt.tcp_window_clamp,
-                    i32::MIN..=i32::MAX,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    "tcpMaxSeg",
-                    &mut sockopt.tcp_max_seg,
-                    i32::MIN..=i32::MAX,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvTcpUserTimeoutMs),
-                    &mut sockopt.tcp_user_timeout,
-                    i32::MIN..=i32::MAX,
-                );
-                ui.weak(t(lang, Key::SrvTcpMptcpEditedAbove));
-                changed |= widgets::opt_num(ui, "mark", &mut sockopt.mark, i32::MIN..=i32::MAX);
-                changed |= opt_combo_str(ui, lang, "tproxy", &mut sockopt.tproxy, TPROXY_MODES);
-            });
-        });
-
     match usage {
         SockoptUsage::Stream => {
             changed |= widgets::opt_bool(
@@ -947,29 +915,6 @@ fn sockopt_editor(
             ui.weak(t(lang, Key::SrvPenetrateMaskNote));
         }
     }
-
-    egui::CollapsingHeader::new(t(lang, Key::SrvListenerOnlySockopt))
-        .id_salt(ui.auto_id_with("listener-only-sockopt"))
-        .show(ui, |ui| {
-            ui.weak(t(lang, Key::SrvListenerOnlySockoptNote));
-            ui.add_enabled_ui(false, |ui| {
-                changed |=
-                    widgets::opt_bool(ui, "v6only", &mut sockopt.v6only, t(lang, Key::SrvUnset));
-                changed |= widgets::opt_bool(
-                    ui,
-                    "acceptProxyProtocol",
-                    &mut sockopt.accept_proxy_protocol,
-                    t(lang, Key::SrvUnset),
-                );
-                changed |= widgets::string_list(
-                    ui,
-                    lang,
-                    "trustedXForwardedFor",
-                    &mut sockopt.trusted_x_forwarded_for,
-                    "trusted peer/header",
-                );
-            });
-        });
 
     if ui.button(t(lang, Key::SrvAddCustomSockopt)).clicked() {
         sockopt.custom_sockopt.push(CustomSockopt::default());

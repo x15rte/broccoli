@@ -1064,12 +1064,6 @@ keys! {
     SrvUnknownFutureFields,
     SrvUnknownFutureFieldsSockopt,
     SrvUnknownFutureFieldsCustom,
-    SrvNonWindowsSockopt,
-    SrvNonWindowsSockoptNote,
-    SrvKeepAliveNote,
-    SrvTcpMptcpNote,
-    SrvListenerOnlySockopt,
-    SrvListenerOnlySockoptNote,
     SrvPenetrateNote,
     SrvPenetrateEchNote,
     SrvEchDnsQuerySockopt,
@@ -1102,7 +1096,6 @@ keys! {
     RoutingOverrideApplied,
     RoutingOverrideCleared,
     SrvNewDraftName,
-    SrvTcpMptcpEditedAbove,
     SrvAddTransformArgument,
     SrvProtocolSettingsMismatch,
     SrvVlessIdUuid,
@@ -1233,7 +1226,6 @@ keys! {
     SrvPublicKeyPassword,
     SrvTcpKeepAliveIdleS,
     SrvTcpKeepAliveIntervalS,
-    SrvTcpUserTimeoutMs,
     SrvPenetrateInherit,
     SrvPenetrateDownloadOnly,
     SrvCustomTablesLegacy,
@@ -3848,23 +3840,6 @@ mod en {
             Key::SrvUnknownFutureFieldsCustom => {
                 "{} unknown future happyEyeballs field(s) are preserved unchanged."
             }
-            Key::SrvNonWindowsSockopt => "Non-Windows outbound socket options",
-            Key::SrvNonWindowsSockoptNote => {
-                "Xray's Windows outbound socket path does not consume these values. Imported values \
-                 are preserved."
-            }
-            Key::SrvKeepAliveNote => {
-                "tcpKeepAliveInterval is edited above because Xray's Go dialer uses it \
-                 on every supported platform."
-            }
-            Key::SrvTcpMptcpNote => {
-                "tcpMptcp is passed to Go's network dialer on supported operating systems."
-            }
-            Key::SrvListenerOnlySockopt => "Listener/server-only (no outbound effect)",
-            Key::SrvListenerOnlySockoptNote => {
-                "ECH uses DialSystem. Listeners consume v6only and acceptProxyProtocol. Inbound \
-                 HTTP/gRPC transports consume trustedXForwardedFor."
-            }
             Key::SrvPenetrateNote => "penetrate is consulted only when XHTTP has downloadSettings.",
             Key::SrvPenetrateEchNote => {
                 "penetrate only copies stream sockopt into XHTTP downloadSettings. The ECH DNS query \
@@ -3909,9 +3884,6 @@ mod en {
                 "Runtime override cleared. The configured strategy is active."
             }
             Key::SrvNewDraftName => "New {}",
-            Key::SrvTcpMptcpEditedAbove => {
-                "tcpMptcp is edited above because it is not Windows-specific."
-            }
             Key::SrvAddTransformArgument => "+ transform argument",
             Key::SrvProtocolSettingsMismatch => "protocol and settings type do not match",
             Key::SrvVlessIdUuid => "VLESS id must be a UUID",
@@ -4081,7 +4053,6 @@ mod en {
             Key::SrvPublicKeyPassword => "publicKey (password)",
             Key::SrvTcpKeepAliveIdleS => "tcpKeepAliveIdle (s, negative disables)",
             Key::SrvTcpKeepAliveIntervalS => "tcpKeepAliveInterval (s, negative disables)",
-            Key::SrvTcpUserTimeoutMs => "tcpUserTimeout (ms)",
             Key::SrvPenetrateInherit => "penetrate (inherit into XHTTP downloadSettings)",
             Key::SrvPenetrateDownloadOnly => "penetrate (XHTTP downloadSettings only)",
             Key::SrvCustomTablesLegacy => "custom_tables (legacy)",

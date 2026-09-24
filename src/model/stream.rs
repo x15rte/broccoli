@@ -599,7 +599,8 @@ pub struct SockoptModel {
     pub tcp_keep_alive_idle: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_keep_alive_interval: Option<i32>,
-    // --- Linux-only below; the GUI hides/greys these on Windows ---
+    // --- No reader on the Windows outbound path: the editor renders no widget
+    // for these, and a hand-edited profile keeps its values unchanged. ---
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub tcp_congestion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -608,15 +609,18 @@ pub struct SockoptModel {
     pub tcp_max_seg: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_user_timeout: Option<i32>,
+    /// Go's dialer consumes it on Linux only, so no dial here uses it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_mptcp: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub penetrate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mark: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tproxy: Option<String>,
-    // --- end Linux-only ---
+    // --- end no-Windows-reader block ---
+    /// XHTTP copies the stream sockopt into `downloadSettings`, and that dial
+    /// path runs on every platform, so the stream editor still edits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub penetrate: Option<bool>,
     /// Listener-only upstream; it has no effect on outbound dials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub v6only: Option<bool>,
