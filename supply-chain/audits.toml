@@ -4422,6 +4422,18 @@ version = "2.0.1"
 criteria = "safe-to-deploy"
 version = "0.41.0"
 
+[[audits.quinn]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.11.12"
+notes = "0.11.11 -> 0.11.12: the manifest moves the proto requirement and the range ends at the same release commit as quinn-proto 0.11.18, so it carries the bounded read_to_end accumulation and the proto fixes recorded under that entry; the endpoint, client-config and rustls-verifier code the capture path drives is byte-identical. No dependency, MSRV or unsafe change."
+
+[[audits.quinn-proto]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.11.18"
+notes = "0.11.17 -> 0.11.18: send windows budgeted against retained storage, abandoned send buffers released on reset, empty ranges handled in RangeSet::replace, no panic on a hostile maximum ACK delay, transport parameters with a mismatched length rejected, the server config preserved for pending incoming connections, and queued DATAGRAMs pruned when the active path changes. Manifest, MSRV and unsafe surface unchanged."
+
 [[audits.r-efi]]
 criteria = "safe-to-deploy"
 version = "5.3.0"
