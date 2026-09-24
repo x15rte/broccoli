@@ -28,7 +28,6 @@ use state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransit
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
-use crate::metrics::{MetricsHandle, TickArm};
 use crate::model::inbound::TUN_INBOUND_TAG;
 use crate::model::settings::Language;
 use crate::sys::selfupd::UpdateCheckState;
@@ -612,11 +611,7 @@ impl Drop for RuntimeHandle {
 /// Spawn the runtime thread (own tokio current-thread runtime) and return its
 /// command handle. `evt` receives every [`CoreEvt`]; `repaint` is poked after
 /// each one so the GUI redraws promptly.
-pub fn spawn_runtime(
-    evt: SyncSender<CoreEvt>,
-    repaint: egui::Context,
-    metrics: MetricsHandle,
-) -> RuntimeHandle {
+pub fn spawn_runtime(evt: SyncSender<CoreEvt>, repaint: egui::Context) -> RuntimeHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::Builder::new()
@@ -634,7 +629,7 @@ pub fn spawn_runtime(
             rt.block_on(async move {
                 // Runtime::new builds the tonic connect_lazy channel, which needs
                 // a reactor context — construct inside block_on, not before it.
-                Runtime::new(rx, evt, repaint, metrics).run().await
+                Runtime::new(rx, evt, repaint).run().await
             });
             // A UAC consent prompt runs in a non-cancellable blocking worker.
             // Runtime cancellation drops its JoinHandle, then this bounded
@@ -831,16 +826,34 @@ fn ticker(period: Duration) -> tokio::time::Interval {
     tick
 }
 
+/// Fire counts for the control-plane poll arms of [`Runtime::run`], owned by
+/// the runtime and shared with the module's phase-gating tests — those tests
+/// spawn `run`, which consumes the runtime, so the counts must outlive it.
+///
+/// The counts are the module's only observable of an arm that escapes its
+/// phase gate: while its gate is closed an arm leaves no other trace (an
+/// ungated stats poll against a stopped core fails its RPC and emits no
+/// event), so a dropped gate shows up here and nowhere else. Read only by
+/// the phase-gating tests below.
+#[derive(Debug, Default)]
+struct PollArmCounters {
+    /// `ready_tick` arm, gated on [`CorePhase::Starting`].
+    ready: AtomicU64,
+    /// `stats_tick` arm, gated on [`CorePhase::Running`].
+    stats: AtomicU64,
+    /// `obs_tick` arm, gated on [`CorePhase::Running`] and `obs_enabled`.
+    observatory: AtomicU64,
+}
+
 struct Runtime {
     evt: SyncSender<CoreEvt>,
     repaint: egui::Context,
     cmd: mpsc::UnboundedReceiver<CoreCmd>,
     grpc: GrpcClient,
     api_port: u16,
-    /// Always-on performance instrumentation:
-    /// app-owned snapshot; this thread records control-plane tick durations
-    /// through this clone.
-    metrics: MetricsHandle,
+    /// Fire counts of the control-plane poll arms; the module's phase-gating
+    /// tests are their only readers (see [`PollArmCounters`]).
+    poll_fires: Arc<PollArmCounters>,
 
     /// Owns the live backend slot (direct child or helper pipe), its event
     /// channel, and the derived alive/tun-ownership flags.
@@ -1123,7 +1136,6 @@ impl Runtime {
         cmd: mpsc::UnboundedReceiver<CoreCmd>,
         evt: SyncSender<CoreEvt>,
         repaint: egui::Context,
-        metrics: MetricsHandle,
     ) -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1142,7 +1154,7 @@ impl Runtime {
             evt,
             repaint,
             cmd,
-            metrics,
+            poll_fires: Arc::new(PollArmCounters::default()),
             // The API port is ephemeral per launch and derived from
             // the active/candidate config at start and apply time, never from
             // Settings. 0 is a placeholder until the first derivation.
@@ -1540,22 +1552,19 @@ impl Runtime {
                     }
                 }
                 _ = ready_tick.tick(), if matches!(self.phase, CorePhase::Starting) => {
-                    let started = Instant::now();
                     self.ready_poll().await;
-                    self.metrics.record_tick(TickArm::Ready, started.elapsed());
+                    self.poll_fires.ready.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = dns_tick.tick(), if matches!(self.phase, CorePhase::Running) && self.dns_in_listener.is_some() => {
                     self.dns_in_poll().await;
                 }
                 _ = stats_tick.tick(), if matches!(self.phase, CorePhase::Running) => {
-                    let started = Instant::now();
                     self.stats_poll().await;
-                    self.metrics.record_tick(TickArm::Stats, started.elapsed());
+                    self.poll_fires.stats.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = obs_tick.tick(), if matches!(self.phase, CorePhase::Running) && self.obs_enabled => {
-                    let started = Instant::now();
                     self.obs_poll().await;
-                    self.metrics.record_tick(TickArm::Observatory, started.elapsed());
+                    self.poll_fires.observatory.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = house_tick.tick(), if self.exit_policy.stopping() || self.pending_restart.is_some() => {
                     self.housekeeping().await;
@@ -3872,12 +3881,7 @@ mod tests {
         let (event_sender, event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
         (
-            Runtime::new(
-                command_receiver,
-                event_sender,
-                egui::Context::default(),
-                crate::metrics::MetricsHandle::new(),
-            ),
+            Runtime::new(command_receiver, event_sender, egui::Context::default()),
             event_receiver,
         )
     }
@@ -4245,11 +4249,7 @@ mod tests {
     fn drop_with_full_event_channel_completes_within_bounded_time() {
         let (event_sender, event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-        let handle = spawn_runtime(
-            event_sender.clone(),
-            egui::Context::default(),
-            crate::metrics::MetricsHandle::new(),
-        );
+        let handle = spawn_runtime(event_sender.clone(), egui::Context::default());
         assert!(matches!(
             event_receiver.recv_timeout(Duration::from_secs(1)),
             Ok(super::CoreEvt::State(super::CorePhase::Stopped))
@@ -4530,12 +4530,8 @@ mod tests {
             let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
             let (event_sender, event_receiver) =
                 std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-            let mut runtime = Runtime::new(
-                command_receiver,
-                event_sender,
-                egui::Context::default(),
-                crate::metrics::MetricsHandle::new(),
-            );
+            let mut runtime =
+                Runtime::new(command_receiver, event_sender, egui::Context::default());
             runtime
                 .jobs
                 .try_begin(JobKind::UpdateCore)
@@ -5738,12 +5734,7 @@ mod tests {
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-        let mut runtime = Runtime::new(
-            command_receiver,
-            event_sender,
-            egui::Context::default(),
-            crate::metrics::MetricsHandle::new(),
-        );
+        let mut runtime = Runtime::new(command_receiver, event_sender, egui::Context::default());
         runtime
             .jobs
             .try_begin(JobKind::ValidateProfiles)
@@ -7131,11 +7122,7 @@ mod tests {
     fn runtime_handle_drop_waits_for_worker_shutdown() {
         let (event_sender, event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-        let handle = spawn_runtime(
-            event_sender,
-            egui::Context::default(),
-            crate::metrics::MetricsHandle::new(),
-        );
+        let handle = spawn_runtime(event_sender, egui::Context::default());
         assert!(matches!(
             event_receiver.recv_timeout(Duration::from_secs(1)),
             Ok(super::CoreEvt::State(super::CorePhase::Stopped))
@@ -7155,18 +7142,26 @@ mod tests {
         );
     }
 
+    /// The ready arm fires while the runtime is Starting, and the stats/obs
+    /// arms — gated on Running — do not, even though their intervals elapse
+    /// in the same window. The counts are [`PollArmCounters`], the runtime's
+    /// own state, and are the only observable of an arm firing: no event or
+    /// state reports one. `obs_enabled` is armed so the observatory zero is
+    /// attributable to the phase half of that guard (see the setup below).
     #[tokio::test(flavor = "current_thread")]
     async fn ready_ticks_accumulate_while_stats_and_obs_arms_stay_gated() {
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, _event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-        let metrics = crate::metrics::MetricsHandle::new();
-        let mut runtime = Runtime::new(
-            command_receiver,
-            event_sender,
-            egui::Context::default(),
-            metrics.clone(),
-        );
+        let mut runtime = Runtime::new(command_receiver, event_sender, egui::Context::default());
+        // The obs arm's guard has two halves — the phase and `obs_enabled` —
+        // and `Runtime::new` starts with the flag false (only
+        // `CoreCmd::SetObservatory` flips it). Arm the flag here: left false,
+        // the observatory zero below would hold in every phase and a dropped
+        // phase guard would keep this test green. The ready/stats arms gate on
+        // the phase alone, so their assertions need no flag.
+        runtime.obs_enabled = true;
+        let fires = Arc::clone(&runtime.poll_fires);
         // The ready arm is gated on Starting; the stats/obs arms are gated on
         // Running. With no backend, ready_poll returns immediately, so each
         // interval tick still fires the ready arm.
@@ -7180,37 +7175,40 @@ mod tests {
         let _ = command_sender.send(super::CoreCmd::Shutdown);
         run.await.expect("runtime run() must complete cleanly");
 
-        // Whether a poll arm fired has no other observable — no event or
-        // state reports it — so the tick counts themselves are the cheapest
-        // available guard of the phase gating.
-        let snapshot = metrics.snapshot();
+        let ready = fires.ready.load(Ordering::Relaxed);
         assert!(
-            snapshot.ready_ticks >= 2,
-            "ready ticks must accumulate while Starting, got {}",
-            snapshot.ready_ticks
+            ready >= 2,
+            "the ready arm must fire while Starting, got {ready}"
         );
-        assert_eq!(snapshot.stats_ticks, 0, "stats arm is gated on Running");
-        assert_eq!(snapshot.obs_ticks, 0, "obs arm is gated on Running");
+        assert_eq!(
+            fires.stats.load(Ordering::Relaxed),
+            0,
+            "the stats arm is gated on Running and must not fire while Starting"
+        );
+        assert_eq!(
+            fires.observatory.load(Ordering::Relaxed),
+            0,
+            "the obs arm is gated on Running and must not fire while Starting"
+        );
     }
 
     /// The flip side of the gating above: while the runtime is Stopped no
     /// poll arm may fire — ready is gated on Starting, stats/obs on Running.
     /// Tokio's interval first tick fires immediately, so 600 ms of Stopped
-    /// time would record at least one tick per arm whose phase guard was
-    /// dropped. Whether an arm fired has no other observable, so the tick
-    /// counts are the cheapest available guard.
+    /// time would bump a count for every arm whose phase guard was dropped;
+    /// the counts are the only observable of an arm firing at all.
+    /// `obs_enabled` is armed here too: with the flag false the observatory
+    /// zero would prove nothing about the phase half of its guard.
     #[tokio::test(flavor = "current_thread")]
     async fn stopped_phase_records_no_poll_arm_ticks() {
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, _event_receiver) =
             std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
-        let metrics = crate::metrics::MetricsHandle::new();
-        let mut runtime = Runtime::new(
-            command_receiver,
-            event_sender,
-            egui::Context::default(),
-            metrics.clone(),
-        );
+        let mut runtime = Runtime::new(command_receiver, event_sender, egui::Context::default());
+        // Armed as in the test above: the zero below must be the phase gate's
+        // doing, not the resting flag's.
+        runtime.obs_enabled = true;
+        let fires = Arc::clone(&runtime.poll_fires);
         runtime.phase = super::CorePhase::Stopped;
         let run = tokio::spawn(runtime.run());
 
@@ -7218,10 +7216,21 @@ mod tests {
         let _ = command_sender.send(super::CoreCmd::Shutdown);
         run.await.expect("runtime run() must complete cleanly");
 
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.ready_ticks, 0, "ready arm is gated on Starting");
-        assert_eq!(snapshot.stats_ticks, 0, "stats arm is gated on Running");
-        assert_eq!(snapshot.obs_ticks, 0, "obs arm is gated on Running");
+        assert_eq!(
+            fires.ready.load(Ordering::Relaxed),
+            0,
+            "the ready arm is gated on Starting and must not fire while Stopped"
+        );
+        assert_eq!(
+            fires.stats.load(Ordering::Relaxed),
+            0,
+            "the stats arm is gated on Running and must not fire while Stopped"
+        );
+        assert_eq!(
+            fires.observatory.load(Ordering::Relaxed),
+            0,
+            "the obs arm is gated on Running and must not fire while Stopped"
+        );
     }
 
     /// Every run-loop ticker is built by [`super::ticker`], which pins

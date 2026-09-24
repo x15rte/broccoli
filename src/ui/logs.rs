@@ -12,7 +12,6 @@ use egui::{Color32, RichText, ScrollArea, TextEdit, TextStyle, Ui};
 use super::UiCtx;
 use crate::diag::DiagError;
 use crate::i18n::{Key, t, t_fmt};
-use crate::metrics::{MetricsHandle, WorkCounter};
 use crate::model::settings::Language;
 use crate::rt::{CoreCmd, CorePhase};
 use crate::sys;
@@ -195,8 +194,9 @@ struct ViewKey {
 /// Memoized filtered view plus its layout bookkeeping:
 /// only rows intersecting the scroll viewport are laid out per frame; row
 /// heights are measured once per rebuild and re-fitted when the wrap width
-/// changes (window resize, scrollbar appearance). A re-fit is a layout
-/// pass, not a filter rebuild, so it never bumps the work counter. A pure
+/// changes (window resize, scrollbar appearance). A re-fit is a layout pass,
+/// not a filter rebuild: it re-measures inside the retained view, so only the
+/// screen's own layout-pass counts ([`LogsScreen::show_rows`]) move. A pure
 /// append extends `rows` in place (see [`LogsScreen::refresh_view`]); the
 /// measured vectors then cover a strict prefix of `rows` — the retained
 /// prefix stays valid — and [`LogsScreen::show_rows`] extends them with
@@ -338,7 +338,7 @@ impl LogsScreen {
         // and layout vectors — with the admitted tail instead of rebuilding.
         // The ring identity is the app's monotonic push count (see
         // [`RingId`]), so empty-line rotations at the cap still invalidate.
-        self.refresh_view(logs, ctx.logs_generation, ctx.metrics);
+        self.refresh_view(logs, ctx.logs_generation);
 
         ui.horizontal_wrapped(|ui| {
             let lang = ctx.settings.language;
@@ -467,15 +467,10 @@ impl LogsScreen {
     /// grew, filter inputs unchanged) extends the cached rows with the
     /// admitted tail and keeps the measured layout vectors; anything else
     /// — rotation, filter/level changes, clears, first build — rebuilds
-    /// the rows from scratch. Bumps `WorkCounter::LogFilterRebuilds`
-    /// exactly once per refresh, never on idle frames. Returns whether a
-    /// refresh (rebuild or append-extension) happened.
-    fn refresh_view(
-        &mut self,
-        logs: &VecDeque<(bool, String)>,
-        logs_generation: u64,
-        metrics: &MetricsHandle,
-    ) -> bool {
+    /// the rows from scratch. The returned flag is exactly the refresh
+    /// decision: false on an idle frame (the cached view stands), true on a
+    /// rebuild or append-extension.
+    fn refresh_view(&mut self, logs: &VecDeque<(bool, String)>, logs_generation: u64) -> bool {
         let ring = RingId::of(logs, logs_generation);
         let needle = self.text.trim();
         // Idle frames — nothing about the filter inputs changed — reuse the
@@ -514,7 +509,6 @@ impl LogsScreen {
                 }
             }
             view.key.ring = ring;
-            metrics.bump_work(WorkCounter::LogFilterRebuilds);
             return true;
         }
         // Full rebuild. The clear anchor only matters here: it is positional,
@@ -571,7 +565,6 @@ impl LogsScreen {
             spacing_y: 0.0,
             prefix: Vec::new(),
         });
-        metrics.bump_work(WorkCounter::LogFilterRebuilds);
         true
     }
 
@@ -1003,7 +996,6 @@ fn logger_restart_feedback(lang: Language, result: Result<(), DiagError>) -> (bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::MetricsHandle;
     use crate::model::settings::Language;
     use crate::ui::test_rig::UiTestRig;
     use egui_kittest::{Harness, kittest::Queryable as _};
@@ -1101,7 +1093,6 @@ mod tests {
     /// press time.
     #[test]
     fn clear_view_hides_every_line_present_at_press_time() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         // A recurring line ("status ok") appears early, and again as the
@@ -1112,9 +1103,9 @@ mod tests {
         push_line(&mut logs, &mut generation, false, "[Info] connect");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert!(
             screen.view.as_ref().unwrap().rows.is_empty(),
             "Clear view must hide every line present at press time"
@@ -1128,24 +1119,23 @@ mod tests {
     /// nor `rposition` on a text marker can do both.
     #[test]
     fn clear_view_hides_old_and_keeps_new_lines_when_text_recurs_on_both_sides() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         push_line(&mut logs, &mut generation, false, "[Info] connect");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         // Clear pressed now, generation 3.
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
         // New lines arrive, including another textually identical
         // "status ok".
         push_line(&mut logs, &mut generation, false, "[Info] fresh A");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         push_line(&mut logs, &mut generation, false, "[Info] fresh B");
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let rows = &screen.view.as_ref().unwrap().rows;
         assert_eq!(
             rows.iter().map(|row| row.line.as_str()).collect::<Vec<_>>(),
@@ -1295,17 +1285,16 @@ mod tests {
     /// changed, `false` on every frame that reuses the memo.
     #[test]
     fn refresh_view_rebuilds_only_when_an_input_changes() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         let mut screen = LogsScreen::default();
 
         // First frame on the screen builds the view once.
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
 
         // Idle frames never rebuild.
         for _ in 0..10 {
-            assert!(!screen.refresh_view(&logs, generation, &metrics));
+            assert!(!screen.refresh_view(&logs, generation));
         }
 
         // One pushed line → exactly one rebuild.
@@ -1315,19 +1304,19 @@ mod tests {
             false,
             "2026/08/10 12:00:00.123 [Info] connected",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
-        assert!(!screen.refresh_view(&logs, generation, &metrics));
+        assert!(!screen.refresh_view(&logs, generation));
 
         // Filter text change → exactly one rebuild, then stable.
         screen.text = "CONNECTED".to_string();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
-        assert!(!screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
+        assert!(!screen.refresh_view(&logs, generation));
 
         // Level change → one rebuild; the Info line is hidden.
         screen.text.clear();
         screen.level = LevelFilter::WarningPlus;
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
 
         // Clear-view generation → one rebuild; rows through the clear point
@@ -1339,9 +1328,9 @@ mod tests {
             true,
             "2026/08/10 12:00:01.000 [Warning] retry",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
         // The pre-clear lines rotate out entirely; the positional anchor
         // survives the rotation and self-corrects to "show everything" —
@@ -1352,10 +1341,10 @@ mod tests {
             true,
             "2026/08/10 12:00:02.000 [Error] fail",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         logs.pop_front();
         logs.pop_front();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(
             screen.clear_after_generation,
             Some(2),
@@ -1374,7 +1363,6 @@ mod tests {
     /// actually shift: front eviction, filter change, level change.
     #[test]
     fn refresh_view_keeps_selection_on_pure_append_only() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         push_line(
@@ -1384,7 +1372,7 @@ mod tests {
             "2026/08/10 12:00:00.123 [Info] first",
         );
         let mut screen = LogsScreen::default();
-        screen.refresh_view(&logs, generation, &metrics);
+        screen.refresh_view(&logs, generation);
         screen.rows_selection = RowSelection {
             anchor: Some(RowCursor {
                 row: 0,
@@ -1402,14 +1390,14 @@ mod tests {
             false,
             "2026/08/10 12:00:01.000 [Info] second",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert!(
             screen.rows_selection.anchor.is_some(),
             "an append-only rebuild must keep the selection"
         );
         // Front eviction shifts indices → selection must go.
         logs.pop_front();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(screen.rows_selection.anchor, None);
         // Filter change → selection must go.
         screen.rows_selection = RowSelection {
@@ -1423,7 +1411,7 @@ mod tests {
             }),
         };
         screen.text = "FIRST".to_string();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(screen.rows_selection.anchor, None);
     }
 
@@ -1628,7 +1616,6 @@ mod tests {
     /// trimmed text filter, clear marker, display cap.
     #[test]
     fn filtered_view_preserves_level_text_and_clear_marker_semantics() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         for (from_core, line) in [
@@ -1647,18 +1634,18 @@ mod tests {
         }
 
         // All: every line, including the unparseable ones.
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(rows(&screen).len(), 6);
 
         // InfoPlus: unparseable + Info + Warning + Error + WARN-token line.
         screen.level = LevelFilter::InfoPlus;
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(rows(&screen).len(), 5);
 
         // WarningPlus: the two warning-or-above lines plus the WARN-token
         // line; unparseable and below-threshold lines are hidden.
         screen.level = LevelFilter::WarningPlus;
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let warning_plus = rows(&screen);
         assert_eq!(warning_plus.len(), 3);
         assert_eq!(
@@ -1678,14 +1665,14 @@ mod tests {
 
         // ErrorPlus: only the Error line, from_core preserved.
         screen.level = LevelFilter::ErrorPlus;
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(rows(&screen).len(), 1);
         assert!(rows(&screen)[0].from_core);
 
         // Text filter: ASCII-case-insensitive, whitespace trimmed.
         screen.level = LevelFilter::All;
         screen.text = "  DNS ".to_string();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(rows(&screen).len(), 1);
         assert_eq!(
             rows(&screen)[0].line,
@@ -1697,7 +1684,7 @@ mod tests {
         // first three lines.
         screen.text.clear();
         screen.clear_after_generation = Some(3);
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let after_marker = rows(&screen);
         assert_eq!(after_marker.len(), 3);
         assert_eq!(
@@ -1712,14 +1699,13 @@ mod tests {
     /// oldest first.
     #[test]
     fn filtered_view_covers_the_entire_ring() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         for i in 0..2500 {
             push_line(&mut logs, &mut generation, false, &format!("line {i:04}"));
         }
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let rows = &screen.view.as_ref().unwrap().rows;
         assert_eq!(rows.len(), 2500);
         assert_eq!(rows[0].line, "line 0000");
@@ -1916,7 +1902,6 @@ mod tests {
     /// needed.
     #[test]
     fn full_rebuild_resets_layout_vectors_but_pure_append_keeps_them() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         push_line(
@@ -1932,7 +1917,7 @@ mod tests {
             "2026/08/10 12:00:01.000 [Info] line B",
         );
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         // Simulate a measured frame: the layout vectors cover the two rows.
         let view = screen.view.as_mut().unwrap();
         view.heights = vec![10.0, 20.0];
@@ -1946,17 +1931,17 @@ mod tests {
             false,
             "2026/08/10 12:00:02.000 [Info] line C",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let view = screen.view.as_ref().unwrap();
         assert_eq!(view.rows.len(), 3);
         assert_eq!(view.heights, [10.0, 20.0]);
         assert_eq!(view.prefix, [0.0, 10.0, 30.0]);
         // The refreshed key keeps the following idle frame pure.
-        assert!(!screen.refresh_view(&logs, generation, &metrics));
+        assert!(!screen.refresh_view(&logs, generation));
 
         // Level switch: rows rebuilt from scratch, stale layout discarded.
         screen.level = LevelFilter::ErrorPlus;
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let view = screen.view.as_ref().unwrap();
         assert!(view.rows.is_empty());
         assert!(
@@ -1973,7 +1958,7 @@ mod tests {
             "2026/08/10 12:00:03.000 [Error] fatal boom",
         );
         screen.text = "fatal".to_string();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         let view = screen.view.as_ref().unwrap();
         assert_eq!(view.rows.len(), 1);
         assert_eq!(
@@ -1992,7 +1977,6 @@ mod tests {
     /// actions work on.
     #[test]
     fn pure_append_that_admits_nothing_keeps_the_selection() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         push_line(
@@ -2005,7 +1989,7 @@ mod tests {
             text: "KEEP".to_string(),
             ..Default::default()
         };
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         screen.rows_selection = RowSelection {
             anchor: Some(RowCursor {
                 row: 0,
@@ -2025,7 +2009,7 @@ mod tests {
             false,
             "2026/08/10 12:00:01.000 [Info] filtered noise",
         );
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
         assert!(
             screen.rows_selection.anchor.is_some(),
@@ -2033,7 +2017,7 @@ mod tests {
         );
 
         // The next idle frame changes nothing.
-        assert!(!screen.refresh_view(&logs, generation, &metrics));
+        assert!(!screen.refresh_view(&logs, generation));
         assert!(screen.rows_selection.anchor.is_some());
     }
 
@@ -2047,7 +2031,6 @@ mod tests {
     /// generation cannot false-equal.
     #[test]
     fn empty_line_rotation_at_the_cap_invalidates_the_view() {
-        let metrics = MetricsHandle::new();
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         // Small stand-in for the app's ring with `LogBuffer`'s eviction
@@ -2068,7 +2051,7 @@ mod tests {
         push(&mut logs, &mut generation);
         push(&mut logs, &mut generation);
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation, &metrics));
+        assert!(screen.refresh_view(&logs, generation));
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
 
         // Rotate at the cap with another empty line. Ring length, front and
@@ -2076,13 +2059,13 @@ mod tests {
         // monotonic generation moved.
         push(&mut logs, &mut generation);
         assert!(
-            screen.refresh_view(&logs, generation, &metrics),
+            screen.refresh_view(&logs, generation),
             "an empty-line push at the cap must invalidate the memoized view"
         );
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
 
         // The refresh consumed the rotation: idle frames stay pure again.
-        assert!(!screen.refresh_view(&logs, generation, &metrics));
+        assert!(!screen.refresh_view(&logs, generation));
     }
 
     /// The "N of M lines" caption is re-formatted

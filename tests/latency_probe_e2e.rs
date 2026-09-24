@@ -299,11 +299,7 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
     .expect("write servers");
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let runtime = broccoli::rt::spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let runtime = broccoli::rt::spawn_runtime(evt_tx, egui::Context::default());
     runtime
         .cmd
         .send(CoreCmd::ApplyConfigAndStart(main_config))

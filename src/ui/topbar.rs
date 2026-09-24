@@ -14,7 +14,6 @@
 //! child sized to the row remainder.
 
 use crate::i18n::{Key, t, t_fmt};
-use crate::metrics::{MetricsHandle, WorkCounter};
 use crate::model::settings::{Language, TrafficUnit};
 use crate::rt::StatsTick;
 use crate::ui::dashboard::format_bytes;
@@ -84,13 +83,13 @@ pub(crate) struct TopbarRightInputs<'a> {
 /// Refresh the right-cluster memo and return the width it reserves. The
 /// shell calls this with disjoint field borrows. Never allocates on the
 /// repaint path: the staleness check compares by value, and only a key
-/// change rebuilds the strings (bumping [`WorkCounter::TopbarSpeedRebuilds`]
-/// when the cache was already warm).
+/// change rebuilds the strings — the cached speed text's identity across an
+/// idle frame and the cache key after a change are the rebuild checks the
+/// tests pin.
 pub(crate) fn refresh_topbar_right(
     ui: &egui::Ui,
     inputs: &TopbarRightInputs<'_>,
     cache: &mut Option<TopbarRightCache>,
-    metrics: &MetricsHandle,
 ) -> f32 {
     let view_w = (ui.max_rect().width() * 2.0).round() / 2.0;
     let stale = cache.as_ref().is_none_or(|c| {
@@ -105,7 +104,6 @@ pub(crate) fn refresh_topbar_right(
             .stats
             .map(|s| build_speed_label(s, inputs.unit, inputs.lang));
         let width = cluster_width(ui, inputs.version_caption, speed.as_deref());
-        let was_warm = cache.is_some();
         *cache = Some(TopbarRightCache {
             key: (
                 inputs.stats_generation,
@@ -117,9 +115,6 @@ pub(crate) fn refresh_topbar_right(
             speed: speed.unwrap_or_default(),
             width,
         });
-        if was_warm {
-            metrics.bump_work(WorkCounter::TopbarSpeedRebuilds);
-        }
     }
     cache
         .as_ref()
@@ -391,7 +386,6 @@ mod tests {
             lang: Language,
             version: String,
             cache: Option<TopbarRightCache>,
-            metrics: MetricsHandle,
         }
         let state = RightState {
             generation: 7,
@@ -400,7 +394,6 @@ mod tests {
             lang: Language::En,
             version: "xray v1 · app 0.1".to_owned(),
             cache: None,
-            metrics: MetricsHandle::new(),
         };
         let mut h = Harness::builder().build_ui_state(
             move |ui, state: &mut RightState| {
@@ -412,7 +405,7 @@ mod tests {
                     version_caption: &state.version,
                     core_version: Some("v1"),
                 };
-                refresh_topbar_right(ui, &inputs, &mut state.cache, &state.metrics);
+                refresh_topbar_right(ui, &inputs, &mut state.cache);
             },
             state,
         );
@@ -453,7 +446,6 @@ mod tests {
     #[test]
     fn right_cluster_without_stats_reserves_only_the_version_caption() {
         let mut cache: Option<TopbarRightCache> = None;
-        let metrics = MetricsHandle::new();
         {
             let mut h = Harness::new_ui(|ui| {
                 let inputs = TopbarRightInputs {
@@ -464,7 +456,7 @@ mod tests {
                     version_caption: "xray v1 · app 0.1",
                     core_version: Some("v1"),
                 };
-                refresh_topbar_right(ui, &inputs, &mut cache, &metrics);
+                refresh_topbar_right(ui, &inputs, &mut cache);
                 assert!(
                     cache.as_ref().is_some_and(|c| c.speed.is_empty()),
                     "no stats tick -> no speed text"

@@ -1164,13 +1164,13 @@ fn right_click_never_offers_copy() {
     );
 }
 
-/// The frame-time accumulator (timing instrumentation by design) must count
-/// N completed frame intervals across N idle frames and aggregate their real
-/// elapsed time, and the app must still be rendering afterwards. That no
-/// work side-effect rides an idle frame is guarded where the work is
-/// decided: the memoization gates per screen and the runtime arm gates.
+/// An idle window must leave the app alive and rendering: no idle frame may
+/// drive a work side-effect (a teardown, a screen that stops painting), so
+/// the shell's own body is still on screen after N idle frames. That no work
+/// side-effect rides an idle frame is guarded where the work is decided: the
+/// memoization gates per screen and the runtime arm gates.
 #[test]
-fn idle_frames_accumulate_frame_time_and_keep_rendering() {
+fn idle_frames_keep_the_app_rendering() {
     let (_lock, _tmp, mut h) = harness();
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
@@ -1183,25 +1183,7 @@ fn idle_frames_accumulate_frame_time_and_keep_rendering() {
     h.run();
 
     const IDLE_FRAMES: u64 = 120;
-    // Harness construction already ran a few frames (initial AccessKit frame
-    // + settle run), so assert on the delta across the idle window, not an
-    // absolute count.
-    let before = h.state().metrics_snapshot();
     h.run_steps(IDLE_FRAMES as usize);
-
-    let snapshot = h.state().metrics_snapshot();
-    // One frame interval is completed between consecutive frame entries, so
-    // the idle window must advance the accumulator by exactly its frame
-    // count.
-    assert_eq!(
-        snapshot.frames - before.frames,
-        IDLE_FRAMES,
-        "the frame-time accumulator must count completed frame intervals, not frame entries"
-    );
-    assert!(
-        snapshot.frame_ns_total > before.frame_ns_total,
-        "the frame-time accumulator must aggregate the real elapsed time between frame entries"
-    );
 
     // Idle frames must leave the app alive and rendering: the Dashboard body
     // (its no-servers empty state) is still on screen after the window.

@@ -6,7 +6,6 @@
 //! buffer machinery (`super::raw_editor`). Private to the screen.
 
 use crate::i18n::{Key, t, t_fmt};
-use crate::metrics::MetricsHandle;
 use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, pinned_peer_cert_sha256_valid};
 use crate::model::{
@@ -19,7 +18,7 @@ use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
 
 use super::raw_editor::{
-    FieldKey, JsonBuf, JsonEditorSpec, PemBuf, RawField, pem_lines_editor, raw_buffer_edit,
+    FieldKey, JsonEditorSpec, PemBuf, RawBuffers, RawField, pem_lines_editor, raw_buffer_edit,
 };
 use super::{
     TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, mask_sockopt_editor, path_field,
@@ -115,8 +114,7 @@ fn finalmask_unknown_editor(
     raw: &mut serde_json::Value,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut std::collections::HashMap<egui::Id, JsonBuf>,
-    metrics: &MetricsHandle,
+    raw_buffers: &mut RawBuffers,
 ) -> bool {
     ui.colored_label(
         status_colors_of(ui).warn,
@@ -142,7 +140,6 @@ fn finalmask_unknown_editor(
             hint: "{}",
             rows: 5,
         },
-        metrics,
     )
 }
 
@@ -153,7 +150,6 @@ fn finalmask_raw_value_editor(
     encoding: &mut String,
     raw: &mut FinalmaskRawValue,
     field: RawField<'_>,
-    metrics: &MetricsHandle,
 ) -> bool {
     let mut changed = widgets::combo_str_labeled(
         ui,
@@ -201,7 +197,6 @@ fn finalmask_raw_value_editor(
                 hint: "[0, 255]",
                 rows: 2,
             },
-            metrics,
         );
     }
     changed
@@ -213,8 +208,7 @@ fn finalmask_transform_editor(
     transform: &mut FinalmaskTransform,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut std::collections::HashMap<egui::Id, JsonBuf>,
-    metrics: &MetricsHandle,
+    raw_buffers: &mut RawBuffers,
 ) -> bool {
     let mut changed = widgets::text_field(ui, "op", &mut transform.op, "operation");
     let mut remove = None;
@@ -283,7 +277,6 @@ fn finalmask_transform_editor(
                                 },
                                 buffers: raw_buffers,
                             },
-                            metrics,
                         );
                     }
                     "u64" => {
@@ -309,7 +302,6 @@ fn finalmask_transform_editor(
                                 key.with(("arg", index, "nested")),
                                 profile,
                                 raw_buffers,
-                                metrics,
                             );
                         }
                     }
@@ -338,8 +330,7 @@ fn finalmask_tcp_item_editor(
     item: &mut FinalmaskTcpItem,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut std::collections::HashMap<egui::Id, JsonBuf>,
-    metrics: &MetricsHandle,
+    raw_buffers: &mut RawBuffers,
 ) -> bool {
     let mut changed = range_editor(ui, "delay", &mut item.delay, i32::MIN..=i32::MAX);
     changed |= ui
@@ -365,7 +356,6 @@ fn finalmask_tcp_item_editor(
             },
             buffers: raw_buffers,
         },
-        metrics,
     );
     let mut has_transform = item.transform.is_some();
     if ui.checkbox(&mut has_transform, "transform").changed() {
@@ -380,7 +370,6 @@ fn finalmask_tcp_item_editor(
             key.with("transform"),
             profile,
             raw_buffers,
-            metrics,
         );
     }
     changed
@@ -392,8 +381,7 @@ fn finalmask_udp_item_editor(
     item: &mut FinalmaskUdpItem,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut std::collections::HashMap<egui::Id, JsonBuf>,
-    metrics: &MetricsHandle,
+    raw_buffers: &mut RawBuffers,
 ) -> bool {
     let mut changed = ui
         .horizontal(|ui| {
@@ -418,7 +406,6 @@ fn finalmask_udp_item_editor(
             },
             buffers: raw_buffers,
         },
-        metrics,
     );
     let mut has_transform = item.transform.is_some();
     if ui.checkbox(&mut has_transform, "transform").changed() {
@@ -433,7 +420,6 @@ fn finalmask_udp_item_editor(
             key.with("transform"),
             profile,
             raw_buffers,
-            metrics,
         );
     }
     changed
@@ -445,7 +431,6 @@ fn finalmask_tcp_sequences_editor(
     label: &str,
     sequences: &mut Vec<Vec<FinalmaskTcpItem>>,
     field: RawField<'_>,
-    metrics: &MetricsHandle,
 ) -> bool {
     let mut changed = false;
     ui.label(label);
@@ -479,7 +464,6 @@ fn finalmask_tcp_sequences_editor(
                                 field.id.key.with((sequence_index, item_index)),
                                 field.id.profile,
                                 &mut *field.buffers,
-                                metrics,
                             );
                         });
                     });
@@ -512,7 +496,6 @@ fn finalmask_udp_items_editor(
     label: &str,
     items: &mut Vec<FinalmaskUdpItem>,
     field: RawField<'_>,
-    metrics: &MetricsHandle,
 ) -> bool {
     let mut changed = false;
     ui.label(label);
@@ -532,7 +515,6 @@ fn finalmask_udp_items_editor(
                         field.id.key.with(index),
                         field.id.profile,
                         &mut *field.buffers,
-                        metrics,
                     );
                 });
         });
@@ -745,8 +727,7 @@ pub(super) fn finalmask_tcp_settings_editor(
     mask: &mut FinalmaskTcpMask,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut std::collections::HashMap<egui::Id, JsonBuf>,
-    metrics: &MetricsHandle,
+    raw_buffers: &mut RawBuffers,
 ) -> bool {
     match mask {
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
@@ -762,7 +743,6 @@ pub(super) fn finalmask_tcp_settings_editor(
                     },
                     buffers: raw_buffers,
                 },
-                metrics,
             );
             changed |= finalmask_tcp_sequences_editor(
                 ui,
@@ -776,7 +756,6 @@ pub(super) fn finalmask_tcp_settings_editor(
                     },
                     buffers: raw_buffers,
                 },
-                metrics,
             );
             changed |= finalmask_tcp_sequences_editor(
                 ui,
@@ -790,7 +769,6 @@ pub(super) fn finalmask_tcp_settings_editor(
                     },
                     buffers: raw_buffers,
                 },
-                metrics,
             );
             changed
         }
@@ -822,15 +800,9 @@ pub(super) fn finalmask_tcp_settings_editor(
         }
         FinalmaskTcpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
         FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings),
-        FinalmaskTcpMask::Unknown(raw) => finalmask_unknown_editor(
-            ui,
-            lang,
-            raw,
-            key.with("unknown"),
-            profile,
-            raw_buffers,
-            metrics,
-        ),
+        FinalmaskTcpMask::Unknown(raw) => {
+            finalmask_unknown_editor(ui, lang, raw, key.with("unknown"), profile, raw_buffers)
+        }
     }
 }
 
@@ -1025,7 +997,6 @@ pub(super) fn finalmask_udp_settings_editor(
     mask: &mut FinalmaskUdpMask,
     field: RawField<'_>,
     pem_buffers: &mut std::collections::HashMap<egui::Id, PemBuf>,
-    metrics: &MetricsHandle,
 ) -> bool {
     match mask {
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
@@ -1049,7 +1020,6 @@ pub(super) fn finalmask_udp_settings_editor(
                     },
                     buffers: &mut *field.buffers,
                 },
-                metrics,
             );
             changed |= finalmask_udp_items_editor(
                 ui,
@@ -1063,7 +1033,6 @@ pub(super) fn finalmask_udp_settings_editor(
                     },
                     buffers: &mut *field.buffers,
                 },
-                metrics,
             );
             changed
         }
@@ -1113,7 +1082,6 @@ pub(super) fn finalmask_udp_settings_editor(
                                 },
                                 buffers: &mut *field.buffers,
                             },
-                            metrics,
                         );
                     });
                 });
@@ -1233,7 +1201,6 @@ pub(super) fn finalmask_udp_settings_editor(
             field.id.key.with("unknown"),
             field.id.profile,
             &mut *field.buffers,
-            metrics,
         ),
     }
 }

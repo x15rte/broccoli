@@ -311,11 +311,7 @@ fn downloads_and_reloads_geodata_without_restart() {
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::ApplyConfigAndStart(config))
         .expect("apply and start the isolated configuration");
@@ -420,11 +416,7 @@ fn payload_files_stay_replaceable_while_core_runs() {
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::ApplyConfigAndStart(config))
         .expect("apply and start the isolated configuration");
@@ -520,11 +512,7 @@ fn broken_file_rolls_back() {
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::ApplyConfigAndStart(config))
         .expect("apply and start the isolated configuration");
@@ -724,11 +712,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::ApplyConfigAndStart(config.clone()))
         .expect("apply and start the isolated configuration");

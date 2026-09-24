@@ -15,7 +15,6 @@
 //! suite (`tests/ui_smoke.rs`) drives the real eframe app and does not use
 //! it.
 
-use crate::metrics::MetricsHandle;
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
     CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OutboundStatusView, StatsTick,
@@ -78,7 +77,6 @@ pub(crate) struct UiTestRig {
     pub(crate) dirty: bool,
     pub(crate) ui_dirty: bool,
     pub(crate) config_revision: u64,
-    pub(crate) metrics: MetricsHandle,
     pub(crate) stats_generation: u64,
     pub(crate) latency_generation: u64,
     /// Staging store for [`UiTestRig::ctx`]: the runtime inputs are
@@ -118,7 +116,6 @@ impl Default for UiTestRig {
             dirty: false,
             ui_dirty: false,
             config_revision: 0,
-            metrics: MetricsHandle::new(),
             stats_generation: 0,
             latency_generation: 0,
             snapshot: UiCtxSnapshot {
@@ -179,7 +176,6 @@ impl UiTestRig {
                 logs: &self.logs,
                 logs_generation: self.logs_generation,
                 probe_feedback: &mut self.probe_feedback,
-                metrics: &self.metrics,
                 dirty: &mut self.dirty,
                 ui_dirty: &mut self.ui_dirty,
                 connect_requested: &mut self.connect_requested,

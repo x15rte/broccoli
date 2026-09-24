@@ -131,11 +131,7 @@ fn socks_to_freedom_e2e() {
     // The control-plane port is ephemeral and derived from the
     // emitted config; the runtime must recover the endpoint from the active
     // config before polling, never from Settings.
-    let rt = broccoli::rt::spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = broccoli::rt::spawn_runtime(evt_tx, egui::Context::default());
 
     // One command guarantees Start cannot race validation or launch a stale
     // config when validation fails.

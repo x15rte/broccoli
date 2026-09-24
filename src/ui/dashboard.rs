@@ -1,7 +1,6 @@
 //! Dashboard: core state, mode switching, throughput plot, latency table.
 
 use crate::i18n::{Key, t, t_fmt};
-use crate::metrics::WorkCounter;
 use crate::model::Mode;
 use crate::model::settings::{Language, Settings, TrafficUnit};
 use crate::rt::{CorePhase, DownloadState, OutboundStatusView};
@@ -93,10 +92,8 @@ pub struct DashboardScreen {
 impl DashboardScreen {
     /// The throughput series for this frame: cached, rebuilt only when the
     /// stats generation advanced — a stats tick is the only way the history
-    /// ring changes. Bumps [`WorkCounter::PlotRebuilds`] once per rebuild,
-    /// never per frame. The initial cache fill (a screen's first render) is
-    /// a one-time seed, not a rebuild, so the counter stays at absolute zero
-    /// on a fresh harness (the idle-frame purity contract).
+    /// ring changes. The cached generation is the rebuild key the tests pin:
+    /// an idle frame reuses the series it already holds.
     fn plot_series(&mut self, ctx: &UiCtx<'_>) -> &PlotCache {
         let generation = ctx.stats_generation;
         if !self
@@ -104,7 +101,6 @@ impl DashboardScreen {
             .as_ref()
             .is_some_and(|cache| cache.stats_generation == generation)
         {
-            let rebuild = self.plot_cache.is_some();
             let n = ctx.stats_history.len();
             let up = ctx
                 .stats_history
@@ -123,9 +119,6 @@ impl DashboardScreen {
                 up,
                 down,
             });
-            if rebuild {
-                ctx.metrics.bump_work(WorkCounter::PlotRebuilds);
-            }
         }
         self.plot_cache
             .as_ref()
@@ -1693,11 +1686,10 @@ mod tests {
     }
 
     /// The inbound cache rebuilds exactly once per input change: idle
-    /// frames rebuild nothing, and a traffic-unit flip rebuilds once (no
-    /// work counter exists for the inbound cache; its memoization is
-    /// structural — the labels only ever change on the rebuild frame, so
-    /// the `(stats_generation, unit, language)` key is observable through
-    /// them).
+    /// frames rebuild nothing, and a traffic-unit flip rebuilds once. Its
+    /// memoization is structural — the labels only ever change on the
+    /// rebuild frame, so the `(stats_generation, unit, language)` key is
+    /// observable through them.
     #[test]
     fn unit_change_rebuilds_inbound_cache_once() {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));

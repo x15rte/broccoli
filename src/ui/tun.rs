@@ -1,7 +1,6 @@
 //! TUN screen: full-tunnel inbound settings + elevation state.
 
 use crate::i18n::{Key, safety_message_for_path, t, t_fmt, validation_message};
-use crate::metrics::WorkCounter;
 use crate::model::Mode;
 use crate::model::TunCfg;
 use crate::model::safety::assess;
@@ -61,10 +60,10 @@ fn tun_gateway_error(lang: Language, mode: Mode, tun: &TunCfg) -> Option<&'stati
 impl TunScreen {
     /// Refresh the adapter list off the UI thread at most once per
     /// [`REFRESH_INTERVAL`]: a worker enumerates and delivers through a
-    /// channel, so no frame ever blocks on `GetAdaptersAddresses`. Each
-    /// actual enumeration bumps `WorkCounter::AdapterEnumerations` on the
-    /// worker; idle frames never reach the counter.
-    fn poll_ifaces(&mut self, ui: &egui::Ui, ctx: &mut UiCtx) {
+    /// channel, so no frame ever blocks on `GetAdaptersAddresses`. An idle
+    /// frame never enumerates: the request slot's state is the observable
+    /// (a delivered fixture versus an idle slot).
+    fn poll_ifaces(&mut self, ui: &egui::Ui) {
         match self.iface_request.poll() {
             Some(Terminal::Answered(ifaces)) => self.set_ifaces(ifaces),
             // A worker that exits without delivering clears the request so
@@ -75,13 +74,8 @@ impl TunScreen {
         let now = std::time::Instant::now();
         let due = self.next_refresh_at.map(|at| now >= at).unwrap_or(true);
         if !self.iface_request.is_pending() && due {
-            let metrics = ctx.metrics.clone();
             let repaint = ui.ctx().clone();
-            match Request::worker("broccoli-netif", &repaint, move |_| {
-                let ifaces = netif::list();
-                metrics.bump_work(WorkCounter::AdapterEnumerations);
-                Some(ifaces)
-            }) {
+            match Request::worker("broccoli-netif", &repaint, move |_| Some(netif::list())) {
                 Ok(request) => {
                     self.iface_request = request;
                     self.next_refresh_at = Some(now + REFRESH_INTERVAL);
@@ -90,7 +84,6 @@ impl TunScreen {
                     // Thread-spawn failure (resource exhaustion): fall back to
                     // a synchronous enumeration so the list still refreshes.
                     self.set_ifaces(netif::list());
-                    ctx.bump_work(WorkCounter::AdapterEnumerations);
                     self.next_refresh_at = Some(now + REFRESH_INTERVAL);
                 }
             }
@@ -114,7 +107,7 @@ impl TunScreen {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
-        self.poll_ifaces(ui, ctx);
+        self.poll_ifaces(ui);
 
         // The privacy warning is rebuilt only when the model generation
         // changes — an edit frame, a persist, or a load — never on idle

@@ -225,11 +225,7 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     });
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = broccoli::rt::spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = broccoli::rt::spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(broccoli::rt::CoreCmd::ApplyConfigAndStart(config))
         .unwrap();

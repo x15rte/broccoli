@@ -3,7 +3,6 @@
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message_for_path, t, t_fmt};
-use crate::metrics::{MetricsHandle, ResourceCounter, WorkCounter};
 use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, TUN_INBOUND_TAG,
 };
@@ -232,23 +231,23 @@ fn geodata_search_indices(codes: &[String], query: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Refresh `memo` when the (query, dataset) key changed, bumping
-/// `WorkCounter::GeodataSearches` once per real scan; returns the match
+/// Refresh `memo` when the (query, dataset) key changed; returns the match
 /// indices to render this frame. Repeated renders with an unchanged key are
-/// free (no scan, no counter bump) — the idle-frame purity contract.
+/// free — the memo entry is kept whole, so its allocations survive: the
+/// `matches` vector for a query that matches, the key `String` for one that
+/// matches nothing. Those two allocations are what the idle-frame purity
+/// test pins as un-reallocated.
 fn geodata_search_matches<'a>(
     memo: &'a mut Option<GeodataSearchMemo>,
     dataset_revision: u64,
     codes: &[String],
     query: &str,
-    metrics: &MetricsHandle,
 ) -> &'a [u32] {
     let stale = memo
         .as_ref()
         .is_none_or(|m| m.query != query || m.dataset_revision != dataset_revision);
     if stale {
         let matches = geodata_search_indices(codes, query);
-        metrics.bump_work(WorkCounter::GeodataSearches);
         *memo = Some(GeodataSearchMemo {
             query: query.to_owned(),
             dataset_revision,
@@ -520,13 +519,7 @@ impl RoutingScreen {
 
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
         // rebuilt only when the routing model changed, never per frame.
-        self.refresh_view_cache(
-            ctx.config_revision,
-            lang,
-            ctx.servers,
-            ctx.settings,
-            ctx.metrics,
-        );
+        self.refresh_view_cache(ctx.config_revision, lang, ctx.servers, ctx.settings);
 
         self.consume_balancer_results(lang);
         self.consume_trial_results(ctx, lang);
@@ -1158,21 +1151,14 @@ impl RoutingScreen {
 
     /// Borrow (creating on demand) the live runtime UI state for one
     /// balancer tag. The per-frame editor calls this to persist UI state
-    /// across frames, but an insert is a real mutation: the resource
-    /// counter is set exactly when a new entry is created,
-    /// never per frame.
+    /// across frames; an insert is a real mutation, but the map's own length
+    /// is the size the tests read — idle frames never insert, so they never
+    /// grow it.
     fn balancer_runtime_state<'a>(
         runtime: &'a mut BTreeMap<String, BalancerRuntimeUi>,
         tag: &str,
-        metrics: &MetricsHandle,
     ) -> &'a mut BalancerRuntimeUi {
-        let created = !runtime.contains_key(tag);
-        let len = runtime.len();
-        let state = runtime.entry(tag.to_string()).or_default();
-        if created {
-            metrics.set_resource(ResourceCounter::BalancerRuntimeMapEntries, (len + 1) as u64);
-        }
-        state
+        runtime.entry(tag.to_string()).or_default()
     }
 
     /// Evict-absent: drop balancer-runtime entries whose
@@ -1181,9 +1167,9 @@ impl RoutingScreen {
     /// stays bounded by the live balancer set across add/remove/rename
     /// churn. Live state (pending request, info, feedback, target draft)
     /// for tags still present is untouched. Runs on model change — never
-    /// per frame — and re-syncs `ResourceCounter::BalancerRuntimeMapEntries`
-    /// with the resulting size.
-    fn evict_stale_balancer_runtime(&mut self, settings: &Settings, metrics: &MetricsHandle) {
+    /// per frame — so the map's own length stays bounded by the live
+    /// balancer set.
+    fn evict_stale_balancer_runtime(&mut self, settings: &Settings) {
         self.balancer_runtime.retain(|tag, _| {
             settings
                 .routing
@@ -1191,18 +1177,13 @@ impl RoutingScreen {
                 .iter()
                 .any(|balancer| balancer.tag == *tag)
         });
-        metrics.set_resource(
-            ResourceCounter::BalancerRuntimeMapEntries,
-            self.balancer_runtime.len() as u64,
-        );
     }
 
     /// Rebuild the derived UI data (tag vectors, rule-row text, balancer
     /// reference counts, TestRoute inbound options) only when the model
     /// generation `(config_revision, model_revision, language)` changed;
-    /// idle frames reuse the cached snapshot. Bumps
-    /// `WorkCounter::RoutingTagRebuilds` and `WorkCounter::RoutingRuleFormats`
-    /// exactly once per real rebuild — the idle-frame purity contract.
+    /// idle frames reuse the cached snapshot, and the cache's own generation
+    /// key is what the tests pin as the rebuild decision.
     /// Also evicts balancer-runtime entries absent from the model — the
     /// generation change is the model-change signal, so
     /// the eviction pass runs once per change, never per frame.
@@ -1212,7 +1193,6 @@ impl RoutingScreen {
         lang: Language,
         servers: &ServersFile,
         settings: &Settings,
-        metrics: &MetricsHandle,
     ) {
         let generation = (config_revision, self.model_revision, lang);
         if matches!(&self.view_cache, Some(cache) if cache.generation == generation) {
@@ -1222,7 +1202,7 @@ impl RoutingScreen {
         // A balancer removed or renamed — here, or persisted from another
         // screen (config_revision) — must not leave its runtime entry
         // resident for the session.
-        self.evict_stale_balancer_runtime(settings, metrics);
+        self.evict_stale_balancer_runtime(settings);
 
         // Outbound tags offered as rule targets: every profile + contract
         // tags (gen always emits freedom "direct" and blackhole "block").
@@ -1321,8 +1301,6 @@ impl RoutingScreen {
             })
             .collect();
 
-        metrics.bump_work(WorkCounter::RoutingTagRebuilds);
-        metrics.bump_work(WorkCounter::RoutingRuleFormats);
         self.view_cache = Some(RoutingViewCache {
             generation,
             out_tags,
@@ -1399,7 +1377,7 @@ impl RoutingScreen {
                             );
                         });
                         if self.edit_rule == Some(i) {
-                            *changed |= self.rule_editor(ui, lang, rule, ctx.metrics);
+                            *changed |= self.rule_editor(ui, lang, rule);
                         }
                     });
                 }
@@ -1435,13 +1413,7 @@ impl RoutingScreen {
     }
 
     /// Inline editor covering every `Rule` model field. Returns true on change.
-    fn rule_editor(
-        &mut self,
-        ui: &mut Ui,
-        lang: Language,
-        rule: &mut Rule,
-        metrics: &MetricsHandle,
-    ) -> bool {
+    fn rule_editor(&mut self, ui: &mut Ui, lang: Language, rule: &mut Rule) -> bool {
         let mut changed = false;
 
         // PortList fields are edited through commit-gated buffers: an
@@ -1494,7 +1466,6 @@ impl RoutingScreen {
                             lang,
                             GeodataPickerKind::Geosite,
                             &mut rule.domain,
-                            metrics,
                         );
                     });
                     self.geodata_diagnostic(ui, lang, GeodataPickerKind::Geosite);
@@ -1514,7 +1485,6 @@ impl RoutingScreen {
                             lang,
                             GeodataPickerKind::Geoip,
                             &mut rule.ip,
-                            metrics,
                         );
                     });
                     self.geodata_diagnostic(ui, lang, GeodataPickerKind::Geoip);
@@ -1855,7 +1825,6 @@ impl RoutingScreen {
         lang: Language,
         kind: GeodataPickerKind,
         rule_values: &mut Vec<String>,
-        metrics: &MetricsHandle,
     ) -> bool {
         let mut changed = false;
         ui.menu_button(kind.button_label(lang), |ui| {
@@ -1972,7 +1941,6 @@ impl RoutingScreen {
                             self.geodata_revision,
                             &catalog.codes,
                             query,
-                            metrics,
                         );
                         if matches.is_empty() {
                             ui.label(RichText::new(t(lang, Key::GeodataNoMatches)).weak());
@@ -2096,7 +2064,6 @@ impl RoutingScreen {
         ui: &mut Ui,
         lang: Language,
         control: &RuntimeControl<'_>,
-        metrics: &MetricsHandle,
         tag: &str,
     ) {
         ui.separator();
@@ -2115,7 +2082,7 @@ impl RoutingScreen {
         );
 
         let action = {
-            let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag, metrics);
+            let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag);
             if state.known_target.is_empty()
                 || !self
                     .view_cache
@@ -2267,7 +2234,7 @@ impl RoutingScreen {
             // One reply channel per action; the entry's pending holds the
             // request until the terminal lands. A synchronous send failure
             // clears exactly this request.
-            let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag, metrics);
+            let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag);
             state.feedback = None;
             match action {
                 BalancerControlAction::Refresh => {
@@ -2454,13 +2421,7 @@ impl RoutingScreen {
                             if let Some(tag) = requested_tag {
                                 rename = Some((i, tag));
                             }
-                            self.balancer_runtime_controls(
-                                ui,
-                                lang,
-                                &runtime_control,
-                                ctx.metrics,
-                                &bal.tag,
-                            );
+                            self.balancer_runtime_controls(ui, lang, &runtime_control, &bal.tag);
                         }
                     });
                 }
@@ -3437,7 +3398,6 @@ mod geodata_picker_search_tests {
         GeodataLoadState, Request, RoutingScreen, contains_ascii_case_insensitive,
         geodata_search_indices, geodata_search_matches,
     };
-    use crate::metrics::MetricsHandle;
     use crate::model::settings::Language;
     use crate::sys::geodata::{
         GeodataCatalog, GeodataError, GeodataFileMetadata, GeodataOperation, GeodataSnapshot,
@@ -3477,10 +3437,9 @@ mod geodata_picker_search_tests {
             "telegram",
             "netflix",
         ]);
-        let metrics = MetricsHandle::new();
         let mut memo = None;
 
-        let memoized = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn", &metrics);
+        let memoized = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn");
         let fresh: Vec<&str> = catalog
             .codes
             .iter()
@@ -3504,51 +3463,63 @@ mod geodata_picker_search_tests {
     }
 
     /// Idle-frame purity + generation gating: repeated renders with the same
-    /// (query, dataset) reuse the memo — its key allocation survives, so no
-    /// rescan ran — and a query change or a dataset revision change rewrites
-    /// the memo's key exactly once.
+    /// (query, dataset) reuse the memo — its `matches` allocation survives,
+    /// and for a query that matches nothing its key `String` does — while a
+    /// rescan would collect a fresh vector / allocate a fresh key, so the
+    /// identity compare is what fails when the reuse gate is dropped. A query
+    /// change or a dataset revision change rewrites the memo's key exactly
+    /// once.
     #[test]
     fn rescans_only_on_query_or_dataset_change() {
         let catalog = fixture_catalog(&["cn", "google", "github", "geolocation-!cn"]);
-        let metrics = MetricsHandle::new();
         let mut memo = None;
 
-        let first = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn", &metrics);
+        let first = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn");
         assert_eq!(first, [0_u32, 3]);
-        let first_key = memo.as_ref().unwrap().query.as_ptr();
+        let first_matches = memo.as_ref().unwrap().matches.as_ptr();
 
         // Unchanged (query, dataset): reuse the memo, no scan.
-        let again = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn", &metrics);
+        let again = geodata_search_matches(&mut memo, 1, &catalog.codes, "cn");
         assert_eq!(again, [0_u32, 3]);
         assert_eq!(
-            memo.as_ref().unwrap().query.as_ptr(),
-            first_key,
-            "an unchanged (query, dataset) must reuse the memo, not rescan"
+            memo.as_ref().unwrap().matches.as_ptr(),
+            first_matches,
+            "an unchanged (query, dataset) must reuse the memo's match vector, not rescan"
         );
 
         // Query change: exactly one scan, matching a fresh scan of the query.
-        let changed = geodata_search_matches(&mut memo, 1, &catalog.codes, "google", &metrics);
+        let changed = geodata_search_matches(&mut memo, 1, &catalog.codes, "google");
         assert_eq!(changed, [1_u32]);
         assert_eq!(memo.as_ref().unwrap().query, "google");
 
         // Dataset revision change with the same query: exactly one scan
         // (the picker rescans the refreshed catalog, so the memo's key
         // carries the new revision).
-        let refreshed = geodata_search_matches(&mut memo, 2, &catalog.codes, "google", &metrics);
+        let refreshed = geodata_search_matches(&mut memo, 2, &catalog.codes, "google");
         assert_eq!(refreshed, [1_u32]);
         assert_eq!(memo.as_ref().unwrap().dataset_revision, 2);
 
-        // No-match query scans once and stays memoized as empty.
-        let none = geodata_search_matches(&mut memo, 2, &catalog.codes, "zzz", &metrics);
+        // No-match query scans once and stays memoized as empty. Its
+        // `matches` is empty and so has no allocation to identify; the idle
+        // direction therefore holds the memo's *key* allocation across the
+        // replay. That check fails when the reuse gate is dropped: a rescan
+        // rebuilds the entry with `query.to_owned()`, and the old key is still
+        // alive while the new one is allocated, so the two cannot share an
+        // address.
+        let none = geodata_search_matches(&mut memo, 2, &catalog.codes, "zzz");
         assert!(none.is_empty());
-        assert_eq!(memo.as_ref().unwrap().query, "zzz");
+        assert_eq!(
+            memo.as_ref().unwrap().query,
+            "zzz",
+            "a no-match query must still memoize its key"
+        );
         let none_key = memo.as_ref().unwrap().query.as_ptr();
-        let still_none = geodata_search_matches(&mut memo, 2, &catalog.codes, "zzz", &metrics);
+        let still_none = geodata_search_matches(&mut memo, 2, &catalog.codes, "zzz");
         assert!(still_none.is_empty());
         assert_eq!(
             memo.as_ref().unwrap().query.as_ptr(),
             none_key,
-            "a memoized no-match query must not rescan"
+            "a memoized no-match query must reuse its memo key, not rescan"
         );
     }
 
@@ -3588,7 +3559,6 @@ mod geodata_picker_search_tests {
 #[cfg(test)]
 mod view_cache_tests {
     use super::{Language, RoutingScreen, rule_summary, rule_target_line};
-    use crate::metrics::MetricsHandle;
     use crate::model::inbound::{DNS_INBOUND_TAG, TUN_INBOUND_TAG};
     use crate::model::{
         Balancer, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, OutboundModel, Rule,
@@ -3602,7 +3572,6 @@ mod view_cache_tests {
     /// allocations are the seam — a rebuild replaces both.
     #[test]
     fn view_cache_rebuilds_only_when_the_model_generation_changes() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -3610,7 +3579,7 @@ mod view_cache_tests {
 
         // First frame: one rebuild, one format pass, keyed on the live
         // generation.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let first_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (0, screen.model_revision, Language::En));
@@ -3624,8 +3593,8 @@ mod view_cache_tests {
 
         // Idle frames with the same generation rebuild nothing: the cache
         // keeps its generation key and its own allocations.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (0, screen.model_revision, Language::En));
@@ -3641,13 +3610,13 @@ mod view_cache_tests {
         settings.routing.rules[0].port = "443".into();
         screen.model_revision = screen.model_revision.wrapping_add(1);
         let edited = screen.model_revision;
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let edited_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (0, edited, Language::En));
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (0, edited, Language::En));
@@ -3655,13 +3624,13 @@ mod view_cache_tests {
         }
 
         // A persisted change (config_revision bump) rebuilds exactly once.
-        screen.refresh_view_cache(1, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         let persisted_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (1, edited, Language::En));
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(1, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (1, edited, Language::En));
@@ -3673,7 +3642,6 @@ mod view_cache_tests {
     /// model: the memoized summary and target lines are what the rows paint.
     #[test]
     fn cached_rule_rows_match_fresh_formatting() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -3693,7 +3661,7 @@ mod view_cache_tests {
             ..Rule::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let rows = &screen.view_cache.as_ref().unwrap().rule_rows;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short_tag, "rule-one");
@@ -3725,7 +3693,6 @@ mod view_cache_tests {
     /// editor's combo, and the unfiltered list kept for the rename validator.
     #[test]
     fn cached_tag_vectors_match_the_model() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let mut servers = ServersFile::default();
         servers
@@ -3741,7 +3708,7 @@ mod view_cache_tests {
             .balancers
             .push(Balancer::new("b1".into(), "srv-".into()));
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let cache = screen.view_cache.as_ref().unwrap();
 
         assert_eq!(cache.out_tags.len(), 3, "one profile + direct + block");
@@ -3755,7 +3722,7 @@ mod view_cache_tests {
         servers
             .profiles
             .push(ServerProfile::new("beta", OutboundModel::default()));
-        screen.refresh_view_cache(1, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert_eq!(screen.view_cache.as_ref().unwrap().out_tags.len(), 4);
     }
 
@@ -3765,7 +3732,6 @@ mod view_cache_tests {
     /// the model generation advances.
     #[test]
     fn cached_reference_counts_match_the_model_and_refresh_on_generation() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -3788,7 +3754,7 @@ mod view_cache_tests {
             ..Rule::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let counts = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(
@@ -3806,7 +3772,7 @@ mod view_cache_tests {
 
         // Idle frames reuse the same generation's counts: the retained
         // vector survives, so no scan ran.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [2, 0]);
@@ -3820,13 +3786,13 @@ mod view_cache_tests {
         // One rule edit (generation bump) → exactly one rebuild, one scan.
         settings.routing.rules[1].balancer_tag = "b2".into();
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let edited = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
             cache.reference_counts.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
@@ -3840,7 +3806,6 @@ mod view_cache_tests {
     /// generation bump changes the row.
     #[test]
     fn cached_balancer_headers_match_fresh_formatting_and_refresh_once() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -3863,7 +3828,7 @@ mod view_cache_tests {
             ..Default::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let headers = &screen.view_cache.as_ref().unwrap().balancer_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(
@@ -3905,8 +3870,8 @@ mod view_cache_tests {
             .unwrap()
             .balancer_headers
             .as_ptr();
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.balancer_headers[0].strategy, "strategy: random");
@@ -3921,7 +3886,7 @@ mod view_cache_tests {
         // exactly once, in the same pass as the tag vectors.
         settings.routing.balancers[0].selector = vec!["srv-a".into(), "srv-c".into()];
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         let rebuilt = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(
@@ -3931,7 +3896,7 @@ mod view_cache_tests {
             );
             cache.balancer_headers.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         assert_eq!(
             screen
                 .view_cache
@@ -3949,7 +3914,6 @@ mod view_cache_tests {
     /// never cloned per open-dialog frame.
     #[test]
     fn cached_known_inbounds_match_the_model() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -3962,7 +3926,7 @@ mod view_cache_tests {
             ..DokodemoCfg::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -3978,7 +3942,7 @@ mod view_cache_tests {
 
         // A dokodemo change persisted from another screen refreshes the list.
         settings.dokodemo[1].tag = "in-doko-c".into();
-        screen.refresh_view_cache(1, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -3999,7 +3963,7 @@ mod view_cache_tests {
             protocol: LocalInboundProtocol::Http,
             ..Default::default()
         });
-        screen.refresh_view_cache(2, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(2, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -4024,7 +3988,6 @@ mod view_cache_tests {
 mod routing_grammar_tests {
     use super::{Language, RoutingScreen, safety_message_for_path, valid_ip_rule, valid_port_list};
     use crate::i18n::{Key, t};
-    use crate::metrics::MetricsHandle;
     use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding};
     use crate::model::{
         Balancer, OutboundModel, ServerProfile, ServersFile, Settings, StrategyCfg,
@@ -4187,7 +4150,6 @@ mod routing_grammar_tests {
     /// outbound tag warns, and the warning clears once a profile tag matches.
     #[test]
     fn balancer_breakage_warnings_follow_assess() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let mut settings = Settings::default();
         settings
@@ -4196,13 +4158,7 @@ mod routing_grammar_tests {
             .push(Balancer::new("bal-a".into(), "srv-".into()));
 
         // No profiles: "srv-" matches nothing among [direct, block].
-        screen.refresh_view_cache(
-            0,
-            Language::En,
-            &ServersFile::default(),
-            &settings,
-            &metrics,
-        );
+        screen.refresh_view_cache(0, Language::En, &ServersFile::default(), &settings);
         let cache = screen.view_cache.as_ref().unwrap();
         assert!(
             cache.balancer_warnings[0].is_some(),
@@ -4217,7 +4173,7 @@ mod routing_grammar_tests {
             .push(ServerProfile::new("alpha", OutboundModel::default()));
         settings.routing.balancers[0].selector = vec![servers.profiles[0].tag()];
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().balancer_warnings[0].is_none(),
             "a selector matching a seeded profile must not warn"
@@ -4229,13 +4185,13 @@ mod routing_grammar_tests {
 /// map holds live per-balancer UI state and must stay bounded by the tags
 /// present in the routing model. Mirrors the `prev_traffic` precedent in
 /// `rt::tests`: entries for tags absent from the model are evicted in one
-/// pass on model change, live state for present tags survives, and the
-/// resource counter tracks the map through every insert/evict cycle.
+/// pass on model change, live state for present tags survives, and the map's
+/// own length is the size the tests watch through every insert/evict cycle.
 #[cfg(test)]
 mod balancer_runtime_eviction_tests {
     use super::{
-        Balancer, BalancerInfoView, BalancerPending, Language, MetricsHandle, Request,
-        RoutingScreen, ServersFile, Settings,
+        Balancer, BalancerInfoView, BalancerPending, Language, Request, RoutingScreen, ServersFile,
+        Settings,
     };
     use tokio::sync::oneshot;
 
@@ -4257,7 +4213,6 @@ mod balancer_runtime_eviction_tests {
     /// balancers keep their live state (pending request, info, feedback).
     #[test]
     fn balancer_removed_evicts_its_entry_and_keeps_live_state() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -4265,14 +4220,10 @@ mod balancer_runtime_eviction_tests {
         settings.routing.balancers.push(balancer("accel"));
         settings.routing.balancers.push(balancer("tunnel"));
 
-        // Live UI state created through the real insert path, so the
-        // resource counter tracks each creation.
+        // Live UI state created through the real insert path, so every entry
+        // the eviction pass must account for exists before it runs.
         {
-            let edge = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "edge",
-                &metrics,
-            );
+            let edge = RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "edge");
             edge.pending_request = Some(pending());
             edge.info = Some(BalancerInfoView {
                 override_target: Some("direct".into()),
@@ -4280,19 +4231,13 @@ mod balancer_runtime_eviction_tests {
             });
         }
         {
-            let accel = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "accel",
-                &metrics,
-            );
+            let accel =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "accel");
             accel.pending_request = Some(pending());
         }
         {
-            let tunnel = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "tunnel",
-                &metrics,
-            );
+            let tunnel =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "tunnel");
             tunnel.feedback = Some((false, "no route".into()));
         }
         assert_eq!(
@@ -4305,7 +4250,7 @@ mod balancer_runtime_eviction_tests {
         // then the generation-gated pass evicts its entry.
         settings.routing.balancers.remove(1);
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4341,7 +4286,6 @@ mod balancer_runtime_eviction_tests {
     /// created on demand when the editor renders, never duplicated.
     #[test]
     fn tag_rename_evicts_the_old_key_without_duplicates() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -4349,19 +4293,12 @@ mod balancer_runtime_eviction_tests {
         settings.routing.balancers.push(balancer("tunnel"));
 
         {
-            let edge = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "edge",
-                &metrics,
-            );
+            let edge = RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "edge");
             edge.pending_request = Some(pending());
         }
         {
-            let tunnel = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "tunnel",
-                &metrics,
-            );
+            let tunnel =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "tunnel");
             tunnel.pending_request = Some(pending());
         }
         assert_eq!(
@@ -4375,7 +4312,7 @@ mod balancer_runtime_eviction_tests {
         // map's).
         settings.routing.balancers[0].tag = "edge-2".into();
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
 
         assert!(
             !screen.balancer_runtime.contains_key("edge"),
@@ -4394,11 +4331,8 @@ mod balancer_runtime_eviction_tests {
         // The editor renders the new tag next frame: exactly one entry is
         // created for it alongside the survivor — no duplicates.
         {
-            let renamed = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "edge-2",
-                &metrics,
-            );
+            let renamed =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "edge-2");
             renamed.known_target = "direct".into();
         }
         assert_eq!(
@@ -4414,7 +4348,6 @@ mod balancer_runtime_eviction_tests {
     /// shrink/grow cycles move the map exactly with the model.
     #[test]
     fn repeated_changes_keep_the_map_bounded_by_the_model() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -4426,7 +4359,6 @@ mod balancer_runtime_eviction_tests {
             let state = RoutingScreen::balancer_runtime_state(
                 &mut screen.balancer_runtime,
                 &format!("tag-{i}"),
-                &metrics,
             );
             state.pending_request = Some(pending());
         }
@@ -4444,7 +4376,7 @@ mod balancer_runtime_eviction_tests {
             )
         });
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4468,7 +4400,7 @@ mod balancer_runtime_eviction_tests {
             .balancers
             .retain(|b| b.tag == "tag-1" || b.tag == "tag-3");
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
 
         // Grow the model: added tags have no runtime entry until their
@@ -4480,17 +4412,14 @@ mod balancer_runtime_eviction_tests {
                 .push(balancer(&format!("tag-{i}")));
         }
         screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
         assert!(screen.balancer_runtime.len() <= settings.routing.balancers.len());
 
         // Opening one of the new tags' editors creates exactly one entry.
         {
-            let state = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "tag-5",
-                &metrics,
-            );
+            let state =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "tag-5");
             state.pending_request = Some(pending());
         }
         assert_eq!(screen.balancer_runtime.len(), 3);
@@ -4501,7 +4430,6 @@ mod balancer_runtime_eviction_tests {
     /// state) stays untouched.
     #[test]
     fn idle_frames_leave_the_map_untouched() {
-        let metrics = MetricsHandle::new();
         let mut screen = RoutingScreen::default();
         let servers = ServersFile::default();
         let mut settings = Settings::default();
@@ -4509,22 +4437,15 @@ mod balancer_runtime_eviction_tests {
         settings.routing.balancers.push(balancer("tunnel"));
 
         {
-            let edge = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "edge",
-                &metrics,
-            );
+            let edge = RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "edge");
             edge.pending_request = Some(pending());
         }
         {
-            let tunnel = RoutingScreen::balancer_runtime_state(
-                &mut screen.balancer_runtime,
-                "tunnel",
-                &metrics,
-            );
+            let tunnel =
+                RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "tunnel");
             tunnel.pending_request = Some(pending());
         }
-        screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+        screen.refresh_view_cache(0, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4534,7 +4455,7 @@ mod balancer_runtime_eviction_tests {
         let before_tags: Vec<String> = screen.balancer_runtime.keys().cloned().collect();
 
         for _ in 0..10 {
-            screen.refresh_view_cache(0, Language::En, &servers, &settings, &metrics);
+            screen.refresh_view_cache(0, Language::En, &servers, &settings);
         }
 
         assert_eq!(

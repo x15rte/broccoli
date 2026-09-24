@@ -7,7 +7,6 @@ pub mod r#gen;
 pub mod i18n;
 mod icon;
 pub mod links;
-pub mod metrics;
 pub mod model;
 pub mod probe_verdict;
 pub mod quic_probe;

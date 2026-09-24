@@ -6,7 +6,6 @@ use crate::r#gen;
 use crate::i18n::{Key, t, t_fmt};
 use crate::icon::{IconAssets, IconPresentation, classify};
 use crate::links::excerpt;
-use crate::metrics::{Metrics, MetricsHandle, ResourceCounter, WorkCounter};
 use crate::model::inbound::API_INBOUND_TAG;
 use crate::model::safety::SafetyFinding;
 use crate::model::settings::{Language, Mode};
@@ -103,26 +102,22 @@ struct LogBuffer {
     /// false-equal when capacity-0 empty lines rotated through a full ring
     /// (every empty String reports the same dangling pointer).
     generation: u64,
-    /// Reports `bytes` to `ResourceCounter::LogBufferBytes` on every change.
-    metrics: MetricsHandle,
 }
 
 impl LogBuffer {
-    fn new(metrics: MetricsHandle) -> Self {
+    fn new() -> Self {
         Self {
             entries: VecDeque::with_capacity(LOG_CAP),
             bytes: 0,
             generation: 0,
-            metrics,
         }
     }
 
     /// Insert one line, dropping oldest entries until both the line cap and
     /// the byte cap hold. Amortized O(1): each entry is pushed once and
-    /// popped at most once, and no entry is ever re-copied. Reports the
-    /// resident byte total to the resource counter on every change — this is
-    /// event-driven (core events, button handlers), never
-    /// per frame.
+    /// popped at most once, and no entry is ever re-copied. The `bytes` total
+    /// it keeps is the resident accounting the tests read — this is
+    /// event-driven (core events, button handlers), never per frame.
     fn push(&mut self, from_core: bool, line: String) {
         self.generation += 1;
         self.bytes += line.len();
@@ -140,13 +135,6 @@ impl LogBuffer {
         // loop above always terminates within the byte cap. The assert pins it
         // against future drift in debug builds.
         debug_assert!(self.bytes <= LOG_BYTE_CAP, "log buffer over byte cap");
-        self.metrics
-            .set_resource(ResourceCounter::LogBufferBytes, self.bytes() as u64);
-    }
-
-    /// Resident byte total (sum of retained line lengths).
-    fn bytes(&self) -> usize {
-        self.bytes
     }
 
     /// Monotonic push count: the ring-content identity the Logs screen's
@@ -258,8 +246,8 @@ pub struct BroccoliApp {
     /// event changes them (see `ui_ctx_dirty`) — never per frame.
     ui_ctx_snapshot: UiCtxSnapshot,
     /// Set when a drained event invalidates the snapshot; the next `ui()`
-    /// frame rebuilds it (and bumps `WorkCounter::UiCtxRebuilds`) exactly
-    /// once per actual input change.
+    /// frame rebuilds it exactly once per actual input change (the snapshot's
+    /// `same_inputs` compare decides; a no-op invalidation rebuilds nothing).
     ui_ctx_dirty: bool,
     /// Monotonic per-input generations for screens' memoization keys
     /// (dashboard plot/latency-grid caches): `stats_generation` bumps once
@@ -268,14 +256,6 @@ pub struct BroccoliApp {
     /// `latency_ms`, the grid's no-observatory-cell input.
     stats_generation: u64,
     latency_generation: u64,
-    /// Always-on performance instrumentation:
-    /// owned by the app; the runtime thread records control-plane tick
-    /// durations through its clone. Read by the kittest tests via
-    /// [`Self::metrics_snapshot`].
-    metrics: MetricsHandle,
-    /// Frame-entry timestamp of the previous `logic` call, for the frame-time
-    /// accumulator. `None` before the first frame.
-    last_frame_entry: Option<std::time::Instant>,
     phase: CorePhase,
     /// Transport reported by `ActiveConfig`, held until its following start phase.
     pending_transport: Option<CoreTransport>,
@@ -741,10 +721,9 @@ impl BroccoliApp {
             .ok()
             .map(normalize_candidate_for_compare);
 
-        let metrics = MetricsHandle::new();
         let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(EVT_CHANNEL_CAPACITY);
-        let rt = spawn_runtime(evt_tx.clone(), cc.egui_ctx.clone(), metrics.clone());
-        let log_buffer = LogBuffer::new(metrics.clone());
+        let rt = spawn_runtime(evt_tx.clone(), cc.egui_ctx.clone());
+        let log_buffer = LogBuffer::new();
         if persistence_error.is_none() {
             let want_tun = settings.mode == crate::model::Mode::Tun;
             let _ = rt.cmd.send(CoreCmd::SetTunMode(want_tun));
@@ -801,8 +780,6 @@ impl BroccoliApp {
             ui_ctx_dirty: false,
             stats_generation: 0,
             latency_generation: 0,
-            metrics,
-            last_frame_entry: None,
             phase: CorePhase::Stopped,
             pending_transport: None,
             health_engine_in_launch: false,
@@ -947,7 +924,6 @@ impl BroccoliApp {
                                 error.message.clone(),
                                 error.tail.clone(),
                                 self.settings.language,
-                                &self.metrics,
                             ));
                         }
                         _ if !same_phase(&phase, &self.phase) => {
@@ -1547,7 +1523,6 @@ impl BroccoliApp {
             message,
             String::new(),
             self.settings.language,
-            &self.metrics,
         ))
     }
 
@@ -1941,23 +1916,10 @@ impl BroccoliApp {
         });
     }
 
-    /// Frame-time accumulator: measure between frame entries (`logic` calls)
-    /// and fold each completed interval into the snapshot. This is timing
-    /// instrumentation, not a work counter — idle frames legitimately
-    /// advance it.
-    fn record_frame_entry(&mut self) {
-        let now = std::time::Instant::now();
-        if let Some(previous) = self.last_frame_entry {
-            self.metrics.record_frame(now.duration_since(previous));
-        }
-        self.last_frame_entry = Some(now);
-    }
-
     /// Rebuild the generation-gated UI-context snapshot.
     /// Runs only when a drained event changed its inputs — never on idle
-    /// frames — and bumps `WorkCounter::UiCtxRebuilds` once per actual input
-    /// change (no-op rebuilds, e.g. the initial `State(Stopped)` drain, are
-    /// skipped so the counter stays at zero on idle frames).
+    /// frames — so a no-op rebuild (e.g. the initial `State(Stopped)` drain)
+    /// is skipped: the snapshot's own `same_inputs` compare is the gate.
     fn rebuild_ui_ctx_snapshot(&mut self) {
         let candidate = UiCtxSnapshot {
             phase: self.phase.clone(),
@@ -1973,7 +1935,6 @@ impl BroccoliApp {
         };
         if !self.ui_ctx_snapshot.same_inputs(&candidate) {
             self.ui_ctx_snapshot = candidate;
-            self.metrics.bump_work(WorkCounter::UiCtxRebuilds);
         }
         self.ui_ctx_dirty = false;
     }
@@ -1984,12 +1945,6 @@ impl BroccoliApp {
     /// production — the runtime owns the channel's only other sender.
     pub fn inject_event(&self, ev: CoreEvt) {
         let _ = self.evt_tx.send(ev);
-    }
-
-    /// Cheap read path for the kittest tests: one lock and a struct copy of
-    /// the current snapshot.
-    pub fn metrics_snapshot(&self) -> Metrics {
-        self.metrics.snapshot()
     }
 }
 
@@ -2021,7 +1976,6 @@ impl Drop for BroccoliApp {
 
 impl eframe::App for BroccoliApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.record_frame_entry();
         self.frame_drain = self.drain_events();
         if self.frame_drain == DrainOutcome::Full {
             // A full drain batch means more events are queued:
@@ -2059,7 +2013,7 @@ impl eframe::App for BroccoliApp {
         // other frame), and the snapshot below carries the fresh text.
         let language = self.settings.language;
         if let Some(error) = self.terminal_error.as_mut()
-            && error.render_in(language, &self.metrics)
+            && error.render_in(language)
         {
             self.ui_ctx_dirty = true;
         }
@@ -2131,7 +2085,6 @@ impl eframe::App for BroccoliApp {
                         core_version: self.core_version.as_deref(),
                     },
                     &mut self.topbar_right_cache,
-                    &self.metrics,
                 );
                 ui.colored_label(phase_badge_color(&self.phase, status_colors_of(ui)), "●");
                 ui.label(&labels.badge);
@@ -2297,7 +2250,6 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    metrics: &self.metrics,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
@@ -2351,7 +2303,6 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    metrics: &self.metrics,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
@@ -2394,7 +2345,6 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    metrics: &self.metrics,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
                     connect_requested: &mut connect_requested,
@@ -3464,16 +3414,11 @@ struct TerminalError {
 }
 
 impl TerminalError {
-    /// Record one failure, rendering its message for `language` (counted by
-    /// [`WorkCounter::TerminalErrorFormats`]).
-    fn new(
-        message: impl Into<AppMessage>,
-        output: String,
-        language: Language,
-        metrics: &MetricsHandle,
-    ) -> Self {
+    /// Record one failure, rendering its message for `language` once: the
+    /// rendered text and the language it was rendered in are the memo
+    /// [`Self::render_in`] re-renders against.
+    fn new(message: impl Into<AppMessage>, output: String, language: Language) -> Self {
         let message = message.into();
-        metrics.bump_work(WorkCounter::TerminalErrorFormats);
         Self {
             text: message.text(language),
             message,
@@ -3484,12 +3429,12 @@ impl TerminalError {
 
     /// Re-render the message when the active language moved. True when the
     /// text changed, so the caller can mark the UI-context snapshot dirty;
-    /// false on every other frame, at a string-compare cost of nothing.
-    fn render_in(&mut self, language: Language, metrics: &MetricsHandle) -> bool {
+    /// false on every other frame — and that false, with the text
+    /// allocation it retains, is what the test pins.
+    fn render_in(&mut self, language: Language) -> bool {
         if self.language == language {
             return false;
         }
-        metrics.bump_work(WorkCounter::TerminalErrorFormats);
         self.text = self.message.text(language);
         self.language = language;
         true
@@ -4720,7 +4665,6 @@ mod tests {
     };
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
-    use crate::metrics::MetricsHandle;
     use crate::model::settings::Mode;
     use crate::rt::supervisor::MAX_LINE_BYTES;
     use crate::rt::{CorePhase, PhaseError};
@@ -4939,18 +4883,18 @@ mod tests {
     /// preserved, and the newest line always survives.
     #[test]
     fn max_size_lines_never_exceed_byte_cap() {
-        let mut buf = LogBuffer::new(MetricsHandle::new());
+        let mut buf = LogBuffer::new();
         let max_lines = LOG_BYTE_CAP / MAX_LINE_BYTES;
         let count = 10 * LOG_CAP;
         for i in 0..count {
             // Exactly MAX_LINE_BYTES ASCII bytes per line, distinguishable
             // by the zero-padded index.
             buf.push(true, format!("{:0width$}", i, width = MAX_LINE_BYTES));
-            assert!(buf.bytes() <= LOG_BYTE_CAP, "push {i} left the byte cap");
+            assert!(buf.bytes <= LOG_BYTE_CAP, "push {i} left the byte cap");
         }
         // Steady state: exactly the byte cap, filled with max-size lines.
         assert_eq!(buf.len(), max_lines);
-        assert_eq!(buf.bytes(), max_lines * MAX_LINE_BYTES);
+        assert_eq!(buf.bytes, max_lines * MAX_LINE_BYTES);
         // Order intact: the newest line is at the back, and the oldest
         // survivor is the first line that fits within the byte cap.
         let newest = format!("{:0width$}", count - 1, width = MAX_LINE_BYTES);
@@ -4963,7 +4907,7 @@ mod tests {
     /// cap still binds, order is preserved, and the oldest lines are dropped.
     #[test]
     fn normal_lines_keep_count_cap_ordering_and_oldest_dropped() {
-        let mut buf = LogBuffer::new(MetricsHandle::new());
+        let mut buf = LogBuffer::new();
         let short = "status ok";
         let count = 3 * LOG_CAP;
         for i in 0..count {
@@ -4977,7 +4921,7 @@ mod tests {
             .map(|i| format!("{short} {i}").len())
             .sum();
         assert!(expected_bytes < LOG_BYTE_CAP);
-        assert_eq!(buf.bytes(), expected_bytes);
+        assert_eq!(buf.bytes, expected_bytes);
         // Oldest dropped, order and from_core flags preserved.
         let expected: Vec<(bool, String)> = (2 * LOG_CAP..count)
             .map(|i| (i % 2 == 0, format!("{short} {i}")))
@@ -4991,22 +4935,22 @@ mod tests {
     /// bring it down to exactly the cap.
     #[test]
     fn byte_accounting_tracks_pushes_and_evictions() {
-        let mut buf = LogBuffer::new(MetricsHandle::new());
+        let mut buf = LogBuffer::new();
 
         buf.push(false, "hello".to_string());
         buf.push(false, "world".to_string());
-        assert_eq!(buf.bytes(), 10);
+        assert_eq!(buf.bytes, 10);
 
         // Max-size lines: the byte cap binds and stays bound on every push.
         let max_line = "y".repeat(MAX_LINE_BYTES);
         for _ in 0..(LOG_BYTE_CAP / MAX_LINE_BYTES + 2) {
             buf.push(true, max_line.clone());
-            assert!(buf.bytes() <= LOG_BYTE_CAP);
+            assert!(buf.bytes <= LOG_BYTE_CAP);
         }
         // The short lines were evicted; the ring holds exactly the byte cap
         // of max-size lines.
         assert_eq!(buf.len(), LOG_BYTE_CAP / MAX_LINE_BYTES);
-        assert_eq!(buf.bytes(), LOG_BYTE_CAP);
+        assert_eq!(buf.bytes, LOG_BYTE_CAP);
     }
 
     /// The terminal message is formatted when the failure is recorded, and
@@ -5016,18 +4960,16 @@ mod tests {
     /// render.
     #[test]
     fn terminal_error_renders_once_and_keeps_its_text() {
-        let metrics = MetricsHandle::new();
         let mut error = TerminalError::new(
             Diag::new(Key::RtPhaseRestartCancelled),
             String::new(),
             Language::En,
-            &metrics,
         );
         assert_eq!(error.text, t(Language::En, Key::RtPhaseRestartCancelled));
         let text_ptr = error.text.as_ptr();
 
         assert!(
-            !error.render_in(Language::En, &metrics),
+            !error.render_in(Language::En),
             "the recorded language must keep the memoized text"
         );
         assert_eq!(

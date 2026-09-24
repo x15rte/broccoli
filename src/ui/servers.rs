@@ -12,7 +12,6 @@ use egui::{Color32, RichText, Stroke, StrokeKind};
 
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
-use crate::metrics::{MetricsHandle, ResourceCounter, WorkCounter};
 use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
@@ -59,7 +58,7 @@ use keygen::{
     PRIV_PREFIXES, PUB_PREFIXES, ca_pins_from_probe_output, gen_short_id, keygen_value,
     leaf_pin_from_probe_output, run_xray_bounded,
 };
-use raw_editor::{FieldKey, JsonBuf, PemBuf, RawField, evict_owned_buffers, pem_lines_editor};
+use raw_editor::{FieldKey, PemBuf, RawBuffers, RawField, evict_owned_buffers, pem_lines_editor};
 use validators::{
     v_optional_wg_key, v_required, v_uuid, v_uuid_required, v_vless_encryption,
     v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
@@ -1479,13 +1478,13 @@ struct DialerProxyOptions {
 /// Refresh `slot` when its signal moved and hand back the options it holds.
 /// Each editor keeps its own slot: the existing-draft editor and the
 /// add-server dialog may render in one frame, and they exclude different
-/// profiles.
+/// profiles. The cached slot's generation is the rebuild key — idle frames
+/// reuse the options it holds.
 fn refresh_dialer_proxy_options<'a>(
     slot: &'a mut Option<DialerProxyOptions>,
     set_key: (u64, bool, usize),
     own_id: &str,
     profiles: &[ServerProfile],
-    metrics: &MetricsHandle,
 ) -> &'a [String] {
     let unchanged = slot
         .as_ref()
@@ -1500,7 +1499,6 @@ fn refresh_dialer_proxy_options<'a>(
                 BLOCK_OUTBOUND_TAG.to_string(),
             ])
             .collect();
-        metrics.bump_work(WorkCounter::AdvancedTagRebuilds);
         *slot = Some(DialerProxyOptions {
             generation: set_key,
             own_id: own_id.to_owned(),
@@ -1514,7 +1512,7 @@ fn refresh_dialer_proxy_options<'a>(
 /// Trailing context for [`ServersScreen::advanced_tab`]:
 /// the profile-set signal the chain-target options memoize on, the memoized
 /// finalmask verdicts, the memoized `stream.sockopt` verdict, and the
-/// per-editor raw JSON/PEM buffers plus metrics. Bundled so the tab stays
+/// per-editor raw JSON/PEM buffers. Bundled so the tab stays
 /// under clippy's argument-count ceiling without a lint suppression
 /// (zero-suppression repo contract).
 struct AdvancedTabCtx<'a> {
@@ -1524,9 +1522,8 @@ struct AdvancedTabCtx<'a> {
     /// The chain-target picker's memo slot for the editor rendering this
     /// tab (see [`DialerProxyOptions`]).
     dialer_proxy_options: &'a mut Option<DialerProxyOptions>,
-    finalmask_raw: &'a mut std::collections::HashMap<egui::Id, JsonBuf>,
+    finalmask_raw: &'a mut RawBuffers,
     pem_buffers: &'a mut std::collections::HashMap<egui::Id, PemBuf>,
-    metrics: &'a MetricsHandle,
 }
 
 /// `validate_finalmask` messages for the profile's finalmask, in model order
@@ -1680,7 +1677,7 @@ fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
 fn existing_draft_dirty(
     draft: &ExistingProfileDraft,
     cache: Option<&EditorValidationCache>,
-    finalmask_raw: &std::collections::HashMap<egui::Id, JsonBuf>,
+    finalmask_raw: &RawBuffers,
 ) -> bool {
     if finalmask_raw
         .values()
@@ -1815,10 +1812,6 @@ enum LeaveDecision {
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
-    /// Visible-band row count reported to `ResourceCounter::ServerListRowsLaidOut`
-    /// last frame; the virtualized list writes that resource only when this
-    /// count changed, so idle frames never touch the metrics cell.
-    last_list_rows_laid_out: usize,
     /// In-flight row drag-reorder (see [`ListDrag`]); `None` whenever no row
     /// is being dragged.
     list_drag: Option<ListDrag>,
@@ -1888,8 +1881,9 @@ pub struct ServersScreen {
     show_tls_probe_output: bool,
     tool_job: Option<XrayToolJob>,
     /// Raw-JSON editor buffers, keyed by the field's egui `Id` (per-field
-    /// buffer identity, stable across frames, no per-frame key allocation).
-    finalmask_raw: std::collections::HashMap<egui::Id, JsonBuf>,
+    /// buffer identity, stable across frames, no per-frame key allocation),
+    /// beside the parse count their idle-frame test reads.
+    finalmask_raw: RawBuffers,
     /// PEM editor buffers (certificate/key line lists), keyed the same way;
     /// evicted with the owning profile in `evict_raw_buffers`.
     pem_buffers: std::collections::HashMap<egui::Id, PemBuf>,
@@ -1939,18 +1933,10 @@ impl ServersScreen {
     /// Evict every raw-editor buffer owned by `profile_id`:
     /// that profile is gone, so its buffers are dead weight. The raw-JSON
     /// and PEM maps share the one retain rule in
-    /// [`raw_editor::evict_owned_buffers`]; this wrapper reports the cache
-    /// metric when the raw-JSON map actually shrank. Click-time only —
-    /// never on idle frames.
-    fn evict_raw_buffers(&mut self, profile_id: &str, metrics: &MetricsHandle) {
-        let evicted =
-            evict_owned_buffers(&mut self.finalmask_raw, &mut self.pem_buffers, profile_id);
-        if evicted > 0 {
-            metrics.set_resource(
-                ResourceCounter::RawEditorCacheEntries,
-                self.finalmask_raw.len() as u64,
-            );
-        }
+    /// [`raw_editor::evict_owned_buffers`]. Click-time only — never on idle
+    /// frames.
+    fn evict_raw_buffers(&mut self, profile_id: &str) {
+        evict_owned_buffers(&mut self.finalmask_raw, &mut self.pem_buffers, profile_id);
     }
 
     fn import_preview_is_current(&self) -> bool {
@@ -2664,9 +2650,6 @@ impl ServersScreen {
             (true, "")
         };
         let mut action: Option<ListAction> = None;
-        // Visible-band row count for the layout-work resource below; 0 when
-        // the empty-state branch renders.
-        let mut laid_out_rows = 0usize;
         let list_height = (ui.available_height() - 120.0).max(80.0);
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
@@ -2697,7 +2680,6 @@ impl ServersScreen {
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
                 .max_height(list_height)
                 .show_rows(ui, row_height, profiles.len(), |ui, rows| {
-                    laid_out_rows = rows.len();
                     let colors = status_colors_of(ui);
                     // One frame of drag-reorder state: the pointer (only
                     // while it is inside the list viewport), the proposed
@@ -2870,15 +2852,6 @@ impl ServersScreen {
                 self.list_drag = Some(drag);
             }
         }
-        // A rows-laid-out quantity is per frame, not an event: report it as a
-        // resource, and only when the count changed, so idle frames never
-        // touch the metrics cell.
-        if laid_out_rows != self.last_list_rows_laid_out {
-            self.last_list_rows_laid_out = laid_out_rows;
-            ctx.metrics
-                .set_resource(ResourceCounter::ServerListRowsLaidOut, laid_out_rows as u64);
-        }
-
         ui.separator();
         let mut add_proto: Option<Protocol> = None;
         ui.add_enabled_ui(self.add_draft.is_none(), |ui| {
@@ -3154,7 +3127,7 @@ impl ServersScreen {
     /// holds changes (an add draft is always unsaved — it has no committed
     /// source), otherwise drop it and evict its seeded raw-editor buffers
     /// (dead weight).
-    fn close_add_draft(&mut self, draft: ServerProfile, metrics: &MetricsHandle) {
+    fn close_add_draft(&mut self, draft: ServerProfile) {
         if self.derive_dialog.as_ref().is_some_and(|dialog| {
             matches!(
                 &dialog.target,
@@ -3173,7 +3146,7 @@ impl ServersScreen {
             self.stage_leave(LeaveAction::CloseAdd);
             self.add_draft = Some(draft);
         } else {
-            self.evict_raw_buffers(&draft.id, metrics);
+            self.evict_raw_buffers(&draft.id);
         }
     }
 
@@ -3203,7 +3176,7 @@ impl ServersScreen {
     /// Discard resolution of the leave modal: drop the staged action's
     /// draft(s) (existing draft → revert + raw-buffer clear; add draft →
     /// drop + evict; Quit discards both), then perform the action.
-    fn discard_leave_action(&mut self, action: LeaveAction, uictx: &mut UiCtx) {
+    fn discard_leave_action(&mut self, action: LeaveAction) {
         match action {
             LeaveAction::Select(id) => {
                 self.discard_existing_draft();
@@ -3211,13 +3184,13 @@ impl ServersScreen {
             }
             LeaveAction::CloseAdd => {
                 if let Some(draft) = self.add_draft.take() {
-                    self.evict_raw_buffers(&draft.id, uictx.metrics);
+                    self.evict_raw_buffers(&draft.id);
                 }
             }
             LeaveAction::Quit => {
                 self.discard_existing_draft();
                 if let Some(draft) = self.add_draft.take() {
-                    self.evict_raw_buffers(&draft.id, uictx.metrics);
+                    self.evict_raw_buffers(&draft.id);
                 }
                 self.quit_resume = true;
             }
@@ -3382,7 +3355,7 @@ impl ServersScreen {
                 }
                 LeaveDecision::Discard => {
                     if let Some(action) = action {
-                        self.discard_leave_action(action, uictx);
+                        self.discard_leave_action(action);
                     }
                 }
                 // Cancel: change nothing beyond clearing the staged action.
@@ -3595,12 +3568,7 @@ impl ServersScreen {
     /// tabs' inline finalmask/sockopt/issues, changed-from-source) when the
     /// draft generation or the UI language moved on; a no-op while the cache
     /// still covers the draft. One real sweep per change — never per frame.
-    fn refresh_editor_validation_cache(
-        &mut self,
-        draft: &ExistingProfileDraft,
-        lang: Language,
-        metrics: &MetricsHandle,
-    ) {
+    fn refresh_editor_validation_cache(&mut self, draft: &ExistingProfileDraft, lang: Language) {
         if self
             .editor_validation_cache
             .as_ref()
@@ -3625,16 +3593,10 @@ impl ServersScreen {
                 .map(|current| current != draft.source)
                 .unwrap_or(true),
         });
-        metrics.bump_work(WorkCounter::EditorValidationRebuilds);
     }
 
     /// Add-draft twin of [`Self::refresh_editor_validation_cache`].
-    fn refresh_add_draft_validation_cache(
-        &mut self,
-        draft: &ServerProfile,
-        lang: Language,
-        metrics: &MetricsHandle,
-    ) {
+    fn refresh_add_draft_validation_cache(&mut self, draft: &ServerProfile, lang: Language) {
         if self
             .add_draft_validation_cache
             .as_ref()
@@ -3661,7 +3623,6 @@ impl ServersScreen {
             // draft is unsaved by definition).
             changed_from_source: add_draft_changed_from_source(draft),
         });
-        metrics.bump_work(WorkCounter::EditorValidationRebuilds);
     }
 
     /// Run `render` with the memoized existing-draft verdicts moved out of
@@ -3749,7 +3710,7 @@ impl ServersScreen {
         // renders. Content edits bump the generation after the tab content
         // and refresh again below; idle frames hit only the cheap freshness
         // check here and there.
-        self.refresh_editor_validation_cache(&draft, lang, ctx.metrics);
+        self.refresh_editor_validation_cache(&draft, lang);
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvName));
@@ -3887,7 +3848,6 @@ impl ServersScreen {
                                 dialer_proxy_options: &mut self.dialer_proxy_options,
                                 finalmask_raw: &mut self.finalmask_raw,
                                 pem_buffers: &mut self.pem_buffers,
-                                metrics: ctx.metrics,
                             },
                         )
                     }
@@ -3925,7 +3885,7 @@ impl ServersScreen {
         // verdicts (validation errors, finalmask issues, changed-from-source)
         // once for the new generation. Idle frames hit the cheap freshness
         // check only.
-        self.refresh_editor_validation_cache(&draft, lang, ctx.metrics);
+        self.refresh_editor_validation_cache(&draft, lang);
         let Some(cached) = self.editor_validation_cache.as_ref() else {
             return;
         };
@@ -6023,7 +5983,6 @@ impl ServersScreen {
             dialer_proxy_options,
             finalmask_raw,
             pem_buffers,
-            metrics,
         } = ctx;
         let mut changed = false;
         let o = &mut p.outbound;
@@ -6035,7 +5994,7 @@ impl ServersScreen {
         // signal: idle frames reuse the cached snapshot, and a rebuild costs
         // O(profiles) only when the set actually changed.
         let dialer_proxy_options =
-            refresh_dialer_proxy_options(dialer_proxy_options, set_key, key, profiles, metrics);
+            refresh_dialer_proxy_options(dialer_proxy_options, set_key, key, profiles);
 
         widgets::section(ui, t(lang, Key::SrvEnvelope), |ui| {
             changed |= opt_string(
@@ -6140,7 +6099,6 @@ impl ServersScreen {
                             egui::Id::new(("fm", key, "tcp", index)),
                             key,
                             finalmask_raw,
-                            metrics,
                         );
                     });
                 });
@@ -6234,7 +6192,6 @@ impl ServersScreen {
                                 buffers: &mut *finalmask_raw,
                             },
                             pem_buffers,
-                            metrics,
                         );
                     });
                 });
@@ -6313,7 +6270,7 @@ impl ServersScreen {
             // (mirrors show_editor): refresh before the content so a fresh
             // dialog, a tool application, or a language switch renders
             // same-frame accurate verdicts.
-            self.refresh_add_draft_validation_cache(&draft, lang, uictx.metrics);
+            self.refresh_add_draft_validation_cache(&draft, lang);
             ui.add_enabled_ui(!validating, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(t(lang, Key::SrvName));
@@ -6410,7 +6367,6 @@ impl ServersScreen {
                                         dialer_proxy_options: &mut self.add_dialer_proxy_options,
                                         finalmask_raw: &mut self.finalmask_raw,
                                         pem_buffers: &mut self.pem_buffers,
-                                        metrics: uictx.metrics,
                                     },
                                 )
                             }
@@ -6426,7 +6382,7 @@ impl ServersScreen {
                 // Content edits bumped the generation above; refresh the
                 // memoized verdicts once for the new generation (mirrors the
                 // editor path).
-                self.refresh_add_draft_validation_cache(&draft, lang, uictx.metrics);
+                self.refresh_add_draft_validation_cache(&draft, lang);
                 let Some(cached) = self.add_draft_validation_cache.as_ref() else {
                     return;
                 };
@@ -6527,7 +6483,7 @@ impl ServersScreen {
             // guard clears a derive dialog targeting it, stages the leave
             // modal when the draft is dirty, and otherwise drops the draft
             // with its seeded raw buffers.
-            self.close_add_draft(draft, uictx.metrics);
+            self.close_add_draft(draft);
         }
     }
 
@@ -6847,7 +6803,7 @@ impl ServersScreen {
                 if self.selected.as_deref() == Some(deleted_id.as_str()) {
                     self.selected = None;
                 }
-                self.evict_raw_buffers(&deleted_id, uictx.metrics);
+                self.evict_raw_buffers(&deleted_id);
                 // The deleted profile's memoized latency badge is dead
                 // weight; the row loop would never re-insert it
                 // because the id no longer renders.
@@ -7128,12 +7084,13 @@ mod tests {
     use super::keygen::{
         ca_pins_from_probe_output, keygen_value, leaf_pin_from_probe_output, redacted_tool_args,
     };
+    use super::raw_editor::JsonBuf;
     use super::{
         AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog,
         DraftTargetKind, EditorTab, EditorValidationCache, ExistingProfileDraft, FINGERPRINTS,
-        FeedbackLevel, FieldKey, JsonBuf, Language, LatencyBadge, LeaveAction, RawField, Request,
-        RowProbeState, STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen, SockoptUsage,
-        StatusLine, drag_scroll_delta, ech_sockopt_editor, editor_validation_errors,
+        FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, RawBuffers, RawField,
+        Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen,
+        SockoptUsage, StatusLine, drag_scroll_delta, ech_sockopt_editor, editor_validation_errors,
         final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed, mux_tab,
         noises_editor, reorder_target, server_list_row, sockopt_validation_errors,
         status_colors_of, status_toast_expired,
@@ -7141,7 +7098,6 @@ mod tests {
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_message};
     use crate::links;
-    use crate::metrics::MetricsHandle;
     use crate::model::stream::MasqueradeCfg;
     use crate::model::validation::ValidationCode;
     use crate::model::{
@@ -9517,7 +9473,6 @@ TLS ping finished"#;
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
                         finalmask_raw: &mut screen.finalmask_raw,
                         pem_buffers: &mut screen.pem_buffers,
-                        metrics: &crate::metrics::MetricsHandle::new(),
                     },
                 );
             });
@@ -10298,11 +10253,7 @@ TLS ping finished"#;
 
     /// One full Advanced-tab frame through a kittest harness. The harness is
     /// dropped before returning so its borrows do not overlap later ones.
-    fn render_advanced_tab(
-        screen: &mut ServersScreen,
-        profile: &mut ServerProfile,
-        metrics: &MetricsHandle,
-    ) {
+    fn render_advanced_tab(screen: &mut ServersScreen, profile: &mut ServerProfile) {
         let _harness = Harness::new_ui(|ui| {
             let _ = ServersScreen::advanced_tab(
                 ui,
@@ -10316,7 +10267,6 @@ TLS ping finished"#;
                     dialer_proxy_options: &mut screen.dialer_proxy_options,
                     finalmask_raw: &mut screen.finalmask_raw,
                     pem_buffers: &mut screen.pem_buffers,
-                    metrics,
                 },
             );
         });
@@ -10331,7 +10281,6 @@ TLS ping finished"#;
         // (`transport/internet/finalmask/sudoku/config.go` and the other
         // per-type checks are UDP-only).
         let mut screen = ServersScreen::default();
-        let metrics = MetricsHandle::new();
         let mut profile =
             ServerProfile::new("caption-order", OutboundModel::new(Protocol::Freedom));
         profile.outbound.stream.finalmask = Some(FinalmaskModel::default());
@@ -10350,7 +10299,6 @@ TLS ping finished"#;
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
                         finalmask_raw: &mut screen.finalmask_raw,
                         pem_buffers: &mut screen.pem_buffers,
-                        metrics: &metrics,
                     },
                 );
             });
@@ -10371,7 +10319,6 @@ TLS ping finished"#;
     #[test]
     fn deleting_a_profile_evicts_only_its_raw_editor_buffers() {
         let mut screen = ServersScreen::default();
-        let metrics = MetricsHandle::new();
         let mut alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom));
         alpha.outbound.stream.finalmask = Some(FinalmaskModel {
             tcp: vec![FinalmaskTcpMask::Unknown(json!({"type": "future-alpha"}))],
@@ -10391,16 +10338,16 @@ TLS ping finished"#;
 
         // One render per profile creates one buffer each: the raw-editor
         // map carries one entry per rendered profile.
-        render_advanced_tab(&mut screen, &mut alpha, &metrics);
-        render_advanced_tab(&mut screen, &mut beta, &metrics);
+        render_advanced_tab(&mut screen, &mut alpha);
+        render_advanced_tab(&mut screen, &mut beta);
         assert_eq!(screen.finalmask_raw.len(), 2);
 
         // Evicting a profile that never rendered is a no-op for the cache.
-        screen.evict_raw_buffers("00000000000000000000000000000000", &metrics);
+        screen.evict_raw_buffers("00000000000000000000000000000000");
         assert_eq!(screen.finalmask_raw.len(), 2);
 
         // Deleting alpha evicts exactly its buffer; beta's stays untouched.
-        screen.evict_raw_buffers(&alpha_id, &metrics);
+        screen.evict_raw_buffers(&alpha_id);
         assert_eq!(
             screen.finalmask_raw.len(),
             1,
@@ -10415,19 +10362,18 @@ TLS ping finished"#;
 
         // Idle re-render of the surviving profile: its entry is reused, so
         // the map does not grow.
-        render_advanced_tab(&mut screen, &mut beta, &metrics);
+        render_advanced_tab(&mut screen, &mut beta);
         assert_eq!(screen.finalmask_raw.len(), 1);
 
         // Re-rendering the deleted profile recreates its buffer; the map
         // follows the live size.
-        render_advanced_tab(&mut screen, &mut alpha, &metrics);
+        render_advanced_tab(&mut screen, &mut alpha);
         assert_eq!(screen.finalmask_raw.len(), 2);
     }
 
     #[test]
     fn renaming_a_profile_keeps_raw_editor_buffers_bounded() {
         let mut screen = ServersScreen::default();
-        let metrics = MetricsHandle::new();
         let mut profile =
             ServerProfile::new("original-name", OutboundModel::new(Protocol::Freedom));
         profile.outbound.stream.finalmask = Some(FinalmaskModel {
@@ -10437,7 +10383,7 @@ TLS ping finished"#;
             extra: Default::default(),
         });
         let id = profile.id.clone();
-        render_advanced_tab(&mut screen, &mut profile, &metrics);
+        render_advanced_tab(&mut screen, &mut profile);
         assert_eq!(screen.finalmask_raw.len(), 1);
         let seeded_text = screen.finalmask_raw.values().next().unwrap().text.clone();
 
@@ -10446,7 +10392,7 @@ TLS ping finished"#;
         // not grow the cache or re-seed buffers.
         for rename in 0..5 {
             profile.name = format!("renamed-{rename}");
-            render_advanced_tab(&mut screen, &mut profile, &metrics);
+            render_advanced_tab(&mut screen, &mut profile);
         }
         assert_eq!(screen.finalmask_raw.len(), 1);
         let surviving = screen.finalmask_raw.values().next().unwrap();
@@ -10464,10 +10410,10 @@ TLS ping finished"#;
         // reuse both the cached text and its parse result. The gate itself
         // leaves no other trace: a needless reparse of unchanged text
         // rewrites the same error string and never touches the committed
-        // value, so the parse counter is the only observable that fails when
-        // the gate is dropped — hence one delta, never an absolute count.
+        // value, so the cache's own parse count — `RawBuffers::parses`, the
+        // state the gate measures — is the only observable that fails when
+        // the gate is dropped. Hence one delta, never an absolute count.
         let mut screen = ServersScreen::default();
-        let metrics = MetricsHandle::new();
         let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         profile.outbound.stream.finalmask = Some(FinalmaskModel {
             tcp: vec![FinalmaskTcpMask::Unknown(json!({"type": "future-parse"}))],
@@ -10475,18 +10421,17 @@ TLS ping finished"#;
             quic_params: None,
             extra: Default::default(),
         });
-        render_advanced_tab(&mut screen, &mut profile, &metrics);
+        render_advanced_tab(&mut screen, &mut profile);
         assert_eq!(
             screen.finalmask_raw.len(),
             1,
             "the rendered buffer must be in the raw-editor cache for the \
              idle frame to have a parse to skip"
         );
-        let parses = metrics.snapshot().raw_editor_parses;
-        render_advanced_tab(&mut screen, &mut profile, &metrics);
+        let parses = screen.finalmask_raw.parses;
+        render_advanced_tab(&mut screen, &mut profile);
         assert_eq!(
-            metrics.snapshot().raw_editor_parses,
-            parses,
+            screen.finalmask_raw.parses, parses,
             "an idle re-render of an unchanged buffer must not reparse the JSON"
         );
     }
@@ -10902,7 +10847,7 @@ TLS ping finished"#;
             basic_inline_errors: Vec::new(),
             changed_from_source: true,
         });
-        screen.close_add_draft(draft.clone(), &MetricsHandle::new());
+        screen.close_add_draft(draft.clone());
         assert_eq!(
             screen.leave_pending,
             Some(LeaveAction::CloseAdd),
@@ -10933,7 +10878,7 @@ TLS ping finished"#;
             basic_inline_errors: Vec::new(),
             changed_from_source: false,
         });
-        screen.close_add_draft(draft, &MetricsHandle::new());
+        screen.close_add_draft(draft);
         assert!(
             screen.leave_pending.is_none(),
             "a clean add draft must not stage the leave modal"
@@ -10970,7 +10915,7 @@ TLS ping finished"#;
             error: None,
             pending: false,
         });
-        screen.close_add_draft(draft.clone(), &MetricsHandle::new());
+        screen.close_add_draft(draft.clone());
         assert!(
             screen.derive_dialog.is_none(),
             "a derive dialog cannot outlive the add draft it targets"
@@ -11257,7 +11202,7 @@ TLS ping finished"#;
             basic_inline_errors: Vec::new(),
             changed_from_source: true,
         });
-        screen.discard_leave_action(LeaveAction::Quit, &mut rig.ctx());
+        screen.discard_leave_action(LeaveAction::Quit);
         assert!(
             screen.existing_draft.is_none(),
             "Quit discard must drop the existing draft"
@@ -11300,10 +11245,7 @@ TLS ping finished"#;
         // Select discard reverts the existing draft but keeps the add draft.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
         screen.add_draft = Some(add.clone());
-        screen.discard_leave_action(
-            LeaveAction::Select("osaka-target-id".into()),
-            &mut rig.ctx(),
-        );
+        screen.discard_leave_action(LeaveAction::Select("osaka-target-id".into()));
         assert!(
             screen.existing_draft.is_none(),
             "Select discard must drop the existing draft"
@@ -12680,7 +12622,7 @@ TLS ping finished"#;
 
     /// The rows the virtualized list actually laid out: the consumer-visible
     /// band, counted from the rendered `Server {i:02}` row buttons of a
-    /// [`seeded_rig`] list (what the rows-laid-out resource reports).
+    /// [`seeded_rig`] list.
     fn laid_out_list_rows(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> u64 {
         (0..harness.state().1.servers.profiles.len())
             .filter(|index| {
@@ -13165,11 +13107,10 @@ TLS ping finished"#;
             extra: Default::default(),
         }));
         let mask_for_ui = Rc::clone(&mask);
-        let buffers = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let buffers = Rc::new(RefCell::new(RawBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
         let pem_buffers = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let pem_buffers_for_ui = Rc::clone(&pem_buffers);
-        let metrics = MetricsHandle::new();
         let mut harness = Harness::new_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
@@ -13183,7 +13124,6 @@ TLS ping finished"#;
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 &mut pem_buffers_for_ui.borrow_mut(),
-                &metrics,
             );
         });
         harness.run();

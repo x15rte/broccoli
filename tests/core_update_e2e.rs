@@ -163,11 +163,7 @@ fn failed_updated_core_spawn_restores_retained_tree_and_releases_settings() {
     let _appdata = AppDataGuard::install(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::Start)
         .expect("send the health-gate start command");
@@ -216,11 +212,7 @@ fn deferred_setup_first_install_gates_the_downloaded_core_and_settles_stopped() 
     );
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::UpdateCore)
         .expect("send first-install update command");
@@ -304,11 +296,7 @@ fn imported_pinned_archive_gates_cleanly_and_settles_stopped() {
     );
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
-    let rt = spawn_runtime(
-        evt_tx,
-        egui::Context::default(),
-        broccoli::metrics::MetricsHandle::new(),
-    );
+    let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
         .send(CoreCmd::ImportCoreArchive(archive))
         .expect("send pinned archive import command");

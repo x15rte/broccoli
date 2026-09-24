@@ -20,7 +20,6 @@ pub mod wizard;
 pub(crate) mod test_rig;
 
 use crate::i18n::{Key, t, t_fmt};
-use crate::metrics::{MetricsHandle, WorkCounter};
 use crate::model::settings::{Language, Mode};
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
@@ -174,10 +173,6 @@ pub struct UiCtx<'a> {
     /// (the dashboard's latency grid and the inbounds validation cache key
     /// on it).
     pub config_revision: u64,
-    /// Always-on performance instrumentation:
-    /// screens bump their work counters through this handle. Owned by the
-    /// app; borrowed here at zero cost.
-    pub metrics: &'a MetricsHandle,
     /// Monotonic per-input generations for screens' memoization keys
     /// (dashboard plot and latency-grid caches): `stats_generation` advances
     /// once per stats tick, `latency_generation` once per observatory tick
@@ -204,7 +199,6 @@ pub(crate) struct UiCtxParts<'a> {
     /// so the identity changes exactly when the ring's content changes.
     pub(crate) logs_generation: u64,
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
-    pub(crate) metrics: &'a MetricsHandle,
     pub(crate) dirty: &'a mut bool,
     pub(crate) ui_dirty: &'a mut bool,
     pub(crate) connect_requested: &'a mut bool,
@@ -265,7 +259,6 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
-            metrics,
             dirty,
             ui_dirty,
             connect_requested,
@@ -325,7 +318,6 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
-            metrics,
             dirty,
             ui_dirty,
             connect_requested,
@@ -360,13 +352,6 @@ impl<'a> UiCtx<'a> {
     /// config-apply pipeline — no "changes pending" chip, no Apply now.
     pub fn mark_ui_dirty(&mut self) {
         *self.ui_dirty = true;
-    }
-
-    /// Bump one work counter through the app-owned metrics handle. Screens
-    /// call this on real events (a rebuild, a parse, a search, a read, an
-    /// enumeration) — never per frame.
-    pub fn bump_work(&self, counter: WorkCounter) {
-        self.metrics.bump_work(counter);
     }
 
     /// Request Connect through the shell so every screen shares persistence,
@@ -502,9 +487,9 @@ pub(crate) struct UiCtxSnapshot {
 impl UiCtxSnapshot {
     /// True when `other` carries the same inputs as this snapshot. The app
     /// skips no-op rebuilds with this (e.g. the initial `State(Stopped)`
-    /// drain, duplicate events), so the rebuild counter counts actual input
-    /// changes. Field-wise because the payload types derive only `Clone`,
-    /// not `PartialEq`.
+    /// drain, duplicate events), so the snapshot is replaced only when an
+    /// input actually changed. Field-wise because the payload types derive
+    /// only `Clone`, not `PartialEq`.
     pub(crate) fn same_inputs(&self, other: &UiCtxSnapshot) -> bool {
         self.stats_generation == other.stats_generation
             && self.latency_generation == other.latency_generation
