@@ -4950,6 +4950,12 @@ version = "1.24.0"
 criteria = "safe-to-deploy"
 version = "1.26.0"
 
+[[audits.uuid]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "1.26.1"
+notes = "1.26.0 -> 1.26.1: a saturating Timestamp -> SystemTime conversion, v7 counter placement, and version/doc churn; no build script, no new dependency, no new unsafe. v4 generation, parsing and formatting are untouched. Published 2026-09-10, six days before this crate's wildcard window opens on 2026-09-16, so the wildcard cannot carry it."
+
 [[audits.valuable]]
 criteria = "safe-to-deploy"
 version = "0.1.1"
