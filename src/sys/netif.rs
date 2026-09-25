@@ -106,6 +106,16 @@ pub fn list_all() -> Vec<NetIf> {
 /// excluded.
 fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    // SAFETY: the family argument is 0 (`AF_UNSPEC`, every family), `flags`
+    // is a valid flag set, and the adapter buffer argument is null with
+    // `size` reporting 0 — the documented sizing call, which writes only the
+    // required size. The second call passes `head`, the base of an
+    // allocation made for exactly that size and aligned to at least
+    // `align_of::<IP_ADAPTER_ADDRESSES_LH>()` (`AdapterBuffer` records the
+    // layout it allocated and deallocates with it on every exit path), so the
+    // chain the API writes stays inside the allocation. Every node is then
+    // only reached through the null-terminated `Next` links the API wrote,
+    // each dereference carrying its own SAFETY note below.
     unsafe {
         // Two-call sizing: the first call reports ERROR_BUFFER_OVERFLOW plus
         // the required buffer size.
@@ -351,7 +361,22 @@ pub fn resolve_probe_uplink<'a>(
     }
 }
 
+/// Format a `sockaddr` the OS handed back as a string, or `None` for a
+/// family this app does not recognize.
+///
+/// # Safety
+///
+/// `sa` must be null or point at a complete `SOCKADDR` whose `sa_family`
+/// member accurately describes the object — the two families read here are
+/// `SOCKADDR_IN` (16 bytes) and `SOCKADDR_IN6` (28 bytes), each starting with
+/// the same 2-byte family member — and it must stay valid for the call.
 unsafe fn format_sockaddr(sa: *const SOCKADDR) -> Option<String> {
+    // SAFETY: the caller guarantees `sa` is null or points at a complete,
+    // live `SOCKADDR` whose family member describes it (see `# Safety`). The
+    // null check runs before any dereference, and the casts only re-interpret
+    // that same object as the concrete struct named by `sa_family`, both of
+    // which begin with the family member already read. Every field reached is
+    // inside the size that struct declares, and no pointer escapes.
     unsafe {
         if sa.is_null() {
             return None;

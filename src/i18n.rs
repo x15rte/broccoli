@@ -2150,6 +2150,16 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
                 t(lang, Key::SrvXhttpSettingsMissing)
             }
         },
+        HeaderValuesNotStrings(network) => match network {
+            // The rule is the same one the share-link grammar applies, so the
+            // text is reused rather than duplicated.
+            Network::Ws => t(lang, Key::LinkWsHeaderValues),
+            Network::Httpupgrade => t(lang, Key::LinkHttpupgradeHeaderValues),
+            _ => {
+                debug_assert!(false, "HeaderValuesNotStrings cannot name {network:?}");
+                t(lang, Key::LinkWsHeaderValues)
+            }
+        },
         HysteriaTransportRequiresTls => t(lang, Key::SrvHysteriaTransportTls),
         HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),

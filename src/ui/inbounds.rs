@@ -590,10 +590,12 @@ const UDP: u8 = 2;
 /// unparseable listen is treated as loopback — validation reports it as an
 /// error, so it should never warn as a LAN exposure.
 fn any_non_loopback_listen(settings: &Settings) -> bool {
+    // The address is classified in its socket form, as the model's exposure
+    // rule does: an IPv4-mapped loopback literal binds loopback.
     let non_loopback = |listen: &str| -> bool {
         listen
             .parse::<std::net::IpAddr>()
-            .map(|address| !address.is_loopback())
+            .map(|address| !crate::model::inbound::socket_address(address).is_loopback())
             .unwrap_or(false)
     };
     settings

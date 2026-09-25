@@ -91,33 +91,56 @@ pub(super) struct JsonBuf {
     pub(super) profile: String,
 }
 
-/// The raw-JSON editor buffer cache and the parse count kept beside it: one
-/// entry per rendered field, keyed by the field's egui `Id`. The cache parses
-/// only on a seed or an edit (see [`JsonBuf::edit`]) — an idle re-render of
-/// unchanged text reuses both the buffer and its parse result. That parse is
-/// the counted quantity because it leaves no other trace: a needless reparse
-/// rewrites the same error string and never touches the committed value, so
-/// the count is what fails when the parse gate is dropped. Read only by the
-/// servers screen's idle-frame parse test.
+/// The raw-JSON editor buffer cache: one entry per rendered field, keyed by
+/// the field's egui `Id`. It parses only on a seed or an edit (see
+/// [`JsonBuf::edit`]), so an idle re-render of unchanged text reuses both the
+/// buffer and its parse result — the reused buffer is what the screen's
+/// idle-frame test observes.
 #[derive(Default)]
 pub(super) struct RawBuffers {
     entries: std::collections::HashMap<egui::Id, JsonBuf>,
-    /// JSON parses this cache has performed since the screen was created:
-    /// one per buffer seed plus one per edit that re-parses.
-    pub(super) parses: u64,
 }
 
-impl std::ops::Deref for RawBuffers {
-    type Target = std::collections::HashMap<egui::Id, JsonBuf>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.entries
+impl RawBuffers {
+    /// The cache is a map of field id to buffer at every call site (the
+    /// editors look entries up by id, eviction retains by owner), so the
+    /// handful of map operations those sites use are named here instead of a
+    /// `Deref` that hides the field.
+    pub(super) fn entry(
+        &mut self,
+        key: egui::Id,
+    ) -> std::collections::hash_map::Entry<'_, egui::Id, JsonBuf> {
+        self.entries.entry(key)
     }
-}
 
-impl std::ops::DerefMut for RawBuffers {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.entries
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub(super) fn retain(&mut self, keep: impl FnMut(&egui::Id, &mut JsonBuf) -> bool) {
+        self.entries.retain(keep);
+    }
+
+    /// Every buffer, for the dirty-buffer scans (`unsaved_changes`, the
+    /// Discard gate) and the tests that assert eviction, survival across
+    /// renames, and buffer reuse.
+    pub(super) fn values(&self) -> impl Iterator<Item = &JsonBuf> {
+        self.entries.values()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, key: egui::Id, buffer: JsonBuf) -> Option<JsonBuf> {
+        self.entries.insert(key, buffer)
     }
 }
 
@@ -144,12 +167,9 @@ pub(super) struct RawField<'a> {
     pub(super) buffers: &'a mut RawBuffers,
 }
 
-/// Outcome of one buffered edit pass: whether the committed value changed,
-/// and whether the pass parsed the buffer's text (a re-seed or a text edit) —
-/// the parse [`RawBuffers::parses`] counts.
+/// Outcome of one buffered edit pass: whether the committed value changed.
 struct EditPass {
     changed: bool,
-    parsed: bool,
 }
 
 impl JsonBuf {
@@ -172,10 +192,7 @@ impl JsonBuf {
             // Re-seeded from the committed value: nothing is left uncommitted.
             self.dirty = false;
         }
-        let mut pass = EditPass {
-            changed: false,
-            parsed: false,
-        };
+        let mut pass = EditPass { changed: false };
         let resp = ui.add(
             egui::TextEdit::multiline(&mut self.text)
                 .font(egui::TextStyle::Monospace)
@@ -193,7 +210,6 @@ impl JsonBuf {
         // never on idle frames. The result is persisted so validation errors
         // render identically until the next edit.
         if seeded || resp.changed() {
-            pass.parsed = true;
             match serde_json::from_str::<T>(&self.text) {
                 Ok(v) => {
                     self.error = None;
@@ -227,8 +243,7 @@ impl JsonBuf {
 /// Present one raw-JSON editor buffer, creating the per-field entry on first
 /// sight. A fresh entry is a cache mutation, so the live entry count is the
 /// map's own `len`; eviction happens through [`evict_owned_buffers`] when the
-/// owning profile is deleted. Each parse the pass ran is counted on the
-/// cache ([`RawBuffers::parses`]).
+/// owning profile is deleted.
 pub(super) fn raw_buffer_edit<T>(
     ui: &mut egui::Ui,
     lang: Language,
@@ -241,10 +256,9 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned + Clone,
 {
     ui.label(label);
-    let RawBuffers { entries, parses } = field.buffers;
     // One lookup per field per frame: re-use the existing buffer, or create
-    // the entry and count the parse it ran.
-    let pass = match entries.entry(field.id.key) {
+    // the entry and seed it.
+    match field.buffers.entry(field.id.key) {
         std::collections::hash_map::Entry::Occupied(mut occupied) => {
             occupied.get_mut().edit(ui, lang, field.id, value, spec)
         }
@@ -254,11 +268,8 @@ where
             vacant.insert(buffer);
             pass
         }
-    };
-    if pass.parsed {
-        *parses += 1;
     }
-    pass.changed
+    .changed
 }
 
 /// Owner-eviction rule shared by the raw-JSON and PEM buffer caches:

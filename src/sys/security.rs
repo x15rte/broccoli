@@ -47,9 +47,10 @@ use windows::Win32::Security::{
     ACE_FLAGS, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
     GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorGroup, SetSecurityDescriptorOwner, TOKEN_ACCESS_MASK, TOKEN_QUERY,
-    TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
+    TOKEN_ACCESS_MASK, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -152,13 +153,25 @@ impl Drop for TokenHandle {
     }
 }
 
+/// Whole `u32` words covering `bytes`: the SID storage's unit, so an
+/// allocation is never smaller than the SID it holds.
+fn sid_words(bytes: usize) -> usize {
+    bytes.div_ceil(std::mem::size_of::<u32>())
+}
+
 /// An owned SID: either a well-known SID (`Sid::well_known`) or the user SID
 /// of a token (`Sid::token_user`). The storage lives inside the value, so a
 /// `PSID` obtained from [`Sid::psid`] stays valid (and points at the same
 /// SID) as long as the `Sid` is alive — including after any move, because
 /// the storage is heap-allocated.
 pub struct Sid {
-    storage: Vec<u8>,
+    /// The SID bytes, laid out at the base of word storage. A Win32 `SID`
+    /// carries `Rev`/`SubAuthorityCount` bytes, a 6-byte authority and
+    /// `SubAuthority: [u32; 1]`, so its alignment is 4 — while `Vec<u8>`
+    /// promises only 1 and the system allocator's over-alignment is not a
+    /// language guarantee. Storing `u32`s is what makes the pointer
+    /// [`Sid::psid`] hands to the SID APIs aligned by type.
+    storage: Vec<u32>,
 }
 
 impl Sid {
@@ -166,19 +179,21 @@ impl Sid {
     /// `CreateWellKnownSid` fails for kinds that require a domain SID, which
     /// the alias kinds used in this crate never do.
     pub fn well_known(kind: WELL_KNOWN_SID_TYPE) -> Result<Self> {
-        // SECURITY_MAX_SID_SIZE (68) is the documented capacity for any
-        // well-known SID.
-        let mut storage = vec![0u8; 68];
-        let mut length = storage.len() as u32;
+        // `SECURITY_MAX_SID_SIZE` is the documented capacity for any
+        // well-known SID; the storage is `u32` words so the SID at its base
+        // is 4-byte aligned (see the field comment).
+        let mut storage = vec![0u32; sid_words(SECURITY_MAX_SID_SIZE as usize)];
+        let mut length = SECURITY_MAX_SID_SIZE;
         let sid = PSID(storage.as_mut_ptr().cast());
-        // SAFETY: `storage` is 68 bytes (`SECURITY_MAX_SID_SIZE`), the
-        // documented capacity for any well-known SID, so the cast pointer is
-        // writable for `length` bytes and stays alive for the call; `None`
-        // domain SID is valid for the alias kinds used here. On success the
-        // buffer holds a valid SID at offset 0 and `length` reports its
-        // exact size.
+        // SAFETY: `storage` covers `SECURITY_MAX_SID_SIZE` bytes — the
+        // documented capacity for any well-known SID — at an address 4-byte
+        // aligned by the storage type, so the cast pointer satisfies the
+        // `SID` layout the callee writes; the buffer stays alive for the
+        // call. `None` domain SID is valid for the alias kinds used here. On
+        // success the buffer holds a valid SID at offset 0 and `length`
+        // reports its exact byte size.
         unsafe { CreateWellKnownSid(kind, None, Some(sid), &mut length) }?;
-        storage.truncate(length as usize);
+        storage.truncate(sid_words(length as usize));
         Ok(Self { storage })
     }
 
@@ -250,20 +265,28 @@ impl Sid {
         if sid_length == 0 || sid_offset + sid_length > base + allocated {
             return Err(invalid_parameter_error());
         }
-        let mut storage = vec![0u8; sid_length];
+        let mut storage = vec![0u32; sid_words(sid_length)];
         // SAFETY: the bounds checks above guarantee `sid` points at
-        // `sid_length` initialized bytes inside the live `buffer`, and
-        // `storage` is an exactly-sized, alive destination; both ranges are
-        // disjoint (heap allocations).
+        // `sid_length` initialized bytes inside the live `buffer`; `storage`
+        // covers at least `sid_length` bytes (rounded up to whole words) at
+        // an address 4-byte aligned by the storage type and stays alive, so
+        // the destination is valid for the copy and both ranges are disjoint
+        // (heap allocations). The bytes past `sid_length` stay zero.
         unsafe {
-            std::ptr::copy_nonoverlapping(sid.0.cast::<u8>(), storage.as_mut_ptr(), sid_length);
+            std::ptr::copy_nonoverlapping(
+                sid.0.cast::<u8>(),
+                storage.as_mut_ptr().cast::<u8>(),
+                sid_length,
+            );
         }
         Ok(Self { storage })
     }
 
     /// A raw pointer to the SID bytes, which start at offset 0 of the owned
-    /// storage (both constructors lay the SID out first). Valid as long as
-    /// `self` is alive and never mutated; kernel APIs only read SIDs.
+    /// word storage (both constructors lay the SID out first). The address is
+    /// 4-byte aligned by the storage type, as a `SID`'s `SubAuthority: [u32]`
+    /// requires. Valid as long as `self` is alive and never mutated; kernel
+    /// APIs only read SIDs.
     pub fn psid(&self) -> PSID {
         PSID(self.storage.as_ptr().cast::<core::ffi::c_void>().cast_mut())
     }

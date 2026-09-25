@@ -31,9 +31,9 @@ use std::sync::{
 use windows::Win32::Foundation::HWND;
 
 /// The non-blocking tracing worker's guard, kept for the app's lifetime so a
-/// clean exit flushes accepted records. The exit-cleanup path takes it
-/// out explicitly ([`release_log_guard`]) so no log-file
-/// handle stays open when the app-data dirs are wiped; `Option` + mutex
+/// clean exit flushes accepted records. The exit path takes it out
+/// explicitly ([`release_log_guard`], before anything touches the app-data
+/// dirs) so no log-file handle stays open when they are wiped; `Option` + mutex
 /// instead of `OnceLock` because the guard must be movable out of the
 /// static.
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
@@ -652,18 +652,14 @@ impl BroccoliApp {
         let (servers, servers_error) = match ServersFile::load() {
             Ok(servers) => (servers, None),
             Err(error) => {
-                tracing::error!(
-                    "servers.json is valid JSON but could not be loaded (left intact): {error}"
-                );
+                tracing::error!("servers.json could not be loaded (left intact): {error}");
                 (ServersFile::default(), Some(error.to_string()))
             }
         };
         let (settings, settings_error) = match Settings::load() {
             Ok(settings) => (settings, None),
             Err(error) => {
-                tracing::error!(
-                    "settings.json is valid JSON but could not be loaded (left intact): {error}"
-                );
+                tracing::error!("settings.json could not be loaded (left intact): {error}");
                 (Settings::default(), Some(error.to_string()))
             }
         };
@@ -671,10 +667,13 @@ impl BroccoliApp {
         // accent lives in broccoli settings and must be re-applied on every boot.
         crate::ui::settings::apply_accent(&cc.egui_ctx, settings.accent_color);
         let lang = settings.language;
-        // A state file with valid JSON but unknown enum values fails
-        // load with the file left intact (no `.broken-*` quarantine). Surface
-        // it up front so a typo'd `security`/`network` can never silently
-        // downgrade TLS to plaintext unnoticed.
+        // A state file that cannot be read, or whose valid JSON carries
+        // unknown enum values, fails the load with the file left intact (no
+        // `.broken-*` quarantine, no defaults substituted). Surface it up
+        // front so a typo'd `security`/`network` can never silently downgrade
+        // TLS to plaintext unnoticed, and so a transient read failure cannot
+        // be mistaken for a fresh install whose defaults then overwrite the
+        // file.
         let state_error = match (settings_error, servers_error) {
             (None, None) => None,
             (Some(settings_err), None) => Some(t_fmt(
@@ -1165,7 +1164,14 @@ impl BroccoliApp {
                 TrayAction::Show => self.show_window(ctx),
                 TrayAction::ToggleConnection => match PhaseAction::for_phase(&self.phase) {
                     PhaseAction::Connect => {
-                        if self.request_connect().is_err() {
+                        // A connect parked on the hazard acknowledgment
+                        // succeeds without starting anything, and that
+                        // acknowledgment can only be answered in the window:
+                        // with it hidden (close-to-tray) or minimized the
+                        // tray action would look like a no-op until the user
+                        // surfaced the window by hand. Same rule as the tray
+                        // Quit's own deferral.
+                        if self.request_connect().is_err() || self.pending_safety_ack.is_some() {
                             self.show_window(ctx);
                         }
                     }
@@ -2371,6 +2377,15 @@ impl eframe::App for BroccoliApp {
         }
         if ui_dirty {
             self.persist_if_due(&ctx, PersistKind::UiOnly);
+        }
+        // The repaint `persist_if_due` arms at the throttle deadline exists to
+        // land the last edit of a burst, and the frame it delivers carries no
+        // widget change of its own — nothing above routes through the two
+        // calls, so the pending kind is flushed here. Inside the window the
+        // call only re-arms the repaint, so the write still happens at most
+        // once per window.
+        if let Some(kind) = self.persist_pending {
+            self.persist_if_due(&ctx, kind);
         }
         if stop_requested {
             let _ = self.request_stop();
@@ -3716,14 +3731,16 @@ mod native_theme {
                     // `Option<FARPROC>`; the outer `Some` exists only when
                     // GetProcAddress found the export, so this is a non-null
                     // code pointer into the still-loaded uxtheme.dll. `FARPROC`
-                    // is `Option<unsafe extern "system" fn() -> isize>`; the
-                    // `Some` bit pattern (a plain code pointer) is identical
-                    // to the target `unsafe extern "system" fn() -> bool`, and
-                    // the export's real signature
-                    // (`BOOL ShouldSystemUseDarkMode(void)`) matches the
-                    // declared type under the `system` calling convention, so
-                    // the transmute is value- and ABI-preserving (muda does
-                    // the same).
+                    // is `Option<unsafe extern "system" fn() -> isize>` and the
+                    // target is `unsafe extern "system" fn() -> bool`; both are
+                    // one code pointer taken in `RAX` under the `system`
+                    // calling convention, so the transmute is value-preserving.
+                    // The export's real signature is
+                    // `BOOL ShouldSystemUseDarkMode(void)` and the declared
+                    // return is Rust's `bool`: MSVC returns 0 or 1 in `EAX`
+                    // and a `bool` return reads the low byte of that register,
+                    // which is the value the export wrote (muda declares the
+                    // same shape for the same export).
                     std::mem::transmute::<_, ShouldSystemUseDarkMode>(address)
                 })
             });
@@ -4120,9 +4137,8 @@ impl std::io::Write for RotatingLogWriter {
 
 /// Drop the tracing worker guard — flushing accepted records and stopping
 /// the non-blocking writer — so no log-file handle remains open. Called by
-/// the exit path before cleanup wipes the app-data dirs; after this,
-/// tracing writes are no-ops for the rest of the
-/// process.
+/// the exit path on every quit, before cleanup wipes the app-data dirs; after
+/// this, tracing writes are no-ops for the rest of the process.
 pub fn release_log_guard() {
     let guard = LOG_GUARD
         .lock()

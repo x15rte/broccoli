@@ -105,6 +105,13 @@ pub(crate) fn state_file(name: &str) -> PathBuf {
 /// and surface it.
 #[derive(Debug)]
 pub enum StateLoadError {
+    /// The state file could not be read at all — a sharing violation while
+    /// another process holds it, an ACL denial, a disk error. The file was
+    /// NOT touched and `Default` was NOT substituted: the caller must fail
+    /// visibly, because an in-memory `Default` model written over an
+    /// unreadable file would destroy state the user still has on disk. Only
+    /// a genuinely absent file (`NotFound`) loads defaults.
+    Io(String),
     /// The file is valid JSON but its content failed to deserialize — an
     /// unknown `security`/`network` value, a field of the wrong type, etc.
     /// The file was NOT renamed or modified, and `Default` was NOT
@@ -118,14 +125,18 @@ pub enum StateLoadError {
 impl std::fmt::Display for StateLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StateLoadError::Semantic(message) => f.write_str(message),
+            StateLoadError::Io(message) | StateLoadError::Semantic(message) => f.write_str(message),
         }
     }
 }
 
 /// Load a GUI state file.
 ///
-/// Missing → `Default`. STRUCTURAL corruption (serde_json cannot parse the
+/// Missing → `Default`. UNREADABLE (any read failure other than a missing
+/// file) → `Err` naming the path and the OS error, file untouched: a
+/// transient failure must not be reported as a fresh install, because the
+/// defaults that would then be in memory get written over the intact file on
+/// the next save. STRUCTURAL corruption (serde_json cannot parse the
 /// document: syntax/EOF errors) → renamed to `<file>.broken-<unix ts>`, wiped
 /// and deleted, and `Default` returned (no plaintext quarantine copy
 /// remains). SEMANTIC failure (valid JSON whose content does not fit the
@@ -140,7 +151,10 @@ where
     let path = state_file(name);
     let data = match std::fs::read(&path) {
         Ok(d) => d,
-        Err(_) => return Ok(T::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) => {
+            return Err(StateLoadError::Io(format!("{}: {error}", path.display())));
+        }
     };
     // `serde_json::Deserializer` implements `serde::Deserializer` only through
     // `&mut`, so the path-aware wrapper borrows it.

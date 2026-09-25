@@ -735,6 +735,93 @@ fn traffic_unit_change_persists_without_demanding_apply() {
     );
 }
 
+/// Run `steps` frames with egui's clock pinned to `time` before each one: the
+/// harness takes its raw input per frame, so a pinned clock must be re-applied
+/// for every frame it should cover.
+fn run_at(h: &mut Harness<'static, BroccoliApp>, time: f64, steps: usize) {
+    for _ in 0..steps {
+        h.input_mut().time = Some(time);
+        h.run_steps(1);
+    }
+}
+
+/// Pick a display unit through the dashboard's combo, which shows the current
+/// unit as its value. Each click costs one batch of frames, so a caller that
+/// pins the clock around two calls holds both edits inside one persist window.
+fn choose_traffic_unit_at(
+    h: &mut Harness<'static, BroccoliApp>,
+    time: f64,
+    current: &str,
+    next: &str,
+) {
+    h.get_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|node| node.value().as_deref() == Some(current))
+        .expect("the traffic-unit combo must show the current unit")
+        .click();
+    run_at(h, time, 1);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, next)
+        .click();
+    run_at(h, time, 2);
+}
+
+fn saved_settings(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(path).expect("the state file must have been written"),
+    )
+    .expect("the state file must be valid JSON")
+}
+
+/// An edit landing inside the persist throttle window is written when the
+/// window closes, with no further edit to carry it: the deadline repaint's
+/// frame has no widget change of its own, so the deferred save has to be
+/// flushed by that frame — otherwise the last edit of a burst stays in memory
+/// until the next edit, or until a clean exit.
+#[test]
+fn the_persist_deadline_flushes_the_last_edit_of_a_burst() {
+    let lock = APPDATA_LOCK.lock();
+    let tmp = tempfile::tempdir().unwrap();
+    // SAFETY: APPDATA_LOCK serializes every test in this process that changes
+    // or reads APPDATA through a BroccoliApp harness.
+    unsafe { std::env::set_var("APPDATA", tmp.path()) };
+    // The harness's default frame step is a quarter second, which is longer
+    // than the persist window this test reasons about; a 60 Hz step keeps
+    // every frame a small, known distance from the pinned clock.
+    let mut h = Harness::builder()
+        .with_step_dt(1.0 / 60.0)
+        .with_size(egui::Vec2::new(1100.0, 720.0))
+        .build_eframe(|cc| BroccoliApp::new_headless(cc));
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
+        .click();
+    h.run();
+    // Every pin below sits at least a window away from the save it must not
+    // see, and inside one of the save it must: a click's own frames drift at
+    // most a few 60 Hz steps from the frame it pinned.
+    let settings_path = tmp.path().join("broccoli/state/settings.json");
+    let first = h.ctx.input(|input| input.time) + 1.0;
+
+    // The first edit opens the window, so it lands at once.
+    choose_traffic_unit_at(&mut h, first, "Auto", "KiB/s");
+    assert_eq!(saved_settings(&settings_path)["trafficUnit"], "kiBps");
+
+    // The second edit lands 50 ms into that window: deferred to the deadline.
+    choose_traffic_unit_at(&mut h, first + 0.05, "KiB/s", "MiB/s");
+    assert_eq!(
+        saved_settings(&settings_path)["trafficUnit"],
+        "kiBps",
+        "an edit inside the throttle window must not be written yet"
+    );
+
+    // The deadline frame, with nothing edited in between.
+    run_at(&mut h, first + 1.0, 1);
+    assert_eq!(
+        saved_settings(&settings_path)["trafficUnit"],
+        "miBps",
+        "the deadline frame must flush the deferred edit"
+    );
+    drop(lock);
+}
+
 #[test]
 fn settings_appearance_theme_radio_switches_preference() {
     let (_lock, _tmp, mut h) = harness();

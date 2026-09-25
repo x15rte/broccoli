@@ -1932,8 +1932,16 @@ impl StreamModel {
         }
         if let Some(websocket) = self.ws_settings.as_mut() {
             // `self` is the cloned wire model. Canonicalize Xray's accepted
-            // legacy Host header here without mutating persisted/imported state.
-            let _ = websocket.migrate_legacy_host_header();
+            // legacy Host header here without mutating persisted/imported
+            // state. A header value that is not a string cannot be migrated
+            // (and cannot be built: Xray types `wsSettings.headers` as
+            // `map[string]string`), so the failure is reported instead of
+            // dropped — the model rule that refuses the same value only gates
+            // the generated configuration, not the link export that shares
+            // this path.
+            if let Err(error) = websocket.migrate_legacy_host_header() {
+                tracing::warn!("legacy WebSocket Host header left unmigrated: {error}");
+            }
         }
         if let Some(download) = self
             .xhttp_settings

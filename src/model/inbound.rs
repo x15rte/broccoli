@@ -44,18 +44,41 @@ pub const BLOCK_OUTBOUND_TAG: &str = "block";
 /// DNS listener tags.
 pub const API_INBOUND_TAG: &str = "api";
 
+/// The address as the socket layer sees it: an IPv4-mapped IPv6 literal
+/// (`::ffff:127.0.0.1`) is the IPv4 address it carries, which is what the
+/// stack binds and routes — the same re-classification the latency probe's
+/// host guard and the outbound privacy check apply to their literals.
+pub fn socket_address(address: std::net::IpAddr) -> std::net::IpAddr {
+    match address {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
 /// Wildcard-aware port-collision overlap: `0.0.0.0` and `::` bind every
 /// interface, so they conflict with every other address on a shared port;
-/// otherwise two addresses conflict only when identical.
+/// otherwise two addresses conflict only when identical — identical meaning
+/// the same endpoint after [`socket_address`], so the mapped and plain
+/// spellings of one address overlap too. Unparseable values (which the
+/// validation layer rejects separately) still compare as text.
 pub fn listen_addresses_overlap(a: &str, b: &str) -> bool {
-    is_wildcard_listen(a) || is_wildcard_listen(b) || a == b
+    if is_wildcard_listen(a) || is_wildcard_listen(b) {
+        return true;
+    }
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => socket_address(a) == socket_address(b),
+        _ => a == b,
+    }
 }
 
 /// True for the all-interfaces wildcard addresses: the unspecified IPv4/IPv6
-/// addresses `0.0.0.0`, `::`, and their equivalent spellings (e.g. `::0`).
+/// addresses `0.0.0.0`, `::`, and their equivalent spellings (e.g. `::0`, or
+/// the IPv4-mapped `::ffff:0.0.0.0`).
 pub fn is_wildcard_listen(s: &str) -> bool {
     s.parse::<std::net::IpAddr>()
-        .is_ok_and(|address| address.is_unspecified())
+        .is_ok_and(|address| socket_address(address).is_unspecified())
 }
 
 /// The listener-collision rule, one definition, over one endpoint per side
@@ -591,6 +614,32 @@ mod listen_address_tests {
         assert!(!is_wildcard_listen("127.0.0.1"));
         assert!(!is_wildcard_listen("::1"));
         assert!(!is_wildcard_listen(""));
+    }
+
+    /// Windows binds an IPv4-mapped literal as the IPv4 address it carries,
+    /// so the two spellings of one endpoint must collide and a mapped
+    /// wildcard must count as the wildcard it is — otherwise two listeners
+    /// are emitted for one socket and the core fails to start with no
+    /// field-scoped message.
+    #[test]
+    fn ipv4_mapped_spellings_overlap_their_plain_form() {
+        assert!(is_wildcard_listen("::ffff:0.0.0.0"));
+        assert!(listen_addresses_overlap("::ffff:0.0.0.0", "127.0.0.1"));
+        assert!(listen_addresses_overlap("127.0.0.1", "::ffff:0.0.0.0"));
+        assert!(listen_addresses_overlap("::ffff:127.0.0.1", "127.0.0.1"));
+        assert!(listen_addresses_overlap(
+            "::ffff:192.168.1.5",
+            "192.168.1.5"
+        ));
+        // Distinct endpoints stay distinct, mapped or not.
+        assert!(!listen_addresses_overlap(
+            "::ffff:192.168.1.5",
+            "192.168.1.6"
+        ));
+        assert!(!listen_addresses_overlap("::ffff:192.168.1.5", "::1"));
+        // Unparseable values keep comparing as text.
+        assert!(listen_addresses_overlap("weird", "weird"));
+        assert!(!listen_addresses_overlap("weird", "other"));
     }
 
     #[test]

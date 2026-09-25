@@ -198,6 +198,14 @@ fn main() {
 
     let run_result = broccoli::run();
 
+    // Release the tracing worker guard on every exit, before anything below
+    // touches the app-data dirs: the guard's drop flushes the records still
+    // queued on the non-blocking writer and joins it, so a normal quit keeps
+    // the log tail (the teardown lines the app just wrote) and the cleanup
+    // path below can wipe the directories with no log handle open. Later
+    // `tracing` records are no-ops for the rest of the process.
+    broccoli::app::release_log_guard();
+
     // Exit-time cleanup: `run` returns only after
     // eframe has dropped the app, so the core and the elevated helper are
     // stopped. The filesystem actions run here — after normal shutdown,
@@ -207,15 +215,11 @@ fn main() {
     // `ensure_dirs`). The requested mode distinguishes a full wipe (Clean Up
     // and Exit) from a reset-to-default, which keeps state/servers.json and
     // core/.
-    if let Some(mode) = broccoli::sys::cleanup::take_requested() {
-        // Drop the tracing worker guard so no log-file handle stays open
-        // when the app-data dirs are wiped below.
-        broccoli::app::release_log_guard();
-        if let Err(error) =
+    if let Some(mode) = broccoli::sys::cleanup::take_requested()
+        && let Err(error) =
             broccoli::sys::cleanup::run(mode, &broccoli::sys::paths::broccoli_root())
-        {
-            eprintln!("broccoli cleanup: app-data cleanup failed: {error:#}");
-        }
+    {
+        eprintln!("broccoli cleanup: app-data cleanup failed: {error:#}");
     }
 
     if let Err(e) = run_result {

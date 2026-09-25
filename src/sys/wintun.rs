@@ -143,6 +143,13 @@ pub fn adapter_guid(name: &str) -> GUID {
 /// ([`WINTUN_ENUMERATOR`]), including non-present (phantom) devnodes — exactly
 /// what must be cleaned before a TUN restart.
 fn enumerate_wintun_devnodes() -> Result<HDEVINFO, String> {
+    // SAFETY: `Some(&GUID_DEVCLASS_NET)` and `WINTUN_ENUMERATOR` are both
+    // static NUL-terminated strings that outlive the call, and every other
+    // argument is absent (no parent window, no machine name, no extra
+    // parameters) — the `None`s the callee treats as defaults. Flags are
+    // `Default::default()` (none), which is what keeps phantom devnodes in
+    // the list. The returned `HDEVINFO` is the only owned object, and its
+    // caller wraps it in `DevInfoGuard`, which destroys it on every exit.
     unsafe {
         SetupDiGetClassDevsExW(
             Some(&GUID_DEVCLASS_NET),
@@ -160,13 +167,20 @@ fn enumerate_wintun_devnodes() -> Result<HDEVINFO, String> {
 /// The instance ID of one enumerated devnode (trimmed at the NUL).
 fn instance_id_of(devinfo: HDEVINFO, data: &SP_DEVINFO_DATA) -> Result<Option<String>, String> {
     let mut required = 0u32;
-    // First call with a null buffer is the documented sizing query; it fails
-    // with ERROR_INSUFFICIENT_BUFFER and fills `required`.
+    // SAFETY: `devinfo` is a live list handle owned by the caller,
+    // `data.cbSize` was set at construction (`SP_DEVINFO_DATA` demands it
+    // before any enumerate call), and the null buffer with a length
+    // out-pointer is the documented sizing query: the callee writes only the
+    // required length into `required` and fails with
+    // ERROR_INSUFFICIENT_BUFFER, which is deliberately ignored here.
     let _ = unsafe { SetupDiGetDeviceInstanceIdW(devinfo, data, None, Some(&mut required)) };
     if required == 0 {
         return Ok(None);
     }
     let mut buffer = vec![0u16; required as usize];
+    // SAFETY: same live `devinfo`/`data`, and `buffer` holds exactly the
+    // `required` UTF-16 units the sizing query just reported, so the callee
+    // writes at most that many units into a live, writable buffer.
     unsafe {
         SetupDiGetDeviceInstanceIdW(devinfo, data, Some(&mut buffer), None)
             .map_err(|error| format!("SetupDiGetDeviceInstanceIdW failed: {error}"))?;
@@ -226,6 +240,11 @@ pub fn matching_instance_ids(name: &str) -> Result<Vec<String>, String> {
     let mut ids = Vec::new();
     let mut index = 0u32;
     loop {
+        // SAFETY: `devinfo` is the live list the guard above owns, `index`
+        // counts from zero in this loop only, and `data` is a live
+        // `SP_DEVINFO_DATA` whose `cbSize` was set before the first call —
+        // the callee writes the enumerated element into it and reports
+        // ERROR_NO_MORE_ITEMS past the end, which ends the loop.
         match unsafe { SetupDiEnumDeviceInfo(devinfo, index, &mut data) } {
             Ok(()) => {}
             Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) => break,
@@ -253,6 +272,9 @@ pub fn remove_instance(instance_id: &str) -> Result<(), String> {
     };
     let mut index = 0u32;
     loop {
+        // SAFETY: `devinfo` is the live list the guard above owns, `index`
+        // counts from zero in this loop only, and `data` is a live
+        // `SP_DEVINFO_DATA` whose `cbSize` was set before the first call.
         match unsafe { SetupDiEnumDeviceInfo(devinfo, index, &mut data) } {
             Ok(()) => {}
             Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) => {
@@ -271,6 +293,14 @@ pub fn remove_instance(instance_id: &str) -> Result<(), String> {
         params.ClassInstallHeader.cbSize = std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32;
         params.ClassInstallHeader.InstallFunction = DIF_REMOVE;
         params.Scope = DI_REMOVEDEVICE_GLOBAL;
+        // SAFETY: `devinfo` is the live list the guard above owns and `data`
+        // is the live element the enumeration matched, with its `cbSize` set.
+        // `params` is a fully initialized `SP_REMOVEDEVICE_PARAMS` (its own
+        // `ClassInstallHeader.cbSize` set to that header's size, the install
+        // function set to DIF_REMOVE), and the length passed with it is
+        // exactly `size_of::<SP_REMOVEDEVICE_PARAMS>()`, so the callee reads
+        // one complete structure. The header sub-object the call points at is
+        // the first field of `params`, inside that same live value.
         unsafe {
             SetupDiSetClassInstallParamsW(
                 devinfo,

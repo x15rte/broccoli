@@ -133,16 +133,29 @@ impl RingId {
         }
     }
 
-    /// Whether the ring moved from `prev` to `self` through appends alone —
-    /// one or more pushes with no eviction. In production eviction happens
-    /// only inside `push` (every eviction lowers `len` by one while its
-    /// push raises `generation` by one), so `generation - prev.generation`
-    /// equals `len - prev.len` exactly when no entry was dropped; the
-    /// growth guard rules out shrinks (which can only be test-side pops).
-    fn is_pure_append_from(&self, prev: RingId) -> bool {
-        self.len > prev.len
-            && self.generation >= prev.generation
-            && self.generation - prev.generation == (self.len - prev.len) as u64
+    /// Whether the ring moved from `prev` forward by pushes alone — the shape
+    /// every production refresh has, because `LogBuffer::push` is the ring's
+    /// only mutation: it bumps the counter once and evicts oldest-first until
+    /// both caps hold, so one push can drop one entry (the line cap, or a line
+    /// exactly filling the byte cap's slack) or several (a long line pushing
+    /// the byte cap past a run of short ones). The cached view can then be
+    /// extended in place: drop the rows whose lines rotated out and admit the
+    /// new tail. Two conditions make that derivation sound — the push counter
+    /// never rewinds, and the retained window's front, which [`Self::front`]
+    /// reads off the counter and the length, never moves backwards. Both
+    /// follow from the ring's documented invariant that eviction happens only
+    /// inside `push`, oldest-first; a ring mutated any other way (a test-side
+    /// back pop, which would move the derived front without moving the real
+    /// one) rebuilds instead.
+    fn extends_from(&self, prev: RingId) -> bool {
+        self.generation >= prev.generation && self.front() >= prev.front()
+    }
+
+    /// Absolute push index of the oldest retained entry: the counter is
+    /// bumped once per push and eviction only ever drops from the front, so
+    /// `generation - len` is that entry's sequence number.
+    fn front(&self) -> u64 {
+        self.generation.saturating_sub(self.len as u64)
     }
 }
 
@@ -162,6 +175,12 @@ struct RowCursor {
 /// evicted lines were unadmitted).
 #[derive(PartialEq)]
 struct FilteredRow {
+    /// Absolute push index of the line this row was admitted from (the ring's
+    /// front sequence plus the line's offset in it). It is what lets a
+    /// refresh drop exactly the rows whose lines rotated out of the ring —
+    /// the ring's current front is the watermark — instead of rebuilding the
+    /// whole view whenever a cap evicts.
+    seq: u64,
     from_core: bool,
     /// Sniffed level, computed once at rebuild instead of per painted row.
     level: Option<Level>,
@@ -196,11 +215,11 @@ struct ViewKey {
 /// heights are measured once per rebuild and re-fitted when the wrap width
 /// changes (window resize, scrollbar appearance). A re-fit is a layout pass,
 /// not a filter rebuild: it re-measures inside the retained view, so only the
-/// screen's own layout-pass counts ([`LogsScreen::show_rows`]) move. A pure
-/// append extends `rows` in place (see [`LogsScreen::refresh_view`]); the
-/// measured vectors then cover a strict prefix of `rows` — the retained
-/// prefix stays valid — and [`LogsScreen::show_rows`] extends them with
-/// the admitted tail only.
+/// screen's own layout-pass counts ([`LogsScreen::show_rows`]) move. A forward
+/// refresh (pushes, with or without eviction) extends `rows` in place (see
+/// [`LogsScreen::refresh_view`]); the measured vectors then cover a prefix of
+/// `rows` — the retained prefix stays valid, and eviction truncates it — and
+/// [`LogsScreen::show_rows`] extends them with the admitted tail only.
 struct FilteredView {
     key: ViewKey,
     rows: Vec<FilteredRow>,
@@ -220,6 +239,36 @@ struct FilteredView {
     /// `prefix[i]` is the y-offset of row `i`, `prefix[n]` the total
     /// content height including the trailing spacing.
     prefix: Vec<f32>,
+}
+
+impl FilteredView {
+    /// Drop the rows whose lines left the ring, keeping the measured layout
+    /// index-aligned with the survivors: each dropped row takes its height,
+    /// galley and prefix-sum entry with it, and the retained prefix sums are
+    /// rebased on the new front (`prefix[i] - prefix[k]` is the y-offset of
+    /// the first survivor in the shortened view). The measured prefix is what
+    /// `heights` covers — it may be shorter than `rows` when a refresh landed
+    /// before the next layout pass — so only that prefix is drained.
+    /// Returns how many rows moved, which is what invalidates an index-keyed
+    /// selection.
+    fn drop_departed_rows(&mut self, front: u64) -> usize {
+        let keep = self.rows.partition_point(|row| row.seq < front);
+        if keep == 0 {
+            return 0;
+        }
+        self.rows.drain(..keep);
+        let measured = keep.min(self.heights.len());
+        self.heights.drain(..measured);
+        self.galleys.drain(..measured);
+        if measured > 0 && self.prefix.len() > measured {
+            let base = self.prefix[measured];
+            self.prefix.drain(..measured);
+            for offset in &mut self.prefix {
+                *offset -= base;
+            }
+        }
+        keep
+    }
 }
 
 pub struct LogsScreen {
@@ -242,8 +291,8 @@ pub struct LogsScreen {
     pending_logger_request: Request<Result<(), DiagError>>,
     logger_restart_feedback: Option<(bool, String)>,
     /// Memoized filtered view: rebuilt only when the ring identity, level,
-    /// needle, or clear generation change — never per frame; a pure append
-    /// extends it in place.
+    /// needle, or clear generation change — never per frame; a forward
+    /// refresh extends it in place.
     view: Option<FilteredView>,
     /// Custom log-row selection (see [`RowSelection`]); cleared when the
     /// filtered view rebuilds, because the row indices shift.
@@ -262,7 +311,7 @@ pub struct LogsScreen {
     /// Layout-work counters: a full pass re-measures every
     /// filtered row from scratch (fresh build, filter/level/clear change,
     /// width re-fit); a tail pass extends the retained vectors with only
-    /// the rows a pure append admitted. Plain integers, bumped when the
+    /// the rows a forward refresh admitted. Plain integers, bumped when the
     /// pass runs — never on idle frames.
     full_layout_passes: u64,
     tail_layout_passes: u64,
@@ -334,8 +383,9 @@ impl LogsScreen {
         let logger_busy = ctx.operation.is_some();
         // The filtered view is memoized on
         // (ring identity, level, needle, clear generation); idle frames
-        // never rebuild it, and pure appends extend the cached view — rows
-        // and layout vectors — with the admitted tail instead of rebuilding.
+        // never rebuild it, and forward refreshes extend the cached view —
+        // rows and layout vectors — with the admitted tail instead of
+        // rebuilding.
         // The ring identity is the app's monotonic push count (see
         // [`RingId`]), so empty-line rotations at the cap still invalidate.
         self.refresh_view(logs, ctx.logs_generation);
@@ -463,13 +513,14 @@ impl LogsScreen {
     }
 
     /// Refresh the memoized filtered view when its inputs — ring identity,
-    /// level, needle, clear generation — changed. A pure append (the ring only
-    /// grew, filter inputs unchanged) extends the cached rows with the
-    /// admitted tail and keeps the measured layout vectors; anything else
-    /// — rotation, filter/level changes, clears, first build — rebuilds
-    /// the rows from scratch. The returned flag is exactly the refresh
-    /// decision: false on an idle frame (the cached view stands), true on a
-    /// rebuild or append-extension.
+    /// level, needle, clear generation — changed. A forward refresh (the ring
+    /// only took pushes, filter inputs unchanged) extends the cached rows in
+    /// place: the rows whose lines rotated out are dropped with their measured
+    /// layout, and the admitted tail is appended — so a push at a cap costs
+    /// the tail, not the ring. Anything else — a backwards or shrinking ring,
+    /// filter/level changes, clears, first build — rebuilds the rows from
+    /// scratch. The returned flag is exactly the refresh decision: false on an
+    /// idle frame (the cached view stands), true on a rebuild or extension.
     fn refresh_view(&mut self, logs: &VecDeque<(bool, String)>, logs_generation: u64) -> bool {
         let ring = RingId::of(logs, logs_generation);
         let needle = self.text.trim();
@@ -485,23 +536,44 @@ impl LogsScreen {
         }) {
             return false;
         }
-        // Pure append: the ring only grew (the push count moved exactly in
-        // step with the length — no eviction, so the head is untouched),
-        // with the level/needle/clear inputs unchanged, so the cached rows
-        // are exactly the new rows' prefix. Keep the rows and the measured
-        // layout vectors and admit just the appended tail; the index-keyed
-        // selection stays valid untouched. The clear anchor is positional
-        // and unchanged, so no tail line can be hidden by it.
+        // Forward refresh: the ring's push counter advanced and the
+        // level/needle/clear inputs are unchanged, so the cached rows are
+        // still the new view's rows minus the ones whose lines left the
+        // ring, followed by the unexamined tail. Drop the departed rows
+        // (their measured heights, galleys and prefix sums with them, so the
+        // retained layout stays index-aligned) and admit the tail; the
+        // clear anchor is positional and unchanged, so no tail line can be
+        // hidden by it. The push counter is the watermark: every line with a
+        // sequence below the ring's front is gone, and the cached key's
+        // counter is the first line this view has not examined.
         if let Some(view) = self.view.as_mut()
-            && ring.is_pure_append_from(view.key.ring)
+            && ring.extends_from(view.key.ring)
             && view.key.level == self.level
             && view.key.needle == needle
             && view.key.clear_after_generation == self.clear_after_generation
         {
-            for (from_core, line) in logs.iter().skip(view.key.ring.len) {
+            let front = ring.front();
+            if view.drop_departed_rows(front) > 0 {
+                // Evicted lines the view had admitted shift every later
+                // row's index, so the index-keyed selection (and the copy
+                // action it drives) must go. A refresh that dropped only
+                // unadmitted lines leaves the indices alone and keeps it.
+                self.rows_selection = RowSelection::default();
+            }
+            // `max` covers the ring having rotated past the view's watermark
+            // (the Logs screen was not painted while lines streamed): those
+            // lines are gone, so the walk starts at the oldest survivor.
+            let from = view.key.ring.generation.max(front);
+            for (offset, (from_core, line)) in logs.iter().enumerate().skip((from - front) as usize)
+            {
+                let seq = front + offset as u64;
+                if seq >= ring.generation {
+                    break;
+                }
                 let level = line_level(line);
                 if passes(self.level, level) && contains_ascii_case_insensitive(line, needle) {
                     view.rows.push(FilteredRow {
+                        seq,
                         from_core: *from_core,
                         level,
                         line: line.clone(),
@@ -524,10 +596,11 @@ impl LogsScreen {
             start = start.max(logs.len().saturating_sub(pushed));
         }
         let mut rows = Vec::new();
-        for (from_core, line) in logs.iter().skip(start) {
+        for (offset, (from_core, line)) in logs.iter().enumerate().skip(start) {
             let level = line_level(line);
             if passes(self.level, level) && contains_ascii_case_insensitive(line, needle) {
                 rows.push(FilteredRow {
+                    seq: ring.front() + offset as u64,
                     from_core: *from_core,
                     level,
                     line: line.clone(),
@@ -572,7 +645,7 @@ impl LogsScreen {
     /// coordinates) are laid out per frame, positioned by the memoized
     /// prefix sums — O(log n) lookup, then the visible band only. Heights
     /// are measured once per rebuild and re-fitted when the wrap width or
-    /// spacing changes; a pure append lays out only its admitted tail.
+    /// spacing changes; a forward refresh lays out only its admitted tail.
     /// Both are layout passes, not filter rebuilds.
     fn show_rows(&mut self, ui: &mut Ui, viewport: egui::Rect, lang: Language) {
         // The re-fit decision and its settle tracker must run before `view`
@@ -591,7 +664,7 @@ impl LogsScreen {
         // placeholder color: they are never painted — the label paints the
         // text with the per-frame color. A full re-measure runs only when
         // the measured width/spacing changed (a re-fit) or no rows have
-        // been measured yet (a fresh rebuild); a pure append leaves the
+        // been measured yet (a fresh rebuild); a forward refresh leaves the
         // cached vectors as a measured prefix of `rows`, so only the newly
         // admitted tail is laid out here.
         //
@@ -1415,10 +1488,320 @@ mod tests {
         assert_eq!(screen.rows_selection.anchor, None);
     }
 
+    /// Push one line into a ring that evicts at `cap`, the shape
+    /// `LogBuffer::push` gives the screen once either cap binds: the counter
+    /// advances by one and the oldest entry drops.
+    fn push_capped(
+        logs: &mut VecDeque<(bool, String)>,
+        generation: &mut u64,
+        cap: usize,
+        line: &str,
+    ) {
+        push_line(logs, generation, false, line);
+        while logs.len() > cap {
+            logs.pop_front();
+        }
+    }
+
+    /// A capped ring rotates: each push evicts the oldest line. The memoized
+    /// view must refresh incrementally — dropping the rows whose lines left
+    /// the ring (with their measured layout, rebased on the survivor front)
+    /// and admitting the new tail — and it must agree row for row with a
+    /// view built from scratch at the same ring state.
+    #[test]
+    fn rotation_at_the_cap_drops_and_admits_rows_and_matches_a_rebuild() {
+        const CAP: usize = 4;
+        let mut logs = VecDeque::new();
+        let mut generation = 0u64;
+        for index in 0..CAP {
+            push_capped(
+                &mut logs,
+                &mut generation,
+                CAP,
+                &format!("2026/08/10 12:00:0{index}.000 [Info] line {index}"),
+            );
+        }
+        let mut screen = LogsScreen::default();
+        assert!(screen.refresh_view(&logs, generation));
+        // Simulate a measured frame over the four admitted rows: heights,
+        // galleys and prefix sums cover the same prefix, as `show_rows`
+        // leaves them.
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        // Fonts are only usable after a pass has run, and the seam test needs
+        // galleys to hand the view as its measured prefix.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        let galley = |text: &str| {
+            ctx.fonts_mut(|fonts| {
+                fonts.layout(
+                    text.to_owned(),
+                    egui::FontId::default(),
+                    egui::Color32::PLACEHOLDER,
+                    100.0,
+                )
+            })
+        };
+        {
+            let view = screen.view.as_mut().unwrap();
+            view.heights = vec![10.0; CAP];
+            view.galleys = (0..CAP)
+                .map(|index| galley(&format!("line {index}")))
+                .collect();
+            view.prefix = vec![0.0, 10.0, 20.0, 30.0, 40.0];
+        }
+
+        // Two arrivals, two evictions: the ring stays at its cap.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:04.000 [Info] line 4",
+        );
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:05.000 [Info] line 5",
+        );
+        assert!(screen.refresh_view(&logs, generation));
+        let view = screen.view.as_ref().unwrap();
+        let lines: Vec<&str> = view.rows.iter().map(|row| row.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "2026/08/10 12:00:02.000 [Info] line 2",
+                "2026/08/10 12:00:03.000 [Info] line 3",
+                "2026/08/10 12:00:04.000 [Info] line 4",
+                "2026/08/10 12:00:05.000 [Info] line 5",
+            ],
+            "the two evicted rows are gone and both arrivals are admitted"
+        );
+        assert_eq!(
+            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [2, 3, 4, 5],
+            "each row carries the ring position of its line"
+        );
+        assert_eq!(
+            view.heights,
+            [10.0, 10.0],
+            "the survivors keep their measurements; the tail is left to the layout pass"
+        );
+        assert_eq!(
+            view.prefix,
+            [0.0, 10.0, 20.0],
+            "the prefix sums are rebased on the survivor front"
+        );
+
+        // The same ring state through a view with no history: the incremental
+        // refresh must agree with the rebuild row for row.
+        let mut fresh = LogsScreen::default();
+        assert!(fresh.refresh_view(&logs, generation));
+        let rebuilt = fresh.view.as_ref().unwrap();
+        assert_eq!(
+            rebuilt
+                .rows
+                .iter()
+                .map(|row| (row.seq, row.line.as_str()))
+                .collect::<Vec<_>>(),
+            view.rows
+                .iter()
+                .map(|row| (row.seq, row.line.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !screen.refresh_view(&logs, generation),
+            "the refreshed key still makes the next idle frame a no-op"
+        );
+    }
+
+    /// One push can evict several lines at once: the byte cap binds against a
+    /// run of short lines when a long one arrives, so the length shrinks while
+    /// the counter advances. That refresh is still a forward one — the view
+    /// drops every departed row and admits only the arrival — and the frames
+    /// that follow stay incremental.
+    #[test]
+    fn a_push_that_evicts_a_run_of_lines_still_refreshes_incrementally() {
+        const CAP: usize = 4;
+        let mut rig = UiTestRig::default();
+        for index in 0..CAP {
+            push_capped_rig(&mut rig, CAP, index);
+        }
+        let mut screen = LogsScreen::default();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        run_frame(&ctx, &mut screen, &mut rig);
+        assert_eq!(screen.full_layout_passes, 1);
+
+        // One arrival that pushes three short lines out of the ring.
+        rig.push_log(
+            false,
+            "2026/08/10 12:01:00.000 [Info] a much longer line than the rest".to_string(),
+        );
+        for _ in 0..CAP - 1 {
+            rig.logs.pop_front();
+        }
+        assert_eq!(rig.logs.len(), CAP - 2);
+        run_frame(&ctx, &mut screen, &mut rig);
+
+        let view = screen.view.as_ref().unwrap();
+        assert_eq!(
+            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [3, 4],
+            "the survivors keep their positions and the arrival is admitted"
+        );
+        assert_eq!(view.rows.len(), view.heights.len());
+        assert_eq!(view.prefix.len(), view.rows.len() + 1);
+        assert_eq!(
+            screen.full_layout_passes, 1,
+            "a multi-line eviction must not re-measure the ring"
+        );
+        assert_eq!(screen.tail_layout_passes, 1);
+
+        // The next arrival is a plain one-line rotation at the same length.
+        push_capped_rig(&mut rig, 2, 5);
+        run_frame(&ctx, &mut screen, &mut rig);
+        assert_eq!(
+            screen
+                .view
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.seq)
+                .collect::<Vec<_>>(),
+            [4, 5]
+        );
+        assert_eq!(screen.full_layout_passes, 1);
+        assert_eq!(screen.tail_layout_passes, 2);
+    }
+
+    /// Rotation that evicts lines the filter never admitted leaves the row
+    /// indices alone, so the index-keyed selection survives; a rotation that
+    /// evicts an admitted line shifts them and must drop it.
+    #[test]
+    fn rotation_keeps_the_selection_only_when_no_admitted_row_moved() {
+        const CAP: usize = 4;
+        let mut logs = VecDeque::new();
+        let mut generation = 0u64;
+        // The ring's oldest line is one the filter drops, so the first
+        // rotation evicts an unadmitted line.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:00.000 [Info] noise",
+        );
+        for index in 1..CAP {
+            push_capped(
+                &mut logs,
+                &mut generation,
+                CAP,
+                &format!("2026/08/10 12:00:0{index}.000 [Info] keep {index}"),
+            );
+        }
+        let mut screen = LogsScreen {
+            text: "keep".to_string(),
+            ..Default::default()
+        };
+        assert!(screen.refresh_view(&logs, generation));
+        let selection = RowSelection {
+            anchor: Some(RowCursor {
+                row: 1,
+                ccursor: egui::text::CCursor::new(2),
+            }),
+            active: Some(RowCursor {
+                row: 2,
+                ccursor: egui::text::CCursor::new(3),
+            }),
+        };
+        screen.rows_selection = selection;
+        // The evicted line is the one the filter dropped: no admitted row
+        // moved, and the admitted arrival only extends the tail.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:04.000 [Info] keep 4",
+        );
+        assert!(screen.refresh_view(&logs, generation));
+        assert_eq!(
+            screen.rows_selection.anchor, selection.anchor,
+            "an eviction of unadmitted lines leaves every row index alone"
+        );
+        // The next arrival evicts an admitted line: every later row shifts.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:05.000 [Info] keep 5",
+        );
+        assert!(screen.refresh_view(&logs, generation));
+        assert_eq!(
+            screen.rows_selection.anchor, None,
+            "an eviction of an admitted line must drop the index-keyed selection"
+        );
+    }
+
+    /// Push one line into the rig's ring, evicting the oldest entries so the
+    /// ring stays at `cap` — the shape `LogBuffer::push` gives the screen once
+    /// either cap binds.
+    fn push_capped_rig(rig: &mut UiTestRig, cap: usize, index: usize) {
+        rig.push_log(
+            false,
+            format!("2026/08/10 12:00:{index:02}.000 [Info] line {index}"),
+        );
+        while rig.logs.len() > cap {
+            rig.logs.pop_front();
+        }
+    }
+
+    /// At a cap, an arriving line refreshes through the incremental path: the
+    /// frame extends the retained measurements with the admitted tail instead
+    /// of re-measuring the whole ring, so a streaming session at the cap does
+    /// not pay a full-ring re-layout per line.
+    #[test]
+    fn rotation_at_the_cap_extends_the_measured_layout() {
+        const CAP: usize = 4;
+        let mut rig = UiTestRig::default();
+        for index in 0..CAP {
+            push_capped_rig(&mut rig, CAP, index);
+        }
+        let mut screen = LogsScreen::default();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        run_frame(&ctx, &mut screen, &mut rig);
+        assert_eq!(screen.full_layout_passes, 1);
+        assert_eq!(screen.tail_layout_passes, 0);
+
+        for index in CAP..CAP + 2 {
+            push_capped_rig(&mut rig, CAP, index);
+        }
+        run_frame(&ctx, &mut screen, &mut rig);
+        assert_eq!(
+            screen.full_layout_passes, 1,
+            "a rotation at the cap must not re-measure the ring"
+        );
+        assert_eq!(screen.tail_layout_passes, 1);
+        let view = screen.view.as_ref().unwrap();
+        assert_eq!(
+            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(view.rows.len(), CAP);
+        assert_eq!(view.heights.len(), CAP, "survivors plus the admitted tail");
+        assert_eq!(view.galleys.len(), CAP);
+        assert_eq!(view.prefix.len(), CAP + 1);
+        assert_eq!(view.prefix[0], 0.0);
+    }
+
     /// Build one filtered row the way the view does, so the copy-text
     /// helper is exercised against the row shape the render path hands it.
+    /// The sequence is irrelevant here: the copy helpers address rows by
+    /// index, never by the ring position a row came from.
     fn filtered_row(line: &str) -> FilteredRow {
         FilteredRow {
+            seq: 0,
             from_core: false,
             level: line_level(line),
             line: line.to_string(),

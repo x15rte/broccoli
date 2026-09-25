@@ -3,7 +3,7 @@
 //! module assembles the top-level document and injects tags.
 
 use crate::diag::Diag;
-use crate::i18n::{Key, t_fmt, validation_issue_message, validation_message};
+use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::dns::DEFAULT_PLAINTEXT_RESOLVERS;
 use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
@@ -58,15 +58,11 @@ impl GenerateError {
         match self {
             Self::RawOverride(error) => t_fmt(language, Key::GenRawOverride, &[error]),
             Self::InvalidModel(message) => message.text(language),
-            // A path-scoped finding renders as `"{location}: {message}"`, the
-            // bytes the generator reported before the locale table carried
-            // rule text; whole-model findings use the filled template.
-            Self::InvalidFinding(issue) => match &issue.path {
-                Some(location) if !location.is_empty() => {
-                    format!("{location}: {}", validation_message(&issue.code, language))
-                }
-                _ => validation_issue_message(issue, language),
-            },
+            // One renderer for every finding: `validation_issue_message`
+            // prefixes a non-empty path as `"{location}: {message}"` and fills
+            // the rule's placeholders, so a parameterized rule keeps the value
+            // that names the fault.
+            Self::InvalidFinding(issue) => validation_issue_message(issue, language),
             Self::ApiPort(error) => t_fmt(language, Key::GenApiPort, &[error]),
         }
     }
@@ -621,14 +617,18 @@ fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
         return None;
     }
     let host = host.to_ascii_lowercase();
+    // A trailing-dot address is the same fully-qualified name the importer
+    // accepts and the dial uses, so it stays in the scope with that exact
+    // spelling: Xray matches these `domains` entries textually against the
+    // dialed address, and dropping the entry would send the server's own
+    // resolution back through the DNS module it bootstraps.
     (!host.is_empty()
         && host.len() <= 255
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         && host.contains('.')
-        && !host.starts_with('.')
-        && !host.ends_with('.'))
+        && !host.starts_with('.'))
     .then_some(host)
 }
 /// Host part of a `scheme://host[:port][/path]` endpoint.
@@ -1258,6 +1258,18 @@ mod error_text_tests {
             format!("{path}: {}", validation_message(&code, Language::En))
         );
         assert_eq!(error.to_string(), error.text(Language::En));
+
+        // A parameterized rule keeps the value that names the fault on the
+        // scoped path too: the template's placeholder is filled, not printed.
+        let scoped = GenerateError::InvalidFinding(Box::new(ValidationIssue {
+            code: ValidationCode::FinalmaskUnknownUdpMask(Some("bogus".into())),
+            path: Some(path.into()),
+            severity: Severity::Error,
+        }));
+        let text = scoped.text(Language::En);
+        assert!(text.starts_with(&format!("{path}: ")), "{text}");
+        assert!(text.contains("Some(\"bogus\")"), "{text}");
+        assert!(!text.contains("{:?}"), "{text}");
 
         let whole_model = GenerateError::InvalidFinding(Box::new(ValidationIssue {
             code,

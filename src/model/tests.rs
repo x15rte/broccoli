@@ -1247,6 +1247,38 @@ fn wipe_and_delete_removes_the_file() {
 }
 
 #[test]
+fn unreadable_state_load_fails_and_missing_state_loads_defaults() {
+    with_appdata(|| {
+        crate::sys::paths::ensure_dirs().expect("create dirs");
+        let path = state_file("servers.json");
+        // A directory at the state path opens as a name but not as a file, so
+        // the read fails with a kind that is not `NotFound` — the shape every
+        // transient failure takes (sharing violation, ACL denial, disk error).
+        // Substituting defaults here would arm no load error, and the persist
+        // gate that exists to protect the intact file would stay open.
+        std::fs::create_dir(&path).expect("create directory at the state path");
+
+        let error = load_state::<ServersFile>("servers.json")
+            .expect_err("an unreadable state file must not become defaults");
+        assert!(matches!(error, StateLoadError::Io(_)), "{error:?}");
+        let message = format!("{error}");
+        assert!(
+            message.contains("servers.json"),
+            "the message names the file: {message}"
+        );
+        assert!(message.contains("os error"), "…and the OS error: {message}");
+        assert!(path.is_dir(), "the unreadable path must be left alone");
+
+        // A genuinely absent file is still first run: the parent directory
+        // existing with no state file in it loads defaults.
+        std::fs::remove_dir(&path).expect("remove the blocking directory");
+        let loaded: ServersFile = load_state("servers.json")
+            .expect("a missing state file is a fresh install, not a failure");
+        assert!(loaded.profiles.is_empty() && loaded.active.is_none());
+    });
+}
+
+#[test]
 fn corrupt_state_load_wipes_the_quarantine() {
     with_appdata(|| {
         crate::sys::paths::ensure_dirs().expect("create dirs");

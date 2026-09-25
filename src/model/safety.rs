@@ -14,7 +14,7 @@
 
 use super::inbound::{
     BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_OUTBOUND_TAG, DokodemoNetwork,
-    LocalInboundProtocol,
+    LocalInboundProtocol, socket_address,
 };
 use super::servers::ServerProfile;
 use super::servers::ServersFile;
@@ -68,11 +68,13 @@ fn finding(path: String, class: HazardClass, code: SafetyCode) -> SafetyFinding 
 /// A listen address bound beyond loopback: any parseable IP that is not a
 /// loopback address; the wildcards 0.0.0.0/::, LAN IPs, and anything else
 /// non-loopback count as exposed — the wildcards bind every interface and
-/// are exactly the exposure this rule flags. Unparseable values are skipped:
-/// the validation layer owns invalidity, and this must never panic.
+/// are exactly the exposure this rule flags. The address is classified in
+/// its socket form ([`inbound::socket_address`]), so an IPv4-mapped loopback
+/// literal is loopback here too. Unparseable values are skipped: the
+/// validation layer owns invalidity, and this must never panic.
 fn is_exposed_listen(s: &str) -> bool {
     s.parse::<std::net::IpAddr>()
-        .is_ok_and(|address| !address.is_loopback())
+        .is_ok_and(|address| !socket_address(address).is_loopback())
 }
 
 /// Assess one settings + servers model for safety hazards: one pass, no
@@ -249,7 +251,7 @@ mod tests {
 
     #[test]
     fn noauth_socks_beyond_loopback_exposes() {
-        for listen in ["192.168.1.5", "::"] {
+        for listen in ["192.168.1.5", "::", "::ffff:192.168.1.5"] {
             let findings = assess(&ServersFile::default(), &with_socks(listen));
             assert_eq!(findings.len(), 1, "listen {listen:?} must expose");
             assert_eq!(findings[0].path, "localInbounds[0].listen");
@@ -263,7 +265,9 @@ mod tests {
 
     #[test]
     fn loopback_listeners_are_safe() {
-        for listen in ["127.0.0.1", "::1"] {
+        // The IPv4-mapped spellings bind the same loopback sockets as their
+        // plain forms, so neither may be reported as exposed.
+        for listen in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
             assert!(
                 assess(&ServersFile::default(), &with_socks(listen)).is_empty(),
                 "socks {listen:?} must be safe"

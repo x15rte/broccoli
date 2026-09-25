@@ -167,7 +167,7 @@ pub(crate) fn resolve_probe_interface(
 }
 
 pub(crate) async fn run(
-    profiles: Vec<ServerProfile>,
+    profiles: &[ServerProfile],
     probe_url: String,
     tun_outbound_interface: Option<String>,
     tun_adapter_name: Option<String>,
@@ -204,7 +204,7 @@ pub(crate) async fn run(
 
     let requested_tags: Vec<String> = profiles.iter().map(ServerProfile::tag).collect();
     let config =
-        r#gen::generate_latency_probe(&profiles, &probe_url, api_port, interface.as_deref())
+        r#gen::generate_latency_probe(profiles, &probe_url, api_port, interface.as_deref())
             .map_err(|error| ProbeFailure::plain(Diag::new(Key::ProbeConfigRejected).arg(error)))?;
     // `TempDir`'s drop removes this directory — and the config with every
     // probed profile's credentials — on every path a run can take
@@ -571,7 +571,7 @@ mod tests {
             ..ServerProfile::new("probe", OutboundModel::new(Protocol::Freedom))
         }];
         let error = run(
-            profiles,
+            &profiles,
             "http://127.0.0.1:9/health".into(),
             None,
             None,

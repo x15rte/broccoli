@@ -12,7 +12,8 @@ use crate::diag::Diag;
 use crate::i18n::Key;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, PSID, TOKEN_QUERY, WinBuiltinAdministratorsSid,
+    CheckTokenMembership, CreateWellKnownSid, PSID, SECURITY_MAX_SID_SIZE, TOKEN_QUERY,
+    WinBuiltinAdministratorsSid,
 };
 use windows::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
@@ -37,25 +38,33 @@ unsafe extern "system" {
 /// `SE_ERR_ACCESSDENIED` from ShellExecuteW: the user cancelled the UAC prompt.
 const SE_ERR_ACCESSDENIED: isize = 5;
 
+/// SID buffer aligned for the Win32 `SID` layout (`Rev`, `SubAuthorityCount`,
+/// a 6-byte authority, `SubAuthority: [u32; 1]` — alignment 4), which a bare
+/// `[u8; N]` would leave to stack luck. `SECURITY_MAX_SID_SIZE` is the
+/// documented capacity for any well-known SID; the Administrators alias SID
+/// needs 16 of its bytes.
+#[repr(align(4))]
+struct SidBuffer([u8; SECURITY_MAX_SID_SIZE as usize]);
+
 /// `true` when the current process token is a member of the Administrators
 /// group (i.e. running elevated, or as a service/system account).
 pub fn is_elevated() -> bool {
     unsafe {
-        // SAFETY: `buf` is 68 bytes — `SECURITY_MAX_SID_SIZE`, the documented
-        // capacity for any well-known SID — and `cb` is its length, so
+        // SAFETY: `buffer` covers `SECURITY_MAX_SID_SIZE` bytes at an address
+        // 4-byte aligned by its type, and `cb` is that length, so
         // `CreateWellKnownSid` writes at most `cb` bytes into the live,
         // writable buffer and reports the used size back through `cb`; on
-        // success the buffer holds a valid SID and `PSID(buf.as_ptr()…)`
-        // points at it for `CheckTokenMembership` (which reads it in place).
+        // success the buffer holds a valid SID at offset 0 and
+        // `PSID(buffer.as_ptr()…)` points at it, aligned for the `SID`
+        // fields, for `CheckTokenMembership` (which reads it in place).
         // `member` is a valid BOOL out-parameter, and every error return is
         // handled rather than ignored.
-        // SECURITY_MAX_SID_SIZE is 68; the Administrators alias SID needs 16.
-        let mut buf = [0u8; 68];
-        let mut cb = buf.len() as u32;
+        let mut buffer = SidBuffer([0u8; SECURITY_MAX_SID_SIZE as usize]);
+        let mut cb = buffer.0.len() as u32;
         if CreateWellKnownSid(
             WinBuiltinAdministratorsSid,
             None,
-            Some(PSID(buf.as_mut_ptr() as *mut core::ffi::c_void)),
+            Some(PSID(buffer.0.as_mut_ptr() as *mut core::ffi::c_void)),
             &mut cb,
         )
         .is_err()
@@ -65,7 +74,7 @@ pub fn is_elevated() -> bool {
         let mut member = BOOL(0);
         match CheckTokenMembership(
             None,
-            PSID(buf.as_ptr() as *mut core::ffi::c_void),
+            PSID(buffer.0.as_ptr() as *mut core::ffi::c_void),
             &mut member,
         ) {
             Ok(()) => member.as_bool(),

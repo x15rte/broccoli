@@ -2089,7 +2089,7 @@ impl Runtime {
         let log = self.log_sink();
         let task = tokio::spawn(async move {
             let result = latency::run(
-                profiles.clone(),
+                &profiles,
                 probe_url,
                 tun_outbound_interface,
                 tun_adapter_name,
@@ -3545,12 +3545,23 @@ impl Runtime {
         self.emit(CoreEvt::Observatory(statuses));
     }
 
-    async fn housekeeping(&mut self) {
-        if let Some(at) = self.pending_restart
-            && Instant::now() >= at
+    /// Whether housekeeping starts the replacement backend now: the pending
+    /// restart's deadline has passed, the exit policy is not stopping, no
+    /// backend is alive — and the runtime is not shutting down. The last
+    /// clause matters because `Shutdown` deliberately leaves the child running
+    /// while a worker-owned record (`ValidateProfiles`, `UpdateCore`) keeps the
+    /// loop alive to its exactly-one terminal: an exit that lands inside that
+    /// window classifies as an unexpected one, re-arms the restart machinery,
+    /// and would otherwise start a core this teardown is about to reap.
+    fn restart_due(&self) -> bool {
+        !self.shutting_down
+            && self.pending_restart.is_some_and(|at| Instant::now() >= at)
             && !self.exit_policy.stopping()
             && !self.backend.is_alive()
-        {
+    }
+
+    async fn housekeeping(&mut self) {
+        if self.restart_due() {
             self.pending_restart = None;
             self.start_backend().await;
         }
@@ -5786,6 +5797,49 @@ mod tests {
                 .count(),
             1,
             "the terminal releases the window exactly once before teardown"
+        );
+    }
+
+    /// A restart that comes due after `Shutdown` must not start a backend.
+    /// `Shutdown` clears the pending restart, resets the exit policy to idle
+    /// and leaves the child running while a worker-owned record holds the loop
+    /// open; a core exit inside that window re-arms the restart machinery, and
+    /// the housekeeping tick that follows must refuse it — otherwise teardown
+    /// spawns (and then kills) a core it never needed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_stays_undue_after_shutdown() {
+        let (_command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) =
+            std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
+        let mut runtime = Runtime::new(command_receiver, event_sender, egui::Context::default());
+
+        // The backoff arm's shape: a deadline that has passed and no live
+        // backend.
+        runtime.pending_restart = Some(Instant::now());
+        assert!(
+            runtime.restart_due(),
+            "an elapsed restart with no live backend is due"
+        );
+
+        runtime.shutting_down = true;
+        assert!(!runtime.restart_due(), "a shutdown must refuse the restart");
+
+        runtime.shutting_down = false;
+        runtime.exit_policy.begin_stop(Instant::now());
+        assert!(
+            !runtime.restart_due(),
+            "a requested stop still refuses the restart"
+        );
+
+        runtime.exit_policy.finish();
+        assert!(
+            runtime.restart_due(),
+            "clearing the stop request makes the same restart due again"
+        );
+        runtime.pending_restart = None;
+        assert!(
+            !runtime.restart_due(),
+            "no pending restart means nothing to start"
         );
     }
 

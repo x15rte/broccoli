@@ -2458,6 +2458,34 @@ fn domain_addressed_outbound_gets_bootstrap_dns_and_useip() {
     );
 }
 
+/// A trailing-dot server address is the same fully-qualified name the dial
+/// uses, so it keeps a scoped bootstrap entry with that exact spelling
+/// instead of being resolved back through the DNS module it bootstraps.
+#[test]
+fn trailing_dot_server_domain_still_gets_a_scoped_bootstrap_entry() {
+    let mut settings = base_settings();
+    settings.dns.servers = vec![DnsServer {
+        address: "https://1.1.1.1/dns-query".into(),
+        ..Default::default()
+    }];
+    settings.dns.bootstrap = String::new();
+    let cfg = generate_deterministic(
+        &single_server(vless_server("srv.example.com.", 443)),
+        &settings,
+    )
+    .expect("generate config");
+
+    assert_eq!(
+        cfg["dns"]["servers"][1]["domains"],
+        json!(["domain:srv.example.com."]),
+        "the scope entry must carry the address spelling the dial uses"
+    );
+    assert_eq!(
+        cfg["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
+        json!("useip")
+    );
+}
+
 #[test]
 fn bootstrap_dns_localhost_default_resolves_proxy_domains_via_os() {
     // DnsCfg::default() bootstraps proxy-server domains through the

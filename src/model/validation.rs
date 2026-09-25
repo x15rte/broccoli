@@ -48,6 +48,11 @@ pub enum ValidationCode {
     // ---- stream / transport invariants (validate_stream) ----
     XhttpDepthExceeded,
     TransportSettingsMissing(Network),
+    /// A transport's `headers` map carries a value that is not a string. Xray
+    /// types both `wsSettings.headers` and `httpupgradeSettings.headers` as
+    /// `map[string]string`, so a non-string value makes the whole document
+    /// unloadable; the share-link grammar refuses the same value on import.
+    HeaderValuesNotStrings(Network),
     HysteriaTransportRequiresTls,
     /// Both the outbound `settings.version` and the transport
     /// `hysteriaSettings.version` collapse into this one rule; the issue's
@@ -1731,6 +1736,31 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
                 Some("stream.hysteriaSettings".into()),
             )),
             _ => {}
+        }
+        // Both headers maps reach Xray's `map[string]string` fields, and a
+        // non-string value (a hand-edited state file, or an extra-map key kept
+        // verbatim from one) makes the generated document unloadable. The
+        // share-link grammar refuses the same value on import, so the state
+        // load is the only way in — and generation must refuse it with a
+        // message that names the rule instead of spending a core start on it.
+        let headers = match stream.network {
+            Network::Ws => stream
+                .ws_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.wsSettings.headers")),
+            Network::Httpupgrade => stream
+                .httpupgrade_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.httpupgradeSettings.headers")),
+            _ => None,
+        };
+        if let Some((headers, path)) = headers
+            && headers.values().any(|value| !value.is_string())
+        {
+            issues.push(issue(
+                ValidationCode::HeaderValuesNotStrings(stream.network),
+                Some(path.into()),
+            ));
         }
         if stream.network == Network::Hysteria {
             if stream.security != Security::Tls {
@@ -4068,8 +4098,8 @@ mod tests {
     use super::*;
     use crate::model::outbound::{OutboundModel, Protocol, ProtocolSettings};
     use crate::model::stream::{
-        CustomSockopt, GrpcSettings, HysteriaTransport, KcpSettings, Security, SockoptModel,
-        XhttpSettings,
+        CustomSockopt, GrpcSettings, HttpupgradeSettings, HysteriaTransport, KcpSettings, Security,
+        SockoptModel, WsSettings, XhttpSettings,
     };
     use serde_json::json;
 
@@ -4108,6 +4138,81 @@ mod tests {
             ValidationCode::SockoptDomainStrategyInvalid,
         ] {
             assert!(found.contains(&code), "missing {code:?} in {found:#?}");
+        }
+    }
+
+    /// Xray types `wsSettings.headers` and `httpupgradeSettings.headers` as
+    /// `map[string]string`. A non-string value cannot be built into the
+    /// document (and cannot be migrated out of the legacy `Host` form), and
+    /// only a hand-edited state file can carry one — the share-link grammar
+    /// refuses it on import — so the model must gate it with a field-scoped
+    /// finding instead of spending a core start on the failure.
+    #[test]
+    fn non_string_transport_header_values_gate_the_profile() {
+        for (network, path) in [
+            (Network::Ws, "stream.wsSettings.headers"),
+            (Network::Httpupgrade, "stream.httpupgradeSettings.headers"),
+        ] {
+            let headers = |value: Value| {
+                let mut headers = serde_json::Map::new();
+                headers.insert("Host".to_string(), value);
+                headers
+            };
+
+            let mut outbound = vless_canonical();
+            outbound.stream.network = network;
+            match network {
+                Network::Ws => {
+                    outbound.stream.ws_settings = Some(WsSettings {
+                        headers: headers(json!(123)),
+                        ..Default::default()
+                    })
+                }
+                Network::Httpupgrade => {
+                    outbound.stream.httpupgrade_settings = Some(HttpupgradeSettings {
+                        headers: headers(json!(123)),
+                        ..Default::default()
+                    })
+                }
+                _ => unreachable!(),
+            }
+            let issues = validate_outbound(&outbound);
+            let finding = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::HeaderValuesNotStrings(network))
+                .unwrap_or_else(|| {
+                    panic!("{network:?} must gate a non-string header value: {issues:#?}")
+                });
+            assert_eq!(finding.path.as_deref(), Some(path));
+            assert_eq!(finding.severity, Severity::Error);
+
+            // A string-valued map — including the legacy `Host` form the wire
+            // pass canonicalizes — still validates.
+            let mut outbound = vless_canonical();
+            outbound.stream.network = network;
+            let string_headers = headers(json!("example.com"));
+            match network {
+                Network::Ws => {
+                    outbound.stream.ws_settings = Some(WsSettings {
+                        headers: string_headers,
+                        ..Default::default()
+                    })
+                }
+                Network::Httpupgrade => {
+                    outbound.stream.httpupgrade_settings = Some(HttpupgradeSettings {
+                        headers: string_headers,
+                        ..Default::default()
+                    })
+                }
+                _ => unreachable!(),
+            }
+            let issues = validate_outbound(&outbound);
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| matches!(issue.code, ValidationCode::HeaderValuesNotStrings(_))),
+                "{network:?} must accept string header values: {issues:#?}"
+            );
         }
     }
 

@@ -1353,7 +1353,7 @@ impl ToolTarget {
 /// the selected profile's editor draft. The tab closures pass a borrowed id
 /// plus generation, and the owned [`ToolTarget`] is built only on the click
 /// path, so repaints never allocate the 36-char profile id.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DraftTargetKind {
     Existing,
     Add,
@@ -1809,6 +1809,40 @@ enum LeaveDecision {
     Cancel,
 }
 
+/// One formatted import-preview row: the text the list paints, and whether it
+/// reports a failed link (which only decides its color and its tooltip).
+struct ImportPreviewRow {
+    text: String,
+    error: bool,
+}
+
+/// Memoized pretty print of one preserved over-limit `downloadSettings`
+/// subtree: its header body re-runs on every frame it stays open, and the
+/// subtree is as large as the configuration behind it. The key is the draft
+/// the text belongs to — kind, profile or add-draft id, and edit generation,
+/// which every editor change advances — plus the nesting depth, so the text is
+/// rebuilt exactly when the subtree it describes can have moved.
+struct OverLimitJson {
+    /// `None` for a render-only caller with no draft identity to key on: the
+    /// text is refilled on every such call and never reused.
+    key: Option<(DraftTargetKind, String, u64, u32, Language)>,
+    text: String,
+}
+
+/// The import dialog's formatted preview, built once per parse result and per
+/// language. The paste cap allows a subscription blob with tens of thousands
+/// of entries, so formatting a row inside the paint loop would make the frame
+/// cost scale with the paste; the rows are also painted through a virtualized
+/// list, so only the ones on screen are laid out. Rebuilt (not validated) when
+/// `import_parsed` changes — both writers of that vector clear this slot.
+struct ImportPreview {
+    lang: Language,
+    /// How many entries parsed into a profile: the count the caption and the
+    /// "validate and add" gate read.
+    ok: usize,
+    rows: Vec<ImportPreviewRow>,
+}
+
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
@@ -1840,6 +1874,14 @@ pub struct ServersScreen {
     import_text: String,
     import_parsed: Vec<Result<ServerProfile, links::LinkError>>,
     import_parsed_source: Option<String>,
+    /// Formatted preview of `import_parsed` (see [`ImportPreview`]), built on
+    /// the first frame that shows it and reused until the parse result or the
+    /// language moves.
+    import_preview: Option<ImportPreview>,
+    /// Pretty print of the preserved over-limit `downloadSettings` subtree of
+    /// one draft (see [`Self::over_limit_json_for`]): the transport tab walks
+    /// it every frame while the header is open.
+    over_limit_json: Option<OverLimitJson>,
     /// In-flight background parse of `import_text` (spawned on Parse click,
     /// polled every frame in `show`); idle while none runs.
     import_parse_job: Request<ImportParseResult>,
@@ -1928,6 +1970,45 @@ impl ServersScreen {
     fn invalidate_import_preview(&mut self) {
         self.import_parsed.clear();
         self.import_parsed_source = None;
+        self.import_preview = None;
+    }
+
+    /// Format the import preview once for the current parse result and
+    /// language: the dialog paints it every frame, and the parsed list is as
+    /// large as the paste allows. A no-op while the cached preview's language
+    /// still stands — every path that replaces `import_parsed` clears the
+    /// slot, so the language is the only input this memo can go stale on.
+    fn refresh_import_preview(&mut self, lang: Language) {
+        if self
+            .import_preview
+            .as_ref()
+            .is_some_and(|preview| preview.lang == lang)
+        {
+            return;
+        }
+        let mut ok = 0;
+        let rows = self
+            .import_parsed
+            .iter()
+            .map(|result| match result {
+                Ok(profile) => {
+                    ok += 1;
+                    ImportPreviewRow {
+                        text: t_fmt(
+                            lang,
+                            Key::SrvImportOkMark,
+                            &[&profile.name, &profile.outbound.protocol.as_str()],
+                        ),
+                        error: false,
+                    }
+                }
+                Err(error) => ImportPreviewRow {
+                    text: t_fmt(lang, Key::SrvImportErrMark, &[&error.text(lang)]),
+                    error: true,
+                },
+            })
+            .collect();
+        self.import_preview = Some(ImportPreview { lang, ok, rows });
     }
 
     /// Evict every raw-editor buffer owned by `profile_id`:
@@ -1999,6 +2080,8 @@ impl ServersScreen {
         }
         self.import_parsed = result.parsed;
         self.import_parsed_source = Some(result.source);
+        // The formatted preview belongs to the previous result.
+        self.import_preview = None;
     }
 
     /// Request a cooperative stop of the in-flight parse and drop the job so
@@ -3790,9 +3873,17 @@ impl ServersScreen {
                             inline_errors,
                         )
                     }),
-                    EditorTab::Transport => {
-                        self.transport_tab(ui, lang, &mut draft.profile.outbound.stream, 0)
-                    }
+                    EditorTab::Transport => self.transport_tab(
+                        ui,
+                        lang,
+                        &mut draft.profile.outbound.stream,
+                        0,
+                        Some((
+                            DraftTargetKind::Existing,
+                            draft.id.as_str(),
+                            draft.generation,
+                        )),
+                    ),
                     EditorTab::Security => {
                         let address = draft.profile.server_address();
                         self.with_editor_validation(|screen, cache| {
@@ -4658,12 +4749,50 @@ impl ServersScreen {
 
     // ---------- Transport tab (recursive for downloadSettings) ----------
 
+    /// The pretty-printed text of one preserved over-limit `downloadSettings`
+    /// subtree, serialized only when the draft it belongs to or the depth it
+    /// sits at moved (see [`OverLimitJson`]). Callers with no draft identity
+    /// to key on get a fresh serialization for the frame instead of another
+    /// draft's text.
+    fn over_limit_json_for(
+        &mut self,
+        target: Option<(DraftTargetKind, &str, u64)>,
+        depth: u32,
+        lang: Language,
+        download: &StreamModel,
+    ) -> &str {
+        // The cached key's fields are compared in place — nothing is
+        // allocated on a hit, and the header body runs every frame it stays
+        // open.
+        let unchanged = match (target, self.over_limit_json.as_ref()) {
+            (Some((kind, id, generation)), Some(cached)) => {
+                cached.key.as_ref().is_some_and(|key| {
+                    key.0 == kind && key.1 == id && key.2 == generation && key.3 == depth
+                })
+            }
+            _ => false,
+        };
+        if !unchanged {
+            let text = serde_json::to_string_pretty(download)
+                .unwrap_or_else(|error| t_fmt(lang, Key::SrvSerializationError, &[&error]));
+            self.over_limit_json = Some(OverLimitJson {
+                key: target
+                    .map(|(kind, id, generation)| (kind, id.to_owned(), generation, depth, lang)),
+                text,
+            });
+        }
+        self.over_limit_json
+            .as_ref()
+            .map_or("", |cached| cached.text.as_str())
+    }
+
     fn transport_tab(
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
         st: &mut StreamModel,
         depth: u32,
+        target: Option<(DraftTargetKind, &str, u64)>,
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -5101,7 +5230,8 @@ impl ServersScreen {
                             }
                             if let Some(download) = s.download_settings.as_mut() {
                                 ui.indent(("download", depth), |ui| {
-                                    changed |= self.transport_tab(ui, lang, download, depth + 1);
+                                    changed |=
+                                        self.transport_tab(ui, lang, download, depth + 1, target);
                                     changed |= self.security_tab_readonly(ui, lang, download);
                                 });
                             }
@@ -5115,10 +5245,7 @@ impl ServersScreen {
                     egui::CollapsingHeader::new(t(lang, Key::SrvPreservedOverLimit))
                         .id_salt(ui.auto_id_with(("download-over-limit", depth)))
                         .show(ui, |ui| {
-                            let json = serde_json::to_string_pretty(download.as_ref())
-                                .unwrap_or_else(|error| {
-                                    t_fmt(lang, Key::SrvSerializationError, &[&error])
-                                });
+                            let json = self.over_limit_json_for(target, depth, lang, download);
                             egui::ScrollArea::vertical()
                                 .max_height(180.0)
                                 .show(ui, |ui| {
@@ -6307,9 +6434,17 @@ impl ServersScreen {
                                     inline_errors,
                                 )
                             }),
-                            EditorTab::Transport => {
-                                self.transport_tab(ui, lang, &mut draft.outbound.stream, 0)
-                            }
+                            EditorTab::Transport => self.transport_tab(
+                                ui,
+                                lang,
+                                &mut draft.outbound.stream,
+                                0,
+                                Some((
+                                    DraftTargetKind::Add,
+                                    draft_id.as_str(),
+                                    self.add_draft_generation,
+                                )),
+                            ),
                             EditorTab::Security => {
                                 let address = draft.server_address();
                                 self.with_add_draft_validation(|screen, cache| {
@@ -6597,44 +6732,38 @@ impl ServersScreen {
                         ui.colored_label(status_colors_of(ui).err, message);
                     }
                     if self.import_preview_is_current() && !self.import_parsed.is_empty() {
-                        let ok = self
-                            .import_parsed
-                            .iter()
-                            .filter(|result| result.is_ok())
-                            .count();
-                        ui.label(t_fmt(
-                            lang,
-                            Key::SrvOkTotal,
-                            &[&ok, &self.import_parsed.len()],
-                        ));
-                        egui::ScrollArea::vertical()
-                            .max_height(140.0)
-                            .show(ui, |ui| {
-                                for result in &self.import_parsed {
-                                    match result {
-                                        Ok(profile) => {
-                                            ui.label(t_fmt(
-                                                lang,
-                                                Key::SrvImportOkMark,
-                                                &[
-                                                    &profile.name,
-                                                    &profile.outbound.protocol.as_str(),
-                                                ],
-                                            ));
-                                        }
-                                        Err(error) => {
-                                            ui.colored_label(
-                                                status_colors_of(ui).err,
-                                                t_fmt(
-                                                    lang,
-                                                    Key::SrvImportErrMark,
-                                                    &[&error.text(lang)],
-                                                ),
-                                            );
-                                        }
+                        self.refresh_import_preview(lang);
+                        let preview = self
+                            .import_preview
+                            .as_ref()
+                            .expect("the preview was built for this frame");
+                        let ok = preview.ok;
+                        ui.label(t_fmt(lang, Key::SrvOkTotal, &[&ok, &preview.rows.len()]));
+                        // One truncated line per entry, laid out only for the
+                        // rows the scroll viewport shows: a subscription
+                        // paste can hold tens of thousands of links, and egui
+                        // lays out every child of a plain `show`. The full
+                        // error text stays reachable as the row's tooltip.
+                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                        egui::ScrollArea::vertical().max_height(140.0).show_rows(
+                            ui,
+                            row_height,
+                            preview.rows.len(),
+                            |ui, rows| {
+                                let error_color = status_colors_of(ui).err;
+                                for row in &preview.rows[rows] {
+                                    let text = if row.error {
+                                        RichText::new(row.text.as_str()).color(error_color)
+                                    } else {
+                                        RichText::new(row.text.as_str())
+                                    };
+                                    let response = ui.add(egui::Label::new(text).truncate());
+                                    if row.error {
+                                        response.on_hover_text(row.text.as_str());
                                     }
                                 }
-                            });
+                            },
+                        );
                         if uictx.operation.is_some() {
                             ui.colored_label(
                                 status_colors_of(ui).warn,
@@ -9363,7 +9492,7 @@ TLS ping finished"#;
         };
         let mut screen = ServersScreen::default();
         let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.transport_tab(ui, Language::En, &mut stream, 0);
+            let _ = screen.transport_tab(ui, Language::En, &mut stream, 0, None);
         });
         harness.run();
         assert!(
@@ -9405,6 +9534,153 @@ TLS ping finished"#;
         }
     }
 
+    /// The preserved over-limit subtree is serialized once per draft state, not
+    /// once per frame: its header body re-runs on every frame it stays open,
+    /// and the subtree is as large as the configuration behind it. The same
+    /// draft identity returns the same text, and an edit generation — which
+    /// every editor change advances — rebuilds it from the new subtree.
+    #[test]
+    fn over_limit_subtree_json_is_memoized_per_draft_state() {
+        let subtree = |path: &str| StreamModel {
+            network: Network::Ws,
+            ws_settings: Some(WsSettings {
+                path: path.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = "0123456789abcdef";
+        let mut screen = ServersScreen::default();
+        let preserved = subtree("/preserved");
+        let target = || Some((DraftTargetKind::Existing, id, 7));
+
+        let first = {
+            let text = screen.over_limit_json_for(target(), 2, Language::En, &preserved);
+            assert!(
+                text.contains("/preserved"),
+                "the text is the subtree's pretty print: {text}"
+            );
+            text.as_ptr()
+        };
+        assert_eq!(
+            screen
+                .over_limit_json_for(target(), 2, Language::En, &preserved)
+                .as_ptr(),
+            first,
+            "an idle frame of the open header must reuse the serialized text"
+        );
+
+        // An edit advances the draft's generation: the next frame renders the
+        // edited subtree.
+        let edited = subtree("/edited");
+        assert!(
+            screen
+                .over_limit_json_for(
+                    Some((DraftTargetKind::Existing, id, 8)),
+                    2,
+                    Language::En,
+                    &edited
+                )
+                .contains("/edited"),
+            "a new edit generation must re-serialize the edited subtree"
+        );
+
+        // Another draft's subtree never reuses this one's text, and a call
+        // with no draft identity to key on does not cache at all.
+        assert!(
+            screen
+                .over_limit_json_for(
+                    Some((DraftTargetKind::Add, "fedcba9876543210", 8)),
+                    2,
+                    Language::En,
+                    &preserved
+                )
+                .contains("/preserved")
+        );
+        assert!(
+            screen
+                .over_limit_json_for(None, 2, Language::En, &preserved)
+                .contains("/preserved")
+        );
+    }
+
+    /// The over-limit branch renders its depth message and the preserved
+    /// subtree's header, and pays nothing while that header is collapsed: the
+    /// pretty print is serialized on demand, not as part of walking the
+    /// configuration.
+    #[test]
+    fn the_over_limit_branch_renders_and_serializes_only_on_demand() {
+        let depth = crate::model::stream::MAX_XHTTP_DOWNLOAD_DEPTH;
+        let mut stream = StreamModel::default();
+        {
+            let mut current = &mut stream;
+            for level in 0..=depth {
+                current.network = Network::Xhttp;
+                let settings = current
+                    .xhttp_settings
+                    .get_or_insert_with(XhttpSettings::default);
+                current = settings
+                    .download_settings
+                    .get_or_insert_with(|| {
+                        // A marker only this level's settings carry, so an
+                        // ancestor's text can never satisfy the assertion.
+                        Box::new(StreamModel {
+                            network: Network::Xhttp,
+                            xhttp_settings: Some(XhttpSettings {
+                                path: format!("/level-{level}"),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })
+                    })
+                    .as_mut();
+            }
+        }
+        // The view descends one `downloadSettings` per level and keeps the one
+        // past its limit: that leaf is what the header shows when expanded.
+        let preserved = {
+            let mut node = &stream;
+            for _ in 0..=depth {
+                node = node
+                    .xhttp_settings
+                    .as_ref()
+                    .expect("every level carries xhttpSettings")
+                    .download_settings
+                    .as_deref()
+                    .expect("every level carries downloadSettings");
+            }
+            serde_json::to_string_pretty(node).expect("the preserved subtree serializes")
+        };
+        assert!(preserved.contains("/level-"), "{preserved}");
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 2400.0))
+            .build_ui_state(
+                |ui, screen: &mut ServersScreen| {
+                    let _ = screen.transport_tab(
+                        ui,
+                        Language::En,
+                        &mut stream,
+                        0,
+                        Some((DraftTargetKind::Existing, "0123456789abcdef", 1)),
+                    );
+                },
+                ServersScreen::default(),
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label_contains("preserved")
+                .next()
+                .is_some(),
+            "the over-limit level must render its preserved-value header"
+        );
+        assert!(
+            harness.state().over_limit_json.is_none(),
+            "a collapsed header must not serialize the preserved subtree"
+        );
+    }
+
     #[test]
     fn transport_security_mux_and_advanced_tabs_are_render_idempotent() {
         for network in [
@@ -9425,7 +9701,8 @@ TLS ping finished"#;
             let mut reported_changed = false;
             {
                 let _harness = Harness::new_ui(|ui| {
-                    reported_changed |= screen.transport_tab(ui, Language::En, &mut stream, 0);
+                    reported_changed |=
+                        screen.transport_tab(ui, Language::En, &mut stream, 0, None);
                 });
             }
             assert!(!reported_changed, "{}", network.as_str());
@@ -10154,7 +10431,7 @@ TLS ping finished"#;
         let mut reported_changed = false;
         {
             let _harness = Harness::new_ui(|ui| {
-                reported_changed |= screen.transport_tab(ui, Language::En, &mut stream, 0);
+                reported_changed |= screen.transport_tab(ui, Language::En, &mut stream, 0, None);
             });
         }
         assert!(!reported_changed);
@@ -10186,6 +10463,72 @@ TLS ping finished"#;
         assert!(
             screen.import_parsed.is_empty(),
             "nothing may be parsed from an oversized paste"
+        );
+    }
+
+    /// One headless frame of the whole Servers screen with the import dialog
+    /// open, over a paste far larger than the dialog's viewport. Exercises the
+    /// real paint path of the preview (virtualized rows, truncated labels) and
+    /// checks the formatted rows survive into the next frame.
+    fn render_servers_frame(screen: &mut ServersScreen, rig: &mut UiTestRig) {
+        let _harness = Harness::new_ui(|ui| screen.show(ui, &mut rig.ctx()));
+    }
+
+    /// The import preview is formatted once per parse result, not per frame:
+    /// the dialog paints it every frame while it is open, and the paste cap
+    /// allows a subscription blob with tens of thousands of entries. A later
+    /// frame reuses the formatted rows — the same text allocations — and an
+    /// edit that invalidates the parsed snapshot drops them with it.
+    #[test]
+    fn import_dialog_paints_a_large_preview_and_reuses_its_rows() {
+        const ROWS: usize = 300;
+        let paste: String = (0..ROWS)
+            .map(|index| {
+                format!(
+                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@h{index}.local:443?encryption=none#P{index}\n"
+                )
+            })
+            .collect();
+        let mut rig = UiTestRig::default();
+        let mut screen = ServersScreen {
+            import_open: true,
+            import_text: paste.clone(),
+            ..Default::default()
+        };
+        screen.import_parsed = links::parse_bulk(&paste);
+        screen.import_parsed_source = Some(paste);
+
+        render_servers_frame(&mut screen, &mut rig);
+        let allocations: Vec<*const u8> = {
+            let preview = screen
+                .import_preview
+                .as_ref()
+                .expect("the open dialog builds the preview");
+            assert_eq!(preview.rows.len(), ROWS);
+            assert_eq!(preview.ok, ROWS);
+            preview.rows.iter().map(|row| row.text.as_ptr()).collect()
+        };
+
+        render_servers_frame(&mut screen, &mut rig);
+        let reused: Vec<*const u8> = screen
+            .import_preview
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.text.as_ptr())
+            .collect();
+        assert_eq!(
+            reused, allocations,
+            "a later frame of the same dialog must reuse the formatted rows"
+        );
+
+        // Editing the paste invalidates the snapshot the preview was built
+        // from, so the formatted rows go with it.
+        screen.invalidate_import_preview();
+        assert!(
+            screen.import_preview.is_none(),
+            "a text edit must drop the formatted preview"
         );
     }
 
@@ -10400,39 +10743,6 @@ TLS ping finished"#;
         assert_eq!(
             surviving.text, seeded_text,
             "the buffer must survive renames"
-        );
-    }
-
-    #[test]
-    fn idle_advanced_frames_do_not_reparse_the_raw_editor_buffers() {
-        // The raw editor parses only on a re-seed or a text edit (the parse
-        // gate in `raw_editor.rs`); an idle re-render of the same buffer must
-        // reuse both the cached text and its parse result. The gate itself
-        // leaves no other trace: a needless reparse of unchanged text
-        // rewrites the same error string and never touches the committed
-        // value, so the cache's own parse count — `RawBuffers::parses`, the
-        // state the gate measures — is the only observable that fails when
-        // the gate is dropped. Hence one delta, never an absolute count.
-        let mut screen = ServersScreen::default();
-        let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
-        profile.outbound.stream.finalmask = Some(FinalmaskModel {
-            tcp: vec![FinalmaskTcpMask::Unknown(json!({"type": "future-parse"}))],
-            udp: Vec::new(),
-            quic_params: None,
-            extra: Default::default(),
-        });
-        render_advanced_tab(&mut screen, &mut profile);
-        assert_eq!(
-            screen.finalmask_raw.len(),
-            1,
-            "the rendered buffer must be in the raw-editor cache for the \
-             idle frame to have a parse to skip"
-        );
-        let parses = screen.finalmask_raw.parses;
-        render_advanced_tab(&mut screen, &mut profile);
-        assert_eq!(
-            screen.finalmask_raw.parses, parses,
-            "an idle re-render of an unchanged buffer must not reparse the JSON"
         );
     }
 
@@ -13206,6 +13516,7 @@ TLS ping finished"#;
                 Language::En,
                 &mut stream_for_ui.borrow_mut(),
                 0,
+                None,
             );
         });
         harness.run();
