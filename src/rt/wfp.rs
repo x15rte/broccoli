@@ -14,6 +14,7 @@
 //! fatal.
 
 use crate::diag::{Diag, DiagError};
+use crate::r#gen::keys;
 use crate::i18n::Key;
 use crate::sys::netif::AdapterBuffer;
 use std::path::Path;
@@ -117,16 +118,19 @@ static SHIELD: Mutex<Option<DnsShield>> = Mutex::new(None);
 /// core (src/rt/dns_in.rs). Either half without the other has no tunnel DNS
 /// to protect.
 pub fn config_needs_dns_shield(config: &serde_json::Value) -> bool {
-    let Some(inbounds) = config.get("inbounds").and_then(serde_json::Value::as_array) else {
+    let Some(inbounds) = config
+        .get(keys::INBOUNDS)
+        .and_then(serde_json::Value::as_array)
+    else {
         return false;
     };
     let has_tun = inbounds.iter().any(|inbound| {
         inbound
-            .get("protocol")
+            .get(keys::PROTOCOL)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|protocol| protocol == "tun")
     });
-    has_tun && config.get("dns").is_some()
+    has_tun && config.get(keys::DNS).is_some()
 }
 
 pub fn set_dns_shield(

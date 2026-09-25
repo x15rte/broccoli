@@ -1,11 +1,13 @@
-//! Wire-tag coupling tests: the runtime teardown must remove
-//! exactly the tag the generator emits, and the WFP DNS shield must trigger
-//! on exactly the emitted DNS listener. Both production sides already
-//! reference the canonical consts in `src/model/inbound.rs`; these tests pin
-//! the wire-level agreement against the actual emitted config (and the
-//! golden fixture) so a unilateral literal re-spelling on either side fails.
+//! Wire-name coupling tests: the runtime teardown must remove
+//! exactly the tag the generator emits, the WFP DNS shield must trigger on
+//! exactly the emitted DNS listener, and every config reader must address the
+//! emitted document through the same section and field names. The production
+//! sides reference the canonical consts (`src/model/inbound.rs` for the tags,
+//! `src/gen/keys.rs` for the schema keys); these tests pin the wire-level
+//! agreement against the actual emitted config (and the golden fixtures) so a
+//! unilateral literal re-spelling on either side fails.
 
-use broccoli::r#gen::generate_with_api_port;
+use broccoli::r#gen::{generate_with_api_port, keys};
 use broccoli::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
     TUN_INBOUND_TAG,
@@ -27,44 +29,53 @@ fn emitted_tun_config() -> Value {
         .expect("default TUN settings must generate")
 }
 
+/// The first inbound with the given protocol, or `None`.
+fn inbound<'a>(config: &'a Value, protocol: &str) -> Option<&'a Value> {
+    config
+        .get(keys::INBOUNDS)?
+        .as_array()?
+        .iter()
+        .find(|inbound| {
+            inbound
+                .get(keys::PROTOCOL)
+                .and_then(Value::as_str)
+                .is_some_and(|p| p == protocol)
+        })
+}
+
 /// Tag of the first inbound with the given protocol, or `None`.
 fn inbound_tag<'a>(config: &'a Value, protocol: &str) -> Option<&'a str> {
-    let inbounds = config.get("inbounds")?.as_array()?;
-    inbounds.iter().find_map(|inbound| {
-        let tag = inbound.get("tag")?.as_str()?;
-        inbound
-            .get("protocol")
-            .and_then(Value::as_str)
-            .is_some_and(|p| p == protocol)
-            .then_some(tag)
-    })
+    inbound(config, protocol)?.get(keys::TAG)?.as_str()
 }
 
 /// Tag of the first outbound with the given protocol, or `None`.
 fn outbound_tag<'a>(config: &'a Value, protocol: &str) -> Option<&'a str> {
-    let outbounds = config.get("outbounds")?.as_array()?;
-    outbounds.iter().find_map(|outbound| {
-        let tag = outbound.get("tag")?.as_str()?;
-        outbound
-            .get("protocol")
-            .and_then(Value::as_str)
-            .is_some_and(|p| p == protocol)
-            .then_some(tag)
-    })
+    config
+        .get(keys::OUTBOUNDS)?
+        .as_array()?
+        .iter()
+        .find_map(|outbound| {
+            let tag = outbound.get(keys::TAG)?.as_str()?;
+            outbound
+                .get(keys::PROTOCOL)
+                .and_then(Value::as_str)
+                .is_some_and(|p| p == protocol)
+                .then_some(tag)
+        })
 }
 
 /// Tag of the control-plane `api` section, or `None`.
 fn api_tag(config: &Value) -> Option<&str> {
-    config.get("api")?.get("tag")?.as_str()
+    config.get(keys::API)?.get(keys::TAG)?.as_str()
 }
 
 /// Clone of `config` with every inbound of the given protocols removed.
 fn without_inbounds(config: &Value, drop_protocols: &[&str]) -> Value {
     let mut config = config.clone();
-    if let Some(inbounds) = config.get_mut("inbounds").and_then(Value::as_array_mut) {
+    if let Some(inbounds) = config.get_mut(keys::INBOUNDS).and_then(Value::as_array_mut) {
         inbounds.retain(|inbound| {
             let protocol = inbound
-                .get("protocol")
+                .get(keys::PROTOCOL)
                 .and_then(Value::as_str)
                 .unwrap_or("");
             !drop_protocols.contains(&protocol)
@@ -75,13 +86,9 @@ fn without_inbounds(config: &Value, drop_protocols: &[&str]) -> Value {
 
 /// The address the emitted tun inbound pins as the adapter DNS, or `None`.
 fn tun_adapter_dns(config: &Value) -> Option<&str> {
-    config
-        .get("inbounds")?
-        .as_array()?
-        .iter()
-        .find(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))?
-        .get("settings")?
-        .get("dns")?
+    inbound(config, "tun")?
+        .get(keys::SETTINGS)?
+        .get(keys::DNS)?
         .as_array()?
         .first()?
         .as_str()
@@ -90,7 +97,7 @@ fn tun_adapter_dns(config: &Value) -> Option<&str> {
 /// The inbound tag the DNS module's interception rule names, or `None`.
 fn dns_in_rule_tag(config: &Value) -> Option<&str> {
     config
-        .get("routing")?
+        .get(keys::ROUTING)?
         .get("rules")?
         .as_array()?
         .iter()
@@ -170,6 +177,52 @@ fn golden_tun_tags_match_runtime_consts() {
 }
 
 #[test]
+fn golden_nested_keys_match_schema_consts() {
+    // These byte-compared fixtures also carry the nested keys whose emitting
+    // side is the model's own serialization rather than a generator `json!`
+    // literal: the inbound envelope's `sniffing` block and the chain target's
+    // `streamSettings.sockopt.dialerProxy`. Reading them through the schema
+    // consts fails if the emitted spelling drifts from the const readers name.
+    let tun: Value = serde_json::from_str(include_str!("../src/gen/goldens/tun.json"))
+        .expect("golden tun.json must parse");
+    let socks = inbound(&tun, "socks").expect("tun.json carries the SOCKS inbound");
+    assert!(
+        socks.get(keys::SNIFFING).is_some(),
+        "the emitted inbound envelope must carry sniffing: {socks}"
+    );
+
+    let chain_json = include_str!("../src/gen/goldens/chain_dialer_proxy.json");
+    let chain: Value =
+        serde_json::from_str(chain_json).expect("golden chain_dialer_proxy.json must parse");
+    let outbounds = chain
+        .get(keys::OUTBOUNDS)
+        .and_then(Value::as_array)
+        .expect("chain_dialer_proxy.json carries the outbound list");
+    let targets: Vec<&str> = outbounds
+        .iter()
+        .filter_map(|outbound| {
+            outbound
+                .get(keys::STREAM_SETTINGS)?
+                .get(keys::SOCKOPT)?
+                .get(keys::DIALER_PROXY)?
+                .as_str()
+        })
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "the fixture states exactly one chain target: {outbounds:?}"
+    );
+    assert!(
+        outbounds
+            .iter()
+            .filter_map(|outbound| outbound.get(keys::TAG).and_then(Value::as_str))
+            .any(|tag| tag == targets[0]),
+        "the chain target must name an emitted outbound tag: {targets:?}"
+    );
+}
+
+#[test]
 fn wfp_shield_fires_on_exactly_the_emitted_dns_module() {
     // The full emitted TUN config must need the shield: a tun inbound plus
     // the DNS module whose in-tun listener the runtime adds. If the shield
@@ -182,7 +235,7 @@ fn wfp_shield_fires_on_exactly_the_emitted_dns_module() {
     no_module
         .as_object_mut()
         .expect("config is an object")
-        .remove("dns");
+        .remove(keys::DNS);
     assert!(!config_needs_dns_shield(&no_module));
 
     // Module alone (no tun inbound) -> no shield: no TUN interface to protect.
@@ -191,6 +244,6 @@ fn wfp_shield_fires_on_exactly_the_emitted_dns_module() {
 
     // No inbounds at all -> no shield.
     assert!(!config_needs_dns_shield(
-        &serde_json::json!({"inbounds": []})
+        &serde_json::json!({ keys::INBOUNDS: [] })
     ));
 }

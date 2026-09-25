@@ -1,6 +1,9 @@
 //! Config generator: GUI state → Xray `config.json`.
 //! Thin conversion — the model structs already mirror the wire shape; this
-//! module assembles the top-level document and injects tags.
+//! module assembles the top-level document and injects tags. The document's
+//! section and field names live in [`keys`].
+
+pub mod keys;
 
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
@@ -160,20 +163,20 @@ pub fn generate_with_api_port(
     } else {
         json!({ "loglevel": settings.log_level, "access": "none" })
     };
-    root.insert("log".into(), log);
+    root.insert(keys::LOG.into(), log);
 
     // stats + api + policy (system stats always on → traffic counters).
-    root.insert("stats".into(), json!({}));
+    root.insert(keys::STATS.into(), json!({}));
     let mut services: Vec<&str> = API_SERVICES.to_vec();
     if observatory_emitted || burst_emitted {
         services.push("ObservatoryService");
     }
     root.insert(
-        "api".into(),
+        keys::API.into(),
         json!({
-            "tag": API_INBOUND_TAG,
-            "listen": format!("127.0.0.1:{}", api_port),
-            "services": services,
+            keys::TAG: API_INBOUND_TAG,
+            keys::LISTEN: format!("127.0.0.1:{}", api_port),
+            keys::SERVICES: services,
         }),
     );
     let mut policy = settings.policy.extra.clone();
@@ -204,7 +207,7 @@ pub fn generate_with_api_port(
     if !levels.is_empty() {
         policy.insert("levels".into(), Value::Object(levels));
     }
-    root.insert("policy".into(), Value::Object(policy));
+    root.insert(keys::POLICY.into(), Value::Object(policy));
 
     let dns_wire = dns(&settings.dns, fakedns);
     // Enabled SOCKS entries (in list order) carry DNS UDP:53 to dns-out;
@@ -261,15 +264,15 @@ pub fn generate_with_api_port(
     }
 
     root.insert(
-        "outbounds".into(),
+        keys::OUTBOUNDS.into(),
         outbounds(servers, dns_intercept, bootstrap.is_some(), &direct_dial),
     );
     root.insert(
-        "inbounds".into(),
+        keys::INBOUNDS.into(),
         inbounds(settings, fakedns, tun_on, dns_wire.is_some()),
     );
     root.insert(
-        "routing".into(),
+        keys::ROUTING.into(),
         routing(
             &settings.routing,
             tun_on,
@@ -281,7 +284,7 @@ pub fn generate_with_api_port(
         ),
     );
     if let Some(dns) = dns_wire {
-        root.insert("dns".into(), dns);
+        root.insert(keys::DNS.into(), dns);
     }
 
     let obs = &settings.routing.observatory;
@@ -307,13 +310,13 @@ pub fn generate_with_api_port(
                 .collect::<Vec<String>>()
         });
         root.insert(
-            "observatory".into(),
+            keys::OBSERVATORY.into(),
             obs.to_wire(forced_subjects.as_deref()),
         );
     }
     if burst_emitted {
         root.insert(
-            "burstObservatory".into(),
+            keys::BURST_OBSERVATORY.into(),
             settings.routing.burst_observatory.to_wire(),
         );
     }
@@ -321,7 +324,7 @@ pub fn generate_with_api_port(
     // fakeDns trio (1/3): top-level pool. (2/3) dns server + (3/3) sniffing
     // destOverride are handled in dns()/inbounds().
     if fakedns && let Some(wire) = settings.dns.fakedns.to_wire() {
-        root.insert("fakeDns".into(), wire);
+        root.insert(keys::FAKE_DNS.into(), wire);
     }
 
     if !settings.env.is_empty() {
@@ -330,7 +333,7 @@ pub fn generate_with_api_port(
             .iter()
             .map(|(k, v)| (k.clone(), json!(v)))
             .collect();
-        root.insert("env".into(), Value::Object(env));
+        root.insert(keys::ENV.into(), Value::Object(env));
     }
 
     // Core-native `geodata` block: emitted only when at least one
@@ -350,10 +353,13 @@ pub fn generate_with_api_port(
             (&settings.geodata.geosite_url, "geosite.dat"),
         ] {
             if let Some(u) = url.as_deref().filter(|u| !u.is_empty()) {
-                assets.push(json!({ "url": u, "file": file }));
+                assets.push(json!({ keys::URL: u, "file": file }));
             }
         }
-        root.insert("geodata".into(), json!({ "cron": cron, "assets": assets }));
+        root.insert(
+            keys::GEODATA.into(),
+            json!({ "cron": cron, keys::ASSETS: assets }),
+        );
     }
 
     Ok(Value::Object(root))
@@ -451,22 +457,22 @@ pub fn generate_core_gate(api_port: u16) -> Result<Value, GenerateError> {
     }
     let mut root = Map::new();
     root.insert(
-        "log".into(),
+        keys::LOG.into(),
         // Access log pinned off: the gate's captured stdout is a failure
         // diagnostic, never a traffic record.
         json!({ "loglevel": "warning", "access": "none" }),
     );
-    root.insert("stats".into(), json!({}));
+    root.insert(keys::STATS.into(), json!({}));
     root.insert(
-        "api".into(),
+        keys::API.into(),
         json!({
-            "tag": API_INBOUND_TAG,
-            "listen": format!("127.0.0.1:{api_port}"),
-            "services": API_SERVICES,
+            keys::TAG: API_INBOUND_TAG,
+            keys::LISTEN: format!("127.0.0.1:{api_port}"),
+            keys::SERVICES: API_SERVICES,
         }),
     );
     root.insert(
-        "policy".into(),
+        keys::POLICY.into(),
         json!({ "system": {
             "statsInboundUplink": true,
             "statsInboundDownlink": true,
@@ -476,7 +482,7 @@ pub fn generate_core_gate(api_port: u16) -> Result<Value, GenerateError> {
     );
     let mut out = Vec::new();
     append_builtin_outbounds(&mut out);
-    root.insert("outbounds".into(), Value::Array(out));
+    root.insert(keys::OUTBOUNDS.into(), Value::Array(out));
     Ok(Value::Object(root))
 }
 
@@ -526,21 +532,21 @@ pub fn generate_latency_probe(
 
     let mut root = Map::new();
     root.insert(
-        "log".into(),
+        keys::LOG.into(),
         // Access log pinned off: the probe's stdout feeds failure
         // diagnostics, and the access channel is not gated by loglevel.
         json!({ "loglevel": "warning", "access": "none" }),
     );
     root.insert(
-        "api".into(),
+        keys::API.into(),
         json!({
-            "tag": API_INBOUND_TAG,
-            "listen": format!("127.0.0.1:{api_port}"),
-            "services": ["ObservatoryService"],
+            keys::TAG: API_INBOUND_TAG,
+            keys::LISTEN: format!("127.0.0.1:{api_port}"),
+            keys::SERVICES: ["ObservatoryService"],
         }),
     );
     root.insert(
-        "observatory".into(),
+        keys::OBSERVATORY.into(),
         json!({
             "subjectSelector": profiles.iter().map(ServerProfile::tag).collect::<Vec<_>>(),
             "probeURL": probe_url,
@@ -558,7 +564,7 @@ pub fn generate_latency_probe(
         .map(|profile| profile_wire_outbound(profile, policy))
         .collect();
     append_builtin_outbounds(&mut out);
-    root.insert("outbounds".into(), Value::Array(out));
+    root.insert(keys::OUTBOUNDS.into(), Value::Array(out));
     Ok(Value::Object(root))
 }
 
@@ -751,16 +757,20 @@ fn inject_server_domain_strategy(wire: &mut Value) {
     let Some(object) = wire.as_object_mut() else {
         return;
     };
-    let stream = object.entry("streamSettings").or_insert_with(|| json!({}));
+    let stream = object
+        .entry(keys::STREAM_SETTINGS)
+        .or_insert_with(|| json!({}));
     let Some(stream_object) = stream.as_object_mut() else {
         return;
     };
-    let sockopt = stream_object.entry("sockopt").or_insert_with(|| json!({}));
+    let sockopt = stream_object
+        .entry(keys::SOCKOPT)
+        .or_insert_with(|| json!({}));
     let Some(sockopt_object) = sockopt.as_object_mut() else {
         return;
     };
-    if !sockopt_object.contains_key("domainStrategy") {
-        sockopt_object.insert("domainStrategy".into(), json!("useip"));
+    if !sockopt_object.contains_key(keys::DOMAIN_STRATEGY) {
+        sockopt_object.insert(keys::DOMAIN_STRATEGY.into(), json!("useip"));
     }
 }
 
@@ -772,15 +782,19 @@ fn inject_outbound_interface(wire: &mut Value, interface: &str) {
     let Some(object) = wire.as_object_mut() else {
         return;
     };
-    let stream = object.entry("streamSettings").or_insert_with(|| json!({}));
+    let stream = object
+        .entry(keys::STREAM_SETTINGS)
+        .or_insert_with(|| json!({}));
     let Some(stream_object) = stream.as_object_mut() else {
         return;
     };
-    let sockopt = stream_object.entry("sockopt").or_insert_with(|| json!({}));
+    let sockopt = stream_object
+        .entry(keys::SOCKOPT)
+        .or_insert_with(|| json!({}));
     let Some(sockopt_object) = sockopt.as_object_mut() else {
         return;
     };
-    sockopt_object.insert("interface".into(), json!(interface));
+    sockopt_object.insert(keys::INTERFACE.into(), json!(interface));
 }
 
 /// The caller-side wire policies the generator may apply to a profile
@@ -827,8 +841,8 @@ fn profile_wire_outbound(profile: &ServerProfile, policy: OutboundWirePolicy<'_>
 }
 
 fn append_builtin_outbounds(out: &mut Vec<Value>) {
-    out.push(json!({ "protocol": "freedom", "tag": DIRECT_OUTBOUND_TAG }));
-    out.push(json!({ "protocol": "blackhole", "tag": BLOCK_OUTBOUND_TAG }));
+    out.push(json!({ keys::PROTOCOL: "freedom", keys::TAG: DIRECT_OUTBOUND_TAG }));
+    out.push(json!({ keys::PROTOCOL: "blackhole", keys::TAG: BLOCK_OUTBOUND_TAG }));
 }
 
 /// The user's server order, then the built-in `direct`/`block` tags and the
@@ -857,7 +871,7 @@ fn outbounds(
     }
     append_builtin_outbounds(&mut out);
     if dns_intercept {
-        out.push(json!({ "protocol": "dns", "tag": DNS_OUTBOUND_TAG }));
+        out.push(json!({ keys::PROTOCOL: "dns", keys::TAG: DNS_OUTBOUND_TAG }));
     }
     Value::Array(out)
 }
@@ -890,13 +904,13 @@ fn inbounds(settings: &Settings, fakedns: bool, tun_on: bool, dns_on: bool) -> V
         // behavior (stored list, or plaintext resolvers when empty): leaky
         // but functional, as the TUN screen banner states.
         if dns_on {
-            if let Some(o) = wire.get_mut("settings").and_then(Value::as_object_mut) {
-                o.insert("dns".into(), json!([tun_dns_address(&settings.tun)]));
+            if let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut) {
+                o.insert(keys::DNS.into(), json!([tun_dns_address(&settings.tun)]));
             }
         } else if settings.tun.dns.is_empty()
-            && let Some(o) = wire.get_mut("settings").and_then(Value::as_object_mut)
+            && let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut)
         {
-            o.insert("dns".into(), json!(DEFAULT_PLAINTEXT_RESOLVERS));
+            o.insert(keys::DNS.into(), json!(DEFAULT_PLAINTEXT_RESOLVERS));
         }
         list.push(wire);
     }

@@ -13,6 +13,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::r#gen::keys;
+
 use super::netif::{DEFAULT_TUN_ADAPTER_NAME, tun_adapter_name};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DI_REMOVEDEVICE_GLOBAL, DIF_REMOVE, GUID_DEVCLASS_NET, HDEVINFO, SP_CLASSINSTALL_HEADER,
@@ -357,13 +359,17 @@ pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, Vec<String>) {
 /// cleared name the wire form drops.
 pub fn staged_tun_adapter_name(config_json: &str) -> Option<String> {
     let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
-    let inbounds = config.get("inbounds")?.as_array()?;
+    let inbounds = config.get(keys::INBOUNDS)?.as_array()?;
     for inbound in inbounds {
-        if inbound.get("protocol").and_then(serde_json::Value::as_str) != Some("tun") {
+        if inbound
+            .get(keys::PROTOCOL)
+            .and_then(serde_json::Value::as_str)
+            != Some("tun")
+        {
             continue;
         }
         let name = inbound
-            .get("settings")
+            .get(keys::SETTINGS)
             .and_then(|settings| settings.get("name"))
             .and_then(serde_json::Value::as_str)
             .map(tun_adapter_name)

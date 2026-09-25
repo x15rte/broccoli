@@ -17,6 +17,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use crate::diag::{Diag, DiagError, DiagResult};
+use crate::r#gen::keys;
 use crate::i18n::Key;
 use crate::model::{ServersFile, Settings};
 use tokio::process::Command;
@@ -227,7 +228,7 @@ pub fn read_active_contents() -> Result<String, DiagError> {
 /// A snapshot that does not parse starts no read.
 pub fn carries_health_extension(config_text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(config_text).is_ok_and(|config| {
-        config.get("observatory").is_some() || config.get("burstObservatory").is_some()
+        config.get(keys::OBSERVATORY).is_some() || config.get(keys::BURST_OBSERVATORY).is_some()
     })
 }
 
@@ -256,9 +257,9 @@ pub fn active_api_port() -> Result<u16, DiagError> {
 /// is the single seam the runtime uses to learn the ephemeral port.
 pub fn api_port_from_value(config: &serde_json::Value) -> Result<u16, DiagError> {
     let listen = config
-        .get("api")
+        .get(keys::API)
         .and_then(serde_json::Value::as_object)
-        .and_then(|api| api.get("listen"))
+        .and_then(|api| api.get(keys::LISTEN))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| DiagError::new(Diag::new(Key::ApplyListenMissing)))?;
     let address: std::net::SocketAddr = listen

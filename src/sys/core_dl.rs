@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::diag::{Diag, DiagError, DiagResult};
+use crate::r#gen::keys;
 use crate::i18n::Key;
 use sha2::{Digest, Sha256};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
@@ -272,16 +273,16 @@ pub(crate) fn open_verified_core_with_scope(
 /// unconfigured or unparseable fails closed toward the hard pins.
 pub fn geodata_updater_configured(config: &serde_json::Value) -> bool {
     let Some(assets) = config
-        .get("geodata")
+        .get(keys::GEODATA)
         .and_then(serde_json::Value::as_object)
-        .and_then(|geodata| geodata.get("assets"))
+        .and_then(|geodata| geodata.get(keys::ASSETS))
         .and_then(serde_json::Value::as_array)
     else {
         return false;
     };
     assets.iter().any(|entry| {
         entry
-            .get("url")
+            .get(keys::URL)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|url| !url.is_empty())
     })

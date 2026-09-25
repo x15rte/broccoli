@@ -23,6 +23,7 @@ use std::net::Ipv4Addr;
 use serde_json::Value;
 
 use super::grpc::pb;
+use crate::r#gen::keys;
 use crate::model::inbound::DNS_INBOUND_TAG;
 
 /// The port the in-tun DNS listener serves.
@@ -86,23 +87,23 @@ impl Listener {
 /// inbound pins its adapter DNS to the in-tun address (`gen::inbounds`),
 /// which is therefore the address the listener must bind.
 pub fn listener_for_config(config: &Value) -> Option<Listener> {
-    config.get("dns")?.as_object()?;
-    let inbounds = config.get("inbounds")?.as_array()?;
+    config.get(keys::DNS)?.as_object()?;
+    let inbounds = config.get(keys::INBOUNDS)?.as_array()?;
     // A config that declares its own listener (a raw override writes the
     // config verbatim) owns that socket, whatever address family it names:
     // the runtime must neither add nor replace it.
     if inbounds
         .iter()
-        .any(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(DNS_INBOUND_TAG))
+        .any(|inbound| inbound.get(keys::TAG).and_then(Value::as_str) == Some(DNS_INBOUND_TAG))
     {
         return None;
     }
     let tun = inbounds
         .iter()
-        .find(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))?;
+        .find(|inbound| inbound.get(keys::PROTOCOL).and_then(Value::as_str) == Some("tun"))?;
     let address = tun
-        .get("settings")?
-        .get("dns")?
+        .get(keys::SETTINGS)?
+        .get(keys::DNS)?
         .as_array()?
         .first()?
         .as_str()?

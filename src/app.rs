@@ -2,7 +2,7 @@
 //! first-run wizard.
 
 use crate::diag::Diag;
-use crate::r#gen;
+use crate::r#gen::{self, keys};
 use crate::i18n::{Key, t, t_fmt};
 use crate::icon::{IconAssets, IconPresentation, classify};
 use crate::links::excerpt;
@@ -2451,19 +2451,20 @@ impl eframe::App for BroccoliApp {
 /// bits, so candidates can be compared for config equality.
 fn normalize_candidate_for_compare(mut config: serde_json::Value) -> serde_json::Value {
     if let Some(api) = config
-        .get_mut("api")
+        .get_mut(keys::API)
         .and_then(serde_json::Value::as_object_mut)
     {
-        api.remove("listen");
+        api.remove(keys::LISTEN);
     }
     if let Some(inbounds) = config
-        .get_mut("inbounds")
+        .get_mut(keys::INBOUNDS)
         .and_then(serde_json::Value::as_array_mut)
     {
         for inbound in inbounds {
-            if inbound.get("tag").and_then(serde_json::Value::as_str) == Some(API_INBOUND_TAG) {
+            let tag = inbound.get(keys::TAG).and_then(serde_json::Value::as_str);
+            if tag == Some(API_INBOUND_TAG) {
                 if let Some(object) = inbound.as_object_mut() {
-                    object.remove("listen");
+                    object.remove(keys::LISTEN);
                 }
                 break;
             }
@@ -2634,7 +2635,7 @@ fn show_safety_ack_modal(
 /// 0-based: it addresses the JSON array the user pasted.
 fn raw_override_retired_proxy_settings(config: &serde_json::Value) -> Option<usize> {
     config
-        .get("outbounds")?
+        .get(keys::OUTBOUNDS)?
         .as_array()?
         .iter()
         .position(|outbound| {
@@ -2669,13 +2670,13 @@ fn json_field<'a>(
 /// 0-based: it addresses the JSON array the user pasted.
 fn raw_override_retired_udp_hop(config: &serde_json::Value) -> Option<String> {
     config
-        .get("outbounds")?
+        .get(keys::OUTBOUNDS)?
         .as_array()?
         .iter()
         .enumerate()
         .find_map(|(index, outbound)| {
             let outbound = outbound.as_object()?;
-            let stream = json_field(outbound, "streamSettings")?.as_object()?;
+            let stream = json_field(outbound, keys::STREAM_SETTINGS)?.as_object()?;
             let finalmask = json_field(stream, "finalmask")?.as_object()?;
             let quic_params = json_field(finalmask, "quicParams")?.as_object()?;
             quic_params
@@ -2725,11 +2726,11 @@ fn validate_raw_override_candidate(
     // a loopback api.listen with StatsService so the runtime can verify the
     // listener's owning PID before trusting readiness.
     let api = config
-        .get("api")
+        .get(keys::API)
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| t(lang, Key::RawOverrideDefineApi))?;
     let listen = api
-        .get("listen")
+        .get(keys::LISTEN)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| t(lang, Key::RawOverrideDefineApi))?;
     let address: std::net::SocketAddr = listen
@@ -2739,7 +2740,7 @@ fn validate_raw_override_candidate(
         return Err(t(lang, Key::RawOverrideDefineApi).into());
     }
     let has_stats = api
-        .get("services")
+        .get(keys::SERVICES)
         .and_then(serde_json::Value::as_array)
         .is_some_and(|services| {
             services.iter().any(|service| {
@@ -2752,12 +2753,12 @@ fn validate_raw_override_candidate(
         return Err(t(lang, Key::RawOverrideStatsService).into());
     }
     if config
-        .get("inbounds")
+        .get(keys::INBOUNDS)
         .and_then(serde_json::Value::as_array)
         .is_some_and(|inbounds| {
             inbounds.iter().any(|inbound| {
                 inbound
-                    .get("protocol")
+                    .get(keys::PROTOCOL)
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tun"))
             })
