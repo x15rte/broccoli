@@ -29,6 +29,9 @@ use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::Map;
 
+#[path = "common/screen.rs"]
+mod screen;
+
 mod common;
 
 /// Boot the real app through the shared fixture against `profiles` persisted
@@ -42,32 +45,16 @@ fn boot_servers(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = common::boot(
-        |root| {
-            let state_dir = root.join("broccoli/state");
-            std::fs::create_dir_all(&state_dir).unwrap();
-            let servers = ServersFile {
-                version: 1,
-                active: profiles.first().map(|profile| profile.id.clone()),
-                profiles,
-                extra: Map::new(),
-            };
-            std::fs::write(
-                state_dir.join("servers.json"),
-                serde_json::to_vec_pretty(&servers).unwrap(),
-            )
-            .unwrap();
-            let mut settings = Settings::default();
-            settings.routing.observatory.enabled = false;
-            settings.routing.burst_observatory.enabled = false;
-            std::fs::write(
-                state_dir.join("settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
-        },
-        None,
-    );
+    let servers = ServersFile {
+        version: 1,
+        active: profiles.first().map(|profile| profile.id.clone()),
+        profiles,
+        extra: Map::new(),
+    };
+    let mut settings = Settings::default();
+    settings.routing.observatory.enabled = false;
+    settings.routing.burst_observatory.enabled = false;
+    let (lock, tmp, mut h) = screen::boot_state(screen::BootState { settings, servers }, None);
 
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();

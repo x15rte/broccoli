@@ -23,6 +23,9 @@ use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::json;
 
+#[path = "common/screen.rs"]
+mod screen;
+
 mod common;
 
 /// Boot the app through the shared fixture against a temp APPDATA seeded with
@@ -35,42 +38,24 @@ fn harness_with_raw(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    common::boot(
-        |root| {
-            let broccoli_root = root.join("broccoli");
-            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
-            let mut profile =
-                ServerProfile::new("raw-editor", OutboundModel::new(Protocol::Freedom));
-            profile.id = "0123456789abcdef".into();
-            profile.outbound.stream.finalmask = Some(FinalmaskModel {
-                tcp: vec![FinalmaskTcpMask::Unknown(raw)],
-                udp: Vec::new(),
-                quic_params: None,
-                extra: Default::default(),
-            });
-            let servers = ServersFile {
-                version: 1,
-                active: Some(profile.id.clone()),
-                profiles: vec![profile],
-                extra: Default::default(),
-            };
-            std::fs::write(
-                broccoli_root.join("state/servers.json"),
-                serde_json::to_vec_pretty(&servers).unwrap(),
-            )
-            .unwrap();
-            let mut settings = Settings::default();
-            settings.routing.observatory.enabled = false;
-            settings.routing.burst_observatory.enabled = false;
-            std::fs::write(
-                broccoli_root.join("state/settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
-        },
-        None,
-    )
+    let mut profile = ServerProfile::new("raw-editor", OutboundModel::new(Protocol::Freedom));
+    profile.id = "0123456789abcdef".into();
+    profile.outbound.stream.finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Unknown(raw)],
+        udp: Vec::new(),
+        quic_params: None,
+        extra: Default::default(),
+    });
+    let servers = ServersFile {
+        version: 1,
+        active: Some(profile.id.clone()),
+        profiles: vec![profile],
+        extra: Default::default(),
+    };
+    let mut settings = Settings::default();
+    settings.routing.observatory.enabled = false;
+    settings.routing.burst_observatory.enabled = false;
+    screen::boot_state(screen::BootState { settings, servers }, None)
 }
 
 /// The only multiline text input on the Advanced tab: the preserved-raw JSON

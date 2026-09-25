@@ -17,6 +17,9 @@ use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
 use std::time::Duration;
 
+#[path = "common/screen.rs"]
+mod screen;
+
 mod common;
 
 /// The Logs screen's filter input — the only text input on that screen.
@@ -272,7 +275,7 @@ fn settings_exposes_same_core_setup_after_defer() {
 
 #[test]
 fn routing_exposes_probe_interval_and_one_health_engine() {
-    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -320,7 +323,7 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
     field.type_text("30s");
     h.run_steps(4);
 
-    let settings = persisted_settings(tmp.path());
+    let settings = persisted_settings();
     assert_eq!(settings["routing"]["observatory"]["probeInterval"], "30s");
     assert_eq!(settings["routing"]["observatory"]["enabled"], true);
 
@@ -347,7 +350,7 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
         h.query_by_label("Destination").is_some(),
         "the burst group must render its own fields"
     );
-    let settings = persisted_settings(tmp.path());
+    let settings = persisted_settings();
     assert_eq!(
         settings["routing"]["burstObservatory"]["enabled"], true,
         "the burst toggle must persist"
@@ -358,9 +361,11 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
     );
 }
 
-fn persisted_settings(root: &std::path::Path) -> serde_json::Value {
-    let settings_bytes =
-        std::fs::read(root.join("broccoli/state/settings.json")).expect("settings state");
+/// The settings.json the app just wrote, read from the path the app itself
+/// resolves (the fixture redirected `APPDATA`, so this is the temp tree).
+fn persisted_settings() -> serde_json::Value {
+    let path = broccoli::sys::paths::state_dir().join("settings.json");
+    let settings_bytes = std::fs::read(&path).expect("settings state");
     serde_json::from_slice(&settings_bytes).expect("persisted settings must be JSON")
 }
 
@@ -515,7 +520,7 @@ fn typing_partial_listen_address_keeps_input_focus() {
 
 #[test]
 fn settings_edits_persist_without_applying_the_runtime_candidate() {
-    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -540,19 +545,25 @@ fn settings_edits_persist_without_applying_the_runtime_candidate() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     h.run_steps(4);
 
-    let broccoli_root = tmp.path().join("broccoli");
-    assert!(broccoli_root.join("state/settings.json").is_file());
-    assert!(broccoli_root.join("state/servers.json").is_file());
+    // The app's own resolution of its state root (the fixture redirected
+    // APPDATA to the temp tree).
+    let state_dir = broccoli::sys::paths::state_dir();
+    assert!(state_dir.join("settings.json").is_file());
+    assert!(state_dir.join("servers.json").is_file());
     assert!(
         h.get_all_by_label("changes pending").next().is_some(),
         "an ordinary edit must remain pending until Apply now or Connect"
     );
     assert!(
-        !broccoli_root.join("config/config.candidate.json").exists(),
+        !broccoli::sys::paths::config_dir()
+            .join("config.candidate.json")
+            .exists(),
         "an ordinary edit must not enqueue a runtime candidate"
     );
     assert!(
-        !broccoli_root.join("config/config.json").exists(),
+        !broccoli::sys::paths::config_dir()
+            .join("config.json")
+            .exists(),
         "an ordinary edit must not replace the active runtime configuration"
     );
 }
@@ -613,7 +624,7 @@ fn reverting_a_settings_edit_clears_the_changes_pending_chip() {
 /// depend on a unit choice.
 #[test]
 fn traffic_unit_change_persists_without_demanding_apply() {
-    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -645,8 +656,7 @@ fn traffic_unit_change_persists_without_demanding_apply() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     h.run_steps(4);
 
-    let broccoli_root = tmp.path().join("broccoli");
-    let settings_path = broccoli_root.join("state/settings.json");
+    let settings_path = broccoli::sys::paths::state_dir().join("settings.json");
     assert!(settings_path.is_file(), "settings must have been persisted");
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -659,7 +669,9 @@ fn traffic_unit_change_persists_without_demanding_apply() {
         "still no config-apply gate after the throttle flush"
     );
     assert!(
-        !broccoli_root.join("config/config.candidate.json").exists(),
+        !broccoli::sys::paths::config_dir()
+            .join("config.candidate.json")
+            .exists(),
         "a display preference must not enqueue a runtime candidate"
     );
 }
@@ -710,14 +722,14 @@ fn the_persist_deadline_flushes_the_last_edit_of_a_burst() {
     // The harness's default frame step is a quarter second, which is longer
     // than the persist window this test reasons about; a 60 Hz step keeps
     // every frame a small, known distance from the pinned clock.
-    let (_lock, tmp, mut h) = common::boot(|_| {}, Some(1.0 / 60.0));
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, Some(1.0 / 60.0));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
     common::dismiss_wizard(&mut h);
     // Every pin below sits at least a window away from the save it must not
     // see, and inside one of the save it must: a click's own frames drift at
     // most a few 60 Hz steps from the frame it pinned.
-    let settings_path = tmp.path().join("broccoli/state/settings.json");
+    let settings_path = broccoli::sys::paths::state_dir().join("settings.json");
     let first = h.ctx.input(|input| input.time) + 1.0;
 
     // The first edit opens the window, so it lands at once.
@@ -785,15 +797,10 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
         accent_color: Some(0x4f_af_4f_ff),
         ..Default::default()
     };
-    let (_lock, tmp, mut h) = common::boot(
-        |root| {
-            let broccoli_root = root.join("broccoli");
-            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-            std::fs::write(
-                broccoli_root.join("state/settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
+    let (_lock, _tmp, mut h) = screen::boot_state(
+        screen::BootState {
+            settings: settings.clone(),
+            servers: ServersFile::default(),
         },
         None,
     );
@@ -829,7 +836,7 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
             "{theme:?} reset must restore stock"
         );
     }
-    let settings_path = tmp.path().join("broccoli/state/settings.json");
+    let settings_path = broccoli::sys::paths::state_dir().join("settings.json");
     let persisted: serde_json::Value =
         serde_json::from_slice(&std::fs::read(settings_path).unwrap())
             .expect("settings state must persist");
@@ -943,7 +950,9 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
     );
     assert_eq!(std::fs::read(&config_path).ok(), config_before);
     assert!(
-        !broccoli_root.join("config/config.candidate.json").exists(),
+        !broccoli::sys::paths::config_dir()
+            .join("config.candidate.json")
+            .exists(),
         "one-shot probing must not write a candidate config"
     );
     assert!(

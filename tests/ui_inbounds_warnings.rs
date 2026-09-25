@@ -17,9 +17,15 @@ use broccoli::app::BroccoliApp;
 use broccoli::i18n::safety_finding_message;
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
-use broccoli::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol};
+use broccoli::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, ServersFile};
+use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
+
+#[path = "common/nav.rs"]
+mod nav;
+#[path = "common/screen.rs"]
+mod screen;
 
 mod common;
 
@@ -45,26 +51,14 @@ fn boot_inbounds(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = common::boot(
-        |root| {
-            let state_dir = root.join("broccoli/state");
-            std::fs::create_dir_all(&state_dir).unwrap();
-            std::fs::write(
-                state_dir.join("settings.json"),
-                serde_json::to_vec_pretty(settings).unwrap(),
-            )
-            .unwrap();
+    nav::boot_screen(
+        screen::BootState {
+            settings: settings.clone(),
+            servers: ServersFile::default(),
         },
-        None,
-    );
-
-    h.set_size(egui::Vec2::new(1100.0, 2800.0));
-    h.run();
-    common::dismiss_wizard(&mut h);
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Inbounds")
-        .click();
-    h.run();
-    (lock, tmp, h)
+        Screen::Inbounds,
+        egui::Vec2::new(1100.0, 2800.0),
+    )
 }
 
 fn settings_with_socks_listen(listen: &str) -> Settings {

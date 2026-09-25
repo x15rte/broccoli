@@ -402,7 +402,7 @@ mod tests {
     /// only writes the release-verification line to it.
     fn log_sink() -> super::AppLogSink {
         let (evt, _rx) = std::sync::mpsc::sync_channel(1);
-        super::AppLogSink::new(evt, egui::Context::default())
+        super::super::events::EventStream::new(evt, egui::Context::default()).sink()
     }
 
     #[test]

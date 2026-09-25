@@ -19,10 +19,16 @@ use broccoli::i18n::{Key, safety_finding_message, t};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{Balancer, OutboundModel, RoutingCfg, Rule, ServerProfile, ServersFile};
+use broccoli::ui::Screen;
 use egui::accesskit::Role;
 use egui::{Key as EguiKey, Modifiers, Vec2};
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
+
+#[path = "common/nav.rs"]
+mod nav;
+#[path = "common/screen.rs"]
+mod screen;
 
 mod common;
 
@@ -54,32 +60,11 @@ fn boot_routing(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = common::boot(
-        |root| {
-            let state_dir = root.join("broccoli/state");
-            std::fs::create_dir_all(&state_dir).unwrap();
-            std::fs::write(
-                state_dir.join("settings.json"),
-                serde_json::to_vec_pretty(settings).unwrap(),
-            )
-            .unwrap();
-            if let Some(servers) = servers {
-                std::fs::write(
-                    state_dir.join("servers.json"),
-                    serde_json::to_vec_pretty(servers).unwrap(),
-                )
-                .unwrap();
-            }
-        },
-        None,
-    );
-
-    h.set_size(Vec2::new(1100.0, 2800.0));
-    h.run();
-    common::dismiss_wizard(&mut h);
-    h.get_by_role_and_label(Role::Button, "Routing").click();
-    h.run();
-    (lock, tmp, h)
+    let state = screen::BootState {
+        settings: settings.clone(),
+        servers: servers.cloned().unwrap_or_default(),
+    };
+    nav::boot_screen(state, Screen::Routing, Vec2::new(1100.0, 2800.0))
 }
 
 /// A rule with a valid built-in target and a fixed tag.

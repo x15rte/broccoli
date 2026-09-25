@@ -22,12 +22,15 @@
 
 use broccoli::app::BroccoliApp;
 use broccoli::i18n::{Key, t, t_fmt};
-use broccoli::model::settings::Language;
+use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile};
 use broccoli::rt::{CoreEvt, LatencyProbeResult, OutboundStatusView};
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::Map;
+
+#[path = "common/screen.rs"]
+mod screen;
 
 mod common;
 
@@ -54,15 +57,10 @@ fn harness() -> (
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    common::boot(
-        |root| {
-            let state = root.join("broccoli/state");
-            std::fs::create_dir_all(&state).unwrap();
-            std::fs::write(
-                state.join("servers.json"),
-                serde_json::to_vec_pretty(&seeded_servers()).unwrap(),
-            )
-            .unwrap();
+    screen::boot_state(
+        screen::BootState {
+            settings: Settings::default(),
+            servers: seeded_servers(),
         },
         None,
     )

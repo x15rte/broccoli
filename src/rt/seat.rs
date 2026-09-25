@@ -285,7 +285,7 @@ pub(crate) fn deliver_profile_reply(
             if sender.send(reply).is_err() {
                 // Receiver vanished; nothing further is delivered.
             }
-            runtime.repaint.request_repaint();
+            runtime.events.repaint_now();
         }
         sidecar => unreachable!(
             "a profile-validation terminal must carry its parked reply sidecar, got {sidecar:?}"
@@ -321,7 +321,7 @@ pub(crate) fn deliver_test_reply(
             if reply.send(verdict).is_err() {
                 // Receiver vanished; nothing further is delivered.
             }
-            runtime.repaint.request_repaint();
+            runtime.events.repaint_now();
         }
         sidecar => unreachable!(
             "a config-test terminal must carry its parked reply sidecar, got {sidecar:?}"
@@ -810,7 +810,7 @@ impl Runtime {
         };
 
         let grpc = self.grpc.clone();
-        let repaint = self.repaint.clone();
+        let repaint = self.events.repaint_handle();
         let task = tokio::spawn(async move {
             let result = seat.call(&grpc, prepared).await;
             let _ = guard.send(result);
@@ -830,7 +830,7 @@ impl Runtime {
         error: DiagError,
     ) {
         let _ = guard.send(Err(error));
-        self.repaint.request_repaint();
+        self.events.repaint_now();
     }
 
     /// Answer the registry's busy-window reject with the seat's declared

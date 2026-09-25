@@ -29,6 +29,9 @@ use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::{Value, json};
 
+#[path = "common/screen.rs"]
+mod screen;
+
 mod common;
 
 /// The seeded profile name; Discard must restore it after an edit.
@@ -62,42 +65,24 @@ fn harness() -> (
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    common::boot(
-        |root| {
-            let broccoli_root = root.join("broccoli");
-            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
-            let mut profile =
-                ServerProfile::new(SEEDED_NAME, OutboundModel::new(Protocol::Freedom));
-            profile.id = "0123456789abcdef".into();
-            profile.outbound.stream.finalmask = Some(FinalmaskModel {
-                tcp: vec![FinalmaskTcpMask::Unknown(large_raw_value(0x03))],
-                udp: Vec::new(),
-                quic_params: None,
-                extra: Default::default(),
-            });
-            let servers = ServersFile {
-                version: 1,
-                active: Some(profile.id.clone()),
-                profiles: vec![profile],
-                extra: Default::default(),
-            };
-            std::fs::write(
-                broccoli_root.join("state/servers.json"),
-                serde_json::to_vec_pretty(&servers).unwrap(),
-            )
-            .unwrap();
-            let mut settings = Settings::default();
-            settings.routing.observatory.enabled = false;
-            settings.routing.burst_observatory.enabled = false;
-            std::fs::write(
-                broccoli_root.join("state/settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
-        },
-        None,
-    )
+    let mut profile = ServerProfile::new(SEEDED_NAME, OutboundModel::new(Protocol::Freedom));
+    profile.id = "0123456789abcdef".into();
+    profile.outbound.stream.finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Unknown(large_raw_value(0x03))],
+        udp: Vec::new(),
+        quic_params: None,
+        extra: Default::default(),
+    });
+    let servers = ServersFile {
+        version: 1,
+        active: Some(profile.id.clone()),
+        profiles: vec![profile],
+        extra: Default::default(),
+    };
+    let mut settings = Settings::default();
+    settings.routing.observatory.enabled = false;
+    settings.routing.burst_observatory.enabled = false;
+    screen::boot_state(screen::BootState { settings, servers }, None)
 }
 
 /// A 32-byte Wireguard key in hex (64 hex digits — any 64-hex-digit value
@@ -114,48 +99,30 @@ fn harness_wg() -> (
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    common::boot(
-        |root| {
-            let broccoli_root = root.join("broccoli");
-            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
-            let mut profile =
-                ServerProfile::new(SEEDED_NAME, OutboundModel::new(Protocol::Wireguard));
-            profile.id = "0123456789abcdef".into();
-            if let ProtocolSettings::Wireguard(settings) = &mut profile.outbound.settings {
-                settings.secret_key = WG_KEY.into();
-                settings.address = vec!["10.0.0.2/32".into()];
-                settings.peers = (0..6)
-                    .map(|_| WireguardPeer {
-                        public_key: WG_KEY.into(),
-                        endpoint: "1.2.3.4:51820".into(),
-                        allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
-                        ..Default::default()
-                    })
-                    .collect();
-            }
-            let servers = ServersFile {
-                version: 1,
-                active: Some(profile.id.clone()),
-                profiles: vec![profile],
-                extra: Default::default(),
-            };
-            std::fs::write(
-                broccoli_root.join("state/servers.json"),
-                serde_json::to_vec_pretty(&servers).unwrap(),
-            )
-            .unwrap();
-            let mut settings = Settings::default();
-            settings.routing.observatory.enabled = false;
-            settings.routing.burst_observatory.enabled = false;
-            std::fs::write(
-                broccoli_root.join("state/settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
-        },
-        None,
-    )
+    let mut profile = ServerProfile::new(SEEDED_NAME, OutboundModel::new(Protocol::Wireguard));
+    profile.id = "0123456789abcdef".into();
+    if let ProtocolSettings::Wireguard(settings) = &mut profile.outbound.settings {
+        settings.secret_key = WG_KEY.into();
+        settings.address = vec!["10.0.0.2/32".into()];
+        settings.peers = (0..6)
+            .map(|_| WireguardPeer {
+                public_key: WG_KEY.into(),
+                endpoint: "1.2.3.4:51820".into(),
+                allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                ..Default::default()
+            })
+            .collect();
+    }
+    let servers = ServersFile {
+        version: 1,
+        active: Some(profile.id.clone()),
+        profiles: vec![profile],
+        extra: Default::default(),
+    };
+    let mut settings = Settings::default();
+    settings.routing.observatory.enabled = false;
+    settings.routing.burst_observatory.enabled = false;
+    screen::boot_state(screen::BootState { settings, servers }, None)
 }
 
 /// Dismiss the first-run wizard and open the Servers screen at the DEFAULT

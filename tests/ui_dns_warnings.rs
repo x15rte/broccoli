@@ -17,9 +17,15 @@ use broccoli::i18n::safety_finding_message;
 use broccoli::i18n::{Key, t};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Mode};
-use broccoli::model::{DnsCfg, DnsServer, FakeDnsCfg, Settings};
+use broccoli::model::{DnsCfg, DnsServer, FakeDnsCfg, ServersFile, Settings};
+use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
+
+#[path = "common/nav.rs"]
+mod nav;
+#[path = "common/screen.rs"]
+mod screen;
 
 mod common;
 
@@ -51,7 +57,7 @@ fn invalid_pool_cidr_shows_inline_error() {
         },
         ..Default::default()
     };
-    let (_lock, _tmp, mut h) = boot(&settings, "DNS");
+    let (_lock, _tmp, mut h) = boot(&settings, Screen::Dns);
 
     // Replace the first pool's CIDR with a non-CIDR value, exactly like the
     // shared smoke-test editing flow.
@@ -82,41 +88,20 @@ fn invalid_pool_cidr_shows_inline_error() {
 /// AccessKit tree without scrolling.
 fn boot(
     settings: &Settings,
-    screen: &str,
+    screen: Screen,
 ) -> (
     MutexGuard<'static, ()>,
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = common::boot(
-        |root| {
-            let state_dir = root.join("broccoli/state");
-            std::fs::create_dir_all(&state_dir).unwrap();
-            std::fs::write(
-                state_dir.join("settings.json"),
-                serde_json::to_vec_pretty(settings).unwrap(),
-            )
-            .unwrap();
+    nav::boot_screen(
+        screen::BootState {
+            settings: settings.clone(),
+            servers: ServersFile::default(),
         },
-        None,
-    );
-
-    h.set_size(egui::Vec2::new(1100.0, 2800.0));
-    h.run();
-    common::dismiss_wizard(&mut h);
-    // The dashboard's mode selector carries its own "TUN" selectable label
-    // (same Button role in the AccessKit tree), so the sidebar item is
-    // ambiguous while the dashboard is showing; stage through the DNS screen
-    // (whose label is unique) so the final nav click has exactly one match.
-    if screen != "DNS" {
-        h.get_by_role_and_label(egui::accesskit::Role::Button, "DNS")
-            .click();
-        h.run();
-    }
-    h.get_by_role_and_label(egui::accesskit::Role::Button, screen)
-        .click();
-    h.run();
-    (lock, tmp, h)
+        screen,
+        egui::Vec2::new(1100.0, 2800.0),
+    )
 }
 
 /// A `Settings` in the given mode, with a DNS server configured iff
@@ -145,7 +130,7 @@ fn settings_with_mode(mode: Mode, dns_configured: bool) -> Settings {
 
 #[test]
 fn tun_without_dns_renders_tun_warning() {
-    let (_lock, _tmp, h) = boot(&settings_with_mode(Mode::Tun, false), "TUN");
+    let (_lock, _tmp, h) = boot(&settings_with_mode(Mode::Tun, false), Screen::Tun);
 
     let warning = privacy_message(SafetyCode::TunDnsUnprotected);
     assert!(
@@ -156,7 +141,7 @@ fn tun_without_dns_renders_tun_warning() {
 
 #[test]
 fn tun_with_dns_renders_no_tun_warning() {
-    let (_lock, _tmp, h) = boot(&settings_with_mode(Mode::Tun, true), "TUN");
+    let (_lock, _tmp, h) = boot(&settings_with_mode(Mode::Tun, true), Screen::Tun);
 
     let warning = privacy_message(SafetyCode::TunDnsUnprotected);
     assert!(
@@ -167,7 +152,7 @@ fn tun_with_dns_renders_no_tun_warning() {
 
 #[test]
 fn mode_off_renders_no_tun_warning() {
-    let (_lock, _tmp, h) = boot(&Settings::default(), "TUN");
+    let (_lock, _tmp, h) = boot(&Settings::default(), Screen::Tun);
     let tun_warning = privacy_message(SafetyCode::TunDnsUnprotected);
     assert!(
         h.query_by_label(&tun_warning).is_none(),
@@ -179,7 +164,7 @@ fn mode_off_renders_no_tun_warning() {
 fn enabling_tun_live_shows_warning_and_dns_config_clears_it() {
     // Default settings now carry the seeded DNS module, so the "no DNS"
     // state must be built explicitly (servers empty + parallel flag cleared).
-    let (_lock, _tmp, mut h) = boot(&settings_with_mode(Mode::Off, false), "TUN");
+    let (_lock, _tmp, mut h) = boot(&settings_with_mode(Mode::Off, false), Screen::Tun);
     let warning = privacy_message(SafetyCode::TunDnsUnprotected);
     assert!(
         h.query_by_label(&warning).is_none(),

@@ -21,6 +21,9 @@ use broccoli::rt::{CoreEvt, DownloadState};
 use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
 use parking_lot::MutexGuard;
 
+#[path = "common/screen.rs"]
+mod screen;
+
 mod common;
 
 /// A raw override that fails generation with a message longer than the
@@ -71,19 +74,13 @@ fn boot(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = common::boot(
-        |root| {
-            let state_dir = root.join("broccoli/state");
-            std::fs::create_dir_all(&state_dir).unwrap();
-            std::fs::write(
-                state_dir.join("settings.json"),
-                serde_json::to_vec_pretty(settings).unwrap(),
-            )
-            .unwrap();
+    let (lock, tmp, mut h) = screen::boot_state(
+        screen::BootState {
+            settings: settings.clone(),
+            servers: ServersFile::default(),
         },
         None,
     );
-
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
     common::dismiss_wizard(&mut h);

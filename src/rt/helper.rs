@@ -2562,8 +2562,9 @@ impl HopLogGate {
         if self.suppressed > 0 {
             // Deliver the summary of previously suppressed lines first; if
             // the channel still rejects it, suppress this line too.
-            let summary =
-                HelperLog::Message(DiagError::from(super::suppressed_summary(self.suppressed)));
+            let summary = HelperLog::Message(DiagError::from(super::events::suppressed_summary(
+                self.suppressed,
+            )));
             match sender.try_send(HelperEvent::Log(summary)) {
                 Ok(()) => self.suppressed = 0,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2608,7 +2609,7 @@ fn send_helper_lifecycle_event(mut event: HelperEvent, sender: &mpsc::Sender<Hel
                     // rather than wedge the reader thread against it.
                     return true;
                 }
-                std::thread::sleep(super::EVENT_SEND_RETRY);
+                std::thread::sleep(super::events::EVENT_SEND_RETRY);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
         }
@@ -4072,7 +4073,7 @@ mod tests {
         match &drained[0] {
             HelperEvent::Log(HelperLog::Message(message)) => assert_eq!(
                 message.text(Language::En),
-                super::super::suppressed_summary(3).text(Language::En)
+                super::super::events::suppressed_summary(3).text(Language::En)
             ),
             other => panic!("expected suppression summary, got {other:?}"),
         }
@@ -4125,7 +4126,7 @@ mod tests {
         match &drained[0] {
             HelperEvent::Log(HelperLog::Message(message)) => assert_eq!(
                 message.text(Language::En),
-                super::super::suppressed_summary(1).text(Language::En)
+                super::super::events::suppressed_summary(1).text(Language::En)
             ),
             other => panic!("expected singular suppression summary, got {other:?}"),
         }
@@ -4162,7 +4163,7 @@ mod tests {
         match &drained[0] {
             HelperEvent::Log(HelperLog::Message(message)) => assert_eq!(
                 message.text(Language::En),
-                super::super::suppressed_summary(2).text(Language::En)
+                super::super::events::suppressed_summary(2).text(Language::En)
             ),
             other => panic!("expected second summary with a fresh count, got {other:?}"),
         }
@@ -4258,7 +4259,7 @@ mod tests {
         // A stall a healthy runtime can legitimately exceed the old
         // GUI-side bound by (3× the old window), yet far below the new
         // 4 s drop window.
-        let stall = super::super::EVENT_SEND_BOUND * 3;
+        let stall = super::super::events::EVENT_SEND_BOUND * 3;
         assert!(stall < LIFECYCLE_SEND_WINDOW);
 
         let (sender, mut receiver) = mpsc::channel(1);

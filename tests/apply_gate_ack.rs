@@ -27,10 +27,14 @@
 
 use broccoli::app::BroccoliApp;
 use broccoli::i18n::{Key, t};
+use broccoli::model::ServersFile;
 use broccoli::model::Settings;
 use broccoli::model::inbound::{LocalInboundCfg, LocalInboundProtocol};
 use broccoli::model::settings::Language;
 use egui_kittest::{Harness, kittest::Queryable};
+
+#[path = "common/screen.rs"]
+mod screen;
 
 mod common;
 
@@ -39,25 +43,20 @@ fn harness_with_hazardous_settings() -> (
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    common::boot(
-        |root| {
-            let broccoli_root = root.join("broccoli");
-            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-            // Unauthenticated SOCKS listener bound beyond loopback: an Exposure
-            // hazard by every model rule (src/model/safety.rs).
-            let settings = Settings {
-                local_inbounds: vec![LocalInboundCfg {
-                    protocol: LocalInboundProtocol::Socks,
-                    listen: "0.0.0.0".into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            };
-            std::fs::write(
-                broccoli_root.join("state/settings.json"),
-                serde_json::to_vec_pretty(&settings).unwrap(),
-            )
-            .unwrap();
+    // Unauthenticated SOCKS listener bound beyond loopback: an Exposure hazard
+    // by every model rule (src/model/safety.rs).
+    let settings = Settings {
+        local_inbounds: vec![LocalInboundCfg {
+            protocol: LocalInboundProtocol::Socks,
+            listen: "0.0.0.0".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    screen::boot_state(
+        screen::BootState {
+            settings,
+            servers: ServersFile::default(),
         },
         None,
     )
@@ -65,7 +64,7 @@ fn harness_with_hazardous_settings() -> (
 
 #[test]
 fn hazardous_settings_boot_without_a_dialog_and_existing_gates_still_block() {
-    let (_lock, tmp, mut h) = harness_with_hazardous_settings();
+    let (_lock, _tmp, mut h) = harness_with_hazardous_settings();
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -105,14 +104,14 @@ fn hazardous_settings_boot_without_a_dialog_and_existing_gates_still_block() {
         "the hazard gate must not fire while the existing gates still block"
     );
     assert!(
-        !tmp.path()
-            .join("broccoli/config/config.candidate.json")
+        !broccoli::sys::paths::config_dir()
+            .join("config.candidate.json")
             .exists(),
         "a blocked Connect must not produce a candidate config"
     );
     // The persisted hazardous settings survive untouched.
     let settings: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tmp.path().join("broccoli/state/settings.json")).unwrap(),
+        &std::fs::read(broccoli::sys::paths::state_dir().join("settings.json")).unwrap(),
     )
     .expect("settings state must remain JSON");
     assert_eq!(settings["localInbounds"][0]["listen"], "0.0.0.0");

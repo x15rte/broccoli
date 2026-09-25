@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub mod dns_in;
+mod events;
 pub mod grpc;
 pub mod helper;
 pub mod jobs;
@@ -25,6 +26,8 @@ use policy::{
     readiness_timeout_verdict, spend_retry_attempt, update_retries_bind_race,
 };
 use state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
+
+use self::events::{AppLogSink, EventStream};
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
@@ -62,7 +65,7 @@ const TUN_CLOSE_DEADLINE: Duration = TUN_RPC_TIMEOUT.saturating_add(TUN_CLOSE_MA
 /// config, so the runtime cannot finish before the worker's own terminal)
 /// plus TUN cleanup ([`TUN_CLOSE_DEADLINE`]) plus STOP_TIMEOUT (5 s) plus
 /// the Tokio shutdown (0.25 s) plus the bounded event sends during shutdown
-/// (a few × EVENT_SEND_BOUND). A worker still alive after this bound is
+/// (a few × the events module's send bound). A worker still alive after this bound is
 /// pathologically stalled; [`RuntimeHandle::drop`]
 /// detaches it so the GUI thread's teardown can never hang on the join.
 const RUNTIME_JOIN_BOUND: Duration =
@@ -877,15 +880,6 @@ const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// queue without bound (CWE-400/770); 2048 slots cover many frames
 /// of GUI drain, and lifecycle events stay rare enough that they never starve.
 pub const EVT_CHANNEL_CAPACITY: usize = 2048;
-/// Bounded wait for one lifecycle event whose channel is full.
-/// The GUI drains every frame, so this covers many drain cycles; only a GUI
-/// that has stopped draining (shutdown) can exhaust it. Kept small so a
-/// shutdown stalls for at most one event's window.
-const EVENT_SEND_BOUND: Duration = Duration::from_millis(250);
-/// Retry cadence of the bounded full-channel fallback. Far shorter than a
-/// GUI frame, so a drain cycle is picked up within a few milliseconds.
-const EVENT_SEND_RETRY: Duration = Duration::from_millis(10);
-
 /// Build one select-loop ticker with `MissedTickBehavior::Delay`.
 ///
 /// Tokio's default `Burst` fires the next tick instantly after an overrun.
@@ -924,8 +918,7 @@ struct PollArmCounters {
 }
 
 struct Runtime {
-    evt: SyncSender<CoreEvt>,
-    repaint: egui::Context,
+    events: EventStream,
     cmd: mpsc::UnboundedReceiver<CoreCmd>,
     grpc: GrpcClient,
     api_port: u16,
@@ -1045,165 +1038,6 @@ struct Runtime {
     /// (an event emitted after a mutation follows that mutation's
     /// bookends; an event emitted before stays before).
     pending_bookends: mpsc::UnboundedReceiver<Option<JobKind>>,
-    /// Coalescing gate for core output lines, shared with the
-    /// direct-mode pump closure and the helper path.
-    log_gate: Arc<Mutex<LogGate>>,
-}
-
-/// Coalescing gate for core output lines forwarded to the GUI log. A flooding
-/// core must not be able to grow the bounded GUI event queue without bound
-/// (CWE-400/770): once the channel rejects a log event, later
-/// lines are counted instead of queued, and the count is delivered as one
-/// summary message as soon as the channel accepts again — coalescing rather
-/// than dropping silently or blocking. Broccoli's own messages bypass the
-/// gate (app-generated, low volume).
-struct LogGate {
-    /// True while the GUI channel has rejected at least one log event.
-    backed_up: bool,
-    /// Lines dropped since the last delivered summary.
-    suppressed: u64,
-}
-
-impl LogGate {
-    fn new() -> Self {
-        LogGate {
-            backed_up: false,
-            suppressed: 0,
-        }
-    }
-
-    /// Forward one core output line. Returns true when at least one event was
-    /// actually queued (the caller requests a repaint then).
-    fn forward(&mut self, line: String, evt: &SyncSender<CoreEvt>) -> bool {
-        if self.backed_up {
-            // Deliver the summary of previously suppressed lines first; if the
-            // channel still rejects it, suppress this line too.
-            if evt
-                .try_send(CoreEvt::AppLog(AppMessage::from(suppressed_summary(
-                    self.suppressed,
-                ))))
-                .is_err()
-            {
-                self.suppressed += 1;
-                return false;
-            }
-            self.backed_up = false;
-            self.suppressed = 0;
-        }
-        match evt.try_send(CoreEvt::Log {
-            line,
-            from_core: true,
-        }) {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                self.backed_up = true;
-                self.suppressed = 1;
-                false
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-        }
-    }
-}
-
-/// Message summarizing the core output lines the gate had to drop while the
-/// GUI channel was full; the app renders it in the active language like every
-/// other runtime-authored line.
-fn suppressed_summary(n: u64) -> Diag {
-    if n == 1 {
-        Diag::new(Key::RtLogSuppressedOne)
-    } else {
-        Diag::new(Key::RtLogSuppressedMany).arg(n)
-    }
-}
-
-/// Queue an event on the GUI channel. Log events are routed through
-/// [`LogGate`] (coalesced when the channel is full); every other event falls
-/// back to a bounded wait when the channel is momentarily full.
-///
-/// The fallback must never block the runtime thread without bound:
-/// the GUI drains every frame in normal operation, so a channel
-/// that stays full can only mean the GUI has stopped draining — shutdown.
-/// Volatile events (telemetry, progress, diagnostics) are therefore dropped
-/// immediately on a full channel: they are superseded by a later event of
-/// the same class or lost without user-visible effect. Lifecycle, terminal,
-/// and correlated events wait one [`EVENT_SEND_BOUND`] drain window first —
-/// in normal operation the GUI's next frame drain delivers them, so they are
-/// never dropped while the GUI is alive; only a permanently undrained
-/// channel (shutdown) loses them, where no event is observable anyway.
-fn queue_event(evt: CoreEvt, sender: &SyncSender<CoreEvt>) {
-    match sender.try_send(evt) {
-        Ok(()) => {}
-        Err(std::sync::mpsc::TrySendError::Full(evt)) => {
-            if is_volatile_event(&evt) {
-                return;
-            }
-            queue_lifecycle_with_bounded_wait(evt, sender);
-        }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
-    }
-}
-
-/// Wait one bounded drain window for a lifecycle event whose channel is
-/// full, retrying at [`EVENT_SEND_RETRY`] cadence so the GUI's next drain
-/// cycle picks it up within milliseconds. On timeout the GUI is not draining
-/// (shutdown), and the event is dropped rather than deadlocking the runtime
-/// thread against the GUI thread's join.
-fn queue_lifecycle_with_bounded_wait(evt: CoreEvt, sender: &SyncSender<CoreEvt>) {
-    let deadline = Instant::now() + EVENT_SEND_BOUND;
-    let mut pending = evt;
-    loop {
-        match sender.try_send(pending) {
-            Ok(()) => return,
-            Err(std::sync::mpsc::TrySendError::Full(evt)) => {
-                pending = evt;
-                if Instant::now() >= deadline {
-                    return;
-                }
-                std::thread::sleep(EVENT_SEND_RETRY);
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
-        }
-    }
-}
-
-/// Event classes that are safe to drop when the GUI channel is full: they
-/// are either superseded by a later event of the same class (stats,
-/// observatory snapshots, download progress) or diagnostic text whose loss
-/// the log gate already tolerates. These never wait on the channel.
-fn is_volatile_event(evt: &CoreEvt) -> bool {
-    matches!(
-        evt,
-        CoreEvt::Stats(_)
-            | CoreEvt::Observatory(_)
-            | CoreEvt::Log { .. }
-            | CoreEvt::AppLog(_)
-            | CoreEvt::Download(DownloadState::Working { .. })
-    )
-}
-
-/// One app-authored log line written from outside the runtime loop — a
-/// spawn's release verification, a probe worker. It emits exactly what
-/// [`Runtime::app_log`] emits: the message lands on the GUI channel as an
-/// [`CoreEvt::AppLog`] event the app renders in the display language, and
-/// one repaint is requested. Cloneable, so a worker owns its own handle.
-#[derive(Clone)]
-pub(crate) struct AppLogSink {
-    evt: SyncSender<CoreEvt>,
-    repaint: egui::Context,
-}
-
-impl AppLogSink {
-    pub(crate) fn new(evt: SyncSender<CoreEvt>, repaint: egui::Context) -> Self {
-        Self { evt, repaint }
-    }
-
-    /// Queue one keyed message. Volatile by class (see
-    /// [`is_volatile_event`]): a full GUI channel drops the line instead of
-    /// blocking the worker that made the decision.
-    pub(crate) fn log(&self, message: impl Into<AppMessage>) {
-        queue_event(CoreEvt::AppLog(message.into()), &self.evt);
-        self.repaint.request_repaint();
-    }
 }
 
 /// Install the aws-lc-rs crypto provider as rustls's process default.
@@ -1242,8 +1076,7 @@ impl Runtime {
         // struct owns.
         let (bookend_tx, bookend_rx) = mpsc::unbounded_channel();
         Self {
-            evt,
-            repaint,
+            events: EventStream::new(evt, repaint),
             cmd,
             poll_fires: Arc::new(PollArmCounters::default()),
             // The API port is ephemeral per launch and derived from
@@ -1263,7 +1096,6 @@ impl Runtime {
             obs_enabled: false,
             obs_tags: Vec::new(),
             output_ring: Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_RING))),
-            log_gate: Arc::new(Mutex::new(LogGate::new())),
             shutting_down: false,
             update_gate_start: false,
             replay_after_rollback: false,
@@ -1289,23 +1121,15 @@ impl Runtime {
 
     // -- event plumbing ------------------------------------------------------
 
-    /// Queue a core-output log line through the coalescing gate,
-    /// requesting a repaint only when an event actually made it onto the
-    /// channel.
+    /// Queue a core-output log line through the coalescing gate.
     fn emit_core_log(&self, line: String) {
-        let queued = match self.log_gate.lock() {
-            Ok(mut gate) => gate.forward(line, &self.evt),
-            Err(_) => false,
-        };
-        if queued {
-            self.repaint.request_repaint();
-        }
+        self.events.core_line(line);
     }
 
     fn emit(&mut self, evt: CoreEvt) {
         self.drain_pending_bookends();
-        queue_event(evt, &self.evt);
-        self.repaint.request_repaint();
+        self.events.emit(evt);
+        self.events.repaint_now();
     }
 
     /// Deliver every queued busy-window bookend onto the GUI event channel
@@ -1328,7 +1152,7 @@ impl Runtime {
     /// Queue one busy-window bookend onto the GUI event channel: the registry's
     /// payload is already the shape the shell reads.
     fn deliver_bookend(&mut self, bookend: Option<JobKind>) {
-        queue_event(CoreEvt::Operation(bookend), &self.evt);
+        self.events.bookend(bookend);
     }
 
     fn emit_active_config(&mut self) {
@@ -1457,7 +1281,7 @@ impl Runtime {
                 }
                 // Wake the requester's poll: the rejection did not travel the
                 // event stream.
-                self.repaint.request_repaint();
+                self.events.repaint_now();
             }
             (seat::ExclusiveReject::ProbeEvent, BusyAnswer::ProbeProfiles(profiles)) => {
                 let output = Self::busy_reject_text(active);
@@ -1611,13 +1435,20 @@ impl Runtime {
     /// Queue one runtime-authored message: the app renders it in the active
     /// language and adds the `[broccoli] ` log prefix at drain time.
     fn app_log(&mut self, message: impl Into<AppMessage>) {
-        self.emit(CoreEvt::AppLog(message.into()));
+        self.drain_pending_bookends();
+        self.events.app_log(message);
     }
 
     /// A log handle for work that runs outside the runtime loop (a spawn's
     /// release verification, a probe worker); see [`AppLogSink`].
     fn log_sink(&self) -> AppLogSink {
-        AppLogSink::new(self.evt.clone(), self.repaint.clone())
+        self.events.sink()
+    }
+
+    /// The stream, cloned for a worker task: the handle publishes events and
+    /// pokes the shell under the same drop policy the loop's own events take.
+    fn events_handle(&self) -> EventStream {
+        self.events.handle()
     }
 
     /// Route one decoded helper log record: a keyed record becomes a runtime
@@ -1722,7 +1553,7 @@ impl Runtime {
                     if let Some(bookend) = bookend {
                         self.deliver_bookend(bookend);
                         self.drain_pending_bookends();
-                        self.repaint.request_repaint();
+                        self.events.repaint_now();
                     }
                     // `None` means the sender is gone with the runtime
                     // itself; the select loop is shutting down regardless.
@@ -1903,7 +1734,7 @@ impl Runtime {
                     if reply.send(Err(seat::runtime_stopping())).is_err() {
                         // Receiver vanished; nothing further is delivered.
                     }
-                    self.repaint.request_repaint();
+                    self.events.repaint_now();
                     return;
                 }
                 let Some(_id) =
@@ -1922,7 +1753,7 @@ impl Runtime {
                     if reply.send(Err(seat::runtime_stopping())).is_err() {
                         // Receiver vanished; nothing further is delivered.
                     }
-                    self.repaint.request_repaint();
+                    self.events.repaint_now();
                     return;
                 }
                 let Some(_id) = self
@@ -2710,10 +2541,8 @@ impl Runtime {
         match supervisor::spawn(&apply::active_path(), &log).await {
             Ok(mut child) => {
                 let pid = child.pid();
-                let evt = self.evt.clone();
-                let repaint = self.repaint.clone();
+                let sink = self.log_sink();
                 let ring = Arc::clone(&self.output_ring);
-                let gate = Arc::clone(&self.log_gate);
                 child.pump_output(Box::new(move |line, _is_stderr| {
                     if let Ok(mut ring) = ring.lock() {
                         if ring.len() >= OUTPUT_RING {
@@ -2724,13 +2553,7 @@ impl Runtime {
                     // The error-surface ring above keeps every line (bounded
                     // at OUTPUT_RING); the GUI channel is gated so a flooding
                     // core cannot grow the event queue.
-                    let queued = match gate.lock() {
-                        Ok(mut gate) => gate.forward(line, &evt),
-                        Err(_) => false,
-                    };
-                    if queued {
-                        repaint.request_repaint();
-                    }
+                    sink.core_line(line);
                 }));
                 self.backend.spawn_direct(Box::new(child));
                 self.arm_readiness_deadline();
@@ -3820,8 +3643,9 @@ impl Runtime {
             done: 0,
             total: 0,
         }));
-        let evt = self.evt.clone();
-        let repaint = self.repaint.clone();
+        // The worker publishes through the stream's handle: the drop policy
+        // and the repaint follow the same rules as the loop's own events.
+        let progress_events = self.events_handle();
         let client = if matches!(&source, CoreUpdateSource::PinnedDownload) {
             Some(self.http.get_or_insert_with(reqwest::Client::new).clone())
         } else {
@@ -3845,16 +3669,15 @@ impl Runtime {
                             total,
                         );
                         if should_emit {
-                            // Progress is volatile: a full channel
-                            // drops it without blocking the runtime thread the
-                            // task runs on; the next snapshot or the terminal
-                            // event follows.
-                            let _ = evt.try_send(CoreEvt::Download(DownloadState::Working {
+                            // Progress is volatile: a full channel drops it
+                            // without blocking the runtime thread the task runs
+                            // on; the next snapshot or the terminal event
+                            // follows.
+                            progress_events.emit(CoreEvt::Download(DownloadState::Working {
                                 stage: stage.clone(),
                                 done,
                                 total,
                             }));
-                            repaint.request_repaint();
                         }
                     };
                     crate::sys::core_dl::download_core(&client, progress).await
@@ -3895,19 +3718,17 @@ impl Runtime {
             return;
         }
         let client = self.http.get_or_insert_with(reqwest::Client::new).clone();
-        let evt = self.evt.clone();
-        let repaint = self.repaint.clone();
+        let events = self.events_handle();
         let busy = Arc::clone(&self.update_check_busy);
         tokio::spawn(async move {
             let state = match crate::sys::selfupd::check_for_update(&client).await {
                 Ok(remote) => crate::sys::selfupd::check_outcome(remote),
                 Err(_) => UpdateCheckState::Failed,
             };
-            queue_event(CoreEvt::UpdateCheck(state), &evt);
+            events.emit(CoreEvt::UpdateCheck(state));
             // Release the gate only after the terminal event is queued, so a
             // retry click cannot interleave a second check ahead of it.
             busy.store(false, Ordering::SeqCst);
-            repaint.request_repaint();
         });
     }
 
@@ -4283,7 +4104,7 @@ mod tests {
     /// channel capacity are counted and later coalesced into one summary.
     #[test]
     fn log_gate_coalesces_lines_when_channel_is_full() {
-        use super::{LogGate, suppressed_summary};
+        use super::events::{LogGate, suppressed_summary};
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
         let mut gate = LogGate::new();
@@ -4330,11 +4151,11 @@ mod tests {
     }
 
     /// A lifecycle event must never be dropped while the GUI is
-    /// draining — the bounded fallback waits (well within EVENT_SEND_BOUND)
+    /// draining — the bounded fallback waits (well within the events module's bound)
     /// for the next drain cycle to free a slot.
     #[test]
     fn lifecycle_events_are_never_dropped_when_channel_is_full() {
-        use super::queue_event;
+        use super::events::queue_event;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
@@ -4365,7 +4186,7 @@ mod tests {
     /// thread forever; the lifecycle event is dropped only in that case.
     #[test]
     fn full_channel_lifecycle_event_waits_bounded_window_then_drops() {
-        use super::queue_event;
+        use super::events::queue_event;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
@@ -4383,7 +4204,7 @@ mod tests {
         blocker.join().expect("bounded fallback must return");
         let waited = started.elapsed();
         assert!(
-            waited >= super::EVENT_SEND_BOUND / 2,
+            waited >= super::events::EVENT_SEND_BOUND / 2,
             "the bounded window must actually wait for a drain cycle, got {waited:?}"
         );
         // Only the filler remains; the lifecycle event was dropped after the
@@ -4402,7 +4223,7 @@ mod tests {
     /// block the runtime thread — a full channel drops them immediately.
     #[test]
     fn volatile_events_never_block_when_channel_is_full() {
-        use super::queue_event;
+        use super::events::queue_event;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
