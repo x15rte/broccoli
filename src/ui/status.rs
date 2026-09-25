@@ -1,11 +1,19 @@
-//! Theme-aware semantic status colors.
+//! Theme-aware status colors and the phase badge's presentation.
 //!
 //! The pre-theme UI hardcoded dark-tuned colors (`Color32::YELLOW`,
 //! `from_rgb(0xe0, 0xa0, 0x40)`, …) that become unreadable on the Light
 //! theme (light yellow on white). Every status text, dot, and error frame
 //! must pick its color from [`status_colors`] / [`status_colors_of`] instead
 //! of a raw literal, so both themes stay readable.
+//!
+//! The phase badge — the colored dot plus its caption, shown by the top bar
+//! and the dashboard header — keeps its phase→presentation rule here too:
+//! one match per fact, so a new [`CorePhase`] variant cannot be handled in
+//! one surface and forgotten in the other.
 
+use crate::i18n::{Key, t, t_fmt};
+use crate::model::settings::Language;
+use crate::rt::CorePhase;
 use egui::{Color32, Ui};
 
 /// Semantic status palette for one theme.
@@ -41,9 +49,127 @@ pub fn status_colors_of(ui: &Ui) -> StatusColors {
     status_colors(ui.visuals().dark_mode)
 }
 
+/// Which wording a phase badge uses: the top bar's chip caption or the
+/// dashboard header's status word. The two surfaces word the same phase
+/// differently ("Starting…" beside the action button, "Starting" as a row
+/// label, "Retrying (attempt 2)" versus "Retry #2"), but which variant a
+/// phase maps to is one rule, written once below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseBadgeWording {
+    Topbar,
+    Dashboard,
+}
+
+/// Pure phase → badge caption. One arm per phase — the wording selects the
+/// key set, never the shape (an error phase stays a phase word in both: its
+/// message is the terminal error block, not a badge payload).
+pub(crate) fn phase_badge_text(
+    p: &CorePhase,
+    lang: Language,
+    wording: PhaseBadgeWording,
+) -> String {
+    let (topbar, dashboard, attempt) = match p {
+        CorePhase::Stopped => (Key::AppPhaseStopped, Key::DashboardPhaseStopped, None),
+        CorePhase::Starting => (Key::AppPhaseStarting, Key::DashboardPhaseStarting, None),
+        CorePhase::Running => (Key::AppPhaseRunning, Key::DashboardPhaseRunning, None),
+        CorePhase::Backoff { attempt } => (
+            Key::AppPhaseRetrying,
+            Key::DashboardPhaseRetry,
+            Some(*attempt),
+        ),
+        CorePhase::Error(_) => (Key::AppPhaseError, Key::DashboardPhaseError, None),
+    };
+    let key = match wording {
+        PhaseBadgeWording::Topbar => topbar,
+        PhaseBadgeWording::Dashboard => dashboard,
+    };
+    match attempt {
+        Some(attempt) => t_fmt(lang, key, &[&attempt]),
+        None => t(lang, key).into(),
+    }
+}
+
+/// Pure phase → badge dot color, from the theme's status palette.
+pub(crate) fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> Color32 {
+    match p {
+        CorePhase::Stopped => Color32::GRAY,
+        CorePhase::Starting => colors.warn,
+        CorePhase::Running => colors.ok,
+        CorePhase::Backoff { .. } => colors.warn,
+        CorePhase::Error(_) => colors.err,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every phase maps to a badge caption in both wordings, and an error
+    /// phase stays a phase word in each: the failure's message belongs to the
+    /// terminal error block, never to the phase readout. One table over the
+    /// phase, since that is the rule this module owns.
+    #[test]
+    fn phase_badge_captions_cover_every_phase_in_both_wordings() {
+        let error = CorePhase::Error(crate::rt::PhaseError::new(crate::diag::Diag::new(
+            Key::RtPhaseRestartCancelled,
+        )));
+        let cases = [
+            (CorePhase::Stopped, "Stopped", "Stopped"),
+            (CorePhase::Starting, "Starting…", "Starting"),
+            (CorePhase::Running, "Running", "Running"),
+            (
+                CorePhase::Backoff { attempt: 3 },
+                "Retrying (attempt 3)",
+                "Retry #3",
+            ),
+        ];
+        for (phase, topbar, dashboard) in cases {
+            assert_eq!(
+                phase_badge_text(&phase, Language::En, PhaseBadgeWording::Topbar),
+                topbar,
+                "{phase:?}"
+            );
+            assert_eq!(
+                phase_badge_text(&phase, Language::En, PhaseBadgeWording::Dashboard),
+                dashboard,
+                "{phase:?}"
+            );
+        }
+        let headline = t(Language::En, Key::RtPhaseRestartCancelled);
+        for wording in [PhaseBadgeWording::Topbar, PhaseBadgeWording::Dashboard] {
+            let caption = phase_badge_text(&error, Language::En, wording);
+            assert_eq!(caption, "Error", "the badge must read the phase word");
+            assert!(
+                !caption.contains(headline),
+                "the failure's message must not stand where the phase belongs"
+            );
+        }
+    }
+
+    /// The dot color follows the theme's palette role for each phase.
+    #[test]
+    fn phase_badge_color_follows_the_palette() {
+        let colors = status_colors(true);
+        assert_eq!(
+            phase_badge_color(&CorePhase::Stopped, colors),
+            Color32::GRAY
+        );
+        assert_eq!(phase_badge_color(&CorePhase::Starting, colors), colors.warn);
+        assert_eq!(phase_badge_color(&CorePhase::Running, colors), colors.ok);
+        assert_eq!(
+            phase_badge_color(&CorePhase::Backoff { attempt: 1 }, colors),
+            colors.warn
+        );
+        assert_eq!(
+            phase_badge_color(
+                &CorePhase::Error(crate::rt::PhaseError::new(crate::diag::Diag::new(
+                    Key::RtPhaseConfigError
+                ))),
+                colors
+            ),
+            colors.err
+        );
+    }
 
     /// WCAG relative luminance of an sRGB color.
     fn luminance(c: Color32) -> f64 {

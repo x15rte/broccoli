@@ -18,7 +18,6 @@ use crate::rt::{
 use crate::sys::selfupd::UpdateCheckState;
 use crate::sys::{self, paths};
 use crate::ui::servers::{LeaveAction, ServersScreen};
-use crate::ui::status::{StatusColors, status_colors_of};
 use crate::ui::{self, PhaseAction, Screen, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
@@ -375,16 +374,10 @@ pub struct BroccoliApp {
     /// One-time session log that saving is refused while `state_error` is
     /// set; prevents identical refusal lines on every edit frame.
     state_error_save_logged: bool,
-    /// Top-bar caption cache: phase-badge, mode and
-    /// active-server captions, rebuilt only when a phase/mode/active/
-    /// language/config transition moved them — never on repaint frames.
-    topbar_labels: Option<TopbarLabelCache>,
-    /// Memoized topbar right cluster (version + speed): the speed text and
-    /// the width the cluster reserves, rebuilt only when the stats
-    /// generation / traffic unit / language / core version / viewport
-    /// width moves (ui::topbar). The zone between the
-    /// action button and the cluster is capped to the row minus this width.
-    topbar_right_cache: Option<ui::topbar::TopbarRightCache>,
+    /// The top bar's own memos (captions + right-cluster measurement):
+    /// opaque to the shell, which only hands the value back each frame
+    /// ([`ui::topbar::show_row`]).
+    topbar: ui::topbar::TopbarMemos,
     /// Generator/parsing failure for the current persisted model. Unlike a
     /// runtime verdict, this blocks sending any candidate until an edit fixes it.
     config_error: Option<String>,
@@ -850,8 +843,7 @@ impl BroccoliApp {
             persistence_error,
             config_error,
             state_error_save_logged: false,
-            topbar_labels: None,
-            topbar_right_cache: None,
+            topbar: ui::topbar::TopbarMemos::default(),
             logs_ui: Default::default(),
             settings_ui: Default::default(),
             profile_preview: Default::default(),
@@ -1459,7 +1451,7 @@ impl BroccoliApp {
     /// moved. Runs in `logic` before the tray/icon sync reads the reason,
     /// and once more at the top of `ui` — the second call is a no-op check
     /// that keeps the borrowable texts current on every render pass (the
-    /// same staleness pattern as [`TopbarLabelCache`]).
+    /// same staleness pattern as the top bar's caption memo).
     ///
     /// The recompute reads shell-recorded state only: the raw-override
     /// verdict was recorded by the boot / config-persist generation, so this
@@ -1516,21 +1508,6 @@ impl BroccoliApp {
         } else {
             None
         };
-    }
-
-    /// Borrow the Apply-now block reason for the dirty-config chip: the
-    /// first of the persistence error, the config error, or the
-    /// memoized in-flight-operation caption — all borrowed, so a painted
-    /// frame with a pending apply allocates nothing.
-    fn apply_block_text(&self) -> Option<&str> {
-        self.persistence_error
-            .as_deref()
-            .or(self.config_error.as_deref())
-            .or_else(|| {
-                self.connect_block_cache
-                    .as_ref()
-                    .and_then(|cache| cache.operation_caption.as_deref())
-            })
     }
 
     /// Record a candidate-generation failure in every surface that echoes it
@@ -1924,45 +1901,6 @@ impl BroccoliApp {
 }
 
 impl BroccoliApp {
-    /// Refresh the cached top-bar captions: the badge,
-    /// mode and active-server captions are formatted here — at most once
-    /// per input transition, never on repaint frames. The caller checks
-    /// staleness first; the cache key fields (phase, config revision, mode,
-    /// active id, language) are snapshotted alongside the captions.
-    fn refresh_topbar_labels(&mut self, lang: Language) {
-        let active_caption = self
-            .servers
-            .active_profile()
-            .map(|active| t_fmt(lang, Key::TopbarActiveServer, &[&active.name]));
-        let version_caption = match self.core_version.as_deref() {
-            // `&v` is `&&str` — `&str` implements Display, so the element
-            // coerces to `&dyn Display` (same double-reference shape as the
-            // other t_fmt call sites).
-            Some(v) => t_fmt(
-                lang,
-                Key::TopbarXrayAppVersions,
-                &[&v, &env!("CARGO_PKG_VERSION")],
-            ),
-            None => t_fmt(lang, Key::TopbarAppVersion, &[&env!("CARGO_PKG_VERSION")]),
-        };
-        self.topbar_labels = Some(TopbarLabelCache {
-            phase: self.phase.clone(),
-            config_revision: self.config_revision,
-            mode_key: self.settings.mode,
-            active_id: self.servers.active.clone(),
-            core_version: self.core_version.clone(),
-            lang,
-            badge: phase_badge_text(&self.phase, lang),
-            mode_caption: t_fmt(
-                lang,
-                Key::TopbarMode,
-                &[&mode_label(&self.settings.mode, lang)],
-            ),
-            active_caption,
-            version_caption,
-        });
-    }
-
     /// Rebuild the generation-gated UI-context snapshot.
     /// Runs only when a drained event changed its inputs — never on idle
     /// frames — so a no-op rebuild (e.g. the initial `State(Stopped)` drain)
@@ -2086,187 +2024,81 @@ impl eframe::App for BroccoliApp {
         let mut open_core_setup_requested = false;
 
         // Top bar: runtime phase/action, configured mode, persistence, and
-        // active server.
-        egui::Panel::top("topbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let lang = self.settings.language;
-                // The badge, mode and active-server captions are cached on
-                // their inputs (phase payload, mode, active server id,
-                // language, config revision): the top bar paints every
-                // frame, and each caption used to allocate per frame. The
-                // staleness check compares `CorePhase` variant + payload
-                // explicitly (`CorePhase` has no `PartialEq`) and never
-                // allocates.
-                let stale = match &self.topbar_labels {
-                    Some(cache) => {
-                        cache.lang != lang
-                            || cache.config_revision != self.config_revision
-                            || cache.mode_key != self.settings.mode
-                            || cache.active_id != self.servers.active
-                            || cache.core_version != self.core_version
-                            || cache.phase != self.phase
-                    }
-                    None => true,
-                };
-                if stale {
-                    self.refresh_topbar_labels(lang);
-                }
-                let labels = self
-                    .topbar_labels
-                    .as_ref()
-                    .expect("topbar labels refreshed above");
-                // Measure the right cluster (version + speed) first: its
-                // width is memoized (ui::topbar) on stats generation /
-                // traffic unit / language / core version / viewport width —
-                // never formatted per frame. The zone below is capped to
-                // the row minus this reservation, so the dynamic chips can
-                // never cover the version/speed info.
-                ui::topbar::refresh_topbar_right(
+        // active server. The row owns its captions, its width budget and its
+        // clip (ui::topbar); the shell supplies the frame's facts and
+        // dispatches the clicks.
+        let lang = self.settings.language;
+        let blocked = cached_block_reason(&self.connect_block_cache);
+        let apply_block = apply_block_text(
+            &self.persistence_error,
+            &self.config_error,
+            &self.connect_block_cache,
+        );
+        let topbar_clicks = egui::Panel::top("topbar")
+            .show(ui, |ui| {
+                ui::topbar::show_row(
                     ui,
-                    &ui::topbar::TopbarRightInputs {
+                    &ui::topbar::TopbarRowState {
+                        lang,
+                        phase: &self.phase,
+                        mode: self.settings.mode,
+                        active_name: self.servers.active_profile().map(|p| p.name.as_str()),
+                        core_version: self.core_version.as_deref(),
+                        model_generation: self.model_generation,
+                        blocked_reason: blocked.as_deref(),
+                        unsaved_changes: self.servers_ui.unsaved_changes(),
+                        trial_rule_count: self.routing.trial_rule_count(),
+                        core_available: self.core_available,
+                        config_dirty: self.config_dirty,
+                        apply_block,
+                        apply_result: self
+                            .apply_result
+                            .as_ref()
+                            .map(|(ok, output)| (ok, output.as_str())),
+                        terminal_error: self
+                            .terminal_error
+                            .as_ref()
+                            .map(|error| error.text.as_str()),
+                        config_error: self.config_error.as_deref(),
+                        state_error: self.state_error.as_deref(),
+                        persistence_error: self.persistence_error.as_deref(),
                         stats_generation: self.ui_ctx_snapshot.stats_generation,
                         unit: self.settings.traffic_unit,
-                        lang,
                         stats: self.ui_ctx_snapshot.stats.as_ref(),
-                        version_caption: &labels.version_caption,
-                        core_version: self.core_version.as_deref(),
                     },
-                    &mut self.topbar_right_cache,
-                );
-                ui.colored_label(phase_badge_color(&self.phase, status_colors_of(ui)), "●");
-                ui.label(&labels.badge);
-                ui.separator();
-
-                let action = PhaseAction::for_phase(&self.phase);
-                match action {
-                    PhaseAction::Connect => {
-                        // Borrow the memoized reason: the hover
-                        // text is the cached string, not a per-frame clone.
-                        let blocked = cached_block_reason(&self.connect_block_cache);
-                        let response = ui
-                            .add_enabled(blocked.is_none(), egui::Button::new(action.label(lang)));
-                        let response = if let Some(reason) = blocked.as_deref() {
-                            response.on_disabled_hover_text(reason)
-                        } else {
-                            response
-                        };
-                        if response.clicked() {
-                            let _ = self.request_connect();
-                        }
-                    }
-                    PhaseAction::Disconnect | PhaseAction::CancelRetry => {
-                        if ui.button(action.label(lang)).clicked() {
-                            let _ = self.request_stop();
-                        }
-                    }
-                }
-
-                // Re-borrow after the action match: the click handlers above
-                // take `&mut self`, so the cache borrow is split into two
-                // sequential regions (badge before, zone after).
-                // Dynamic status/error zone, capped to the row minus the
-                // right-cluster reservation (measured above): every text
-                // chip truncates to the remaining budget with the full text
-                // on hover, and the scope is clipped — the chips can never
-                // push under or cover the version/speed info, whatever
-                // combination of errors is live. The scope keeps the width
-                // cap from leaking into the right cluster below.
-                let labels = self
-                    .topbar_labels
-                    .as_ref()
-                    .expect("topbar labels refreshed above");
-                let apply_block = self.apply_block_text();
-                let can_apply = matches!(self.phase, CorePhase::Running) && apply_block.is_none();
-                // The terminal message's hover text: the zone shows the
-                // compact chip, the content-area block shows the wrapped
-                // message with the captured core output. Both borrow the
-                // text the shell rendered once (never per frame) from the
-                // UI-context snapshot.
-                let terminal_hover = self
-                    .terminal_error
-                    .as_ref()
-                    .map(|error| error.text.as_str());
-                let status = ui::topbar::TopbarStatus {
-                    lang,
-                    mode_caption: &labels.mode_caption,
-                    active_caption: labels.active_caption.as_deref(),
-                    unsaved_changes: self.servers_ui.unsaved_changes(),
-                    trial_rule_count: self.routing.trial_rule_count(),
-                    core_available: self.core_available,
-                    config_dirty: self.config_dirty,
-                    can_apply,
-                    apply_block,
-                    apply_result: self
-                        .apply_result
-                        .as_ref()
-                        .map(|(ok, output)| (ok, output.as_str())),
-                    terminal_error: terminal_hover,
-                    config_error: self.config_error.as_deref(),
-                    state_error: self.state_error.as_deref(),
-                    persistence_error: self.persistence_error.as_deref(),
-                };
-                let budget_w = self
-                    .topbar_right_cache
-                    .as_ref()
-                    .map(|cache| cache.width)
-                    .unwrap_or(0.0);
-                let zone_start_x = ui.cursor().min.x;
-                let zone_w =
-                    (ui.max_rect().max.x - budget_w - ui.spacing().item_spacing.x - zone_start_x)
-                        .max(0.0);
-                let clicks = ui
-                    .scope(|ui| {
-                        ui.set_max_width(zone_w);
-                        ui.set_clip_rect(egui::Rect::from_min_max(
-                            egui::pos2(zone_start_x, ui.max_rect().min.y),
-                            egui::pos2(
-                                zone_start_x + zone_w + ui.spacing().item_spacing.x,
-                                ui.max_rect().max.y,
-                            ),
-                        ));
-                        ui::topbar::topbar_status_zone(ui, &status)
-                    })
-                    .inner;
-                if clicks.apply {
-                    self.apply_runtime_config();
-                }
-                if clicks.retry {
-                    // Explicit user action in a failure state: bypass the
-                    // throttle and retry immediately.
-                    self.persist_now(ctx.input(|input| input.time), PersistKind::Config);
-                }
-                if clicks.jump_to_error {
-                    // Jump to the message: the wrapped block with the
-                    // captured core output lives at the top of the dashboard
-                    // content area.
-                    self.screen = Screen::Dashboard;
-                }
-                if clicks.open_folder
-                    && let Err(open_error) = sys::hidden_command("explorer")
-                        .arg(paths::state_dir())
-                        .spawn()
-                {
-                    self.push_log(
-                        false,
-                        t_fmt(lang, Key::LogOpenStateFolderFailed, &[&open_error]),
-                    );
-                }
-                // Right edge last: the version caption with the live speed
-                // readout immediately left of it, anchored to the row's far
-                // right (the right-to-left child fills whatever remains of
-                // the row — the zone above yielded instead of covering it).
-                // Fresh re-borrow after the `&mut self` click dispatch above.
-                let labels = self
-                    .topbar_labels
-                    .as_ref()
-                    .expect("topbar labels refreshed above");
-                let speed = self
-                    .topbar_right_cache
-                    .as_ref()
-                    .and_then(|cache| (!cache.speed.is_empty()).then_some(cache.speed.as_str()));
-                ui::topbar::show_right_cluster(ui, &labels.version_caption, speed);
-            });
-        });
+                    &mut self.topbar,
+                )
+            })
+            .inner;
+        if topbar_clicks.connect {
+            let _ = self.request_connect();
+        }
+        if topbar_clicks.stop {
+            let _ = self.request_stop();
+        }
+        if topbar_clicks.apply {
+            self.apply_runtime_config();
+        }
+        if topbar_clicks.retry {
+            // Explicit user action in a failure state: bypass the throttle
+            // and retry immediately.
+            self.persist_now(ctx.input(|input| input.time), PersistKind::Config);
+        }
+        if topbar_clicks.jump_to_error {
+            // Jump to the message: the wrapped block with the captured core
+            // output lives at the top of the dashboard content area.
+            self.screen = Screen::Dashboard;
+        }
+        if topbar_clicks.open_folder
+            && let Err(open_error) = sys::hidden_command("explorer")
+                .arg(paths::state_dir())
+                .spawn()
+        {
+            self.push_log(
+                false,
+                t_fmt(lang, Key::LogOpenStateFolderFailed, &[&open_error]),
+            );
+        }
 
         // Sidebar navigation. The live speed readout and the session totals
         // now live in the top bar and the dashboard table; the
@@ -3533,63 +3365,13 @@ fn dat_pins_suspended(settings: &Settings) -> bool {
         || settings.geodata.is_configured()
 }
 
-fn phase_badge_text(p: &CorePhase, lang: Language) -> String {
-    match p {
-        CorePhase::Stopped => t(lang, Key::AppPhaseStopped).into(),
-        CorePhase::Starting => t(lang, Key::AppPhaseStarting).into(),
-        CorePhase::Running => t(lang, Key::AppPhaseRunning).into(),
-        CorePhase::Backoff { attempt } => t_fmt(lang, Key::AppPhaseRetrying, &[&attempt]),
-        // The badge is the phase readout: the failure's message is the
-        // terminal error block in the content area, so a long error can no
-        // longer stand where the phase belongs.
-        CorePhase::Error(_) => t(lang, Key::AppPhaseError).into(),
-    }
-}
-
-/// Pure phase → badge dot color (the phase badge's `colors` half of the
-/// former `phase_badge` pair).
-fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> egui::Color32 {
-    match p {
-        CorePhase::Stopped => egui::Color32::GRAY,
-        CorePhase::Starting => colors.warn,
-        CorePhase::Running => colors.ok,
-        CorePhase::Backoff { .. } => colors.warn,
-        CorePhase::Error(_) => colors.err,
-    }
-}
-
-/// One generation of the top-bar captions: the phase
-/// badge, the mode caption and the active-server caption, rebuilt only
-/// when their inputs — the phase (payload included), the mode, the active
-/// server id, the language or the config revision (a rename/persist) —
-/// change, never on repaint frames. `CorePhase`'s own `PartialEq` is the
-/// comparison: the payloads are part of the rendered captions.
-struct TopbarLabelCache {
-    phase: CorePhase,
-    config_revision: u64,
-    mode_key: Mode,
-    active_id: Option<String>,
-    /// The cached core version snapshot: a core install/removal is the only
-    /// way it changes, and the staleness check compares it by value next to
-    /// the other key fields.
-    core_version: Option<String>,
-    lang: Language,
-    badge: String,
-    mode_caption: String,
-    active_caption: Option<String>,
-    /// Right-edge captions: the xray-core version plus the broccoli app
-    /// version (`xray {} · app {}`), or just the app version while no core
-    /// is installed.
-    version_caption: String,
-}
-
 /// Memoized connect-block/apply-block chip texts for the shell's top bar:
 /// while any blocking state is set — persistence/config
 /// error, in-flight operation, raw-override verdict, missing core — the
 /// reason text used to be re-formatted (`t_fmt`/`clone`) on every frame
 /// the shell painted. The texts are pure functions of the keyed inputs, so
 /// they are rebuilt only when an input moves, never on repaint frames (the
-/// [`TopbarLabelCache`] staleness pattern; the compare below is
+/// caption-memo staleness pattern; the compare below is
 /// allocation-free — the `Option<String>` fields compare by value).
 struct ConnectBlockCache {
     lang: Language,
@@ -3606,6 +3388,26 @@ struct ConnectBlockCache {
     operation_caption: Option<String>,
 }
 
+/// Borrow the Apply-now block reason for the dirty-config chip: the first of
+/// the persistence error, the config error, or the memoized
+/// in-flight-operation caption — all borrowed, so a painted frame with a
+/// pending apply allocates nothing. Free over the fields (not a `&self`
+/// method) so a frame can hold these borrows beside `&mut` shell fields.
+fn apply_block_text<'a>(
+    persistence_error: &'a Option<String>,
+    config_error: &'a Option<String>,
+    connect_block_cache: &'a Option<ConnectBlockCache>,
+) -> Option<&'a str> {
+    persistence_error
+        .as_deref()
+        .or(config_error.as_deref())
+        .or_else(|| {
+            connect_block_cache
+                .as_ref()
+                .and_then(|cache| cache.operation_caption.as_deref())
+        })
+}
+
 /// `None` fallback for [`cached_block_reason`] before the first refresh.
 static NO_CONNECT_BLOCK: Option<String> = None;
 
@@ -3618,13 +3420,6 @@ fn cached_block_reason(cache: &Option<ConnectBlockCache>) -> &Option<String> {
         .as_ref()
         .map(|cache| &cache.reason)
         .unwrap_or(&NO_CONNECT_BLOCK)
-}
-
-fn mode_label(m: &crate::model::Mode, lang: Language) -> &'static str {
-    match m {
-        crate::model::Mode::Off => t(lang, Key::ModeOff),
-        crate::model::Mode::Tun => t(lang, Key::ModeTun),
-    }
 }
 
 /// Resolve whether native Windows chrome/menus should render dark for the
@@ -4720,18 +4515,11 @@ mod apply_verdict_tests {
 #[cfg(test)]
 mod tests {
     use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, TerminalError};
-    use super::{Language, native_dark_for, phase_badge_text, tun_outbound_interface_block_reason};
+    use super::{Language, native_dark_for, tun_outbound_interface_block_reason};
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
     use crate::model::settings::Mode;
     use crate::rt::supervisor::MAX_LINE_BYTES;
-    use crate::rt::{CorePhase, PhaseError};
-
-    /// A terminal phase for the caption tests: production payloads are keyed
-    /// `Diag`s, so the fixtures use keys too.
-    fn error_phase(key: Key) -> CorePhase {
-        CorePhase::Error(PhaseError::new(Diag::new(key)))
-    }
 
     fn iface(name: &str, up: bool) -> crate::sys::netif::NetIf {
         crate::sys::netif::NetIf {
@@ -4846,41 +4634,6 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries.len(), 4, "app.log plus three rotated segments");
-    }
-
-    /// Every phase maps to a badge caption, the retry and
-    /// error caption stays the phase word (the failure's message belongs to
-    /// the terminal error block, never to the phase readout), and the other
-    /// captions are the `t()` statics the top bar paints without allocating.
-    #[test]
-    fn phase_badge_text_covers_every_phase_and_keeps_the_error_a_phase_word() {
-        assert_eq!(
-            phase_badge_text(&CorePhase::Stopped, Language::En),
-            "Stopped"
-        );
-        assert_eq!(
-            phase_badge_text(&CorePhase::Starting, Language::En),
-            "Starting…"
-        );
-        assert_eq!(
-            phase_badge_text(&CorePhase::Running, Language::En),
-            "Running"
-        );
-        assert_eq!(
-            phase_badge_text(&CorePhase::Backoff { attempt: 3 }, Language::En),
-            "Retrying (attempt 3)"
-        );
-        let error = error_phase(Key::RtPhaseRestartCancelled);
-        let headline = t(Language::En, Key::RtPhaseRestartCancelled);
-        assert_eq!(
-            phase_badge_text(&error, Language::En),
-            t(Language::En, Key::AppPhaseError),
-            "the badge must read the phase word"
-        );
-        assert!(
-            !phase_badge_text(&error, Language::En).contains(headline),
-            "the failure's message must not stand where the phase belongs"
-        );
     }
 
     /// Exhaustive 3 x 2 preference/system matrix for the native-theme resolver.

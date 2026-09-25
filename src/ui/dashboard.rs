@@ -5,7 +5,9 @@ use crate::model::Mode;
 use crate::model::settings::{Language, Settings, TrafficUnit};
 use crate::rt::{CorePhase, DownloadState, OutboundStatusView};
 use crate::ui::inbounds::protocol_label;
-use crate::ui::status::{StatusColors, status_colors_of};
+use crate::ui::status::{
+    PhaseBadgeWording, StatusColors, phase_badge_color, phase_badge_text, status_colors_of,
+};
 use crate::ui::{PhaseAction, TerminalErrorView, UiCtx};
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
@@ -264,7 +266,7 @@ impl DashboardScreen {
         };
         if stale {
             let phase = ctx.phase.clone();
-            let badge = phase_badge_text(ctx.phase, lang);
+            let badge = phase_badge_text(ctx.phase, lang, PhaseBadgeWording::Dashboard);
             let endpoints = ctx
                 .settings
                 .local_inbounds
@@ -920,23 +922,6 @@ struct HeaderCache {
     endpoints: Vec<(String, ListenerStatus)>,
 }
 
-/// Pure phase → badge caption: static phases render their `t()` string,
-/// parameterized phases format their payload. Runs inside the header-cache
-/// rebuild only — never per frame.
-fn phase_badge_text(p: &CorePhase, lang: Language) -> String {
-    match p {
-        CorePhase::Stopped => t(lang, Key::DashboardPhaseStopped).into(),
-        CorePhase::Starting => t(lang, Key::DashboardPhaseStarting).into(),
-        CorePhase::Running => t(lang, Key::DashboardPhaseRunning).into(),
-        CorePhase::Backoff { attempt } => t_fmt(lang, Key::DashboardPhaseRetry, &[&attempt]),
-        // The phase readout stays the phase: the failure's own message is the
-        // terminal error block below this row, wrapped and complete, never a
-        // payload crammed into the badge (where a long message used to hide
-        // the state it belonged to).
-        CorePhase::Error(_) => t(lang, Key::DashboardPhaseError).into(),
-    }
-}
-
 /// Render the terminal error block: the failure's headline and the captured
 /// core output behind it, both wrapped — never truncated, which is the point
 /// of the content-area surface — plus the button that opens the core setup
@@ -978,17 +963,6 @@ fn terminal_error_block(ui: &mut egui::Ui, lang: Language, error: &TerminalError
         });
     ui.add_space(8.0);
     open_core_setup
-}
-
-/// Pure phase → badge dot color.
-fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> egui::Color32 {
-    match p {
-        CorePhase::Stopped => egui::Color32::GRAY,
-        CorePhase::Starting => colors.warn,
-        CorePhase::Running => colors.ok,
-        CorePhase::Backoff { .. } => colors.warn,
-        CorePhase::Error(_) => colors.err,
-    }
 }
 
 /// Pure phase/settings → status derivation for one local endpoint.
@@ -1051,8 +1025,8 @@ fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus
 mod tests {
     use super::{
         DashboardScreen, LatencyCell, ListenerStatus, TunStatus, build_latency_rows, format_axis,
-        format_bytes, listener_status, missing_inbound_listener, phase_badge_color,
-        phase_badge_text, terminal_error_block, truncate_chars, tun_status, y_axis_label_for,
+        format_bytes, listener_status, missing_inbound_listener, terminal_error_block,
+        truncate_chars, tun_status, y_axis_label_for,
     };
     use crate::diag::Diag;
     use crate::i18n::{Key, t, t_fmt};
@@ -1146,15 +1120,6 @@ mod tests {
         assert!(
             harness.state().open_core_setup_requested,
             "the block's button must ask the shell to open the core setup surface"
-        );
-    }
-
-    #[test]
-    fn error_phase_badge_stays_a_phase_word() {
-        assert_eq!(phase_badge_text(&error_phase(), Language::En), "Error");
-        assert_eq!(
-            phase_badge_color(&error_phase(), crate::ui::status::status_colors(true)),
-            crate::ui::status::status_colors(true).err
         );
     }
 
