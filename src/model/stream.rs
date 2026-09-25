@@ -1450,196 +1450,123 @@ impl<'de> Deserialize<'de> for FinalmaskQuicParams {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum FinalmaskTcpMask {
-    HeaderCustom {
-        settings: FinalmaskHeaderCustomTcp,
-        extra: Map<String, Value>,
-    },
-    Fragment {
-        settings: FinalmaskFragment,
-        extra: Map<String, Value>,
-    },
-    Sudoku {
-        settings: FinalmaskSudoku,
-        extra: Map<String, Value>,
-    },
-    Xmc {
-        settings: FinalmaskXmc,
-        extra: Map<String, Value>,
-    },
-    /// A future discriminator unknown to this Broccoli build. The complete raw
-    /// envelope is retained and shown in the editor.
-    Unknown(Value),
-}
-
-impl FinalmaskTcpMask {
-    pub const TYPES: &'static [&'static str] = &["header-custom", "fragment", "sudoku", "xmc"];
-
-    pub fn known_type(&self) -> Option<&'static str> {
-        match self {
-            Self::HeaderCustom { .. } => Some("header-custom"),
-            Self::Fragment { .. } => Some("fragment"),
-            Self::Sudoku { .. } => Some("sudoku"),
-            Self::Xmc { .. } => Some("xmc"),
-            Self::Unknown(_) => None,
+/// One row per mask variant: the variant, the settings payload it carries,
+/// the settings a new mask of that type starts with, and the `type` string
+/// the core matches the variant on (`infra/conf/transport_finalmask.go`). The
+/// variant list, the discriminant mapping, the row defaults and the
+/// envelope's serialize/deserialize arms all come from these rows, so a new
+/// mask variant is one row.
+macro_rules! finalmask_masks {
+    ($(
+        $mask:ident {
+            $(
+                $variant:ident : $settings:ty = $default:expr => $kind:literal,
+            )*
         }
-    }
-
-    pub fn discriminator(&self) -> Option<&str> {
-        self.known_type().or_else(|| match self {
-            Self::Unknown(Value::Object(object)) => object.get("type").and_then(Value::as_str),
-            _ => None,
-        })
-    }
-
-    pub fn from_known_type(kind: &str) -> Option<Self> {
-        let extra = Map::new();
-        Some(match kind {
-            "header-custom" => Self::HeaderCustom {
-                settings: FinalmaskHeaderCustomTcp::default(),
-                extra,
-            },
-            "fragment" => {
-                let settings = FinalmaskFragment {
-                    packets: "tlshello".into(),
-                    length: Int32Range::single(100),
-                    ..Default::default()
-                };
-                Self::Fragment { settings, extra }
+    )*) => {
+        $(
+            #[derive(Clone, Debug)]
+            pub enum $mask {
+                $(
+                    $variant {
+                        settings: $settings,
+                        extra: Map<String, Value>,
+                    },
+                )*
+                /// A future discriminator unknown to this Broccoli build. The complete raw
+                /// envelope is retained and shown in the editor.
+                Unknown(Value),
             }
-            "sudoku" => Self::Sudoku {
-                settings: FinalmaskSudoku::default(),
-                extra,
-            },
-            "xmc" => Self::Xmc {
-                settings: FinalmaskXmc::default(),
-                extra,
-            },
-            _ => return None,
-        })
+
+            impl $mask {
+                pub const TYPES: &'static [&'static str] = &[$( $kind ),*];
+
+                pub fn known_type(&self) -> Option<&'static str> {
+                    match self {
+                        $( Self::$variant { .. } => Some($kind), )*
+                        Self::Unknown(_) => None,
+                    }
+                }
+
+                pub fn discriminator(&self) -> Option<&str> {
+                    self.known_type().or_else(|| match self {
+                        Self::Unknown(Value::Object(object)) => {
+                            object.get("type").and_then(Value::as_str)
+                        }
+                        _ => None,
+                    })
+                }
+
+                pub fn from_known_type(kind: &str) -> Option<Self> {
+                    let extra = Map::new();
+                    Some(match kind {
+                        $( $kind => Self::$variant { settings: $default, extra }, )*
+                        _ => return None,
+                    })
+                }
+            }
+
+            impl Serialize for $mask {
+                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    match self {
+                        $(
+                            Self::$variant { settings, extra } => {
+                                serialize_finalmask_envelope($kind, settings, extra, serializer)
+                            }
+                        )*
+                        Self::Unknown(raw) => raw.serialize(serializer),
+                    }
+                }
+            }
+
+            impl<'de> Deserialize<'de> for $mask {
+                fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    let raw = Value::deserialize(deserializer)?;
+                    let Some((kind, settings, extra)) = split_finalmask_envelope(&raw) else {
+                        return Ok(Self::Unknown(raw));
+                    };
+                    match kind.as_str() {
+                        $(
+                            $kind => Ok(Self::$variant {
+                                settings: serde_json::from_value(settings)
+                                    .map_err(<D::Error as serde::de::Error>::custom)?,
+                                extra,
+                            }),
+                        )*
+                        _ => Ok(Self::Unknown(raw)),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+finalmask_masks! {
+    FinalmaskTcpMask {
+        HeaderCustom: FinalmaskHeaderCustomTcp = FinalmaskHeaderCustomTcp::default()
+            => "header-custom",
+        Fragment: FinalmaskFragment = FinalmaskFragment {
+            packets: "tlshello".into(),
+            length: Int32Range::single(100),
+            ..Default::default()
+        } => "fragment",
+        Sudoku: FinalmaskSudoku = FinalmaskSudoku::default() => "sudoku",
+        Xmc: FinalmaskXmc = FinalmaskXmc::default() => "xmc",
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum FinalmaskUdpMask {
-    HeaderCustom {
-        settings: FinalmaskHeaderCustomUdp,
-        extra: Map<String, Value>,
-    },
-    MkcpLegacy {
-        settings: FinalmaskMkcpLegacy,
-        extra: Map<String, Value>,
-    },
-    Noise {
-        settings: FinalmaskNoise,
-        extra: Map<String, Value>,
-    },
-    Salamander {
-        settings: FinalmaskSalamander,
-        extra: Map<String, Value>,
-    },
-    Sudoku {
-        settings: FinalmaskSudoku,
-        extra: Map<String, Value>,
-    },
-    Xdns {
-        settings: FinalmaskXdns,
-        extra: Map<String, Value>,
-    },
-    Xicmp {
-        settings: FinalmaskXicmp,
-        extra: Map<String, Value>,
-    },
-    Realm {
-        settings: Box<FinalmaskRealm>,
-        extra: Map<String, Value>,
-    },
-    Udphop {
-        settings: Box<FinalmaskUdpHop>,
-        extra: Map<String, Value>,
-    },
-    /// A future discriminator unknown to this Broccoli build. The complete raw
-    /// envelope is retained and shown in the editor.
-    Unknown(Value),
-}
-
-impl FinalmaskUdpMask {
-    pub const TYPES: &'static [&'static str] = &[
-        "header-custom",
-        "mkcp-legacy",
-        "noise",
-        "salamander",
-        "sudoku",
-        "xdns",
-        "xicmp",
-        "realm",
-        "udphop",
-    ];
-
-    pub fn known_type(&self) -> Option<&'static str> {
-        match self {
-            Self::HeaderCustom { .. } => Some("header-custom"),
-            Self::MkcpLegacy { .. } => Some("mkcp-legacy"),
-            Self::Noise { .. } => Some("noise"),
-            Self::Salamander { .. } => Some("salamander"),
-            Self::Sudoku { .. } => Some("sudoku"),
-            Self::Xdns { .. } => Some("xdns"),
-            Self::Xicmp { .. } => Some("xicmp"),
-            Self::Realm { .. } => Some("realm"),
-            Self::Udphop { .. } => Some("udphop"),
-            Self::Unknown(_) => None,
-        }
-    }
-
-    pub fn discriminator(&self) -> Option<&str> {
-        self.known_type().or_else(|| match self {
-            Self::Unknown(Value::Object(object)) => object.get("type").and_then(Value::as_str),
-            _ => None,
-        })
-    }
-
-    pub fn from_known_type(kind: &str) -> Option<Self> {
-        let extra = Map::new();
-        Some(match kind {
-            "header-custom" => Self::HeaderCustom {
-                settings: FinalmaskHeaderCustomUdp::default(),
-                extra,
-            },
-            "mkcp-legacy" => Self::MkcpLegacy {
-                settings: FinalmaskMkcpLegacy::default(),
-                extra,
-            },
-            "noise" => Self::Noise {
-                settings: FinalmaskNoise::default(),
-                extra,
-            },
-            "salamander" => Self::Salamander {
-                settings: FinalmaskSalamander::default(),
-                extra,
-            },
-            "sudoku" => Self::Sudoku {
-                settings: FinalmaskSudoku::default(),
-                extra,
-            },
-            "xdns" => Self::Xdns {
-                settings: FinalmaskXdns::default(),
-                extra,
-            },
-            "xicmp" => Self::Xicmp {
-                settings: FinalmaskXicmp::default(),
-                extra,
-            },
-            "realm" => Self::Realm {
-                settings: Box::new(FinalmaskRealm::default()),
-                extra,
-            },
-            "udphop" => Self::Udphop {
-                settings: Box::new(FinalmaskUdpHop::default()),
-                extra,
-            },
-            _ => return None,
-        })
+finalmask_masks! {
+    FinalmaskUdpMask {
+        HeaderCustom: FinalmaskHeaderCustomUdp = FinalmaskHeaderCustomUdp::default()
+            => "header-custom",
+        MkcpLegacy: FinalmaskMkcpLegacy = FinalmaskMkcpLegacy::default() => "mkcp-legacy",
+        Noise: FinalmaskNoise = FinalmaskNoise::default() => "noise",
+        Salamander: FinalmaskSalamander = FinalmaskSalamander::default() => "salamander",
+        Sudoku: FinalmaskSudoku = FinalmaskSudoku::default() => "sudoku",
+        Xdns: FinalmaskXdns = FinalmaskXdns::default() => "xdns",
+        Xicmp: FinalmaskXicmp = FinalmaskXicmp::default() => "xicmp",
+        Realm: Box<FinalmaskRealm> = Box::new(FinalmaskRealm::default()) => "realm",
+        Udphop: Box<FinalmaskUdpHop> = Box::new(FinalmaskUdpHop::default()) => "udphop",
     }
 }
 
@@ -1671,150 +1598,6 @@ where
         serde_json::to_value(settings).map_err(<S::Error as serde::ser::Error>::custom)?,
     );
     Value::Object(object).serialize(serializer)
-}
-
-impl Serialize for FinalmaskTcpMask {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::HeaderCustom { settings, extra } => {
-                serialize_finalmask_envelope("header-custom", settings, extra, serializer)
-            }
-            Self::Fragment { settings, extra } => {
-                serialize_finalmask_envelope("fragment", settings, extra, serializer)
-            }
-            Self::Sudoku { settings, extra } => {
-                serialize_finalmask_envelope("sudoku", settings, extra, serializer)
-            }
-            Self::Xmc { settings, extra } => {
-                serialize_finalmask_envelope("xmc", settings, extra, serializer)
-            }
-            Self::Unknown(raw) => raw.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FinalmaskTcpMask {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Value::deserialize(deserializer)?;
-        let Some((kind, settings, extra)) = split_finalmask_envelope(&raw) else {
-            return Ok(Self::Unknown(raw));
-        };
-        match kind.as_str() {
-            "header-custom" => Ok(Self::HeaderCustom {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "fragment" => Ok(Self::Fragment {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "sudoku" => Ok(Self::Sudoku {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "xmc" => Ok(Self::Xmc {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            _ => Ok(Self::Unknown(raw)),
-        }
-    }
-}
-
-impl Serialize for FinalmaskUdpMask {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::HeaderCustom { settings, extra } => {
-                serialize_finalmask_envelope("header-custom", settings, extra, serializer)
-            }
-            Self::MkcpLegacy { settings, extra } => {
-                serialize_finalmask_envelope("mkcp-legacy", settings, extra, serializer)
-            }
-            Self::Noise { settings, extra } => {
-                serialize_finalmask_envelope("noise", settings, extra, serializer)
-            }
-            Self::Salamander { settings, extra } => {
-                serialize_finalmask_envelope("salamander", settings, extra, serializer)
-            }
-            Self::Sudoku { settings, extra } => {
-                serialize_finalmask_envelope("sudoku", settings, extra, serializer)
-            }
-            Self::Xdns { settings, extra } => {
-                serialize_finalmask_envelope("xdns", settings, extra, serializer)
-            }
-            Self::Xicmp { settings, extra } => {
-                serialize_finalmask_envelope("xicmp", settings, extra, serializer)
-            }
-            Self::Realm { settings, extra } => {
-                serialize_finalmask_envelope("realm", settings, extra, serializer)
-            }
-            Self::Udphop { settings, extra } => {
-                serialize_finalmask_envelope("udphop", settings, extra, serializer)
-            }
-            Self::Unknown(raw) => raw.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FinalmaskUdpMask {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Value::deserialize(deserializer)?;
-        let Some((kind, settings, extra)) = split_finalmask_envelope(&raw) else {
-            return Ok(Self::Unknown(raw));
-        };
-        match kind.as_str() {
-            "header-custom" => Ok(Self::HeaderCustom {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "mkcp-legacy" => Ok(Self::MkcpLegacy {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "noise" => Ok(Self::Noise {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "salamander" => Ok(Self::Salamander {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "sudoku" => Ok(Self::Sudoku {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "xdns" => Ok(Self::Xdns {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "xicmp" => Ok(Self::Xicmp {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "realm" => Ok(Self::Realm {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            "udphop" => Ok(Self::Udphop {
-                settings: serde_json::from_value(settings)
-                    .map_err(<D::Error as serde::de::Error>::custom)?,
-                extra,
-            }),
-            _ => Ok(Self::Unknown(raw)),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

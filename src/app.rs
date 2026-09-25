@@ -12,7 +12,7 @@ use crate::model::settings::{Language, Mode};
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
     AppMessage, ApplyIntent, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState,
-    EVT_CHANNEL_CAPACITY, LatencyProbeResult, OperationKind, OutboundStatusView, RuntimeHandle,
+    EVT_CHANNEL_CAPACITY, JobKind, LatencyProbeResult, OutboundStatusView, RuntimeHandle,
     StatsTick, spawn_runtime, sweep_stale_scratch_configs,
 };
 use crate::sys::selfupd::UpdateCheckState;
@@ -231,6 +231,32 @@ enum PersistKind {
     UiOnly,
 }
 
+/// The operation the shell mirrors while the runtime owns the busy window: the
+/// holding job's kind together with the user-facing name the shell paints for
+/// it. A mirror is built only from a kind that names itself, which is exactly
+/// the set of kinds that occupy the window (`rt::seat`'s operation-name table;
+/// the runtime publishes a bookend for no other kind) — so a control that
+/// reports "an operation is in progress" always names it, and a query kind,
+/// which never holds the window, can never become a mirror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldOperation {
+    kind: JobKind,
+    name: Diag,
+}
+
+impl HeldOperation {
+    /// The shell's mirror of one kind that just took the busy window, from a
+    /// bookend or from a command the shell sent: `Some` for a kind the shell
+    /// can name — the kinds that occupy the window — and `None` for a query
+    /// kind, which never holds it and so is nothing to mirror.
+    fn mirror(kind: JobKind) -> Option<Self> {
+        Some(Self {
+            kind,
+            name: kind.operation_name()?,
+        })
+    }
+}
+
 pub struct BroccoliApp {
     servers: ServersFile,
     settings: Settings,
@@ -259,15 +285,14 @@ pub struct BroccoliApp {
     phase: CorePhase,
     /// Transport reported by `ActiveConfig`, held until its following start phase.
     pending_transport: Option<CoreTransport>,
-    /// True when the configuration the running core launched carries a health
-    /// engine (the observatory or the burst observatory), taken from the
-    /// `ActiveConfig` snapshot. The observatory status read follows this fact,
-    /// not the settings: a raw override and a rolled-back candidate both make
-    /// the core run a config the settings no longer describe.
-    health_engine_in_launch: bool,
+    /// The operation the shell mirrors while the runtime owns the busy window:
+    /// written from the runtime's own bookends and from the kind of the
+    /// command the shell just sent ([`CoreCmd::job_kind`]), never from a
+    /// hand-picked kind. The registry's bookends stay the authority for the
+    /// release.
+    operation: Option<HeldOperation>,
     /// Transport owned by the backend represented by the current live phase.
     active_transport: Option<CoreTransport>,
-    operation: Option<OperationKind>,
     stats: Option<StatsTick>,
     stats_history: VecDeque<StatsTick>,
     observatory: Vec<OutboundStatusView>,
@@ -782,7 +807,6 @@ impl BroccoliApp {
             latency_generation: 0,
             phase: CorePhase::Stopped,
             pending_transport: None,
-            health_engine_in_launch: false,
             active_transport: None,
             operation: None,
             stats: None,
@@ -957,6 +981,9 @@ impl BroccoliApp {
                     // The status read follows the configuration the core
                     // actually launched: a raw override or a rolled-back
                     // candidate can differ from what the settings describe.
+                    // The runtime holds that fact (it reads it off the launch
+                    // it reports) and arms the read with it; the shell owns
+                    // the tags alone.
                     if matches!(phase, CorePhase::Running) {
                         let tags: Vec<String> = self
                             .servers
@@ -964,13 +991,7 @@ impl BroccoliApp {
                             .iter()
                             .map(|profile| profile.tag())
                             .collect();
-                        self.rt
-                            .cmd
-                            .send(CoreCmd::SetObservatory {
-                                enabled: self.health_engine_in_launch,
-                                tags,
-                            })
-                            .ok();
+                        self.rt.cmd.send(CoreCmd::SetObservatory { tags }).ok();
                     }
 
                     if let CorePhase::Error(error) = &phase {
@@ -984,11 +1005,13 @@ impl BroccoliApp {
                 CoreEvt::ActiveConfig {
                     snapshot,
                     transport,
+                    // The launch's health-engine fact arms the runtime's own
+                    // observatory read (`CoreCmd::SetObservatory`); the shell
+                    // paints the launched configuration and nothing else about
+                    // it.
+                    health_extension: _,
                 } => {
                     self.pending_transport = Some(transport);
-                    self.health_engine_in_launch = snapshot
-                        .as_ref()
-                        .is_ok_and(|config| crate::rt::apply::carries_health_extension(config));
                     self.profile_preview.record_start(snapshot);
                 }
                 CoreEvt::Log { line, from_core } => self.push_log(from_core, line),
@@ -1142,7 +1165,7 @@ impl BroccoliApp {
                         // rejection must not re-derive the tree.
                         self.install_in_flight = false;
                     }
-                    self.operation = operation;
+                    self.operation = operation.and_then(HeldOperation::mirror);
                 }
             }
             if event_batch_exhausted(processed) {
@@ -1403,11 +1426,11 @@ impl BroccoliApp {
         // stale or unverified core does not disable Connect — an attempt
         // fails visibly in the terminal error block, which points at the
         // core setup surface (see [`Self::core_gate_error`]).
-        if let Some(operation) = self.operation {
+        if let Some(operation) = &self.operation {
             return Some(t_fmt(
                 lang,
                 Key::ConnectBlockedOperation,
-                &[&operation_name(operation).text(lang)],
+                &[&operation.name.text(lang)],
             ));
         }
         // The verdict the shell recorded where generation already runs
@@ -1457,18 +1480,20 @@ impl BroccoliApp {
         // The Apply-now chip's "operation in progress" text (shown when
         // config_dirty and an operation blocks the apply), formatted once
         // per operation change like the reason above.
-        let operation_caption = self.operation.map(|operation| {
+        let operation_caption = self.operation.as_ref().map(|operation| {
             t_fmt(
                 lang,
                 Key::AppOperationInProgress,
-                &[&operation_name(operation).text(lang)],
+                &[&operation.name.text(lang)],
             )
         });
         self.connect_block_cache = Some(ConnectBlockCache {
             lang,
             persistence_error: self.persistence_error.clone(),
             config_error: self.config_error.clone(),
-            operation: self.operation,
+            // The memo owns its snapshot of the mirror: the key it compares
+            // against on the next refresh.
+            operation: self.operation.clone(),
             mode: self.settings.mode,
             raw_override: self.settings.raw_override.clone(),
             config_revision: self.config_revision,
@@ -1611,6 +1636,26 @@ impl BroccoliApp {
         self.start_apply()
     }
 
+    /// Send one command to the runtime and mirror the busy window it opens.
+    /// The kind comes from the command itself ([`CoreCmd::job_kind`]), never
+    /// from the send site, so a send can neither name a kind the runtime does
+    /// not occupy as nor forget the mirror; a command that opens no window —
+    /// no job at all, or a query that runs alongside the occupant — leaves the
+    /// mirror alone. `false` when the runtime's command channel is gone — the
+    /// caller records its own failure.
+    ///
+    /// Mirroring the begin here is only an optimistic head start: whether the
+    /// record actually began, and every release, still arrives on the runtime's
+    /// own bookends, which stay the authority.
+    fn send_command(&mut self, cmd: CoreCmd) -> bool {
+        let kind = cmd.job_kind();
+        let sent = self.rt.cmd.send(cmd).is_ok();
+        if sent && let Some(held) = kind.and_then(HeldOperation::mirror) {
+            self.operation = Some(held);
+        }
+        sent
+    }
+
     /// The commit itself — candidate generation plus the runtime handoff.
     /// [`Self::request_connect`] and the hazard-dialog confirm both land
     /// here, so confirming applies exactly what the normal path would have
@@ -1642,20 +1687,16 @@ impl BroccoliApp {
         };
         self.config_error = None;
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
-        match self.rt.cmd.send(CoreCmd::Apply {
+        if self.send_command(CoreCmd::Apply {
             value: config,
             intent: ApplyIntent::CommitAndStart { tun_mode: want_tun },
             revision: self.config_revision,
         }) {
-            Ok(()) => {
-                self.operation = Some(OperationKind::ApplyConfig);
-                Ok(())
-            }
-            Err(_) => {
-                let message = t(lang, Key::CoreRuntimeUnavailable).to_string();
-                self.apply_result = Some((false, message.clone()));
-                Err(message)
-            }
+            Ok(())
+        } else {
+            let message = t(lang, Key::CoreRuntimeUnavailable).to_string();
+            self.apply_result = Some((false, message.clone()));
+            Err(message)
         }
     }
 
@@ -1684,20 +1725,20 @@ impl BroccoliApp {
     }
 
     fn request_stop(&mut self) -> Result<(), String> {
-        if self.operation == Some(OperationKind::Stop) {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|held| held.kind == JobKind::Stop)
+        {
             return Ok(());
         }
         let lang = self.settings.language;
-        match self.rt.cmd.send(CoreCmd::Stop) {
-            Ok(()) => {
-                self.operation = Some(OperationKind::Stop);
-                Ok(())
-            }
-            Err(_) => {
-                let message = t(lang, Key::CoreRuntimeUnavailable).to_string();
-                self.apply_result = Some((false, message.clone()));
-                Err(message)
-            }
+        if self.send_command(CoreCmd::Stop) {
+            Ok(())
+        } else {
+            let message = t(lang, Key::CoreRuntimeUnavailable).to_string();
+            self.apply_result = Some((false, message.clone()));
+            Err(message)
         }
     }
 
@@ -1821,11 +1862,11 @@ impl BroccoliApp {
             .map(|error| t_fmt(lang, Key::ApplyBlockedNotSaved, &[&error]))
             .or_else(|| self.config_error.clone())
             .or_else(|| {
-                self.operation.map(|operation| {
+                self.operation.as_ref().map(|operation| {
                     t_fmt(
                         lang,
                         Key::ApplyBlockedOperation,
-                        &[&operation_name(operation).text(lang)],
+                        &[&operation.name.text(lang)],
                     )
                 })
             });
@@ -1866,19 +1907,15 @@ impl BroccoliApp {
         };
         self.config_error = None;
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
-        match self.rt.cmd.send(CoreCmd::Apply {
+        if self.send_command(CoreCmd::Apply {
             value: config,
             intent: ApplyIntent::Commit { tun_mode: want_tun },
             revision: self.config_revision,
         }) {
-            Ok(()) => {
-                self.operation = Some(OperationKind::ApplyConfig);
-                self.apply_result = None;
-            }
-            Err(_) => {
-                self.apply_result = Some((false, t(lang, Key::CoreRuntimeUnavailable).into()));
-                self.config_dirty = true;
-            }
+            self.apply_result = None;
+        } else {
+            self.apply_result = Some((false, t(lang, Key::CoreRuntimeUnavailable).into()));
+            self.config_dirty = true;
         }
     }
 }
@@ -2245,7 +2282,7 @@ impl eframe::App for BroccoliApp {
 
         // Central screen dispatch. Scroll ownership: dashboard/servers/logs
         // manage their own scrolling; the rest get an outer ScrollArea.
-        let operation = self.operation;
+        let operation = self.operation.as_ref().map(|held| held.kind);
         egui::CentralPanel::default().show(ui, |ui| {
             let snapshot = &self.ui_ctx_snapshot;
             let mut uictx = UiCtx::new(
@@ -3403,23 +3440,6 @@ fn scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         .show(ui, add);
 }
 
-/// The user-facing name of one in-flight runtime operation: the shared
-/// `Operation*` keys the runtime's busy frames also nest as a message, so a
-/// blocked user reads the same operation name wherever it appears.
-fn operation_name(operation: OperationKind) -> Diag {
-    let key = match operation {
-        OperationKind::Start => Key::OperationConnect,
-        OperationKind::Stop => Key::OperationDisconnect,
-        OperationKind::Restart => Key::OperationRestart,
-        OperationKind::ApplyConfig => Key::OperationApplyConfig,
-        OperationKind::TestConfig => Key::OperationTestConfig,
-        OperationKind::UpdateCore => Key::OperationUpdateCore,
-        OperationKind::LatencyProbe => Key::OperationLatencyProbe,
-        OperationKind::ValidateProfiles => Key::OperationValidateProfiles,
-    };
-    Diag::new(key)
-}
-
 /// The terminal message the content area renders: the failure's keyed
 /// message with the captured core output behind it. The shell records it with
 /// the phase it describes and drops it when that phase moves on or an action
@@ -3570,7 +3590,7 @@ struct ConnectBlockCache {
     lang: Language,
     persistence_error: Option<String>,
     config_error: Option<String>,
-    operation: Option<OperationKind>,
+    operation: Option<HeldOperation>,
     mode: Mode,
     raw_override: Option<String>,
     config_revision: u64,

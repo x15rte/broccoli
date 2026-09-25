@@ -40,27 +40,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::diag::DiagError;
+use crate::diag::{Diag, DiagError};
 
 use super::ApplyOutput;
-
-/// Runtime-owned mutually-exclusive work (the busy-window bookend payload,
-/// `CoreEvt::Operation(Some(kind)/None)`). The UI uses this state to
-/// disable every command that would race a lifecycle or on-disk
-/// transaction. Localized here with the registry; re-exported
-/// from `rt` so external consumers import `crate::rt::OperationKind`
-/// unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationKind {
-    Start,
-    Stop,
-    Restart,
-    ApplyConfig,
-    TestConfig,
-    UpdateCore,
-    LatencyProbe,
-    ValidateProfiles,
-}
 
 /// Terminal verdict of one accepted `CoreCmd::TestConfig`: `Ok((accepted,
 /// output))` when the core ran the validation, `Err` when it never did
@@ -70,9 +52,12 @@ pub enum OperationKind {
 pub type TestConfigReply = Result<(bool, ApplyOutput), DiagError>;
 
 /// The runtime work a UI request starts. The 13 variants mirror the
-/// `CoreCmd` arms of `rt/mod.rs`; each kind's conflict rule and busy-window
-/// bookend payload are declared with its seat or worker (see [`super::seat`])
-/// and read through [`JobKind::rule`] / [`JobKind::exclusive_operation_kind`].
+/// `CoreCmd` arms of `rt/mod.rs`; each kind's conflict rule and its
+/// user-facing operation name are declared with its seat or worker (see
+/// [`super::seat`]) and read through [`JobKind::rule`] /
+/// [`JobKind::operation_name`]. The kind is also the busy-window bookend
+/// payload ([`super::CoreEvt::Operation`]) and the shell's mirror of it, so
+/// the transaction holding the window names itself without a second enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
     /// `CoreCmd::Start`.
@@ -123,6 +108,15 @@ impl KindRule {
             blocked_by_exclusive,
         }
     }
+
+    /// Whether a job of this kind refuses to begin while an exclusive job
+    /// holds the busy window — the registry's conflict check, and the fact a
+    /// control repeats for its window rung instead of stating it by hand. The
+    /// preemptive kind carries it too: it cancels the occupant instead of
+    /// rejecting, so it never meets a window it would reject against.
+    pub fn blocked_by_exclusive(&self) -> bool {
+        self.blocked_by_exclusive
+    }
 }
 
 impl JobKind {
@@ -133,13 +127,47 @@ impl JobKind {
         super::seat::rule(self)
     }
 
-    /// The [`OperationKind`] this job occupies the busy window as, when it
-    /// is one of the exclusive kinds. Queries return `None` and never emit
-    /// bookends; the busy sink therefore only ever produces `Some` for the
-    /// eight exclusive kinds. Used by the runtime's bookend drain, where a
-    /// `None` is a programming error (it cannot occur by construction).
-    pub fn exclusive_operation_kind(self) -> Option<OperationKind> {
-        super::seat::exclusive_operation_kind(self)
+    /// The user-facing name of this kind: the shared `Operation*` keys the
+    /// runtime's busy frames and the screens' refusals nest as a message, so a
+    /// blocked user reads the same operation name wherever it appears. One
+    /// table, so the name cannot fork between a frame and a refusal. The
+    /// query kinds have none: they never occupy the busy window.
+    pub fn operation_name(self) -> Option<Diag> {
+        super::seat::operation_name(self)
+    }
+}
+
+impl super::CoreCmd {
+    /// The job kind this command runs as, or `None` when the command is no job
+    /// at all (`Shutdown`, `CheckUpdate`, `SetObservatory`). The kind is the
+    /// one the command's dispatch arm begins the record with, declared here so
+    /// a caller names the work it is about to start instead of copying the
+    /// kind by hand: `ImportCoreArchive` runs as [`JobKind::UpdateCore`], and
+    /// `SetTunMode` occupies as [`JobKind::Restart`] when it acts. Only the
+    /// begin is named — what is in flight, and when the window is released,
+    /// stays the registry's own bookends.
+    pub(crate) fn job_kind(&self) -> Option<JobKind> {
+        Some(match self {
+            Self::Start => JobKind::Start,
+            Self::Stop => JobKind::Stop,
+            Self::Restart => JobKind::Restart,
+            Self::Apply { .. } => JobKind::ApplyConfig,
+            Self::TestConfig { .. } => JobKind::TestConfig,
+            Self::ValidateProfiles { .. } => JobKind::ValidateProfiles,
+            Self::UpdateCore | Self::ImportCoreArchive(_) => JobKind::UpdateCore,
+            Self::SetTunMode(_) => JobKind::Restart,
+            Self::ProbeLatency { .. } => JobKind::LatencyProbe,
+            Self::TestRoute { .. } => JobKind::TestRoute,
+            Self::GetBalancerInfo { .. }
+            | Self::SetBalancerOverride { .. }
+            | Self::ClearBalancerOverride { .. } => JobKind::Balancer,
+            Self::RestartLogger { .. } => JobKind::LoggerRestart,
+            Self::AddTrialRule { .. }
+            | Self::RemoveTrialRule { .. }
+            | Self::ListTrialRules { .. } => JobKind::TrialRules,
+            Self::ListRuntimeState { .. } => JobKind::RuntimeState,
+            Self::Shutdown | Self::CheckUpdate | Self::SetObservatory { .. } => return None,
+        })
     }
 }
 
@@ -164,7 +192,7 @@ pub enum ExclusiveOutcome {
     /// A core-update worker (`CoreCmd::UpdateCore`/`ImportCoreArchive`).
     Download {
         state: super::DownloadState,
-        kind: OperationKind,
+        kind: JobKind,
     },
     /// A latency-probe worker (`CoreCmd::ProbeLatency`).
     LatencyProbe {
@@ -779,17 +807,17 @@ mod tests {
     }
 
     #[test]
-    fn bookend_payload_exists_exactly_for_occupying_kinds() {
-        // The busy sink only ever emits `Some(kind)` for occupying kinds,
-        // and the bookend drain resolves their `OperationKind` on the
-        // assumption that every occupying kind carries one: a kind that
-        // occupies without a payload (or a query kind that carries one)
-        // would break the busy-window bookends.
+    fn operation_name_exists_exactly_for_occupying_kinds() {
+        // The busy window's bookend payload is the kind itself, and the frames
+        // and refusals that report it paint the kind's operation name: a kind
+        // that occupies without a name (or a query kind that carries one)
+        // would leave a held window unnamed — the name table is what the
+        // window's `Some(kind)` payload is reported through.
         for kind in ALL_KINDS {
             assert_eq!(
                 kind.rule().occupies,
-                kind.exclusive_operation_kind().is_some(),
-                "{kind:?}: occupancy and bookend payload must agree"
+                kind.operation_name().is_some(),
+                "{kind:?}: occupancy and the operation name must agree"
             );
         }
     }
@@ -1225,33 +1253,34 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_operation_kind_maps_the_eight_bookend_kinds() {
+    fn exclusive_kinds_each_name_their_own_operation() {
+        // The busy window's payload is the kind, and the frames and refusals
+        // report it through the kind's operation name; two kinds sharing a key
+        // would report the same transaction for two different ones.
         let exclusive = [
-            (JobKind::Start, OperationKind::Start),
-            (JobKind::Stop, OperationKind::Stop),
-            (JobKind::Restart, OperationKind::Restart),
-            (JobKind::ApplyConfig, OperationKind::ApplyConfig),
-            (JobKind::TestConfig, OperationKind::TestConfig),
-            (JobKind::UpdateCore, OperationKind::UpdateCore),
-            (JobKind::LatencyProbe, OperationKind::LatencyProbe),
-            (JobKind::ValidateProfiles, OperationKind::ValidateProfiles),
+            JobKind::Start,
+            JobKind::Stop,
+            JobKind::Restart,
+            JobKind::ApplyConfig,
+            JobKind::TestConfig,
+            JobKind::UpdateCore,
+            JobKind::LatencyProbe,
+            JobKind::ValidateProfiles,
         ];
-        for (job, operation) in exclusive {
-            assert_eq!(job.exclusive_operation_kind(), Some(operation));
-        }
-        for query in [
-            JobKind::TestRoute,
-            JobKind::Balancer,
-            JobKind::LoggerRestart,
-            JobKind::TrialRules,
-            JobKind::RuntimeState,
-        ] {
-            assert_eq!(
-                query.exclusive_operation_kind(),
-                None,
-                "queries never emit bookends"
-            );
-        }
+        let mut names: Vec<Diag> = exclusive
+            .iter()
+            .map(|kind| {
+                kind.operation_name()
+                    .expect("every occupying kind names itself")
+            })
+            .collect();
+        names.sort_by_key(|name| name.text(Language::En));
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            exclusive.len(),
+            "operation names must be distinct"
+        );
     }
 
     /// The run-to-terminal guard, exercised as the preemptive begin and the

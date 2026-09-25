@@ -12,6 +12,7 @@ pub mod probe_verdict;
 pub mod quic_probe;
 pub mod rt;
 pub mod sys;
+pub mod tls_ping;
 pub mod ui;
 
 fn viewport_icon() -> Option<std::sync::Arc<egui::IconData>> {

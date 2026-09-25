@@ -8,7 +8,7 @@
 //! enablement from the same verdict, so no control can paint one reason and
 //! refuse for another.
 
-use crate::rt::OperationKind;
+use crate::rt::JobKind;
 
 /// The exclusive runtime job currently holding the busy window, if any: the
 /// frame's copy of the fact the runtime publishes on its operation bookends.
@@ -21,19 +21,29 @@ use crate::rt::OperationKind;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BusyWindow {
     /// The holding job, `None` at rest.
-    holder: Option<OperationKind>,
+    holder: Option<JobKind>,
 }
 
 impl BusyWindow {
     /// The window as the runtime publishes it: `Some(kind)` from the begin
     /// bookend until the job's end bookend, `None` at rest.
-    pub(crate) fn from_operation(holder: Option<OperationKind>) -> Self {
+    pub(crate) fn from_operation(holder: Option<JobKind>) -> Self {
         Self { holder }
     }
 
     /// Whether an exclusive job holds the window.
     pub(crate) fn is_held(&self) -> bool {
         self.holder.is_some()
+    }
+
+    /// Whether this window refuses a job of `kind`, answered by the kind's own
+    /// declared rule (`rt::seat::rule`): the registry refuses exactly the kinds
+    /// whose rule rejects a held window, so a control reads its window rung
+    /// from the rule instead of stating it beside the control. A site whose own
+    /// job occupies the window it reads asks
+    /// [`BusyWindow::is_held`] — its own occupancy is not a refusal.
+    pub(crate) fn blocks(&self, kind: JobKind) -> bool {
+        self.is_held() && kind.rule().blocked_by_exclusive()
     }
 }
 
@@ -63,9 +73,9 @@ pub(crate) struct GateVerdict {
 /// The one refusal ladder: the core must be running, no exclusive job may hold
 /// the busy window, and the site's own request must not be in flight.
 ///
-/// Pure and total. The three facts arrive as the site itself states them, so a
-/// site whose requests run regardless of the window passes `busy: false`
-/// instead of inventing a rung, and a site whose own request is the window's
+/// Pure and total. The three facts arrive as the site itself states them: a
+/// site whose window fact is exactly its own kind's declared rule reads it
+/// through [`BusyWindow::blocks`], a site whose own request is the window's
 /// occupant — a probe occupying the window it holds — states that when it
 /// builds `busy`. The rung order never varies by site.
 pub(crate) fn verdict(running: bool, busy: bool, pending: bool) -> GateVerdict {

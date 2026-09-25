@@ -221,11 +221,13 @@ pub fn read_active_contents() -> Result<String, DiagError> {
 }
 
 /// True when a launched configuration carries an outbound-health extension:
-/// the `observatory` or the `burstObservatory` block. The GUI's status read
+/// the `observatory` or the `burstObservatory` block. The runtime's status read
 /// follows this fact rather than the settings, because the core may run a
 /// config the settings no longer describe — a raw override, or a candidate
-/// that failed readiness and was replaced by the last known-good config.
-/// A snapshot that does not parse starts no read.
+/// that failed readiness and was replaced by the last known-good config — and
+/// the launch path reads it from the exact snapshot text it reports
+/// (`Runtime::emit_active_config`). A snapshot that does not parse carries no
+/// engine.
 pub fn carries_health_extension(config_text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(config_text).is_ok_and(|config| {
         config.get(keys::OBSERVATORY).is_some() || config.get(keys::BURST_OBSERVATORY).is_some()

@@ -8,16 +8,14 @@ pub mod keys;
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::dns::DEFAULT_PLAINTEXT_RESOLVERS;
-use crate::model::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
-    LocalInboundProtocol, TUN_INBOUND_TAG,
-};
+use crate::model::emit;
+use crate::model::inbound::{API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG};
 use crate::model::settings::Language;
 use crate::model::validation::{
     Severity, ValidationIssue, tun_ipv4_gateway, validate_profiles, validate_settings,
 };
 use crate::model::{
-    DnsCfg, Mode, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile, Settings, TunCfg,
+    DnsCfg, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile, Settings, TunCfg,
 };
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
@@ -138,7 +136,7 @@ pub fn generate_with_api_port(
     }
 
     let fakedns = settings.dns.fakedns.enabled;
-    let tun_on = settings.mode == Mode::Tun;
+    let tun_on = emit::tun_inbound_emitted(settings);
     if let Some(error) = invalid_model_error(validate_settings(settings, servers, api_port)) {
         return Err(error);
     }
@@ -212,17 +210,13 @@ pub fn generate_with_api_port(
     let dns_wire = dns(&settings.dns, fakedns);
     // Enabled SOCKS entries (in list order) carry DNS UDP:53 to dns-out;
     // HTTP entries are TCP-only and never appear in the interception rules.
-    let socks_tags: Vec<String> = settings
-        .local_inbounds
-        .iter()
-        .filter(|entry| entry.enabled && entry.protocol == LocalInboundProtocol::Socks)
-        .map(|entry| entry.tag.clone())
-        .collect();
+    let socks_tags = emit::socks_inbound_tags(settings);
     // Local DNS interception: when a DNS server list exists and a proxy
     // inbound can carry UDP, port-53 queries are answered by the DNS module
-    // (dns-out) instead of traveling the tunnel as raw UDP. HTTP inbound is
-    // TCP-only, so it never carries DNS.
-    let dns_intercept = dns_wire.is_some() && (tun_on || !socks_tags.is_empty());
+    // (dns-out) instead of traveling the tunnel as raw UDP. The gate has one
+    // home (emit::dns_intercept), shared with every reader that judges the
+    // emitted tags.
+    let dns_intercept = emit::dns_intercept(settings);
 
     // Proxy-server bootstrap: a direct-dial outbound's domain resolves
     // through a scoped `+local` DNS server (direct dial) instead of the OS
@@ -841,8 +835,9 @@ fn profile_wire_outbound(profile: &ServerProfile, policy: OutboundWirePolicy<'_>
 }
 
 fn append_builtin_outbounds(out: &mut Vec<Value>) {
-    out.push(json!({ keys::PROTOCOL: "freedom", keys::TAG: DIRECT_OUTBOUND_TAG }));
-    out.push(json!({ keys::PROTOCOL: "blackhole", keys::TAG: BLOCK_OUTBOUND_TAG }));
+    for (protocol, tag) in emit::BUILTIN_OUTBOUNDS {
+        out.push(json!({ keys::PROTOCOL: protocol, keys::TAG: tag }));
+    }
 }
 
 /// The user's server order, then the built-in `direct`/`block` tags and the

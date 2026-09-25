@@ -1,10 +1,9 @@
 //! Seeded text-buffer machinery behind the raw-JSON and PEM editors of the
-//! servers screen: per-field text buffers survive across frames while their
-//! text is temporarily invalid. Each buffer is seeded once per field
-//! identity (an [`egui::Id`] derived from the editor path, which includes
-//! the owning profile id), tracks its last parse error and whether it holds
-//! an edit that never reached the draft, and is evicted with its owning
-//! profile by the shared retain rule. Private to the screen.
+//! servers screen: one store of per-field text buffers that survive across
+//! frames while their text is temporarily invalid. Each buffer is seeded once
+//! per field identity (an [`egui::Id`] derived from the editor path, which
+//! includes the owning profile id) and is evicted with its owning profile.
+//! Private to the screen.
 
 use egui::{RichText, Stroke, StrokeKind};
 
@@ -18,19 +17,14 @@ pub(super) fn pem_lines_editor(
     profile: &str,
     lines: &mut Vec<String>,
     hint: &str,
-    pem_buffers: &mut std::collections::HashMap<egui::Id, PemBuf>,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     ui.label(label);
     // Seed the joined text once per field identity (the key derives from
     // the ui id chain, which includes the profile id, so a profile switch
     // re-seeds) instead of joining the whole PEM on every repaint.
     let key = ui.auto_id_with(("pem-lines", label));
-    let buf = pem_buffers.entry(key).or_default();
-    if buf.key != Some(key) {
-        buf.key = Some(key);
-        buf.profile = profile.to_owned();
-        buf.text = lines.join("\n");
-    }
+    let buf = buffers.pem_entry(key, profile, lines);
     let changed = ui
         .add(
             egui::TextEdit::multiline(&mut buf.text)
@@ -50,22 +44,20 @@ pub(super) fn pem_lines_editor(
     changed
 }
 
-/// Text buffer for PEM editors (certificate/key line lists): the multiline
-/// [`egui::TextEdit`] needs a contiguous string, so the joined text is
-/// seeded once per field identity (keyed like [`JsonBuf`] — the field's
-/// [`egui::Id`] derived from the ui id chain, which includes the owning
-/// profile id) and re-joined only when the identity changes (profile
-/// switch, cert re-index) or on edits — never on idle repaints.
+/// One PEM editor's text buffer (certificate/key line lists): the multiline
+/// [`egui::TextEdit`] needs a contiguous string, so the joined text is seeded
+/// once per field identity and re-joined only on an edit — never on idle
+/// repaints. [`pem_lines_editor`] writes every edit straight back to the line
+/// list it renders, so the text here is never uncommitted.
 #[derive(Default)]
 pub(super) struct PemBuf {
     key: Option<egui::Id>,
     text: String,
-    /// Owning profile id, recorded on seed so eviction is one retain pass
-    /// (mirrors [`JsonBuf`]).
+    /// Owning profile id, recorded on seed so eviction is one retain pass.
     profile: String,
 }
 
-/// Text buffer for raw-JSON editors (survives across frames while the text
+/// One raw-JSON editor's text buffer (survives across frames while the text
 /// is temporarily invalid; re-seeded when the field identity `key` changes).
 /// The key is the field's egui [`egui::Id`] — derived from the editor path
 /// without allocating, so the same field maps to the same buffer across
@@ -81,7 +73,7 @@ pub(super) struct JsonBuf {
     /// True while `text` holds an edit that never reached the draft (any
     /// edit is set, cleared when the text parses and commits, on re-seed,
     /// and by buffer eviction). Invalid JSON never commits, so without this
-    /// flag the draft-vs-source comparison alone would leave Discard
+    /// flag the draft-vs-baseline comparison alone would leave Discard
     /// disabled while a buffer holds uncommitted text.
     pub(super) dirty: bool,
     /// Owning profile id, recorded on seed. Profile ids are
@@ -91,56 +83,93 @@ pub(super) struct JsonBuf {
     pub(super) profile: String,
 }
 
-/// The raw-JSON editor buffer cache: one entry per rendered field, keyed by
-/// the field's egui `Id`. It parses only on a seed or an edit (see
-/// [`JsonBuf::edit`]), so an idle re-render of unchanged text reuses both the
-/// buffer and its parse result — the reused buffer is what the screen's
-/// idle-frame test observes.
+/// The servers screen's seeded text buffers: one entry per rendered field,
+/// keyed by the field's egui `Id` (stable across frames without allocating a
+/// key), in the shape the editor that renders it needs.
+///
+/// The two halves commit differently and their "uncommitted" states differ
+/// with them. A raw-JSON entry parses on an edit or a seed and commits only
+/// the text that parses, so it carries its last parse error and the dirty
+/// flag for the text that never reached the draft (see [`JsonBuf`]). A PEM
+/// entry's editor writes each edit straight through to the line list it
+/// renders, so its text is always committed and it carries no such state
+/// (see [`PemBuf`]). Everything else is shared: both halves are seeded per
+/// field identity, keyed by the same id scheme, held across idle frames, and
+/// dropped together when their owning profile goes away.
 #[derive(Default)]
-pub(super) struct RawBuffers {
-    entries: std::collections::HashMap<egui::Id, JsonBuf>,
+pub(super) struct SeededBuffers {
+    json: std::collections::HashMap<egui::Id, JsonBuf>,
+    pem: std::collections::HashMap<egui::Id, PemBuf>,
 }
 
-impl RawBuffers {
-    /// The cache is a map of field id to buffer at every call site (the
-    /// editors look entries up by id, eviction retains by owner), so the
-    /// handful of map operations those sites use are named here instead of a
-    /// `Deref` that hides the field.
-    pub(super) fn entry(
+impl SeededBuffers {
+    /// The raw-JSON half's per-field entry: the editors create it on first
+    /// sight and reuse whatever it holds afterwards.
+    pub(super) fn json_entry(
         &mut self,
         key: egui::Id,
     ) -> std::collections::hash_map::Entry<'_, egui::Id, JsonBuf> {
-        self.entries.entry(key)
+        self.json.entry(key)
     }
 
+    /// The PEM half's buffer for `key`, seeded from `lines` when this field
+    /// identity has no buffer yet.
+    pub(super) fn pem_entry(
+        &mut self,
+        key: egui::Id,
+        profile: &str,
+        lines: &[String],
+    ) -> &mut PemBuf {
+        let buffer = self.pem.entry(key).or_default();
+        if buffer.key != Some(key) {
+            buffer.key = Some(key);
+            buffer.profile = profile.to_owned();
+            buffer.text = lines.join("\n");
+        }
+        buffer
+    }
+
+    /// Drop every buffer of both halves, so no editor keeps showing text of
+    /// a draft that reverted to its persisted profile. Click-time only.
     pub(super) fn clear(&mut self) {
-        self.entries.clear();
+        self.json.clear();
+        self.pem.clear();
     }
 
-    pub(super) fn retain(&mut self, keep: impl FnMut(&egui::Id, &mut JsonBuf) -> bool) {
-        self.entries.retain(keep);
+    /// Drop every buffer of `profile_id`: the owning profile is gone, so its
+    /// buffers are dead weight. Both halves record their owner's immutable id
+    /// on seed, so one retain pass each is exact and needs no reverse index.
+    /// Renames never reach here: profile ids are immutable, so a renamed
+    /// profile keeps its buffers (their keys stay valid, and clearing would
+    /// only force one re-parse).
+    pub(super) fn evict_owned(&mut self, profile_id: &str) {
+        self.json.retain(|_, buffer| buffer.profile != profile_id);
+        self.pem.retain(|_, buffer| buffer.profile != profile_id);
     }
 
-    /// Every buffer, for the dirty-buffer scans (`unsaved_changes`, the
-    /// Discard gate) and the tests that assert eviction, survival across
-    /// renames, and buffer reuse.
-    pub(super) fn values(&self) -> impl Iterator<Item = &JsonBuf> {
-        self.entries.values()
+    /// True when a raw-JSON buffer of `profile_id` holds text that never
+    /// reached the draft: invalid JSON never commits, so the draft stays
+    /// clean while the editor shows the unparsed text (the state that keeps
+    /// Discard reachable). Only the raw-JSON half can qualify — a PEM
+    /// buffer's editor writes through on every edit. Entries exist only
+    /// while a profile has an open raw editor, and the scan short-circuits
+    /// on the first dirty buffer.
+    pub(super) fn holds_uncommitted(&self, profile_id: &str) -> bool {
+        self.json
+            .values()
+            .any(|buffer| buffer.profile == profile_id && buffer.dirty)
+    }
+
+    /// The raw-JSON half, for the tests that assert seeding, reuse and
+    /// per-owner eviction.
+    #[cfg(test)]
+    pub(super) fn json(&self) -> &std::collections::HashMap<egui::Id, JsonBuf> {
+        &self.json
     }
 
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(super) fn insert(&mut self, key: egui::Id, buffer: JsonBuf) -> Option<JsonBuf> {
-        self.entries.insert(key, buffer)
+    pub(super) fn json_mut(&mut self) -> &mut std::collections::HashMap<egui::Id, JsonBuf> {
+        &mut self.json
     }
 }
 
@@ -160,11 +189,11 @@ pub(super) struct FieldKey<'a> {
     pub(super) profile: &'a str,
 }
 
-/// [`FieldKey`] plus the shared seeded-buffer cache the raw-editor chain
+/// [`FieldKey`] plus the shared seeded-buffer store the raw-editor chain
 /// mutates through.
 pub(super) struct RawField<'a> {
     pub(super) id: FieldKey<'a>,
-    pub(super) buffers: &'a mut RawBuffers,
+    pub(super) buffers: &'a mut SeededBuffers,
 }
 
 /// Outcome of one buffered edit pass: whether the committed value changed.
@@ -242,8 +271,8 @@ impl JsonBuf {
 
 /// Present one raw-JSON editor buffer, creating the per-field entry on first
 /// sight. A fresh entry is a cache mutation, so the live entry count is the
-/// map's own `len`; eviction happens through [`evict_owned_buffers`] when the
-/// owning profile is deleted.
+/// store's own raw-JSON map; eviction happens through
+/// [`SeededBuffers::evict_owned`] when the owning profile is deleted.
 pub(super) fn raw_buffer_edit<T>(
     ui: &mut egui::Ui,
     lang: Language,
@@ -258,7 +287,7 @@ where
     ui.label(label);
     // One lookup per field per frame: re-use the existing buffer, or create
     // the entry and seed it.
-    match field.buffers.entry(field.id.key) {
+    match field.buffers.json_entry(field.id.key) {
         std::collections::hash_map::Entry::Occupied(mut occupied) => {
             occupied.get_mut().edit(ui, lang, field.id, value, spec)
         }
@@ -270,19 +299,4 @@ where
         }
     }
     .changed
-}
-
-/// Owner-eviction rule shared by the raw-JSON and PEM buffer caches:
-/// the owning profile is gone, so its buffers are dead weight.
-/// Entries record their immutable owner id on seed, so one retain pass over
-/// each map is exact and needs no reverse index. Renames never reach here:
-/// profile ids are immutable, so a renamed profile keeps its buffers (their
-/// keys stay valid, and clearing would only force one re-parse).
-pub(super) fn evict_owned_buffers(
-    finalmask_raw: &mut RawBuffers,
-    pem_buffers: &mut std::collections::HashMap<egui::Id, PemBuf>,
-    profile_id: &str,
-) {
-    finalmask_raw.retain(|_, buffer| buffer.profile != profile_id);
-    pem_buffers.retain(|_, buffer| buffer.profile != profile_id);
 }

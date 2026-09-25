@@ -1,8 +1,8 @@
 //! Xray keygen/tool helpers of the servers screen: bounded, secret-redacting
 //! `xray.exe` invocations off the UI thread (uuid / vless encryption /
-//! wireguard secret / x25519 derive / ML-DSA-65 / tls hash & ping), stdout
-//! payload extraction, and TLS-probe certificate-pin parsing. Private to
-//! the screen; the tool-apply path in the parent module is the only caller.
+//! wireguard secret / x25519 derive / ML-DSA-65 / tls hash & ping) and
+//! stdout payload extraction. Private to the screen; the tool-apply path in
+//! the parent module is the only caller.
 
 use std::fmt::Write as _;
 use std::process::Stdio;
@@ -13,10 +13,6 @@ use crate::i18n::{Key, t_fmt};
 use crate::model::settings::Language;
 
 // ---------- keygen helpers ----------
-
-/// Upper bound on one tool invocation's wait loop; on expiry the child is
-/// killed and reaped, and the deadline error is rendered with redacted args.
-const XRAY_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Render the tool command line for error messages, masking the argument
 /// that follows `-i`. The REALITY public-key derive runs
@@ -44,14 +40,16 @@ pub(super) fn redacted_tool_args(args: &[String]) -> String {
 /// opens and retains a fresh compiled-pin-verified core handle through child
 /// reaping, so a mutable AppData executable cannot be substituted after its
 /// provenance check and before CreateProcess consumes it. The verification
-/// mode follows the committed config, exactly like every core spawn. A set
-/// `stop` flag (a cancelled request) ends the wait immediately: the loop
-/// falls through to the deadline arm, which kills and reaps the child
-/// instead of holding it until the timeout, and the caller — which sees the
-/// same flag — discards the returned verdict.
+/// mode follows the committed config, exactly like every core spawn. `budget`
+/// bounds the wait loop; on its expiry the child is killed and reaped, and
+/// the deadline error is rendered with redacted args. A set `stop` flag (a
+/// cancelled request) ends the wait immediately: the loop falls through to
+/// that same arm instead of holding the child until the budget, and the
+/// caller — which sees the same flag — discards the returned verdict.
 pub(super) fn run_xray_bounded(
     lang: Language,
     args: &[String],
+    budget: Duration,
     stop: &AtomicBool,
 ) -> Result<String, String> {
     // Hold the verified handles through CreateProcess only: releasing earlier
@@ -114,7 +112,7 @@ pub(super) fn run_xray_bounded(
             // deadline: failing this guard drops through to the arm below,
             // which kills and reaps it. The caller sees the same flag and
             // discards the verdict that arm returns.
-            Ok(None) if started.elapsed() < XRAY_TOOL_TIMEOUT && !stop.load(Ordering::Acquire) => {
+            Ok(None) if started.elapsed() < budget && !stop.load(Ordering::Acquire) => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
@@ -131,11 +129,7 @@ pub(super) fn run_xray_bounded(
                 return Err(t_fmt(
                     lang,
                     Key::SrvXrayDeadline,
-                    &[
-                        &redacted_tool_args(args),
-                        &XRAY_TOOL_TIMEOUT.as_secs(),
-                        &suffix,
-                    ],
+                    &[&redacted_tool_args(args), &budget.as_secs(), &suffix],
                 ));
             }
             Err(error) => {
@@ -173,45 +167,4 @@ pub(super) fn gen_short_id() -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
-}
-
-// ---------- TLS probe output parsing ----------
-
-/// Prefix of the leaf-certificate SHA256 line in `xray tls ping` output
-/// (Xray-core `main/commands/all/tls/ping.go` `printCertificates`).
-const TLS_PROBE_LEAF_PREFIX: &str = "Cert's leaf SHA256:";
-
-/// Prefix of a CA-certificate SHA256 line; the CA name sits between the
-/// angle brackets.
-const TLS_PROBE_CA_PREFIX: &str = "Cert's CA <";
-const TLS_PROBE_CA_SUFFIX: &str = "> SHA256:";
-
-/// The leaf certificate SHA256 pin from `xray tls ping` output: the trimmed
-/// rest of the first "Cert's leaf SHA256:" line (the core's tabwriter pads
-/// the separator with spaces). `None` when no such line exists.
-pub(super) fn leaf_pin_from_probe_output(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(TLS_PROBE_LEAF_PREFIX)
-            .map(str::trim)
-            .filter(|pin| !pin.is_empty())
-            .map(str::to_owned)
-    })
-}
-
-/// Every CA certificate SHA256 pin from `xray tls ping` output as
-/// (name, pin) in line order — one entry per "Cert's CA <name> SHA256:"
-/// line, so the without-SNI and with-SNI blocks both contribute when the
-/// chain repeats.
-pub(super) fn ca_pins_from_probe_output(output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let rest = line.strip_prefix(TLS_PROBE_CA_PREFIX)?;
-            let (name, value) = rest.split_once(TLS_PROBE_CA_SUFFIX)?;
-            let pin = value.trim();
-            (!pin.is_empty()).then(|| (name.trim().to_owned(), pin.to_owned()))
-        })
-        .collect()
 }

@@ -30,6 +30,12 @@
 //! REALITY PQ key: #716 names the parameter `pqv`; the early
 //! `mldsa65Verify` alias is accepted on import, but the two may not coexist.
 //! Export always emits `pqv`.
+//!
+//! The query grammar is declared once per transport in [`TRANSPORTS`]: a
+//! transport's `type` value, the fields it carries with their import defaults
+//! and export spellings, the model facts it cannot carry, and its settings
+//! block. Import, export and the representability ladder all walk that table.
+//! The shareable protocols are declared the same way in [`SHAREABLE`].
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -517,44 +523,13 @@ fn split_alpn(v: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn opt_u32_param(q: &Query, key: &str) -> Result<Option<u32>, LinkError> {
-    q.get_ne(key)
-        .map(|s| {
-            s.parse::<u32>().map_err(|_| {
-                malformed(
-                    Diag::new(Key::LinkNumericParam)
-                        .arg(key)
-                        .arg(excerpt_debug(s)),
-                )
-            })
-        })
-        .transpose()
-}
-
 fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
     let transport = match q.get("type") {
         Some("") => return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("type"))),
         Some(value) => value,
-        None => "tcp",
+        None => DEFAULT_TYPE,
     };
-    match transport {
-        "tcp" | "kcp" | "ws" | "grpc" | "httpupgrade" | "xhttp" => {}
-        "http" | "h2" | "h3" => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedTypeHttp,
-            )));
-        }
-        "quic" => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedTypeQuic,
-            )));
-        }
-        other => {
-            return Err(malformed(
-                Diag::new(Key::LinkTransportUnknown).arg(excerpt_debug(other)),
-            ));
-        }
-    }
+    let spec = transport_for_type(transport)?;
 
     let default_security = if proto == Protocol::Trojan {
         "tls"
@@ -599,35 +574,13 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
         if mode.is_empty() {
             return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("mode")));
         }
-        match transport {
-            "grpc" => match mode {
-                "gun" | "multi" => {}
-                "guna" => {
-                    return Err(LinkError::Unsupported(Diag::new(
-                        Key::LinkUnsupportedGrpcGuna,
-                    )));
-                }
-                other => {
-                    return Err(malformed(
-                        Diag::new(Key::LinkGrpcModeUnknown).arg(excerpt_debug(other)),
-                    ));
-                }
-            },
-            "xhttp" => {
-                // The mode vocabulary is the model's (the same set Xray's
-                // SplitHTTPConfig.Build accepts); the link spells `auto` for
-                // the wire default, which the empty value also means.
-                if !crate::model::validation::xhttp_mode_supported(mode) {
-                    return Err(malformed(
-                        Diag::new(Key::LinkXhttpModeUnknown).arg(excerpt_debug(mode)),
-                    ));
-                }
-            }
-            _ => {
-                return Err(LinkError::Unsupported(
-                    Diag::new(Key::LinkUnsupportedTransportMode).arg(transport),
-                ));
-            }
+        let Some(field) = spec.field("mode") else {
+            return Err(LinkError::Unsupported(
+                Diag::new(Key::LinkUnsupportedTransportMode).arg(transport),
+            ));
+        };
+        if let Some(validate) = field.validate {
+            validate(mode)?;
         }
     }
 
@@ -639,11 +592,6 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
             "sni" | "fp" => matches!(security, "tls" | "reality"),
             "alpn" | "ech" | "pcs" | "vcn" => security == "tls",
             "pbk" | "sid" | "pqv" | "mldsa65Verify" | "spx" => security == "reality",
-            "mtu" | "tti" => transport == "kcp",
-            "host" | "path" => matches!(transport, "ws" | "httpupgrade" | "xhttp"),
-            "serviceName" | "authority" => transport == "grpc",
-            "mode" => matches!(transport, "grpc" | "xhttp"),
-            "extra" => transport == "xhttp",
             "allowInsecure" => {
                 return Err(LinkError::Unsupported(Diag::new(
                     Key::LinkUnsupportedAllowInsecure,
@@ -659,7 +607,10 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
                     Key::LinkUnsupportedVmessAlterId,
                 )));
             }
-            _ => false,
+            // Every transport-scoped parameter is answered by the selected
+            // transport's own row, so a key the table carries nowhere is
+            // unknown here exactly like a key for another transport.
+            other => spec.field(other).is_some(),
         };
         if !allowed {
             return Err(LinkError::Unsupported(
@@ -668,23 +619,8 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
         }
 
         if value.is_empty()
-            && matches!(
-                key.as_str(),
-                "type"
-                    | "security"
-                    | "encryption"
-                    | "sni"
-                    | "fp"
-                    | "alpn"
-                    | "pbk"
-                    | "mtu"
-                    | "tti"
-                    | "path"
-                    | "serviceName"
-                    | "mode"
-                    | "extra"
-                    | "fm"
-            )
+            && (matches!(key.as_str(), "sni" | "fp" | "alpn" | "pbk" | "fm")
+                || spec.field(key).is_some_and(|field| field.require_value))
         {
             return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg(key)));
         }
@@ -797,185 +733,531 @@ fn security_params(stream: &StreamModel, always: bool, q: &mut Vec<(String, Stri
     }
 }
 
-// ---------- shared transport mapping (URL-style links) ----------
+// ---------- share grammar: one declaration per transport ----------
 
-fn apply_transport_query(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError> {
-    let ty = q.get("type").unwrap_or("tcp");
-    match ty {
-        "tcp" => {
-            stream.network = Network::Raw;
-        }
-        "kcp" => {
-            stream.network = Network::Kcp;
-            stream.kcp_settings = Some(KcpSettings {
-                mtu: opt_u32_param(q, "mtu")?,
-                tti: opt_u32_param(q, "tti")?,
-                ..Default::default()
-            });
-        }
-        "ws" => {
-            stream.network = Network::Ws;
-            stream.ws_settings = Some(WsSettings {
-                host: q.get("host").unwrap_or_default().to_string(),
-                path: q.get("path").unwrap_or("/").to_string(),
-                ..Default::default()
-            });
-        }
-        "grpc" => {
-            stream.network = Network::Grpc;
-            let multi_mode = match q.get("mode") {
-                None | Some("gun") => None,
-                Some("multi") => Some(true),
-                Some("guna") => {
-                    return Err(LinkError::Unsupported(Diag::new(
-                        Key::LinkUnsupportedGrpcGuna,
-                    )));
-                }
-                Some(other) => {
-                    return Err(malformed(
-                        Diag::new(Key::LinkGrpcModeUnknown).arg(excerpt_debug(other)),
-                    ));
-                }
-            };
-            stream.grpc_settings = Some(GrpcSettings {
-                service_name: q.get("serviceName").unwrap_or_default().to_string(),
-                authority: q.get("authority").unwrap_or_default().to_string(),
-                multi_mode,
-                ..Default::default()
-            });
-        }
-        "httpupgrade" => {
-            stream.network = Network::Httpupgrade;
-            stream.httpupgrade_settings = Some(HttpupgradeSettings {
-                host: q.get("host").unwrap_or_default().to_string(),
-                path: q.get("path").unwrap_or("/").to_string(),
-                ..Default::default()
-            });
-        }
-        "xhttp" => {
-            // `extra` carries everything except host/path/mode. Reject those
-            // reserved keys instead of allowing a second, ambiguous source.
-            let mut xh = match q.get("extra") {
-                Some(extra) => {
-                    let value: Value = serde_json::from_str(extra).map_err(|err| {
-                        malformed(Diag::new(Key::LinkXhttpExtraJson).arg(excerpt(&err.to_string())))
-                    })?;
-                    let object = value
-                        .as_object()
-                        .ok_or_else(|| malformed(Diag::new(Key::LinkXhttpExtraObject)))?;
-                    if let Some(field) = ["host", "path", "mode"]
-                        .into_iter()
-                        .find(|field| object.contains_key(*field))
-                    {
-                        return Err(malformed(
-                            Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(field)),
-                        ));
-                    }
-                    serde_json::from_value::<XhttpSettings>(value).map_err(|err| {
-                        malformed(Diag::new(Key::LinkXhttpExtraJson).arg(excerpt(&err.to_string())))
-                    })?
-                }
-                None => XhttpSettings::default(),
-            };
-            xh.host = q.get("host").unwrap_or_default().to_string();
-            xh.path = q.get("path").unwrap_or("/").to_string();
-            // Xray's empty model value and #716's `auto` have identical
-            // semantics; keeping the model default makes canonical output
-            // omit the optional parameter.
-            xh.mode = match q.get("mode") {
-                None | Some("auto") => String::new(),
-                Some(mode) => mode.to_string(),
-            };
-            stream.network = Network::Xhttp;
-            stream.xhttp_settings = Some(xh);
-        }
-        "http" | "h2" | "h3" => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedTypeHttp,
-            )));
-        }
-        "quic" => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedTypeQuic,
-            )));
-        }
-        other => {
-            return Err(malformed(
-                Diag::new(Key::LinkTransportUnknown).arg(excerpt_debug(other)),
-            ));
-        }
-    }
-    Ok(())
+/// #716's default transport: an absent `type` names it, and export omits the
+/// parameter for it.
+const DEFAULT_TYPE: &str = "tcp";
+
+/// #716's default `path`, used by every transport whose link omits it.
+const DEFAULT_PATH: &str = "/";
+
+/// A field's value rule: `Ok` when the grammar accepts the link's value.
+type ValueRule = fn(&str) -> Result<(), LinkError>;
+
+/// One query field a transport's share grammar carries, in export order.
+struct Field {
+    /// The parameter's name in the query string.
+    key: &'static str,
+    /// The value import uses when the link omits the parameter. An empty
+    /// string is the grammar's "no value" for a parameter whose model field is
+    /// optional (`mtu`, `extra`).
+    default: &'static str,
+    /// #716 forbids an empty value for this parameter in a link.
+    require_value: bool,
+    /// The grammar's value rule beyond emptiness, when it has one — the `mode`
+    /// vocabularies. The field's setter shares it, so an accepted link value
+    /// has exactly one judge.
+    validate: Option<ValueRule>,
+    /// The value to write on export, or `None` when the model holds none.
+    get: fn(&StreamModel) -> Result<Option<String>, LinkError>,
+    /// Fill the model from `value` (the link's, else the declared default).
+    set: fn(&mut StreamModel, &str) -> Result<(), LinkError>,
 }
 
-/// Transport params for URL-style export. Nothing is emitted for plain raw.
-fn transport_params(stream: &StreamModel, q: &mut Vec<(String, String)>) -> Result<(), LinkError> {
-    match stream.network {
-        Network::Raw => {}
-        Network::Kcp => {
-            q.push(("type".into(), "kcp".into()));
-            if let Some(k) = &stream.kcp_settings {
-                if let Some(v) = k.mtu {
-                    q.push(("mtu".into(), v.to_string()));
+/// One model fact a transport's share grammar cannot carry: a set value
+/// refuses export.
+struct Refused {
+    /// The diagnostic in force for the fact.
+    key: Key,
+    /// Whether the model holds the fact.
+    is_set: fn(&StreamModel) -> bool,
+}
+
+/// One transport's share grammar. The table is the only place that knows a
+/// transport's query keys: import walks the fields, export walks the `type`
+/// value and the same fields, and the representability ladder walks the
+/// refused facts and the settings block's presence.
+struct TransportSpec {
+    network: Network,
+    /// The transport's settings block as the model names it
+    /// (`streamSettings.kcpSettings`); every diagnostic about the block uses
+    /// this one path.
+    path: &'static str,
+    /// The `type` query value; `None` for a transport the grammar cannot spell
+    /// at all (hysteria), which import reports as an unknown transport and
+    /// export refuses through [`unshareable_transport`].
+    type_string: Option<&'static str>,
+    /// The fields the grammar carries, in export order. Their setters
+    /// materialize the settings block, so a link that omits every field still
+    /// imports the block Xray would build for the transport.
+    fields: &'static [Field],
+    /// The model facts the grammar cannot carry, in refusal order.
+    refused: &'static [Refused],
+    /// Whether the settings block holds anything at all, for the
+    /// unselected-transport rule.
+    is_present: fn(&StreamModel) -> bool,
+}
+
+impl TransportSpec {
+    /// This transport's field for `key`, when the grammar carries it.
+    fn field(&self, key: &str) -> Option<&'static Field> {
+        self.fields.iter().find(|field| field.key == key)
+    }
+
+    /// The `type` value, or the refusal for a transport the grammar cannot
+    /// spell.
+    fn spelling(&self) -> Result<&'static str, LinkError> {
+        self.type_string.ok_or_else(unshareable_transport)
+    }
+}
+
+/// The refusal for a transport the share grammar cannot spell. Hysteria is the
+/// only one — the grammar has no `type` value, no field and no scheme for it —
+/// and unlike the transports Xray removed it is a live model network, so
+/// export states the reason instead of reporting an unknown `type`.
+fn unshareable_transport() -> LinkError {
+    LinkError::Unsupported(Diag::new(Key::LinkUnsupportedHysteria))
+}
+
+/// The table, in the order the representability ladder reports transports.
+const TRANSPORTS: &[TransportSpec] = &[RAW, KCP, WS, GRPC, HTTPUPGRADE, XHTTP, HYSTERIA];
+
+/// The row for `network`. The table declares every `Network` variant, so
+/// adding one is a compile error here rather than a transport the grammar
+/// silently skips.
+fn transport_spec(network: Network) -> &'static TransportSpec {
+    match network {
+        Network::Raw => &RAW,
+        Network::Kcp => &KCP,
+        Network::Ws => &WS,
+        Network::Grpc => &GRPC,
+        Network::Httpupgrade => &HTTPUPGRADE,
+        Network::Xhttp => &XHTTP,
+        Network::Hysteria => &HYSTERIA,
+    }
+}
+
+/// Resolve a link's `type` parameter to its row: the one home for the
+/// transports Xray removed (http/h2/h3 and quic) and for values the grammar
+/// does not spell. An absent `type` is #716's default transport; an empty one
+/// is refused before this runs.
+fn transport_for_type(ty: &str) -> Result<&'static TransportSpec, LinkError> {
+    match ty {
+        "http" | "h2" | "h3" => Err(LinkError::Unsupported(Diag::new(
+            Key::LinkUnsupportedTypeHttp,
+        ))),
+        "quic" => Err(LinkError::Unsupported(Diag::new(
+            Key::LinkUnsupportedTypeQuic,
+        ))),
+        other => TRANSPORTS
+            .iter()
+            .find(|spec| spec.type_string == Some(other))
+            .ok_or_else(|| {
+                malformed(Diag::new(Key::LinkTransportUnknown).arg(excerpt_debug(other)))
+            }),
+    }
+}
+
+/// The export value of a text parameter: `None` when the model holds nothing
+/// or holds an empty string — canonical output omits the parameter then.
+fn export_text(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// A numeric parameter as the query spells it.
+fn export_number(value: Option<u32>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+/// A `u32` parameter as the link spells it: decimal, and malformed under its
+/// own key otherwise.
+fn numeric_param(key: &'static str, value: &str) -> Result<u32, LinkError> {
+    value.parse::<u32>().map_err(|_| {
+        malformed(
+            Diag::new(Key::LinkNumericParam)
+                .arg(key)
+                .arg(excerpt_debug(value)),
+        )
+    })
+}
+
+// ----- raw / TCP -----
+
+/// Raw has no settings parameters of its own: its camouflage block is model
+/// state the grammar cannot carry, and a non-empty block refuses export either
+/// way.
+fn raw_settings_present(stream: &StreamModel) -> bool {
+    option_has_fields(&stream.raw_settings)
+}
+
+const RAW: TransportSpec = TransportSpec {
+    network: Network::Raw,
+    path: "streamSettings.rawSettings",
+    type_string: Some(DEFAULT_TYPE),
+    fields: &[],
+    refused: &[Refused {
+        key: Key::LinkLossyRawCamouflage,
+        is_set: raw_settings_present,
+    }],
+    is_present: raw_settings_present,
+};
+
+// ----- mKCP -----
+
+const KCP: TransportSpec = TransportSpec {
+    network: Network::Kcp,
+    path: "streamSettings.kcpSettings",
+    type_string: Some("kcp"),
+    fields: &[
+        Field {
+            key: "mtu",
+            default: "",
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_number(
+                    stream.kcp_settings.as_ref().and_then(|kcp| kcp.mtu),
+                ))
+            },
+            set: |stream, value| {
+                let settings = stream.kcp_settings.get_or_insert_default();
+                if !value.is_empty() {
+                    settings.mtu = Some(numeric_param("mtu", value)?);
                 }
-                if let Some(v) = k.tti {
-                    q.push(("tti".into(), v.to_string()));
+                Ok(())
+            },
+        },
+        Field {
+            key: "tti",
+            default: "",
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_number(
+                    stream.kcp_settings.as_ref().and_then(|kcp| kcp.tti),
+                ))
+            },
+            set: |stream, value| {
+                let settings = stream.kcp_settings.get_or_insert_default();
+                if !value.is_empty() {
+                    settings.tti = Some(numeric_param("tti", value)?);
                 }
-            }
-        }
-        Network::Ws => {
-            q.push(("type".into(), "ws".into()));
-            if let Some(w) = &stream.ws_settings {
-                if !w.host.is_empty() {
-                    q.push(("host".into(), w.host.clone()));
-                }
-                if !w.path.is_empty() {
-                    q.push(("path".into(), w.path.clone()));
-                }
-            }
-        }
-        Network::Grpc => {
-            q.push(("type".into(), "grpc".into()));
-            if let Some(g) = &stream.grpc_settings {
-                if !g.service_name.is_empty() {
-                    q.push(("serviceName".into(), g.service_name.clone()));
-                }
-                if !g.authority.is_empty() {
-                    q.push(("authority".into(), g.authority.clone()));
-                }
-                match g.multi_mode {
-                    Some(true) => q.push(("mode".into(), "multi".into())),
-                    Some(false) => q.push(("mode".into(), "gun".into())),
-                    None => {}
-                }
-            }
-        }
-        Network::Httpupgrade => {
-            q.push(("type".into(), "httpupgrade".into()));
-            if let Some(h) = &stream.httpupgrade_settings {
-                if !h.host.is_empty() {
-                    q.push(("host".into(), h.host.clone()));
-                }
-                if !h.path.is_empty() {
-                    q.push(("path".into(), h.path.clone()));
-                }
-            }
-        }
-        Network::Xhttp => {
-            q.push(("type".into(), "xhttp".into()));
-            if let Some(x) = &stream.xhttp_settings {
-                if !x.host.is_empty() {
-                    q.push(("host".into(), x.host.clone()));
-                }
-                if !x.path.is_empty() {
-                    q.push(("path".into(), x.path.clone()));
-                }
-                if !x.mode.is_empty() {
-                    q.push(("mode".into(), x.mode.clone()));
-                }
-                // Everything except host/path/mode is carried by #716's
-                // percent-encoded `extra` JSON object.
-                let mut value = serde_json::to_value(x).map_err(|error| {
+                Ok(())
+            },
+        },
+    ],
+    refused: &[Refused {
+        key: Key::LinkLossyKcp,
+        // The mKCP congestion knobs have no share-link spelling.
+        is_set: |stream| {
+            stream.kcp_settings.as_ref().is_some_and(|kcp| {
+                kcp.uplink_capacity.is_some()
+                    || kcp.downlink_capacity.is_some()
+                    || kcp.cwnd_multiplier.is_some()
+                    || kcp.max_sending_window.is_some()
+                    || !kcp.extra.is_empty()
+            })
+        },
+    }],
+    is_present: |stream| option_has_fields(&stream.kcp_settings),
+};
+
+// ----- WebSocket -----
+
+const WS: TransportSpec = TransportSpec {
+    network: Network::Ws,
+    path: "streamSettings.wsSettings",
+    type_string: Some("ws"),
+    fields: &[
+        Field {
+            key: "host",
+            default: "",
+            require_value: false,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream.ws_settings.as_ref().map(|ws| ws.host.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.ws_settings.get_or_insert_default().host = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "path",
+            default: DEFAULT_PATH,
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream.ws_settings.as_ref().map(|ws| ws.path.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.ws_settings.get_or_insert_default().path = value.to_string();
+                Ok(())
+            },
+        },
+    ],
+    refused: &[Refused {
+        key: Key::LinkLossyWs,
+        // Custom headers and the heartbeat keepalive have no share-link
+        // spelling.
+        is_set: |stream| {
+            stream.ws_settings.as_ref().is_some_and(|ws| {
+                !ws.headers.is_empty() || ws.heartbeat_period.is_some() || !ws.extra.is_empty()
+            })
+        },
+    }],
+    is_present: |stream| option_has_fields(&stream.ws_settings),
+};
+
+// ----- gRPC -----
+
+/// The gRPC `mode` vocabulary: `gun` and `multi` are the two spellings of the
+/// boolean `multiMode` the model carries, and `guna` has no field at all.
+fn validate_grpc_mode(value: &str) -> Result<(), LinkError> {
+    match value {
+        "gun" | "multi" => Ok(()),
+        "guna" => Err(LinkError::Unsupported(Diag::new(
+            Key::LinkUnsupportedGrpcGuna,
+        ))),
+        other => Err(malformed(
+            Diag::new(Key::LinkGrpcModeUnknown).arg(excerpt_debug(other)),
+        )),
+    }
+}
+
+const GRPC: TransportSpec = TransportSpec {
+    network: Network::Grpc,
+    path: "streamSettings.grpcSettings",
+    type_string: Some("grpc"),
+    fields: &[
+        Field {
+            key: "serviceName",
+            default: "",
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream
+                        .grpc_settings
+                        .as_ref()
+                        .map(|grpc| grpc.service_name.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.grpc_settings.get_or_insert_default().service_name = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "authority",
+            default: "",
+            require_value: false,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream
+                        .grpc_settings
+                        .as_ref()
+                        .map(|grpc| grpc.authority.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.grpc_settings.get_or_insert_default().authority = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "mode",
+            // A `gun` link and an omitted one import alike: `gun` is the
+            // boolean's absent default.
+            default: "gun",
+            require_value: true,
+            validate: Some(validate_grpc_mode),
+            get: |stream| {
+                let multi_mode = stream
+                    .grpc_settings
+                    .as_ref()
+                    .and_then(|grpc| grpc.multi_mode);
+                Ok(match multi_mode {
+                    Some(true) => Some("multi".to_string()),
+                    Some(false) => Some("gun".to_string()),
+                    None => None,
+                })
+            },
+            set: |stream, value| {
+                validate_grpc_mode(value)?;
+                let multi_mode = if value == "multi" { Some(true) } else { None };
+                stream.grpc_settings.get_or_insert_default().multi_mode = multi_mode;
+                Ok(())
+            },
+        },
+    ],
+    refused: &[Refused {
+        key: Key::LinkLossyGrpc,
+        // The gRPC keepalive/health knobs and the user agent have no
+        // share-link spelling.
+        is_set: |stream| {
+            stream.grpc_settings.as_ref().is_some_and(|grpc| {
+                grpc.idle_timeout.is_some()
+                    || grpc.health_check_timeout.is_some()
+                    || grpc.permit_without_stream.is_some()
+                    || grpc.initial_windows_size.is_some()
+                    || grpc.user_agent.is_some()
+                    || !grpc.extra.is_empty()
+            })
+        },
+    }],
+    is_present: |stream| option_has_fields(&stream.grpc_settings),
+};
+
+// ----- HTTPUpgrade -----
+
+const HTTPUPGRADE: TransportSpec = TransportSpec {
+    network: Network::Httpupgrade,
+    path: "streamSettings.httpupgradeSettings",
+    type_string: Some("httpupgrade"),
+    fields: &[
+        Field {
+            key: "host",
+            default: "",
+            require_value: false,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream
+                        .httpupgrade_settings
+                        .as_ref()
+                        .map(|upgrade| upgrade.host.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.httpupgrade_settings.get_or_insert_default().host = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "path",
+            default: DEFAULT_PATH,
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream
+                        .httpupgrade_settings
+                        .as_ref()
+                        .map(|upgrade| upgrade.path.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.httpupgrade_settings.get_or_insert_default().path = value.to_string();
+                Ok(())
+            },
+        },
+    ],
+    refused: &[Refused {
+        key: Key::LinkLossyHttpupgrade,
+        // Custom headers have no share-link spelling.
+        is_set: |stream| {
+            stream
+                .httpupgrade_settings
+                .as_ref()
+                .is_some_and(|upgrade| !upgrade.headers.is_empty() || !upgrade.extra.is_empty())
+        },
+    }],
+    is_present: |stream| option_has_fields(&stream.httpupgrade_settings),
+};
+
+// ----- XHTTP -----
+
+/// The XHTTP `mode` vocabulary is the model's (the same set Xray's
+/// `SplitHTTPConfig.Build` accepts); the link spells `auto` for the wire
+/// default, which the empty model value also means.
+fn validate_xhttp_mode(value: &str) -> Result<(), LinkError> {
+    if crate::model::validation::xhttp_mode_supported(value) {
+        Ok(())
+    } else {
+        Err(malformed(
+            Diag::new(Key::LinkXhttpModeUnknown).arg(excerpt_debug(value)),
+        ))
+    }
+}
+
+const XHTTP: TransportSpec = TransportSpec {
+    network: Network::Xhttp,
+    path: "streamSettings.xhttpSettings",
+    type_string: Some("xhttp"),
+    fields: &[
+        Field {
+            key: "host",
+            default: "",
+            require_value: false,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream.xhttp_settings.as_ref().map(|x| x.host.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.xhttp_settings.get_or_insert_default().host = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "path",
+            default: DEFAULT_PATH,
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                Ok(export_text(
+                    stream.xhttp_settings.as_ref().map(|x| x.path.clone()),
+                ))
+            },
+            set: |stream, value| {
+                stream.xhttp_settings.get_or_insert_default().path = value.to_string();
+                Ok(())
+            },
+        },
+        Field {
+            key: "mode",
+            default: "auto",
+            require_value: true,
+            validate: Some(validate_xhttp_mode),
+            get: |stream| {
+                Ok(export_text(
+                    stream.xhttp_settings.as_ref().map(|x| x.mode.clone()),
+                ))
+            },
+            set: |stream, value| {
+                validate_xhttp_mode(value)?;
+                // Xray's empty model value and #716's `auto` have identical
+                // semantics; keeping the model default makes canonical output
+                // omit the optional parameter.
+                let mode = if value == "auto" {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
+                stream.xhttp_settings.get_or_insert_default().mode = mode;
+                Ok(())
+            },
+        },
+        Field {
+            // Everything except host/path/mode is carried by #716's
+            // percent-encoded `extra` JSON object.
+            key: "extra",
+            default: "",
+            require_value: true,
+            validate: None,
+            get: |stream| {
+                let Some(xhttp) = stream.xhttp_settings.as_ref() else {
+                    return Ok(None);
+                };
+                let mut value = serde_json::to_value(xhttp).map_err(|error| {
                     LinkError::Lossy(
                         Diag::new(Key::LinkLossyXhttpSerialize)
                             .arg("streamSettings.xhttpSettings")
@@ -987,22 +1269,96 @@ fn transport_params(stream: &StreamModel, q: &mut Vec<(String, String)>) -> Resu
                     object.remove("path");
                     object.remove("mode");
                 }
-                if value.as_object().is_some_and(|object| !object.is_empty()) {
-                    let json = serde_json::to_string(&value).map_err(|error| {
-                        LinkError::Lossy(
-                            Diag::new(Key::LinkLossyXhttpEncode)
-                                .arg("streamSettings.xhttpSettings")
-                                .arg(error),
+                if !value.as_object().is_some_and(|object| !object.is_empty()) {
+                    return Ok(None);
+                }
+                let json = serde_json::to_string(&value).map_err(|error| {
+                    LinkError::Lossy(
+                        Diag::new(Key::LinkLossyXhttpEncode)
+                            .arg("streamSettings.xhttpSettings")
+                            .arg(error),
+                    )
+                })?;
+                Ok(Some(json))
+            },
+            set: |stream, value| {
+                if value.is_empty() {
+                    return Ok(());
+                }
+                // `extra` carries everything except host/path/mode. Reject
+                // those reserved keys instead of allowing a second, ambiguous
+                // source.
+                let parsed: Value = serde_json::from_str(value).map_err(|error| {
+                    malformed(Diag::new(Key::LinkXhttpExtraJson).arg(excerpt(&error.to_string())))
+                })?;
+                let object = parsed
+                    .as_object()
+                    .ok_or_else(|| malformed(Diag::new(Key::LinkXhttpExtraObject)))?;
+                if let Some(field) = ["host", "path", "mode"]
+                    .into_iter()
+                    .find(|field| object.contains_key(*field))
+                {
+                    return Err(malformed(
+                        Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(field)),
+                    ));
+                }
+                let mut settings: XhttpSettings =
+                    serde_json::from_value(parsed).map_err(|error| {
+                        malformed(
+                            Diag::new(Key::LinkXhttpExtraJson).arg(excerpt(&error.to_string())),
                         )
                     })?;
-                    q.push(("extra".into(), json));
-                }
-            }
-        }
-        Network::Hysteria => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedHysteria,
-            )));
+                // The link's own host/path/mode parameters were applied before
+                // this field and #716 spells them outside `extra`, so their
+                // values stay in force.
+                let previous = stream.xhttp_settings.take().unwrap_or_default();
+                settings.host = previous.host;
+                settings.path = previous.path;
+                settings.mode = previous.mode;
+                stream.xhttp_settings = Some(settings);
+                Ok(())
+            },
+        },
+    ],
+    refused: &[],
+    is_present: |stream| option_has_fields(&stream.xhttp_settings),
+};
+
+// ----- hysteria -----
+
+/// Hysteria is a live model network with no share grammar — no `type` value,
+/// no field, no scheme — so only its block's presence can refuse an export,
+/// under the unselected-transport rule.
+const HYSTERIA: TransportSpec = TransportSpec {
+    network: Network::Hysteria,
+    path: "streamSettings.hysteriaSettings",
+    type_string: None,
+    fields: &[],
+    refused: &[],
+    is_present: |stream| option_has_fields(&stream.hysteria_settings),
+};
+
+/// Apply the link's `type` parameter: the row's fields, each with the link's
+/// value or the field's declared default.
+fn apply_transport_query(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError> {
+    let spec = transport_for_type(q.get("type").unwrap_or(DEFAULT_TYPE))?;
+    stream.network = spec.network;
+    for field in spec.fields {
+        (field.set)(stream, q.get(field.key).unwrap_or(field.default))?;
+    }
+    Ok(())
+}
+
+/// Transport params for URL-style export. Nothing is emitted for plain raw.
+fn transport_params(stream: &StreamModel, q: &mut Vec<(String, String)>) -> Result<(), LinkError> {
+    let spec = transport_spec(stream.network);
+    let type_string = spec.spelling()?;
+    if type_string != DEFAULT_TYPE {
+        q.push(("type".into(), type_string.into()));
+    }
+    for field in spec.fields {
+        if let Some(value) = (field.get)(stream)? {
+            q.push((field.key.into(), value));
         }
     }
     Ok(())
@@ -1046,6 +1402,62 @@ fn apply_finalmask(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError>
         stream.finalmask = Some(fm);
     }
     Ok(())
+}
+
+// ---------- shareable protocols ----------
+
+/// One protocol a share link names: the scheme in its URL, and the parser for
+/// the body after `scheme://`.
+struct Shareable {
+    scheme: &'static str,
+    protocol: Protocol,
+    parse: fn(&str) -> Result<ServerProfile, LinkError>,
+}
+
+/// The share grammar's supported set, one row per shareable protocol: the
+/// schemes `parse_link` accepts and the protocols `to_link` renders. Any other
+/// protocol is refused with [`unsupported_protocol`].
+const SHAREABLE: &[Shareable] = &[
+    Shareable {
+        scheme: "vless",
+        protocol: Protocol::Vless,
+        parse: |body| parse_url_style(body, Protocol::Vless),
+    },
+    Shareable {
+        scheme: "vmess",
+        protocol: Protocol::Vmess,
+        parse: parse_vmess_body,
+    },
+    Shareable {
+        scheme: "trojan",
+        protocol: Protocol::Trojan,
+        parse: |body| parse_url_style(body, Protocol::Trojan),
+    },
+    Shareable {
+        scheme: "ss",
+        protocol: Protocol::Shadowsocks,
+        parse: parse_ss,
+    },
+];
+
+/// #716 names the VMess URL form when the body carries a userinfo, and the
+/// obsolete whole-body Base64-JSON form otherwise.
+fn parse_vmess_body(body: &str) -> Result<ServerProfile, LinkError> {
+    if body.contains('@') {
+        parse_url_style(body, Protocol::Vmess)
+    } else {
+        parse_legacy_vmess(body)
+    }
+}
+
+/// `Ok` when the grammar names `protocol` in either direction.
+fn shareable(protocol: Protocol) -> bool {
+    SHAREABLE.iter().any(|row| row.protocol == protocol)
+}
+
+/// The refusal for a protocol outside the share set.
+fn unsupported_protocol(protocol: Protocol) -> LinkError {
+    LinkError::Unsupported(Diag::new(Key::LinkUnsupportedProtocol).arg(protocol.as_str()))
 }
 
 // ---------- URL-style links (VLESS / VMess / Trojan) ----------
@@ -1883,9 +2295,10 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             }
         }
         Network::Hysteria => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedHysteria,
-            )));
+            // The grammar spells no `type` for this transport, so a profile
+            // that names it cannot cross the import/export boundary either:
+            // the row's own check states the refusal.
+            transport_spec(Network::Hysteria).spelling()?;
         }
     }
     if let Some(finalmask) = stream.finalmask.as_ref() {
@@ -1977,11 +2390,7 @@ pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
                 return Err(malformed(Diag::new(Key::LinkSsKeyMaterial)));
             }
         }
-        other => {
-            return Err(LinkError::Unsupported(
-                Diag::new(Key::LinkUnsupportedProtocol).arg(other.protocol().as_str()),
-            ));
-        }
+        other => return Err(unsupported_protocol(other.protocol())),
     }
 
     // Model validation pass: protocol, stream, and transport-security
@@ -2147,120 +2556,26 @@ fn validate_url_stream_exportable(stream: &StreamModel) -> Result<(), LinkError>
         ));
     }
 
-    match stream.network {
-        Network::Raw => {
-            if option_has_fields(&stream.raw_settings) {
-                return Err(lossy(
-                    "streamSettings.rawSettings",
-                    Key::LinkLossyRawCamouflage,
-                ));
-            }
-        }
-        Network::Kcp => {
-            if let Some(kcp) = stream.kcp_settings.as_ref()
-                && (kcp.uplink_capacity.is_some()
-                    || kcp.downlink_capacity.is_some()
-                    || kcp.cwnd_multiplier.is_some()
-                    || kcp.max_sending_window.is_some()
-                    || !kcp.extra.is_empty())
-            {
-                return Err(lossy("streamSettings.kcpSettings", Key::LinkLossyKcp));
-            }
-        }
-        Network::Ws => {
-            if let Some(ws) = stream.ws_settings.as_ref()
-                && (!ws.headers.is_empty() || ws.heartbeat_period.is_some() || !ws.extra.is_empty())
-            {
-                return Err(lossy("streamSettings.wsSettings", Key::LinkLossyWs));
-            }
-        }
-        Network::Grpc => {
-            if let Some(grpc) = stream.grpc_settings.as_ref()
-                && (grpc.idle_timeout.is_some()
-                    || grpc.health_check_timeout.is_some()
-                    || grpc.permit_without_stream.is_some()
-                    || grpc.initial_windows_size.is_some()
-                    || grpc.user_agent.is_some()
-                    || !grpc.extra.is_empty())
-            {
-                return Err(lossy("streamSettings.grpcSettings", Key::LinkLossyGrpc));
-            }
-        }
-        Network::Httpupgrade => {
-            if let Some(upgrade) = stream.httpupgrade_settings.as_ref()
-                && (!upgrade.headers.is_empty() || !upgrade.extra.is_empty())
-            {
-                return Err(lossy(
-                    "streamSettings.httpupgradeSettings",
-                    Key::LinkLossyHttpupgrade,
-                ));
-            }
-        }
-        Network::Xhttp => {
-            // The official `extra` parameter carries the remaining XHTTP JSON
-            // object, so all modeled XHTTP fields are representable.
-        }
-        Network::Hysteria => {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedHysteria,
-            )));
+    // The selected transport's own refusals, then every other transport's
+    // block: a transport the grammar cannot spell is refused before either.
+    let selected = transport_spec(stream.network);
+    selected.spelling()?;
+    for refused in selected.refused {
+        if (refused.is_set)(stream) {
+            return Err(lossy(selected.path, refused.key));
         }
     }
-
-    if stream.network != Network::Raw && option_has_fields(&stream.raw_settings) {
-        return Err(lossy(
-            "streamSettings.rawSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Kcp && option_has_fields(&stream.kcp_settings) {
-        return Err(lossy(
-            "streamSettings.kcpSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Ws && option_has_fields(&stream.ws_settings) {
-        return Err(lossy(
-            "streamSettings.wsSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Grpc && option_has_fields(&stream.grpc_settings) {
-        return Err(lossy(
-            "streamSettings.grpcSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Httpupgrade && option_has_fields(&stream.httpupgrade_settings) {
-        return Err(lossy(
-            "streamSettings.httpupgradeSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Xhttp && option_has_fields(&stream.xhttp_settings) {
-        return Err(lossy(
-            "streamSettings.xhttpSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
-    }
-    if stream.network != Network::Hysteria && option_has_fields(&stream.hysteria_settings) {
-        return Err(lossy(
-            "streamSettings.hysteriaSettings",
-            Key::LinkLossyTransportUnselected,
-        ));
+    for spec in TRANSPORTS {
+        if spec.network != stream.network && (spec.is_present)(stream) {
+            return Err(lossy(spec.path, Key::LinkLossyTransportUnselected));
+        }
     }
     Ok(())
 }
 
 fn validate_ss_stream_exportable(stream: &StreamModel) -> Result<(), LinkError> {
     let has_stream_state = stream.network != Network::Raw
-        || option_has_fields(&stream.raw_settings)
-        || option_has_fields(&stream.xhttp_settings)
-        || option_has_fields(&stream.kcp_settings)
-        || option_has_fields(&stream.grpc_settings)
-        || option_has_fields(&stream.ws_settings)
-        || option_has_fields(&stream.httpupgrade_settings)
-        || option_has_fields(&stream.hysteria_settings)
+        || TRANSPORTS.iter().any(|spec| (spec.is_present)(stream))
         || stream.security != Security::None
         || option_has_fields(&stream.tls_settings)
         || option_has_fields(&stream.reality_settings)
@@ -2338,14 +2653,11 @@ pub fn parse_link(s: &str) -> Result<ServerProfile, LinkError> {
         ));
     }
     let body = &s[scheme_end + 3..];
-    let profile = match scheme.to_ascii_lowercase().as_str() {
-        "vless" => parse_url_style(body, Protocol::Vless),
-        "trojan" => parse_url_style(body, Protocol::Trojan),
-        "vmess" if body.contains('@') => parse_url_style(body, Protocol::Vmess),
-        "vmess" => parse_legacy_vmess(body),
-        "ss" => parse_ss(body),
-        other => Err(LinkError::Unsupported(
-            Diag::new(Key::LinkUnsupportedScheme).arg(excerpt(other)),
+    let lowered = scheme.to_ascii_lowercase();
+    let profile = match SHAREABLE.iter().find(|row| row.scheme == lowered.as_str()) {
+        Some(row) => (row.parse)(body),
+        None => Err(LinkError::Unsupported(
+            Diag::new(Key::LinkUnsupportedScheme).arg(excerpt(&lowered)),
         )),
     }?;
     validate_profile(&profile)?;
@@ -2414,14 +2726,20 @@ pub fn to_link(profile: &ServerProfile) -> Result<String, LinkError> {
 
     validate_profile(&canonical)?;
     validate_exportable(&canonical)?;
+    // The share set decides before any renderer runs; the match below only
+    // picks the renderer for a protocol the grammar names.
+    let protocol = canonical.outbound.settings.protocol();
+    if !shareable(protocol) {
+        return Err(unsupported_protocol(protocol));
+    }
     let link = match &canonical.outbound.settings {
         ProtocolSettings::Vless(settings) => vless_link(&canonical, settings),
         ProtocolSettings::Vmess(settings) => vmess_link(&canonical, settings),
         ProtocolSettings::Trojan(settings) => trojan_link(&canonical, settings),
         ProtocolSettings::Shadowsocks(settings) => ss_link(&canonical, settings),
-        other => Err(LinkError::Unsupported(
-            Diag::new(Key::LinkUnsupportedProtocol).arg(other.protocol().as_str()),
-        )),
+        // Refused above by the share set; a total match keeps this refusal
+        // site rather than a second message.
+        other => Err(unsupported_protocol(other.protocol())),
     }?;
 
     // Keep this final structural guard even though the field-specific checks
@@ -3635,6 +3953,21 @@ mod tests {
         }
     }
 
+    /// A lossy export with the exact message `key` and `field` render: the
+    /// refusal's own key and the block it names are the contract the UI
+    /// shows.
+    fn expect_lossy_message(profile: &ServerProfile, key: Key, field: &str) {
+        match to_link(profile) {
+            Err(LinkError::Lossy(message)) => {
+                assert_eq!(
+                    message.text(Language::En),
+                    t_fmt(Language::En, key, &[&field])
+                );
+            }
+            other => panic!("expected Lossy({key:?}, {field:?}), got {other:?}"),
+        }
+    }
+
     /// A link the model rules reject: parse surfaces the first `Error`
     /// finding as a keyed `InvalidModel`, never a rendered string.
     fn expect_invalid_model(s: &str, code: crate::model::validation::ValidationCode) {
@@ -4002,6 +4335,41 @@ mod tests {
     }
 
     #[test]
+    fn export_refusals_name_the_transport_block_and_their_own_reason() {
+        // A congestion knob and a header map have no share-link spelling:
+        // each refusal names the block it sits in under its own key.
+        let mut kcp = parse_link(&format!(
+            "vless://{UUID}@kcp.local:443?type=kcp&mtu=1400#KCP"
+        ))
+        .unwrap();
+        kcp.outbound
+            .stream
+            .kcp_settings
+            .as_mut()
+            .unwrap()
+            .uplink_capacity = Some(1_000);
+        expect_lossy_message(&kcp, Key::LinkLossyKcp, "streamSettings.kcpSettings");
+
+        let mut upgrade = parse_link(&format!(
+            "vless://{UUID}@upgrade.local:443?type=httpupgrade&path=%2Fup#UP"
+        ))
+        .unwrap();
+        upgrade
+            .outbound
+            .stream
+            .httpupgrade_settings
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("X-Test".into(), Value::String("value".into()));
+        expect_lossy_message(
+            &upgrade,
+            Key::LinkLossyHttpupgrade,
+            "streamSettings.httpupgradeSettings",
+        );
+    }
+
+    #[test]
     fn export_ignores_inactive_invalid_transport_drafts_without_leaking_them() {
         let mut profile = parse_link(&format!(
             "vless://{UUID}@grpc.example.com:443?security=tls&type=grpc&serviceName=active-svc#Active"
@@ -4133,6 +4501,29 @@ mod tests {
         match to_link(&p) {
             Err(LinkError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hysteria_has_no_share_grammar_in_either_direction() {
+        // The grammar spells no `type` for hysteria: import reports the value
+        // as an unknown transport, and export refuses the live model network
+        // with its own message.
+        expect_malformed(&format!("vless://{UUID}@h.example.com:443?type=hysteria"));
+
+        let mut profile = parse_link(&format!(
+            "vless://{UUID}@tls.local:443?security=tls&sni=tls.local#Hysteria"
+        ))
+        .unwrap();
+        profile.outbound.stream.network = Network::Hysteria;
+        profile.outbound.stream.hysteria_settings =
+            Some(crate::model::stream::HysteriaTransport::default());
+        match to_link(&profile) {
+            Err(LinkError::Unsupported(message)) => assert_eq!(
+                message.text(Language::En),
+                t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[])
+            ),
+            other => panic!("expected Unsupported(Hysteria), got {other:?}"),
         }
     }
 

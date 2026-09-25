@@ -25,8 +25,8 @@ use crate::model::settings::{Language, Mode};
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
 use crate::rt::{
-    AppMessage, CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OperationKind,
-    OutboundStatusView, StatsTick,
+    AppMessage, CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView,
+    StatsTick,
 };
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
@@ -216,7 +216,7 @@ pub(crate) struct UiCtxParts<'a> {
     /// The raw window the shell drained from the runtime's operation
     /// bookends: [`UiCtx::new`] derives [`UiCtx::busy`] from it once per
     /// frame, and screens read the window through that value.
-    pub(crate) operation: Option<OperationKind>,
+    pub(crate) operation: Option<JobKind>,
     pub(crate) is_elevated: bool,
     pub(crate) config_revision: u64,
 }

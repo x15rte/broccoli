@@ -1129,7 +1129,6 @@ keys! {
     SrvHttpupgradeSettingsMissing,
     SrvHysteriaTransportSettingsMissing,
     SrvStreamOneNoDownload,
-    SrvXhttpHeaderValueString,
     SrvDownloadNestingExceeds,
     SrvMasterKeyLogNotSupported,
     SrvProxySettingsRemoved,
@@ -1139,8 +1138,6 @@ keys! {
     SrvRemoveUdpHopKeyNote,
     SrvMaskSockoptNote,
     SrvPenetrateMaskNote,
-    SrvWsHeaderValueString,
-    SrvHttpupgradeHeaderValueString,
     SrvFromMitmOnlyAlpnShort,
     SrvTlsCertFileOrPem,
     SrvRealitySettingsMissing,
@@ -2153,6 +2150,7 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         HeaderValuesNotStrings(network) => match network {
             // The rule is the same one the share-link grammar applies, so the
             // text is reused rather than duplicated.
+            Network::Xhttp => t(lang, Key::LinkXhttpHeaderValues),
             Network::Ws => t(lang, Key::LinkWsHeaderValues),
             Network::Httpupgrade => t(lang, Key::LinkHttpupgradeHeaderValues),
             _ => {
@@ -2366,15 +2364,6 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         FreedomFragmentInvalid => t(lang, Key::SrvFreedomFragmentInvalid),
         FreedomNoiseInvalid => t(lang, Key::SrvFreedomNoiseInvalid),
         LoopbackTagRequired => t(lang, Key::SrvLoopbackTagRequired),
-        HeaderValueNotString(network) => match network {
-            Network::Xhttp => t(lang, Key::SrvXhttpHeaderValueString),
-            Network::Ws => t(lang, Key::SrvWsHeaderValueString),
-            Network::Httpupgrade => t(lang, Key::SrvHttpupgradeHeaderValueString),
-            _ => {
-                debug_assert!(false, "HeaderValueNotString cannot name {network:?}");
-                t(lang, Key::SrvXhttpHeaderValueString)
-            }
-        },
         TlsFromMitmAlpnShort => t(lang, Key::SrvFromMitmOnlyAlpnShort),
         TlsCertificateRequired => t(lang, Key::SrvTlsCertFileOrPem),
     }
@@ -3966,7 +3955,6 @@ mod en {
             Key::SrvHttpupgradeSettingsMissing => "HTTPUpgrade settings are missing",
             Key::SrvHysteriaTransportSettingsMissing => "Hysteria transport settings are missing",
             Key::SrvStreamOneNoDownload => "stream-one cannot use downloadSettings",
-            Key::SrvXhttpHeaderValueString => "every XHTTP header value must be a string",
             Key::SrvDownloadNestingExceeds => {
                 "XHTTP downloadSettings nesting exceeds the safety depth"
             }
@@ -3991,10 +3979,6 @@ mod en {
             Key::SrvPenetrateMaskNote => {
                 "penetrate only copies the stream sockopt into XHTTP downloadSettings. The hop \
                  socket calls DialSystem directly"
-            }
-            Key::SrvWsHeaderValueString => "every WebSocket header value must be a string",
-            Key::SrvHttpupgradeHeaderValueString => {
-                "every HTTPUpgrade header value must be a string"
             }
             Key::SrvFromMitmOnlyAlpnShort => "fromMitm must be the only ALPN value",
             Key::SrvTlsCertFileOrPem => "every TLS certificate needs a file or inline PEM",

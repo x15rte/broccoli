@@ -29,7 +29,7 @@ use super::stream::{
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
     Network, Security, SockoptModel, StreamModel, XmuxConfig,
 };
-use super::{Mode, ServerProfile, ServersFile, Settings, TunCfg};
+use super::{ServerProfile, ServersFile, Settings, TunCfg, emit};
 use crate::links::{excerpt, excerpt_debug};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -49,9 +49,10 @@ pub enum ValidationCode {
     XhttpDepthExceeded,
     TransportSettingsMissing(Network),
     /// A transport's `headers` map carries a value that is not a string. Xray
-    /// types both `wsSettings.headers` and `httpupgradeSettings.headers` as
-    /// `map[string]string`, so a non-string value makes the whole document
-    /// unloadable; the share-link grammar refuses the same value on import.
+    /// types `wsSettings.headers`, `httpupgradeSettings.headers` and the XHTTP
+    /// settings' own `headers` as `map[string]string`, so a non-string value
+    /// makes the whole document unloadable; the share-link grammar refuses the
+    /// same value on import.
     HeaderValuesNotStrings(Network),
     HysteriaTransportRequiresTls,
     /// Both the outbound `settings.version` and the transport
@@ -181,6 +182,17 @@ pub enum ValidationCode {
     /// comma-separated) — Xray's conf build errors on non-hex or
     /// wrong-length entries (conf/transport_security.go).
     PinnedPeerCertSha256Invalid,
+    /// TLS `alpn` carries `fromMitm` alongside other names: Xray's conf build
+    /// refuses the list (`infra/conf/transport_security.go`: only one element
+    /// is allowed in "alpn" when using "fromMitm" in it). The finalmask realm
+    /// TLS mount has its own code ([`Self::FinalmaskRealmAlpnFromMitm`]).
+    TlsFromMitmAlpnShort,
+    /// An outbound TLS certificate row names no `certificateFile` and holds no
+    /// non-blank inline `certificate` line: Xray's conf build refuses the entry
+    /// (infra/conf: both file and bytes are empty). The finding's path names
+    /// the offending row. The finalmask realm TLS mount has its own code
+    /// ([`Self::FinalmaskRealmCertRequired`]).
+    TlsCertificateRequired,
     // ---- transport security (validate_outbound) ----
     VisionRequiresTlsOrReality,
     PublicVlessRequiresTlsOrEncryption,
@@ -672,12 +684,12 @@ pub enum ValidationCode {
     // The rules below judge a *server draft*: the empty field a fresh draft
     // starts from, the value a widget can only judge while the user types it.
     // Every one of them is a value the wire accepts — Xray builds a config
-    // with an empty id, an empty WireGuard peer list, or a non-string header
-    // value as readily as it builds an empty string — so no model sweep emits
-    // them and no stored profile is refused for carrying them. The editor's
-    // own sweep emits them so a draft rule has an identity (code + tier)
-    // instead of a rendered sentence. Their messages name the field the user
-    // is looking at, so none carries a wire path.
+    // with an empty id or an empty WireGuard peer list as readily as it
+    // builds an empty string — so no model sweep emits them and no stored
+    // profile is refused for carrying them. The editor's own sweep emits them
+    // so a draft rule has an identity (code + tier) instead of a rendered
+    // sentence. Their messages name the field the user is looking at, so none
+    // carries a wire path.
     /// The profile's protocol tag and its `settings` block name different
     /// protocols: serde binds the two independently, so a hand-edited state
     /// file can disagree, and every model rule reads one of them.
@@ -733,21 +745,6 @@ pub enum ValidationCode {
     /// connection back to the inbound it names, and no inbound carries the
     /// empty tag.
     LoopbackTagRequired,
-    /// A transport header map (WebSocket, HTTPUpgrade, or the XHTTP settings'
-    /// own `headers` — the map Xray reads as `map[string]string`) holds a
-    /// JSON value that is not a string. A draft can hold one while the user
-    /// edits a header row; the generated document would refuse to unmarshal.
-    HeaderValueNotString(Network),
-    /// TLS `alpn` carries `fromMitm` alongside other names. Xray substitutes
-    /// its own list only when `fromMitm` is the sole entry
-    /// (`infra/conf/transport_security.go` ALPN handling), so any other
-    /// arrangement sends the literal name and the handshake fails.
-    TlsFromMitmAlpnShort,
-    /// A TLS certificate row has neither `certificateFile` nor inline
-    /// `certificate` lines. Only the editor's row can tell which one the user
-    /// is about to fill in, so the rule lives here rather than in the model
-    /// pass.
-    TlsCertificateRequired,
 }
 
 /// Advisory tier of a [`ValidationIssue`]. `Error` findings block
@@ -1911,13 +1908,17 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
             )),
             _ => {}
         }
-        // Both headers maps reach Xray's `map[string]string` fields, and a
+        // Every headers map reaches Xray's `map[string]string` fields, and a
         // non-string value (a hand-edited state file, or an extra-map key kept
         // verbatim from one) makes the generated document unloadable. The
         // share-link grammar refuses the same value on import, so the state
         // load is the only way in — and generation must refuse it with a
         // message that names the rule instead of spending a core start on it.
         let headers = match stream.network {
+            Network::Xhttp => stream
+                .xhttp_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.xhttpSettings.headers")),
             Network::Ws => stream
                 .ws_settings
                 .as_ref()
@@ -2184,6 +2185,36 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
                     ValidationCode::TlsMinExceedsMax,
                     Some("stream.tlsSettings".into()),
                 ));
+            }
+        }
+        // Xray consults `tlsSettings` only when `security` selects TLS (the
+        // wire pass drops the block otherwise), so the certificate and ALPN
+        // rules ride that selection, exactly like the ECH sockopt check below.
+        if stream.security == Security::Tls
+            && let Some(tls) = stream.tls_settings.as_ref()
+        {
+            // `fromMitm` beside another ALPN name: Xray's conf build refuses
+            // the list (infra/conf/transport_security.go: only one element is
+            // allowed in "alpn" when using "fromMitm" in it).
+            if tls.alpn.len() > 1 && tls.alpn.iter().any(|value| value == "fromMitm") {
+                issues.push(issue(
+                    ValidationCode::TlsFromMitmAlpnShort,
+                    Some("stream.tlsSettings.alpn".into()),
+                ));
+            }
+            // A certificate row with neither a file nor inline PEM lines has
+            // no key material to load (infra/conf: both file and bytes are
+            // empty); the path names the row so the finding points at the
+            // entry the user has to fill in.
+            for (index, certificate) in tls.certificates.iter().enumerate() {
+                if certificate.certificate_file.is_empty()
+                    && certificate.certificate.iter().all(String::is_empty)
+                {
+                    issues.push(issue(
+                        ValidationCode::TlsCertificateRequired,
+                        Some(format!("stream.tlsSettings.certificates[{index}]")),
+                    ));
+                }
             }
         }
         if let Some(reality) = stream.reality_settings.as_ref() {
@@ -3766,17 +3797,20 @@ pub fn validate_profiles(
     active_id: Option<&str>,
     require_nonempty: bool,
 ) -> Vec<ValidationIssue> {
-    profile_set_verdict(profiles, active_id, require_nonempty).0
+    let outbound_tags = emit::profile_outbound_tags(profiles);
+    profile_set_verdict(profiles, active_id, require_nonempty, &outbound_tags)
 }
 
-/// [`validate_profiles`]'s full product: the findings plus the outbound-tag
-/// universe the settings-wide rules reference (every profile tag that
-/// passed the shape checks, plus the `direct`/`block` built-ins).
+/// [`validate_profiles`]'s body: the profile-level findings, judged against
+/// the outbound tags the given configuration carries (`outbound_tags`, so
+/// every target check below reads the emission universe rather than a copy of
+/// it).
 fn profile_set_verdict(
     profiles: &[ServerProfile],
     active_id: Option<&str>,
     require_nonempty: bool,
-) -> (Vec<ValidationIssue>, BTreeSet<String>) {
+    outbound_tags: &BTreeSet<String>,
+) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if require_nonempty && profiles.is_empty() {
         issues.push(issue(ValidationCode::ProfilesRequired, None));
@@ -3868,10 +3902,6 @@ fn profile_set_verdict(
         }
     }
 
-    let mut outbound_tags: BTreeSet<String> = profile_tags.keys().cloned().collect();
-    outbound_tags.insert(DIRECT_OUTBOUND_TAG.into());
-    outbound_tags.insert(BLOCK_OUTBOUND_TAG.into());
-
     for profile in profiles {
         let location = profile_display_name(profile);
         for finding in validate_outbound(&profile.outbound) {
@@ -3924,7 +3954,7 @@ fn profile_set_verdict(
         }
     }
 
-    (issues, outbound_tags)
+    issues
 }
 
 /// One settings-level verdict for the whole configuration: the server
@@ -3939,9 +3969,17 @@ pub fn validate_settings(
     servers: &ServersFile,
     api_port: u16,
 ) -> Vec<ValidationIssue> {
-    let (mut issues, outbound_tags) =
-        profile_set_verdict(&servers.profiles, servers.active.as_deref(), false);
-    let tun_on = settings.mode == Mode::Tun;
+    // The emitted outbound universe first: every check below — the profile
+    // verdict's chain targets, the balancer fallbacks, the rules — judges the
+    // tags the generated document carries.
+    let outbound_tags = emit::outbound_tags(servers, settings);
+    let mut issues = profile_set_verdict(
+        &servers.profiles,
+        servers.active.as_deref(),
+        false,
+        &outbound_tags,
+    );
+    let tun_on = emit::tun_inbound_emitted(settings);
 
     let mut balancer_tags = BTreeSet::new();
     for (index, balancer) in settings.routing.balancers.iter().enumerate() {
@@ -3978,6 +4016,12 @@ pub fn validate_settings(
     }
 
     let mut ip_listeners = vec![("API".to_string(), "127.0.0.1".to_string(), api_port, 1_u8)];
+    // The set this walk grows is the emitted inbound universe
+    // (`emit::inbound_tags`: API, TUN, dns-in, the enabled local endpoints,
+    // the enabled dokodemo listeners). It is built by insertion because the
+    // insert that fails IS the duplicate rule — the arm that inserts second
+    // reports the collision, in emission order, so the findings below stay in
+    // the order their refusal reads.
     let mut inbound_tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
     // Local endpoints: every enabled entry must bind a valid listen address
     // on a non-zero port, and its tag must be unique among all emitted
@@ -4145,8 +4189,10 @@ pub fn validate_settings(
     // The in-tun DNS listener (TUN gateway:53, TCP+UDP) is added to the
     // running TUN core while a DNS module exists; a user listener on the
     // same endpoint must be rejected like any other collision, and no other
-    // inbound may reuse its tag.
-    if tun_on && !settings.dns.is_effectively_empty() {
+    // inbound may reuse its tag. `emit::dns_inbound_emitted` is the one
+    // statement of that arm — the tag is part of the emitted universe
+    // exactly then.
+    if emit::dns_inbound_emitted(settings) {
         if !inbound_tags.insert(DNS_INBOUND_TAG.into()) {
             issues.push(issue(
                 ValidationCode::InboundTagDuplicated(DNS_INBOUND_TAG.into()),
@@ -4429,15 +4475,17 @@ mod tests {
         }
     }
 
-    /// Xray types `wsSettings.headers` and `httpupgradeSettings.headers` as
-    /// `map[string]string`. A non-string value cannot be built into the
-    /// document (and cannot be migrated out of the legacy `Host` form), and
-    /// only a hand-edited state file can carry one — the share-link grammar
-    /// refuses it on import — so the model must gate it with a field-scoped
-    /// finding instead of spending a core start on the failure.
+    /// Xray types `wsSettings.headers`, `httpupgradeSettings.headers` and the
+    /// XHTTP settings' `headers` as `map[string]string`. A non-string value
+    /// cannot be built into the document (and cannot be migrated out of the
+    /// legacy `Host` form), and only a hand-edited state file can carry one —
+    /// the share-link grammar refuses it on import — so the model must gate it
+    /// with a field-scoped finding instead of spending a core start on the
+    /// failure.
     #[test]
     fn non_string_transport_header_values_gate_the_profile() {
         for (network, path) in [
+            (Network::Xhttp, "stream.xhttpSettings.headers"),
             (Network::Ws, "stream.wsSettings.headers"),
             (Network::Httpupgrade, "stream.httpupgradeSettings.headers"),
         ] {
@@ -4450,6 +4498,12 @@ mod tests {
             let mut outbound = vless_canonical();
             outbound.stream.network = network;
             match network {
+                Network::Xhttp => {
+                    outbound.stream.xhttp_settings = Some(XhttpSettings {
+                        headers: headers(json!(123)),
+                        ..Default::default()
+                    })
+                }
                 Network::Ws => {
                     outbound.stream.ws_settings = Some(WsSettings {
                         headers: headers(json!(123)),
@@ -4480,6 +4534,12 @@ mod tests {
             outbound.stream.network = network;
             let string_headers = headers(json!("example.com"));
             match network {
+                Network::Xhttp => {
+                    outbound.stream.xhttp_settings = Some(XhttpSettings {
+                        headers: string_headers,
+                        ..Default::default()
+                    })
+                }
                 Network::Ws => {
                     outbound.stream.ws_settings = Some(WsSettings {
                         headers: string_headers,
@@ -7511,6 +7571,104 @@ mod tests {
             "{:?}",
             validate_stream(&reality)
         );
+    }
+
+    /// An outbound TLS certificate row that names no file and carries no
+    /// non-blank PEM line has no key material for Xray's conf build to load,
+    /// which refuses the entry (infra/conf: both file and bytes are empty).
+    /// The rule fires from the model pass with the offending row's index —
+    /// the row the user has to fill in — and stays silent in a block
+    /// `security` does not select, which Xray never reads.
+    #[test]
+    fn tls_certificate_row_without_material_gates_from_the_model_pass() {
+        let tls_stream = |tls: crate::model::stream::TlsModel| StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(tls),
+            ..Default::default()
+        };
+
+        let issues = validate_stream(&tls_stream(crate::model::stream::TlsModel {
+            certificates: vec![
+                crate::model::stream::TlsCert::default(),
+                crate::model::stream::TlsCert {
+                    certificate_file: "c.pem".into(),
+                    ..Default::default()
+                },
+                crate::model::stream::TlsCert {
+                    certificate: vec!["-----BEGIN CERTIFICATE-----".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        let certificate = finding_with_code(&issues, ValidationCode::TlsCertificateRequired)
+            .unwrap_or_else(|| panic!("an empty certificate row must gate: {issues:#?}"));
+        assert_eq!(
+            certificate.path.as_deref(),
+            Some("stream.tlsSettings.certificates[0]")
+        );
+        assert_eq!(certificate.severity, Severity::Error);
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.code == ValidationCode::TlsCertificateRequired)
+                .count(),
+            1,
+            "only the empty row may fire: {issues:#?}"
+        );
+
+        // A block under another security selection is inert state (the wire
+        // pass drops it and Xray never reads it), so the rule stays silent.
+        let mut inert = tls_stream(crate::model::stream::TlsModel {
+            certificates: vec![crate::model::stream::TlsCert::default()],
+            ..Default::default()
+        });
+        inert.security = Security::Reality;
+        inert.reality_settings = Some(reality_base());
+        let issues = validate_stream(&inert);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::TlsCertificateRequired),
+            "an unselected TLS block must stay silent: {issues:#?}"
+        );
+    }
+
+    /// An outbound TLS `alpn` list carrying `fromMitm` beside another name is
+    /// refused by Xray's conf build (infra/conf/transport_security.go: only
+    /// one element is allowed in "alpn" when using "fromMitm" in it), so the
+    /// model pass gates it on the field path; a sole `fromMitm` and any
+    /// fromMitm-free list stay valid.
+    #[test]
+    fn tls_from_mitm_alpn_beside_another_name_gates_from_the_model_pass() {
+        let tls_stream = |alpn: &[String]| StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(crate::model::stream::TlsModel {
+                alpn: alpn.to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let issues = validate_stream(&tls_stream(&["fromMitm".to_string(), "h2".to_string()]));
+        let alpn = finding_with_code(&issues, ValidationCode::TlsFromMitmAlpnShort)
+            .unwrap_or_else(|| panic!("fromMitm beside another element must gate: {issues:#?}"));
+        assert_eq!(alpn.path.as_deref(), Some("stream.tlsSettings.alpn"));
+        assert_eq!(alpn.severity, Severity::Error);
+
+        for alpn in [
+            Vec::new(),
+            vec!["fromMitm".to_string()],
+            vec!["h2".to_string(), "http/1.1".to_string()],
+        ] {
+            let issues = validate_stream(&tls_stream(&alpn));
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.code == ValidationCode::TlsFromMitmAlpnShort),
+                "a sole fromMitm or a fromMitm-free list must not gate for {alpn:?}: {issues:#?}"
+            );
+        }
     }
 
     #[test]

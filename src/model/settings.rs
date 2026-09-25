@@ -225,51 +225,32 @@ pub fn geodata_cron_error(cron: &str, lang: Language) -> Option<String> {
     (!geodata_cron_valid(cron)).then(|| t(lang, Key::GeodataCronNotFiveFields).into())
 }
 
-/// Load-side mirror of [`Settings`]: with the container default, any missing
-/// key deserializes to its field default, so [`Settings::from_raw`] can fill
-/// the one default `Settings` itself cannot express — a file without
-/// `localInbounds` loads the fresh-install seed list. Unknown keys land in
-/// `extra` and round-trip losslessly.
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct SettingsRaw {
-    version: u32,
-    local_inbounds: Option<Vec<LocalInboundCfg>>,
-    /// GUI-owned tag-allocator high-water marks: one per
-    /// protocol, bumped on every allocation, never decremented, so a tag
-    /// number is never reissued after its entry is removed. Absent in
-    /// older files (0).
-    socks_tag_seq: u32,
-    http_tag_seq: u32,
-    dokodemo: Vec<DokodemoCfg>,
-    routing: RoutingCfg,
-    dns: DnsCfg,
-    tun: TunCfg,
-    mode: Mode,
-    log_level: String,
-    /// xray per-connection access log (a channel `loglevel` cannot gate);
-    /// off by default.
-    access_log: bool,
-    language: Language,
-    traffic_unit: TrafficUnit,
-    accent_color: Option<u32>,
-    policy: PolicyCfg,
-    env: Vec<(String, String)>,
-    geodata: GeodataCfg,
-    /// Custom probe URL for the on-demand ping test (mirrors
-    /// `Settings::probe_url`).
-    probe_url: String,
-    raw_override: Option<String>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
+/// `localInbounds` reads an absent key and a JSON `null` the same way: both
+/// load the fresh-install seed list. Every other key of [`Settings`] keeps
+/// its field default, and unknown keys land in `extra` and round-trip
+/// losslessly.
+fn deserialize_local_inbounds<'de, D>(deserializer: D) -> Result<Vec<LocalInboundCfg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<LocalInboundCfg>>::deserialize(deserializer)?
+        .unwrap_or_else(default_local_inbounds))
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// An absent key loads as 0 (unset) — the version records what the file
+    /// itself carries, not the fresh-install default.
+    #[serde(default)]
     pub version: u32,
     /// User-managed local endpoints: zero or more SOCKS/HTTP
-    /// entries; serialized as `localInbounds`.
+    /// entries; serialized as `localInbounds`. An absent key — and the null a
+    /// hand-edited file may carry — loads the fresh-install seed list.
+    #[serde(
+        default = "default_local_inbounds",
+        deserialize_with = "deserialize_local_inbounds"
+    )]
     pub local_inbounds: Vec<LocalInboundCfg>,
     /// GUI-owned tag-allocator high-water marks: one per
     /// protocol, bumped on every allocation, never decremented, so a tag
@@ -284,7 +265,9 @@ pub struct Settings {
     pub dns: DnsCfg,
     pub tun: TunCfg,
     pub mode: Mode,
-    #[serde(skip_serializing_if = "skip_empty_str")]
+    /// An absent key loads as the empty level — the value the generator emits
+    /// as `loglevel` — never as the fresh-install `warning`.
+    #[serde(default, skip_serializing_if = "skip_empty_str")]
     pub log_level: String,
     /// xray per-connection access log lines ("from … accepted …"); on =
     /// the generator omits `access` (xray defaults that to console), off =
@@ -321,12 +304,6 @@ pub struct Settings {
     pub raw_override: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
-}
-
-impl<'de> Deserialize<'de> for Settings {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        SettingsRaw::deserialize(deserializer).map(Settings::from_raw)
-    }
 }
 
 impl Default for Settings {
@@ -366,38 +343,6 @@ impl Settings {
     }
     pub fn save(&self) -> anyhow::Result<()> {
         save_state("settings.json", self)
-    }
-
-    /// Fold the raw persisted shape into the canonical model: `localInbounds`
-    /// wins when present; a file without the key gets the fresh-install seed
-    /// list.
-    fn from_raw(raw: SettingsRaw) -> Self {
-        let local_inbounds = match raw.local_inbounds {
-            Some(list) => list,
-            None => default_local_inbounds(),
-        };
-        Self {
-            version: raw.version,
-            local_inbounds,
-            socks_tag_seq: raw.socks_tag_seq,
-            http_tag_seq: raw.http_tag_seq,
-            dokodemo: raw.dokodemo,
-            routing: raw.routing,
-            dns: raw.dns,
-            tun: raw.tun,
-            mode: raw.mode,
-            log_level: raw.log_level,
-            access_log: raw.access_log,
-            language: raw.language,
-            traffic_unit: raw.traffic_unit,
-            accent_color: raw.accent_color,
-            policy: raw.policy,
-            env: raw.env,
-            geodata: raw.geodata,
-            probe_url: raw.probe_url,
-            raw_override: raw.raw_override,
-            extra: raw.extra,
-        }
     }
 
     /// Set the network mode. The mode is the single persisted TUN switch —
@@ -759,6 +704,26 @@ mod tests {
                 restored.local_inbounds[1].sniffing.enabled
             );
         });
+    }
+
+    #[test]
+    fn null_local_inbounds_loads_the_seed_list_like_an_absent_key() {
+        // A hand-edited `null` is the absent-key reading — the fresh-install
+        // seed list — never an error and never an empty list.
+        let seed = serde_json::to_value(default_local_inbounds()).unwrap();
+        let null: Settings = serde_json::from_value(json!({"localInbounds": null})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&null.local_inbounds).unwrap(),
+            seed,
+            "a null localInbounds must load the seed list"
+        );
+        // A present list wins, the empty one included: clearing every endpoint
+        // in the UI must not resurrect the seed entries on the next launch.
+        let empty: Settings = serde_json::from_value(json!({"localInbounds": []})).unwrap();
+        assert!(
+            empty.local_inbounds.is_empty(),
+            "an empty localInbounds list must stay empty"
+        );
     }
 
     #[test]

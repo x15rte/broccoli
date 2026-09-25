@@ -71,7 +71,7 @@ const RUNTIME_JOIN_BOUND: Duration =
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::rt::jobs::{Busy, ExclusiveOutcome, ExclusiveSidecar, JobKind, JobRegistry};
+use crate::rt::jobs::{Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry};
 
 pub use grpc::{
     BalancerInfoView, GrpcClient, HealthPingView, OutboundStatusView, RuntimeEntryView, StatsTick,
@@ -164,11 +164,12 @@ pub enum CoreCmd {
     /// new transport.
     SetTunMode(bool),
     /// Enable/disable the observatory status read and choose the reported
-    /// outbound tags (empty = every observed tag). The app derives the flag
-    /// from the generated configuration's health engine, so the read runs
-    /// exactly when a core-side extension can answer it.
+    /// outbound tags (empty = every observed tag). The shell sends this once
+    /// the core reports `Running`, carrying only the tags it owns; whether a
+    /// read can answer at all follows the launched configuration's own health
+    /// engine (`ActiveConfig`), which the runtime holds and arms this read
+    /// with.
     SetObservatory {
-        enabled: bool,
         tags: Vec<String>,
     },
     /// Ask the running core how it would route a complete official
@@ -424,6 +425,11 @@ pub enum CoreEvt {
     ActiveConfig {
         snapshot: Result<String, AppMessage>,
         transport: CoreTransport,
+        /// Whether the launched configuration carries a health engine (the
+        /// `observatory` or the `burstObservatory` block, see
+        /// [`apply::carries_health_extension`]): the fact the runtime arms the
+        /// observatory status read with, published with the launch.
+        health_extension: bool,
     },
     /// One raw log line (core output, or a passthrough app-authored line that
     /// has no key): complete text, rendered verbatim.
@@ -456,9 +462,11 @@ pub enum CoreEvt {
     Download(DownloadState),
     /// Terminal result of one accepted `CoreCmd::CheckUpdate`.
     UpdateCheck(UpdateCheckState),
-    /// `Some` while the runtime owns a mutually-exclusive lifecycle/update
-    /// operation, then `None` exactly once when it finishes or is cancelled.
-    Operation(Option<OperationKind>),
+    /// `Some(kind)` while the runtime owns a mutually-exclusive
+    /// lifecycle/update operation, then `None` exactly once when it finishes
+    /// or is cancelled. The payload is the job's own kind, so the frame that
+    /// reports the held window names it through [`JobKind::operation_name`].
+    Operation(Option<JobKind>),
 }
 
 /// Live inbounds and outbounds of the running core (runtime state), as read
@@ -619,11 +627,12 @@ pub enum DownloadState {
     /// failure has one.
     Failed(AppMessage),
 }
-/// Runtime-owned mutually-exclusive work. The UI can use this event state to
-/// disable every command that would race a lifecycle or on-disk transaction.
-/// Localized to the job registry; re-exported here so
-/// consumers import `crate::rt::OperationKind` unchanged.
-pub use self::jobs::OperationKind;
+
+/// The busy window's payload and the shell's mirror of it are the job's own
+/// kind ([`jobs::JobKind`]): a screen that reports which operation holds the
+/// window names a job kind, not a parallel enumeration. Re-exported here with
+/// the runtime's other consumer-facing names.
+pub use self::jobs::JobKind;
 
 /// GUI-side owner of the runtime command channel and worker thread.
 ///
@@ -933,6 +942,13 @@ struct Runtime {
     phase: CorePhase,
 
     requested_tun_mode: bool,
+    /// True when the configuration the core launched carries a health engine
+    /// (the `observatory` or the `burstObservatory` block), read from the exact
+    /// configuration text the launch was reported with (see
+    /// [`Runtime::emit_active_config`]). The observatory status read follows
+    /// this fact, not the settings: a raw override and a rolled-back candidate
+    /// both make the core run a config the settings no longer describe.
+    health_extension: bool,
     obs_enabled: bool,
     obs_tags: Vec<String>,
 
@@ -1231,6 +1247,7 @@ impl Runtime {
             backoff: Backoff::new(),
             phase: CorePhase::Stopped,
             requested_tun_mode: false,
+            health_extension: false,
             obs_enabled: false,
             obs_tags: Vec::new(),
             output_ring: Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_RING))),
@@ -1296,20 +1313,10 @@ impl Runtime {
         }
     }
 
-    /// Queue one busy-window bookend onto the GUI event channel.
+    /// Queue one busy-window bookend onto the GUI event channel: the registry's
+    /// payload is already the shape the shell reads.
     fn deliver_bookend(&mut self, bookend: Option<JobKind>) {
-        let event = match bookend {
-            Some(kind) => {
-                // Only exclusive kinds ever reach the sink (queries
-                // never emit), so this cannot be None by construction.
-                CoreEvt::Operation(Some(
-                    kind.exclusive_operation_kind()
-                        .expect("busy sink only emits exclusive kinds; queries never emit"),
-                ))
-            }
-            None => CoreEvt::Operation(None),
-        };
-        queue_event(event, &self.evt);
+        queue_event(CoreEvt::Operation(bookend), &self.evt);
     }
 
     fn emit_active_config(&mut self) {
@@ -1318,9 +1325,17 @@ impl Runtime {
                 DiagError::new(Diag::new(Key::RtFramePreviewReadFailed)).caused_by(error),
             )
         });
+        // The snapshot text is the exact configuration the core is launching,
+        // and the runtime already holds it here — so the health-extension fact
+        // is read once, where the text exists, and the command that arms the
+        // status read combines it with what the shell owns (the tags).
+        self.health_extension = snapshot
+            .as_ref()
+            .is_ok_and(|config| apply::carries_health_extension(config));
         self.emit(CoreEvt::ActiveConfig {
             snapshot,
             transport: self.backend.transport(),
+            health_extension: self.health_extension,
         });
     }
 
@@ -1454,11 +1469,7 @@ impl Runtime {
                 self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
                     output,
                 ))));
-                self.emit(CoreEvt::Operation(Some(
-                    active
-                        .exclusive_operation_kind()
-                        .expect("busy occupants are exclusive kinds; queries never occupy"),
-                )));
+                self.emit(CoreEvt::Operation(Some(active)));
             }
             (flavour, answer) => unreachable!(
                 "the {flavour:?} flavour is declared with its own answer, got {answer:?}"
@@ -1481,7 +1492,7 @@ impl Runtime {
     /// occupant is named through its user-facing operation key, nested as a
     /// message so it renders in the display language.
     fn busy_reject_text(active: JobKind) -> Diag {
-        Diag::new(Key::RtFrameCommandRejectedBusy).arg_message(seat::operation_name(active))
+        Diag::new(Key::RtFrameCommandRejectedBusy).arg_message(seat::occupant_name(active))
     }
 
     /// Cancel the busy exclusive record and release it (Stop/Shutdown/GUI
@@ -1532,7 +1543,7 @@ impl Runtime {
         self.jobs.cancel_exclusive_record();
         self.app_log(
             Diag::new(Key::RtLogOperationCancelled)
-                .arg_message(seat::operation_name(kind))
+                .arg_message(seat::occupant_name(kind))
                 .arg_message(reason.clone()),
         );
         if task_active {
@@ -1961,8 +1972,10 @@ impl Runtime {
                     Diag::new(Key::RtLogTunModeOff)
                 });
             }
-            CoreCmd::SetObservatory { enabled, tags } => {
-                self.obs_enabled = enabled;
+            CoreCmd::SetObservatory { tags } => {
+                // The tags are the shell's; whether a core-side extension can
+                // answer at all is the launched configuration's own fact.
+                self.obs_enabled = self.health_extension;
                 self.obs_tags = tags;
             }
             CoreCmd::TestRoute { reply, request } => {
@@ -2327,7 +2340,7 @@ impl Runtime {
                 // meant exactly that — no automatic restart. The durable
                 // swap marker still protects the next explicit Start.
                 let cancelled = self.jobs.is_cancel_requested();
-                if succeeded && kind == OperationKind::UpdateCore && !cancelled {
+                if succeeded && kind == JobKind::UpdateCore && !cancelled {
                     // The filesystem swap completed. Keep the record owner
                     // through the health-gate startup so no second update can
                     // race the candidate before it is acknowledged or rolled
@@ -3849,7 +3862,7 @@ impl Runtime {
             };
             ExclusiveOutcome::Download {
                 state,
-                kind: OperationKind::UpdateCore,
+                kind: JobKind::UpdateCore,
             }
         });
         self.jobs.attach_exclusive_task(task);
@@ -3902,11 +3915,11 @@ mod tests {
 
     use super::{
         CoreCmd, CoreEvt, CoreTransport, DOWNLOAD_PROGRESS_INTERVAL, ExclusiveOutcome,
-        LatencyProbeResult, NO_PROGRESS_EMITTED, OperationKind, OutboundStatusView, PhaseError,
-        ProbeFailure, ProfileValidationOrigin, ProfileValidationRequest, READY_TIMEOUT,
-        READY_TIMEOUT_APPLIED, Runtime, STOP_TIMEOUT, TUN_BIND_RACE_RETRIES, TUN_STOP_WINDOW,
-        connect_after_helper_launch, policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE,
-        should_emit_download_progress, spawn_runtime, state::BackendState,
+        LatencyProbeResult, NO_PROGRESS_EMITTED, OutboundStatusView, PhaseError, ProbeFailure,
+        ProfileValidationOrigin, ProfileValidationRequest, READY_TIMEOUT, READY_TIMEOUT_APPLIED,
+        Runtime, STOP_TIMEOUT, TUN_BIND_RACE_RETRIES, TUN_STOP_WINDOW, connect_after_helper_launch,
+        policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE, should_emit_download_progress,
+        spawn_runtime, state::BackendState,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t};
@@ -4647,7 +4660,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 ExclusiveOutcome::Download {
                     state: super::DownloadState::Done("26.7.28".into()),
-                    kind: OperationKind::UpdateCore,
+                    kind: JobKind::UpdateCore,
                 }
             }));
             let run = tokio::spawn(runtime.run());
@@ -4726,7 +4739,7 @@ mod tests {
         runtime
             .complete_exclusive(ExclusiveOutcome::Download {
                 state: super::DownloadState::Done("26.7.28".into()),
-                kind: OperationKind::UpdateCore,
+                kind: JobKind::UpdateCore,
             })
             .await;
 
@@ -5033,11 +5046,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                Some(OperationKind::Restart),
-                None,
-                Some(OperationKind::Stop)
-            ],
+            vec![Some(JobKind::Restart), None, Some(JobKind::Stop)],
             "the occupant's release must be ordered before the preemptor's begin"
         );
     }
@@ -5099,7 +5108,7 @@ mod tests {
             assert!(
                 emitted.iter().any(|event| matches!(
                     event,
-                    CoreEvt::Operation(Some(OperationKind::ValidateProfiles))
+                    CoreEvt::Operation(Some(JobKind::ValidateProfiles))
                 )),
                 "the occupied window must stay visible to the UI gates"
             );
@@ -5228,7 +5237,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![Some(OperationKind::Restart), None],
+            vec![Some(JobKind::Restart), None],
             "the toggle's own record must open and close"
         );
         assert_eq!(
@@ -5422,7 +5431,7 @@ mod tests {
             assert_eq!(
                 emitted
                     .iter()
-                    .filter(|event| matches!(event, CoreEvt::Operation(Some(OperationKind::Start))))
+                    .filter(|event| matches!(event, CoreEvt::Operation(Some(JobKind::Start))))
                     .count(),
                 2,
                 "the GUI must be handed its owner back after each reject"
@@ -6901,7 +6910,7 @@ mod tests {
     /// channels do.
     fn busy_reject_text(kind: JobKind) -> String {
         Diag::new(Key::RtFrameCommandRejectedBusy)
-            .arg_message(super::seat::operation_name(kind))
+            .arg_message(super::seat::occupant_name(kind))
             .text(Language::En)
     }
 
@@ -6991,7 +7000,7 @@ mod tests {
             let frame = Runtime::busy_reject_text(kind);
             assert_eq!(frame.key(), Key::RtFrameCommandRejectedBusy);
             let rendered = frame.text(Language::En);
-            let name = super::seat::operation_name(kind).text(Language::En);
+            let name = super::seat::occupant_name(kind).text(Language::En);
             assert!(
                 rendered.contains(&name),
                 "the busy frame must name the operation, got: {rendered}"
@@ -7795,7 +7804,7 @@ mod tests {
             runtime
                 .complete_exclusive(ExclusiveOutcome::Download {
                     state: super::DownloadState::Done("26.9.9".into()),
-                    kind: OperationKind::UpdateCore,
+                    kind: JobKind::UpdateCore,
                 })
                 .await;
             // The completed install arms the health gate. Its start writes

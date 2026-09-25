@@ -12,11 +12,8 @@
 //! configuration; breakage rules cover balancers whose selectors match no
 //! outbound tag.
 
-use super::inbound::{
-    BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_OUTBOUND_TAG, DokodemoNetwork,
-    LocalInboundProtocol, socket_address,
-};
-use super::servers::ServerProfile;
+use super::emit;
+use super::inbound::{DokodemoNetwork, LocalInboundProtocol, socket_address};
 use super::servers::ServersFile;
 use super::settings::{Mode, Settings};
 
@@ -142,20 +139,11 @@ pub fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> 
         ));
     }
 
-    // Breakage: a balancer whose selectors match no emitted outbound tag
-    // (mirrors the generator's outbound contract: profile tags, the
-    // built-ins, and dns-out only when DNS interception is active).
-    let mut outbound_tags: Vec<String> = servers.profiles.iter().map(ServerProfile::tag).collect();
-    outbound_tags.push(DIRECT_OUTBOUND_TAG.into());
-    outbound_tags.push(BLOCK_OUTBOUND_TAG.into());
-    let tun_on = settings.mode == Mode::Tun;
-    let socks_on = settings
-        .local_inbounds
-        .iter()
-        .any(|entry| entry.enabled && entry.protocol == LocalInboundProtocol::Socks);
-    if !dns_empty && (tun_on || socks_on) {
-        outbound_tags.push(DNS_OUTBOUND_TAG.into());
-    }
+    // Breakage: a balancer whose selectors match no emitted outbound tag. The
+    // universe is `emit::outbound_tags` — the profile tags, the built-ins, and
+    // dns-out exactly while the DNS module intercepts port-53 traffic — so a
+    // selector is judged against the tags the document actually carries.
+    let outbound_tags = emit::outbound_tags(servers, settings);
     for (index, balancer) in settings.routing.balancers.iter().enumerate() {
         let matched = balancer
             .selector

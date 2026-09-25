@@ -13,7 +13,7 @@ use super::UiCtx;
 use crate::diag::DiagError;
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::settings::Language;
-use crate::rt::{CoreCmd, CorePhase};
+use crate::rt::{CoreCmd, CorePhase, JobKind};
 use crate::sys;
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
@@ -382,7 +382,10 @@ impl LogsScreen {
         let logs: &VecDeque<(bool, String)> = ctx.logs;
         let logger_gate = verdict(
             matches!(ctx.phase, CorePhase::Running),
-            ctx.busy.is_held(),
+            // The window rung is the logger restart kind's declared rule: the
+            // runtime rejects the request while an exclusive job holds the
+            // window, so the control is refused on exactly the same fact.
+            ctx.busy.blocks(JobKind::LoggerRestart),
             self.pending_logger_request.is_pending(),
         );
         // The filtered view is memoized on

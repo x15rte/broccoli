@@ -11,90 +11,115 @@ use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-/// The 12 client-side outbound protocols (infra/conf/xray.go:37-52).
-/// Serializes to the Xray protocol string.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Protocol {
-    #[default]
-    Vless,
-    Vmess,
-    Trojan,
-    Shadowsocks,
-    Socks,
-    Http,
-    Wireguard,
-    Freedom,
-    Blackhole,
-    Dns,
-    Loopback,
-    Hysteria,
+/// One row per client-side outbound protocol: the variant, the spelling the
+/// core accepts for it on the wire (infra/conf/xray.go:37-52), any further
+/// spelling that names the same handler (`direct` and `block` are the
+/// `freedom` and `blackhole` handler aliases), and the settings payload that
+/// carries the protocol's settings. The enum, its spellings,
+/// [`Protocol::ALL`], the settings enum and the settings dispatch all come
+/// from these rows, so a new protocol is one row.
+macro_rules! outbound_protocols {
+    ($(
+        $(#[$variant_meta:meta])*
+        $variant:ident = $wire:literal $( | $alias:literal )* => $settings:ident,
+    )*) => {
+        /// The 12 client-side outbound protocols (infra/conf/xray.go:37-52).
+        /// Serializes to the Xray protocol string.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub enum Protocol {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )*
+        }
+
+        impl Protocol {
+            /// Number of protocols in the table; the length of [`Self::ALL`].
+            pub const COUNT: usize = [$( Self::$variant, )*].len();
+
+            /// Every protocol, in table order.
+            pub const ALL: [Self; Self::COUNT] = [$( Self::$variant, )*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire, )*
+                }
+            }
+
+            pub fn parse(s: &str) -> Option<Self> {
+                $(
+                    if s.eq_ignore_ascii_case($wire) $( || s.eq_ignore_ascii_case($alias) )* {
+                        return Some(Self::$variant);
+                    }
+                )*
+                None
+            }
+
+            #[cfg(test)]
+            pub fn from_str_lossy(s: &str) -> Self {
+                Self::parse(s).expect("test protocol must be recognized")
+            }
+        }
+
+        /// Per-protocol settings, serialized untagged (the discriminant is the
+        /// sibling `protocol` key). Deserialization goes through
+        /// [`ProtocolSettings::from_value`] keyed by the protocol.
+        #[derive(Clone, Debug, Serialize)]
+        #[serde(untagged)]
+        pub enum ProtocolSettings {
+            $( $variant($settings), )*
+        }
+
+        impl Default for ProtocolSettings {
+            fn default() -> Self {
+                Self::default_for(Protocol::default())
+            }
+        }
+
+        impl ProtocolSettings {
+            pub fn protocol(&self) -> Protocol {
+                match self {
+                    $( Self::$variant(_) => Protocol::$variant, )*
+                }
+            }
+
+            pub fn default_for(p: Protocol) -> Self {
+                match p {
+                    $( Protocol::$variant => Self::$variant($settings::default()), )*
+                }
+            }
+
+            /// Parse a `settings` JSON object into the variant matching `p`.
+            ///
+            /// A malformed known field is fatal. Defaulting the whole object here
+            /// would silently discard every valid and unknown sibling field. Errors
+            /// include the failing field path so import failures identify the exact
+            /// value the user must repair.
+            pub fn from_value(p: Protocol, v: Value) -> Result<Self, serde_json::Error> {
+                match p {
+                    $( Protocol::$variant => from_value_path(v).map(Self::$variant), )*
+                }
+            }
+        }
+    };
 }
 
-impl Protocol {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Protocol::Vless => "vless",
-            Protocol::Vmess => "vmess",
-            Protocol::Trojan => "trojan",
-            Protocol::Shadowsocks => "shadowsocks",
-            Protocol::Socks => "socks",
-            Protocol::Http => "http",
-            Protocol::Wireguard => "wireguard",
-            Protocol::Freedom => "freedom",
-            Protocol::Blackhole => "blackhole",
-            Protocol::Dns => "dns",
-            Protocol::Loopback => "loopback",
-            Protocol::Hysteria => "hysteria",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        if s.eq_ignore_ascii_case("vless") {
-            Some(Protocol::Vless)
-        } else if s.eq_ignore_ascii_case("vmess") {
-            Some(Protocol::Vmess)
-        } else if s.eq_ignore_ascii_case("trojan") {
-            Some(Protocol::Trojan)
-        } else if s.eq_ignore_ascii_case("shadowsocks") {
-            Some(Protocol::Shadowsocks)
-        } else if s.eq_ignore_ascii_case("socks") {
-            Some(Protocol::Socks)
-        } else if s.eq_ignore_ascii_case("http") {
-            Some(Protocol::Http)
-        } else if s.eq_ignore_ascii_case("wireguard") {
-            Some(Protocol::Wireguard)
-        } else if s.eq_ignore_ascii_case("freedom") || s.eq_ignore_ascii_case("direct") {
-            Some(Protocol::Freedom)
-        } else if s.eq_ignore_ascii_case("blackhole") || s.eq_ignore_ascii_case("block") {
-            Some(Protocol::Blackhole)
-        } else if s.eq_ignore_ascii_case("dns") {
-            Some(Protocol::Dns)
-        } else if s.eq_ignore_ascii_case("loopback") {
-            Some(Protocol::Loopback)
-        } else if s.eq_ignore_ascii_case("hysteria") {
-            Some(Protocol::Hysteria)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(test)]
-    pub fn from_str_lossy(s: &str) -> Self {
-        Self::parse(s).expect("test protocol must be recognized")
-    }
-    pub const ALL: [Protocol; 12] = [
-        Protocol::Vless,
-        Protocol::Vmess,
-        Protocol::Trojan,
-        Protocol::Shadowsocks,
-        Protocol::Socks,
-        Protocol::Http,
-        Protocol::Wireguard,
-        Protocol::Freedom,
-        Protocol::Blackhole,
-        Protocol::Dns,
-        Protocol::Loopback,
-        Protocol::Hysteria,
-    ];
+outbound_protocols! {
+    /// The table's default: a persisted outbound without a `protocol` key
+    /// loads as this one.
+    #[default]
+    Vless = "vless" => VlessSettings,
+    Vmess = "vmess" => VmessSettings,
+    Trojan = "trojan" => TrojanSettings,
+    Shadowsocks = "shadowsocks" => ShadowsocksSettings,
+    Socks = "socks" => SocksSettings,
+    Http = "http" => HttpSettings,
+    Wireguard = "wireguard" => WireguardSettings,
+    Freedom = "freedom" | "direct" => FreedomSettings,
+    Blackhole = "blackhole" | "block" => BlackholeSettings,
+    Dns = "dns" => DnsOutboundSettings,
+    Loopback = "loopback" => LoopbackSettings,
+    Hysteria = "hysteria" => HysteriaSettings,
 }
 
 impl Serialize for Protocol {
@@ -618,32 +643,6 @@ impl Default for HysteriaSettings {
     }
 }
 
-/// Per-protocol settings, serialized untagged (the discriminant is the
-/// sibling `protocol` key). Deserialization goes through
-/// [`ProtocolSettings::from_value`] keyed by the protocol.
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-pub enum ProtocolSettings {
-    Vless(VlessSettings),
-    Vmess(VmessSettings),
-    Trojan(TrojanSettings),
-    Shadowsocks(ShadowsocksSettings),
-    Socks(SocksSettings),
-    Http(HttpSettings),
-    Wireguard(WireguardSettings),
-    Freedom(FreedomSettings),
-    Blackhole(BlackholeSettings),
-    Dns(DnsOutboundSettings),
-    Loopback(LoopbackSettings),
-    Hysteria(HysteriaSettings),
-}
-
-impl Default for ProtocolSettings {
-    fn default() -> Self {
-        ProtocolSettings::Vless(VlessSettings::default())
-    }
-}
-
 /// Deserialize a JSON value with the failing field path attached, so import
 /// errors identify the exact value the user must repair (`settings`,
 /// `streamSettings`, `mux`, and the QUIC parameter block all parse through
@@ -654,65 +653,6 @@ where
 {
     serde_path_to_error::deserialize(value)
         .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))
-}
-
-impl ProtocolSettings {
-    pub fn protocol(&self) -> Protocol {
-        match self {
-            ProtocolSettings::Vless(_) => Protocol::Vless,
-            ProtocolSettings::Vmess(_) => Protocol::Vmess,
-            ProtocolSettings::Trojan(_) => Protocol::Trojan,
-            ProtocolSettings::Shadowsocks(_) => Protocol::Shadowsocks,
-            ProtocolSettings::Socks(_) => Protocol::Socks,
-            ProtocolSettings::Http(_) => Protocol::Http,
-            ProtocolSettings::Wireguard(_) => Protocol::Wireguard,
-            ProtocolSettings::Freedom(_) => Protocol::Freedom,
-            ProtocolSettings::Blackhole(_) => Protocol::Blackhole,
-            ProtocolSettings::Dns(_) => Protocol::Dns,
-            ProtocolSettings::Loopback(_) => Protocol::Loopback,
-            ProtocolSettings::Hysteria(_) => Protocol::Hysteria,
-        }
-    }
-
-    pub fn default_for(p: Protocol) -> Self {
-        match p {
-            Protocol::Vless => ProtocolSettings::Vless(VlessSettings::default()),
-            Protocol::Vmess => ProtocolSettings::Vmess(VmessSettings::default()),
-            Protocol::Trojan => ProtocolSettings::Trojan(TrojanSettings::default()),
-            Protocol::Shadowsocks => ProtocolSettings::Shadowsocks(ShadowsocksSettings::default()),
-            Protocol::Socks => ProtocolSettings::Socks(SocksSettings::default()),
-            Protocol::Http => ProtocolSettings::Http(HttpSettings::default()),
-            Protocol::Wireguard => ProtocolSettings::Wireguard(WireguardSettings::default()),
-            Protocol::Freedom => ProtocolSettings::Freedom(FreedomSettings::default()),
-            Protocol::Blackhole => ProtocolSettings::Blackhole(BlackholeSettings::default()),
-            Protocol::Dns => ProtocolSettings::Dns(DnsOutboundSettings::default()),
-            Protocol::Loopback => ProtocolSettings::Loopback(LoopbackSettings::default()),
-            Protocol::Hysteria => ProtocolSettings::Hysteria(HysteriaSettings::default()),
-        }
-    }
-
-    /// Parse a `settings` JSON object into the variant matching `p`.
-    ///
-    /// A malformed known field is fatal. Defaulting the whole object here
-    /// would silently discard every valid and unknown sibling field. Errors
-    /// include the failing field path so import failures identify the exact
-    /// value the user must repair.
-    pub fn from_value(p: Protocol, v: Value) -> Result<Self, serde_json::Error> {
-        match p {
-            Protocol::Vless => from_value_path(v).map(ProtocolSettings::Vless),
-            Protocol::Vmess => from_value_path(v).map(ProtocolSettings::Vmess),
-            Protocol::Trojan => from_value_path(v).map(ProtocolSettings::Trojan),
-            Protocol::Shadowsocks => from_value_path(v).map(ProtocolSettings::Shadowsocks),
-            Protocol::Socks => from_value_path(v).map(ProtocolSettings::Socks),
-            Protocol::Http => from_value_path(v).map(ProtocolSettings::Http),
-            Protocol::Wireguard => from_value_path(v).map(ProtocolSettings::Wireguard),
-            Protocol::Freedom => from_value_path(v).map(ProtocolSettings::Freedom),
-            Protocol::Blackhole => from_value_path(v).map(ProtocolSettings::Blackhole),
-            Protocol::Dns => from_value_path(v).map(ProtocolSettings::Dns),
-            Protocol::Loopback => from_value_path(v).map(ProtocolSettings::Loopback),
-            Protocol::Hysteria => from_value_path(v).map(ProtocolSettings::Hysteria),
-        }
-    }
 }
 
 // ---------- mux (xray.go:102-124) ----------

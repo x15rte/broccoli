@@ -42,6 +42,7 @@ use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
     ProfileValidationRequest, ToolTarget,
 };
+use crate::tls_ping::{ca_pins_from_probe_output, leaf_pin_from_probe_output};
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
 use crate::ui::request::{Request, Terminal};
@@ -55,20 +56,19 @@ mod finalmask_editors;
 mod keygen;
 mod raw_editor;
 mod validators;
+mod xray_tool;
 
 use finalmask_editors::{
     finalmask_move_buttons, finalmask_quic_editor, finalmask_tcp_settings_editor,
     finalmask_udp_settings_editor,
 };
-use keygen::{
-    PRIV_PREFIXES, PUB_PREFIXES, ca_pins_from_probe_output, gen_short_id, keygen_value,
-    leaf_pin_from_probe_output, run_xray_bounded,
-};
-use raw_editor::{FieldKey, PemBuf, RawBuffers, RawField, evict_owned_buffers, pem_lines_editor};
+use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
+use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
 use validators::{
     v_optional_wg_key, v_required, v_uuid, v_uuid_required, v_vless_encryption,
     v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
 };
+use xray_tool::XrayToolKind;
 
 /// Editor-selectable uTLS fingerprint options for the TLS and realm-TLS
 /// combos, in display order — the canonical model vocabulary's editor table
@@ -571,67 +571,16 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
         }
     }
 
-    let stream = &profile.outbound.stream;
-    // Editor stream checks not modeled by the validation pass: a header map's
-    // JSON values (the model keeps header maps as JSON values and judges only
-    // the ws/httpupgrade pair) and two keystroke-only rules. The xhttp enum
-    // vocabulary, the cookie/header-placement and uplink-GET mode cross-field
-    // rules, the xmux exclusivity rule, and the sessionID room/table
-    // constraints are model rules above (validate_outbound), one message
-    // channel per value.
-    if stream
-        .xhttp_settings
-        .as_ref()
-        .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
-    {
-        blocking.push(ValidationIssue::error(
-            ValidationCode::HeaderValueNotString(Network::Xhttp),
-        ));
-    }
-    if stream
-        .ws_settings
-        .as_ref()
-        .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
-    {
-        blocking.push(ValidationIssue::error(
-            ValidationCode::HeaderValueNotString(Network::Ws),
-        ));
-    }
-    if stream
-        .httpupgrade_settings
-        .as_ref()
-        .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
-    {
-        blocking.push(ValidationIssue::error(
-            ValidationCode::HeaderValueNotString(Network::Httpupgrade),
-        ));
-    }
-
-    // Keystroke-only stream checks the model cannot express: TLS/REALITY
-    // fingerprint / publicKey / shortId / spiderX / mldsa65Verify /
-    // pinnedPeerCertSha256 formats and the TLS version vocabulary are model
-    // rules above (validate_outbound), and the in-range min > max inversion is
-    // `TlsMinExceedsMax`. What stays here is the fromMitm ALPN interaction and
-    // the cert-file-or-PEM presence rule — the model cannot know which
-    // certificate row the user is editing.
-    if stream.security == Security::Tls
-        && let Some(tls) = &stream.tls_settings
-    {
-        if tls.alpn.len() > 1 && tls.alpn.iter().any(|value| value == "fromMitm") {
-            blocking.push(ValidationIssue::error(ValidationCode::TlsFromMitmAlpnShort));
-        }
-        if tls.certificates.iter().any(|certificate| {
-            certificate.certificate_file.trim().is_empty()
-                && certificate
-                    .certificate
-                    .iter()
-                    .all(|line| line.trim().is_empty())
-        }) {
-            blocking.push(ValidationIssue::error(
-                ValidationCode::TlsCertificateRequired,
-            ));
-        }
-    }
+    // The stream sweep: every rule it used to re-derive lives in the model
+    // pass above — header-map JSON values (`HeaderValuesNotStrings`, one path
+    // per transport), the fromMitm ALPN interaction (`TlsFromMitmAlpnShort`),
+    // and the certificate-file-or-PEM presence rule
+    // (`TlsCertificateRequired`, its path naming the offending row) — so a
+    // stream value has exactly one message channel here. What stays editor-only
+    // is the draft-requirement tier above — the empty "not chosen yet" states,
+    // which the model treats as the valid default, and the VMess security
+    // vocabulary, which no model sweep judges — plus the inline hints the
+    // field editors draw beside a value for the row the user is editing.
 
     EditorValidationFindings {
         blocking,
@@ -1466,75 +1415,142 @@ impl EditorTab {
 
 impl ToolTarget {
     /// Build the owned target for a draft, cloning the profile id only on the
-    /// click path (keygen/tool requests, derive dialog) instead of per frame.
-    fn draft(kind: DraftTargetKind, profile_id: &str, generation: u64) -> Self {
+    /// click path (keygen/tool requests, derive dialog, validation start)
+    /// instead of per frame: the editors pass a borrowed draft identity and
+    /// the owned value is built where it is used.
+    fn draft(kind: DraftKind, profile_id: &str, generation: u64) -> Self {
         match kind {
-            DraftTargetKind::Existing => ToolTarget::ExistingDraft {
+            DraftKind::Existing => ToolTarget::ExistingDraft {
                 profile_id: profile_id.to_owned(),
                 generation,
             },
-            DraftTargetKind::Add => ToolTarget::AddDraft {
+            DraftKind::Add => ToolTarget::AddDraft {
                 profile_id: profile_id.to_owned(),
                 generation,
             },
         }
     }
+
+    /// The draft slot this target names.
+    fn draft_kind(&self) -> DraftKind {
+        match self {
+            ToolTarget::ExistingDraft { .. } => DraftKind::Existing,
+            ToolTarget::AddDraft { .. } => DraftKind::Add,
+        }
+    }
+
+    /// The profile id the target names.
+    fn profile_id(&self) -> &str {
+        match self {
+            ToolTarget::ExistingDraft { profile_id, .. }
+            | ToolTarget::AddDraft { profile_id, .. } => profile_id,
+        }
+    }
+
+    /// The draft generation the request was staged from. A verdict for any
+    /// other generation is stale: every content edit bumps it.
+    fn generation(&self) -> u64 {
+        match self {
+            ToolTarget::ExistingDraft { generation, .. }
+            | ToolTarget::AddDraft { generation, .. } => *generation,
+        }
+    }
 }
 
-/// Which draft a keygen/tool request targets: the in-progress add-draft or
-/// the selected profile's editor draft. The tab closures pass a borrowed id
-/// plus generation, and the owned [`ToolTarget`] is built only on the click
-/// path, so repaints never allocate the 36-char profile id.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DraftTargetKind {
+/// Which of the screen's two draft slots a draft or a request names: the
+/// selected profile's editor draft, or the in-progress add-server draft. Both
+/// hold one [`ProfileDraft`]; this is the only thing that distinguishes their
+/// slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftKind {
     Existing,
     Add,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum XrayToolKind {
-    Uuid,
-    VlessEncryption,
-    WireguardSecret,
-    Mldsa65Verify,
-    TlsPin,
-    TlsPing,
-    /// In-app QUIC certificate capture: the transcript has the
-    /// same "Cert's leaf SHA256:" shape as `xray tls ping`, so the TlsPing
-    /// success/error handling applies unchanged.
-    TlsPingQuic,
-    RealityPublicKey,
-}
-
-struct XrayToolJob {
-    target: ToolTarget,
-    kind: XrayToolKind,
-    request: Request<Result<String, String>>,
-}
-
-struct ExistingProfileDraft {
+/// One open editor draft, in either slot. The existing-profile editor and the
+/// add-server dialog differ in where the draft commits to and what "changed"
+/// is measured against — which is what `kind` and the baseline spell — so one
+/// type holds both. The tab closures pass a borrowed identity (`kind`, `id`,
+/// `generation`) and the owned [`ToolTarget`] is built only on the click
+/// path, so repaints never allocate the 36-char profile id.
+struct ProfileDraft {
+    kind: DraftKind,
     /// The profile id, mirrored from `profile.id`. Profile ids are immutable
     /// (a rename changes only the display name), so this never drifts. The
     /// copy lets the tab closures borrow the id (for tool targets and the
     /// tag list) without either cloning `self.selected` per repaint or
     /// overlapping `&mut draft.profile`.
     id: String,
-    /// The `srv-<id8>` display tag, computed once at draft creation: the
-    /// tag derives from the immutable id, so it never changes while the
-    /// draft lives. The copy keeps the editor header row allocation-free on
-    /// idle repaints.
+    /// The `srv-<id8>` tag of the profile this draft carries, derived from
+    /// the immutable id and formatted once at creation so the editor header
+    /// row stays allocation-free on idle repaints. It is the tag the profile
+    /// keeps once the draft commits; only the editor paints it.
     tag: String,
     profile: ServerProfile,
-    source: serde_json::Value,
+    /// The serialized profile this draft is compared against: the persisted
+    /// snapshot the draft was loaded from, or — for an add draft, which has
+    /// no committed source — the empty profile carrying the draft's id,
+    /// computed once at creation.
+    baseline: serde_json::Value,
+    /// The draft generation, bumped by every content edit. It keys the
+    /// memoized validation and stamps the request target a tool or validation
+    /// is staged with, so a verdict that arrives after an edit is dropped.
     generation: u64,
+    /// Memoized validation for this draft (see [`EditorValidationCache`]),
+    /// `None` until the draft's editor has rendered once.
+    validation: Option<EditorValidationCache>,
 }
 
-/// Memoized editor validation for one existing draft: the findings (swept
-/// once per draft generation, bumped on every edit and tool application) and
-/// the strings they render to (rebuilt when the generation or the language
+impl ProfileDraft {
+    /// The draft for an already-persisted profile: what it is compared
+    /// against is the snapshot the file holds, so an unedited draft is never
+    /// "changed".
+    fn existing(persisted: &ServerProfile) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            kind: DraftKind::Existing,
+            id: persisted.id.clone(),
+            tag: persisted.tag(),
+            profile: persisted.clone(),
+            baseline: serde_json::to_value(persisted)?,
+            generation: 0,
+            validation: None,
+        })
+    }
+
+    /// The draft for a profile being added: it has no committed source, so
+    /// what it is compared against is the empty profile carrying its id — an
+    /// add draft is unsaved by definition until it commits.
+    fn add(profile: ServerProfile) -> Self {
+        let baseline = serde_json::to_value(ServerProfile {
+            id: profile.id.clone(),
+            ..ServerProfile::default()
+        })
+        .unwrap_or_default();
+        Self {
+            kind: DraftKind::Add,
+            id: profile.id.clone(),
+            tag: profile.tag(),
+            profile,
+            baseline,
+            generation: 0,
+            validation: None,
+        }
+    }
+
+    /// The owned request target for this draft: the identity a tool or
+    /// validation request is staged with, and the generation a verdict must
+    /// still match to be applied.
+    fn target(&self) -> ToolTarget {
+        ToolTarget::draft(self.kind, &self.id, self.generation)
+    }
+}
+
+/// Memoized editor validation for one draft: the findings (swept once per
+/// draft generation, bumped on every edit and tool application) and the
+/// strings they render to (rebuilt when the generation or the language
 /// moves, so a language change re-renders instead of re-validating). Both
-/// live here so `show_editor` never serializes or validates the whole profile
-/// on a repaint.
+/// live here so a draft's editor never serializes or validates the whole
+/// profile on a repaint.
 struct EditorValidationCache {
     /// The draft generation the findings were computed from.
     generation: u64,
@@ -1547,46 +1563,32 @@ struct EditorValidationCache {
     /// verdicts show — the same sweep, rendered once per (generation,
     /// language).
     rendered: EditorValidationRender,
-    /// The draft differs from its committed source (see
-    /// [`existing_draft_gate`]).
+    /// The draft differs from its baseline (see [`draft_gate`]). For an
+    /// existing draft that is the persisted profile; for an add draft, which
+    /// has no committed source, the empty template it was created against.
     changed_from_source: bool,
 }
 
-/// Memoized add-draft validation, mirroring [`EditorValidationCache`] for the
-/// Add-server window: the full sweep (validators, base64url decodes, hex
-/// scans) runs once per draft generation, and its strings render once per
-/// (generation, language) — never per repaint of the modal.
-struct AddDraftValidationCache {
-    /// The add-draft generation the findings were computed from.
-    generation: u64,
-    /// The sweep's findings, unrendered — the blocking half gates
-    /// Validate-and-add and the leave modal's Save.
-    findings: EditorValidationFindings,
-    /// The language `rendered` was built in.
-    rendered_language: Language,
-    /// The strings the error list, the warnings list, and the tabs' inline
-    /// verdicts show.
-    rendered: EditorValidationRender,
-    /// The draft differs from an empty profile carrying the draft's id. An
-    /// add draft has no committed source, so this is the add-draft dirty
-    /// flag (a fresh add draft is unsaved by definition).
-    changed_from_source: bool,
+struct XrayToolJob {
+    target: ToolTarget,
+    kind: XrayToolKind,
+    request: Request<Result<String, String>>,
 }
 
-/// The facts every draft control reads, built where the draft's findings are.
-/// The two memoized facts — whether the draft differs from its committed
-/// profile, and whether an error-severity finding blocks it — come from the
-/// validation cache the sweep produced, so a generation bump updates the
-/// verdicts and those facts together. The three facts that move without a
-/// draft edit (a raw buffer's uncommitted text, the profile validation job,
-/// and the busy window) are read where the control renders.
+/// The facts every draft control reads, built by [`draft_gate`] where the
+/// draft's findings are. The two memoized facts — whether the draft differs
+/// from its baseline, and whether an error-severity finding blocks it — come
+/// from the validation memo the sweep produced, so a generation bump updates
+/// the verdicts and those facts together. The three facts that move without a
+/// draft edit (a seeded buffer's uncommitted text, the profile validation
+/// job, and the busy window) are read where the control renders.
 #[derive(Clone, Copy, Default)]
 struct DraftGate {
-    /// The draft differs from its committed profile (an add draft: from an
-    /// empty profile carrying its id).
+    /// The draft differs from its baseline: the persisted profile for an
+    /// existing draft, the empty template for an add draft.
     changed_from_source: bool,
-    /// A raw finalmask/PEM buffer of this draft holds text that never reached
-    /// the draft.
+    /// A raw-JSON buffer of this draft holds text that never reached the
+    /// draft (a PEM buffer never does — see [`SeededBuffers`]).
     raw_buffers_dirty: bool,
     /// An error-severity finding exists.
     blocking: bool,
@@ -1597,14 +1599,14 @@ struct DraftGate {
 }
 
 impl DraftGate {
-    /// The draft holds unsaved changes: it differs from its committed profile,
-    /// or a raw buffer holds text that never reached it. The "Unsaved
+    /// The draft holds unsaved changes: it differs from its baseline, or a
+    /// raw-JSON buffer holds text that never reached it. The "Unsaved
     /// changes" dot, the Discard button, and the leave guard read this.
     fn dirty(self) -> bool {
         self.changed_from_source || self.raw_buffers_dirty
     }
 
-    /// The draft may commit: it differs from its committed profile and no
+    /// The draft may commit: it differs from its baseline and no
     /// error-severity finding blocks it. Validate-and-save and the leave
     /// modal's Save read this. A buffer-only dirty state is deliberately not
     /// committable — the raw text never parsed, so committing would be a
@@ -1664,10 +1666,10 @@ fn refresh_dialer_proxy_options<'a>(
 
 /// Trailing context for [`ServersScreen::advanced_tab`]:
 /// the profile-set signal the chain-target options memoize on, the memoized
-/// finalmask verdicts, the memoized `stream.sockopt` verdict, and the
-/// per-editor raw JSON/PEM buffers. Bundled so the tab stays
-/// under clippy's argument-count ceiling without a lint suppression
-/// (zero-suppression repo contract).
+/// finalmask verdicts, the memoized `stream.sockopt` verdict, and the seeded
+/// text buffers the tab's raw-JSON and PEM fields edit through. Bundled so
+/// the tab stays under clippy's argument-count ceiling without a lint
+/// suppression (zero-suppression repo contract).
 struct AdvancedTabCtx<'a> {
     set_key: (u64, bool, usize),
     finalmask_errors: &'a [String],
@@ -1675,8 +1677,7 @@ struct AdvancedTabCtx<'a> {
     /// The chain-target picker's memo slot for the editor rendering this
     /// tab (see [`DialerProxyOptions`]).
     dialer_proxy_options: &'a mut Option<DialerProxyOptions>,
-    finalmask_raw: &'a mut RawBuffers,
-    pem_buffers: &'a mut std::collections::HashMap<egui::Id, PemBuf>,
+    buffers: &'a mut SeededBuffers,
 }
 
 /// The chain target the draft was loaded with: the dial-through tag the
@@ -1765,57 +1766,40 @@ fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// True when a raw finalmask/PEM buffer of `profile_id` holds text that never
-/// reached the draft: invalid JSON never commits, so the draft stays clean
-/// while the editor shows the unparsed text (the condition that enables
-/// Discard in that state). Entries exist only while a profile has an open raw
-/// editor, and the scan short-circuits on the first dirty buffer.
-fn raw_buffers_hold_uncommitted(finalmask_raw: &RawBuffers, profile_id: &str) -> bool {
-    finalmask_raw
-        .values()
-        .any(|buffer| buffer.profile == profile_id && buffer.dirty)
-}
-
-/// Serialized comparison of an add draft against an empty profile carrying
-/// the draft's id: an add draft has no committed source, so "changed" means
-/// differing from the empty template.
-fn add_draft_differs_from_empty(draft: &ServerProfile) -> bool {
-    let default = ServerProfile {
-        id: draft.id.clone(),
-        ..ServerProfile::default()
-    };
-    serde_json::to_value(draft)
-        .map(|current| current != serde_json::to_value(default).unwrap_or_default())
+/// True when `profile` differs from the serialized `baseline` it is compared
+/// against. A profile that cannot serialize counts as changed, so a draft
+/// whose serialization fails can never commit silently.
+fn profile_differs_from_baseline(profile: &ServerProfile, baseline: &serde_json::Value) -> bool {
+    serde_json::to_value(profile)
+        .map(|current| current != *baseline)
         .unwrap_or(true)
 }
 
-/// Bring the existing-draft validation cache up to date: sweep the draft only
-/// when its generation moved, render the findings it holds only when the
-/// generation or the language moved. A language change therefore re-renders
-/// without re-validating, and an idle frame does neither.
-fn refresh_editor_validation(
-    cache: &mut Option<EditorValidationCache>,
-    draft: &ExistingProfileDraft,
-    lang: Language,
-) {
-    let covered = cache
+/// Bring the draft's memoized validation up to date: sweep the profile only
+/// when the memo does not cover the draft's generation, render the findings
+/// it holds only when the generation or the language moved. A language change
+/// therefore re-renders without re-validating, and an idle frame does
+/// neither. The changed-from-source baseline is the draft's own baseline
+/// (the persisted snapshot, or the empty template of an add draft), compared
+/// once per sweep.
+fn refresh_editor_validation(draft: &mut ProfileDraft, lang: Language) {
+    let covered = draft
+        .validation
         .as_ref()
         .is_some_and(|cached| cached.generation == draft.generation);
     if !covered {
         let findings = editor_validation_findings(&draft.profile);
         let rendered = findings.render(lang);
-        *cache = Some(EditorValidationCache {
+        draft.validation = Some(EditorValidationCache {
             generation: draft.generation,
             findings,
             rendered_language: lang,
             rendered,
-            changed_from_source: serde_json::to_value(&draft.profile)
-                .map(|current| current != draft.source)
-                .unwrap_or(true),
+            changed_from_source: profile_differs_from_baseline(&draft.profile, &draft.baseline),
         });
         return;
     }
-    if let Some(cached) = cache.as_mut()
+    if let Some(cached) = draft.validation.as_mut()
         && cached.rendered_language != lang
     {
         let rendered = cached.findings.render(lang);
@@ -1824,103 +1808,33 @@ fn refresh_editor_validation(
     }
 }
 
-/// Add-draft twin of [`refresh_editor_validation`]: the add draft's
-/// generation counter lives on the screen, so it is passed in.
-fn refresh_add_draft_validation(
-    cache: &mut Option<AddDraftValidationCache>,
-    generation: u64,
-    draft: &ServerProfile,
-    lang: Language,
-) {
-    let covered = cache
-        .as_ref()
-        .is_some_and(|cached| cached.generation == generation);
-    if !covered {
-        let findings = editor_validation_findings(draft);
-        let rendered = findings.render(lang);
-        *cache = Some(AddDraftValidationCache {
-            generation,
-            findings,
-            rendered_language: lang,
-            rendered,
-            // An add draft has no committed source; "changed" means differing
-            // from an empty profile carrying the draft's id (a fresh add
-            // draft is unsaved by definition).
-            changed_from_source: add_draft_differs_from_empty(draft),
-        });
-        return;
-    }
-    if let Some(cached) = cache.as_mut()
-        && cached.rendered_language != lang
-    {
-        let rendered = cached.findings.render(lang);
-        cached.rendered = rendered;
-        cached.rendered_language = lang;
-    }
-}
-
-/// The existing draft's gate for one frame: the draft's own facts as the
-/// validation refresh computed them (recomputed inline when the cache does
+/// The facts every control of `draft` reads this frame: the draft's own facts
+/// as the validation refresh left them (recomputed inline when the memo does
 /// not cover the draft's generation — a tool-applied edit can land after the
 /// refresh, and the topbar chip reads this before the editor renders), plus
-/// the raw-buffer scan and the frame's validation/busy facts.
-fn existing_draft_gate(
-    draft: &ExistingProfileDraft,
-    cache: Option<&EditorValidationCache>,
-    finalmask_raw: &RawBuffers,
+/// the seeded-buffer scan and the frame's validation/busy facts. A memo that
+/// is absent or stale answers `changed_from_source` from the baseline
+/// comparison; an absent one — a draft whose editor has not rendered once —
+/// has no swept verdicts, so it reads as unchanged, exactly as the pre-sweep
+/// state always has: every render path sweeps before it reads the gate.
+fn draft_gate(
+    draft: &ProfileDraft,
+    buffers: &SeededBuffers,
     validating: bool,
     busy: bool,
 ) -> DraftGate {
-    // The draft-against-source fact: the memoized answer when the cache covers
-    // the draft's generation, recomputed inline (one serialize) when it does
-    // not — a mutation applied outside the render that refreshed the cache
-    // (e.g. a TLS pin fetched by a tool) must still answer same-frame
-    // accurately, and the topbar chip reads this before the editor renders.
-    // An absent cache is never changed: a fresh draft is seeded from its
-    // persisted source.
-    let changed_from_source = match cache {
+    let changed_from_source = match draft.validation.as_ref() {
         Some(cached) if cached.generation == draft.generation => cached.changed_from_source,
-        Some(_) => serde_json::to_value(&draft.profile)
-            .map(|current| current != draft.source)
-            .unwrap_or(true),
+        Some(_) => profile_differs_from_baseline(&draft.profile, &draft.baseline),
         None => false,
     };
     DraftGate {
         changed_from_source,
-        raw_buffers_dirty: raw_buffers_hold_uncommitted(finalmask_raw, &draft.profile.id),
-        blocking: cache.is_some_and(|cached| !cached.findings.blocking.is_empty()),
-        validating,
-        busy,
-    }
-}
-
-/// The add draft's gate, mirroring [`existing_draft_gate`] over the add
-/// draft's substrate. Its `changed_from_source` is the add-draft fact
-/// (differing from the empty template) and its raw-buffer scan covers the
-/// buffers seeded for the dialog's own draft id; the add draft's controls
-/// read `changed_from_source` and `blocking`, never its raw-buffer half.
-fn add_draft_gate(
-    draft: &ServerProfile,
-    generation: u64,
-    cache: Option<&AddDraftValidationCache>,
-    finalmask_raw: &RawBuffers,
-    validating: bool,
-    busy: bool,
-) -> DraftGate {
-    // The add draft's counterpart fact: it has no committed source, so
-    // "changed" means differing from the empty profile carrying its id.
-    // Memoized with the findings; recomputed (two serializations — the draft
-    // and the empty baseline) when the cache does not cover the generation,
-    // and never changed while the dialog has not rendered yet.
-    let changed_from_source = match cache {
-        Some(cached) if cached.generation == generation => cached.changed_from_source,
-        Some(_) => add_draft_differs_from_empty(draft),
-        None => false,
-    };
-    DraftGate {
-        changed_from_source,
-        raw_buffers_dirty: raw_buffers_hold_uncommitted(finalmask_raw, &draft.id),
-        blocking: cache.is_some_and(|cached| !cached.findings.blocking.is_empty()),
+        raw_buffers_dirty: buffers.holds_uncommitted(&draft.id),
+        blocking: draft
+            .validation
+            .as_ref()
+            .is_some_and(|cached| !cached.findings.blocking.is_empty()),
         validating,
         busy,
     }
@@ -2033,7 +1947,7 @@ struct ImportPreviewRow {
 struct OverLimitJson {
     /// `None` for a render-only caller with no draft identity to key on: the
     /// text is refilled on every such call and never reused.
-    key: Option<(DraftTargetKind, String, u64, u32, Language)>,
+    key: Option<(DraftKind, String, u64, u32, Language)>,
     text: String,
 }
 
@@ -2067,17 +1981,18 @@ pub struct ServersScreen {
     latency_badges: std::collections::HashMap<String, LatencyBadge>,
     tab: EditorTab,
     draft_tab: EditorTab,
-    existing_draft: Option<ExistingProfileDraft>,
-    editor_validation_cache: Option<EditorValidationCache>,
+    /// The two open drafts, one per slot: the selected profile's editor draft
+    /// and the in-progress add-server draft. Each carries its own validation
+    /// memo, so neither can read the other's verdicts while both render in
+    /// one frame.
+    existing_draft: Option<ProfileDraft>,
+    add_draft: Option<ProfileDraft>,
     /// The chain-target picker's option memo for the existing-draft editor
     /// and the add-server dialog — one slot each, since both may render in
     /// one frame and they exclude different profiles (see
     /// [`DialerProxyOptions`]).
     dialer_proxy_options: Option<DialerProxyOptions>,
     add_dialer_proxy_options: Option<DialerProxyOptions>,
-    add_draft: Option<ServerProfile>,
-    add_draft_generation: u64,
-    add_draft_validation_cache: Option<AddDraftValidationCache>,
     import_open: bool,
     import_text: String,
     import_parsed: Vec<Result<ServerProfile, links::LinkError>>,
@@ -2130,13 +2045,11 @@ pub struct ServersScreen {
     /// Whether the raw probe output window is open (drawn in `show_dialogs`).
     show_tls_probe_output: bool,
     tool_job: Option<XrayToolJob>,
-    /// Raw-JSON editor buffers, keyed by the field's egui `Id` (per-field
-    /// buffer identity, stable across frames, no per-frame key allocation),
-    /// beside the parse count their idle-frame test reads.
-    finalmask_raw: RawBuffers,
-    /// PEM editor buffers (certificate/key line lists), keyed the same way;
-    /// evicted with the owning profile in `evict_raw_buffers`.
-    pem_buffers: std::collections::HashMap<egui::Id, PemBuf>,
+    /// The seeded text buffers the raw-JSON and PEM editors render from,
+    /// keyed by the field's egui `Id` (per-field buffer identity, stable
+    /// across frames, no per-frame key allocation); evicted with their owning
+    /// profile.
+    seeded_buffers: SeededBuffers,
     /// Reused edit buffer for the header key/value tables (`json_map_kv`):
     /// the key column and the non-string value rows need a `&mut String`
     /// for the frame, and one owned buffer per row would allocate on every
@@ -2217,15 +2130,6 @@ impl ServersScreen {
             })
             .collect();
         self.import_preview = Some(ImportPreview { lang, ok, rows });
-    }
-
-    /// Evict every raw-editor buffer owned by `profile_id`:
-    /// that profile is gone, so its buffers are dead weight. The raw-JSON
-    /// and PEM maps share the one retain rule in
-    /// [`raw_editor::evict_owned_buffers`]. Click-time only — never on idle
-    /// frames.
-    fn evict_raw_buffers(&mut self, profile_id: &str) {
-        evict_owned_buffers(&mut self.finalmask_raw, &mut self.pem_buffers, profile_id);
     }
 
     fn import_preview_is_current(&self) -> bool {
@@ -2426,7 +2330,10 @@ impl ServersScreen {
                     self.set_status(StatusLine::err(error));
                     return;
                 };
-                if !self.target_is_current(target) {
+                if self.current_draft(target).is_none() {
+                    // The draft this verdict belongs to has been edited,
+                    // replaced or closed since the request went out: the
+                    // generation check is what makes a stale verdict safe.
                     return;
                 }
                 let Some(profile) = result.accepted.into_iter().next() else {
@@ -2438,11 +2345,10 @@ impl ServersScreen {
                     self.leave_pending = None;
                     return;
                 };
-                match target {
-                    ToolTarget::AddDraft { .. } => {
+                match target.draft_kind() {
+                    DraftKind::Add => {
                         let id = profile.id.clone();
                         self.add_draft = None;
-                        self.add_draft_generation = self.add_draft_generation.wrapping_add(1);
                         uictx.servers.profiles.push(profile);
                         if uictx.servers.active.is_none() {
                             // No choice yet: the first row is the default
@@ -2483,7 +2389,7 @@ impl ServersScreen {
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
                                 if self
-                                    .existing_gate(uictx.busy.is_held())
+                                    .gate(DraftKind::Existing, uictx.busy.is_held())
                                     .is_some_and(DraftGate::dirty)
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
@@ -2494,12 +2400,12 @@ impl ServersScreen {
                             _ => {}
                         }
                     }
-                    ToolTarget::ExistingDraft { profile_id, .. } => {
+                    DraftKind::Existing => {
                         let Some(index) = uictx
                             .servers
                             .profiles
                             .iter()
-                            .position(|persisted| persisted.id == *profile_id)
+                            .position(|persisted| persisted.id == target.profile_id())
                         else {
                             self.profile_validation_report =
                                 Some(t(lang, Key::SrvServerDeletedWhileValidating).into());
@@ -2525,7 +2431,7 @@ impl ServersScreen {
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
                                 if self
-                                    .add_gate(uictx.busy.is_held())
+                                    .gate(DraftKind::Add, uictx.busy.is_held())
                                     .is_some_and(|gate| gate.changed_from_source)
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
@@ -2596,19 +2502,15 @@ impl ServersScreen {
         if self.tool_job.is_some() {
             return Err(t(lang, Key::SrvAnotherToolRunning).into());
         }
-        // The cooperative stop flag ends a cancelled run: `run_xray_bounded`
-        // kills its child on the same flag, and a verdict for a cancelled
+        // The cooperative stop flag ends a cancelled run: the verb's adapter
+        // abandons its work on the same flag, and a verdict for a cancelled
         // request is dropped here instead of delivered, so the screen's
         // stale-target check never sees it.
         let request = Request::worker("broccoli-xray-tool", &repaint, move |stop| {
             if stop.load(Ordering::Acquire) {
                 return None;
             }
-            let result = if kind == XrayToolKind::TlsPingQuic {
-                crate::quic_probe::run(lang, &args)
-            } else {
-                run_xray_bounded(lang, &args, stop)
-            };
+            let result = xray_tool::run(kind, lang, &args, stop);
             if stop.load(Ordering::Acquire) {
                 return None;
             }
@@ -2623,57 +2525,62 @@ impl ServersScreen {
         Ok(())
     }
 
-    fn target_is_current(&self, target: &ToolTarget) -> bool {
-        match target {
-            ToolTarget::ExistingDraft {
-                profile_id,
-                generation,
-            } => self.existing_draft.as_ref().is_some_and(|draft| {
-                draft.profile.id == *profile_id && draft.generation == *generation
-            }),
-            ToolTarget::AddDraft {
-                profile_id,
-                generation,
-            } => self.add_draft.as_ref().is_some_and(|draft| {
-                draft.id == *profile_id && self.add_draft_generation == *generation
-            }),
+    /// The open draft in `kind`'s slot, if any.
+    fn draft(&self, kind: DraftKind) -> Option<&ProfileDraft> {
+        match kind {
+            DraftKind::Existing => self.existing_draft.as_ref(),
+            DraftKind::Add => self.add_draft.as_ref(),
         }
     }
 
+    /// The open draft in `kind`'s slot, mutably, if any.
+    fn draft_mut(&mut self, kind: DraftKind) -> Option<&mut ProfileDraft> {
+        match kind {
+            DraftKind::Existing => self.existing_draft.as_mut(),
+            DraftKind::Add => self.add_draft.as_mut(),
+        }
+    }
+
+    /// The draft `target` names, when it is still the open one at the same
+    /// generation: a tool or validation verdict for a draft that has been
+    /// edited, replaced or closed since the request went out is dropped here.
+    fn current_draft(&self, target: &ToolTarget) -> Option<&ProfileDraft> {
+        self.draft(target.draft_kind()).filter(|draft| {
+            draft.id == target.profile_id() && draft.generation == target.generation()
+        })
+    }
+
+    /// The gate of the open draft in `kind`'s slot as this frame sees it;
+    /// `None` while that slot is empty. `busy` is the frame's own fact — a
+    /// caller with no frame (the topbar chip's per-frame check) passes
+    /// `false` and reads only a composition that ignores it.
+    fn gate(&self, kind: DraftKind, busy: bool) -> Option<DraftGate> {
+        let draft = self.draft(kind)?;
+        Some(draft_gate(
+            draft,
+            &self.seeded_buffers,
+            self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
+            busy,
+        ))
+    }
+
+    /// The profile a tool verdict writes into: the draft `target` names, at
+    /// any generation (the verdict's currency was checked before it was
+    /// applied).
     fn profile_for_target_mut(&mut self, target: &ToolTarget) -> Option<&mut ServerProfile> {
-        match target {
-            ToolTarget::ExistingDraft { profile_id, .. } => self
-                .existing_draft
-                .as_mut()
-                .filter(|draft| draft.profile.id == *profile_id)
-                .map(|draft| &mut draft.profile),
-            ToolTarget::AddDraft { profile_id, .. } => self
-                .add_draft
-                .as_mut()
-                .filter(|draft| draft.id == *profile_id),
-        }
+        self.draft_mut(target.draft_kind())
+            .filter(|draft| draft.id == target.profile_id())
+            .map(|draft| &mut draft.profile)
     }
 
+    /// Advance the generation of the draft `target` names, so the memoized
+    /// validation sweeps the mutated profile on the next refresh and any
+    /// in-flight request for the older generation is dropped.
     fn advance_target_generation(&mut self, target: &ToolTarget) {
-        match target {
-            ToolTarget::ExistingDraft { profile_id, .. } => {
-                if let Some(draft) = self
-                    .existing_draft
-                    .as_mut()
-                    .filter(|draft| draft.profile.id == *profile_id)
-                {
-                    draft.generation = draft.generation.wrapping_add(1);
-                }
-            }
-            ToolTarget::AddDraft { profile_id, .. } => {
-                if self
-                    .add_draft
-                    .as_ref()
-                    .is_some_and(|draft| draft.id == *profile_id)
-                {
-                    self.add_draft_generation = self.add_draft_generation.wrapping_add(1);
-                }
-            }
+        if let Some(draft) = self.draft_mut(target.draft_kind())
+            && draft.id == target.profile_id()
+        {
+            draft.generation = draft.generation.wrapping_add(1);
         }
     }
 
@@ -2803,10 +2710,7 @@ impl ServersScreen {
                 if output.contains("Handshake succeeded") {
                     self.tls_probe_leaf_pin = leaf_pin_from_probe_output(&output);
                     self.tls_probe_ca_pins = ca_pins_from_probe_output(&output);
-                    self.tls_probe_profile = Some(match &target {
-                        ToolTarget::ExistingDraft { profile_id, .. }
-                        | ToolTarget::AddDraft { profile_id, .. } => profile_id.clone(),
-                    });
+                    self.tls_probe_profile = Some(target.profile_id().to_owned());
                     self.tls_probe_handshake_ok = true;
                     self.tls_tool_output = Some(output);
                     self.tls_tool_error = None;
@@ -2867,7 +2771,7 @@ impl ServersScreen {
         let Some(job) = self.tool_job.take() else {
             return;
         };
-        if !self.target_is_current(&job.target) {
+        if self.current_draft(&job.target).is_none() {
             return;
         }
         match terminal {
@@ -3157,14 +3061,12 @@ impl ServersScreen {
         });
         if let Some(protocol) = add_proto {
             self.draft_tab = EditorTab::Basic;
-            self.add_draft = Some(ServerProfile::new(
+            self.add_draft = Some(ProfileDraft::add(ServerProfile::new(
                 t_fmt(lang, Key::SrvNewDraftName, &[&protocol.as_str()]),
                 OutboundModel::new(protocol),
-            ));
-            // A new draft is a fresh validation subject even if the
-            // generation counter did not move (the previous draft may have
-            // been cancelled without a bump).
-            self.add_draft_validation_cache = None;
+            )));
+            // A fresh draft starts with no memoized verdicts, so this is a
+            // fresh validation subject whatever the previous draft left.
             self.profile_validation_report = None;
         }
         if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
@@ -3355,51 +3257,25 @@ impl ServersScreen {
         self.leave_pending = Some(action);
     }
 
-    /// The existing draft's gate as this frame sees it (see
-    /// [`existing_draft_gate`]); `None` while no draft is open. `busy` is the
-    /// frame's own fact — a caller with no frame (the topbar chip's per-frame
-    /// check) passes `false` and reads only a composition that ignores it.
-    fn existing_gate(&self, busy: bool) -> Option<DraftGate> {
-        self.existing_draft.as_ref().map(|draft| {
-            existing_draft_gate(
-                draft,
-                self.editor_validation_cache.as_ref(),
-                &self.finalmask_raw,
-                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
-                busy,
-            )
-        })
-    }
-
-    /// The add draft's gate as this frame sees it (see [`add_draft_gate`]);
-    /// `None` while the add dialog is closed.
-    fn add_gate(&self, busy: bool) -> Option<DraftGate> {
-        self.add_draft.as_ref().map(|draft| {
-            add_draft_gate(
-                draft,
-                self.add_draft_generation,
-                self.add_draft_validation_cache.as_ref(),
-                &self.finalmask_raw,
-                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
-                busy,
-            )
-        })
-    }
-
     /// True when the existing-draft (selected server) or the add-draft
     /// holds uncommitted changes. Cheap: reads the memoized validation
-    /// caches; if a draft's cache generation is stale relative to the draft
+    /// verdicts; if a draft's memo generation is stale relative to the draft
     /// generation, recompute the changed flag inline (one serialize). Must
     /// be same-frame accurate for the topbar chip (called before/after the
     /// Servers screen renders this frame).
     pub fn unsaved_changes(&self) -> bool {
         // The dirty composition reads only the draft's own facts, and this
         // per-frame chip check runs without a frame: nothing read below
-        // consults the busy window.
-        if self.existing_gate(false).is_some_and(DraftGate::dirty) {
+        // consults the busy window. The add draft's raw-buffer half is not
+        // part of its unsaved state — the dialog's own controls treat an
+        // add draft as unsaved from the moment it exists.
+        if self
+            .gate(DraftKind::Existing, false)
+            .is_some_and(DraftGate::dirty)
+        {
             return true;
         }
-        self.add_gate(false)
+        self.gate(DraftKind::Add, false)
             .is_some_and(|gate| gate.changed_from_source)
     }
 
@@ -3438,10 +3314,9 @@ impl ServersScreen {
     /// dialog targeting this draft cannot outlive it (its apply would
     /// reference a draft that no longer exists), so it is cleared first. The
     /// draft then takes the shared close guard: stage the leave modal when it
-    /// holds changes (an add draft is always unsaved — it has no committed
-    /// source), otherwise drop it and evict its seeded raw-editor buffers
-    /// (dead weight).
-    fn close_add_draft(&mut self, draft: ServerProfile) {
+    /// differs from its baseline, otherwise drop it and evict its seeded
+    /// editor buffers (dead weight).
+    fn close_add_draft(&mut self, draft: ProfileDraft) {
         if self.derive_dialog.as_ref().is_some_and(|dialog| {
             matches!(
                 &dialog.target,
@@ -3451,11 +3326,9 @@ impl ServersScreen {
             self.derive_dialog = None;
         }
         if self.delete_pending.is_none()
-            && add_draft_gate(
+            && draft_gate(
                 &draft,
-                self.add_draft_generation,
-                self.add_draft_validation_cache.as_ref(),
-                &self.finalmask_raw,
+                &self.seeded_buffers,
                 self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
                 false,
             )
@@ -3464,7 +3337,7 @@ impl ServersScreen {
             self.stage_leave(LeaveAction::CloseAdd);
             self.add_draft = Some(draft);
         } else {
-            self.evict_raw_buffers(&draft.id);
+            self.seeded_buffers.evict_owned(&draft.id);
         }
     }
 
@@ -3483,17 +3356,16 @@ impl ServersScreen {
         self.tls_probe_profile = None;
         self.show_tls_probe_output = false;
         self.profile_validation_report = None;
-        // The draft reverts to the persisted profile, so seeded finalmask
-        // raw-JSON and PEM editor buffers (both keyed by profile id) would
-        // show the discarded text; drop them so the editors re-seed from
-        // the reverted draft. Click-time only.
-        self.finalmask_raw.clear();
-        self.pem_buffers.clear();
+        // The draft reverts to the persisted profile, so seeded editor
+        // buffers (keyed by profile id) would show the discarded text; drop
+        // them so the editors re-seed from the reverted draft. Click-time
+        // only.
+        self.seeded_buffers.clear();
     }
 
     /// Discard resolution of the leave modal: drop the staged action's
-    /// draft(s) (existing draft → revert + raw-buffer clear; add draft →
-    /// drop + evict; Quit discards both), then perform the action.
+    /// draft(s) (existing draft → revert + buffer clear; add draft → drop +
+    /// evict; Quit discards both), then perform the action.
     fn discard_leave_action(&mut self, action: LeaveAction) {
         match action {
             LeaveAction::Select(id) => {
@@ -3502,13 +3374,13 @@ impl ServersScreen {
             }
             LeaveAction::CloseAdd => {
                 if let Some(draft) = self.add_draft.take() {
-                    self.evict_raw_buffers(&draft.id);
+                    self.seeded_buffers.evict_owned(&draft.id);
                 }
             }
             LeaveAction::Quit => {
                 self.discard_existing_draft();
                 if let Some(draft) = self.add_draft.take() {
-                    self.evict_raw_buffers(&draft.id);
+                    self.seeded_buffers.evict_owned(&draft.id);
                 }
                 self.quit_resume = true;
             }
@@ -3522,28 +3394,20 @@ impl ServersScreen {
     /// staged action and shows the status error.
     fn save_leave_action(&mut self, action: LeaveAction, lang: Language, uictx: &mut UiCtx) {
         let busy = uictx.busy.is_held();
-        let target = if let Some(draft) = &self.existing_draft
-            && self
-                .existing_gate(busy)
+        let mut staged = None;
+        for kind in [DraftKind::Existing, DraftKind::Add] {
+            let Some(draft) = self.draft(kind) else {
+                continue;
+            };
+            if self
+                .gate(kind, busy)
                 .is_some_and(|gate| gate.changed_from_source)
-        {
-            Some(ToolTarget::ExistingDraft {
-                profile_id: draft.profile.id.clone(),
-                generation: draft.generation,
-            })
-        } else if let Some(draft) = &self.add_draft
-            && self
-                .add_gate(busy)
-                .is_some_and(|gate| gate.changed_from_source)
-        {
-            Some(ToolTarget::AddDraft {
-                profile_id: draft.id.clone(),
-                generation: self.add_draft_generation,
-            })
-        } else {
-            None
-        };
-        let Some(target) = target else {
+            {
+                staged = Some((draft.target(), draft.profile.clone()));
+                break;
+            }
+        }
+        let Some((target, profile)) = staged else {
             // Every dirty draft was already committed while the modal was
             // staged; the deferred action is safe to perform now.
             match action {
@@ -3551,22 +3415,6 @@ impl ServersScreen {
                 LeaveAction::CloseAdd => {}
                 LeaveAction::Quit => self.quit_resume = true,
             }
-            return;
-        };
-        let profile = match &target {
-            ToolTarget::ExistingDraft { profile_id, .. } => self
-                .existing_draft
-                .as_ref()
-                .filter(|draft| draft.profile.id == *profile_id)
-                .map(|draft| draft.profile.clone()),
-            ToolTarget::AddDraft { profile_id, .. } => self
-                .add_draft
-                .as_ref()
-                .filter(|draft| draft.id == *profile_id)
-                .cloned(),
-        };
-        let Some(profile) = profile else {
-            self.leave_pending = None;
             return;
         };
         match self.start_profile_validation(
@@ -3603,8 +3451,12 @@ impl ServersScreen {
         // control: `committable` refuses a raw-buffer-only dirty state, whose
         // commit would be a no-op that leaves the unsaved indicator on.
         let busy = uictx.busy.is_held();
-        let existing_saveable = self.existing_gate(busy).is_some_and(DraftGate::committable);
-        let add_saveable = self.add_gate(busy).is_some_and(DraftGate::committable);
+        let existing_saveable = self
+            .gate(DraftKind::Existing, busy)
+            .is_some_and(DraftGate::committable);
+        let add_saveable = self
+            .gate(DraftKind::Add, busy)
+            .is_some_and(DraftGate::committable);
         let saveable = existing_saveable || add_saveable;
         let mut decision: Option<LeaveDecision> = None;
         let modal =
@@ -3866,51 +3718,6 @@ fn server_list_row(
 impl ServersScreen {
     // ---------- editor (right side) ----------
 
-    /// Rebuild the memoized existing-draft findings when the draft generation
-    /// moved on, and their strings when the generation or the UI language
-    /// moved on; a no-op while both still cover the draft. One real sweep per
-    /// generation, one render per (generation, language) — never per frame.
-    fn refresh_editor_validation_cache(&mut self, draft: &ExistingProfileDraft, lang: Language) {
-        refresh_editor_validation(&mut self.editor_validation_cache, draft, lang);
-    }
-
-    /// Add-draft twin of [`Self::refresh_editor_validation_cache`].
-    fn refresh_add_draft_validation_cache(&mut self, draft: &ServerProfile, lang: Language) {
-        refresh_add_draft_validation(
-            &mut self.add_draft_validation_cache,
-            self.add_draft_generation,
-            draft,
-            lang,
-        );
-    }
-
-    /// Run `render` with the memoized existing-draft verdicts moved out of
-    /// the screen and handed to it for the call. The Basic and Security tabs
-    /// borrow a memoized slice from the cache while calling screen methods
-    /// that borrow the screen mutably; moving the cache out (and restoring it
-    /// right after) keeps those messages borrowed instead of cloned per
-    /// frame.
-    fn with_editor_validation<R>(
-        &mut self,
-        render: impl FnOnce(&mut Self, Option<&EditorValidationCache>) -> R,
-    ) -> R {
-        let cache = self.editor_validation_cache.take();
-        let result = render(self, cache.as_ref());
-        self.editor_validation_cache = cache;
-        result
-    }
-
-    /// Add-draft twin of [`Self::with_editor_validation`].
-    fn with_add_draft_validation<R>(
-        &mut self,
-        render: impl FnOnce(&mut Self, Option<&AddDraftValidationCache>) -> R,
-    ) -> R {
-        let cache = self.add_draft_validation_cache.take();
-        let result = render(self, cache.as_ref());
-        self.add_draft_validation_cache = cache;
-        result
-    }
-
     fn show_editor(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
         // Borrow the selected id instead of cloning the 36-char String on
@@ -3933,8 +3740,8 @@ impl ServersScreen {
             else {
                 return;
             };
-            let source = match serde_json::to_value(persisted) {
-                Ok(source) => source,
+            match ProfileDraft::existing(persisted) {
+                Ok(draft) => self.existing_draft = Some(draft),
                 Err(error) => {
                     self.set_status(StatusLine::err(t_fmt(
                         lang,
@@ -3943,18 +3750,10 @@ impl ServersScreen {
                     )));
                     return;
                 }
-            };
-            self.existing_draft = Some(ExistingProfileDraft {
-                id: id.to_owned(),
-                tag: persisted.tag(),
-                profile: persisted.clone(),
-                source,
-                generation: 0,
-            });
-            // A fresh draft (or one for a different profile) invalidates the
-            // memoized validation: the cache is keyed on the generation
-            // counter, which restarts at zero for every new draft.
-            self.editor_validation_cache = None;
+            }
+            // A fresh draft (or one for a different profile) carries no
+            // memoized verdicts of its own, so the sweep its editor runs
+            // below is the first one.
             self.profile_validation_report = None;
         }
 
@@ -3963,13 +3762,13 @@ impl ServersScreen {
         };
         // The validation blocks below — the dot, the Advanced tab's inline
         // finalmask verdict, the error list, the Validate gate — render from
-        // the memoized cache, so a draft whose generation or language moved
-        // outside this frame's content edits (fresh open, tool application,
-        // language switch) must carry a current cache before anything
-        // renders. Content edits bump the generation after the tab content
-        // and refresh again below; idle frames hit only the cheap freshness
-        // check here and there.
-        self.refresh_editor_validation_cache(&draft, lang);
+        // the draft's memoized verdicts, so a draft whose generation or
+        // language moved outside this frame's content edits (fresh open, tool
+        // application, language switch) must carry a current memo before
+        // anything renders. Content edits bump the generation after the tab
+        // content and refresh again below; idle frames hit only the cheap
+        // freshness check here and there.
+        refresh_editor_validation(&mut draft, lang);
         // The two gate facts that move without a draft edit: the profile
         // validation job (read here so the dot, the tabs' gates and the
         // action row all see one value) and the busy window.
@@ -3983,19 +3782,11 @@ impl ServersScreen {
                 .changed();
             ui.separator();
             ui.monospace(draft.tag.as_str());
-            // Unsaved-changes dot: the draft differs from its committed
-            // source or a raw buffer holds uncommitted text (the same
-            // condition that enables Discard). Only the existing draft gets
-            // the dot — an add draft is unsaved by definition.
-            if existing_draft_gate(
-                &draft,
-                self.editor_validation_cache.as_ref(),
-                &self.finalmask_raw,
-                validating,
-                busy,
-            )
-            .dirty()
-            {
+            // Unsaved-changes dot: the draft differs from its baseline or a
+            // raw-JSON buffer holds uncommitted text (the same condition that
+            // enables Discard). Only the existing draft gets the dot — an add
+            // draft is unsaved by definition.
+            if draft_gate(&draft, &self.seeded_buffers, validating, busy).dirty() {
                 ui.add(
                     egui::Label::new(RichText::new("●").color(status_colors_of(ui).warn))
                         .selectable(false),
@@ -4042,52 +3833,42 @@ impl ServersScreen {
             .max_height(tab_height)
             .show(ui, |ui| {
                 changed |= match self.tab {
-                    EditorTab::Basic => self.with_editor_validation(|screen, cache| {
-                        let inline_errors = cache
+                    EditorTab::Basic => {
+                        let inline_errors: &[String] = draft
+                            .validation
+                            .as_ref()
                             .map(|cached| cached.rendered.basic_inline.as_slice())
                             .unwrap_or(&[]);
-                        screen.basic_tab_for_target(
+                        self.basic_tab_for_target(
                             ui,
                             lang,
                             &mut draft.profile,
-                            Some((
-                                DraftTargetKind::Existing,
-                                draft.id.as_str(),
-                                draft.generation,
-                            )),
+                            Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
                             inline_errors,
                         )
-                    }),
+                    }
                     EditorTab::Transport => self.transport_tab(
                         ui,
                         lang,
                         &mut draft.profile.outbound.stream,
                         0,
-                        Some((
-                            DraftTargetKind::Existing,
-                            draft.id.as_str(),
-                            draft.generation,
-                        )),
+                        Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
                     ),
                     EditorTab::Security => {
                         let address = draft.profile.server_address();
-                        self.with_editor_validation(|screen, cache| {
-                            let ech_sockopt_errors = cache
-                                .map(|cached| cached.rendered.ech_sockopt.as_slice())
-                                .unwrap_or(&[]);
-                            screen.security_tab_for_target(
-                                ui,
-                                lang,
-                                Some((
-                                    DraftTargetKind::Existing,
-                                    draft.id.as_str(),
-                                    draft.generation,
-                                )),
-                                &mut draft.profile.outbound.stream,
-                                address.as_deref(),
-                                ech_sockopt_errors,
-                            )
-                        })
+                        let ech_sockopt_errors: &[String] = draft
+                            .validation
+                            .as_ref()
+                            .map(|cached| cached.rendered.ech_sockopt.as_slice())
+                            .unwrap_or(&[]);
+                        self.security_tab_for_target(
+                            ui,
+                            lang,
+                            Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
+                            &mut draft.profile.outbound.stream,
+                            address.as_deref(),
+                            ech_sockopt_errors,
+                        )
                     }
                     EditorTab::Mux => {
                         let flow = vless_flow(&draft.profile.outbound.settings);
@@ -4095,16 +3876,17 @@ impl ServersScreen {
                     }
                     EditorTab::Advanced => {
                         // The inline finalmask and sockopt verdicts ride the
-                        // memoized validation cache (refreshed above whenever
-                        // the draft generation or language moved): identical
-                        // messages, zero re-validation on idle frames.
-                        let finalmask_errors: &[String] = self
-                            .editor_validation_cache
+                        // draft's memoized validation (refreshed above
+                        // whenever the draft generation or language moved):
+                        // identical messages, zero re-validation on idle
+                        // frames.
+                        let finalmask_errors: &[String] = draft
+                            .validation
                             .as_ref()
                             .map(|cached| cached.rendered.finalmask.as_slice())
                             .unwrap_or(&[]);
-                        let stream_sockopt_errors: &[String] = self
-                            .editor_validation_cache
+                        let stream_sockopt_errors: &[String] = draft
+                            .validation
                             .as_ref()
                             .map(|cached| cached.rendered.stream_sockopt.as_slice())
                             .unwrap_or(&[]);
@@ -4122,8 +3904,7 @@ impl ServersScreen {
                                 finalmask_errors,
                                 stream_sockopt_errors,
                                 dialer_proxy_options: &mut self.dialer_proxy_options,
-                                finalmask_raw: &mut self.finalmask_raw,
-                                pem_buffers: &mut self.pem_buffers,
+                                buffers: &mut self.seeded_buffers,
                             },
                         )
                     }
@@ -4132,18 +3913,18 @@ impl ServersScreen {
         if changed {
             // The retired `proxySettings` key needs a chain decision, not any
             // edit: the profile stops gating when its chain target differs
-            // from the loaded source's, or when the user dismisses the key on
-            // the finding row. An unrelated edit (a rename, a port) leaves
+            // from the loaded baseline's, or when the user dismisses the key
+            // on the finding row. An unrelated edit (a rename, a port) leaves
             // the gate in place, so a save can never drop a chain the user
             // never looked at.
-            if draft.profile.chain_target() != source_chain_target(&draft.source) {
+            if draft.profile.chain_target() != source_chain_target(&draft.baseline) {
                 draft.profile.outbound.retired_proxy_settings = None;
             }
             // The retired `quicParams.udpHop` key clears the same way: the
             // user rebuilds the hop as a `udphop` UDP mask (the mask list
-            // moved away from the loaded source's), or dismisses the key on
+            // moved away from the loaded baseline's), or dismisses the key on
             // the finding row. Editing an unrelated mask leaves the gate.
-            if udphop_masks(&draft.profile) != source_udphop_masks(&draft.source)
+            if udphop_masks(&draft.profile) != source_udphop_masks(&draft.baseline)
                 && let Some(quic) = draft
                     .profile
                     .outbound
@@ -4157,12 +3938,16 @@ impl ServersScreen {
             draft.generation = draft.generation.wrapping_add(1);
             self.profile_validation_report = None;
         }
-        // Content edits bumped the generation above; refresh the memoized
-        // verdicts (validation errors, finalmask issues, changed-from-source)
-        // once for the new generation. Idle frames hit the cheap freshness
-        // check only.
-        self.refresh_editor_validation_cache(&draft, lang);
-        let Some(cached) = self.editor_validation_cache.as_ref() else {
+        // Content edits bumped the generation above; refresh the draft's
+        // memoized verdicts (validation errors, finalmask issues,
+        // changed-from-source) once for the new generation. Idle frames hit
+        // the cheap freshness check only.
+        refresh_editor_validation(&mut draft, lang);
+        let Some(cached) = draft.validation.as_ref() else {
+            // The refresh above leaves a memo for the generation it was
+            // handed; keep the draft so an impossible miss cannot lose the
+            // editor's state, and render nothing further.
+            self.existing_draft = Some(draft);
             return;
         };
         let validation_errors = &cached.rendered.blocking;
@@ -4246,13 +4031,7 @@ impl ServersScreen {
         // available while a raw buffer of this profile holds text that never
         // parsed into the draft, or the user would be stuck with the error
         // text.
-        let gate = existing_draft_gate(
-            &draft,
-            self.editor_validation_cache.as_ref(),
-            &self.finalmask_raw,
-            validating,
-            busy,
-        );
+        let gate = draft_gate(&draft, &self.seeded_buffers, validating, busy);
         let mut validate_clicked = false;
         let mut discard_clicked = false;
         ui.horizontal(|ui| {
@@ -4298,10 +4077,7 @@ impl ServersScreen {
         // The whole-profile snapshot is needed only when the user actually
         // clicks "Validate and save", not on every repaint.
         let validation_profile = validate_clicked.then(|| draft.profile.clone());
-        let validation_target = validate_clicked.then(|| ToolTarget::ExistingDraft {
-            profile_id: draft.profile.id.clone(),
-            generation: draft.generation,
-        });
+        let validation_target = validate_clicked.then(|| draft.target());
         self.existing_draft = Some(draft);
         if validate_clicked
             && let (Some(validation_profile), Some(validation_target)) =
@@ -4340,7 +4116,7 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         profile: &mut ServerProfile,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
         // The Basic tab's memoized inline outbound verdicts (the
         // public-endpoint TLS rules), rendered under the protocol fields.
         inline_errors: &[String],
@@ -4900,7 +4676,7 @@ impl ServersScreen {
         &mut self,
         ui: &egui::Ui,
         lang: Language,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
         kind: XrayToolKind,
         args: Vec<String>,
     ) {
@@ -4920,7 +4696,7 @@ impl ServersScreen {
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
         stream: &mut StreamModel,
         server_address: Option<&str>,
         ech_sockopt_errors: &[String],
@@ -4937,7 +4713,7 @@ impl ServersScreen {
     /// draft's text.
     fn over_limit_json_for(
         &mut self,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
         depth: u32,
         lang: Language,
         download: &StreamModel,
@@ -4973,7 +4749,7 @@ impl ServersScreen {
         lang: Language,
         st: &mut StreamModel,
         depth: u32,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -5655,7 +5431,7 @@ impl ServersScreen {
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
-        target: Option<(DraftTargetKind, &str, u64)>,
+        target: Option<(DraftKind, &str, u64)>,
         st: &mut StreamModel,
         // The edited profile's server endpoint (`host:port`, IPv6-bracketed)
         // for the probe panel's "Use server address:port" fill; `None` when
@@ -6090,7 +5866,7 @@ impl ServersScreen {
                                 profile_id,
                                 &mut c.certificate,
                                 "-----BEGIN CERTIFICATE-----",
-                                &mut self.pem_buffers,
+                                &mut self.seeded_buffers,
                             );
                             changed |= pem_lines_editor(
                                 ui,
@@ -6098,7 +5874,7 @@ impl ServersScreen {
                                 profile_id,
                                 &mut c.key,
                                 "-----BEGIN PRIVATE KEY-----",
-                                &mut self.pem_buffers,
+                                &mut self.seeded_buffers,
                             );
                             changed |= widgets::combo_str_labeled(
                                 ui,
@@ -6295,8 +6071,7 @@ impl ServersScreen {
             finalmask_errors,
             stream_sockopt_errors,
             dialer_proxy_options,
-            finalmask_raw,
-            pem_buffers,
+            buffers,
         } = ctx;
         let mut changed = false;
         let o = &mut p.outbound;
@@ -6412,7 +6187,7 @@ impl ServersScreen {
                             mask,
                             egui::Id::new(("fm", key, "tcp", index)),
                             key,
-                            finalmask_raw,
+                            buffers,
                         );
                     });
                 });
@@ -6503,9 +6278,8 @@ impl ServersScreen {
                                     key: egui::Id::new(("fm", key, "udp", index)),
                                     profile: key,
                                 },
-                                buffers: &mut *finalmask_raw,
+                                buffers: &mut *buffers,
                             },
-                            pem_buffers,
                         );
                     });
                 });
@@ -6563,7 +6337,6 @@ impl ServersScreen {
         let Some(mut draft) = self.add_draft.take() else {
             return;
         };
-        let draft_id = draft.id.clone();
         let lang = uictx.settings.language;
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
         let core_busy = uictx.busy.is_held();
@@ -6581,18 +6354,20 @@ impl ServersScreen {
             window.open(&mut open)
         };
         window.show(ctx, |ui| {
-            // The validation blocks inside render from the memoized cache
-            // (mirrors show_editor): refresh before the content so a fresh
-            // dialog, a tool application, or a language switch renders
+            // The validation blocks inside render from the draft's memoized
+            // verdicts (mirrors show_editor): refresh before the content so a
+            // fresh dialog, a tool application, or a language switch renders
             // same-frame accurate verdicts.
-            self.refresh_add_draft_validation_cache(&draft, lang);
+            refresh_editor_validation(&mut draft, lang);
             ui.add_enabled_ui(!validating, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(t(lang, Key::SrvName));
-                    ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(260.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.profile.name).desired_width(260.0),
+                    );
                     ui.separator();
                     ui.label(t(lang, Key::SrvProtocol));
-                    ui.monospace(draft.outbound.protocol.as_str());
+                    ui.monospace(draft.profile.outbound.protocol.as_str());
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -6606,78 +6381,68 @@ impl ServersScreen {
                     .max_height(430.0)
                     .show(ui, |ui| {
                         let changed = match self.draft_tab {
-                            EditorTab::Basic => self.with_add_draft_validation(|screen, cache| {
-                                let inline_errors = cache
+                            EditorTab::Basic => {
+                                let inline_errors: &[String] = draft
+                                    .validation
+                                    .as_ref()
                                     .map(|cached| cached.rendered.basic_inline.as_slice())
                                     .unwrap_or(&[]);
-                                screen.basic_tab_for_target(
+                                self.basic_tab_for_target(
                                     ui,
                                     lang,
-                                    &mut draft,
-                                    Some((
-                                        DraftTargetKind::Add,
-                                        draft_id.as_str(),
-                                        screen.add_draft_generation,
-                                    )),
+                                    &mut draft.profile,
+                                    Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
                                     inline_errors,
                                 )
-                            }),
+                            }
                             EditorTab::Transport => self.transport_tab(
                                 ui,
                                 lang,
-                                &mut draft.outbound.stream,
+                                &mut draft.profile.outbound.stream,
                                 0,
-                                Some((
-                                    DraftTargetKind::Add,
-                                    draft_id.as_str(),
-                                    self.add_draft_generation,
-                                )),
+                                Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
                             ),
                             EditorTab::Security => {
-                                let address = draft.server_address();
-                                self.with_add_draft_validation(|screen, cache| {
-                                    let ech_sockopt_errors = cache
-                                        .map(|cached| cached.rendered.ech_sockopt.as_slice())
-                                        .unwrap_or(&[]);
-                                    screen.security_tab_for_target(
-                                        ui,
-                                        lang,
-                                        Some((
-                                            DraftTargetKind::Add,
-                                            draft_id.as_str(),
-                                            screen.add_draft_generation,
-                                        )),
-                                        &mut draft.outbound.stream,
-                                        address.as_deref(),
-                                        ech_sockopt_errors,
-                                    )
-                                })
+                                let address = draft.profile.server_address();
+                                let ech_sockopt_errors: &[String] = draft
+                                    .validation
+                                    .as_ref()
+                                    .map(|cached| cached.rendered.ech_sockopt.as_slice())
+                                    .unwrap_or(&[]);
+                                self.security_tab_for_target(
+                                    ui,
+                                    lang,
+                                    Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
+                                    &mut draft.profile.outbound.stream,
+                                    address.as_deref(),
+                                    ech_sockopt_errors,
+                                )
                             }
                             EditorTab::Mux => {
-                                let flow = vless_flow(&draft.outbound.settings);
-                                mux_tab(ui, lang, &mut draft.outbound.mux, flow)
+                                let flow = vless_flow(&draft.profile.outbound.settings);
+                                mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
                             }
                             EditorTab::Advanced => {
                                 // The inline finalmask and sockopt verdicts
-                                // ride the memoized add-draft validation
-                                // cache (refreshed above whenever the draft
+                                // ride the draft's memoized validation
+                                // (refreshed above whenever the draft
                                 // generation or language moved): identical
                                 // messages, zero re-validation on idle
                                 // frames.
-                                let finalmask_errors: &[String] = self
-                                    .add_draft_validation_cache
+                                let finalmask_errors: &[String] = draft
+                                    .validation
                                     .as_ref()
                                     .map(|cached| cached.rendered.finalmask.as_slice())
                                     .unwrap_or(&[]);
-                                let stream_sockopt_errors: &[String] = self
-                                    .add_draft_validation_cache
+                                let stream_sockopt_errors: &[String] = draft
+                                    .validation
                                     .as_ref()
                                     .map(|cached| cached.rendered.stream_sockopt.as_slice())
                                     .unwrap_or(&[]);
                                 ServersScreen::advanced_tab(
                                     ui,
                                     lang,
-                                    &mut draft,
+                                    &mut draft.profile,
                                     &uictx.servers.profiles,
                                     AdvancedTabCtx {
                                         set_key: (
@@ -6688,37 +6453,29 @@ impl ServersScreen {
                                         finalmask_errors,
                                         stream_sockopt_errors,
                                         dialer_proxy_options: &mut self.add_dialer_proxy_options,
-                                        finalmask_raw: &mut self.finalmask_raw,
-                                        pem_buffers: &mut self.pem_buffers,
+                                        buffers: &mut self.seeded_buffers,
                                     },
                                 )
                             }
                         };
-                        // The draft changed this frame; bump the generation so
+                        // The draft changed this frame; bump its generation so
                         // the memoized validation below recomputes (mirrors
                         // show_editor).
                         if changed {
-                            self.add_draft_generation = self.add_draft_generation.wrapping_add(1);
+                            draft.generation = draft.generation.wrapping_add(1);
                         }
                     });
 
                 // Content edits bumped the generation above; refresh the
                 // memoized verdicts once for the new generation (mirrors the
                 // editor path).
-                self.refresh_add_draft_validation_cache(&draft, lang);
-                let Some(cached) = self.add_draft_validation_cache.as_ref() else {
+                refresh_editor_validation(&mut draft, lang);
+                let Some(cached) = draft.validation.as_ref() else {
                     return;
                 };
                 let errors = &cached.rendered.blocking;
                 let warnings = &cached.rendered.advisory;
-                let gate = add_draft_gate(
-                    &draft,
-                    self.add_draft_generation,
-                    self.add_draft_validation_cache.as_ref(),
-                    &self.finalmask_raw,
-                    validating,
-                    core_busy,
-                );
+                let gate = draft_gate(&draft, &self.seeded_buffers, validating, core_busy);
                 if !errors.is_empty() {
                     ui.separator();
                     ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvCompleteRequired));
@@ -6792,15 +6549,11 @@ impl ServersScreen {
         });
 
         if validate_clicked {
-            let target = ToolTarget::AddDraft {
-                profile_id: draft.id.clone(),
-                generation: self.add_draft_generation,
-            };
             match self.start_profile_validation(
                 lang,
                 ProfileValidationOrigin::Draft,
-                vec![draft.clone()],
-                Some(target),
+                vec![draft.profile.clone()],
+                Some(draft.target()),
                 uictx,
             ) {
                 Ok(()) => self.add_draft = Some(draft),
@@ -7132,7 +6885,7 @@ impl ServersScreen {
                 if self.selected.as_deref() == Some(deleted_id.as_str()) {
                     self.selected = None;
                 }
-                self.evict_raw_buffers(&deleted_id);
+                self.seeded_buffers.evict_owned(&deleted_id);
                 // The deleted profile's memoized latency badge is dead
                 // weight; the row loop would never re-insert it
                 // because the id no longer renders.
@@ -7410,19 +7163,16 @@ fn final_rules_editor(
 
 #[cfg(test)]
 mod tests {
-    use super::keygen::{
-        ca_pins_from_probe_output, keygen_value, leaf_pin_from_probe_output, redacted_tool_args,
-    };
+    use super::keygen::{keygen_value, redacted_tool_args};
     use super::raw_editor::JsonBuf;
     use super::{
-        AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog,
-        DraftTargetKind, EditorTab, EditorValidationCache, EditorValidationFindings,
-        EditorValidationRender, ExistingProfileDraft, FINGERPRINTS, FeedbackLevel, FieldKey,
-        Language, LatencyBadge, LeaveAction, RawBuffers, RawField, Request, RowProbeState,
-        STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen, SockoptUsage, StatusLine,
-        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
-        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
-        fingerprint_allowed, mux_tab, noises_editor, refresh_add_draft_validation,
+        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftKind, EditorTab,
+        EditorValidationCache, EditorValidationFindings, EditorValidationRender, FINGERPRINTS,
+        FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft, RawField,
+        Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
+        ServersScreen, SockoptUsage, StatusLine, basic_tab_inline_verdict, drag_scroll_delta,
+        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor,
         refresh_editor_validation, reorder_target, server_list_row, sockopt_findings,
         status_colors_of, status_toast_expired,
     };
@@ -7435,11 +7185,11 @@ mod tests {
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
         FinalmaskQuicParams, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask,
         FreedomFinalRule, HysteriaTransport, Network, Noise, OutboundModel, Protocol,
-        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsModel, WsSettings,
-        XhttpSettings,
+        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
+        WsSettings, XhttpSettings,
     };
     use crate::rt::{
-        CoreCmd, LatencyProbeResult, OperationKind, OutboundStatusView, ProfileValidationOrigin,
+        CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
         ProfileValidationResult, ToolTarget,
     };
     use crate::ui::test_rig::UiTestRig;
@@ -7461,6 +7211,51 @@ mod tests {
             .find(|issue| issue.code == code)
             .cloned()
             .expect("the sweep reports the rule")
+    }
+
+    /// An editor draft for `profile`, as the editor builds one: the persisted
+    /// snapshot is the baseline the draft is compared against, and no sweep
+    /// has run yet.
+    fn draft_for(profile: &ServerProfile) -> ProfileDraft {
+        ProfileDraft::existing(profile).expect("the fixture serializes")
+    }
+
+    /// An add-server draft for `profile` carrying the memo a rendered dialog
+    /// leaves: an add draft has no committed source, so `changed_from_source`
+    /// is its whole unsaved state.
+    fn rendered_add_draft(profile: &ServerProfile, changed_from_source: bool) -> ProfileDraft {
+        let mut draft = ProfileDraft::add(profile.clone());
+        draft.validation = Some(clean_memo(0, changed_from_source));
+        draft
+    }
+
+    /// The memo a draft's editor leaves when the sweep finds nothing, so a
+    /// test can install the verdicts a rendered draft carries without running
+    /// the sweep itself.
+    fn clean_memo(generation: u64, changed_from_source: bool) -> EditorValidationCache {
+        EditorValidationCache {
+            generation,
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
+            changed_from_source,
+        }
+    }
+
+    /// The editor's open draft.
+    fn open_draft(screen: &ServersScreen) -> &ProfileDraft {
+        screen
+            .existing_draft
+            .as_ref()
+            .expect("the editor holds a draft")
+    }
+
+    /// The verdicts the editor rendered its draft with.
+    fn editor_memo(screen: &ServersScreen) -> &EditorValidationCache {
+        open_draft(screen)
+            .validation
+            .as_ref()
+            .expect("the editor swept the draft")
     }
 
     #[test]
@@ -7517,142 +7312,6 @@ Authentication: ML-KEM-768, Post-Quantum
             ]),
             "tls hash --cert C:\\certs\\leaf.pem"
         );
-    }
-    #[test]
-    fn leaf_pin_from_probe_output_parses_the_golden_probe_output() {
-        // Realistic `xray tls ping` output: the tabwriter (padding 2, space
-        // padchar) aligns every value column; both the without-SNI and the
-        // with-SNI connection print the same chain. The hex literals below
-        // are the fixture's own values (independent source of truth).
-        let output = r#"TLS ping:  example.com
-Using IP:  93.184.216.34:443
--------------------
-Pinging without SNI
-Handshake succeeded
-TLS Version:                                          TLS 1.3
-TLS Post-Quantum key exchange:                        false (RSA Exchange)
-Certificate chain's total length:                     2144 (certs count: 2)
-Cert's signature algorithm:                           SHA256-RSA
-Cert's publicKey algorithm:                           RSA
-Cert's leaf SHA256:                                   7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9
-Cert's CA <DigiCert TLS RSA SHA256 2020 CA1> SHA256:  a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90
-Cert's CA <DigiCert Global Root R11> SHA256:          c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2
-Cert's allowed domains:                               [example.com]
--------------------
-Pinging with SNI
-Handshake succeeded
-TLS Version:                                          TLS 1.3
-TLS Post-Quantum key exchange:                        false (RSA Exchange)
-Certificate chain's total length:                     2144 (certs count: 2)
-Cert's signature algorithm:                           SHA256-RSA
-Cert's publicKey algorithm:                           RSA
-Cert's leaf SHA256:                                   7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9
-Cert's CA <DigiCert TLS RSA SHA256 2020 CA1> SHA256:  a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90
-Cert's CA <DigiCert Global Root R11> SHA256:          c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2
-Cert's allowed domains:                               [example.com]
--------------------
-TLS ping finished"#;
-        assert_eq!(
-            leaf_pin_from_probe_output(output),
-            Some("7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9".to_owned())
-        );
-    }
-
-    #[test]
-    fn leaf_pin_from_probe_output_none_without_a_leaf_line() {
-        // A successful handshake whose chain has no leaf with DNSNames
-        // prints no certificate detail lines at all.
-        let output = r#"TLS ping:  10.0.0.5
-Using IP:  10.0.0.5:443
--------------------
-Pinging without SNI
-Handshake succeeded
-TLS Version:                       TLS 1.3
-TLS Post-Quantum key exchange:     false (RSA Exchange)
-Certificate chain's total length:  1024 (certs count: 1)
--------------------
-Pinging with SNI
-Handshake succeeded
-TLS Version:                       TLS 1.3
-TLS Post-Quantum key exchange:     false (RSA Exchange)
-Certificate chain's total length:  1024 (certs count: 1)
--------------------
-TLS ping finished"#;
-        assert_eq!(leaf_pin_from_probe_output(output), None);
-    }
-
-    #[test]
-    fn ca_pins_from_probe_output_parses_every_ca_line_in_order() {
-        let output = r#"TLS ping:  example.com
-Using IP:  93.184.216.34:443
--------------------
-Pinging without SNI
-Handshake succeeded
-TLS Version:                                          TLS 1.3
-TLS Post-Quantum key exchange:                        false (RSA Exchange)
-Certificate chain's total length:                     2144 (certs count: 2)
-Cert's signature algorithm:                           SHA256-RSA
-Cert's publicKey algorithm:                           RSA
-Cert's leaf SHA256:                                   7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9
-Cert's CA <DigiCert TLS RSA SHA256 2020 CA1> SHA256:  a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90
-Cert's CA <DigiCert Global Root R11> SHA256:          c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2
-Cert's allowed domains:                               [example.com]
--------------------
-Pinging with SNI
-Handshake succeeded
-TLS Version:                                          TLS 1.3
-TLS Post-Quantum key exchange:                        false (RSA Exchange)
-Certificate chain's total length:                     2144 (certs count: 2)
-Cert's signature algorithm:                           SHA256-RSA
-Cert's publicKey algorithm:                           RSA
-Cert's leaf SHA256:                                   7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9
-Cert's CA <DigiCert TLS RSA SHA256 2020 CA1> SHA256:  a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90
-Cert's CA <DigiCert Global Root R11> SHA256:          c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2
-Cert's allowed domains:                               [example.com]
--------------------
-TLS ping finished"#;
-        assert_eq!(
-            ca_pins_from_probe_output(output),
-            vec![
-                (
-                    "DigiCert TLS RSA SHA256 2020 CA1".to_owned(),
-                    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
-                ),
-                (
-                    "DigiCert Global Root R11".to_owned(),
-                    "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2".to_owned(),
-                ),
-                (
-                    "DigiCert TLS RSA SHA256 2020 CA1".to_owned(),
-                    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
-                ),
-                (
-                    "DigiCert Global Root R11".to_owned(),
-                    "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2".to_owned(),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn ca_pins_from_probe_output_empty_without_ca_lines() {
-        let output = r#"TLS ping:  10.0.0.5
-Using IP:  10.0.0.5:443
--------------------
-Pinging without SNI
-Handshake succeeded
-TLS Version:                       TLS 1.3
-TLS Post-Quantum key exchange:     false (RSA Exchange)
-Certificate chain's total length:  1024 (certs count: 1)
--------------------
-Pinging with SNI
-Handshake succeeded
-TLS Version:                       TLS 1.3
-TLS Post-Quantum key exchange:     false (RSA Exchange)
-Certificate chain's total length:  1024 (certs count: 1)
--------------------
-TLS ping finished"#;
-        assert!(ca_pins_from_probe_output(output).is_empty());
     }
 
     #[test]
@@ -9340,6 +8999,76 @@ TLS ping finished"#;
         }
     }
 
+    /// One-channel guard for the stream rules the sweep used to re-derive: a
+    /// non-string header value, an empty TLS certificate row, and `fromMitm`
+    /// beside another ALPN name each surface exactly one blocking line — the
+    /// model's, on the field path, with the certificate rule naming the
+    /// offending row.
+    #[test]
+    fn stream_rule_findings_report_once_through_the_model_channel() {
+        fn base_profile() -> ServerProfile {
+            let mut profile = ServerProfile::new("stream", OutboundModel::new(Protocol::Vless));
+            let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.address = "example.com".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.encryption = "none".into();
+            let _ = profile.outbound.stream.select_security(Security::Tls);
+            profile
+        }
+
+        // A ws header map whose JSON value is not a string: one error line on
+        // the headers path (a re-introduced UI push would double it).
+        let mut profile = base_profile();
+        profile.outbound.stream.network = Network::Ws;
+        profile.outbound.stream.ws_settings = Some(WsSettings {
+            headers: json!({"Host": 123}).as_object().unwrap().clone(),
+            ..Default::default()
+        });
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert_eq!(
+            blocking.len(),
+            1,
+            "a non-string ws header value must surface exactly one finding: {blocking:#?}"
+        );
+        assert_eq!(
+            blocking[0].code,
+            ValidationCode::HeaderValuesNotStrings(Network::Ws)
+        );
+        assert_eq!(
+            blocking[0].path.as_deref(),
+            Some("stream.wsSettings.headers")
+        );
+
+        // The TLS block: the empty certificate row and the fromMitm ALPN list
+        // report once each, on their own field path.
+        let mut profile = base_profile();
+        let tls = profile
+            .outbound
+            .stream
+            .tls_settings
+            .as_mut()
+            .expect("select_security materializes the TLS block");
+        tls.certificates = vec![TlsCert::default()];
+        tls.alpn = vec!["fromMitm".into(), "h2".into()];
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert_eq!(
+            codes_of(&blocking),
+            vec![
+                ValidationCode::TlsFromMitmAlpnShort,
+                ValidationCode::TlsCertificateRequired
+            ],
+            "{blocking:#?}"
+        );
+        assert_eq!(blocking[0].path.as_deref(), Some("stream.tlsSettings.alpn"));
+        assert_eq!(
+            blocking[1].path.as_deref(),
+            Some("stream.tlsSettings.certificates[0]")
+        );
+    }
+
     /// The profile behind the warning matrix below: VLESS + vision flow over
     /// TLS, mux enabled — everything valid except the advisory rules.
     fn vision_mux_profile() -> ServerProfile {
@@ -9869,7 +9598,7 @@ TLS ping finished"#;
         let id = "0123456789abcdef";
         let mut screen = ServersScreen::default();
         let preserved = subtree("/preserved");
-        let target = || Some((DraftTargetKind::Existing, id, 7));
+        let target = || Some((DraftKind::Existing, id, 7));
 
         let first = {
             let text = screen.over_limit_json_for(target(), 2, Language::En, &preserved);
@@ -9892,12 +9621,7 @@ TLS ping finished"#;
         let edited = subtree("/edited");
         assert!(
             screen
-                .over_limit_json_for(
-                    Some((DraftTargetKind::Existing, id, 8)),
-                    2,
-                    Language::En,
-                    &edited
-                )
+                .over_limit_json_for(Some((DraftKind::Existing, id, 8)), 2, Language::En, &edited)
                 .contains("/edited"),
             "a new edit generation must re-serialize the edited subtree"
         );
@@ -9907,7 +9631,7 @@ TLS ping finished"#;
         assert!(
             screen
                 .over_limit_json_for(
-                    Some((DraftTargetKind::Add, "fedcba9876543210", 8)),
+                    Some((DraftKind::Add, "fedcba9876543210", 8)),
                     2,
                     Language::En,
                     &preserved
@@ -9979,7 +9703,7 @@ TLS ping finished"#;
                         Language::En,
                         &mut stream,
                         0,
-                        Some((DraftTargetKind::Existing, "0123456789abcdef", 1)),
+                        Some((DraftKind::Existing, "0123456789abcdef", 1)),
                     );
                 },
                 ServersScreen::default(),
@@ -10065,8 +9789,7 @@ TLS ping finished"#;
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
-                        finalmask_raw: &mut screen.finalmask_raw,
-                        pem_buffers: &mut screen.pem_buffers,
+                        buffers: &mut screen.seeded_buffers,
                     },
                 );
             });
@@ -10188,7 +9911,7 @@ TLS ping finished"#;
                 let _ = screen_for_ui.borrow_mut().security_tab(
                     ui,
                     Language::En,
-                    Some((DraftTargetKind::Existing, "profile-1", 0)),
+                    Some((DraftKind::Existing, "profile-1", 0)),
                     &mut stream_for_ui.borrow_mut(),
                     None,
                     &[],
@@ -10254,7 +9977,7 @@ TLS ping finished"#;
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftTargetKind::Existing, "profile-1", 0)),
+                Some((DraftKind::Existing, "profile-1", 0)),
                 &mut stream,
                 None,
                 &[],
@@ -10285,7 +10008,7 @@ TLS ping finished"#;
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftTargetKind::Existing, "profile-2", 0)),
+                Some((DraftKind::Existing, "profile-2", 0)),
                 &mut stream_for_ui.borrow_mut(),
                 None,
                 &[],
@@ -10333,7 +10056,7 @@ TLS ping finished"#;
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftTargetKind::Existing, "profile-1", 0)),
+                Some((DraftKind::Existing, "profile-1", 0)),
                 &mut stream_for_ui.borrow_mut(),
                 Some(&address),
                 &[],
@@ -10947,8 +10670,7 @@ TLS ping finished"#;
                     finalmask_errors: &[],
                     stream_sockopt_errors: &[],
                     dialer_proxy_options: &mut screen.dialer_proxy_options,
-                    finalmask_raw: &mut screen.finalmask_raw,
-                    pem_buffers: &mut screen.pem_buffers,
+                    buffers: &mut screen.seeded_buffers,
                 },
             );
         });
@@ -10979,8 +10701,7 @@ TLS ping finished"#;
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
-                        finalmask_raw: &mut screen.finalmask_raw,
-                        pem_buffers: &mut screen.pem_buffers,
+                        buffers: &mut screen.seeded_buffers,
                     },
                 );
             });
@@ -11022,22 +10743,25 @@ TLS ping finished"#;
         // map carries one entry per rendered profile.
         render_advanced_tab(&mut screen, &mut alpha);
         render_advanced_tab(&mut screen, &mut beta);
-        assert_eq!(screen.finalmask_raw.len(), 2);
+        assert_eq!(screen.seeded_buffers.json().len(), 2);
 
         // Evicting a profile that never rendered is a no-op for the cache.
-        screen.evict_raw_buffers("00000000000000000000000000000000");
-        assert_eq!(screen.finalmask_raw.len(), 2);
+        screen
+            .seeded_buffers
+            .evict_owned("00000000000000000000000000000000");
+        assert_eq!(screen.seeded_buffers.json().len(), 2);
 
         // Deleting alpha evicts exactly its buffer; beta's stays untouched.
-        screen.evict_raw_buffers(&alpha_id);
+        screen.seeded_buffers.evict_owned(&alpha_id);
         assert_eq!(
-            screen.finalmask_raw.len(),
+            screen.seeded_buffers.json().len(),
             1,
             "only the deleted profile's buffer may be evicted"
         );
         assert!(
             screen
-                .finalmask_raw
+                .seeded_buffers
+                .json()
                 .values()
                 .all(|buffer| buffer.profile == beta_id)
         );
@@ -11045,12 +10769,12 @@ TLS ping finished"#;
         // Idle re-render of the surviving profile: its entry is reused, so
         // the map does not grow.
         render_advanced_tab(&mut screen, &mut beta);
-        assert_eq!(screen.finalmask_raw.len(), 1);
+        assert_eq!(screen.seeded_buffers.json().len(), 1);
 
         // Re-rendering the deleted profile recreates its buffer; the map
         // follows the live size.
         render_advanced_tab(&mut screen, &mut alpha);
-        assert_eq!(screen.finalmask_raw.len(), 2);
+        assert_eq!(screen.seeded_buffers.json().len(), 2);
     }
 
     #[test]
@@ -11066,8 +10790,15 @@ TLS ping finished"#;
         });
         let id = profile.id.clone();
         render_advanced_tab(&mut screen, &mut profile);
-        assert_eq!(screen.finalmask_raw.len(), 1);
-        let seeded_text = screen.finalmask_raw.values().next().unwrap().text.clone();
+        assert_eq!(screen.seeded_buffers.json().len(), 1);
+        let seeded_text = screen
+            .seeded_buffers
+            .json()
+            .values()
+            .next()
+            .unwrap()
+            .text
+            .clone();
 
         // A rename changes only the display name — the profile id is
         // immutable, so the buffer keys stay valid: repeated renames must
@@ -11076,8 +10807,8 @@ TLS ping finished"#;
             profile.name = format!("renamed-{rename}");
             render_advanced_tab(&mut screen, &mut profile);
         }
-        assert_eq!(screen.finalmask_raw.len(), 1);
-        let surviving = screen.finalmask_raw.values().next().unwrap();
+        assert_eq!(screen.seeded_buffers.json().len(), 1);
+        let surviving = screen.seeded_buffers.json().values().next().unwrap();
         assert_eq!(surviving.profile, id);
         assert_eq!(
             surviving.text, seeded_text,
@@ -11137,7 +10868,8 @@ TLS ping finished"#;
             harness
                 .state()
                 .0
-                .finalmask_raw
+                .seeded_buffers
+                .json()
                 .values()
                 .any(|buffer| buffer.error.is_some()),
             "an invalid edit must leave its parse error on the buffer"
@@ -11361,14 +11093,7 @@ TLS ping finished"#;
         // the list stays clickable behind it — a row click staged a Select
         // while the modal's Save must target the add draft.
         let added = ServerProfile::new("Added", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(added.clone());
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        screen.add_draft = Some(rendered_add_draft(&added, true));
         screen.leave_pending = Some(LeaveAction::Select(osaka.id.clone()));
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11413,7 +11138,7 @@ TLS ping finished"#;
         // A raw finalmask buffer holds text that never parsed into the
         // draft: the draft itself is unchanged, so Save must refuse — the
         // same gate as the editor's Validate-and-save button.
-        harness.state_mut().0.finalmask_raw.insert(
+        harness.state_mut().0.seeded_buffers.json_mut().insert(
             egui::Id::new("finalmask-test"),
             JsonBuf {
                 key: Some(egui::Id::new("finalmask-test")),
@@ -11469,7 +11194,7 @@ TLS ping finished"#;
             "Discard must complete the switch"
         );
         assert!(
-            state.0.finalmask_raw.is_empty(),
+            state.0.seeded_buffers.json().is_empty(),
             "Discard must clear the raw buffers"
         );
     }
@@ -11478,17 +11203,9 @@ TLS ping finished"#;
     fn add_draft_close_stages_close_leave_when_the_draft_is_dirty() {
         let mut screen = ServersScreen::default();
         let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
-        // The dialog has rendered, so the memoized cache carries the flag:
-        // a fresh add draft is unsaved by definition (it has no committed
-        // source).
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
-        screen.close_add_draft(draft.clone());
+        // The dialog has rendered, so its memo carries the flag: a fresh add
+        // draft is unsaved by definition (it has no committed source).
+        screen.close_add_draft(rendered_add_draft(&draft, true));
         assert_eq!(
             screen.leave_pending,
             Some(LeaveAction::CloseAdd),
@@ -11508,14 +11225,7 @@ TLS ping finished"#;
             id: "draft-id".into(),
             ..ServerProfile::default()
         };
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: false,
-        });
-        screen.close_add_draft(draft);
+        screen.close_add_draft(rendered_add_draft(&draft, false));
         assert!(
             screen.leave_pending.is_none(),
             "a clean add draft must not stage the leave modal"
@@ -11530,15 +11240,8 @@ TLS ping finished"#;
     fn add_draft_close_clears_a_targeting_derive_dialog_and_keeps_the_guard() {
         let mut screen = ServersScreen::default();
         let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
-        // The dialog has rendered, so the memoized cache carries the flag:
-        // a fresh add draft is unsaved by definition.
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        // The dialog has rendered, so its memo carries the flag: a fresh add
+        // draft is unsaved by definition.
         screen.derive_dialog = Some(DeriveDialog {
             target: ToolTarget::AddDraft {
                 profile_id: draft.id.clone(),
@@ -11548,7 +11251,7 @@ TLS ping finished"#;
             error: None,
             pending: false,
         });
-        screen.close_add_draft(draft.clone());
+        screen.close_add_draft(rendered_add_draft(&draft, true));
         assert!(
             screen.derive_dialog.is_none(),
             "a derive dialog cannot outlive the add draft it targets"
@@ -11571,24 +11274,15 @@ TLS ping finished"#;
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let mut edited = tokyo.clone();
         edited.name = "Tokyo-2".into();
-        screen.existing_draft = Some(ExistingProfileDraft {
-            id: tokyo.id.clone(),
-            tag: tokyo.tag(),
-            profile: edited,
-            source: serde_json::to_value(&tokyo).unwrap(),
-            generation: 3,
-        });
+        let mut draft = draft_for(&tokyo);
+        draft.profile = edited;
+        draft.generation = 3;
+        screen.existing_draft = Some(draft);
         assert!(
             !screen.unsaved_changes(),
-            "an absent cache (fresh draft) is never dirty"
+            "a fresh draft carries no memo and is never dirty"
         );
-        screen.editor_validation_cache = Some(EditorValidationCache {
-            generation: 3,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: false,
-        });
+        screen.existing_draft.as_mut().unwrap().validation = Some(clean_memo(3, false));
         assert!(
             !screen.unsaved_changes(),
             "a fresh memo must be authoritative"
@@ -11598,14 +11292,8 @@ TLS ping finished"#;
             screen.unsaved_changes(),
             "a stale memo must recompute the flag inline (same-frame accuracy)"
         );
-        screen.editor_validation_cache = Some(EditorValidationCache {
-            generation: 4,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: false,
-        });
-        screen.finalmask_raw.insert(
+        screen.existing_draft.as_mut().unwrap().validation = Some(clean_memo(4, false));
+        screen.seeded_buffers.json_mut().insert(
             egui::Id::new("raw-field"),
             JsonBuf {
                 key: None,
@@ -11620,18 +11308,11 @@ TLS ping finished"#;
             "a raw buffer holding uncommitted text must be dirty regardless of the memo"
         );
         // The add draft contributes independently.
-        screen.finalmask_raw.clear();
-        screen.add_draft = Some(ServerProfile::new(
-            "New VLESS server",
-            OutboundModel::new(Protocol::Vless),
+        screen.seeded_buffers.clear();
+        screen.add_draft = Some(rendered_add_draft(
+            &ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless)),
+            true,
         ));
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
         assert!(
             screen.unsaved_changes(),
             "a dirty add draft must count as unsaved"
@@ -11644,13 +11325,9 @@ TLS ping finished"#;
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
-        screen.existing_draft = Some(ExistingProfileDraft {
-            id: tokyo.id.clone(),
-            tag: tokyo.tag(),
-            profile: tokyo.clone(),
-            source: serde_json::to_value(&tokyo).unwrap(),
-            generation: 7,
-        });
+        let mut draft = draft_for(&tokyo);
+        draft.generation = 7;
+        screen.existing_draft = Some(draft);
         screen.leave_pending = Some(LeaveAction::Select("some-other-id".into()));
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11691,31 +11368,15 @@ TLS ping finished"#;
         screen.selected = Some(tokyo.id.clone());
         let mut edited = tokyo.clone();
         edited.name = "Tokyo-2".into();
-        screen.existing_draft = Some(ExistingProfileDraft {
-            id: tokyo.id.clone(),
-            tag: tokyo.tag(),
-            profile: edited.clone(),
-            source: serde_json::to_value(&tokyo).unwrap(),
-            generation: 3,
-        });
-        screen.editor_validation_cache = Some(EditorValidationCache {
-            generation: 3,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        let mut draft = draft_for(&tokyo);
+        draft.profile = edited.clone();
+        draft.generation = 3;
+        draft.validation = Some(clean_memo(3, true));
+        screen.existing_draft = Some(draft);
         // The add draft stays dirty after the existing draft commits: the
         // quit must remain staged for a second Save.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(add.clone());
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        screen.add_draft = Some(rendered_add_draft(&add, true));
         screen.leave_pending = Some(LeaveAction::Quit);
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11784,29 +11445,11 @@ TLS ping finished"#;
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
-        screen.existing_draft = Some(ExistingProfileDraft {
-            id: tokyo.id.clone(),
-            tag: tokyo.tag(),
-            profile: tokyo.clone(),
-            source: serde_json::to_value(&tokyo).unwrap(),
-            generation: 0,
-        });
-        screen.editor_validation_cache = Some(EditorValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        let mut draft = draft_for(&tokyo);
+        draft.validation = Some(clean_memo(0, true));
+        screen.existing_draft = Some(draft);
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(add.clone());
-        screen.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        screen.add_draft = Some(rendered_add_draft(&add, true));
         screen.discard_leave_action(LeaveAction::Quit);
         assert!(
             screen.existing_draft.is_none(),
@@ -11828,24 +11471,13 @@ TLS ping finished"#;
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
-        screen.existing_draft = Some(ExistingProfileDraft {
-            id: tokyo.id.clone(),
-            tag: tokyo.tag(),
-            profile: tokyo.clone(),
-            source: serde_json::to_value(&tokyo).unwrap(),
-            generation: 0,
-        });
-        screen.editor_validation_cache = Some(EditorValidationCache {
-            generation: 0,
-            findings: EditorValidationFindings::default(),
-            rendered_language: Language::En,
-            rendered: EditorValidationRender::default(),
-            changed_from_source: true,
-        });
+        let mut draft = draft_for(&tokyo);
+        draft.validation = Some(clean_memo(0, true));
+        screen.existing_draft = Some(draft);
         // An open add dialog is independent of the selection switch: the
         // Select discard reverts the existing draft but keeps the add draft.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(add.clone());
+        screen.add_draft = Some(ProfileDraft::add(add.clone()));
         screen.discard_leave_action(LeaveAction::Select("osaka-target-id".into()));
         assert!(
             screen.existing_draft.is_none(),
@@ -11910,13 +11542,12 @@ TLS ping finished"#;
                 .existing_draft
                 .as_ref()
                 .map_or(1, |draft| draft.generation.wrapping_add(1));
-            screen.existing_draft = Some(ExistingProfileDraft {
-                id: profile.id.clone(),
-                tag: profile.tag(),
-                profile: profile.clone(),
-                source,
-                generation,
-            });
+            let mut draft = draft_for(profile);
+            draft.baseline = source;
+            draft.generation = generation;
+            // Installed behind the editor's back: no memo covers the new
+            // generation, so the next frame sweeps it.
+            screen.existing_draft = Some(draft);
         }
 
         let clean = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
@@ -11956,7 +11587,7 @@ TLS ping finished"#;
             &clean,
             serde_json::to_value(&clean).unwrap(),
         );
-        harness.state_mut().0.finalmask_raw.insert(
+        harness.state_mut().0.seeded_buffers.json_mut().insert(
             egui::Id::new("finalmask-raw-action-row"),
             JsonBuf {
                 key: None,
@@ -11972,7 +11603,7 @@ TLS ping finished"#;
             (true, false),
             "uncommitted raw text must offer Discard even when the draft is unchanged"
         );
-        harness.state_mut().0.finalmask_raw.clear();
+        harness.state_mut().0.seeded_buffers.clear();
 
         // The edit plus a blocking finding: Discard stays, Save goes dark.
         let mut blocked = edited.clone();
@@ -12013,7 +11644,7 @@ TLS ping finished"#;
         // the commit, so Save waits it out; Discard is not a commit.
         harness.state_mut().0.profile_validation_request.cancel();
         harness.state_mut().0.profile_validation_origin = None;
-        harness.state_mut().1.operation = Some(OperationKind::Start);
+        harness.state_mut().1.operation = Some(JobKind::Start);
         harness.run();
         assert_eq!(
             action_row_disabled(&harness),
@@ -12056,17 +11687,14 @@ TLS ping finished"#;
             settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
             settings.encryption = "none".into();
         }
-        let mut draft = ExistingProfileDraft {
-            id: profile.id.clone(),
-            tag: profile.tag(),
-            source: serde_json::to_value(&profile).expect("the fixture serializes"),
-            profile,
-            generation: 1,
-        };
+        let mut draft = draft_for(&profile);
+        draft.generation = 1;
 
-        let mut cache = None;
-        refresh_editor_validation(&mut cache, &draft, Language::En);
-        let swept = cache.as_ref().expect("the first refresh sweeps the draft");
+        refresh_editor_validation(&mut draft, Language::En);
+        let swept = draft
+            .validation
+            .as_ref()
+            .expect("the first refresh sweeps the draft");
         assert_eq!(
             codes_of(&swept.findings.blocking),
             vec![ValidationCode::PublicVlessRequiresTlsOrEncryption],
@@ -12080,8 +11708,8 @@ TLS ping finished"#;
         // keeps the sweep it made, and the strings it renders stay the ones
         // those findings produce (no re-validation, no re-render).
         draft.profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
-        refresh_editor_validation(&mut cache, &draft, Language::En);
-        let reused = cache.as_ref().expect("the memo stays populated");
+        refresh_editor_validation(&mut draft, Language::En);
+        let reused = draft.validation.as_ref().expect("the memo stays populated");
         assert_eq!(
             codes_of(&reused.findings.blocking),
             vec![ValidationCode::PublicVlessRequiresTlsOrEncryption],
@@ -12094,10 +11722,10 @@ TLS ping finished"#;
         );
 
         // A moved generation sweeps the profile as it is now and renders it.
-        draft.source = serde_json::to_value(&draft.profile).expect("the fixture serializes");
+        draft.baseline = serde_json::to_value(&draft.profile).expect("the fixture serializes");
         draft.generation = 2;
-        refresh_editor_validation(&mut cache, &draft, Language::En);
-        let reswept = cache.as_ref().expect("the memo stays populated");
+        refresh_editor_validation(&mut draft, Language::En);
+        let reswept = draft.validation.as_ref().expect("the memo stays populated");
         assert!(
             reswept.findings.blocking.is_empty(),
             "{:#?}",
@@ -12129,12 +11757,7 @@ TLS ping finished"#;
             "the finalmask verdict must render inline on the Advanced tab"
         );
         assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the draft-open frame seeds the finalmask verdicts")
+            editor_memo(&harness.state().0)
                 .findings
                 .finalmask
                 .iter()
@@ -12175,10 +11798,8 @@ TLS ping finished"#;
             .as_ref()
             .expect("the editor keeps the edited draft")
             .generation;
-        let cache = harness
-            .state()
-            .0
-            .editor_validation_cache
+        let cache = open_draft(&harness.state().0)
+            .validation
             .as_ref()
             .expect("the edited draft must be covered by a fresh sweep");
         assert_eq!(
@@ -12215,15 +11836,7 @@ TLS ping finished"#;
     fn editor_blocking(
         harness: &Harness<'static, (ServersScreen, UiTestRig)>,
     ) -> Vec<ValidationIssue> {
-        harness
-            .state()
-            .0
-            .editor_validation_cache
-            .as_ref()
-            .expect("the editor validates the draft")
-            .findings
-            .blocking
-            .clone()
+        editor_memo(&harness.state().0).findings.blocking.clone()
     }
 
     #[test]
@@ -13124,28 +12737,32 @@ TLS ping finished"#;
         );
     }
 
-    /// The add dialog's memo mirrors the editor's: a refresh at the same
-    /// generation keeps the findings it holds, a moved generation sweeps
-    /// again, and its strings follow the findings it swept.
+    /// The add draft is swept through the same refresher as the editor's
+    /// draft, over its own baseline: a refresh at the same generation keeps
+    /// the findings it holds, a moved generation sweeps again, and its strings
+    /// follow the findings it swept.
     #[test]
     fn add_draft_memo_reuses_findings_until_the_generation_moves() {
-        let draft = profile_with_bad_finalmask();
-        let mut cache = None;
-        refresh_add_draft_validation(&mut cache, 0, &draft, Language::En);
-        let swept = cache
+        let mut draft = ProfileDraft::add(profile_with_bad_finalmask());
+        refresh_editor_validation(&mut draft, Language::En);
+        let swept = draft
+            .validation
             .as_ref()
             .expect("the first refresh sweeps the add draft");
+        assert!(
+            swept.changed_from_source,
+            "a fresh add draft differs from the empty baseline it was created against"
+        );
         let verdicts = codes_of(&swept.findings.finalmask);
         assert_eq!(verdicts.len(), 1, "{:#?}", swept.findings.finalmask);
         let rendered = swept.rendered.finalmask.clone();
 
-        // The same generation with a different draft behind it: the memo
+        // The same generation with an edited profile behind it: the memo
         // answers with the sweep it made (the dialog bumps the generation on
         // every content edit, so this is the idle-frame path).
-        let mut edited = draft.clone();
-        edited.name = "edited".into();
-        refresh_add_draft_validation(&mut cache, 0, &edited, Language::En);
-        let reused = cache.as_ref().expect("the memo stays populated");
+        draft.profile.name = "edited".into();
+        refresh_editor_validation(&mut draft, Language::En);
+        let reused = draft.validation.as_ref().expect("the memo stays populated");
         assert_eq!(
             codes_of(&reused.findings.finalmask),
             verdicts,
@@ -13154,10 +12771,11 @@ TLS ping finished"#;
         );
         assert_eq!(reused.rendered.finalmask, rendered);
 
-        // A moved generation sweeps the clean draft it is handed.
-        let clean = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
-        refresh_add_draft_validation(&mut cache, 1, &clean, Language::En);
-        let reswept = cache.as_ref().expect("the memo stays populated");
+        // A moved generation sweeps the clean profile the draft now carries.
+        draft.profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
+        draft.generation = 1;
+        refresh_editor_validation(&mut draft, Language::En);
+        let reswept = draft.validation.as_ref().expect("the memo stays populated");
         assert!(reswept.findings.finalmask.is_empty());
         assert!(reswept.rendered.finalmask.is_empty());
     }
@@ -13212,20 +12830,8 @@ TLS ping finished"#;
             "picking a known type must convert the unknown mask"
         );
         assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the conversion edit must re-validate exactly once")
-                .generation,
-            harness
-                .state()
-                .0
-                .existing_draft
-                .as_ref()
-                .expect("the editor keeps the converted draft")
-                .generation,
+            editor_memo(&harness.state().0).generation,
+            open_draft(&harness.state().0).generation,
             "the conversion edit must re-validate exactly once"
         );
         // Re-picking the current type of a known mask is a no-op: the draft
@@ -13766,10 +13372,10 @@ TLS ping finished"#;
             extra: Default::default(),
         }));
         let mask_for_ui = Rc::clone(&mask);
-        let buffers = Rc::new(RefCell::new(RawBuffers::default()));
+        // One store serves both halves: the realm mask's raw-JSON fields and
+        // its PEM certificate lists seed into it.
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let pem_buffers = Rc::new(RefCell::new(std::collections::HashMap::new()));
-        let pem_buffers_for_ui = Rc::clone(&pem_buffers);
         let mut harness = Harness::new_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
@@ -13782,7 +13388,6 @@ TLS ping finished"#;
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
-                &mut pem_buffers_for_ui.borrow_mut(),
             );
         });
         harness.run();

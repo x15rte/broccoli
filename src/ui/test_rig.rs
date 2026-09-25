@@ -17,8 +17,7 @@
 
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
-    CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OperationKind, OutboundStatusView,
-    StatsTick,
+    CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView, StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
@@ -77,7 +76,7 @@ pub(crate) struct UiTestRig {
     pub(crate) update_check: UpdateCheckState,
     /// The runtime's exclusive operation as the shell mirrors it — the busy
     /// window every gated control reads. `None` is the resting shell.
-    pub(crate) operation: Option<OperationKind>,
+    pub(crate) operation: Option<JobKind>,
     /// Whether this process runs elevated: the TUN badge and the TUN hover
     /// copy read it.
     pub(crate) is_elevated: bool,
@@ -215,7 +214,7 @@ mod busy_window_gates {
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ServerProfile};
-    use crate::rt::{CorePhase, OperationKind};
+    use crate::rt::{CorePhase, JobKind};
     use crate::ui::logs::LogsScreen;
     use crate::ui::servers::ServersScreen;
     use egui::accesskit::Role;
@@ -224,7 +223,7 @@ mod busy_window_gates {
     #[test]
     fn a_busy_window_disables_the_latency_probe_and_states_the_reason() {
         let mut rig = UiTestRig {
-            operation: Some(OperationKind::Start),
+            operation: Some(JobKind::Start),
             ..UiTestRig::default()
         };
         // A profile, so the gate under test is the busy window and not the
@@ -264,7 +263,7 @@ mod busy_window_gates {
     fn a_busy_window_disables_the_logger_restart_and_states_the_reason() {
         let rig = UiTestRig {
             phase: CorePhase::Running,
-            operation: Some(OperationKind::Start),
+            operation: Some(JobKind::Start),
             ..UiTestRig::default()
         };
         let mut harness = Harness::new_ui_state(

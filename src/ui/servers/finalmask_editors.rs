@@ -18,7 +18,7 @@ use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
 
 use super::raw_editor::{
-    FieldKey, JsonEditorSpec, PemBuf, RawBuffers, RawField, pem_lines_editor, raw_buffer_edit,
+    FieldKey, JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
 };
 use super::{
     TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, mask_sockopt_editor, path_field,
@@ -114,7 +114,7 @@ fn finalmask_unknown_editor(
     raw: &mut serde_json::Value,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut RawBuffers,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     ui.colored_label(
         status_colors_of(ui).warn,
@@ -133,7 +133,7 @@ fn finalmask_unknown_editor(
         t(lang, Key::SrvPreservedRawValue),
         RawField {
             id: FieldKey { key, profile },
-            buffers: raw_buffers,
+            buffers,
         },
         raw,
         &JsonEditorSpec {
@@ -208,7 +208,7 @@ fn finalmask_transform_editor(
     transform: &mut FinalmaskTransform,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut RawBuffers,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     let mut changed = widgets::text_field(ui, "op", &mut transform.op, "operation");
     let mut remove = None;
@@ -275,7 +275,7 @@ fn finalmask_transform_editor(
                                     key: key.with(("arg", index, "bytes")),
                                     profile,
                                 },
-                                buffers: raw_buffers,
+                                buffers,
                             },
                         );
                     }
@@ -301,7 +301,7 @@ fn finalmask_transform_editor(
                                 nested,
                                 key.with(("arg", index, "nested")),
                                 profile,
-                                raw_buffers,
+                                buffers,
                             );
                         }
                     }
@@ -330,7 +330,7 @@ fn finalmask_tcp_item_editor(
     item: &mut FinalmaskTcpItem,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut RawBuffers,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     let mut changed = range_editor(ui, "delay", &mut item.delay, i32::MIN..=i32::MAX);
     changed |= ui
@@ -354,7 +354,7 @@ fn finalmask_tcp_item_editor(
                 key: key.with("packet"),
                 profile,
             },
-            buffers: raw_buffers,
+            buffers,
         },
     );
     let mut has_transform = item.transform.is_some();
@@ -369,7 +369,7 @@ fn finalmask_tcp_item_editor(
             transform,
             key.with("transform"),
             profile,
-            raw_buffers,
+            buffers,
         );
     }
     changed
@@ -381,7 +381,7 @@ fn finalmask_udp_item_editor(
     item: &mut FinalmaskUdpItem,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut RawBuffers,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     let mut changed = ui
         .horizontal(|ui| {
@@ -404,7 +404,7 @@ fn finalmask_udp_item_editor(
                 key: key.with("packet"),
                 profile,
             },
-            buffers: raw_buffers,
+            buffers,
         },
     );
     let mut has_transform = item.transform.is_some();
@@ -419,7 +419,7 @@ fn finalmask_udp_item_editor(
             transform,
             key.with("transform"),
             profile,
-            raw_buffers,
+            buffers,
         );
     }
     changed
@@ -727,7 +727,7 @@ pub(super) fn finalmask_tcp_settings_editor(
     mask: &mut FinalmaskTcpMask,
     key: egui::Id,
     profile: &str,
-    raw_buffers: &mut RawBuffers,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     match mask {
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
@@ -741,7 +741,7 @@ pub(super) fn finalmask_tcp_settings_editor(
                         key: key.with("clients"),
                         profile,
                     },
-                    buffers: raw_buffers,
+                    buffers,
                 },
             );
             changed |= finalmask_tcp_sequences_editor(
@@ -754,7 +754,7 @@ pub(super) fn finalmask_tcp_settings_editor(
                         key: key.with("servers"),
                         profile,
                     },
-                    buffers: raw_buffers,
+                    buffers,
                 },
             );
             changed |= finalmask_tcp_sequences_editor(
@@ -767,7 +767,7 @@ pub(super) fn finalmask_tcp_settings_editor(
                         key: key.with("errors"),
                         profile,
                     },
-                    buffers: raw_buffers,
+                    buffers,
                 },
             );
             changed
@@ -801,7 +801,7 @@ pub(super) fn finalmask_tcp_settings_editor(
         FinalmaskTcpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
         FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings),
         FinalmaskTcpMask::Unknown(raw) => {
-            finalmask_unknown_editor(ui, lang, raw, key.with("unknown"), profile, raw_buffers)
+            finalmask_unknown_editor(ui, lang, raw, key.with("unknown"), profile, buffers)
         }
     }
 }
@@ -811,7 +811,7 @@ fn finalmask_realm_tls_editor(
     lang: Language,
     profile: &str,
     tls: &mut FinalmaskRealmTls,
-    pem_buffers: &mut std::collections::HashMap<egui::Id, PemBuf>,
+    buffers: &mut SeededBuffers,
 ) -> bool {
     let mut changed = widgets::opt_bool(
         ui,
@@ -938,7 +938,7 @@ fn finalmask_realm_tls_editor(
                     profile,
                     &mut certificate.certificate,
                     "-----BEGIN CERTIFICATE-----",
-                    pem_buffers,
+                    buffers,
                 );
                 changed |= pem_lines_editor(
                     ui,
@@ -946,7 +946,7 @@ fn finalmask_realm_tls_editor(
                     profile,
                     &mut certificate.key,
                     "-----BEGIN PRIVATE KEY-----",
-                    pem_buffers,
+                    buffers,
                 );
                 changed |= widgets::combo_str_labeled(
                     ui,
@@ -996,7 +996,6 @@ pub(super) fn finalmask_udp_settings_editor(
     lang: Language,
     mask: &mut FinalmaskUdpMask,
     field: RawField<'_>,
-    pem_buffers: &mut std::collections::HashMap<egui::Id, PemBuf>,
 ) -> bool {
     match mask {
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
@@ -1189,7 +1188,13 @@ pub(super) fn finalmask_udp_settings_editor(
                 changed = true;
             }
             if let Some(tls) = settings.tls_config.as_mut() {
-                changed |= finalmask_realm_tls_editor(ui, lang, field.id.profile, tls, pem_buffers);
+                changed |= finalmask_realm_tls_editor(
+                    ui,
+                    lang,
+                    field.id.profile,
+                    tls,
+                    &mut *field.buffers,
+                );
             }
             changed
         }

@@ -2,7 +2,7 @@ use egui::{ScrollArea, TextEdit, TextStyle, Ui};
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
-use crate::rt::{AppMessage, CoreCmd, CorePhase, RuntimeEntryView, RuntimeStateView};
+use crate::rt::{AppMessage, CoreCmd, CorePhase, JobKind, RuntimeEntryView, RuntimeStateView};
 use crate::ui::UiCtx;
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
@@ -141,12 +141,12 @@ impl ProfilePreviewScreen {
         ctx: &mut UiCtx,
         lang: crate::model::settings::Language,
     ) {
-        // The runtime-state read is a free query — the runtime answers it
-        // while a job holds the busy window — so the ladder is asked without
-        // a window fact.
+        // The runtime-state read runs regardless of the busy window, which is
+        // exactly the rule this kind declares: the ladder's window rung comes
+        // from that rule instead of being stated here.
         let gate = verdict(
             matches!(ctx.phase, CorePhase::Running),
-            false,
+            ctx.busy.blocks(JobKind::RuntimeState),
             self.pending_request.is_pending(),
         );
         let refresh = egui::Button::new(t(lang, Key::RuntimeRefresh));

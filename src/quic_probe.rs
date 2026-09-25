@@ -7,8 +7,8 @@
 //! stack the app already ships for reqwest — accepts whatever certificate
 //! the server presents (the displayed pin is a TOFU trust decision by the
 //! user, the same role the unverified `tls ping` transcript plays), and
-//! renders the transcript in the exact "Cert's leaf SHA256:" shape the pin
-//! panel parses.
+//! renders the transcript through [`crate::tls_ping`], the line grammar the
+//! pin panel parses.
 //!
 //! The handshake negotiates ALPN "h3" (HTTP/3): hysteria's TLS listener
 //! requires it (`transport/internet/hysteria/hub.go` in Xray-core), so a
@@ -17,6 +17,7 @@
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,13 +30,16 @@ use x509_parser::prelude::{GeneralName, X509Certificate, parse_x509_certificate}
 
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::settings::Language;
+use crate::tls_ping::{CertRow, Transcript};
 
 /// Port used when the probe domain carries no explicit `:port`.
 const DEFAULT_QUIC_PORT: u16 = 443;
 /// Hysteria2 negotiates ALPN "h3" (its traffic masquerades as HTTP/3).
 const H3_ALPN: &[u8] = b"h3";
-/// Total budget for DNS + handshake; a UDP-blackholed server must fail fast.
-const QUIC_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a running capture checks the request's stop flag: a cancelled
+/// capture must end promptly instead of holding the single-flight gate until
+/// its budget expires.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Shared slot holding the DER chain (leaf first) captured by the last
 /// accepted verification.
@@ -105,37 +109,63 @@ impl ServerCertVerifier for AcceptAllVerifier {
 }
 
 /// Runs a QUIC certificate capture against `args[0]` (the probe domain,
-/// `host` or `host:port`) and `args[1]` (optional IP override), mirroring
-/// `run_xray_bounded`'s signature so the probe job thread stays uniform.
-/// Returns the transcript on success; the panel's `tls_probe_*` parsers
-/// consume it exactly like `xray tls ping` output.
-pub fn run(lang: Language, args: &[String]) -> Result<String, String> {
+/// `host` or `host:port`) and `args[1]` (optional IP override), taking the
+/// same arguments as the core-subprocess adapter so one dispatch can drive
+/// either. `budget` bounds DNS plus the handshake; a set `stop` flag (a
+/// cancelled request) abandons the capture immediately instead of waiting
+/// out that budget, and the caller — which sees the same flag — discards the
+/// verdict this returns for it. Returns the transcript on success; the
+/// panel's `tls_probe_*` parsers consume it exactly like `xray tls ping`
+/// output.
+pub fn run(
+    lang: Language,
+    args: &[String],
+    budget: Duration,
+    stop: &AtomicBool,
+) -> Result<String, String> {
     let domain = args.first().map(String::as_str).unwrap_or("");
     let ip_override = args.get(1).map(String::as_str).unwrap_or("");
     let (host, port) = split_host_port(domain)
         .map_err(|error| t_fmt(lang, Key::SrvQuicProbeDomainInvalid, &[&error]))?;
-    let result = tokio::runtime::Builder::new_current_thread()
+    let captured = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?
         .block_on(async {
-            tokio::time::timeout(QUIC_PROBE_TIMEOUT, async {
-                let addrs = resolve(&host, port, ip_override).await?;
-                capture(&addrs, &host).await
-            })
-            .await
+            tokio::select! {
+                captured = tokio::time::timeout(budget, async {
+                    let addrs = resolve(&host, port, ip_override).await?;
+                    capture(&addrs, &host).await
+                }) => captured.ok(),
+                // Nothing below the capture's own future holds a socket or a
+                // task: dropping it closes the endpoint's UDP socket, and
+                // the runtime dropped after `block_on` takes any remaining
+                // endpoint task with it.
+                () = wait_for_cancel(stop) => None,
+            }
         });
-    let chain = match result {
-        Err(_elapsed) => return Err(t(lang, Key::SrvQuicProbeTimeout).into()),
-        Ok(Err(error)) => {
+    let chain = match captured {
+        // The budget elapsing and a cancelled request are the same
+        // non-answer here: the caller drops a cancelled verdict before the
+        // screen sees it, so it takes the timeout error.
+        None => return Err(t(lang, Key::SrvQuicProbeTimeout).into()),
+        Some(Err(error)) => {
             return Err(t_fmt(lang, Key::SrvQuicProbeHandshakeFailed, &[&error]));
         }
-        Ok(Ok(chain)) => chain,
+        Some(Ok(chain)) => chain,
     };
     if chain.is_empty() {
         return Err(t(lang, Key::SrvQuicProbeNoCert).into());
     }
-    Ok(render_transcript(&host, port, &host, &chain))
+    Ok(render_capture(&host, port, &host, &chain))
+}
+
+/// Resolves when the request's cooperative `stop` flag is set, polling on the
+/// runtime's timer so the wait parks instead of spinning.
+async fn wait_for_cancel(stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
 }
 
 /// Resolves the capture target: the IP override wins when present, then an
@@ -223,33 +253,45 @@ async fn capture(addrs: &[SocketAddr], sni: &str) -> Result<Vec<Vec<u8>>, String
     Err(last_error)
 }
 
-/// Renders the captured chain in `xray tls ping`'s output shape so
-/// [`crate::ui::servers::leaf_pin_from_probe_output`] and
-/// [`crate::ui::servers::ca_pins_from_probe_output`] parse it unchanged.
-fn render_transcript(host: &str, port: u16, sni: &str, chain: &[Vec<u8>]) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "QUIC handshake:  {host}:{port}");
-    let _ = writeln!(out, "SNI:  {sni}");
-    let _ = writeln!(out, "Handshake succeeded");
-    let _ = writeln!(out, "TLS Version:  TLS 1.3");
-    let _ = writeln!(out, "ALPN:  h3");
-    let total_len: usize = chain.iter().map(Vec::len).sum();
-    let _ = writeln!(
-        out,
-        "Certificate chain's total length:\t{total_len} (certs count: {})",
-        chain.len()
-    );
-    if let Some(leaf) = chain.first() {
-        let _ = writeln!(out, "Cert's leaf SHA256:\t{}", sha256_hex(leaf));
-        for (index, cert) in chain.iter().enumerate().skip(1) {
-            let name = cert_common_name(cert).unwrap_or_else(|| format!("#{index}"));
-            let _ = writeln!(out, "Cert's CA <{name}> SHA256:\t{}", sha256_hex(cert));
-        }
-        if let Some(domains) = cert_allowed_domains(leaf) {
-            let _ = writeln!(out, "Cert's allowed domains:\t[{domains}]");
-        }
+/// Renders the captured chain for the pin panel. The X.509 facts — each
+/// certificate's name and pin, the leaf's allowed domains — are computed
+/// here, which is the half that parses the certificates; the lines they are
+/// written on come from [`crate::tls_ping`], so
+/// [`crate::tls_ping::leaf_pin_from_probe_output`] and
+/// [`crate::tls_ping::ca_pins_from_probe_output`] parse the result
+/// unchanged.
+fn render_capture(host: &str, port: u16, sni: &str, chain: &[Vec<u8>]) -> String {
+    let certs: Vec<CertRow> = chain
+        .iter()
+        .enumerate()
+        .map(|(index, der)| CertRow {
+            // The leaf's row prints its pin without a name, like the core's;
+            // an issuing certificate without a common name prints its
+            // position in the chain.
+            common_name: if index == 0 {
+                None
+            } else {
+                cert_common_name(der)
+            },
+            sha256: sha256_hex(der),
+        })
+        .collect();
+    Transcript {
+        host,
+        port,
+        sni,
+        // A QUIC handshake of this probe is always TLS 1.3, and `H3_ALPN` is
+        // the only protocol it offers.
+        tls_version: "TLS 1.3",
+        alpn: "h3",
+        chain_total_len: chain.iter().map(Vec::len).sum(),
+        certs: &certs,
+        allowed_domains: chain
+            .first()
+            .and_then(|leaf| cert_allowed_domains(leaf))
+            .as_deref(),
     }
-    out
+    .render()
 }
 
 fn sha256_hex(der: &[u8]) -> String {
@@ -363,7 +405,41 @@ fn split_host_port(domain: &str) -> Result<(String, u16), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, DnType, KeyPair};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+    use std::time::Instant;
+
+    /// How long a cancelled capture may take to come back. It must be far
+    /// below the budget the call was given, while leaving room for a loaded
+    /// machine and for the endpoint's own teardown.
+    const CANCELLED_CAPTURE_BOUND: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn cancelled_capture_stops_before_its_budget() {
+        // A bound UDP socket answers nothing, so the handshake stalls until
+        // either the 10 s budget or the flag ends it.
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("the sink binds");
+        let target = sink
+            .local_addr()
+            .expect("the sink has an address")
+            .to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelling = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::Release);
+            })
+        };
+        let started = Instant::now();
+        let result = run(Language::En, &[target], Duration::from_secs(10), &stop);
+        let elapsed = started.elapsed();
+        cancelling.join().expect("the cancelling thread joins");
+        assert!(result.is_err(), "a cancelled capture reports no transcript");
+        assert!(
+            elapsed < CANCELLED_CAPTURE_BOUND,
+            "a cancelled capture took {elapsed:?}"
+        );
+    }
 
     fn make_cert(common_name: &str, dns_names: &[String]) -> Vec<u8> {
         let mut params = CertificateParams::new(dns_names.to_vec()).unwrap();
@@ -381,7 +457,7 @@ mod tests {
             &["example.com".into(), "www.example.com".into()],
         );
         let ca = make_cert("Probe Intermediate", &[]);
-        let transcript = render_transcript(
+        let transcript = render_capture(
             "rm-eco.example.com",
             9000,
             "rm-eco.example.com",
@@ -428,9 +504,33 @@ mod tests {
     #[test]
     fn transcript_with_single_leaf_cert() {
         let leaf = make_cert("node.example.com", &["node.example.com".into()]);
-        let transcript = render_transcript("node.example.com", 443, "node.example.com", &[leaf]);
+        let transcript = render_capture("node.example.com", 443, "node.example.com", &[leaf]);
         assert!(transcript.contains("(certs count: 1)"));
         assert!(!transcript.contains("Cert's CA <"));
+    }
+
+    #[test]
+    fn transcript_labels_an_issuer_without_a_common_name_by_position() {
+        let leaf = make_cert("leaf.example.com", &["example.com".into()]);
+        // An issuer with no common name at all, so its row has nothing to
+        // print and falls back to its position in the chain.
+        let unnamed = {
+            let mut params = CertificateParams::new(Vec::new()).expect("params");
+            params.distinguished_name = DistinguishedName::new();
+            let key = KeyPair::generate().expect("key");
+            params
+                .self_signed(&key)
+                .expect("certificate")
+                .der()
+                .to_vec()
+        };
+        let chain = vec![leaf, unnamed];
+        let pin = sha256_hex(&chain[1]);
+        let transcript = render_capture("n.example.com", 443, "n.example.com", &chain);
+        assert!(
+            transcript.contains(&format!("Cert's CA <#1> SHA256:\t{pin}\n")),
+            "{transcript}"
+        );
     }
 
     #[test]
@@ -494,7 +594,7 @@ mod tests {
         let addrs = resolve(&host, port, "").await.unwrap();
         let chain = capture(&addrs, &host).await.unwrap();
         assert!(!chain.is_empty());
-        let transcript = render_transcript(&host, port, &host, &chain);
+        let transcript = render_capture(&host, port, &host, &chain);
         assert!(transcript.contains("Cert's leaf SHA256:\t"));
     }
 }

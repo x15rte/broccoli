@@ -12,6 +12,7 @@
 //!   infra/conf/cfgcommon/duration/duration.go.
 
 pub mod dns;
+pub mod emit;
 pub mod fingerprint;
 pub mod inbound;
 pub mod outbound;

@@ -3,8 +3,9 @@
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message_for_path, t, t_fmt};
+use crate::model::emit;
 use crate::model::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, TUN_INBOUND_TAG,
+    API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, TUN_INBOUND_TAG,
 };
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::assess;
@@ -307,6 +308,11 @@ struct BalancerHeaderText {
 struct RoutingViewCache {
     generation: (u64, u64, Language),
     out_tags: Vec<String>,
+    /// Whether the emitted outbound tags (`emit::outbound_tags`) include a
+    /// server profile's (`srv-…`): the balancer Add button and the rule
+    /// editor's "select all servers" shortcut exist only then. Derived from
+    /// the emission universe, not from the narrower `out_tags` menu.
+    server_outbound_emitted: bool,
     /// Non-empty balancer tags, as offered by the rule editor's target combo.
     bal_tags: Vec<String>,
     /// Every balancer tag (empty ones included) for the rename validator.
@@ -1215,17 +1221,30 @@ impl RoutingScreen {
         // resident for the session.
         self.evict_stale_balancer_runtime(settings);
 
-        // Outbound tags offered as rule targets: every profile + contract
-        // tags (gen always emits freedom "direct" and blackhole "block").
+        // Outbound tags offered as rule targets: every profile in list order
+        // (the document's first outbound is the active profile, so the menu
+        // and the wire order agree) then the built-in freedom "direct" and
+        // blackhole "block". Deliberately narrower than
+        // `emit::outbound_tags`: that answers which tags the *document*
+        // carries, and it also counts the internal `dns-out` DNS-module
+        // outbound — never a traffic target, the same reason the inbound
+        // lists never offer the api/in-tun/dns-in listeners.
         let out_tags: Vec<String> = servers
             .profiles
             .iter()
             .map(ServerProfile::tag)
-            .chain([
-                DIRECT_OUTBOUND_TAG.to_string(),
-                BLOCK_OUTBOUND_TAG.to_string(),
-            ])
+            .chain(
+                emit::BUILTIN_OUTBOUNDS
+                    .iter()
+                    .map(|(_, tag)| (*tag).to_string()),
+            )
             .collect();
+        // Whether the document carries a server outbound (`srv-…`): the two
+        // prefix checks below ask the emitted universe, not the menu vector
+        // above — a selector only ever matches a tag that reaches the wire.
+        let server_outbound_emitted = emit::outbound_tags(servers, settings)
+            .iter()
+            .any(|tag| tag.starts_with("srv-"));
         let bal_tags: Vec<String> = settings
             .routing
             .balancers
@@ -1287,8 +1306,11 @@ impl RoutingScreen {
             })
             .collect();
         // TestRoute dialog inbound options: every local endpoint tag (all
-        // entries, list order) plus the built-in tun/dns/api
-        // listeners and every dokodemo tag.
+        // entries, list order) plus the built-in tun/dns/api listeners and
+        // every dokodemo tag. A different question than `emit::inbound_tags`:
+        // a trial rule may name a listener that is switched off right now —
+        // the dialog offers it, and the core answers for the tags it does not
+        // know — so disabled entries stay in this list on purpose.
         let known_inbounds: Vec<String> = settings
             .local_inbounds
             .iter()
@@ -1315,6 +1337,7 @@ impl RoutingScreen {
         self.view_cache = Some(RoutingViewCache {
             generation,
             out_tags,
+            server_outbound_emitted,
             bal_tags,
             balancer_tags,
             rule_rows,
@@ -2476,9 +2499,7 @@ impl RoutingScreen {
                 .view_cache
                 .as_ref()
                 .expect("view cache populated above")
-                .out_tags
-                .iter()
-                .any(|tag| tag.starts_with("srv-"))
+                .server_outbound_emitted
                 .then_some("srv-");
             let add = ui
                 .add_enabled(
@@ -2613,9 +2634,7 @@ impl RoutingScreen {
                     .view_cache
                     .as_ref()
                     .expect("view cache populated above")
-                    .out_tags
-                    .iter()
-                    .any(|tag| tag.starts_with("srv-"))
+                    .server_outbound_emitted
                     && ui.small_button(t(lang, Key::SelectAllServers)).clicked()
                 {
                     bal.selector = vec!["srv-".into()];
@@ -3745,6 +3764,31 @@ mod view_cache_tests {
             .push(ServerProfile::new("beta", OutboundModel::default()));
         screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert_eq!(screen.view_cache.as_ref().unwrap().out_tags.len(), 4);
+    }
+
+    /// The balancer rows' "is there a server outbound" fact is read from the
+    /// emitted tag universe: only a profile contributes a `srv-…` tag, so the
+    /// Add button and the "select all servers" shortcut follow the profiles
+    /// the document would carry.
+    #[test]
+    fn cached_server_outbound_fact_follows_the_emitted_tags() {
+        let mut screen = RoutingScreen::default();
+        let settings = Settings::default();
+        screen.refresh_view_cache(0, Language::En, &ServersFile::default(), &settings);
+        assert!(
+            !screen.view_cache.as_ref().unwrap().server_outbound_emitted,
+            "a model without profiles emits no server outbound"
+        );
+
+        let mut servers = ServersFile::default();
+        servers
+            .profiles
+            .push(ServerProfile::new("alpha", OutboundModel::default()));
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        assert!(
+            screen.view_cache.as_ref().unwrap().server_outbound_emitted,
+            "a profile tag is a server outbound"
+        );
     }
 
     /// The per-balancer reference counts are a

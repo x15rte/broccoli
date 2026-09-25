@@ -158,6 +158,9 @@ fn socks_to_freedom_e2e() {
             Ok(broccoli::rt::CoreEvt::ActiveConfig {
                 snapshot,
                 transport,
+                // The health-extension fact arms the runtime's own observatory
+                // read; this test reads the launch's snapshot and transport.
+                health_extension: _,
             }) => {
                 assert_eq!(
                     transport,

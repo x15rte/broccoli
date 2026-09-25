@@ -15,7 +15,8 @@
 //! and the scratch-config contract it owns live in `rt/profiles.rs`.
 //! Declared here are the facts every shared path reads for them: the
 //! conflict rule, the busy-reject flavour the begin runner emits for a held
-//! window, the busy-window bookend payload, whether a hard abort must
+//! window, the user-facing operation name the busy window is reported
+//! through, whether a hard abort must
 //! leave the task to its own terminal, whether an unexpected exit cancels
 //! the in-flight task, and where the exactly-one terminal travels when the
 //! worker's own outcome cannot arrive.
@@ -29,9 +30,7 @@ use super::grpc::pb::xray::app::router::command as router_cmd;
 use super::grpc::{
     GrpcClient, add_rule_outcome, balancer_status_diag, routing_context, trial_rule_to_pb,
 };
-use super::jobs::{
-    Busy, ExclusiveSidecar, JobKind, KindRule, OperationKind, ReplyGuard, TestConfigReply,
-};
+use super::jobs::{Busy, ExclusiveSidecar, JobKind, KindRule, ReplyGuard, TestConfigReply};
 use super::{
     AppMessage, ApplyOutput, CoreEvt, CorePhase, DownloadState, LatencyProbeResult, PhaseError,
     ProbeFailure, Runtime, RuntimeStateView, TrialRuleAddOutcome,
@@ -44,7 +43,7 @@ use crate::model::routing::{RouteTestRequest, Rule};
 /// runtime busy frames and the seat's busy reject nest as a message, so a
 /// blocked user reads the same operation name wherever it appears. Query
 /// kinds never occupy the busy window and have no operation name.
-pub(crate) fn operation_name(kind: JobKind) -> Diag {
+pub(crate) fn operation_name(kind: JobKind) -> Option<Diag> {
     let key = match kind {
         JobKind::Start => Key::OperationConnect,
         JobKind::Stop => Key::OperationDisconnect,
@@ -54,9 +53,22 @@ pub(crate) fn operation_name(kind: JobKind) -> Diag {
         JobKind::UpdateCore => Key::OperationUpdateCore,
         JobKind::LatencyProbe => Key::OperationLatencyProbe,
         JobKind::ValidateProfiles => Key::OperationValidateProfiles,
-        kind => unreachable!("query kinds never occupy the busy window: {kind:?}"),
+        JobKind::TestRoute
+        | JobKind::Balancer
+        | JobKind::LoggerRestart
+        | JobKind::TrialRules
+        | JobKind::RuntimeState => return None,
     };
-    Diag::new(key)
+    Some(Diag::new(key))
+}
+
+/// The user-facing name of the kind holding the busy window, for the texts
+/// that report the occupant (the busy rejection, the cancel log). The window
+/// is held by an occupying kind — the registry begins nothing else — and every
+/// occupying kind names itself ([`operation_name`]).
+pub(crate) fn occupant_name(kind: JobKind) -> Diag {
+    kind.operation_name()
+        .expect("a held window is an occupying kind, and every occupying kind names itself")
 }
 
 /// Terminal a query job's reply guard delivers when the job dies without a
@@ -222,27 +234,6 @@ pub(crate) fn exclusive_reject(kind: JobKind) -> ExclusiveReject {
         // that view without releasing the owner that rejected it.
         JobKind::UpdateCore => ExclusiveReject::UpdateSettled,
         kind => unreachable!("query kinds never occupy the busy window: {kind:?}"),
-    }
-}
-
-/// The busy-window bookend payload of each kind, read by
-/// [`JobKind::exclusive_operation_kind`]: `Some` exactly for the occupying
-/// kinds, which is what the runtime's bookend drain relies on.
-pub(crate) fn exclusive_operation_kind(kind: JobKind) -> Option<OperationKind> {
-    match kind {
-        JobKind::Start => Some(OperationKind::Start),
-        JobKind::Stop => Some(OperationKind::Stop),
-        JobKind::Restart => Some(OperationKind::Restart),
-        JobKind::ApplyConfig => Some(OperationKind::ApplyConfig),
-        JobKind::TestConfig => Some(OperationKind::TestConfig),
-        JobKind::UpdateCore => Some(OperationKind::UpdateCore),
-        JobKind::LatencyProbe => Some(OperationKind::LatencyProbe),
-        JobKind::ValidateProfiles => Some(OperationKind::ValidateProfiles),
-        JobKind::TestRoute
-        | JobKind::Balancer
-        | JobKind::LoggerRestart
-        | JobKind::TrialRules
-        | JobKind::RuntimeState => None,
     }
 }
 
@@ -858,7 +849,7 @@ impl Runtime {
                 DiagError::from(output)
             }
             BusyReject::Text => DiagError::from(
-                Diag::new(Key::SeatBusyWithOperation).arg_message(operation_name(active)),
+                Diag::new(Key::SeatBusyWithOperation).arg_message(occupant_name(active)),
             ),
             BusyReject::Impossible => unreachable!(
                 "{:?} never checks the busy window (rule table); the registry cannot reject it",
