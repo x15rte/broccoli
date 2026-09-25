@@ -666,6 +666,88 @@ pub enum ValidationCode {
     /// Configuration warning (class E, Severity::Warning): the
     /// code carries the offending key.
     XhttpExtraShadowsSettings(String),
+
+    // ---- draft requirements ----
+    //
+    // The rules below judge a *server draft*: the empty field a fresh draft
+    // starts from, the value a widget can only judge while the user types it.
+    // Every one of them is a value the wire accepts — Xray builds a config
+    // with an empty id, an empty WireGuard peer list, or a non-string header
+    // value as readily as it builds an empty string — so no model sweep emits
+    // them and no stored profile is refused for carrying them. The editor's
+    // own sweep emits them so a draft rule has an identity (code + tier)
+    // instead of a rendered sentence. Their messages name the field the user
+    // is looking at, so none carries a wire path.
+    /// The profile's protocol tag and its `settings` block name different
+    /// protocols: serde binds the two independently, so a hand-edited state
+    /// file can disagree, and every model rule reads one of them.
+    ProtocolSettingsMismatch,
+    /// A server address field is empty (`settings.address`). An outbound
+    /// dialing the empty host fails every connection.
+    ServerAddressRequired,
+    /// A server port field is zero (`settings.port`).
+    ServerPortRequired,
+    /// VLESS `settings.id` is empty. Xray builds the config and the handler
+    /// rejects every connection for lack of a user id.
+    VlessIdRequired,
+    /// VLESS `settings.encryption` is empty — the handler's encryption
+    /// factory refuses it (`proxy/vless/outbound/outbound.go`: "failed to use
+    /// encryption"). The *value* grammar is [`Self::VlessEncryptionUnsupported`];
+    /// this code is the missing-value state.
+    VlessEncryptionRequired,
+    /// VLESS `settings.reverse.tag` is set but empty: the reverse tag is the
+    /// outbound's own tag on the wire, and an empty one cannot be routed to.
+    VlessReverseTagRequired,
+    /// VMess `settings.id` is empty — the same missing-user state as
+    /// [`Self::VlessIdRequired`].
+    VmessIdRequired,
+    /// VMess `settings.security` is outside the vocabulary Xray's
+    /// `proxy/vmess/outbound` reads, so the core refuses connection attempts
+    /// with an unknown cipher instead of falling back to `auto`.
+    VmessSecurityUnsupported,
+    /// WireGuard `settings.secretKey` is not the base64 of 32 bytes the
+    /// Noise handshake needs (`proxy/wireguard/device` key parsing).
+    WireguardSecretKeyInvalid,
+    /// WireGuard `settings.reserved` is set but not exactly three bytes: the
+    /// value is spliced into the header ahead of the handshake
+    /// (`proxy/wireguard/client.go`), so any other length corrupts it.
+    WireguardReservedKeyBytes,
+    /// WireGuard `settings.peers` is empty: a peer-less tunnel has nothing to
+    /// hand a packet to.
+    WireguardPeersRequired,
+    /// A WireGuard peer's `publicKey` is not the base64 of 32 bytes.
+    WireguardPeerPublicKeyRequired,
+    /// A WireGuard peer's `endpoint` is empty: the dial has no target.
+    WireguardPeerEndpointRequired,
+    /// A set WireGuard peer `preSharedKey` is not the base64 of 32 bytes the
+    /// handshake mixes in.
+    WireguardPresharedKeyInvalid,
+    /// Freedom `settings.fragment` cannot run: Xray's fragment manager
+    /// requires a positive length range and a non-decreasing interval range.
+    FreedomFragmentInvalid,
+    /// A Freedom `settings.noises` entry cannot run: its `type`, `packet`
+    /// payload and `applyTo` value must each match the shape Xray's noise
+    /// manager reads.
+    FreedomNoiseInvalid,
+    /// Loopback `settings.inboundTag` is empty: the outbound hands the
+    /// connection back to the inbound it names, and no inbound carries the
+    /// empty tag.
+    LoopbackTagRequired,
+    /// A transport header map (WebSocket, HTTPUpgrade, or the XHTTP settings'
+    /// own `headers` — the map Xray reads as `map[string]string`) holds a
+    /// JSON value that is not a string. A draft can hold one while the user
+    /// edits a header row; the generated document would refuse to unmarshal.
+    HeaderValueNotString(Network),
+    /// TLS `alpn` carries `fromMitm` alongside other names. Xray substitutes
+    /// its own list only when `fromMitm` is the sole entry
+    /// (`infra/conf/transport_security.go` ALPN handling), so any other
+    /// arrangement sends the literal name and the handshake fails.
+    TlsFromMitmAlpnShort,
+    /// A TLS certificate row has neither `certificateFile` nor inline
+    /// `certificate` lines. Only the editor's row can tell which one the user
+    /// is about to fill in, so the rule lives here rather than in the model
+    /// pass.
+    TlsCertificateRequired,
 }
 
 /// Advisory tier of a [`ValidationIssue`]. `Error` findings block
@@ -686,6 +768,19 @@ pub struct ValidationIssue {
     pub code: ValidationCode,
     pub path: Option<String>,
     pub severity: Severity,
+}
+
+impl ValidationIssue {
+    /// An error-tier finding with no wire path: the rule is about the profile
+    /// as a whole, or its message names the field the user is looking at, so
+    /// no path is prefixed.
+    pub fn error(code: ValidationCode) -> Self {
+        ValidationIssue {
+            code,
+            path: None,
+            severity: Severity::Error,
+        }
+    }
 }
 
 fn issue(code: ValidationCode, path: Option<String>) -> ValidationIssue {
@@ -724,12 +819,15 @@ fn extra_key_set(extra: &Map<String, Value>, key: &str) -> bool {
         .any(|(candidate, value)| candidate.eq_ignore_ascii_case(key) && !value.is_null())
 }
 
-/// True when a VLESS `flow` is one of the two vision (XRV) variants. The
-/// single definition of the set, shared by the transport-security rule, the
-/// mux+vision warning, and the share-link grammar — a new vision variant
-/// must be added here, never at a call site.
+/// The vision (XRV) flow spellings Xray's XRV servers accept, in display
+/// order — the set [`is_vision_flow`] judges. Spelled once: the
+/// transport-security rule, the mux+vision warning, the share-link grammar
+/// and the VLESS flow combo all reach it through these two items.
+pub const VISION_FLOW_OPTIONS: &[&str] = &["xtls-rprx-vision", "xtls-rprx-vision-udp443"];
+
+/// True when a VLESS `flow` is one of the two vision (XRV) variants.
 pub fn is_vision_flow(flow: &str) -> bool {
-    matches!(flow, "xtls-rprx-vision" | "xtls-rprx-vision-udp443")
+    VISION_FLOW_OPTIONS.contains(&flow)
 }
 
 /// Mux/vision predicate (shared with the editor's targeted-inline hints, so
@@ -836,35 +934,69 @@ fn vless_flow_supported(flow: &str) -> bool {
     flow.is_empty() || is_vision_flow(flow)
 }
 
+/// The VMess `settings.security` vocabulary: the ciphers Xray's
+/// `proxy/vmess/outbound` reads, matched exactly (the core's cipher list is
+/// a map lookup, so a case variant is an unknown cipher). The editor combo
+/// and the share-link grammar both read this list.
+pub const VMESS_SECURITY_OPTIONS: &[&str] = &["auto", "aes-128-gcm", "chacha20-poly1305"];
+
+/// True when a VMess `settings.security` names one of
+/// [`VMESS_SECURITY_OPTIONS`].
+pub fn vmess_security_supported(security: &str) -> bool {
+    VMESS_SECURITY_OPTIONS.contains(&security)
+}
+
+/// The AEAD method vocabulary: the canonical spellings, then the legacy
+/// aliases Xray's `cipherFromString` folds onto them (each alias sits beside
+/// the canonical name it names). Compared case-insensitively.
+const SS_AEAD_METHODS: &[&str] = &[
+    "aes-128-gcm",
+    "aead_aes_128_gcm",
+    "aes-256-gcm",
+    "aead_aes_256_gcm",
+    "chacha20-poly1305",
+    "aead_chacha20_poly1305",
+    "chacha20-ietf-poly1305",
+    "xchacha20-poly1305",
+    "aead_xchacha20_poly1305",
+    "xchacha20-ietf-poly1305",
+];
+
+/// The Shadowsocks-2022 method names, matched exactly by Xray's
+/// `shadowaead_2022.List` (a map lookup: a case variant is not a method).
+const SS_METHODS_2022: &[&str] = &[
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+];
+
+/// The Shadowsocks method vocabulary the editors offer and the share links
+/// spell, in display order: the four canonical AEAD methods, then the 2022
+/// methods. Spelled element-wise from the two accepted lists, so the offered
+/// set can never hold a method the rule refuses (the legacy alias spellings
+/// are accepted but never offered).
+pub const SS_METHOD_OPTIONS: &[&str] = &[
+    SS_AEAD_METHODS[0],
+    SS_AEAD_METHODS[2],
+    SS_AEAD_METHODS[6],
+    SS_AEAD_METHODS[9],
+    SS_METHODS_2022[0],
+    SS_METHODS_2022[1],
+    SS_METHODS_2022[2],
+];
+
 /// True when a Shadowsocks `method` is in Xray's
 /// accepted vocabulary — the AEAD methods and their legacy alias spellings
 /// (case-insensitive, `cipherFromString`) plus the exact 2022 method names
 /// (`shadowaead_2022.List`). Legacy *stream* ciphers (e.g. `aes-256-cfb`)
 /// and anything else fall through to the unknown-cipher load error and are
-/// unsupported. The literal lists mirror the import whitelist
-/// (`links::validate_profile`, Shadowsocks arm).
-fn shadowsocks_method_supported(method: &str) -> bool {
-    const AEAD_METHODS: &[&str] = &[
-        "aes-128-gcm",
-        "aead_aes_128_gcm",
-        "aes-256-gcm",
-        "aead_aes_256_gcm",
-        "chacha20-poly1305",
-        "aead_chacha20_poly1305",
-        "chacha20-ietf-poly1305",
-        "xchacha20-poly1305",
-        "aead_xchacha20_poly1305",
-        "xchacha20-ietf-poly1305",
-    ];
-    const METHODS_2022: &[&str] = &[
-        "2022-blake3-aes-128-gcm",
-        "2022-blake3-aes-256-gcm",
-        "2022-blake3-chacha20-poly1305",
-    ];
-    AEAD_METHODS
+/// unsupported. The share-link grammar calls this predicate instead of
+/// re-listing the methods.
+pub fn shadowsocks_method_supported(method: &str) -> bool {
+    SS_AEAD_METHODS
         .iter()
         .any(|accepted| method.eq_ignore_ascii_case(accepted))
-        || METHODS_2022.contains(&method)
+        || SS_METHODS_2022.contains(&method)
 }
 
 /// True when a Shadowsocks-2022 `password` is usable key
@@ -1002,13 +1134,18 @@ pub fn pinned_peer_cert_sha256_valid(value: &str) -> bool {
         })
 }
 
-/// True when `version` is a TLS version string Xray's
-/// transport layer maps onto a concrete TLS version
-/// (transport/internet/tls/config.go switches); every other non-empty
+/// The TLS version vocabulary Xray's transport layer maps onto a concrete
+/// TLS version (transport/internet/tls/config.go switches); every other
 /// string is accepted by the conf loader but silently dropped, leaving the
-/// Go defaults in place. Mirrors the `TLS_VERSIONS` editor list.
+/// Go defaults in place. Empty is the field's wire default rather than a
+/// version — the rules that judge a version check emptiness themselves — so
+/// it is not an entry here; the version combos add their own empty display
+/// entry.
+pub const TLS_VERSION_OPTIONS: &[&str] = &["1.0", "1.1", "1.2", "1.3"];
+
+/// True when `version` names one of [`TLS_VERSION_OPTIONS`].
 pub fn tls_version_supported(version: &str) -> bool {
-    matches!(version, "1.0" | "1.1" | "1.2" | "1.3")
+    TLS_VERSION_OPTIONS.contains(&version)
 }
 
 /// Monotonic rank of one wire TLS version in {1.0, 1.1, 1.2, 1.3} — the
@@ -1034,44 +1171,64 @@ pub fn tls_version_rank(version: &str) -> Option<u8> {
 // 317-459): every non-`""` value outside the sets below is refused at Xray
 // conf load, and `""` is always the wire default of the field it feeds.
 
-/// True when an XHTTP `mode` is one Xray accepts —
-/// empty (wire default `auto`) or one of the four modes. Xray's conf build
-/// rejects every other string ("unsupported mode").
+/// The XHTTP `mode` vocabulary: empty (wire default `auto`) or one of the
+/// four modes. Xray's conf build rejects every other string ("unsupported
+/// mode"). The editor's mode combo aliases this list.
+pub const XHTTP_MODE_OPTIONS: &[&str] = &["", "auto", "packet-up", "stream-up", "stream-one"];
+
+/// True when an XHTTP `mode` is one Xray accepts — empty (wire default
+/// `auto`) or one of the four modes.
 pub fn xhttp_mode_supported(mode: &str) -> bool {
-    matches!(mode, "" | "auto" | "packet-up" | "stream-up" | "stream-one")
+    XHTTP_MODE_OPTIONS.contains(&mode)
 }
 
-/// `xPaddingPlacement` vocabulary — empty (wire default
-/// `queryInHeader`) or one of the four placements Xray accepts.
+/// The `xPaddingPlacement` vocabulary: empty (wire default `queryInHeader`)
+/// or one of the four placements Xray accepts.
+pub const X_PADDING_PLACEMENT_OPTIONS: &[&str] =
+    &["", "cookie", "header", "query", "queryInHeader"];
+
+/// True when an `xPaddingPlacement` is one of
+/// [`X_PADDING_PLACEMENT_OPTIONS`].
 pub fn xpadding_placement_supported(placement: &str) -> bool {
-    matches!(
-        placement,
-        "" | "cookie" | "header" | "query" | "queryInHeader"
-    )
+    X_PADDING_PLACEMENT_OPTIONS.contains(&placement)
 }
 
-/// `xPaddingMethod` vocabulary — empty (wire default
-/// `repeat-x`) or one of the two methods Xray accepts.
+/// The `xPaddingMethod` vocabulary: empty (wire default `repeat-x`) or one
+/// of the two methods Xray accepts.
+pub const XPADDING_METHOD_OPTIONS: &[&str] = &["", "repeat-x", "tokenish"];
+
+/// True when an `xPaddingMethod` is one of [`XPADDING_METHOD_OPTIONS`].
 pub fn xpadding_method_supported(method: &str) -> bool {
-    matches!(method, "" | "repeat-x" | "tokenish")
+    XPADDING_METHOD_OPTIONS.contains(&method)
 }
 
-/// `uplinkDataPlacement` vocabulary — empty (wire
-/// default `auto`) or one of the four placements Xray accepts.
+/// The `uplinkDataPlacement` vocabulary: empty (wire default `auto`) or one
+/// of the four placements Xray accepts.
+pub const UPLINK_DATA_PLACEMENT_OPTIONS: &[&str] = &["", "auto", "body", "cookie", "header"];
+
+/// True when an `uplinkDataPlacement` is one of
+/// [`UPLINK_DATA_PLACEMENT_OPTIONS`].
 pub fn uplink_data_placement_supported(placement: &str) -> bool {
-    matches!(placement, "" | "auto" | "body" | "cookie" | "header")
+    UPLINK_DATA_PLACEMENT_OPTIONS.contains(&placement)
 }
 
-/// `sessionIDPlacement` / `seqPlacement` vocabulary —
-/// both accept empty (wire default `path`) plus the same four placements.
+/// The `sessionIDPlacement` vocabulary: empty (wire default `path`) plus the
+/// four placements Xray accepts.
+pub const SESSION_ID_PLACEMENT_OPTIONS: &[&str] = &["", "path", "cookie", "header", "query"];
+
+/// True when a `sessionIDPlacement` is one of
+/// [`SESSION_ID_PLACEMENT_OPTIONS`].
 pub fn session_id_placement_supported(placement: &str) -> bool {
-    matches!(placement, "" | "path" | "cookie" | "header" | "query")
+    SESSION_ID_PLACEMENT_OPTIONS.contains(&placement)
 }
 
-/// `seqPlacement` uses exactly the sessionID placement
-/// vocabulary upstream; one definition.
+/// `seqPlacement` uses exactly the sessionID placement vocabulary upstream;
+/// one list and one predicate.
+pub const SEQ_PLACEMENT_OPTIONS: &[&str] = SESSION_ID_PLACEMENT_OPTIONS;
+
+/// True when a `seqPlacement` is one of [`SEQ_PLACEMENT_OPTIONS`].
 pub fn seq_placement_supported(placement: &str) -> bool {
-    session_id_placement_supported(placement)
+    SEQ_PLACEMENT_OPTIONS.contains(&placement)
 }
 
 /// True when an `xPaddingBytes` range is acceptable —
@@ -1164,43 +1321,71 @@ pub(crate) fn range_has_session_room(table: &str, range: crate::model::Int32Rang
 /// profile or the raw config override.
 pub const TPROXY_MODES: &[&str] = &["off", "redirect", "tproxy"];
 
+/// The target-domain-strategy vocabulary: every value Xray's outbound
+/// `targetStrategy` switch and freedom `domainStrategy` switch accept
+/// (infra/conf/xray.go OutboundDetectorConfig.Build and conf/freedom.go read
+/// the same word list). Comparison folds case — Xray lowercases the value
+/// before switching — and empty is the wire default (`asis`), which the
+/// rules that judge a strategy check themselves. The strategy combos alias
+/// this list.
+pub const TARGET_STRATEGY_OPTIONS: &[&str] = &[
+    "AsIs",
+    "UseIP",
+    "UseIPv4",
+    "UseIPv6",
+    "UseIPv4v6",
+    "UseIPv6v4",
+    "ForceIP",
+    "ForceIPv4",
+    "ForceIPv6",
+    "ForceIPv6v4",
+    "ForceIPv4v6",
+];
+
 /// True when `target_strategy` names one of Xray's
 /// outbound target domain strategies, case-insensitively — Xray lowercases
 /// the value before its switch (infra/conf/xray.go OutboundDetectorConfig
 /// Build). Empty stays legal (the wire default `asis`).
 fn target_strategy_supported(strategy: &str) -> bool {
-    TARGET_STRATEGIES
+    TARGET_STRATEGY_OPTIONS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
 }
 
 /// True when a freedom `domainStrategy`
 /// value names one of the strategies Xray's FreedomConfig.Build switch
-/// accepts — the very same ten-value list as the outbound `targetStrategy`
+/// accepts — the very same word list as the outbound `targetStrategy`
 /// rule, compared the same case-insensitive way (Xray lowercases before
 /// switching, conf/freedom.go). Empty is separately legal (the wire
 /// default `asis`).
 fn freedom_domain_strategy_supported(strategy: &str) -> bool {
-    TARGET_STRATEGIES
+    target_strategy_supported(strategy)
+}
+
+/// The `settings.domainStrategy` vocabulary the WireGuard editor offers —
+/// the resolution strategies the core's WireGuard endpoint dial runs a peer
+/// host through, plus the empty zero value that leaves the core's own
+/// `forceip` default in place. The WireGuard profile's own default is spelled
+/// `forceip`, so comparison folds case.
+pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
+    "",
+    "ForceIP",
+    "ForceIPv4",
+    "ForceIPv6",
+    "ForceIPv4v6",
+    "ForceIPv6v4",
+];
+
+/// True when a WireGuard `settings.domainStrategy` is one of
+/// [`WG_TARGET_STRATEGY_OPTIONS`]. The field is a *hint* to the dial: the
+/// core keeps its own default for an unknown value, so the profile still
+/// runs and no model rule gates on this predicate — the editor combo and
+/// this predicate are its whole reach.
+pub fn wg_target_strategy_supported(strategy: &str) -> bool {
+    WG_TARGET_STRATEGY_OPTIONS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
 }
-
-/// The Xray target domain strategy vocabulary, lowercased as Xray compares
-/// it (infra/conf/xray.go OutboundDetectorConfig.Build).
-const TARGET_STRATEGIES: &[&str] = &[
-    "asis",
-    "useip",
-    "useipv4",
-    "useipv6",
-    "useipv4v6",
-    "useipv6v4",
-    "forceip",
-    "forceipv4",
-    "forceipv6",
-    "forceipv4v6",
-    "forceipv6v4",
-];
 
 // ---------- outbound envelope / DNS-rule vocabularies ----------
 //
@@ -2320,48 +2505,66 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
     issues
 }
 
+/// The sockopt `domainStrategy` vocabulary: the empty wire default plus the
+/// same word list the outbound `targetStrategy` rule reads
+/// (infra/conf/transport_sockopt.go hands the value to the dial's resolver).
+/// The sockopt combo aliases this list.
+pub const SOCKOPT_DOMAIN_STRATEGY_OPTIONS: &[&str] = &[
+    "",
+    "AsIs",
+    "UseIP",
+    "UseIPv4",
+    "UseIPv6",
+    "UseIPv4v6",
+    "UseIPv6v4",
+    "ForceIP",
+    "ForceIPv4",
+    "ForceIPv6",
+    "ForceIPv4v6",
+    "ForceIPv6v4",
+];
+
+/// True when a sockopt `domainStrategy` is one of
+/// [`SOCKOPT_DOMAIN_STRATEGY_OPTIONS`], case-insensitively.
+pub fn sockopt_domain_strategy_supported(strategy: &str) -> bool {
+    SOCKOPT_DOMAIN_STRATEGY_OPTIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+}
+
+/// The sockopt `addressPortStrategy` vocabulary: the empty wire default plus
+/// the SRV/TXT lookup orders Xray's dialer reads
+/// (infra/conf/transport_sockopt.go). The sockopt combo aliases this list.
+pub const SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS: &[&str] = &[
+    "",
+    "none",
+    "srvportonly",
+    "srvaddressonly",
+    "srvportandaddress",
+    "txtportonly",
+    "txtaddressonly",
+    "txtportandaddress",
+];
+
+/// True when a sockopt `addressPortStrategy` is one of
+/// [`SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS`], case-insensitively.
+pub fn sockopt_address_port_strategy_supported(strategy: &str) -> bool {
+    SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+}
+
 /// Validate one sockopt block. `prefix` is the wire path prefix that scopes
 /// every field finding (e.g. `"stream.sockopt"`).
 pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Vec<ValidationIssue> {
-    const DOMAIN_STRATEGIES: &[&str] = &[
-        "",
-        "asis",
-        "useip",
-        "useipv4",
-        "useipv6",
-        "useipv4v6",
-        "useipv6v4",
-        "forceip",
-        "forceipv4",
-        "forceipv6",
-        "forceipv4v6",
-        "forceipv6v4",
-    ];
-    const ADDRESS_PORT_STRATEGIES: &[&str] = &[
-        "",
-        "none",
-        "srvportonly",
-        "srvaddressonly",
-        "srvportandaddress",
-        "txtportonly",
-        "txtaddressonly",
-        "txtportandaddress",
-    ];
-
     let mut issues = Vec::new();
-    if !DOMAIN_STRATEGIES
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&s.domain_strategy))
-    {
+    if !sockopt_domain_strategy_supported(&s.domain_strategy) {
         issues.push(issue(
             ValidationCode::SockoptDomainStrategyInvalid,
             Some(format!("{prefix}.domainStrategy")),
         ));
     }
-    if !ADDRESS_PORT_STRATEGIES
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&s.address_port_strategy))
-    {
+    if !sockopt_address_port_strategy_supported(&s.address_port_strategy) {
         issues.push(issue(
             ValidationCode::SockoptAddressPortStrategyInvalid,
             Some(format!("{prefix}.addressPortStrategy")),
@@ -4105,6 +4308,105 @@ mod tests {
 
     fn codes(issues: &[ValidationIssue]) -> Vec<ValidationCode> {
         issues.iter().map(|issue| issue.code.clone()).collect()
+    }
+
+    /// Every published field vocabulary and the predicate that judges it
+    /// agree: the predicate accepts each entry of the list, and refuses the
+    /// near-misses the list does not hold (a case variant of a case-sensitive
+    /// vocabulary, a spelling with stray whitespace, a value one step past
+    /// the set). A combo that offers a value its own rule refuses, or a rule
+    /// that drifts off its list, reds here.
+    #[test]
+    fn field_vocabularies_and_their_predicates_agree() {
+        fn couples(options: &[&str], accepts: impl Fn(&str) -> bool, refused: &[&str]) {
+            assert!(
+                !options.is_empty(),
+                "a published vocabulary must hold the values it offers"
+            );
+            for entry in options {
+                assert!(
+                    accepts(entry),
+                    "{entry:?} is in its vocabulary and refused by its predicate"
+                );
+            }
+            for neighbour in refused {
+                assert!(
+                    !accepts(neighbour),
+                    "{neighbour:?} is outside the vocabulary and must be refused"
+                );
+            }
+        }
+
+        couples(
+            TARGET_STRATEGY_OPTIONS,
+            target_strategy_supported,
+            &["ForceIPv6v4 ", "asis+", "bogus"],
+        );
+        couples(
+            WG_TARGET_STRATEGY_OPTIONS,
+            wg_target_strategy_supported,
+            &["ForceIPv6v4 ", "UseIP", "bogus"],
+        );
+        couples(
+            SOCKOPT_DOMAIN_STRATEGY_OPTIONS,
+            sockopt_domain_strategy_supported,
+            &["asis+", "bogus"],
+        );
+        couples(
+            SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
+            sockopt_address_port_strategy_supported,
+            &["srvportonly ", "txtportandaddress!", "bogus"],
+        );
+        couples(
+            SS_METHOD_OPTIONS,
+            shadowsocks_method_supported,
+            &["", "aes-128-gcm ", "2022-BLAKE3-AES-128-GCM", "bogus"],
+        );
+        couples(
+            XHTTP_MODE_OPTIONS,
+            xhttp_mode_supported,
+            &["packet_up", "stream-one-plus", "bogus"],
+        );
+        couples(
+            X_PADDING_PLACEMENT_OPTIONS,
+            xpadding_placement_supported,
+            &["queryinheader", "body", "bogus"],
+        );
+        couples(
+            XPADDING_METHOD_OPTIONS,
+            xpadding_method_supported,
+            &["repeatx", "cookie", "bogus"],
+        );
+        couples(
+            UPLINK_DATA_PLACEMENT_OPTIONS,
+            uplink_data_placement_supported,
+            &["path", "body ", "bogus"],
+        );
+        couples(
+            SESSION_ID_PLACEMENT_OPTIONS,
+            session_id_placement_supported,
+            &["body", "query ", "bogus"],
+        );
+        couples(
+            SEQ_PLACEMENT_OPTIONS,
+            seq_placement_supported,
+            &["body", "query ", "bogus"],
+        );
+        couples(
+            TLS_VERSION_OPTIONS,
+            tls_version_supported,
+            &["", "1.4", "TLSv1.3", "bogus"],
+        );
+        couples(
+            VMESS_SECURITY_OPTIONS,
+            vmess_security_supported,
+            &["", "AES-128-GCM", "auto ", "bogus"],
+        );
+        couples(
+            VISION_FLOW_OPTIONS,
+            is_vision_flow,
+            &["", "xtls-rprx-vision-udp444", "bogus"],
+        );
     }
 
     #[test]

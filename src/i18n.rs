@@ -2347,6 +2347,36 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
         FakeDnsPoolCapacityExceeded(_, _, _) => t(lang, Key::SettingsFakeDnsPoolCapacityExceeded),
         GeodataUrlInvalid(_) => t(lang, Key::SettingsGeodataUrlInvalid),
         GeodataCronInvalid => t(lang, Key::SettingsGeodataCronInvalid),
+        // Draft requirements: the editor's own rules, each rendering the
+        // message the editor has always shown for that field.
+        ProtocolSettingsMismatch => t(lang, Key::SrvProtocolSettingsMismatch),
+        ServerAddressRequired => t(lang, Key::SrvAddressRequired),
+        ServerPortRequired => t(lang, Key::SrvPortRequired),
+        VlessIdRequired => t(lang, Key::SrvVlessIdUuid),
+        VlessEncryptionRequired => t(lang, Key::SrvVlessEncryptionInvalid),
+        VlessReverseTagRequired => t(lang, Key::SrvVlessReverseTagRequired),
+        VmessIdRequired => t(lang, Key::SrvVmessIdUuid),
+        VmessSecurityUnsupported => t(lang, Key::SrvVmessSecurityUnsupported),
+        WireguardSecretKeyInvalid => t(lang, Key::SrvWgSecretInvalid),
+        WireguardReservedKeyBytes => t(lang, Key::SrvWgReservedThreeBytes),
+        WireguardPeersRequired => t(lang, Key::SrvWgAtLeastOnePeer),
+        WireguardPeerPublicKeyRequired => t(lang, Key::SrvWgPeerPublicKeyRequired),
+        WireguardPeerEndpointRequired => t(lang, Key::SrvWgPeerEndpointRequired),
+        WireguardPresharedKeyInvalid => t(lang, Key::SrvWgPresharedInvalid),
+        FreedomFragmentInvalid => t(lang, Key::SrvFreedomFragmentInvalid),
+        FreedomNoiseInvalid => t(lang, Key::SrvFreedomNoiseInvalid),
+        LoopbackTagRequired => t(lang, Key::SrvLoopbackTagRequired),
+        HeaderValueNotString(network) => match network {
+            Network::Xhttp => t(lang, Key::SrvXhttpHeaderValueString),
+            Network::Ws => t(lang, Key::SrvWsHeaderValueString),
+            Network::Httpupgrade => t(lang, Key::SrvHttpupgradeHeaderValueString),
+            _ => {
+                debug_assert!(false, "HeaderValueNotString cannot name {network:?}");
+                t(lang, Key::SrvXhttpHeaderValueString)
+            }
+        },
+        TlsFromMitmAlpnShort => t(lang, Key::SrvFromMitmOnlyAlpnShort),
+        TlsCertificateRequired => t(lang, Key::SrvTlsCertFileOrPem),
     }
 }
 

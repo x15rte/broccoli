@@ -1057,11 +1057,14 @@ impl OutboundModel {
             settings.encryption = "none".to_string();
         }
         if let ProtocolSettings::Vmess(settings) = &mut self.settings
-            && !matches!(
-                settings.security.as_str(),
-                "auto" | "aes-128-gcm" | "chacha20-poly1305"
-            )
+            && !super::validation::vmess_security_supported(&settings.security)
         {
+            // The rewrite is generation's, not the profile's: a value outside
+            // the vocabulary dies silently on the wire (the emitted document
+            // carries the core's own default), so the editor refuses the
+            // value instead of rewriting it in place, and this branch only
+            // keeps generation able to emit a document from whatever the
+            // profile holds.
             settings.security = "auto".to_string();
         }
         if self.protocol == Protocol::Hysteria {

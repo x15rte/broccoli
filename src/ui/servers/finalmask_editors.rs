@@ -843,7 +843,7 @@ fn finalmask_realm_tls_editor(
         ui,
         "minVersion",
         &mut tls.min_version,
-        TLS_VERSIONS,
+        &TLS_VERSIONS,
         t(lang, Key::SrvDefault),
         false,
     );
@@ -851,7 +851,7 @@ fn finalmask_realm_tls_editor(
         ui,
         "maxVersion",
         &mut tls.max_version,
-        TLS_VERSIONS,
+        &TLS_VERSIONS,
         t(lang, Key::SrvDefault),
         false,
     );

@@ -21,11 +21,11 @@ use crate::model::outbound::{
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
 use crate::model::validation::{
-    DNS_OUT_ACTIONS, Severity, ValidationCode, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
-    freedom_final_rule_supported, mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid,
-    reality_mldsa65_verify_valid, reality_public_key_valid, send_through_supported,
-    server_name_implausible, tls_version_rank, validate_finalmask, validate_outbound,
-    validate_sockopt,
+    self, DNS_OUT_ACTIONS, Severity, ValidationCode, ValidationIssue, XUDP_PROXY_UDP443_MODES,
+    dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
+    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
+    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
+    validate_outbound, validate_sockopt, vmess_security_supported,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -70,46 +70,65 @@ use validators::{
 /// has never offered. The REALITY combo offers its own trimmed option set
 /// ([`fingerprint_allowed`]).
 const FINGERPRINTS: &[&str] = crate::model::fingerprint::FINGERPRINTS;
-const TARGET_STRATEGIES: &[&str] = &[
-    "AsIs",
-    "UseIP",
-    "UseIPv4",
-    "UseIPv6",
-    "UseIPv4v6",
-    "UseIPv6v4",
-    "ForceIP",
-    "ForceIPv4",
-    "ForceIPv6",
-    "ForceIPv6v4",
-    "ForceIPv4v6",
-];
-const WG_TARGET_STRATEGIES: &[&str] = &[
+
+// The combo tables below are the model's own field vocabularies
+// (src/model/validation.rs), where the predicate that judges each value
+// lives: an alias where the wire vocabulary includes the combo's empty
+// "(default)" entry, and the same vocabulary spelled element-wise behind that
+// entry where the empty string is not a value the rule accepts (a fresh
+// profile's field is empty, and the combo must still offer the way back to
+// it). A field's spellings live in the model, never here.
+const TARGET_STRATEGIES: &[&str] = validation::TARGET_STRATEGY_OPTIONS;
+const WG_TARGET_STRATEGIES: &[&str] = validation::WG_TARGET_STRATEGY_OPTIONS;
+const VMESS_SECURITY: &[&str] = validation::VMESS_SECURITY_OPTIONS;
+const XHTTP_MODES: &[&str] = validation::XHTTP_MODE_OPTIONS;
+const X_PADDING_PLACEMENTS: &[&str] = validation::X_PADDING_PLACEMENT_OPTIONS;
+const SESSION_PLACEMENTS: &[&str] = validation::SESSION_ID_PLACEMENT_OPTIONS;
+const UPLINK_PLACEMENTS: &[&str] = validation::UPLINK_DATA_PLACEMENT_OPTIONS;
+const PADDING_METHODS: &[&str] = validation::XPADDING_METHOD_OPTIONS;
+
+/// The Shadowsocks method combo's display options: the empty "(default)"
+/// entry a fresh profile starts from, then the model method vocabulary
+/// spelled element-wise so the two can never drift.
+const SS_METHODS: [&str; validation::SS_METHOD_OPTIONS.len() + 1] = [
     "",
-    "ForceIP",
-    "ForceIPv4",
-    "ForceIPv6",
-    "ForceIPv4v6",
-    "ForceIPv6v4",
+    validation::SS_METHOD_OPTIONS[0],
+    validation::SS_METHOD_OPTIONS[1],
+    validation::SS_METHOD_OPTIONS[2],
+    validation::SS_METHOD_OPTIONS[3],
+    validation::SS_METHOD_OPTIONS[4],
+    validation::SS_METHOD_OPTIONS[5],
+    validation::SS_METHOD_OPTIONS[6],
 ];
-const SS_METHODS: &[&str] = &[
+
+/// The TLS min/max version combos' display options: the empty "(default)"
+/// entry, then the model version vocabulary element-wise.
+const TLS_VERSIONS: [&str; validation::TLS_VERSION_OPTIONS.len() + 1] = [
     "",
-    "aes-128-gcm",
-    "aes-256-gcm",
-    "chacha20-ietf-poly1305",
-    "xchacha20-ietf-poly1305",
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
+    validation::TLS_VERSION_OPTIONS[0],
+    validation::TLS_VERSION_OPTIONS[1],
+    validation::TLS_VERSION_OPTIONS[2],
+    validation::TLS_VERSION_OPTIONS[3],
 ];
-const VMESS_SECURITY: &[&str] = &["auto", "aes-128-gcm", "chacha20-poly1305"];
-const VLESS_FLOW: &[&str] = &["", "xtls-rprx-vision", "xtls-rprx-vision-udp443"];
-const XHTTP_MODES: &[&str] = &["", "auto", "packet-up", "stream-up", "stream-one"];
-const X_PADDING_PLACEMENTS: &[&str] = &["", "cookie", "header", "query", "queryInHeader"];
-const SESSION_PLACEMENTS: &[&str] = &["", "path", "cookie", "header", "query"];
-const UPLINK_PLACEMENTS: &[&str] = &["", "auto", "body", "cookie", "header"];
-const UPLINK_STREAM_PLACEMENTS: &[&str] = &["", "auto", "body"];
-const PADDING_METHODS: &[&str] = &["", "repeat-x", "tokenish"];
-const TLS_VERSIONS: &[&str] = &["", "1.0", "1.1", "1.2", "1.3"];
+
+/// The VLESS flow combo's display options: the empty "(default)" entry a
+/// plain profile carries, then the model's vision-flow vocabulary
+/// element-wise (the two XRV spellings Xray's servers accept).
+const VLESS_FLOW: [&str; validation::VISION_FLOW_OPTIONS.len() + 1] = [
+    "",
+    validation::VISION_FLOW_OPTIONS[0],
+    validation::VISION_FLOW_OPTIONS[1],
+];
+
+/// The uplink placement options the combos off `packet-up` offer: the model
+/// vocabulary minus the placements the cross-field rule refuses there
+/// (cookies and headers carry the upload only in the packet-up form), so the
+/// stream-up/stream-one tables are the first entries of the model list.
+const UPLINK_STREAM_PLACEMENTS: [&str; 3] = [
+    validation::UPLINK_DATA_PLACEMENT_OPTIONS[0],
+    validation::UPLINK_DATA_PLACEMENT_OPTIONS[1],
+    validation::UPLINK_DATA_PLACEMENT_OPTIONS[2],
+];
 
 // ---------- delete-confirmation reference scan ----------
 
@@ -164,18 +183,26 @@ fn server_reference_paths(
 
 // ---------- editor validation sweep ----------
 
-fn require_address(errors: &mut Vec<String>, lang: Language, address: &str) {
+/// A server draft's address field must carry something: a fresh draft starts
+/// empty and the editor refuses to commit it. Protocols whose model rule
+/// judges the address themselves (Trojan/Shadowsocks completeness) do not
+/// reach here.
+fn require_address(blocking: &mut Vec<ValidationIssue>, address: &str) {
     if address.trim().is_empty() {
-        errors.push(t(lang, Key::SrvAddressRequired).to_string());
+        blocking.push(ValidationIssue::error(
+            ValidationCode::ServerAddressRequired,
+        ));
     }
 }
-/// Empty-address / port-0 draft essentials for protocols with no model rule
-/// for them (the VLESS/VMess/Trojan/Shadowsocks arms moved to the model
-/// pass; their UI pushes were deleted — one message channel).
-fn require_remote(errors: &mut Vec<String>, lang: Language, address: &str, port: u16) {
-    require_address(errors, lang, address);
+
+/// Empty-address / port-0 draft essentials for the protocols with no model
+/// rule for them (the VLESS/VMess port-0 and non-UUID-id pushes are the
+/// model's `SettingsPortZero` / `SettingsIdNotUuid` instead — one message
+/// channel per value).
+fn require_remote(blocking: &mut Vec<ValidationIssue>, address: &str, port: u16) {
+    require_address(blocking, address);
     if port == 0 {
-        errors.push(t(lang, Key::SrvPortRequired).to_string());
+        blocking.push(ValidationIssue::error(ValidationCode::ServerPortRequired));
     }
 }
 
@@ -257,106 +284,244 @@ const DNS_RULE_ACTION_OPTIONS: [&str; DNS_OUT_ACTIONS.len() + 1] = [
     DNS_OUT_ACTIONS[3],
 ];
 
-/// One full editor validation sweep: `(blocking errors, advisory warnings,
-/// inline outbound verdicts)`. Warning findings (`Severity::Warning`) never
-/// block save or add — they render amber under their own header, and callers
-/// gate only on the error half. The third half is the same sweep's
-/// public-endpoint TLS rules, rendered inline at the end of the Basic tab's
-/// fields instead of re-validating on every repaint.
-fn editor_validation_errors(
+/// One full editor validation sweep, as findings: the model rules for the
+/// outbound, its stream security and the transport's own blocks, plus the
+/// draft requirements the editor owns — the empty state a fresh draft starts
+/// from, and the value only the widget being typed in can judge. Nothing here
+/// is rendered; [`EditorValidationFindings::render`] turns a sweep into the
+/// strings the lists and the inline verdicts show, once per (draft
+/// generation, language).
+#[derive(Default)]
+struct EditorValidationFindings {
+    /// Blocking findings (Severity::Error) — the only half that gates
+    /// Validate-and-save and the leave modal's Save.
+    blocking: Vec<ValidationIssue>,
+    /// Advisory findings (Severity::Warning) — rendered amber under their own
+    /// header; never gate anything.
+    advisory: Vec<ValidationIssue>,
+    /// The Advanced tab's inline finalmask verdict: `validate_finalmask`
+    /// findings in model order (TCP masks, UDP masks, QUIC params).
+    finalmask: Vec<ValidationIssue>,
+    /// The Advanced tab's inline `stream.sockopt` verdict.
+    stream_sockopt: Vec<ValidationIssue>,
+    /// The Security tab's inline verdict for the TLS settings' ECH DNS-query
+    /// socket options (`stream.tlsSettings.echSockopt`).
+    ech_sockopt: Vec<ValidationIssue>,
+}
+
+/// The rendered form of one sweep: one `path: message` string per finding, in
+/// the sweep's order. Rebuilt when the draft generation or the language
+/// moves, so no paint path renders a finding.
+#[derive(Default)]
+struct EditorValidationRender {
+    blocking: Vec<String>,
+    advisory: Vec<String>,
+    finalmask: Vec<String>,
+    stream_sockopt: Vec<String>,
+    ech_sockopt: Vec<String>,
+    /// The Basic tab's inline outbound verdicts: the blocking findings whose
+    /// code names a public-endpoint transport-security rule.
+    basic_inline: Vec<String>,
+}
+
+/// Render one finding list through the shared i18n seam.
+fn render_findings<'a>(
+    findings: impl Iterator<Item = &'a ValidationIssue>,
     lang: Language,
-    profile: &ServerProfile,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+) -> Vec<String> {
+    findings
+        .map(|issue| validation_issue_message(issue, lang))
+        .collect()
+}
+
+/// True for the public-endpoint transport-security rules the Basic tab
+/// renders inline at the fields they name — the same findings the error list
+/// carries, filtered by code where they render instead of re-derived.
+fn basic_tab_inline_verdict(code: &ValidationCode) -> bool {
+    matches!(
+        code,
+        ValidationCode::VisionRequiresTlsOrReality
+            | ValidationCode::PublicVlessRequiresTlsOrEncryption
+            | ValidationCode::PublicTrojanRequiresTlsOrReality
+    )
+}
+
+impl EditorValidationFindings {
+    /// The strings the editor shows for this sweep, in its own order.
+    fn render(&self, lang: Language) -> EditorValidationRender {
+        EditorValidationRender {
+            blocking: render_findings(self.blocking.iter(), lang),
+            advisory: render_findings(self.advisory.iter(), lang),
+            finalmask: render_findings(self.finalmask.iter(), lang),
+            stream_sockopt: render_findings(self.stream_sockopt.iter(), lang),
+            ech_sockopt: render_findings(self.ech_sockopt.iter(), lang),
+            basic_inline: render_findings(
+                self.blocking
+                    .iter()
+                    .filter(|issue| basic_tab_inline_verdict(&issue.code)),
+                lang,
+            ),
+        }
+    }
+}
+
+/// The Advanced tab's inline finalmask verdict, in model order (TCP masks,
+/// UDP masks, QUIC params) — the exact findings the tab renders under the
+/// mask list.
+fn finalmask_findings(profile: &ServerProfile) -> Vec<ValidationIssue> {
+    profile
+        .outbound
+        .stream
+        .finalmask
+        .as_ref()
+        .map_or_else(Vec::new, validate_finalmask)
+}
+
+/// `validate_sockopt` findings for one sockopt block, under the wire path
+/// prefix its usage mounts it at.
+fn sockopt_findings(sockopt: &SockoptModel, usage: SockoptUsage) -> Vec<ValidationIssue> {
+    validate_sockopt(sockopt, usage.path_prefix())
+}
+
+/// The sockopt blocks' inline verdicts for one draft: the stream's own
+/// `stream.sockopt` block and — when TLS carries ECH — the
+/// `stream.tlsSettings.echSockopt` block.
+fn sockopt_findings_for(profile: &ServerProfile) -> (Vec<ValidationIssue>, Vec<ValidationIssue>) {
+    let stream = &profile.outbound.stream;
+    let stream_findings = stream
+        .sockopt
+        .as_ref()
+        .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::Stream))
+        .unwrap_or_default();
+    // Only the TLS security mode renders the ECH block, mirroring the model
+    // sweep's condition in `validate_outbound`.
+    let ech_findings = stream
+        .tls_settings
+        .as_ref()
+        .filter(|_| stream.security == Security::Tls)
+        .and_then(|tls| tls.ech_sockopt.as_ref())
+        .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::EchDnsQuery))
+        .unwrap_or_default();
+    (stream_findings, ech_findings)
+}
+
+fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindings {
+    let mut blocking: Vec<ValidationIssue> = Vec::new();
+    let mut advisory: Vec<ValidationIssue> = Vec::new();
+    let (stream_sockopt, ech_sockopt) = sockopt_findings_for(profile);
+    let finalmask = finalmask_findings(profile);
     if profile.outbound.protocol != profile.outbound.settings.protocol() {
-        errors.push(t(lang, Key::SrvProtocolSettingsMismatch).to_string());
-        return (errors, warnings, Vec::new());
+        return EditorValidationFindings {
+            blocking: vec![ValidationIssue::error(
+                ValidationCode::ProtocolSettingsMismatch,
+            )],
+            advisory,
+            finalmask,
+            stream_sockopt,
+            ech_sockopt,
+        };
     }
 
     match &profile.outbound.settings {
         ProtocolSettings::Vless(settings) => {
-            // Port 0, out-of-vocab flow/encryption, and
-            // non-UUID ids are model rules rendered below through the shared
-            // i18n seam; only the empty-address draft requirement and the
-            // empty-value "must choose" states stay UI-only (the model
-            // deliberately accepts "" as the default/empty state).
-            require_address(&mut errors, lang, &settings.address);
+            // Port 0, out-of-vocab flow/encryption, and non-UUID ids are
+            // model rules below; only the empty-address draft requirement and
+            // the empty-value "must choose" states are editor rules (the
+            // model deliberately accepts "" as the default/empty state).
+            require_address(&mut blocking, &settings.address);
             if settings.id.is_empty() {
-                errors.push(t(lang, Key::SrvVlessIdUuid).into());
+                blocking.push(ValidationIssue::error(ValidationCode::VlessIdRequired));
             }
             if settings.encryption.is_empty() {
-                errors.push(t(lang, Key::SrvVlessEncryptionInvalid).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::VlessEncryptionRequired,
+                ));
             }
             if settings
                 .reverse
                 .as_ref()
                 .is_some_and(|reverse| reverse.tag.trim().is_empty())
             {
-                errors.push(t(lang, Key::SrvVlessReverseTagRequired).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::VlessReverseTagRequired,
+                ));
             }
         }
         ProtocolSettings::Vmess(settings) => {
-            // Port 0 and non-UUID ids are model rules
-            // below; the empty-address draft requirement and the empty-id
-            // "required" state stay UI-only.
-            require_address(&mut errors, lang, &settings.address);
+            // Port 0 and non-UUID ids are model rules below; the
+            // empty-address draft requirement and the empty-id "required"
+            // state are editor rules.
+            require_address(&mut blocking, &settings.address);
             if settings.id.is_empty() {
-                errors.push(t(lang, Key::SrvVmessIdUuid).into());
+                blocking.push(ValidationIssue::error(ValidationCode::VmessIdRequired));
             }
-            if !VMESS_SECURITY.contains(&settings.security.as_str()) {
-                errors.push(t(lang, Key::SrvVmessSecurityUnsupported).into());
+            if !vmess_security_supported(&settings.security) {
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::VmessSecurityUnsupported,
+                ));
             }
         }
         ProtocolSettings::Trojan(_) => {
-            // Server essentials (empty address/password,
-            // port 0) are model rules rendered below — the UI pushes were
-            // duplicates of the same predicates on the same values.
+            // Server essentials (empty address/password, port 0) are model
+            // rules below — the editor pushes were duplicates of the same
+            // predicates on the same values.
         }
         ProtocolSettings::Shadowsocks(_) => {
-            // Method vocabulary, SS-2022 key material, and
-            // server essentials (address/password/port) are model rules
-            // rendered below — the UI pushes were duplicates; the level
-            // range is a model invariant too.
+            // Method vocabulary, SS-2022 key material, and server essentials
+            // (address/password/port) are model rules below — the editor
+            // pushes were duplicates; the level range is a model invariant
+            // too.
         }
         ProtocolSettings::Socks(settings) => {
-            require_remote(&mut errors, lang, &settings.address, settings.port);
+            require_remote(&mut blocking, &settings.address, settings.port);
         }
         ProtocolSettings::Http(settings) => {
-            require_remote(&mut errors, lang, &settings.address, settings.port);
+            require_remote(&mut blocking, &settings.address, settings.port);
         }
         ProtocolSettings::Wireguard(settings) => {
             if !is_valid_wireguard_key(&settings.secret_key) {
-                errors.push(t(lang, Key::SrvWgSecretInvalid).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardSecretKeyInvalid,
+                ));
             }
             if settings
                 .reserved
                 .as_ref()
                 .is_some_and(|reserved| reserved.len() != 3)
             {
-                errors.push(t(lang, Key::SrvWgReservedThreeBytes).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardReservedKeyBytes,
+                ));
             }
             if settings.peers.is_empty() {
-                errors.push(t(lang, Key::SrvWgAtLeastOnePeer).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardPeersRequired,
+                ));
             }
             if settings
                 .peers
                 .iter()
                 .any(|peer| !is_valid_wireguard_key(&peer.public_key))
             {
-                errors.push(t(lang, Key::SrvWgPeerPublicKeyRequired).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardPeerPublicKeyRequired,
+                ));
             }
             if settings
                 .peers
                 .iter()
                 .any(|peer| peer.endpoint.trim().is_empty())
             {
-                errors.push(t(lang, Key::SrvWgPeerEndpointRequired).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardPeerEndpointRequired,
+                ));
             }
             if settings.peers.iter().any(|peer| {
                 !peer.pre_shared_key.is_empty() && !is_valid_wireguard_key(&peer.pre_shared_key)
             }) {
-                errors.push(t(lang, Key::SrvWgPresharedInvalid).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::WireguardPresharedKeyInvalid,
+                ));
             }
         }
         ProtocolSettings::Freedom(settings) => {
@@ -365,98 +530,89 @@ fn editor_validation_errors(
                 .as_ref()
                 .is_some_and(|fragment| !fragment_is_valid(fragment))
             {
-                errors.push(t(lang, Key::SrvFreedomFragmentInvalid).into());
+                blocking.push(ValidationIssue::error(
+                    ValidationCode::FreedomFragmentInvalid,
+                ));
             }
             if settings.noises.iter().any(|noise| !noise_is_valid(noise)) {
-                errors.push(t(lang, Key::SrvFreedomNoiseInvalid).into());
+                blocking.push(ValidationIssue::error(ValidationCode::FreedomNoiseInvalid));
             }
             // finalRules actions are a model rule below (validate_outbound).
         }
         ProtocolSettings::Blackhole(_) => {
-            // response type is a model invariant reported by the validation pass.
+            // The response type is a model invariant reported below.
         }
         ProtocolSettings::Dns(_) => {
-            // rule actions are a model rule below (validate_outbound).
+            // The rule actions are a model rule below (validate_outbound).
         }
         ProtocolSettings::Loopback(settings) => {
             if settings.inbound_tag.trim().is_empty() {
-                errors.push(t(lang, Key::SrvLoopbackTagRequired).into());
+                blocking.push(ValidationIssue::error(ValidationCode::LoopbackTagRequired));
             }
         }
         ProtocolSettings::Hysteria(settings) => {
-            require_remote(&mut errors, lang, &settings.address, settings.port);
-            // version is a model invariant reported by the validation pass.
+            require_remote(&mut blocking, &settings.address, settings.port);
+            // version is a model invariant reported below.
         }
     }
     // Model validation pass: protocol + stream + transport security in one
-    // sweep, rendered through the shared i18n seam (path + message).
-    // Advisory findings (Severity::Warning) never block save —
-    // they render amber in the warnings list instead of the error list.
-    let mut inline_errors = Vec::new();
+    // sweep. Advisory findings (Severity::Warning) never block save — they
+    // render amber in the warnings list instead of the error list.
     for issue in validate_outbound(&profile.outbound) {
         match issue.severity {
-            Severity::Warning => warnings.push(validation_issue_message(&issue, lang)),
-            Severity::Error => errors.push(validation_issue_message(&issue, lang)),
-        }
-        // These public-endpoint rules also render inline at the end of the
-        // Basic tab, next to the fields they name: the memoized cache hands
-        // the Basic tab this subset so no repaint re-runs the sweep.
-        if matches!(
-            issue.code,
-            ValidationCode::VisionRequiresTlsOrReality
-                | ValidationCode::PublicVlessRequiresTlsOrEncryption
-                | ValidationCode::PublicTrojanRequiresTlsOrReality
-        ) {
-            inline_errors.push(validation_issue_message(&issue, lang));
+            Severity::Warning => advisory.push(issue),
+            Severity::Error => blocking.push(issue),
         }
     }
 
     let stream = &profile.outbound.stream;
-    // UI-only interactive stream checks not modeled by the validation pass.
-    // The xhttp enum
-    // vocabulary, the cookie/header-placement and uplink-GET mode
-    // cross-field rules, the xmux exclusivity rule, and the sessionID
-    // room/table constraints are model rules now — they render above through
-    // the shared i18n seam (validate_outbound), one message channel per
-    // value. What stays here: header-value stringness (the model keeps
-    // header maps as JSON values and has no rule on them) and the same
-    // keystroke guard for ws/httpupgrade.
+    // Editor stream checks not modeled by the validation pass: a header map's
+    // JSON values (the model keeps header maps as JSON values and judges only
+    // the ws/httpupgrade pair) and two keystroke-only rules. The xhttp enum
+    // vocabulary, the cookie/header-placement and uplink-GET mode cross-field
+    // rules, the xmux exclusivity rule, and the sessionID room/table
+    // constraints are model rules above (validate_outbound), one message
+    // channel per value.
     if stream
         .xhttp_settings
         .as_ref()
         .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
     {
-        errors.push(t(lang, Key::SrvXhttpHeaderValueString).into());
+        blocking.push(ValidationIssue::error(
+            ValidationCode::HeaderValueNotString(Network::Xhttp),
+        ));
     }
     if stream
         .ws_settings
         .as_ref()
         .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
     {
-        errors.push(t(lang, Key::SrvWsHeaderValueString).into());
+        blocking.push(ValidationIssue::error(
+            ValidationCode::HeaderValueNotString(Network::Ws),
+        ));
     }
     if stream
         .httpupgrade_settings
         .as_ref()
         .is_some_and(|settings| settings.headers.values().any(|value| !value.is_string()))
     {
-        errors.push(t(lang, Key::SrvHttpupgradeHeaderValueString).into());
+        blocking.push(ValidationIssue::error(
+            ValidationCode::HeaderValueNotString(Network::Httpupgrade),
+        ));
     }
 
-    // UI-only interactive stream checks the model cannot express. TLS/REALITY
-    // fingerprint / publicKey / shortId / spiderX /
-    // mldsa65Verify / pinnedPeerCertSha256 formats and the TLS version
-    // vocabulary are model rules now — they render above through the shared
-    // i18n seam (validate_outbound), one message channel per value. The
-    // in-range min > max inversion is `TlsMinExceedsMax` (model
-    // rule) now. What stays here: the fromMitm ALPN interaction and the
-    // cert-file-or-PEM presence rule (keystroke-only: the model cannot know
-    // which certificate row is being edited).
+    // Keystroke-only stream checks the model cannot express: TLS/REALITY
+    // fingerprint / publicKey / shortId / spiderX / mldsa65Verify /
+    // pinnedPeerCertSha256 formats and the TLS version vocabulary are model
+    // rules above (validate_outbound), and the in-range min > max inversion is
+    // `TlsMinExceedsMax`. What stays here is the fromMitm ALPN interaction and
+    // the cert-file-or-PEM presence rule — the model cannot know which
+    // certificate row the user is editing.
     if stream.security == Security::Tls
         && let Some(tls) = &stream.tls_settings
     {
         if tls.alpn.len() > 1 && tls.alpn.iter().any(|value| value == "fromMitm") {
-            errors.push(t(lang, Key::SrvFromMitmOnlyAlpnShort).into());
+            blocking.push(ValidationIssue::error(ValidationCode::TlsFromMitmAlpnShort));
         }
         if tls.certificates.iter().any(|certificate| {
             certificate.certificate_file.trim().is_empty()
@@ -465,13 +621,19 @@ fn editor_validation_errors(
                     .iter()
                     .all(|line| line.trim().is_empty())
         }) {
-            errors.push(t(lang, Key::SrvTlsCertFileOrPem).into());
+            blocking.push(ValidationIssue::error(
+                ValidationCode::TlsCertificateRequired,
+            ));
         }
     }
 
-    // `sendThrough` is a model rule now (validate_outbound, rendered in the
-    // loop above); the inline field hint below calls the same predicate.
-    (errors, warnings, inline_errors)
+    EditorValidationFindings {
+        blocking,
+        advisory,
+        finalmask,
+        stream_sockopt,
+        ech_sockopt,
+    }
 }
 
 /// Editor combo membership for one fingerprint value: the TLS and realm-TLS
@@ -615,44 +777,8 @@ fn opt_string(ui: &mut egui::Ui, label: &str, v: &mut Option<String>, hint: &str
     changed
 }
 
-const SOCKOPT_DOMAIN_STRATEGIES: &[&str] = &[
-    "",
-    "AsIs",
-    "UseIP",
-    "UseIPv4",
-    "UseIPv6",
-    "UseIPv4v6",
-    "UseIPv6v4",
-    "ForceIP",
-    "ForceIPv4",
-    "ForceIPv6",
-    "ForceIPv4v6",
-    "ForceIPv6v4",
-];
-const SOCKOPT_ADDRESS_PORT_STRATEGIES: &[&str] = &[
-    "",
-    "none",
-    "srvportonly",
-    "srvaddressonly",
-    "srvportandaddress",
-    "txtportonly",
-    "txtaddressonly",
-    "txtportandaddress",
-];
-
-/// `validate_sockopt` messages for one sockopt block, formatted with the
-/// usage's wire-path prefix. Computed only inside the memoized
-/// editor-validation sweeps — never on a repaint path.
-fn sockopt_validation_errors(
-    lang: Language,
-    sockopt: &SockoptModel,
-    usage: SockoptUsage,
-) -> Vec<String> {
-    validate_sockopt(sockopt, usage.path_prefix())
-        .iter()
-        .map(|issue| validation_issue_message(issue, lang))
-        .collect()
-}
+const SOCKOPT_DOMAIN_STRATEGIES: &[&str] = validation::SOCKOPT_DOMAIN_STRATEGY_OPTIONS;
+const SOCKOPT_ADDRESS_PORT_STRATEGIES: &[&str] = validation::SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TcpFastOpenMode {
@@ -1397,68 +1523,89 @@ struct ExistingProfileDraft {
     generation: u64,
 }
 
-/// Memoized editor validation: `show_editor` recomputes the validation
-/// errors, the Advanced tab's finalmask verdict, and the "changed from
-/// source" flag only when the draft generation (bumped on every edit and
-/// tool application) or the UI language changes, instead of serializing and
-/// validating the whole profile on every repaint.
+/// Memoized editor validation for one existing draft: the findings (swept
+/// once per draft generation, bumped on every edit and tool application) and
+/// the strings they render to (rebuilt when the generation or the language
+/// moves, so a language change re-renders instead of re-validating). Both
+/// live here so `show_editor` never serializes or validates the whole profile
+/// on a repaint.
 struct EditorValidationCache {
+    /// The draft generation the findings were computed from.
     generation: u64,
-    language: Language,
-    /// Blocking findings (Severity::Error) — the only half that gates
+    /// The sweep's findings, unrendered — the blocking half gates
     /// Validate-and-save and the leave modal's Save.
-    validation_errors: Vec<String>,
-    /// Advisory findings (Severity::Warning) — rendered amber
-    /// under their own header; never gate anything.
-    validation_warnings: Vec<String>,
-    /// The Advanced tab's inline finalmask verdict: `validate_finalmask`
-    /// messages in model order (TCP masks, UDP masks, QUIC params). Folded
-    /// into this generation-keyed sweep so idle frames never re-validate.
-    finalmask_errors: Vec<String>,
-    /// The Advanced tab's inline `stream.sockopt` verdict, folded into the
-    /// same sweep.
-    stream_sockopt_errors: Vec<String>,
-    /// The Security tab's inline verdict for the TLS settings' ECH
-    /// DNS-query socket options (`stream.tlsSettings.echSockopt`), same
-    /// sweep.
-    ech_sockopt_errors: Vec<String>,
-    /// The Basic tab's inline outbound verdicts (the public-endpoint TLS
-    /// rules), same sweep.
-    basic_inline_errors: Vec<String>,
+    findings: EditorValidationFindings,
+    /// The language `rendered` was built in.
+    rendered_language: Language,
+    /// The strings the error list, the warnings list, and the tabs' inline
+    /// verdicts show — the same sweep, rendered once per (generation,
+    /// language).
+    rendered: EditorValidationRender,
+    /// The draft differs from its committed source (see
+    /// [`existing_draft_gate`]).
     changed_from_source: bool,
 }
 
-/// Memoized add-draft validation: the Add-server window recomputes the
-/// validation errors, the Advanced tab's finalmask verdict, and the "changed
-/// from source" flag only when the draft generation (bumped on every edit
-/// and tool application) or the UI language changes — mirroring
-/// [`EditorValidationCache`] — instead of running the full validation sweep
-/// (validators, base64url decodes, hex scans) on every repaint of the modal.
+/// Memoized add-draft validation, mirroring [`EditorValidationCache`] for the
+/// Add-server window: the full sweep (validators, base64url decodes, hex
+/// scans) runs once per draft generation, and its strings render once per
+/// (generation, language) — never per repaint of the modal.
 struct AddDraftValidationCache {
+    /// The add-draft generation the findings were computed from.
     generation: u64,
-    language: Language,
-    /// Blocking findings (Severity::Error) — the only half that gates
+    /// The sweep's findings, unrendered — the blocking half gates
     /// Validate-and-add and the leave modal's Save.
-    validation_errors: Vec<String>,
-    /// Advisory findings (Severity::Warning) — rendered amber;
-    /// never gate anything.
-    validation_warnings: Vec<String>,
-    /// The Advanced tab's inline finalmask verdict, mirroring
-    /// [`EditorValidationCache::finalmask_errors`].
-    finalmask_errors: Vec<String>,
-    /// The Advanced tab's inline sockopt verdict, mirroring
-    /// [`EditorValidationCache::stream_sockopt_errors`].
-    stream_sockopt_errors: Vec<String>,
-    /// The Security tab's inline ECH-sockopt verdict, mirroring
-    /// [`EditorValidationCache::ech_sockopt_errors`].
-    ech_sockopt_errors: Vec<String>,
-    /// The Basic tab's inline outbound verdicts, mirroring
-    /// [`EditorValidationCache::basic_inline_errors`].
-    basic_inline_errors: Vec<String>,
+    findings: EditorValidationFindings,
+    /// The language `rendered` was built in.
+    rendered_language: Language,
+    /// The strings the error list, the warnings list, and the tabs' inline
+    /// verdicts show.
+    rendered: EditorValidationRender,
     /// The draft differs from an empty profile carrying the draft's id. An
     /// add draft has no committed source, so this is the add-draft dirty
     /// flag (a fresh add draft is unsaved by definition).
     changed_from_source: bool,
+}
+
+/// The facts every draft control reads, built where the draft's findings are.
+/// The two memoized facts — whether the draft differs from its committed
+/// profile, and whether an error-severity finding blocks it — come from the
+/// validation cache the sweep produced, so a generation bump updates the
+/// verdicts and those facts together. The three facts that move without a
+/// draft edit (a raw buffer's uncommitted text, the profile validation job,
+/// and the busy window) are read where the control renders.
+#[derive(Clone, Copy, Default)]
+struct DraftGate {
+    /// The draft differs from its committed profile (an add draft: from an
+    /// empty profile carrying its id).
+    changed_from_source: bool,
+    /// A raw finalmask/PEM buffer of this draft holds text that never reached
+    /// the draft.
+    raw_buffers_dirty: bool,
+    /// An error-severity finding exists.
+    blocking: bool,
+    /// The profile validation job is in flight.
+    validating: bool,
+    /// An exclusive job holds the busy window.
+    busy: bool,
+}
+
+impl DraftGate {
+    /// The draft holds unsaved changes: it differs from its committed profile,
+    /// or a raw buffer holds text that never reached it. The "Unsaved
+    /// changes" dot, the Discard button, and the leave guard read this.
+    fn dirty(self) -> bool {
+        self.changed_from_source || self.raw_buffers_dirty
+    }
+
+    /// The draft may commit: it differs from its committed profile and no
+    /// error-severity finding blocks it. Validate-and-save and the leave
+    /// modal's Save read this. A buffer-only dirty state is deliberately not
+    /// committable — the raw text never parsed, so committing would be a
+    /// no-op that leaves the unsaved indicator on.
+    fn committable(self) -> bool {
+        self.changed_from_source && !self.blocking
+    }
 }
 
 /// The chain-target (`dialerProxy`) picker's options for one editor: every
@@ -1524,65 +1671,6 @@ struct AdvancedTabCtx<'a> {
     dialer_proxy_options: &'a mut Option<DialerProxyOptions>,
     finalmask_raw: &'a mut RawBuffers,
     pem_buffers: &'a mut std::collections::HashMap<egui::Id, PemBuf>,
-}
-
-/// `validate_finalmask` messages for the profile's finalmask, in model order
-/// (TCP masks, UDP masks, QUIC params) — the exact text and order the
-/// Advanced tab renders inline under the mask list. Computed only inside the
-/// memoized editor-validation sweeps below.
-fn finalmask_error_messages(lang: Language, profile: &ServerProfile) -> Vec<String> {
-    let Some(finalmask) = profile.outbound.stream.finalmask.as_ref() else {
-        return Vec::new();
-    };
-    validate_finalmask(finalmask)
-        .iter()
-        .map(|issue| validation_issue_message(issue, lang))
-        .collect()
-}
-
-/// The sockopt blocks' inline verdicts for one memoized sweep: the stream's
-/// own `stream.sockopt` block and — when TLS carries ECH — the
-/// `stream.tlsSettings.echSockopt` block, each formatted under its usage's
-/// wire path ([`SockoptUsage::path_prefix`]). Computed only inside the
-/// memoized editor-validation sweeps below.
-fn sockopt_error_messages(lang: Language, profile: &ServerProfile) -> (Vec<String>, Vec<String>) {
-    let stream = &profile.outbound.stream;
-    let stream_errors = stream
-        .sockopt
-        .as_ref()
-        .map(|sockopt| sockopt_validation_errors(lang, sockopt, SockoptUsage::Stream))
-        .unwrap_or_default();
-    // Only the TLS security mode renders the ECH block, mirroring the model
-    // sweep's condition in `validate_outbound`.
-    let ech_errors = stream
-        .tls_settings
-        .as_ref()
-        .filter(|_| stream.security == Security::Tls)
-        .and_then(|tls| tls.ech_sockopt.as_ref())
-        .map(|sockopt| sockopt_validation_errors(lang, sockopt, SockoptUsage::EchDnsQuery))
-        .unwrap_or_default();
-    (stream_errors, ech_errors)
-}
-
-/// The existing draft's "differs from its committed source" flag. Rides the
-/// memoized validation cache; when the cache is stale relative to the draft
-/// generation the flag is recomputed inline (one serialize) so the answer is
-/// same-frame accurate. An absent cache (fresh draft, generation 0) is never
-/// dirty — a fresh draft is seeded from its persisted source. Staleness is
-/// bounded: drafts mutate only inside the editor/add-dialog renders, which
-/// rebuild the cache in the same frame; the recompute covers tool-applied
-/// mutations (e.g. a TLS pin) that land after the cache refresh.
-fn existing_changed_from_source(
-    draft: &ExistingProfileDraft,
-    cache: Option<&EditorValidationCache>,
-) -> bool {
-    match cache {
-        Some(cached) if cached.generation == draft.generation => cached.changed_from_source,
-        Some(_) => serde_json::to_value(&draft.profile)
-            .map(|current| current != draft.source)
-            .unwrap_or(true),
-        None => false,
-    }
 }
 
 /// The chain target the draft was loaded with: the dial-through tag the
@@ -1671,27 +1759,21 @@ fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// The existing draft's uncommitted state: the draft differs from its source
-/// OR a raw finalmask/PEM buffer for it holds text that never reached the
-/// draft (the condition that enables the Discard button).
-fn existing_draft_dirty(
-    draft: &ExistingProfileDraft,
-    cache: Option<&EditorValidationCache>,
-    finalmask_raw: &RawBuffers,
-) -> bool {
-    if finalmask_raw
+/// True when a raw finalmask/PEM buffer of `profile_id` holds text that never
+/// reached the draft: invalid JSON never commits, so the draft stays clean
+/// while the editor shows the unparsed text (the condition that enables
+/// Discard in that state). Entries exist only while a profile has an open raw
+/// editor, and the scan short-circuits on the first dirty buffer.
+fn raw_buffers_hold_uncommitted(finalmask_raw: &RawBuffers, profile_id: &str) -> bool {
+    finalmask_raw
         .values()
-        .any(|buffer| buffer.profile == draft.profile.id && buffer.dirty)
-    {
-        return true;
-    }
-    existing_changed_from_source(draft, cache)
+        .any(|buffer| buffer.profile == profile_id && buffer.dirty)
 }
 
 /// Serialized comparison of an add draft against an empty profile carrying
 /// the draft's id: an add draft has no committed source, so "changed" means
 /// differing from the empty template.
-fn add_draft_changed_from_source(draft: &ServerProfile) -> bool {
+fn add_draft_differs_from_empty(draft: &ServerProfile) -> bool {
     let default = ServerProfile {
         id: draft.id.clone(),
         ..ServerProfile::default()
@@ -1701,20 +1783,140 @@ fn add_draft_changed_from_source(draft: &ServerProfile) -> bool {
         .unwrap_or(true)
 }
 
-/// The add draft's uncommitted state. Mirrors [`existing_draft_dirty`]: the
-/// flag rides the memoized cache and is recomputed (two serializations —
-/// the draft and the empty baseline) only when the cache is stale relative
-/// to the draft generation; an absent cache (dialog not yet rendered) is
-/// not dirty.
-fn add_draft_dirty(
+/// Bring the existing-draft validation cache up to date: sweep the draft only
+/// when its generation moved, render the findings it holds only when the
+/// generation or the language moved. A language change therefore re-renders
+/// without re-validating, and an idle frame does neither.
+fn refresh_editor_validation(
+    cache: &mut Option<EditorValidationCache>,
+    draft: &ExistingProfileDraft,
+    lang: Language,
+) {
+    let covered = cache
+        .as_ref()
+        .is_some_and(|cached| cached.generation == draft.generation);
+    if !covered {
+        let findings = editor_validation_findings(&draft.profile);
+        let rendered = findings.render(lang);
+        *cache = Some(EditorValidationCache {
+            generation: draft.generation,
+            findings,
+            rendered_language: lang,
+            rendered,
+            changed_from_source: serde_json::to_value(&draft.profile)
+                .map(|current| current != draft.source)
+                .unwrap_or(true),
+        });
+        return;
+    }
+    if let Some(cached) = cache.as_mut()
+        && cached.rendered_language != lang
+    {
+        let rendered = cached.findings.render(lang);
+        cached.rendered = rendered;
+        cached.rendered_language = lang;
+    }
+}
+
+/// Add-draft twin of [`refresh_editor_validation`]: the add draft's
+/// generation counter lives on the screen, so it is passed in.
+fn refresh_add_draft_validation(
+    cache: &mut Option<AddDraftValidationCache>,
+    generation: u64,
+    draft: &ServerProfile,
+    lang: Language,
+) {
+    let covered = cache
+        .as_ref()
+        .is_some_and(|cached| cached.generation == generation);
+    if !covered {
+        let findings = editor_validation_findings(draft);
+        let rendered = findings.render(lang);
+        *cache = Some(AddDraftValidationCache {
+            generation,
+            findings,
+            rendered_language: lang,
+            rendered,
+            // An add draft has no committed source; "changed" means differing
+            // from an empty profile carrying the draft's id (a fresh add
+            // draft is unsaved by definition).
+            changed_from_source: add_draft_differs_from_empty(draft),
+        });
+        return;
+    }
+    if let Some(cached) = cache.as_mut()
+        && cached.rendered_language != lang
+    {
+        let rendered = cached.findings.render(lang);
+        cached.rendered = rendered;
+        cached.rendered_language = lang;
+    }
+}
+
+/// The existing draft's gate for one frame: the draft's own facts as the
+/// validation refresh computed them (recomputed inline when the cache does
+/// not cover the draft's generation — a tool-applied edit can land after the
+/// refresh, and the topbar chip reads this before the editor renders), plus
+/// the raw-buffer scan and the frame's validation/busy facts.
+fn existing_draft_gate(
+    draft: &ExistingProfileDraft,
+    cache: Option<&EditorValidationCache>,
+    finalmask_raw: &RawBuffers,
+    validating: bool,
+    busy: bool,
+) -> DraftGate {
+    // The draft-against-source fact: the memoized answer when the cache covers
+    // the draft's generation, recomputed inline (one serialize) when it does
+    // not — a mutation applied outside the render that refreshed the cache
+    // (e.g. a TLS pin fetched by a tool) must still answer same-frame
+    // accurately, and the topbar chip reads this before the editor renders.
+    // An absent cache is never changed: a fresh draft is seeded from its
+    // persisted source.
+    let changed_from_source = match cache {
+        Some(cached) if cached.generation == draft.generation => cached.changed_from_source,
+        Some(_) => serde_json::to_value(&draft.profile)
+            .map(|current| current != draft.source)
+            .unwrap_or(true),
+        None => false,
+    };
+    DraftGate {
+        changed_from_source,
+        raw_buffers_dirty: raw_buffers_hold_uncommitted(finalmask_raw, &draft.profile.id),
+        blocking: cache.is_some_and(|cached| !cached.findings.blocking.is_empty()),
+        validating,
+        busy,
+    }
+}
+
+/// The add draft's gate, mirroring [`existing_draft_gate`] over the add
+/// draft's substrate. Its `changed_from_source` is the add-draft fact
+/// (differing from the empty template) and its raw-buffer scan covers the
+/// buffers seeded for the dialog's own draft id; the add draft's controls
+/// read `changed_from_source` and `blocking`, never its raw-buffer half.
+fn add_draft_gate(
     draft: &ServerProfile,
     generation: u64,
     cache: Option<&AddDraftValidationCache>,
-) -> bool {
-    match cache {
+    finalmask_raw: &RawBuffers,
+    validating: bool,
+    busy: bool,
+) -> DraftGate {
+    // The add draft's counterpart fact: it has no committed source, so
+    // "changed" means differing from the empty profile carrying its id.
+    // Memoized with the findings; recomputed (two serializations — the draft
+    // and the empty baseline) when the cache does not cover the generation,
+    // and never changed while the dialog has not rendered yet.
+    let changed_from_source = match cache {
         Some(cached) if cached.generation == generation => cached.changed_from_source,
-        Some(_) => add_draft_changed_from_source(draft),
+        Some(_) => add_draft_differs_from_empty(draft),
         None => false,
+    };
+    DraftGate {
+        changed_from_source,
+        raw_buffers_dirty: raw_buffers_hold_uncommitted(finalmask_raw, &draft.id),
+        blocking: cache.is_some_and(|cached| !cached.findings.blocking.is_empty()),
+        validating,
+        busy,
     }
 }
 
@@ -2274,13 +2476,10 @@ impl ServersScreen {
                             }
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
-                                if self.existing_draft.as_ref().is_some_and(|draft| {
-                                    existing_draft_dirty(
-                                        draft,
-                                        self.editor_validation_cache.as_ref(),
-                                        &self.finalmask_raw,
-                                    )
-                                }) {
+                                if self
+                                    .existing_gate(uictx.operation.is_some())
+                                    .is_some_and(DraftGate::dirty)
+                                {
                                     self.leave_pending = Some(LeaveAction::Quit);
                                 } else {
                                     self.quit_resume = true;
@@ -2319,13 +2518,10 @@ impl ServersScreen {
                             }
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
-                                if self.add_draft.as_ref().is_some_and(|draft| {
-                                    add_draft_dirty(
-                                        draft,
-                                        self.add_draft_generation,
-                                        self.add_draft_validation_cache.as_ref(),
-                                    )
-                                }) {
+                                if self
+                                    .add_gate(uictx.operation.is_some())
+                                    .is_some_and(|gate| gate.changed_from_source)
+                                {
                                     self.leave_pending = Some(LeaveAction::Quit);
                                 } else {
                                     self.quit_resume = true;
@@ -3147,6 +3343,37 @@ impl ServersScreen {
         self.leave_pending = Some(action);
     }
 
+    /// The existing draft's gate as this frame sees it (see
+    /// [`existing_draft_gate`]); `None` while no draft is open. `busy` is the
+    /// frame's own fact — a caller with no frame (the topbar chip's per-frame
+    /// check) passes `false` and reads only a composition that ignores it.
+    fn existing_gate(&self, busy: bool) -> Option<DraftGate> {
+        self.existing_draft.as_ref().map(|draft| {
+            existing_draft_gate(
+                draft,
+                self.editor_validation_cache.as_ref(),
+                &self.finalmask_raw,
+                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
+                busy,
+            )
+        })
+    }
+
+    /// The add draft's gate as this frame sees it (see [`add_draft_gate`]);
+    /// `None` while the add dialog is closed.
+    fn add_gate(&self, busy: bool) -> Option<DraftGate> {
+        self.add_draft.as_ref().map(|draft| {
+            add_draft_gate(
+                draft,
+                self.add_draft_generation,
+                self.add_draft_validation_cache.as_ref(),
+                &self.finalmask_raw,
+                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
+                busy,
+            )
+        })
+    }
+
     /// True when the existing-draft (selected server) or the add-draft
     /// holds uncommitted changes. Cheap: reads the memoized validation
     /// caches; if a draft's cache generation is stale relative to the draft
@@ -3154,22 +3381,14 @@ impl ServersScreen {
     /// be same-frame accurate for the topbar chip (called before/after the
     /// Servers screen renders this frame).
     pub fn unsaved_changes(&self) -> bool {
-        if let Some(draft) = &self.existing_draft
-            && existing_draft_dirty(
-                draft,
-                self.editor_validation_cache.as_ref(),
-                &self.finalmask_raw,
-            )
-        {
+        // The dirty composition reads only the draft's own facts, and this
+        // per-frame chip check runs without a frame: nothing read below
+        // consults the busy window.
+        if self.existing_gate(false).is_some_and(DraftGate::dirty) {
             return true;
         }
-        self.add_draft.as_ref().is_some_and(|draft| {
-            add_draft_dirty(
-                draft,
-                self.add_draft_generation,
-                self.add_draft_validation_cache.as_ref(),
-            )
-        })
+        self.add_gate(false)
+            .is_some_and(|gate| gate.changed_from_source)
     }
 
     /// True exactly once when a staged Quit may proceed (all dirty drafts
@@ -3220,11 +3439,15 @@ impl ServersScreen {
             self.derive_dialog = None;
         }
         if self.delete_pending.is_none()
-            && add_draft_dirty(
+            && add_draft_gate(
                 &draft,
                 self.add_draft_generation,
                 self.add_draft_validation_cache.as_ref(),
+                &self.finalmask_raw,
+                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
+                false,
             )
+            .changed_from_source
         {
             self.stage_leave(LeaveAction::CloseAdd);
             self.add_draft = Some(draft);
@@ -3286,19 +3509,20 @@ impl ServersScreen {
     /// success or clears it on rejection. Failure to start clears the
     /// staged action and shows the status error.
     fn save_leave_action(&mut self, action: LeaveAction, lang: Language, uictx: &mut UiCtx) {
+        let busy = uictx.operation.is_some();
         let target = if let Some(draft) = &self.existing_draft
-            && existing_changed_from_source(draft, self.editor_validation_cache.as_ref())
+            && self
+                .existing_gate(busy)
+                .is_some_and(|gate| gate.changed_from_source)
         {
             Some(ToolTarget::ExistingDraft {
                 profile_id: draft.profile.id.clone(),
                 generation: draft.generation,
             })
         } else if let Some(draft) = &self.add_draft
-            && add_draft_dirty(
-                draft,
-                self.add_draft_generation,
-                self.add_draft_validation_cache.as_ref(),
-            )
+            && self
+                .add_gate(busy)
+                .is_some_and(|gate| gate.changed_from_source)
         {
             Some(ToolTarget::AddDraft {
                 profile_id: draft.id.clone(),
@@ -3363,29 +3587,12 @@ impl ServersScreen {
         }
         let lang = uictx.settings.language;
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
-        // Save mirrors each editor's own gate: the target draft must differ
-        // from its source and pass the model validators, exactly like the
-        // editor's Validate-and-save button. A raw buffer holding
-        // unparseable text alone is not committable — Save would be a
-        // no-op commit that leaves the unsaved indicator on forever (the
-        // editor disables its own Save in this state; the modal must too).
-        let existing_saveable = self.existing_draft.as_ref().is_some_and(|draft| {
-            existing_changed_from_source(draft, self.editor_validation_cache.as_ref())
-                && self
-                    .editor_validation_cache
-                    .as_ref()
-                    .is_some_and(|cached| cached.validation_errors.is_empty())
-        });
-        let add_saveable = self.add_draft.as_ref().is_some_and(|draft| {
-            add_draft_dirty(
-                draft,
-                self.add_draft_generation,
-                self.add_draft_validation_cache.as_ref(),
-            ) && self
-                .add_draft_validation_cache
-                .as_ref()
-                .is_some_and(|cached| cached.validation_errors.is_empty())
-        });
+        // Each draft's Save reads the same gate as its editor's own commit
+        // control: `committable` refuses a raw-buffer-only dirty state, whose
+        // commit would be a no-op that leaves the unsaved indicator on.
+        let busy = uictx.operation.is_some();
+        let existing_saveable = self.existing_gate(busy).is_some_and(DraftGate::committable);
+        let add_saveable = self.add_gate(busy).is_some_and(DraftGate::committable);
         let saveable = existing_saveable || add_saveable;
         let mut decision: Option<LeaveDecision> = None;
         let modal =
@@ -3406,7 +3613,7 @@ impl ServersScreen {
                 }
                 if ui
                     .add_enabled(
-                        saveable && !validating && uictx.operation.is_none(),
+                        saveable && !validating && !busy,
                         egui::Button::new(t(lang, Key::SrvUnsavedLeaveSave)),
                     )
                     .clicked()
@@ -3647,65 +3854,22 @@ fn server_list_row(
 impl ServersScreen {
     // ---------- editor (right side) ----------
 
-    /// Rebuild the memoized existing-draft verdicts (validation errors, the
-    /// tabs' inline finalmask/sockopt/issues, changed-from-source) when the
-    /// draft generation or the UI language moved on; a no-op while the cache
-    /// still covers the draft. One real sweep per change — never per frame.
+    /// Rebuild the memoized existing-draft findings when the draft generation
+    /// moved on, and their strings when the generation or the UI language
+    /// moved on; a no-op while both still cover the draft. One real sweep per
+    /// generation, one render per (generation, language) — never per frame.
     fn refresh_editor_validation_cache(&mut self, draft: &ExistingProfileDraft, lang: Language) {
-        if self
-            .editor_validation_cache
-            .as_ref()
-            .is_some_and(|cached| cached.generation == draft.generation && cached.language == lang)
-        {
-            return;
-        }
-        let (validation_errors, validation_warnings, basic_inline_errors) =
-            editor_validation_errors(lang, &draft.profile);
-        let (stream_sockopt_errors, ech_sockopt_errors) =
-            sockopt_error_messages(lang, &draft.profile);
-        self.editor_validation_cache = Some(EditorValidationCache {
-            generation: draft.generation,
-            language: lang,
-            validation_errors,
-            validation_warnings,
-            finalmask_errors: finalmask_error_messages(lang, &draft.profile),
-            stream_sockopt_errors,
-            ech_sockopt_errors,
-            basic_inline_errors,
-            changed_from_source: serde_json::to_value(&draft.profile)
-                .map(|current| current != draft.source)
-                .unwrap_or(true),
-        });
+        refresh_editor_validation(&mut self.editor_validation_cache, draft, lang);
     }
 
     /// Add-draft twin of [`Self::refresh_editor_validation_cache`].
     fn refresh_add_draft_validation_cache(&mut self, draft: &ServerProfile, lang: Language) {
-        if self
-            .add_draft_validation_cache
-            .as_ref()
-            .is_some_and(|cached| {
-                cached.generation == self.add_draft_generation && cached.language == lang
-            })
-        {
-            return;
-        }
-        let (validation_errors, validation_warnings, basic_inline_errors) =
-            editor_validation_errors(lang, draft);
-        let (stream_sockopt_errors, ech_sockopt_errors) = sockopt_error_messages(lang, draft);
-        self.add_draft_validation_cache = Some(AddDraftValidationCache {
-            generation: self.add_draft_generation,
-            language: lang,
-            validation_errors,
-            validation_warnings,
-            finalmask_errors: finalmask_error_messages(lang, draft),
-            stream_sockopt_errors,
-            ech_sockopt_errors,
-            basic_inline_errors,
-            // An add draft has no committed source; "changed" means differing
-            // from an empty profile carrying the draft's id (a fresh add
-            // draft is unsaved by definition).
-            changed_from_source: add_draft_changed_from_source(draft),
-        });
+        refresh_add_draft_validation(
+            &mut self.add_draft_validation_cache,
+            self.add_draft_generation,
+            draft,
+            lang,
+        );
     }
 
     /// Run `render` with the memoized existing-draft verdicts moved out of
@@ -3794,6 +3958,11 @@ impl ServersScreen {
         // and refresh again below; idle frames hit only the cheap freshness
         // check here and there.
         self.refresh_editor_validation_cache(&draft, lang);
+        // The two gate facts that move without a draft edit: the profile
+        // validation job (read here so the dot, the tabs' gates and the
+        // action row all see one value) and the busy window.
+        let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
+        let busy = ctx.operation.is_some();
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvName));
@@ -3806,11 +3975,15 @@ impl ServersScreen {
             // source or a raw buffer holds uncommitted text (the same
             // condition that enables Discard). Only the existing draft gets
             // the dot — an add draft is unsaved by definition.
-            if existing_draft_dirty(
+            if existing_draft_gate(
                 &draft,
                 self.editor_validation_cache.as_ref(),
                 &self.finalmask_raw,
-            ) {
+                validating,
+                busy,
+            )
+            .dirty()
+            {
                 ui.add(
                     egui::Label::new(RichText::new("●").color(status_colors_of(ui).warn))
                         .selectable(false),
@@ -3859,7 +4032,7 @@ impl ServersScreen {
                 changed |= match self.tab {
                     EditorTab::Basic => self.with_editor_validation(|screen, cache| {
                         let inline_errors = cache
-                            .map(|cached| cached.basic_inline_errors.as_slice())
+                            .map(|cached| cached.rendered.basic_inline.as_slice())
                             .unwrap_or(&[]);
                         screen.basic_tab_for_target(
                             ui,
@@ -3888,7 +4061,7 @@ impl ServersScreen {
                         let address = draft.profile.server_address();
                         self.with_editor_validation(|screen, cache| {
                             let ech_sockopt_errors = cache
-                                .map(|cached| cached.ech_sockopt_errors.as_slice())
+                                .map(|cached| cached.rendered.ech_sockopt.as_slice())
                                 .unwrap_or(&[]);
                             screen.security_tab_for_target(
                                 ui,
@@ -3916,12 +4089,12 @@ impl ServersScreen {
                         let finalmask_errors: &[String] = self
                             .editor_validation_cache
                             .as_ref()
-                            .map(|cached| cached.finalmask_errors.as_slice())
+                            .map(|cached| cached.rendered.finalmask.as_slice())
                             .unwrap_or(&[]);
                         let stream_sockopt_errors: &[String] = self
                             .editor_validation_cache
                             .as_ref()
-                            .map(|cached| cached.stream_sockopt_errors.as_slice())
+                            .map(|cached| cached.rendered.stream_sockopt.as_slice())
                             .unwrap_or(&[]);
                         ServersScreen::advanced_tab(
                             ui,
@@ -3980,9 +4153,8 @@ impl ServersScreen {
         let Some(cached) = self.editor_validation_cache.as_ref() else {
             return;
         };
-        let validation_errors = &cached.validation_errors;
-        let validation_warnings = &cached.validation_warnings;
-        let changed_from_source = cached.changed_from_source;
+        let validation_errors = &cached.rendered.blocking;
+        let validation_warnings = &cached.rendered.advisory;
 
         let mut dismissed_retired_key = false;
         let mut dismissed_retired_hop = false;
@@ -4055,36 +4227,33 @@ impl ServersScreen {
                 });
         }
         ui.separator();
-        let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
+        // One gate for the action row: Validate-and-save commits a changed
+        // draft that nothing blocks, which is only meaningful for the source
+        // this draft owns, and it waits out both the validation job and the
+        // busy window. Discard is the dirty composition — it must also be
+        // available while a raw buffer of this profile holds text that never
+        // parsed into the draft, or the user would be stuck with the error
+        // text.
+        let gate = existing_draft_gate(
+            &draft,
+            self.editor_validation_cache.as_ref(),
+            &self.finalmask_raw,
+            validating,
+            busy,
+        );
         let mut validate_clicked = false;
         let mut discard_clicked = false;
         ui.horizontal(|ui| {
             validate_clicked = ui
                 .add_enabled(
-                    changed_from_source
-                        && validation_errors.is_empty()
-                        && !validating
-                        && ctx.operation.is_none(),
+                    gate.committable() && !gate.validating && !gate.busy,
                     egui::Button::new(t(lang, Key::SrvValidateAndSave)),
                 )
                 .on_hover_text(t(lang, Key::SrvValidateAndSaveHint))
                 .clicked();
-            // Discard must also be available while a raw-JSON buffer of this
-            // profile holds uncommitted text: invalid JSON never commits, so
-            // the draft-vs-source comparison alone would leave the button
-            // disabled and the user stuck with the error text.
-            // The dirty flags change on edits that never bump the draft
-            // generation, so they cannot ride the memoized validation cache;
-            // a bounded scan of the raw-buffer cache is cheaper than any memo
-            // bookkeeping (entries exist only while a profile has an open raw
-            // editor, and the scan short-circuits on the first dirty buffer).
-            let buffers_hold_uncommitted = self
-                .finalmask_raw
-                .values()
-                .any(|buffer| buffer.profile == draft.profile.id && buffer.dirty);
             discard_clicked = ui
                 .add_enabled(
-                    (changed_from_source || buffers_hold_uncommitted) && !validating,
+                    gate.dirty() && !gate.validating,
                     egui::Button::new(t(lang, Key::SrvDiscardChanges)),
                 )
                 .clicked();
@@ -4187,7 +4356,7 @@ impl ServersScreen {
                     ui,
                     "flow",
                     &mut settings.flow,
-                    VLESS_FLOW,
+                    &VLESS_FLOW,
                     t(lang, Key::SrvDefault),
                     false,
                 );
@@ -4308,7 +4477,7 @@ impl ServersScreen {
                     ui,
                     "method",
                     &mut settings.method,
-                    SS_METHODS,
+                    &SS_METHODS,
                     t(lang, Key::SrvDefault),
                     false,
                 );
@@ -4980,14 +5149,17 @@ impl ServersScreen {
                         "POST",
                     );
                     let incompatible_placement = s.mode != "packet-up"
-                        && matches!(s.uplink_data_placement.as_str(), "cookie" | "header");
+                        && !validation::uplink_placement_mode_supported(
+                            &s.uplink_data_placement,
+                            &s.mode,
+                        );
                     if mode_changed && incompatible_placement {
                         s.uplink_data_placement.clear();
                     }
-                    let placements = if s.mode == "packet-up" {
+                    let placements: &[&str] = if s.mode == "packet-up" {
                         UPLINK_PLACEMENTS
                     } else {
-                        UPLINK_STREAM_PLACEMENTS
+                        &UPLINK_STREAM_PLACEMENTS
                     };
                     changed |= widgets::combo_str_labeled(
                         ui,
@@ -4998,7 +5170,10 @@ impl ServersScreen {
                         false,
                     );
                     if s.mode != "packet-up"
-                        && matches!(s.uplink_data_placement.as_str(), "cookie" | "header")
+                        && !validation::uplink_placement_mode_supported(
+                            &s.uplink_data_placement,
+                            &s.mode,
+                        )
                     {
                         ui.horizontal(|ui| {
                             ui.colored_label(
@@ -5570,7 +5745,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvMinVersion),
                     &mut s.min_version,
-                    TLS_VERSIONS,
+                    &TLS_VERSIONS,
                     t(lang, Key::SrvDefault),
                     false,
                 );
@@ -5578,7 +5753,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvMaxVersion),
                     &mut s.max_version,
-                    TLS_VERSIONS,
+                    &TLS_VERSIONS,
                     t(lang, Key::SrvDefault),
                     false,
                 );
@@ -6420,7 +6595,7 @@ impl ServersScreen {
                         let changed = match self.draft_tab {
                             EditorTab::Basic => self.with_add_draft_validation(|screen, cache| {
                                 let inline_errors = cache
-                                    .map(|cached| cached.basic_inline_errors.as_slice())
+                                    .map(|cached| cached.rendered.basic_inline.as_slice())
                                     .unwrap_or(&[]);
                                 screen.basic_tab_for_target(
                                     ui,
@@ -6449,7 +6624,7 @@ impl ServersScreen {
                                 let address = draft.server_address();
                                 self.with_add_draft_validation(|screen, cache| {
                                     let ech_sockopt_errors = cache
-                                        .map(|cached| cached.ech_sockopt_errors.as_slice())
+                                        .map(|cached| cached.rendered.ech_sockopt.as_slice())
                                         .unwrap_or(&[]);
                                     screen.security_tab_for_target(
                                         ui,
@@ -6479,12 +6654,12 @@ impl ServersScreen {
                                 let finalmask_errors: &[String] = self
                                     .add_draft_validation_cache
                                     .as_ref()
-                                    .map(|cached| cached.finalmask_errors.as_slice())
+                                    .map(|cached| cached.rendered.finalmask.as_slice())
                                     .unwrap_or(&[]);
                                 let stream_sockopt_errors: &[String] = self
                                     .add_draft_validation_cache
                                     .as_ref()
-                                    .map(|cached| cached.stream_sockopt_errors.as_slice())
+                                    .map(|cached| cached.rendered.stream_sockopt.as_slice())
                                     .unwrap_or(&[]);
                                 ServersScreen::advanced_tab(
                                     ui,
@@ -6521,8 +6696,16 @@ impl ServersScreen {
                 let Some(cached) = self.add_draft_validation_cache.as_ref() else {
                     return;
                 };
-                let errors = &cached.validation_errors;
-                let warnings = &cached.validation_warnings;
+                let errors = &cached.rendered.blocking;
+                let warnings = &cached.rendered.advisory;
+                let gate = add_draft_gate(
+                    &draft,
+                    self.add_draft_generation,
+                    self.add_draft_validation_cache.as_ref(),
+                    &self.finalmask_raw,
+                    validating,
+                    uictx.operation.is_some(),
+                );
                 if !errors.is_empty() {
                     ui.separator();
                     ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvCompleteRequired));
@@ -6556,9 +6739,12 @@ impl ServersScreen {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
+                    // Validate-and-add gates on the blocking half alone: an
+                    // add draft is unsaved by definition, so there is nothing
+                    // for a changed-from-source test to refuse.
                     if ui
                         .add_enabled(
-                            errors.is_empty() && uictx.operation.is_none(),
+                            !gate.blocking && !gate.busy,
                             egui::Button::new(t(lang, Key::SrvValidateAndAdd)),
                         )
                         .on_hover_text(t(lang, Key::SrvValidateAndAddHint))
@@ -7215,20 +7401,22 @@ mod tests {
     };
     use super::raw_editor::JsonBuf;
     use super::{
-        AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog,
-        DraftTargetKind, EditorTab, EditorValidationCache, ExistingProfileDraft, FINGERPRINTS,
-        FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, RawBuffers, RawField,
-        Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen,
-        SockoptUsage, StatusLine, drag_scroll_delta, ech_sockopt_editor, editor_validation_errors,
-        final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed, mux_tab,
-        noises_editor, reorder_target, server_list_row, sockopt_validation_errors,
+        AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftGate,
+        DraftTargetKind, EditorTab, EditorValidationCache, EditorValidationFindings,
+        EditorValidationRender, ExistingProfileDraft, FINGERPRINTS, FeedbackLevel, FieldKey,
+        Language, LatencyBadge, LeaveAction, RawBuffers, RawField, Request, RowProbeState,
+        STATUS_TOAST_AUTO_CLEAR, ServerProfile, ServersScreen, SockoptUsage, StatusLine,
+        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
+        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
+        fingerprint_allowed, mux_tab, noises_editor, refresh_add_draft_validation,
+        refresh_editor_validation, reorder_target, server_list_row, sockopt_findings,
         status_colors_of, status_toast_expired,
     };
     use crate::diag::{Diag, DiagError};
-    use crate::i18n::{Key, t, t_fmt, validation_message};
+    use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
     use crate::links;
     use crate::model::stream::MasqueradeCfg;
-    use crate::model::validation::ValidationCode;
+    use crate::model::validation::{ValidationCode, ValidationIssue};
     use crate::model::{
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
         FinalmaskQuicParams, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask,
@@ -7241,10 +7429,25 @@ mod tests {
         ProfileValidationResult, ToolTarget,
     };
     use crate::ui::test_rig::UiTestRig;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable};
     use serde_json::json;
     use std::time::{Duration, Instant};
     use std::{cell::RefCell, rc::Rc};
+
+    /// The codes of one finding list, in the sweep's order.
+    fn codes_of(findings: &[ValidationIssue]) -> Vec<ValidationCode> {
+        findings.iter().map(|issue| issue.code.clone()).collect()
+    }
+
+    /// The one finding carrying `code`, or a panic listing what the sweep
+    /// produced instead.
+    fn finding(findings: &[ValidationIssue], code: ValidationCode) -> ValidationIssue {
+        findings
+            .iter()
+            .find(|issue| issue.code == code)
+            .cloned()
+            .expect("the sweep reports the rule")
+    }
 
     #[test]
     fn vlessenc_extracts_client_encryption_not_server_decryption() {
@@ -8699,19 +8902,30 @@ TLS ping finished"#;
             ..Default::default()
         };
         let before = serde_json::to_value(&modeled).unwrap();
-        let errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream);
-        assert!(errors.iter().any(|error| error.contains("domainStrategy")));
-        assert!(errors.iter().any(|error| error.contains("tcpFastOpen")));
-        assert!(errors.iter().any(|error| error.contains("opposite signs")));
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("customSockopt opt"))
+        let findings = sockopt_findings(&modeled, SockoptUsage::Stream);
+        assert_eq!(
+            codes_of(&findings),
+            vec![
+                ValidationCode::SockoptDomainStrategyInvalid,
+                ValidationCode::SockoptTcpFastOpenType,
+                ValidationCode::SockoptKeepaliveSigns,
+                ValidationCode::SockoptCustomOptRequired,
+                ValidationCode::SockoptCustomTypeInvalid,
+            ],
+            "{findings:#?}"
         );
-        assert!(
-            errors
+        assert_eq!(
+            findings
                 .iter()
-                .any(|error| error.contains("customSockopt type"))
+                .map(|issue| issue.path.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("stream.sockopt.domainStrategy"),
+                Some("stream.sockopt.tcpFastOpen"),
+                Some("stream.sockopt.tcpKeepAliveIdle"),
+                Some("stream.sockopt.customSockopt"),
+                Some("stream.sockopt.customSockopt"),
+            ],
         );
 
         let rendered = Rc::new(RefCell::new(Some(modeled)));
@@ -8736,7 +8950,7 @@ TLS ping finished"#;
             tcp_fast_open: Some(json!(12.75)),
             ..Default::default()
         };
-        assert!(sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream).is_empty());
+        assert!(sockopt_findings(&modeled, SockoptUsage::Stream).is_empty());
 
         let rendered = Rc::new(RefCell::new(Some(modeled)));
         let rendered_for_ui = Rc::clone(&rendered);
@@ -8760,36 +8974,44 @@ TLS ping finished"#;
             domain_strategy: "future-strategy".into(),
             ..Default::default()
         };
-        let stream_errors = sockopt_validation_errors(Language::En, &modeled, SockoptUsage::Stream);
-        assert!(
-            stream_errors
-                .iter()
-                .any(|error| error.contains("stream.sockopt.domainStrategy")),
-            "{stream_errors:?}"
+        let stream_findings = sockopt_findings(&modeled, SockoptUsage::Stream);
+        assert_eq!(
+            finding(
+                &stream_findings,
+                ValidationCode::SockoptDomainStrategyInvalid
+            )
+            .path
+            .as_deref(),
+            Some("stream.sockopt.domainStrategy"),
+            "{stream_findings:#?}"
         );
-        let ech_errors =
-            sockopt_validation_errors(Language::En, &modeled, SockoptUsage::EchDnsQuery);
-        assert!(
-            ech_errors
-                .iter()
-                .any(|error| error.contains("stream.tlsSettings.echSockopt.domainStrategy")),
-            "an ECH sockopt finding must name its own wire path: {ech_errors:?}"
+        let ech_findings = sockopt_findings(&modeled, SockoptUsage::EchDnsQuery);
+        assert_eq!(
+            finding(&ech_findings, ValidationCode::SockoptDomainStrategyInvalid)
+                .path
+                .as_deref(),
+            Some("stream.tlsSettings.echSockopt.domainStrategy"),
+            "an ECH sockopt finding must name its own wire path: {ech_findings:#?}"
         );
         // The block paints exactly the memoized slice it is handed — the
         // corrected ECH path included, with no re-validation of its own.
         // The viewport is tall enough to keep the block's verdict lines on
         // screen for the harness.
         let mut rendered = Some(modeled);
+        let messages: Vec<String> = ech_findings
+            .iter()
+            .map(|issue| validation_issue_message(issue, Language::En))
+            .collect();
         let mut harness = Harness::builder()
             .with_size(egui::vec2(800.0, 1200.0))
             .build_ui(|ui| {
-                let _ = ech_sockopt_editor(ui, Language::En, &mut rendered, &ech_errors);
+                let _ = ech_sockopt_editor(ui, Language::En, &mut rendered, &messages);
             });
         harness.run();
-        for message in &ech_errors {
+        for message in &messages {
             assert!(
                 harness.query_by_label(message.as_str()).is_some(),
-                "the ECH block must render the memoized verdict {message:?}"
+                "the ECH block must render the verdict it is handed: {message:?}"
             );
         }
     }
@@ -8815,15 +9037,14 @@ TLS ping finished"#;
     fn invalid_new_server_draft_cannot_commit() {
         let invalid = ServerProfile::new("incomplete", OutboundModel::new(Protocol::Vless));
         assert!(
-            !editor_validation_errors(Language::En, &invalid)
-                .0
-                .is_empty()
+            !editor_validation_findings(&invalid).blocking.is_empty(),
+            "a fresh VLESS draft must not be committable"
         );
 
         let valid = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &valid);
-        assert!(errors.is_empty());
-        assert!(warnings.is_empty());
+        let findings = editor_validation_findings(&valid);
+        assert!(findings.blocking.is_empty());
+        assert!(findings.advisory.is_empty());
     }
 
     /// One-channel regression guard:
@@ -8842,19 +9063,27 @@ TLS ping finished"#;
             settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
             settings.encryption = "none".into();
         }
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(
-            !errors
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert_eq!(
+            blocking
                 .iter()
-                .any(|error| error.contains(t(Language::En, Key::SrvPortRequired))),
-            "the deleted UI port push must not be the channel: {errors:#?}"
+                .filter(|issue| issue.code == ValidationCode::SettingsPortZero)
+                .count(),
+            1,
+            "port 0 must surface exactly one finding: {blocking:#?}"
         );
         assert_eq!(
-            errors.iter().filter(|error| error.contains("port")).count(),
-            1,
-            "port 0 must surface exactly one error line: {errors:#?}"
+            finding(&blocking, ValidationCode::SettingsPortZero)
+                .path
+                .as_deref(),
+            Some("settings.port"),
         );
-        assert!(errors[0].contains("settings.port"), "{errors:#?}");
+        assert!(
+            !blocking
+                .iter()
+                .any(|issue| issue.code == ValidationCode::ServerPortRequired),
+            "the deleted draft push must not be the channel: {blocking:#?}"
+        );
 
         {
             let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
@@ -8863,15 +9092,20 @@ TLS ping finished"#;
             settings.port = 443;
             settings.id = "some-short-account".into();
         }
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+        let blocking = editor_validation_findings(&profile).blocking;
         assert_eq!(
-            errors.iter().filter(|error| error.contains("UUID")).count(),
+            blocking
+                .iter()
+                .filter(|issue| issue.code == ValidationCode::SettingsIdNotUuid)
+                .count(),
             1,
-            "a non-UUID id must surface exactly one error line: {errors:#?}"
+            "a non-UUID id must surface exactly one finding: {blocking:#?}"
         );
+        let duplicate_id = finding(&blocking, ValidationCode::SettingsIdNotUuid);
+        assert_eq!(duplicate_id.path.as_deref(), Some("settings.id"));
         assert!(
-            errors.iter().any(|error| error.contains("canonical UUID")),
-            "{errors:#?}"
+            validation_issue_message(&duplicate_id, Language::En).contains("canonical UUID"),
+            "the message must name the constraint it enforces"
         );
     }
 
@@ -8891,16 +9125,22 @@ TLS ping finished"#;
             settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
             settings.encryption = "mlkem768x25519plus.native.1rtt.key".into();
         }
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(warnings.is_empty(), "{warnings:#?}");
-        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let findings = editor_validation_findings(&profile);
+        assert!(findings.advisory.is_empty(), "{:#?}", findings.advisory);
+        assert_eq!(findings.blocking.len(), 1, "{:#?}", findings.blocking);
+        let encryption = finding(
+            &findings.blocking,
+            ValidationCode::VlessEncryptionUnsupported,
+        );
+        assert_eq!(encryption.path.as_deref(), Some("settings.encryption"));
+        let message = validation_issue_message(&encryption, Language::En);
         assert!(
-            errors[0].contains("at least one full key part"),
-            "the message must name the real constraint: {errors:#?}"
+            message.contains("at least one full key part"),
+            "the message must name the real constraint: {message:?}"
         );
         assert!(
-            errors[0].contains("Padding parts come before the first key part"),
-            "the message must explain where padding belongs: {errors:#?}"
+            message.contains("Padding parts come before the first key part"),
+            "the message must explain where padding belongs: {message:?}"
         );
     }
 
@@ -8935,20 +9175,20 @@ TLS ping finished"#;
             .as_mut()
             .unwrap()
             .fingerprint = "bogus".into();
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+        let blocking = editor_validation_findings(&profile).blocking;
         assert_eq!(
-            errors
+            blocking
                 .iter()
-                .filter(|error| error.contains("fingerprint"))
+                .filter(|issue| issue.code == ValidationCode::TlsFingerprintUnsupported)
                 .count(),
             1,
-            "an out-of-vocab TLS fingerprint must surface exactly one error line: {errors:#?}"
+            "an out-of-vocab TLS fingerprint must surface exactly one finding: {blocking:#?}"
         );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("stream.tlsSettings.fingerprint")),
-            "{errors:#?}"
+        assert_eq!(
+            finding(&blocking, ValidationCode::TlsFingerprintUnsupported)
+                .path
+                .as_deref(),
+            Some("stream.tlsSettings.fingerprint"),
         );
 
         // Malformed cert pins: one line, on the pinnedPeerCertSha256 path.
@@ -8966,17 +9206,20 @@ TLS ping finished"#;
             .as_mut()
             .unwrap()
             .pinned_peer_cert_sha256 = "zz".into();
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+        let blocking = editor_validation_findings(&profile).blocking;
         assert_eq!(
-            errors.iter().filter(|error| error.contains("pin")).count(),
-            1,
-            "a malformed pin must surface exactly one error line: {errors:#?}"
-        );
-        assert!(
-            errors
+            blocking
                 .iter()
-                .any(|error| error.contains("stream.tlsSettings.pinnedPeerCertSha256")),
-            "{errors:#?}"
+                .filter(|issue| issue.code == ValidationCode::PinnedPeerCertSha256Invalid)
+                .count(),
+            1,
+            "a malformed pin must surface exactly one finding: {blocking:#?}"
+        );
+        assert_eq!(
+            finding(&blocking, ValidationCode::PinnedPeerCertSha256Invalid)
+                .path
+                .as_deref(),
+            Some("stream.tlsSettings.pinnedPeerCertSha256"),
         );
 
         // Version strings outside {1.0..1.3} warn once per field and never
@@ -8995,52 +9238,60 @@ TLS ping finished"#;
             .as_mut()
             .unwrap()
             .min_version = "1.4".into();
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        let findings = editor_validation_findings(&profile);
         assert!(
-            errors.is_empty(),
-            "a version warning must not block: {errors:?}"
+            findings.blocking.is_empty(),
+            "a version warning must not block: {:#?}",
+            findings.blocking
         );
         assert_eq!(
-            warnings
+            findings
+                .advisory
                 .iter()
-                .filter(|warning| warning.contains("version"))
+                .filter(|issue| issue.code == ValidationCode::TlsVersionRangeInvalid)
                 .count(),
             1,
-            "an out-of-range minVersion must warn exactly once: {warnings:#?}"
+            "an out-of-range minVersion must warn exactly once: {:#?}",
+            findings.advisory
         );
-        assert!(warnings[0].contains("minVersion"), "{warnings:?}");
+        assert_eq!(
+            finding(&findings.advisory, ValidationCode::TlsVersionRangeInvalid)
+                .path
+                .as_deref(),
+            Some("stream.tlsSettings.minVersion"),
+        );
 
         // REALITY block: each malformed value is one error line with its
         // wire path (the other fields stay canonical so nothing else fires).
-        for (field, value, needle, path) in [
+        for (field, value, code, path) in [
             (
                 "fingerprint",
                 "unsafe",
-                "fingerprint",
+                ValidationCode::RealityFingerprintUnsupported,
                 "stream.realitySettings.fingerprint",
             ),
             (
                 "password",
                 "AAA",
-                "publicKey",
+                ValidationCode::RealityPublicKeyInvalid,
                 "stream.realitySettings.publicKey",
             ),
             (
                 "short_id",
                 "abc",
-                "shortId",
+                ValidationCode::RealityShortIdInvalid,
                 "stream.realitySettings.shortId",
             ),
             (
                 "spider_x",
                 "relative",
-                "spiderX",
+                ValidationCode::RealitySpiderXInvalid,
                 "stream.realitySettings.spiderX",
             ),
             (
                 "mldsa65_verify",
                 "AAA",
-                "ML-DSA-65",
+                ValidationCode::RealityMldsa65Invalid,
                 "stream.realitySettings.mldsa65Verify",
             ),
         ] {
@@ -9060,15 +9311,17 @@ TLS ping finished"#;
                 _ => unreachable!(),
             }
             profile.outbound.stream.reality_settings = Some(reality);
-            let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+            let blocking = editor_validation_findings(&profile).blocking;
             assert_eq!(
-                errors.len(),
+                blocking.len(),
                 1,
-                "{field} = {value:?} must surface exactly one error line: {errors:#?}"
+                "{field} = {value:?} must surface exactly one finding: {blocking:#?}"
             );
-            assert!(
-                errors[0].contains(needle) && errors[0].contains(path),
-                "{field} = {value:?} must name {path}: {errors:#?}"
+            assert_eq!(blocking[0].code, code, "{field} = {value:?}");
+            assert_eq!(
+                blocking[0].path.as_deref(),
+                Some(path),
+                "{field} = {value:?} must name {path}"
             );
         }
     }
@@ -9101,34 +9354,47 @@ TLS ping finished"#;
             server_name: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".into(),
             ..Default::default()
         });
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        let findings = editor_validation_findings(&profile);
         assert!(
-            errors.is_empty(),
-            "warnings must not block save: {errors:?}"
+            findings.blocking.is_empty(),
+            "warnings must not block save: {:#?}",
+            findings.blocking
         );
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|warning| warning.contains("mux")));
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("serverName"))
+        assert_eq!(
+            codes_of(&findings.advisory),
+            vec![
+                ValidationCode::MuxWithVisionFlow,
+                ValidationCode::ServerNameImplausible
+            ],
+            "{:#?}",
+            findings.advisory
+        );
+        assert_eq!(
+            finding(&findings.advisory, ValidationCode::ServerNameImplausible)
+                .path
+                .as_deref(),
+            Some("stream.tlsSettings.serverName"),
         );
 
         // The concurrency -1 escape hatch clears the mux warning only.
         profile.outbound.mux.concurrency = Some(-1);
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(errors.is_empty());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("serverName"), "{warnings:?}");
+        let findings = editor_validation_findings(&profile);
+        assert!(findings.blocking.is_empty());
+        assert_eq!(
+            codes_of(&findings.advisory),
+            vec![ValidationCode::ServerNameImplausible],
+            "{:#?}",
+            findings.advisory
+        );
 
         // A plausible serverName clears the last warning.
         profile.outbound.stream.tls_settings = Some(TlsModel {
             server_name: "example.com".into(),
             ..Default::default()
         });
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(errors.is_empty());
-        assert!(warnings.is_empty());
+        let findings = editor_validation_findings(&profile);
+        assert!(findings.blocking.is_empty());
+        assert!(findings.advisory.is_empty());
 
         // A blocking finding still lands in the error half while a warning
         // stays advisory in its own half.
@@ -9138,10 +9404,26 @@ TLS ping finished"#;
             master_key_log: "C:\\xray-keys.log".into(),
             ..Default::default()
         });
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("masterKeyLog"), "{errors:?}");
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let findings = editor_validation_findings(&profile);
+        assert_eq!(
+            codes_of(&findings.blocking),
+            vec![ValidationCode::MasterKeyLogNotSupported],
+            "{:#?}",
+            findings.blocking
+        );
+        assert_eq!(
+            findings.blocking[0].path.as_deref(),
+            Some("stream.tlsSettings.masterKeyLog"),
+        );
+        assert_eq!(
+            codes_of(&findings.advisory),
+            vec![
+                ValidationCode::MuxWithVisionFlow,
+                ValidationCode::ServerNameImplausible
+            ],
+            "{:#?}",
+            findings.advisory
+        );
     }
 
     #[test]
@@ -9226,14 +9508,26 @@ TLS ping finished"#;
             settings.port = 443;
             settings.encryption = "none".into();
         }
-        let (errors, _, inline) = editor_validation_errors(Language::En, &profile);
-        assert!(
-            !inline.is_empty(),
-            "the sweep must hand the Basic tab the public-endpoint rule: {errors:?}"
+        let findings = editor_validation_findings(&profile);
+        let rendered = findings.render(Language::En);
+        let public_endpoint = finding(
+            &findings.blocking,
+            ValidationCode::PublicVlessRequiresTlsOrEncryption,
         );
         assert!(
-            inline.iter().all(|message| errors.contains(message)),
-            "the inline half must be the same rendered messages as the error half"
+            basic_tab_inline_verdict(&public_endpoint.code),
+            "the Basic tab must own the public-endpoint rule"
+        );
+        assert!(
+            rendered
+                .blocking
+                .contains(&validation_issue_message(&public_endpoint, Language::En))
+        );
+        let inline = rendered.basic_inline;
+        assert_eq!(
+            inline,
+            vec![validation_issue_message(&public_endpoint, Language::En)],
+            "the Basic tab's verdict is the error list's finding, rendered the same"
         );
         let mut screen = ServersScreen::default();
         {
@@ -9403,16 +9697,25 @@ TLS ping finished"#;
             password: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into(),
             ..Default::default()
         });
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
+        let findings = editor_validation_findings(&profile);
         assert!(
-            errors.is_empty(),
-            "a wire-valid fingerprint must not block: {errors:#?}"
+            findings.blocking.is_empty(),
+            "a wire-valid fingerprint must not block: {:#?}",
+            findings.blocking
         );
-        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(findings.advisory.len(), 1, "{:#?}", findings.advisory);
+        let advisory = &findings.advisory[0];
+        assert_eq!(
+            advisory.code,
+            ValidationCode::RealityFingerprintUntested("ios".into())
+        );
+        assert_eq!(
+            advisory.path.as_deref(),
+            Some("stream.realitySettings.fingerprint"),
+        );
         assert!(
-            warnings[0].starts_with("stream.realitySettings.fingerprint: ")
-                && warnings[0].contains("ios"),
-            "{warnings:#?}"
+            validation_issue_message(advisory, Language::En).contains("ios"),
+            "the message must name the value it questions"
         );
     }
 
@@ -10103,9 +10406,9 @@ TLS ping finished"#;
             settings.noises = noises.borrow().clone();
             settings.final_rules = rules.borrow().clone();
         }
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile.borrow());
-        assert!(errors.is_empty());
-        assert!(warnings.is_empty());
+        let findings = editor_validation_findings(&profile.borrow());
+        assert!(findings.blocking.is_empty(), "{:#?}", findings.blocking);
+        assert!(findings.advisory.is_empty(), "{:#?}", findings.advisory);
     }
 
     #[test]
@@ -10118,14 +10421,21 @@ TLS ping finished"#;
         settings.noises.push(Default::default());
         settings.final_rules.push(Default::default());
 
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(errors.iter().any(|error| error.contains("fragmentation")));
-        assert!(errors.iter().any(|error| error.contains("noise")));
-        assert!(errors.iter().any(|error| error.contains("final rule")));
+        let blocking = editor_validation_findings(&profile).blocking;
+        for code in [
+            ValidationCode::FreedomFragmentInvalid,
+            ValidationCode::FreedomNoiseInvalid,
+            ValidationCode::FreedomFinalRuleInvalid,
+        ] {
+            assert!(
+                blocking.iter().any(|issue| issue.code == code),
+                "{code:?} must report: {blocking:#?}"
+            );
+        }
     }
 
     #[test]
-    fn moved_editor_rules_still_render_through_the_editor_errors() {
+    fn moved_editor_rules_still_report_through_the_editor_sweep() {
         // `sendThrough`, freedom final-rule actions, and DNS rule actions
         // moved into the model pass (validate_outbound); the editor's error
         // list must keep rendering their texts.
@@ -10135,14 +10445,18 @@ TLS ping finished"#;
             unreachable!();
         };
         settings.final_rules.push(Default::default());
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+        let blocking = editor_validation_findings(&profile).blocking;
         assert!(
-            errors.iter().any(|error| error.contains("sendThrough")),
-            "{errors:?}"
+            blocking
+                .iter()
+                .any(|issue| issue.code == ValidationCode::SendThroughInvalid),
+            "{blocking:#?}"
         );
         assert!(
-            errors.iter().any(|error| error.contains("final rule")),
-            "{errors:?}"
+            blocking
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FreedomFinalRuleInvalid),
+            "{blocking:#?}"
         );
 
         let mut profile = ServerProfile::new("dns", OutboundModel::new(Protocol::Dns));
@@ -10150,12 +10464,12 @@ TLS ping finished"#;
             unreachable!();
         };
         settings.rules.push(Default::default());
-        let (errors, _warnings, _) = editor_validation_errors(Language::En, &profile);
+        let blocking = editor_validation_findings(&profile).blocking;
         assert!(
-            errors
+            blocking
                 .iter()
-                .any(|error| error.contains("DNS outbound rule")),
-            "{errors:?}"
+                .any(|issue| issue.code == ValidationCode::DnsRuleActionInvalid),
+            "{blocking:#?}"
         );
     }
 
@@ -10171,10 +10485,10 @@ TLS ping finished"#;
         settings.password = "secret".into();
         settings.level = Some(255);
         assert!(
-            !editor_validation_errors(Language::En, &profile)
-                .0
+            !editor_validation_findings(&profile)
+                .blocking
                 .iter()
-                .any(|error| error.contains("level"))
+                .any(|issue| issue.code == ValidationCode::ShadowsocksLevelRange)
         );
 
         let ProtocolSettings::Shadowsocks(settings) = &mut profile.outbound.settings else {
@@ -10182,10 +10496,10 @@ TLS ping finished"#;
         };
         settings.level = Some(256);
         assert!(
-            editor_validation_errors(Language::En, &profile)
-                .0
+            editor_validation_findings(&profile)
+                .blocking
                 .iter()
-                .any(|error| error.contains("level"))
+                .any(|issue| issue.code == ValidationCode::ShadowsocksLevelRange)
         );
     }
 
@@ -10336,18 +10650,25 @@ TLS ping finished"#;
             custom_response_data: "aGk".into(),
             ..Default::default()
         });
-        let (errors, warnings, _) = editor_validation_errors(Language::En, &profile);
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("settings.response.customResponseData")),
-            "the blocking finding must name the payload field: {errors:?}"
+        let findings = editor_validation_findings(&profile);
+        assert_eq!(
+            finding(
+                &findings.blocking,
+                ValidationCode::BlackholeCustomResponseDataInvalid
+            )
+            .path
+            .as_deref(),
+            Some("settings.response.customResponseData"),
+            "the blocking finding must name the payload field: {:#?}",
+            findings.blocking
         );
         assert!(
-            !warnings
+            !findings
+                .advisory
                 .iter()
-                .any(|warning| warning.contains("customResponseData")),
-            "the payload rule gates, it never advises: {warnings:?}"
+                .any(|issue| issue.code == ValidationCode::BlackholeCustomResponseDataInvalid),
+            "the payload rule gates, it never advises: {:#?}",
+            findings.advisory
         );
 
         let ProtocolSettings::Blackhole(settings) = &mut profile.outbound.settings else {
@@ -10358,8 +10679,8 @@ TLS ping finished"#;
             custom_response_data: "aGk=".into(),
             ..Default::default()
         });
-        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
-        assert!(errors.is_empty(), "{errors:?}");
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert!(blocking.is_empty(), "{blocking:#?}");
 
         // The payload is only decoded for the custom type, so a stray value
         // under the other types must not block the commit.
@@ -10371,8 +10692,8 @@ TLS ping finished"#;
             custom_response_data: "not base64!".into(),
             ..Default::default()
         });
-        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
-        assert!(errors.is_empty(), "{errors:?}");
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert!(blocking.is_empty(), "{blocking:#?}");
 
         // The custom match is case-insensitive (infra/conf/blackhole.go:24,31):
         // a case-variant spelling still decodes the payload, so the same
@@ -10385,12 +10706,16 @@ TLS ping finished"#;
             custom_response_data: "aGk".into(),
             ..Default::default()
         });
-        let (errors, _, _) = editor_validation_errors(Language::En, &profile);
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("settings.response.customResponseData")),
-            "the case-variant custom spelling must still gate on the payload: {errors:?}"
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert_eq!(
+            finding(
+                &blocking,
+                ValidationCode::BlackholeCustomResponseDataInvalid
+            )
+            .path
+            .as_deref(),
+            Some("settings.response.customResponseData"),
+            "the case-variant custom spelling must still gate on the payload: {blocking:#?}"
         );
     }
 
@@ -10409,10 +10734,10 @@ TLS ping finished"#;
                 .as_mut();
         }
         assert!(
-            editor_validation_errors(Language::En, &profile)
-                .0
+            editor_validation_findings(&profile)
+                .blocking
                 .iter()
-                .any(|error| error.contains("nesting"))
+                .any(|issue| issue.code == ValidationCode::XhttpDepthExceeded)
         );
     }
 
@@ -11025,13 +11350,9 @@ TLS ping finished"#;
         screen.add_draft = Some(added.clone());
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         screen.leave_pending = Some(LeaveAction::Select(osaka.id.clone()));
@@ -11148,13 +11469,9 @@ TLS ping finished"#;
         // source).
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         screen.close_add_draft(draft.clone());
@@ -11179,13 +11496,9 @@ TLS ping finished"#;
         };
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: false,
         });
         screen.close_add_draft(draft);
@@ -11207,13 +11520,9 @@ TLS ping finished"#;
         // a fresh add draft is unsaved by definition.
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         screen.derive_dialog = Some(DeriveDialog {
@@ -11261,13 +11570,9 @@ TLS ping finished"#;
         );
         screen.editor_validation_cache = Some(EditorValidationCache {
             generation: 3,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: false,
         });
         assert!(
@@ -11281,13 +11586,9 @@ TLS ping finished"#;
         );
         screen.editor_validation_cache = Some(EditorValidationCache {
             generation: 4,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: false,
         });
         screen.finalmask_raw.insert(
@@ -11312,13 +11613,9 @@ TLS ping finished"#;
         ));
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         assert!(
@@ -11389,13 +11686,9 @@ TLS ping finished"#;
         });
         screen.editor_validation_cache = Some(EditorValidationCache {
             generation: 3,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         // The add draft stays dirty after the existing draft commits: the
@@ -11404,13 +11697,9 @@ TLS ping finished"#;
         screen.add_draft = Some(add.clone());
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         screen.leave_pending = Some(LeaveAction::Quit);
@@ -11490,26 +11779,18 @@ TLS ping finished"#;
         });
         screen.editor_validation_cache = Some(EditorValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
         screen.add_draft = Some(add.clone());
         screen.add_draft_validation_cache = Some(AddDraftValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         screen.discard_leave_action(LeaveAction::Quit);
@@ -11542,13 +11823,9 @@ TLS ping finished"#;
         });
         screen.editor_validation_cache = Some(EditorValidationCache {
             generation: 0,
-            language: Language::En,
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            finalmask_errors: Vec::new(),
-            stream_sockopt_errors: Vec::new(),
-            ech_sockopt_errors: Vec::new(),
-            basic_inline_errors: Vec::new(),
+            findings: EditorValidationFindings::default(),
+            rendered_language: Language::En,
+            rendered: EditorValidationRender::default(),
             changed_from_source: true,
         });
         // An open add dialog is independent of the selection switch: the
@@ -11576,9 +11853,11 @@ TLS ping finished"#;
 
     /// Freedom profile carrying one invalid TCP header-custom mask: a `clients`
     /// item that uses `capture` without packet/positive rand/reuse/transform.
-    fn profile_with_bad_finalmask() -> ServerProfile {
-        let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
-        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+    /// A mask list the sweep reports on: the header-custom TCP mask's client
+    /// item sets `capture` without a payload, which Xray's fragment manager
+    /// refuses.
+    fn bad_finalmask_model() -> FinalmaskModel {
+        FinalmaskModel {
             tcp: vec![FinalmaskTcpMask::HeaderCustom {
                 settings: FinalmaskHeaderCustomTcp {
                     clients: vec![vec![FinalmaskTcpItem {
@@ -11592,119 +11871,216 @@ TLS ping finished"#;
             udp: Vec::new(),
             quic_params: None,
             extra: Default::default(),
-        });
+        }
+    }
+
+    fn profile_with_bad_finalmask() -> ServerProfile {
+        let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(bad_finalmask_model());
         profile
     }
 
+    /// The gate's two compositions over every combination of its five facts:
+    /// unsaved changes is the union of the draft's two dirty flags, and a
+    /// commit needs a draft that differs from its source and that no
+    /// error-severity finding blocks. The two facts that move without a draft
+    /// edit (the validation job, the busy window) are the compositions' own
+    /// business at the site — the action row's reading of them is pinned by
+    /// `editor_action_row_renders_the_gate_fact_combinations`.
     #[test]
-    fn editor_validation_sweeps_once_per_draft_generation_and_never_on_idle_frames() {
+    fn draft_gate_compositions_read_every_fact() {
+        for bits in 0..32u8 {
+            let changed = bits & 1 != 0;
+            let raw = bits & 2 != 0;
+            let blocking = bits & 4 != 0;
+            let gate = DraftGate {
+                changed_from_source: changed,
+                raw_buffers_dirty: raw,
+                blocking,
+                validating: bits & 8 != 0,
+                busy: bits & 16 != 0,
+            };
+            assert_eq!(gate.dirty(), changed || raw, "unsaved changes: {bits:05b}");
+            assert_eq!(
+                gate.committable(),
+                changed && !blocking,
+                "a commit needs an edited draft that nothing blocks: {bits:05b}"
+            );
+        }
+    }
+
+    /// The editor action row's rendered enablement for the three fact
+    /// combinations a user can reach: an edited draft that carries a blocking
+    /// finding (nothing to save, something to discard), an edited draft that
+    /// nothing blocks (both controls live), and a pristine draft (neither).
+    #[test]
+    fn editor_action_row_renders_the_gate_fact_combinations() {
+        fn install(screen: &mut ServersScreen, profile: &ServerProfile, source: serde_json::Value) {
+            let generation = screen
+                .existing_draft
+                .as_ref()
+                .map_or(1, |draft| draft.generation.wrapping_add(1));
+            screen.existing_draft = Some(ExistingProfileDraft {
+                id: profile.id.clone(),
+                tag: profile.tag(),
+                profile: profile.clone(),
+                source,
+                generation,
+            });
+        }
+
+        let clean = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let mut rig = UiTestRig::default();
-        // The draft carries a verdict, so the memoized cache's allocation
-        // identity is what tells a real sweep from an idle reuse.
-        let tokyo = profile_with_bad_finalmask();
-        rig.servers.profiles.push(tokyo.clone());
-        rig.servers.active = Some(tokyo.id.clone());
-        let mut harness = unsaved_harness(rig);
+        rig.servers.profiles.push(clean.clone());
+        rig.servers.active = Some(clean.id.clone());
+        let mut harness = wide_servers_harness(rig);
         harness.run();
-        // Opening the editor seeds the fresh draft's cache before the content
-        // renders — one sweep on the open frame, never again while idle.
-        let generation = harness
-            .state()
-            .0
-            .existing_draft
-            .as_ref()
-            .expect("the editor opens the active profile's draft")
-            .generation;
-        let opened = harness
-            .state()
-            .0
-            .editor_validation_cache
-            .as_ref()
-            .expect("the draft-open frame must run the validation sweep");
+        // The pristine draft: nothing to save and nothing to discard.
         assert_eq!(
-            opened.generation, generation,
-            "the draft-open frame must run the validation sweep exactly once"
+            action_row_disabled(&harness),
+            (true, true),
+            "a draft that matches its source offers neither control"
         );
-        let verdicts = opened.finalmask_errors.as_ptr();
-        harness.run();
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the draft stays covered by the memo")
-                .finalmask_errors
-                .as_ptr(),
-            verdicts,
-            "idle frames must not re-validate the draft"
+
+        // The same draft with an edit behind it: both controls are live.
+        let mut edited = clean.clone();
+        edited.name = "Tokyo edited".into();
+        install(
+            &mut harness.state_mut().0,
+            &edited,
+            serde_json::to_value(&clean).unwrap(),
         );
-        // One draft edit (generation bump, as every content edit does) →
-        // exactly one sweep, which is what replaces the memo's allocation.
-        edit_existing_draft(&mut harness.state_mut().0);
         harness.run();
-        let generation = harness
-            .state()
-            .0
-            .existing_draft
-            .as_ref()
-            .expect("the editor keeps the edited draft")
-            .generation;
-        let swept = harness
-            .state()
-            .0
-            .editor_validation_cache
-            .as_ref()
-            .expect("the edited draft must be covered by a fresh sweep");
         assert_eq!(
-            swept.generation, generation,
-            "one generation change must sweep exactly once"
+            action_row_disabled(&harness),
+            (false, false),
+            "an edited draft that nothing blocks must be saveable and discardable"
         );
-        let rebuilt = swept.finalmask_errors.as_ptr();
+
+        // The edit plus a blocking finding: Discard stays, Save goes dark.
+        let mut blocked = edited.clone();
+        blocked.outbound.stream.finalmask = Some(bad_finalmask_model());
+        install(
+            &mut harness.state_mut().0,
+            &blocked,
+            serde_json::to_value(&clean).unwrap(),
+        );
         harness.run();
-        harness.run();
+        assert!(
+            !editor_blocking(&harness).is_empty(),
+            "the fixture draft must carry a blocking finding"
+        );
         assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the draft stays covered by the memo")
-                .finalmask_errors
-                .as_ptr(),
-            rebuilt,
-            "idle frames after an edit must not re-validate"
+            action_row_disabled(&harness),
+            (true, false),
+            "a blocking finding must take Save dark without touching Discard"
         );
     }
 
+    /// The editor action row's two controls on the frame just rendered, as
+    /// (Validate-and-save disabled, Discard disabled).
+    fn action_row_disabled(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> (bool, bool) {
+        let disabled = |label: &str| {
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, label)
+                .accesskit_node()
+                .is_disabled()
+        };
+        (
+            disabled(t(Language::En, Key::SrvValidateAndSave)),
+            disabled(t(Language::En, Key::SrvDiscardChanges)),
+        )
+    }
+
+    /// The editor memo answers from the draft generation it was swept for: a
+    /// refresh at the same generation keeps the findings it holds (a draft
+    /// mutated behind its back must not be re-validated), a moved generation
+    /// sweeps again, and the rendered strings are a function of the findings
+    /// rather than of the profile — which is what makes a language change a
+    /// re-render instead of a re-validation.
     #[test]
-    fn advanced_tab_finalmask_issues_render_from_the_memo_and_track_edits() {
+    fn editor_validation_memo_reuses_findings_until_the_generation_moves() {
+        let mut profile = ServerProfile::new("vless", OutboundModel::new(Protocol::Vless));
+        {
+            let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.address = "example.com".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.encryption = "none".into();
+        }
+        let mut draft = ExistingProfileDraft {
+            id: profile.id.clone(),
+            tag: profile.tag(),
+            source: serde_json::to_value(&profile).expect("the fixture serializes"),
+            profile,
+            generation: 1,
+        };
+
+        let mut cache = None;
+        refresh_editor_validation(&mut cache, &draft, Language::En);
+        let swept = cache.as_ref().expect("the first refresh sweeps the draft");
+        assert_eq!(
+            codes_of(&swept.findings.blocking),
+            vec![ValidationCode::PublicVlessRequiresTlsOrEncryption],
+            "{:#?}",
+            swept.findings.blocking
+        );
+        let rendered = swept.rendered.blocking.clone();
+        assert_eq!(rendered.len(), 1);
+
+        // The same generation with a different profile behind it: the memo
+        // keeps the sweep it made, and the strings it renders stay the ones
+        // those findings produce (no re-validation, no re-render).
+        draft.profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
+        refresh_editor_validation(&mut cache, &draft, Language::En);
+        let reused = cache.as_ref().expect("the memo stays populated");
+        assert_eq!(
+            codes_of(&reused.findings.blocking),
+            vec![ValidationCode::PublicVlessRequiresTlsOrEncryption],
+            "a same-generation refresh must not re-sweep: {:#?}",
+            reused.findings.blocking
+        );
+        assert_eq!(
+            reused.rendered.blocking, rendered,
+            "the strings come from the findings, not from the profile"
+        );
+
+        // A moved generation sweeps the profile as it is now and renders it.
+        draft.source = serde_json::to_value(&draft.profile).expect("the fixture serializes");
+        draft.generation = 2;
+        refresh_editor_validation(&mut cache, &draft, Language::En);
+        let reswept = cache.as_ref().expect("the memo stays populated");
+        assert!(
+            reswept.findings.blocking.is_empty(),
+            "{:#?}",
+            reswept.findings.blocking
+        );
+        assert!(reswept.rendered.blocking.is_empty());
+        assert!(
+            reswept.rendered.advisory.is_empty(),
+            "{:#?}",
+            reswept.rendered.advisory
+        );
+    }
+
+    /// The Advanced tab renders the draft's finalmask verdicts inline, in
+    /// model order, and follows a draft edit that adds one — the verdicts
+    /// come from the sweep the draft's generation was validated with.
+    #[test]
+    fn advanced_tab_finalmask_verdicts_render_inline_and_track_edits() {
         let mut rig = UiTestRig::default();
         let tokyo = profile_with_bad_finalmask();
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.active = Some(tokyo.id.clone());
         let mut harness = unsaved_harness(rig);
         harness.run();
-        // The verdict list's allocation identity is the memo: while the
-        // draft generation holds, the Advanced frames render it without
-        // re-validating.
-        let verdicts = harness
-            .state()
-            .0
-            .editor_validation_cache
-            .as_ref()
-            .expect("the draft-open frame seeds the finalmask verdicts")
-            .finalmask_errors
-            .as_ptr();
         harness.get_by_label("Advanced").click();
         harness.run();
-        // The verdict renders inline under the mask list from the cache
-        // seeded on the draft-open frame; the Advanced frames re-validate
-        // nothing.
         assert!(
             harness.query_by_label(BAD_TCP_ITEM_MESSAGE).is_some(),
-            "the cached finalmask verdict must render inline on the Advanced tab"
+            "the finalmask verdict must render inline on the Advanced tab"
         );
         assert_eq!(
             harness
@@ -11712,33 +12088,21 @@ TLS ping finished"#;
                 .0
                 .editor_validation_cache
                 .as_ref()
-                .expect("the memo covers the draft")
-                .finalmask_errors
-                .as_ptr(),
-            verdicts,
-            "rendering the cached verdict must not re-validate"
+                .expect("the draft-open frame seeds the finalmask verdicts")
+                .findings
+                .finalmask
+                .iter()
+                .map(|issue| issue.path.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("finalmask.tcp[0].settings.clients[0][0]".into())],
         );
         harness.run();
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the memo covers the draft")
-                .finalmask_errors
-                .as_ptr(),
-            verdicts,
-            "idle frames on the Advanced tab must not re-validate the finalmask"
-        );
         assert!(
             harness.query_by_label(BAD_TCP_ITEM_MESSAGE).is_some(),
             "the verdict must keep rendering on idle frames"
         );
-        // One edit that adds a second invalid item: exactly one new sweep,
-        // and the cache carries both verdicts in model order — the second
-        // renders inline on the next frame.
+        // One edit that adds a second invalid item: the next sweep carries
+        // both verdicts in model order, and the second renders inline.
         let state = harness.state_mut();
         let draft = state.0.existing_draft.as_mut().unwrap();
         let FinalmaskTcpMask::HeaderCustom { settings, .. } = &mut draft
@@ -11765,54 +12129,26 @@ TLS ping finished"#;
             .as_ref()
             .expect("the editor keeps the edited draft")
             .generation;
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the edited draft must be covered by a fresh sweep")
-                .generation,
-            generation,
-            "a draft edit must re-validate exactly once"
-        );
-        let second_message = "finalmask.tcp[0].settings.clients[0][1]: set exactly one of \
-            packet, positive rand, reuse, or transform when capture is used";
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the memo covers the edited draft")
-                .finalmask_errors,
-            vec![BAD_TCP_ITEM_MESSAGE.to_string(), second_message.to_string()],
-            "the cache must carry both verdicts in model order"
-        );
-        let rebuilt = harness
+        let cache = harness
             .state()
             .0
             .editor_validation_cache
             .as_ref()
-            .expect("the memo covers the edited draft")
-            .finalmask_errors
-            .as_ptr();
+            .expect("the edited draft must be covered by a fresh sweep");
+        assert_eq!(
+            cache.generation, generation,
+            "the findings must describe the draft's current generation"
+        );
+        let second_message = "finalmask.tcp[0].settings.clients[0][1]: set exactly one of \
+            packet, positive rand, reuse, or transform when capture is used";
+        assert_eq!(
+            cache.rendered.finalmask,
+            vec![BAD_TCP_ITEM_MESSAGE.to_string(), second_message.to_string()],
+            "the sweep must carry both verdicts in model order"
+        );
         assert!(
             harness.query_by_label(second_message).is_some(),
-            "the edited verdict must render inline from the cache"
-        );
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .editor_validation_cache
-                .as_ref()
-                .expect("the memo covers the draft")
-                .finalmask_errors
-                .as_ptr(),
-            rebuilt,
-            "rendering the refreshed verdicts must not re-validate"
+            "the edited verdict must render inline"
         );
     }
 
@@ -11829,15 +12165,18 @@ TLS ping finished"#;
         (rig, tokyo, osaka)
     }
 
-    /// The draft's blocking list as the editor renders it.
-    fn editor_errors(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> Vec<String> {
+    /// The draft's blocking findings, as the editor's own sweep produced them.
+    fn editor_blocking(
+        harness: &Harness<'static, (ServersScreen, UiTestRig)>,
+    ) -> Vec<ValidationIssue> {
         harness
             .state()
             .0
             .editor_validation_cache
             .as_ref()
             .expect("the editor validates the draft")
-            .validation_errors
+            .findings
+            .blocking
             .clone()
     }
 
@@ -11855,12 +12194,11 @@ TLS ping finished"#;
             "a profile with the retired key must stay editable"
         );
         assert!(
-            editor_errors(&harness).iter().any(|error| {
-                error.contains("proxySettings")
-                    && error.contains("streamSettings.sockopt.dialerProxy")
-            }),
+            editor_blocking(&harness)
+                .iter()
+                .any(|issue| issue.code == ValidationCode::OutboundProxySettingsRemoved),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
 
         harness.get_by_label("Advanced").click();
@@ -11905,9 +12243,9 @@ TLS ping finished"#;
             "a rename must not dismiss the retired key"
         );
         assert!(
-            editor_errors(&harness)
+            editor_blocking(&harness)
                 .iter()
-                .any(|error| error.contains("proxySettings")),
+                .any(|issue| issue.code == ValidationCode::OutboundProxySettingsRemoved),
             "the finding must survive an unrelated edit"
         );
 
@@ -11986,11 +12324,11 @@ TLS ping finished"#;
             "the resolved profile must serialize without the key: {persisted}"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("proxySettings")),
+                .any(|issue| issue.code == ValidationCode::OutboundProxySettingsRemoved),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
     }
 
@@ -12238,11 +12576,11 @@ TLS ping finished"#;
             "the dismissed profile must serialize without the key: {persisted}"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("proxySettings")),
+                .any(|issue| issue.code == ValidationCode::OutboundProxySettingsRemoved),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
     }
 
@@ -12364,18 +12702,12 @@ TLS ping finished"#;
             harness.state().0.existing_draft.is_some(),
             "a profile with the retired key must stay editable"
         );
-        let errors = editor_errors(&harness);
+        let blocking = editor_blocking(&harness);
+        let hop = finding(&blocking, ValidationCode::FinalmaskQuicHopMoved);
+        let message = validation_issue_message(&hop, Language::En);
         assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("udpHop") && error.contains("udphop UDP mask")),
-            "{errors:#?}"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("intervalLocal") && error.contains("intervalRemote")),
-            "the fix-it text must state the equivalence: {errors:#?}"
+            message.contains("intervalLocal") && message.contains("intervalRemote"),
+            "the fix-it text must state the equivalence: {message:?}"
         );
 
         harness.get_by_label("Advanced").click();
@@ -12423,11 +12755,11 @@ TLS ping finished"#;
             "rebuilding the hop as the mask must clear the retired key"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("udpHop")),
+                .any(|issue| issue.code == ValidationCode::FinalmaskQuicHopMoved),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
         let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
         assert_eq!(
@@ -12500,11 +12832,11 @@ TLS ping finished"#;
             "the dismissed profile must serialize without the key: {persisted}"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("udpHop")),
+                .any(|issue| issue.code == ValidationCode::FinalmaskQuicHopMoved),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
     }
 
@@ -12746,71 +13078,42 @@ TLS ping finished"#;
         );
     }
 
+    /// The add dialog's memo mirrors the editor's: a refresh at the same
+    /// generation keeps the findings it holds, a moved generation sweeps
+    /// again, and its strings follow the findings it swept.
     #[test]
-    fn add_draft_validation_sweeps_once_per_generation_change_and_never_on_idle_frames() {
-        let rig = UiTestRig::default();
-        let mut harness = unsaved_harness(rig);
-        // A draft the sweep finds a verdict for, so the memoized cache's
-        // allocation identity tells a real sweep from an idle reuse.
-        harness.state_mut().0.add_draft = Some(profile_with_bad_finalmask());
-        harness.run();
-        let generation = harness.state().0.add_draft_generation;
-        let opened = harness
-            .state()
-            .0
-            .add_draft_validation_cache
+    fn add_draft_memo_reuses_findings_until_the_generation_moves() {
+        let draft = profile_with_bad_finalmask();
+        let mut cache = None;
+        refresh_add_draft_validation(&mut cache, 0, &draft, Language::En);
+        let swept = cache
             .as_ref()
-            .expect("the dialog-open frame must run the validation sweep");
+            .expect("the first refresh sweeps the add draft");
+        let verdicts = codes_of(&swept.findings.finalmask);
+        assert_eq!(verdicts.len(), 1, "{:#?}", swept.findings.finalmask);
+        let rendered = swept.rendered.finalmask.clone();
+
+        // The same generation with a different draft behind it: the memo
+        // answers with the sweep it made (the dialog bumps the generation on
+        // every content edit, so this is the idle-frame path).
+        let mut edited = draft.clone();
+        edited.name = "edited".into();
+        refresh_add_draft_validation(&mut cache, 0, &edited, Language::En);
+        let reused = cache.as_ref().expect("the memo stays populated");
         assert_eq!(
-            opened.generation, generation,
-            "the dialog-open frame must run the validation sweep exactly once"
-        );
-        let verdicts = opened.finalmask_errors.as_ptr();
-        harness.run();
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .add_draft_validation_cache
-                .as_ref()
-                .expect("the add draft stays covered by the memo")
-                .finalmask_errors
-                .as_ptr(),
+            codes_of(&reused.findings.finalmask),
             verdicts,
-            "idle frames of the add dialog must not re-validate"
+            "a same-generation refresh must not re-sweep: {:#?}",
+            reused.findings.finalmask
         );
-        // One draft edit (the generation the dialog bumps after content
-        // edits) → exactly one sweep, which replaces the memo's allocation.
-        let state = harness.state_mut();
-        state.0.add_draft.as_mut().unwrap().name.push('-');
-        state.0.add_draft_generation = state.0.add_draft_generation.wrapping_add(1);
-        harness.run();
-        let generation = harness.state().0.add_draft_generation;
-        let swept = harness
-            .state()
-            .0
-            .add_draft_validation_cache
-            .as_ref()
-            .expect("the edited add draft must be covered by a fresh sweep");
-        assert_eq!(
-            swept.generation, generation,
-            "one add-draft generation change must sweep exactly once"
-        );
-        let rebuilt = swept.finalmask_errors.as_ptr();
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .0
-                .add_draft_validation_cache
-                .as_ref()
-                .expect("the add draft stays covered by the memo")
-                .finalmask_errors
-                .as_ptr(),
-            rebuilt,
-            "idle frames after the add-draft edit must not re-validate"
-        );
+        assert_eq!(reused.rendered.finalmask, rendered);
+
+        // A moved generation sweeps the clean draft it is handed.
+        let clean = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
+        refresh_add_draft_validation(&mut cache, 1, &clean, Language::En);
+        let reswept = cache.as_ref().expect("the memo stays populated");
+        assert!(reswept.findings.finalmask.is_empty());
+        assert!(reswept.rendered.finalmask.is_empty());
     }
 
     #[test]
@@ -13215,12 +13518,12 @@ TLS ping finished"#;
             "the bad entry must report inline under its row"
         );
         assert!(
-            editor_errors(&harness)
-                .iter()
-                .any(|error| error.contains("settings.remoteDNS")
-                    && error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+            editor_blocking(&harness).iter().any(|issue| {
+                issue.code == ValidationCode::WireguardRemoteDnsInvalid
+                    && issue.path.as_deref() == Some("settings.remoteDNS")
+            }),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
 
         // Repair in place: the inline verdict and the gate both clear.
@@ -13239,11 +13542,11 @@ TLS ping finished"#;
             "the repaired entry must not report"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("remoteDNS")),
+                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
         let draft = harness
             .state()
@@ -13297,11 +13600,11 @@ TLS ping finished"#;
             "the sentinel alone must not report"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("remoteDNS")),
+                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
 
         // Adding a row makes the sentinel invalid, although its own text
@@ -13325,11 +13628,11 @@ TLS ping finished"#;
             "the empty new row must report its own verdict"
         );
         assert!(
-            editor_errors(&harness)
+            editor_blocking(&harness)
                 .iter()
-                .any(|error| error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
         drop(harness);
 
@@ -13346,11 +13649,11 @@ TLS ping finished"#;
             "the mixed list must report on the sentinel row"
         );
         assert!(
-            editor_errors(&harness)
+            editor_blocking(&harness)
                 .iter()
-                .any(|error| error.contains(t(Language::En, Key::SrvWgRemoteDnsInvalid))),
+                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
 
         // Removing the address row leaves the sentinel alone in the list. The
@@ -13391,11 +13694,11 @@ TLS ping finished"#;
             "no row may keep a verdict from the longer list"
         );
         assert!(
-            editor_errors(&harness)
+            !editor_blocking(&harness)
                 .iter()
-                .all(|error| !error.contains("remoteDNS")),
+                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
-            editor_errors(&harness)
+            editor_blocking(&harness)
         );
     }
 

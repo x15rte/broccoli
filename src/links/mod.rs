@@ -614,7 +614,10 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
                 }
             },
             "xhttp" => {
-                if !matches!(mode, "auto" | "packet-up" | "stream-up" | "stream-one") {
+                // The mode vocabulary is the model's (the same set Xray's
+                // SplitHTTPConfig.Build accepts); the link spells `auto` for
+                // the wire default, which the empty value also means.
+                if !crate::model::validation::xhttp_mode_supported(mode) {
                     return Err(malformed(
                         Diag::new(Key::LinkXhttpModeUnknown).arg(excerpt_debug(mode)),
                     ));
@@ -1415,9 +1418,13 @@ fn parse_legacy_vmess(body: &str) -> Result<ServerProfile, LinkError> {
             });
         }
         "xhttp" | "splithttp" => {
+            // The vmess link's `type` doubles as the xhttp mode: the absent,
+            // `none` and `auto` spellings all mean the wire default (the
+            // empty mode), and every other spelling must be a mode the
+            // model's vocabulary accepts.
             let mode = match typ.as_str() {
                 "" | "none" | "auto" => String::new(),
-                "packet-up" | "stream-up" | "stream-one" => typ,
+                other if crate::model::validation::xhttp_mode_supported(other) => typ,
                 other => {
                     return Err(LinkError::Unsupported(
                         Diag::new(Key::LinkUnsupportedVmessXhttp).arg(excerpt_debug(other)),
@@ -1943,10 +1950,7 @@ pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
                 return Err(malformed(Diag::new(Key::LinkPortZero).arg("vmess")));
             }
             check_uuid(&settings.id, "vmess")?;
-            if !matches!(
-                settings.security.as_str(),
-                "auto" | "aes-128-gcm" | "chacha20-poly1305"
-            ) {
+            if !crate::model::validation::vmess_security_supported(&settings.security) {
                 return Err(LinkError::Unsupported(
                     Diag::new(Key::LinkUnsupportedVmessEncryption)
                         .arg(excerpt_debug(&settings.security)),
@@ -1964,27 +1968,7 @@ pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
             if settings.port == 0 || settings.password.is_empty() {
                 return Err(malformed(Diag::new(Key::LinkSsIncomplete)));
             }
-            const CLASSIC_METHODS: &[&str] = &[
-                "aes-128-gcm",
-                "aead_aes_128_gcm",
-                "aes-256-gcm",
-                "aead_aes_256_gcm",
-                "chacha20-poly1305",
-                "aead_chacha20_poly1305",
-                "chacha20-ietf-poly1305",
-                "xchacha20-poly1305",
-                "aead_xchacha20_poly1305",
-                "xchacha20-ietf-poly1305",
-            ];
-            const METHODS_2022: &[&str] = &[
-                "2022-blake3-aes-128-gcm",
-                "2022-blake3-aes-256-gcm",
-                "2022-blake3-chacha20-poly1305",
-            ];
-            let classic = CLASSIC_METHODS
-                .iter()
-                .any(|method| settings.method.eq_ignore_ascii_case(method));
-            if !classic && !METHODS_2022.contains(&settings.method.as_str()) {
+            if !crate::model::validation::shadowsocks_method_supported(&settings.method) {
                 return Err(malformed(
                     Diag::new(Key::LinkSsMethod).arg(excerpt_debug(&settings.method)),
                 ));
