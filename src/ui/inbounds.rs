@@ -44,7 +44,7 @@ struct ValidationCache {
     /// password-mode HTTP with zero accounts is un-appliable at any bind.
     /// The model verdict pass enforces the same rule, and the row renders
     /// the same code's message.
-    local_auth_errors: Vec<Option<&'static str>>,
+    local_auth_errors: Vec<Option<String>>,
     /// One sniffing-vocabulary verdict per local endpoint list entry, in
     /// list order. The model verdict pass enforces the same rule; the row
     /// renders the shared model message (same code), so the row and the
@@ -265,7 +265,7 @@ impl InboundsScreen {
                     // editor it qualifies: password-mode HTTP with zero
                     // accounts authenticates nobody on the wire, so the row
                     // cannot apply at any bind (the model auth-trap rule).
-                    inline_error(ui, validation.local_auth_errors[i]);
+                    inline_error(ui, validation.local_auth_errors[i].as_deref());
                     changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
                     inline_error(ui, validation.local_sniffing_errors[i].as_deref());
                     inline_error(ui, validation.local_collisions[i].as_deref());
@@ -801,7 +801,7 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
 /// (`validate_settings` emits the same code — Apply/Connect are blocked
 /// through `config_error`); this screen only renders that code's message
 /// under the accounts editor.
-fn local_inbound_auth_error(lang: Language, entry: &LocalInboundCfg) -> Option<&'static str> {
+fn local_inbound_auth_error(lang: Language, entry: &LocalInboundCfg) -> Option<String> {
     if entry.enabled && inbound_auth_trap(entry) {
         Some(validation_message(
             &ValidationCode::LocalInboundAuthRequiresAccounts,
@@ -954,7 +954,7 @@ mod listener_validation_tests {
 
     /// The shared row-error text, rendered through the model code the
     /// verdict pass emits (one rule, one message).
-    fn auth_requires_accounts_error() -> &'static str {
+    fn auth_requires_accounts_error() -> String {
         validation_message(
             &ValidationCode::LocalInboundAuthRequiresAccounts,
             Language::En,
@@ -1365,7 +1365,7 @@ mod listener_validation_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label(auth_requires_accounts_error())
+                .query_by_label(auth_requires_accounts_error().as_str())
                 .is_some(),
             "the trapped row must render the shared inline error"
         );
@@ -1380,7 +1380,7 @@ mod listener_validation_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label(auth_requires_accounts_error())
+                .query_by_label(auth_requires_accounts_error().as_str())
                 .is_none(),
             "adding the first account must clear the row error"
         );
@@ -1473,7 +1473,7 @@ mod listener_validation_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label(auth_requires_accounts_error())
+                .query_by_label(auth_requires_accounts_error().as_str())
                 .is_some(),
             "the trapped row must render the shared inline error"
         );
@@ -1489,7 +1489,7 @@ mod listener_validation_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label(auth_requires_accounts_error())
+                .query_by_label(auth_requires_accounts_error().as_str())
                 .is_none(),
             "unticking Require auth must clear the row error"
         );

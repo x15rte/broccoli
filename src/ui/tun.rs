@@ -43,7 +43,7 @@ pub struct TunScreen {
 struct ValidationCache {
     generation: u64,
     tun_warning: Option<String>,
-    gateway_error: Option<&'static str>,
+    gateway_error: Option<String>,
 }
 
 /// The inline validation error for the gateways editor, or `None` when the
@@ -51,7 +51,7 @@ struct ValidationCache {
 /// IPv4 gateway → invalid): Apply/Connect are blocked through
 /// `config_error`, and this screen renders that code's message under the
 /// gateway list.
-fn tun_gateway_error(lang: Language, mode: Mode, tun: &TunCfg) -> Option<&'static str> {
+fn tun_gateway_error(lang: Language, mode: Mode, tun: &TunCfg) -> Option<String> {
     (mode == Mode::Tun && tun_ipv4_gateway(tun).is_none())
         .then(|| validation_message(&ValidationCode::TunIpv4GatewayRequired, lang))
 }
@@ -130,7 +130,7 @@ impl TunScreen {
             None => unreachable!("validation is built when absent, above"),
         };
         let gateway_error = match &self.validation {
-            Some(cache) => cache.gateway_error,
+            Some(cache) => cache.gateway_error.as_deref(),
             None => unreachable!("validation is built when absent, above"),
         };
 

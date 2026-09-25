@@ -29,7 +29,7 @@ mod common;
 
 /// The gateway rule's message, rendered from the model code the verdict
 /// pass emits (the same bytes the generator surfaces and the screen shows).
-fn gateway_error() -> &'static str {
+fn gateway_error() -> String {
     validation_message(&ValidationCode::TunIpv4GatewayRequired, Language::En)
 }
 
@@ -83,7 +83,7 @@ fn tun_on_with_cleared_gateway_is_a_validation_error() {
     );
     let error = generate(&settings).expect_err("cleared gateway must be rejected");
     assert!(
-        error.contains(gateway_error()),
+        error.contains(gateway_error().as_str()),
         "the error must name the IPv4-gateway requirement: {error:?}"
     );
 }
@@ -97,7 +97,7 @@ fn tun_on_with_ipv6_only_gateway_is_a_validation_error() {
     );
     let error = generate(&settings).expect_err("an IPv6-only gateway must be rejected");
     assert!(
-        error.contains(gateway_error()),
+        error.contains(gateway_error().as_str()),
         "the error must name the IPv4-gateway requirement: {error:?}"
     );
 }
@@ -125,7 +125,7 @@ fn readding_an_ipv4_gateway_clears_the_error_and_derives_from_it() {
     // never from a constant.
     let mut settings = tun_settings(Vec::new());
     let error = generate(&settings).expect_err("cleared gateway must be rejected first");
-    assert!(error.contains(gateway_error()), "{error:?}");
+    assert!(error.contains(gateway_error().as_str()), "{error:?}");
 
     settings.tun.gateway = vec!["192.168.10.1/30".into(), "fd00::1/64".into()];
     let cfg = generate(&settings).expect("re-adding an IPv4 gateway must recover");
@@ -153,7 +153,7 @@ fn cleared_gateway_cannot_reach_the_wire() {
         "the settings verdict must carry the IPv4-gateway rule"
     );
     let error = generate(&settings).expect_err("generation must block the cleared state");
-    assert!(error.contains(gateway_error()), "{error:?}");
+    assert!(error.contains(gateway_error().as_str()), "{error:?}");
 
     let ipv6_only = tun_settings(vec!["fd00::1/64".into()]);
     assert!(
@@ -161,7 +161,7 @@ fn cleared_gateway_cannot_reach_the_wire() {
         "the settings verdict must carry the IPv4-gateway rule"
     );
     let error = generate(&ipv6_only).expect_err("generation must block the IPv6-only state");
-    assert!(error.contains(gateway_error()), "{error:?}");
+    assert!(error.contains(gateway_error().as_str()), "{error:?}");
 }
 
 #[test]
@@ -236,7 +236,8 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
     let (_lock, _tmp, mut h) = boot(&settings, Some("TUN"));
 
     assert!(
-        h.query_by_label_contains(gateway_error()).is_none(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_none(),
         "a dual-stack gateway must not show the inline error"
     );
 
@@ -251,7 +252,8 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
         h.run_steps(4);
     }
     assert!(
-        h.query_by_label_contains(gateway_error()).is_some(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_some(),
         "deleting every gateway row must show the inline error"
     );
 
@@ -275,7 +277,8 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
     h.run_steps(4);
 
     assert!(
-        h.query_by_label_contains(gateway_error()).is_none(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_none(),
         "re-adding an IPv4 gateway must clear the inline error"
     );
 }
@@ -313,7 +316,8 @@ fn cleared_gateway_blocks_connect_and_surfaces_the_error() {
         "the dashboard must render the shell's generation error next to Connect: {expected:?}"
     );
     assert!(
-        h.query_by_label_contains(gateway_error()).is_none(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_none(),
         "the inline label carries the shell's excerpt-bounded text, not the unbounded generator message"
     );
     let connects: Vec<_> = h
@@ -338,7 +342,8 @@ fn valid_tun_config_does_not_surface_the_gateway_error() {
     let (_lock, _tmp, h) = boot(&settings, None);
 
     assert!(
-        h.query_by_label_contains(gateway_error()).is_none(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_none(),
         "a valid TUN config must not surface the gateway error"
     );
 }
@@ -351,7 +356,8 @@ fn fresh_install_default_gateway_stays_valid() {
     generate(&settings).expect("the fresh-install default must keep generating");
     let (_lock, _tmp, h) = boot(&settings, Some("TUN"));
     assert!(
-        h.query_by_label_contains(gateway_error()).is_none(),
+        h.query_by_label_contains(gateway_error().as_str())
+            .is_none(),
         "the fresh-install default must not show the inline error"
     );
 }

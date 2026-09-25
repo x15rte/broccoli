@@ -48,13 +48,9 @@ pub(crate) struct UiTestRig {
     /// renders inline under Connect, excerpt-bounded by the shell's
     /// generation boundary.
     pub(crate) config_error: Option<String>,
-    pub(crate) connect_requested: bool,
-    pub(crate) stop_requested: bool,
-    /// Core setup requests a screen raised this frame (Verify, Open core
-    /// folder, open the core setup surface).
-    pub(crate) verify_core_requested: bool,
-    pub(crate) open_core_folder_requested: bool,
-    pub(crate) open_core_setup_requested: bool,
+    /// The frame's requests, as the shell owns them: the rig hands the same
+    /// bundle to every `ctx()` and tests read the fields a screen set.
+    pub(crate) requests: crate::ui::FrameRequests,
     /// Outcome slot of the one single-flight latency probe, mirroring the
     /// app drain: probe UI tests park results here and the servers screen
     /// adopts them through its `ShellParked` request.
@@ -83,8 +79,7 @@ pub(crate) struct UiTestRig {
     /// Whether this process runs elevated: the TUN badge and the TUN hover
     /// copy read it.
     pub(crate) is_elevated: bool,
-    pub(crate) dirty: bool,
-    pub(crate) ui_dirty: bool,
+
     /// The model's edit generation, as the shell publishes it. Tests that
     /// mutate the model between frames go through [`UiTestRig::edit`], the
     /// rig's one route to the mutation hook, so the caches a screen derived
@@ -112,11 +107,7 @@ impl Default for UiTestRig {
             transport: None,
             connect_blocked_reason: None,
             config_error: None,
-            connect_requested: false,
-            stop_requested: false,
-            verify_core_requested: false,
-            open_core_folder_requested: false,
-            open_core_setup_requested: false,
+            requests: crate::ui::FrameRequests::default(),
             probe_feedback: Default::default(),
             stats: None,
             stats_history: VecDeque::new(),
@@ -130,8 +121,6 @@ impl Default for UiTestRig {
             update_check: UpdateCheckState::Idle,
             operation: None,
             is_elevated: false,
-            dirty: false,
-            ui_dirty: false,
             model_generation: 0,
             config_revision: 0,
             stats_generation: 0,
@@ -204,14 +193,8 @@ impl UiTestRig {
                 logs: &self.logs,
                 logs_generation: self.logs_generation,
                 probe_feedback: &mut self.probe_feedback,
-                dirty: &mut self.dirty,
-                ui_dirty: &mut self.ui_dirty,
+                requests: &mut self.requests,
                 model_generation: &mut self.model_generation,
-                connect_requested: &mut self.connect_requested,
-                stop_requested: &mut self.stop_requested,
-                verify_core_requested: &mut self.verify_core_requested,
-                open_core_folder_requested: &mut self.open_core_folder_requested,
-                open_core_setup_requested: &mut self.open_core_setup_requested,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
                 operation: self.operation,

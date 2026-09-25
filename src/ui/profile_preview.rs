@@ -152,7 +152,7 @@ impl ProfilePreviewScreen {
         let refresh = egui::Button::new(t(lang, Key::RuntimeRefresh));
         if ui.add_enabled(gate.enabled, refresh).clicked() {
             let (reply, receiver) = tokio::sync::oneshot::channel();
-            if ctx.cmd.send(CoreCmd::ListRuntimeState { reply }).is_err() {
+            if !ctx.send(CoreCmd::ListRuntimeState { reply }) {
                 self.runtime = Some(Err(DiagError::from(Diag::new(Key::RuntimeChannelClosed))));
             } else {
                 self.pending_request = Request::reply(receiver);

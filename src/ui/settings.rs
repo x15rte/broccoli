@@ -1629,7 +1629,10 @@ mod tests {
             Some("https://example.com/geosite.dat")
         );
         assert_eq!(rig.settings.geodata.cron.as_deref(), Some("17 3 * * 1"));
-        assert!(rig.dirty, "geodata edits must mark the settings dirty");
+        assert!(
+            rig.requests.dirty,
+            "geodata edits must mark the settings dirty"
+        );
     }
 
     #[test]
@@ -1673,7 +1676,7 @@ mod tests {
             "https://example.com/generate_204"
         );
         assert!(
-            rig.dirty,
+            rig.requests.dirty,
             "ping test URL edits must mark the settings dirty"
         );
     }
@@ -2009,7 +2012,10 @@ mod tests {
         );
         assert_eq!(rig.settings.geodata.geosite_url, None);
         assert_eq!(rig.settings.geodata.cron, None);
-        assert!(rig.dirty, "a URL-only edit must mark the settings dirty");
+        assert!(
+            rig.requests.dirty,
+            "a URL-only edit must mark the settings dirty"
+        );
     }
 
     #[test]
@@ -2072,7 +2078,7 @@ mod tests {
             "an invalid cron must stay in the edit buffer, never committed"
         );
         assert!(
-            !rig.dirty,
+            !rig.requests.dirty,
             "invalid geodata edits must not mark the settings dirty"
         );
     }
@@ -2106,7 +2112,7 @@ mod tests {
             "an untouched section must leave geodata unconfigured"
         );
         assert!(
-            !rig.dirty,
+            !rig.requests.dirty,
             "rendering the empty section must not dirty settings"
         );
     }

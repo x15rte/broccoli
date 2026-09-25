@@ -1129,7 +1129,7 @@ mod tests {
             .click();
         harness.run();
         assert!(
-            harness.state().open_core_setup_requested,
+            harness.state().requests.open_core_setup,
             "the block's button must ask the shell to open the core setup surface"
         );
     }
@@ -1621,11 +1621,11 @@ mod tests {
             "the dropdown writes the selected unit into settings"
         );
         assert!(
-            rig.borrow().ui_dirty,
+            rig.borrow().requests.ui_dirty,
             "the unit change marks the UI-only persist flag"
         );
         assert!(
-            !rig.borrow().dirty,
+            !rig.borrow().requests.dirty,
             "a display preference must never enter the config-apply gate"
         );
 

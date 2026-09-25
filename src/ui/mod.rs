@@ -136,11 +136,6 @@ pub struct UiCtx<'a> {
     /// the generator themselves: generating a candidate binds the ephemeral
     /// control-plane port, so it stays on the shell's boot and persist paths.
     pub config_error: &'a Option<String>,
-    pub(crate) connect_requested: &'a mut bool,
-    pub(crate) stop_requested: &'a mut bool,
-    pub(crate) verify_core_requested: &'a mut bool,
-    pub(crate) open_core_folder_requested: &'a mut bool,
-    pub(crate) open_core_setup_requested: &'a mut bool,
     pub stats: &'a Option<StatsTick>,
     pub stats_history: &'a VecDeque<StatsTick>,
     pub observatory: &'a [OutboundStatusView],
@@ -170,12 +165,10 @@ pub struct UiCtx<'a> {
     /// the single slot is exact because the probe is single-flight and the
     /// UI pending gate holds until the take.
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
-    pub(crate) dirty: &'a mut bool,
-    /// UI-only edits (traffic unit, language, accent): persisted like
-    /// `dirty` but never enter the config-apply gate — no revision bump, no
-    /// "changes pending"/Apply-now (the running core's config is unaffected
-    /// by display preferences).
-    pub(crate) ui_dirty: &'a mut bool,
+    /// The frame's requests, owned by the shell and drained once after the
+    /// screens ran: settings edit hooks write into it (see
+    /// [`FrameRequests`]).
+    pub(crate) requests: &'a mut FrameRequests,
     /// The model's edit generation: bumped by every mutation hook
     /// ([`UiCtx::mark_dirty`] and [`UiCtx::mark_ui_dirty`]), so a screen's
     /// per-frame cache keyed on it re-derives in the frame after any edit —
@@ -196,6 +189,30 @@ pub struct UiCtx<'a> {
     pub latency_generation: u64,
 }
 
+/// The shell-owned requests one frame's screens raise: the lifecycle and
+/// setup actions the shell performs after the frame, the two persist
+/// requests, and the optimistic busy-window mirror for a command a screen
+/// sent. One value the shell owns and drains once, instead of seven `&mut
+/// bool` fields every screen can alias — the request vocabulary is one type,
+/// and a new request is one field here rather than a new borrow in every
+/// construction site.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct FrameRequests {
+    pub(crate) connect: bool,
+    pub(crate) stop: bool,
+    pub(crate) verify_core: bool,
+    pub(crate) open_core_folder: bool,
+    pub(crate) open_core_setup: bool,
+    /// A model edit landed: persist it through the config pipeline.
+    pub(crate) dirty: bool,
+    /// A display-only preference landed: persist it without the apply gate.
+    pub(crate) ui_dirty: bool,
+    /// The job kind of a command a screen just sent — the shell mirrors it
+    /// while the busy window is open, exactly as its own sends do. The
+    /// runtime's bookends stay the authority; this is the head start.
+    pub(crate) mirror_operation: Option<JobKind>,
+}
+
 /// Per-frame borrows and scalars every [`UiCtx::new`] construction site
 /// supplies: model references, the frame-flag
 /// locals, and the lifecycle scalars. Each frame site in the app shell
@@ -213,18 +230,12 @@ pub(crate) struct UiCtxParts<'a> {
     /// so the identity changes exactly when the ring's content changes.
     pub(crate) logs_generation: u64,
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
-    pub(crate) dirty: &'a mut bool,
-    pub(crate) ui_dirty: &'a mut bool,
+    pub(crate) requests: &'a mut FrameRequests,
     pub(crate) model_generation: &'a mut u64,
-    pub(crate) connect_requested: &'a mut bool,
-    pub(crate) stop_requested: &'a mut bool,
     pub(crate) connect_blocked_reason: &'a Option<String>,
     /// The shell's stored config-generation error (the same value the
     /// top-bar config chip renders), projected into [`UiCtx::config_error`].
     pub(crate) config_error: &'a Option<String>,
-    pub(crate) verify_core_requested: &'a mut bool,
-    pub(crate) open_core_folder_requested: &'a mut bool,
-    pub(crate) open_core_setup_requested: &'a mut bool,
     /// The raw window the shell drained from the runtime's operation
     /// bookends: [`UiCtx::new`] derives [`UiCtx::busy`] from it once per
     /// frame, and screens read the window through that value.
@@ -277,14 +288,8 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
-            dirty,
-            ui_dirty,
+            requests,
             model_generation,
-            connect_requested,
-            stop_requested,
-            verify_core_requested,
-            open_core_folder_requested,
-            open_core_setup_requested,
             connect_blocked_reason,
             config_error,
             operation,
@@ -342,14 +347,8 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
-            dirty,
-            ui_dirty,
+            requests,
             model_generation,
-            connect_requested,
-            stop_requested,
-            verify_core_requested,
-            open_core_folder_requested,
-            open_core_setup_requested,
             busy: gate::BusyWindow::from_operation(operation),
             connect_blocked_reason,
             config_error,
@@ -372,7 +371,7 @@ impl<'a> UiCtx<'a> {
     /// mutation site can change the model without invalidating the caches
     /// derived from it.
     pub fn mark_dirty(&mut self) {
-        *self.dirty = true;
+        self.requests.dirty = true;
         self.bump_model_generation();
     }
 
@@ -380,7 +379,7 @@ impl<'a> UiCtx<'a> {
     /// saved to settings.json like any edit, but without entering the
     /// config-apply pipeline — no "changes pending" chip, no Apply now.
     pub fn mark_ui_dirty(&mut self) {
-        *self.ui_dirty = true;
+        self.requests.ui_dirty = true;
         self.bump_model_generation();
     }
 
@@ -391,42 +390,50 @@ impl<'a> UiCtx<'a> {
     /// Request Connect through the shell so every screen shares persistence,
     /// recovery, listener, and runtime-operation gates.
     pub fn request_connect(&mut self) {
-        *self.connect_requested = true;
+        self.requests.connect = true;
     }
 
     /// Request Disconnect/Cancel through the shell so the runtime listener is
     /// stopped through the normal operation path.
     pub fn request_stop(&mut self) {
-        *self.stop_requested = true;
+        self.requests.stop = true;
     }
 
     /// Request a fresh pinned-payload verification of the installed core (the
     /// core setup surface's Verify action). The shell runs the pass and
     /// records the verdict; re-verification never touches the core itself.
     pub fn request_core_verify(&mut self) {
-        *self.verify_core_requested = true;
+        self.requests.verify_core = true;
     }
 
     /// Open the managed core directory in the shell's file browser.
     pub fn request_open_core_folder(&mut self) {
-        *self.open_core_folder_requested = true;
+        self.requests.open_core_folder = true;
     }
 
     /// Open the Settings screen, where the core setup surface stays mounted
     /// in every core state.
     pub fn request_open_core_setup(&mut self) {
-        *self.open_core_setup_requested = true;
+        self.requests.open_core_setup = true;
     }
 
-    /// Fire-and-forget command send. The control channel is closed only
-    /// once the runtime thread has exited; a command dropped then is logged
-    /// here, and the core-setup surface renders the closed channel next to
-    /// the buttons it explains, so a user-initiated action can never
-    /// vanish silently.
-    pub fn send(&self, cmd: CoreCmd) {
-        if self.cmd.send(cmd).is_err() {
+    /// Fire-and-forget command send, recording the busy-window head start a
+    /// command that opens a job asks for. Screens send through this rather
+    /// than the raw channel, so the shell's optimistic mirror cannot be
+    /// skipped by one call site. The control channel is closed only once the
+    /// runtime thread has exited; a command dropped then is logged here, and
+    /// the core-setup surface renders the closed channel next to the buttons
+    /// it explains, so a user-initiated action can never vanish silently.
+    /// `true` when the command reached the runtime.
+    pub fn send(&mut self, cmd: CoreCmd) -> bool {
+        if let Some(kind) = cmd.job_kind() {
+            self.requests.mirror_operation = Some(kind);
+        }
+        let sent = self.cmd.send(cmd).is_ok();
+        if !sent {
             tracing::warn!("core command not sent: runtime control channel is closed");
         }
+        sent
     }
     /// Launch an isolated one-shot probe over every server profile (probe
     /// scope "all"). No settings mutation or dirty marker is involved. The
@@ -1202,7 +1209,7 @@ mod tests {
             .click();
         harness.run();
         assert!(
-            harness.state().verify_core_requested,
+            harness.state().requests.verify_core,
             "Verify must raise the shell's verification request"
         );
         harness
@@ -1213,7 +1220,7 @@ mod tests {
             .click();
         harness.run();
         assert!(
-            harness.state().open_core_folder_requested,
+            harness.state().requests.open_core_folder,
             "Open core folder must raise the shell's folder request"
         );
 

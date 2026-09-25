@@ -2222,7 +2222,7 @@ impl ServersScreen {
         origin: ProfileValidationOrigin,
         profiles: Vec<ServerProfile>,
         draft_target: Option<ToolTarget>,
-        ctx: &UiCtx<'_>,
+        ctx: &mut UiCtx<'_>,
     ) -> Result<(), String> {
         if self.profile_validation_request.is_pending() {
             return Err(t(lang, Key::SrvValidationAlreadyRunning).into());
@@ -2252,7 +2252,7 @@ impl ServersScreen {
         self.profile_validation_origin = Some(origin);
         self.profile_validation_count = count;
         self.profile_validation_report = None;
-        if let Err(error) = ctx.cmd.send(CoreCmd::ValidateProfiles {
+        if !ctx.send(CoreCmd::ValidateProfiles {
             request: Box::new(ProfileValidationRequest {
                 origin,
                 lang,
@@ -2264,11 +2264,12 @@ impl ServersScreen {
             }),
             reply,
         }) {
-            // Runtime went away: no terminal can arrive, so nothing may stay
-            // pending.
+            // The runtime's command channel is gone: no terminal can arrive,
+            // so nothing may stay pending (the send verb logged the refusal
+            // with the closed channel's own text).
             self.profile_validation_origin = None;
             self.profile_validation_count = 0;
-            return Err(t_fmt(lang, Key::SrvStartValidationFailed, &[&error]));
+            return Err(t(lang, Key::SrvStartValidationFailed).to_string());
         }
         self.profile_validation_request = Request::reply(rx);
         Ok(())
@@ -7365,17 +7366,25 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.settings.raw_override = Some("{\"from\":\"file\"}".to_string());
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         {
-            let ctx = rig.ctx();
+            let mut ctx = rig.ctx();
             screen
                 .start_profile_validation(
                     Language::En,
                     ProfileValidationOrigin::Import,
                     vec![tokyo.clone()],
                     None,
-                    &ctx,
+                    &mut ctx,
                 )
                 .expect("an idle screen accepts a validation request");
         }
+        // A command a screen sends asks the shell for the same busy-window
+        // head start the shell's own sends take: the frame's requests carry
+        // the job kind, and the shell mirrors it while the window is open.
+        assert_eq!(
+            rig.requests.mirror_operation,
+            Some(crate::rt::JobKind::ValidateProfiles),
+            "a screen-sent job must ask for the optimistic busy-window mirror"
+        );
         let command = rig
             ._cmd_rx
             .try_recv()
@@ -8002,7 +8011,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ["Alpha", "Charlie", "Bravo"]
         );
         assert!(
-            harness.state().1.dirty,
+            harness.state().1.requests.dirty,
             "a reorder must mark the model dirty"
         );
         assert!(
@@ -8032,7 +8041,7 @@ Authentication: ML-KEM-768, Post-Quantum
             profile_names(&harness.state().1),
             ["Charlie", "Alpha", "Bravo"]
         );
-        assert!(harness.state().1.dirty);
+        assert!(harness.state().1.requests.dirty);
         // The first slot is the default server — the config's first outbound,
         // Xray's default route — so the dragged row takes it.
         let rig = &harness.state().1;
@@ -8112,7 +8121,7 @@ Authentication: ML-KEM-768, Post-Quantum
             rig.servers.active.as_deref(),
             Some(rig.servers.profiles[0].id.as_str())
         );
-        assert!(rig.dirty);
+        assert!(rig.requests.dirty);
     }
 
     #[test]
@@ -8158,7 +8167,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ["Alpha", "Bravo", "Charlie"]
         );
         assert!(
-            !harness.state().1.dirty,
+            !harness.state().1.requests.dirty,
             "a cancelled drag must not mark the model dirty"
         );
         assert!(
@@ -8227,7 +8236,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the release must end the drag"
         );
         assert!(
-            harness.state().1.dirty,
+            harness.state().1.requests.dirty,
             "the drop after an auto-scroll must still move the row"
         );
         let names = profile_names(&harness.state().1);
@@ -9447,7 +9456,7 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         harness.run();
         assert!(
-            harness.query_by_label(blocking).is_some(),
+            harness.query_by_label(blocking.as_str()).is_some(),
             "unsafe must keep its blocking message"
         );
         assert!(

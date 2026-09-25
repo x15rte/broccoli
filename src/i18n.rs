@@ -2191,13 +2191,14 @@ fn fill_message_template(template: &str, args: &[&dyn std::fmt::Display]) -> Str
     fill_placeholders(template, args)
 }
 
-/// Render one model-validation rule as its locale message. Exhaustive over
+/// The locale template of one model-validation rule. Exhaustive over
 /// [`ValidationCode`], so a code forgotten here is a compile error. Where the
 /// underlying text is unchanged it reuses the existing `Key` table entry;
 /// parameterized rules (e.g. `FinalmaskPortListInvalid(..)`) return the
-/// static template, which [`validation_issue_message`] fills with the
-/// code-carried value.
-pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str {
+/// static template that [`validation_message`] fills with the code-carried
+/// value. Private: rendering goes through [`validation_message`], so no
+/// caller can receive a template and forget the payload.
+fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
     use ValidationCode::*;
     match code {
         XhttpDepthExceeded => t(lang, Key::SrvDownloadNestingExceeds),
@@ -2435,11 +2436,20 @@ pub fn validation_message(code: &ValidationCode, lang: Language) -> &'static str
     }
 }
 
-/// Render a validation finding as `"path: message"` (path omitted when the
-/// finding is whole-model). Parameterized rules interpolate their code-carried
-/// value into the locale template.
-pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> String {
-    let message = match &issue.code {
+/// The values one model-validation rule's template interpolates, in template
+/// order: the code's own payload, Debug-quoted exactly where the pre-pass
+/// generator used `{:?}` and rendered where the message names another rule's
+/// text (the sniffing/listen codes carry inner messages, one text per rule,
+/// never re-derived).
+///
+/// Every parameterized arm is listed here, and [`validation_message`] fills
+/// *every* code — including the ones this match does not list — through
+/// [`fill_message_template`], whose placeholder-count assertion therefore
+/// covers the whole universe: a rule that starts carrying a payload without
+/// stating it above fails loudly in the tests that render it instead of
+/// shipping a sentence with braces in it.
+fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
+    match code {
         ValidationCode::FinalmaskPortListInvalid(arg)
         | ValidationCode::FinalmaskBytesValueRequired(arg)
         | ValidationCode::FinalmaskUnknownByteSyntax(arg)
@@ -2448,134 +2458,114 @@ pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> Stri
         | ValidationCode::FinalmaskUdpMaskNotLast(arg)
         | ValidationCode::FinalmaskUdpMaskNotFirst(arg)
         | ValidationCode::XhttpExtraShadowsSettings(arg)
-        | ValidationCode::RealityFingerprintUntested(arg) => {
-            fill_message_template(validation_message(&issue.code, lang), &[arg])
-        }
+        | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
-        | ValidationCode::FinalmaskUnknownUdpMask(arg) => {
-            let rendered = arg
-                .as_deref()
+        | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
+            arg.as_deref()
                 .map(|value| format!("Some({value:?})"))
-                .unwrap_or_else(|| "None".into());
-            fill_message_template(validation_message(&issue.code, lang), &[&rendered])
+                .unwrap_or_else(|| "None".into()),
+        ],
+        ValidationCode::ActiveProfileMissing(id) => vec![format!("{id:?}")],
+        ValidationCode::ActiveProfileAmbiguous(id, count) => {
+            vec![format!("{id:?}"), count.to_string()]
         }
-        // Settings-level verdicts: fill each template with the code-carried
-        // values, Debug-quoted exactly where the pre-pass generator used
-        // `{:?}`. The inner messages carried by the sniffing/listen codes are
-        // their own rules' messages — one text per rule, never re-derived.
-        ValidationCode::ActiveProfileMissing(id) => {
-            fill_message_template(validation_message(&issue.code, lang), &[&format!("{id:?}")])
-        }
-        ValidationCode::ActiveProfileAmbiguous(id, count) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[&format!("{id:?}"), count],
-        ),
         ValidationCode::ProfileIdEmpty(index) | ValidationCode::DokodemoTagMissing(index) => {
-            fill_message_template(validation_message(&issue.code, lang), &[index])
+            vec![index.to_string()]
         }
-        ValidationCode::ProfileIdDuplicated(first, second, id) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[first, second, &format!("{id:?}")],
-        ),
-        ValidationCode::ProfileTagEmpty(index, id) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[index, &format!("{id:?}")],
-        ),
+        ValidationCode::ProfileIdDuplicated(first, second, id) => {
+            vec![first.to_string(), second.to_string(), format!("{id:?}")]
+        }
+        ValidationCode::ProfileTagEmpty(index, id) => vec![index.to_string(), format!("{id:?}")],
         ValidationCode::ProfileTagInvalid(index, id, tag)
-        | ValidationCode::ProfileTagReserved(index, id, tag) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[index, &format!("{id:?}"), &format!("{tag:?}")],
-        ),
-        ValidationCode::ProfileTagDuplicated(first, first_id, second, second_id, tag) => {
-            fill_message_template(
-                validation_message(&issue.code, lang),
-                &[
-                    first,
-                    &format!("{first_id:?}"),
-                    second,
-                    &format!("{second_id:?}"),
-                    &format!("{tag:?}"),
-                ],
-            )
+        | ValidationCode::ProfileTagReserved(index, id, tag) => {
+            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")]
         }
-        ValidationCode::OutboundChainMissing(source, target) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[&format!("{source:?}"), &format!("{target:?}")],
-        ),
-        ValidationCode::OutboundChainCycle(path) => {
-            fill_message_template(validation_message(&issue.code, lang), &[path])
+        ValidationCode::ProfileTagDuplicated(first, first_id, second, second_id, tag) => vec![
+            first.to_string(),
+            format!("{first_id:?}"),
+            second.to_string(),
+            format!("{second_id:?}"),
+            format!("{tag:?}"),
+        ],
+        ValidationCode::OutboundChainMissing(source, target) => {
+            vec![format!("{source:?}"), format!("{target:?}")]
         }
+        ValidationCode::OutboundChainCycle(path) => vec![path.clone()],
         ValidationCode::BalancerTagMissing(index)
         | ValidationCode::DnsServerAddressMissing(index)
         | ValidationCode::FakeDnsPoolCidrInvalid(index)
-        | ValidationCode::FakeDnsPoolSizeInvalid(index) => {
-            fill_message_template(validation_message(&issue.code, lang), &[index])
-        }
+        | ValidationCode::FakeDnsPoolSizeInvalid(index) => vec![index.to_string()],
         ValidationCode::BalancerSelectorMissing(tag)
         | ValidationCode::BalancerTagDuplicated(tag)
         | ValidationCode::LocalInboundPortZero(tag)
         | ValidationCode::DokodemoUnixSocketRequired(tag)
-        | ValidationCode::DokodemoPortZero(tag) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[&format!("{tag:?}")],
-        ),
-        ValidationCode::BalancerFallbackMissing(tag, fallback) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[&format!("{tag:?}"), &format!("{fallback:?}")],
-        ),
-        ValidationCode::InboundTagDuplicated(tag) => {
-            fill_message_template(validation_message(&issue.code, lang), &[tag])
+        | ValidationCode::DokodemoPortZero(tag) => vec![format!("{tag:?}")],
+        ValidationCode::BalancerFallbackMissing(tag, fallback) => {
+            vec![format!("{tag:?}"), format!("{fallback:?}")]
         }
-        ValidationCode::DokodemoNetworkInvalid(tag, error) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[&format!("{tag:?}"), error],
-        ),
-        ValidationCode::DokodemoUnixSocketConflict(tag, other, path) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[
-                &format!("{tag:?}"),
-                &format!("{other:?}"),
-                &format!("{path:?}"),
-            ],
-        ),
-        ValidationCode::ListenerConflict(current, other, address, port) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[current, other, address, port],
-        ),
+        ValidationCode::InboundTagDuplicated(tag) => vec![tag.clone()],
+        ValidationCode::DokodemoNetworkInvalid(tag, error) => {
+            vec![format!("{tag:?}"), error.clone()]
+        }
+        ValidationCode::DokodemoUnixSocketConflict(tag, other, path) => vec![
+            format!("{tag:?}"),
+            format!("{other:?}"),
+            format!("{path:?}"),
+        ],
+        ValidationCode::ListenerConflict(current, other, address, port) => vec![
+            current.clone(),
+            other.clone(),
+            address.clone(),
+            port.to_string(),
+        ],
         ValidationCode::RoutingRuleTarget(index, error) => {
-            fill_message_template(validation_message(&issue.code, lang), &[index, error])
+            vec![index.to_string(), error.clone()]
         }
         ValidationCode::RoutingRuleOutboundMissing(index, tag)
         | ValidationCode::RoutingRuleBalancerMissing(index, tag)
-        | ValidationCode::RoutingRuleInboundMissing(index, tag) => fill_message_template(
-            validation_message(&issue.code, lang),
-            &[index, &format!("{tag:?}")],
-        ),
+        | ValidationCode::RoutingRuleInboundMissing(index, tag) => {
+            vec![index.to_string(), format!("{tag:?}")]
+        }
         ValidationCode::FakeDnsPoolCapacityExceeded(index, size, pool) => {
-            fill_message_template(validation_message(&issue.code, lang), &[index, size, pool])
+            vec![index.to_string(), size.to_string(), pool.clone()]
         }
         ValidationCode::GeodataUrlInvalid(file) => {
-            let not_https = t(lang, Key::GeodataUrlNotHttps);
-            let args: [&dyn std::fmt::Display; 2] = [file, &not_https];
-            fill_message_template(validation_message(&issue.code, lang), &args)
+            vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()]
         }
         ValidationCode::GeodataCronInvalid => {
-            let not_five_fields = t(lang, Key::GeodataCronNotFiveFields);
-            let args: [&dyn std::fmt::Display; 1] = [&not_five_fields];
-            fill_message_template(validation_message(&issue.code, lang), &args)
+            vec![t(lang, Key::GeodataCronNotFiveFields).to_string()]
         }
-        code => validation_message(code, lang).to_string(),
-    };
+        _ => Vec::new(),
+    }
+}
+
+/// Render one model-validation rule as the sentence the user reads: the
+/// locale template with the code-carried values interpolated. The one public
+/// renderer — the template lookup and the payload match are both inside, so a
+/// caller cannot pick half of the rule's text.
+pub fn validation_message(code: &ValidationCode, lang: Language) -> String {
+    let template = validation_template(code, lang);
+    let args = validation_args(code, lang);
+    let args: Vec<&dyn std::fmt::Display> = args
+        .iter()
+        .map(|arg| arg as &dyn std::fmt::Display)
+        .collect();
+    fill_message_template(template, &args)
+}
+
+/// Render a validation finding as `"path: message"` (path omitted when the
+/// finding is whole-model).
+pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> String {
+    let message = validation_message(&issue.code, lang);
     match &issue.path {
         Some(path) if !path.is_empty() => format!("{path}: {message}"),
         _ => message,
     }
 }
 
-/// Message template for one safety hazard; payload-carrying codes return the
-/// static template that [`safety_finding_message`] fills with the
-/// code-carried value.
-pub fn safety_message(code: &SafetyCode, lang: Language) -> &'static str {
+/// Message template for one safety hazard; private, because a payload-carrying
+/// hazard's text is only complete once [`safety_message_for_code`] fills it.
+fn safety_template(code: &SafetyCode, lang: Language) -> &'static str {
     use SafetyCode::*;
     match code {
         SocksListenerExposed(_) => t(lang, Key::SafetySocksListenerExposed),
@@ -2586,21 +2576,27 @@ pub fn safety_message(code: &SafetyCode, lang: Language) -> &'static str {
     }
 }
 
-/// Fully rendered message for one safety finding: the template with the
-/// code-carried value (the exposed listen address) interpolated. The finding
-/// path is deliberately NOT prefixed — callers render the field context
-/// themselves (inline placement or dialog rows).
-pub fn safety_finding_message(finding: &SafetyFinding, lang: Language) -> String {
-    let payload = match &finding.code {
+/// Render one safety hazard as the sentence the user reads: the template with
+/// the code-carried value (the exposed listen address, the unmatched balancer
+/// tag) interpolated. The one renderer for a hazard's text.
+pub fn safety_message(code: &SafetyCode, lang: Language) -> String {
+    let payload = match code {
         SafetyCode::SocksListenerExposed(listen)
         | SafetyCode::HttpListenerExposed(listen)
         | SafetyCode::DokodemoListenerExposed(listen) => listen,
         SafetyCode::BalancerSelectorNoMatch(tag) => tag,
         SafetyCode::TunDnsUnprotected => {
-            return safety_message(&finding.code, lang).to_string();
+            return safety_template(code, lang).to_string();
         }
     };
-    fill_message_template(safety_message(&finding.code, lang), &[payload])
+    fill_message_template(safety_template(code, lang), &[payload])
+}
+
+/// Fully rendered message for one safety finding. The finding path is
+/// deliberately NOT prefixed — callers render the field context themselves
+/// (inline placement or dialog rows).
+pub fn safety_finding_message(finding: &SafetyFinding, lang: Language) -> String {
+    safety_message(&finding.code, lang)
 }
 
 /// Render the first finding whose wire path matches `path` (None when
@@ -6188,7 +6184,7 @@ mod tests {
 
         for (codes, expected) in cases {
             assert_eq!(codes.len(), expected.len(), "codes {codes:#?}");
-            let mut messages: Vec<&str> = codes
+            let mut messages: Vec<String> = codes
                 .iter()
                 .map(|code| validation_message(code, Language::En))
                 .collect();

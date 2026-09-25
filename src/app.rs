@@ -2004,13 +2004,7 @@ impl eframe::App for BroccoliApp {
         // the old frame slot documented.
         self.refresh_connect_block_cache();
 
-        let mut dirty = false;
-        let mut ui_dirty = false;
-        let mut connect_requested = false;
-        let mut stop_requested = false;
-        let mut verify_core_requested = false;
-        let mut open_core_folder_requested = false;
-        let mut open_core_setup_requested = false;
+        let mut requests = ui::FrameRequests::default();
 
         // Top bar: runtime phase/action, configured mode, persistence, and
         // active server. The row owns its captions, its width budget and its
@@ -2118,14 +2112,8 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    dirty: &mut dirty,
-                    ui_dirty: &mut ui_dirty,
+                    requests: &mut requests,
                     model_generation: &mut self.model_generation,
-                    connect_requested: &mut connect_requested,
-                    stop_requested: &mut stop_requested,
-                    verify_core_requested: &mut verify_core_requested,
-                    open_core_folder_requested: &mut open_core_folder_requested,
-                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2172,14 +2160,8 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    dirty: &mut dirty,
-                    ui_dirty: &mut ui_dirty,
+                    requests: &mut requests,
                     model_generation: &mut self.model_generation,
-                    connect_requested: &mut connect_requested,
-                    stop_requested: &mut stop_requested,
-                    verify_core_requested: &mut verify_core_requested,
-                    open_core_folder_requested: &mut open_core_folder_requested,
-                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2215,14 +2197,8 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
-                    dirty: &mut dirty,
-                    ui_dirty: &mut ui_dirty,
+                    requests: &mut requests,
                     model_generation: &mut self.model_generation,
-                    connect_requested: &mut connect_requested,
-                    stop_requested: &mut stop_requested,
-                    verify_core_requested: &mut verify_core_requested,
-                    open_core_folder_requested: &mut open_core_folder_requested,
-                    open_core_setup_requested: &mut open_core_setup_requested,
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2237,10 +2213,19 @@ impl eframe::App for BroccoliApp {
             self.quit_impl(&ctx, None);
         }
 
-        if dirty {
+        // The commands the screens sent this frame: mirroring their job kind
+        // here is what the shell's own send path does, so a screen-started
+        // operation shows the busy window on the same frame. The runtime's
+        // bookends remain the authority for the release.
+        if let Some(kind) = requests.mirror_operation.take()
+            && let Some(held) = HeldOperation::mirror(kind)
+        {
+            self.operation = Some(held);
+        }
+        if requests.dirty {
             self.persist_if_due(&ctx, PersistKind::Config);
         }
-        if ui_dirty {
+        if requests.ui_dirty {
             self.persist_if_due(&ctx, PersistKind::UiOnly);
         }
         // The repaint `persist_if_due` arms at the throttle deadline exists to
@@ -2252,19 +2237,19 @@ impl eframe::App for BroccoliApp {
         if let Some(kind) = self.persist_pending {
             self.persist_if_due(&ctx, kind);
         }
-        if stop_requested {
+        if requests.stop {
             let _ = self.request_stop();
-        } else if connect_requested {
+        } else if requests.connect {
             let _ = self.request_connect();
         }
         // Core setup requests from any mount (the startup dialog, the
         // Settings section, the terminal error block's button): the shell
         // owns the verification pass, the Explorer launch and the screen
         // switch these flags ask for.
-        if verify_core_requested {
+        if requests.verify_core {
             self.verify_core();
         }
-        if open_core_folder_requested
+        if requests.open_core_folder
             && let Err(open_error) = sys::hidden_command("explorer")
                 .arg(paths::core_dir())
                 .spawn()
@@ -2275,7 +2260,7 @@ impl eframe::App for BroccoliApp {
                 t_fmt(lang, Key::LogOpenCoreFolderFailed, &[&open_error]),
             );
         }
-        if open_core_setup_requested {
+        if requests.open_core_setup {
             self.screen = Screen::Settings;
         }
 

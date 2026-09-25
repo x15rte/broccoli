@@ -790,7 +790,7 @@ impl RoutingScreen {
         // turn into a per-frame retry either.
         self.trial.live_out_requested = true;
         let (reply, receiver) = oneshot::channel();
-        if ctx.cmd.send(CoreCmd::ListRuntimeState { reply }).is_ok() {
+        if ctx.send(CoreCmd::ListRuntimeState { reply }) {
             self.trial.pending_live_out = Request::reply(receiver);
         }
     }
@@ -800,11 +800,8 @@ impl RoutingScreen {
         let (reply, receiver) = oneshot::channel();
         self.trial.feedback = None;
         let sent = match action {
-            TrialAction::List => ctx.cmd.send(CoreCmd::ListTrialRules { reply }).is_ok(),
-            TrialAction::Remove(rule_tag) => ctx
-                .cmd
-                .send(CoreCmd::RemoveTrialRule { reply, rule_tag })
-                .is_ok(),
+            TrialAction::List => ctx.send(CoreCmd::ListTrialRules { reply }),
+            TrialAction::Remove(rule_tag) => ctx.send(CoreCmd::RemoveTrialRule { reply, rule_tag }),
         };
         if sent {
             self.trial.pending_inventory = Request::reply(receiver);
