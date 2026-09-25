@@ -320,6 +320,13 @@ pub struct BroccoliApp {
     /// revision it applied, so a verdict for an older one cannot settle the
     /// configuration the app holds now.
     config_revision: u64,
+    /// The model's edit generation: bumped by [`UiCtx::mark_dirty`] /
+    /// [`UiCtx::mark_ui_dirty`] — the mutation hooks every edit goes through
+    /// — and published on the frame context so screens' per-frame caches
+    /// re-derive in the frame after any edit, including edits inside the
+    /// persist throttle window that `config_revision` (bumped at persist)
+    /// cannot cover.
+    model_generation: u64,
     /// egui-clock seconds (`ctx.input(|i| i.time)`) of the last persist.
     /// `None` before the first save, so the first dirty frame after a quiet
     /// period persists immediately (discrete edits stay prompt) and only
@@ -833,6 +840,7 @@ impl BroccoliApp {
             config_dirty: persistence_error.is_some() || config_error.is_some(),
             applied_candidate,
             config_revision: 0,
+            model_generation: 0,
             last_persist: None,
             persist_pending: None,
             raw_override_verdict: None,
@@ -949,7 +957,7 @@ impl BroccoliApp {
                                 self.settings.language,
                             ));
                         }
-                        _ if !same_phase(&phase, &self.phase) => {
+                        _ if phase != self.phase => {
                             self.terminal_error = None;
                         }
                         _ => {}
@@ -2096,7 +2104,7 @@ impl eframe::App for BroccoliApp {
                             || cache.mode_key != self.settings.mode
                             || cache.active_id != self.servers.active
                             || cache.core_version != self.core_version
-                            || !same_phase(&cache.phase, &self.phase)
+                            || cache.phase != self.phase
                     }
                     None => true,
                 };
@@ -2291,6 +2299,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
+                    model_generation: &mut self.model_generation,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
                     verify_core_requested: &mut verify_core_requested,
@@ -2344,6 +2353,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
+                    model_generation: &mut self.model_generation,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
                     verify_core_requested: &mut verify_core_requested,
@@ -2386,6 +2396,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     dirty: &mut dirty,
                     ui_dirty: &mut ui_dirty,
+                    model_generation: &mut self.model_generation,
                     connect_requested: &mut connect_requested,
                     stop_requested: &mut stop_requested,
                     verify_core_requested: &mut verify_core_requested,
@@ -3551,9 +3562,8 @@ fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> egui::Color32 {
 /// badge, the mode caption and the active-server caption, rebuilt only
 /// when their inputs — the phase (payload included), the mode, the active
 /// server id, the language or the config revision (a rename/persist) —
-/// change, never on repaint frames. `CorePhase` carries no `PartialEq`,
-/// so the staleness check compares variant + payload explicitly
-/// ([`same_phase`]).
+/// change, never on repaint frames. `CorePhase`'s own `PartialEq` is the
+/// comparison: the payloads are part of the rendered captions.
 struct TopbarLabelCache {
     phase: CorePhase,
     config_revision: u64,
@@ -3608,20 +3618,6 @@ fn cached_block_reason(cache: &Option<ConnectBlockCache>) -> &Option<String> {
         .as_ref()
         .map(|cache| &cache.reason)
         .unwrap_or(&NO_CONNECT_BLOCK)
-}
-
-/// Explicit `CorePhase` equality for the top-bar label cache key — the
-/// enum carries no `PartialEq` derive (it lives in rt), and the payloads
-/// are part of the rendered captions.
-fn same_phase(a: &CorePhase, b: &CorePhase) -> bool {
-    match (a, b) {
-        (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::Starting, CorePhase::Starting)
-        | (CorePhase::Running, CorePhase::Running) => true,
-        (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
-        (CorePhase::Error(x), CorePhase::Error(y)) => x == y,
-        _ => false,
-    }
 }
 
 fn mode_label(m: &crate::model::Mode, lang: Language) -> &'static str {
@@ -4724,10 +4720,7 @@ mod apply_verdict_tests {
 #[cfg(test)]
 mod tests {
     use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, TerminalError};
-    use super::{
-        Language, native_dark_for, phase_badge_text, same_phase,
-        tun_outbound_interface_block_reason,
-    };
+    use super::{Language, native_dark_for, phase_badge_text, tun_outbound_interface_block_reason};
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
     use crate::model::settings::Mode;
@@ -4887,44 +4880,6 @@ mod tests {
         assert!(
             !phase_badge_text(&error, Language::En).contains(headline),
             "the failure's message must not stand where the phase belongs"
-        );
-    }
-
-    /// The top-bar caption cache treats a phase as changed
-    /// when the payload changed (Backoff attempt, Error message) — the
-    /// payloads are part of the rendered captions.
-    #[test]
-    fn same_phase_distinguishes_phase_payloads() {
-        assert!(same_phase(&CorePhase::Running, &CorePhase::Running));
-        assert!(!same_phase(&CorePhase::Running, &CorePhase::Stopped));
-        assert!(same_phase(
-            &CorePhase::Backoff { attempt: 2 },
-            &CorePhase::Backoff { attempt: 2 }
-        ));
-        assert!(!same_phase(
-            &CorePhase::Backoff { attempt: 2 },
-            &CorePhase::Backoff { attempt: 3 }
-        ));
-        assert!(!same_phase(
-            &CorePhase::Backoff { attempt: 2 },
-            &error_phase(Key::RtPhaseRestartCancelled)
-        ));
-        assert!(same_phase(
-            &error_phase(Key::RtPhaseRestartCancelled),
-            &error_phase(Key::RtPhaseRestartCancelled)
-        ));
-        assert!(!same_phase(
-            &error_phase(Key::RtPhaseRestartCancelled),
-            &error_phase(Key::RtPhaseConfigError)
-        ));
-        assert!(
-            !same_phase(
-                &error_phase(Key::RtPhaseConfigError),
-                &CorePhase::Error(
-                    PhaseError::new(Diag::new(Key::RtPhaseConfigError)).with_tail("boom".into())
-                )
-            ),
-            "the captured tail is part of the rendered record"
         );
     }
 

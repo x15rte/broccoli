@@ -24,9 +24,9 @@ use crate::ui::widgets;
 pub struct InboundsScreen {
     /// Transient port_map rows per dokodemo entry (synced on edit).
     port_map_rows: Vec<Vec<(String, String)>>,
-    /// Cross-listener validation references, rebuilt only when the model
-    /// generation `(config_revision, dirty)` changes — never on idle
-    /// repaint frames. `None` until the first frame.
+    /// Cross-listener validation references, rebuilt whenever the model
+    /// generation moves — never on idle repaint frames. `None` until the
+    /// first frame.
     validation: Option<ValidationCache>,
 }
 
@@ -35,7 +35,8 @@ pub struct InboundsScreen {
 /// tag errors, LAN-exposure posture, auth traps). Rows borrow these while
 /// their editors are open — no per-frame rebuilds or clones.
 struct ValidationCache {
-    generation: (u64, bool, usize, usize),
+    /// The model generation these verdicts were derived from.
+    generation: u64,
     non_loopback: bool,
     /// One collision verdict per local endpoint list entry, in list order.
     local_collisions: Vec<Option<String>>,
@@ -64,26 +65,31 @@ struct ValidationCache {
     doko_warnings: Vec<Option<String>>,
 }
 
+impl ValidationCache {
+    /// Whether these verdicts still describe `settings` at `generation`.
+    ///
+    /// Two conditions, both the cache's own: it was derived from the current
+    /// model generation (the mutation hook moves it, so an edit inside the
+    /// persist throttle window is covered), and it holds exactly one entry
+    /// per rendered row — the render indexes these vectors by the live list
+    /// index, so a row count that outgrew them would be an out-of-bounds
+    /// read, and the cache states that precondition itself rather than
+    /// trusting every caller to fold the counts into a key.
+    fn is_current(&self, generation: u64, settings: &Settings) -> bool {
+        self.generation == generation
+            && self.local_collisions.len() == settings.local_inbounds.len()
+            && self.doko_collisions.len() == settings.dokodemo.len()
+    }
+}
+
 impl InboundsScreen {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
-        // The validation references are rebuilt only when the model
-        // generation changes — an edit frame, a persist, or a row-count
-        // change — never on idle repaint frames. The row
-        // counts are part of the key because `dirty` is frame-local (reset
-        // at the top of every frame) and `config_revision` bumps only on
-        // persist (throttled): two Adds inside the throttle window would
-        // otherwise render the grown list against the stale per-row arrays
-        // and index out of bounds. The rendered verdicts lag an edit by at
-        // most one frame, exactly like the old per-frame build (which also
-        // ran before the editors mutated the model).
-        let generation = (
-            ctx.config_revision,
-            *ctx.dirty,
-            ctx.settings.local_inbounds.len(),
-            ctx.settings.dokodemo.len(),
-        );
-        if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
+        // The validation references are rebuilt when the model generation
+        // moves — the frame after any edit — and never on idle repaint
+        // frames; the cache validates its own row correspondence.
+        let generation = *ctx.model_generation;
+        if !matches!(&self.validation, Some(cache) if cache.is_current(generation, ctx.settings)) {
             let snapshot = listeners(ctx.settings, lang);
             // One `assess` per model generation, in the same rebuild as the
             // collision references — never a second recomputation pattern
@@ -1369,8 +1375,8 @@ mod listener_validation_tests {
             .click();
         harness.run();
         // The model mutation lands at the end of the click frame; the
-        // verdict cache rebuilds one frame later (the dirty flag is part of
-        // its generation key).
+        // verdict cache rebuilds one frame later (the mutation hook moved the
+        // generation).
         harness.run();
         assert!(
             harness
@@ -1381,12 +1387,12 @@ mod listener_validation_tests {
         assert_eq!(rig.borrow().settings.local_inbounds[1].accounts.len(), 1);
     }
 
-    /// The validation references are generation-gated: a frame whose
-    /// `(config_revision, dirty, row counts)` key is unchanged re-renders the
-    /// cached verdicts (the same allocation — nothing is recomputed), and a
-    /// key move rebuilds them once. An app boot plus a frame window is not
-    /// needed to see that: the gate, its key and its cached vectors are all
-    /// reachable from the screen itself.
+    /// The validation references are generation-gated: an idle frame
+    /// re-renders the cached verdicts (the same allocation — nothing is
+    /// recomputed), and an edit — recorded through the shell's mutation hook,
+    /// as a screen records one — rebuilds them once. An app boot plus a frame
+    /// window is not needed to see that: the gate, its key and its cached
+    /// vectors are all reachable from the screen itself.
     #[test]
     fn validation_cache_is_generation_gated() {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
@@ -1436,12 +1442,12 @@ mod listener_validation_tests {
             );
         }
 
-        // One edit: the frame's dirty flag is part of the key, so the cache
-        // rebuilds once and the cleared collision is gone.
+        // One edit, recorded through the mutation hook: the cache rebuilds
+        // once and the cleared collision is gone.
         {
             let mut rig = rig.borrow_mut();
             rig.settings.local_inbounds[1].port = 10899;
-            rig.dirty = true;
+            rig.edit();
         }
         harness.run();
         {

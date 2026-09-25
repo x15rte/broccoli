@@ -301,12 +301,11 @@ struct BalancerHeaderText {
 /// the outbound/balancer tag lists offered by the rule and balancer editors,
 /// the per-rule row text, the per-balancer rule-reference counts, and the
 /// TestRoute dialog's inbound options. Rebuilt only when the model generation
-/// `(config_revision, model_revision, language)` advances — an edit frame,
-/// a persisted cross-screen change, a locale change — never on idle repaint
-/// frames.
+/// or the language advances — an edit, a cross-screen change, a locale change
+/// — never on idle repaint frames.
 #[derive(Debug)]
 struct RoutingViewCache {
-    generation: (u64, u64, Language),
+    generation: (u64, Language),
     out_tags: Vec<String>,
     /// Whether the document carries a server profile's outbound (`srv-…`): the
     /// balancer Add button and the rule editor's "select all servers" shortcut
@@ -509,13 +508,6 @@ pub struct RoutingScreen {
     /// Trial rules are never persisted and die with the core session
     /// — the app invalidates this state on every phase change.
     trial: TrialRulesUi,
-    /// Monotonic routing-model edit generation: bumped once per frame where
-    /// this screen mutated the routing model (the same event that marks the
-    /// app dirty). Unlike the app's frame-local `dirty` flag — which toggles
-    /// F→T→F across an edit frame and its settle frame — a monotonic counter
-    /// changes the generation key exactly once per edit, so the derived UI
-    /// data below rebuilds exactly once per edit.
-    model_revision: u64,
     /// Generation-gated derived UI data: tag vectors + rule-row text, rebuilt
     /// only when the routing model changed (see [`RoutingViewCache`]).
     view_cache: Option<RoutingViewCache>,
@@ -529,7 +521,7 @@ impl RoutingScreen {
 
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
         // rebuilt only when the routing model changed, never per frame.
-        self.refresh_view_cache(ctx.config_revision, lang, ctx.servers, ctx.settings);
+        self.refresh_view_cache(*ctx.model_generation, lang, ctx.servers, ctx.settings);
 
         self.consume_balancer_results(lang);
         self.consume_trial_results(ctx, lang);
@@ -541,10 +533,10 @@ impl RoutingScreen {
         self.trial_rules_section(ui, ctx, lang);
 
         if changed {
+            // One edit = one generation change: the hook moves the shared
+            // generation the view cache gates on, so the next frame rebuilds
+            // the tag vectors and rule rows exactly once.
             ctx.mark_dirty();
-            // One edit = one generation change: the next frame rebuilds the
-            // tag vectors and rule rows exactly once.
-            self.model_revision = self.model_revision.wrapping_add(1);
         }
         self.test_route_dialog(ui, ctx);
         self.trial_rule_dialog(ui, ctx);
@@ -1200,20 +1192,20 @@ impl RoutingScreen {
 
     /// Rebuild the derived UI data (tag vectors, rule-row text, balancer
     /// reference counts, TestRoute inbound options) only when the model
-    /// generation `(config_revision, model_revision, language)` changed;
-    /// idle frames reuse the cached snapshot, and the cache's own generation
-    /// key is what the tests pin as the rebuild decision.
+    /// generation or the language changed; idle frames reuse the cached
+    /// snapshot, and the cache's own generation key is what the tests pin as
+    /// the rebuild decision.
     /// Also evicts balancer-runtime entries absent from the model — the
     /// generation change is the model-change signal, so
     /// the eviction pass runs once per change, never per frame.
     fn refresh_view_cache(
         &mut self,
-        config_revision: u64,
+        generation: u64,
         lang: Language,
         servers: &ServersFile,
         settings: &Settings,
     ) {
-        let generation = (config_revision, self.model_revision, lang);
+        let generation = (generation, lang);
         if matches!(&self.view_cache, Some(cache) if cache.generation == generation) {
             return;
         }
@@ -3608,10 +3600,10 @@ mod view_cache_tests {
     };
 
     /// Memoization contract (module level): the generation key
-    /// `(config_revision, model_revision, language)` rebuilds the tag
-    /// vectors and rule rows exactly once per model change and never on
-    /// idle frames. The cache's own generation key and its retained
-    /// allocations are the seam — a rebuild replaces both.
+    /// `(model generation, language)` rebuilds the tag vectors and rule rows
+    /// exactly once per model change and never on idle frames. The cache's
+    /// own generation key and its retained allocations are the seam — a
+    /// rebuild replaces both.
     #[test]
     fn view_cache_rebuilds_only_when_the_model_generation_changes() {
         let mut screen = RoutingScreen::default();
@@ -3619,12 +3611,13 @@ mod view_cache_tests {
         let mut settings = Settings::default();
         settings.routing.rules.push(Rule::new());
 
+        let mut generation = 0;
         // First frame: one rebuild, one format pass, keyed on the live
         // generation.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
         let first_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (0, screen.model_revision, Language::En));
+            assert_eq!(cache.generation, (generation, Language::En));
             assert_eq!(
                 cache.rule_rows.len(),
                 1,
@@ -3635,11 +3628,11 @@ mod view_cache_tests {
 
         // Idle frames with the same generation rebuild nothing: the cache
         // keeps its generation key and its own allocations.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (0, screen.model_revision, Language::En));
+            assert_eq!(cache.generation, (generation, Language::En));
             assert_eq!(
                 cache.rule_rows.as_ptr(),
                 first_rows,
@@ -3647,36 +3640,39 @@ mod view_cache_tests {
             );
         }
 
-        // One model edit (the edit frame's model_revision bump) → exactly
-        // one rebuild + one format pass, independent of persist timing.
+        // One model edit (the mutation hook's bump) → exactly one rebuild +
+        // one format pass, independent of persist timing.
         settings.routing.rules[0].port = "443".into();
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        let edited = screen.model_revision;
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        generation += 1;
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
         let edited_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (0, edited, Language::En));
+            assert_eq!(cache.generation, (generation, Language::En));
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (0, edited, Language::En));
+            assert_eq!(cache.generation, (generation, Language::En));
             assert_eq!(cache.rule_rows.as_ptr(), edited_rows);
         }
 
-        // A persisted change (config_revision bump) rebuilds exactly once.
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
-        let persisted_rows = {
+        // The next generation rebuilds once more (a generation change is the
+        // rebuild signal, whatever moved it), and the frame after it reuses
+        // that build.
+        generation += 1;
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        let next_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (1, edited, Language::En));
+            assert_eq!(cache.generation, (generation, Language::En));
+            assert_eq!(cache.rule_rows.len(), 1, "the rebuild covers every rule");
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
-            assert_eq!(cache.generation, (1, edited, Language::En));
-            assert_eq!(cache.rule_rows.as_ptr(), persisted_rows);
+            assert_eq!(cache.generation, (generation, Language::En));
+            assert_eq!(cache.rule_rows.as_ptr(), next_rows);
         }
     }
 
@@ -3852,14 +3848,13 @@ mod view_cache_tests {
 
         // One rule edit (generation bump) → exactly one rebuild, one scan.
         settings.routing.rules[1].balancer_tag = "b2".into();
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         let edited = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
             cache.reference_counts.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
@@ -3952,8 +3947,7 @@ mod view_cache_tests {
         // A generation bump after a selector edit rebuilds the header text
         // exactly once, in the same pass as the tag vectors.
         settings.routing.balancers[0].selector = vec!["srv-a".into(), "srv-c".into()];
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         let rebuilt = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(
@@ -3963,7 +3957,7 @@ mod view_cache_tests {
             );
             cache.balancer_headers.as_ptr()
         };
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert_eq!(
             screen
                 .view_cache
@@ -4239,8 +4233,7 @@ mod routing_grammar_tests {
             .profiles
             .push(ServerProfile::new("alpha", OutboundModel::default()));
         settings.routing.balancers[0].selector = vec![servers.profiles[0].tag()];
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().balancer_warnings[0].is_none(),
             "a selector matching a seeded profile must not warn"
@@ -4316,8 +4309,7 @@ mod balancer_runtime_eviction_tests {
         // One model change: "accel" is deleted (the edit frame's bump),
         // then the generation-gated pass evicts its entry.
         settings.routing.balancers.remove(1);
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4378,8 +4370,7 @@ mod balancer_runtime_eviction_tests {
         // model; rule-reference rewrites are the model's concern, not the
         // map's).
         settings.routing.balancers[0].tag = "edge-2".into();
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
 
         assert!(
             !screen.balancer_runtime.contains_key("edge"),
@@ -4442,8 +4433,7 @@ mod balancer_runtime_eviction_tests {
                 "tag-0" | "tag-1" | "tag-2" | "tag-3" | "tag-4"
             )
         });
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(1, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4466,8 +4456,7 @@ mod balancer_runtime_eviction_tests {
             .routing
             .balancers
             .retain(|b| b.tag == "tag-1" || b.tag == "tag-3");
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(2, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
 
         // Grow the model: added tags have no runtime entry until their
@@ -4478,8 +4467,7 @@ mod balancer_runtime_eviction_tests {
                 .balancers
                 .push(balancer(&format!("tag-{i}")));
         }
-        screen.model_revision = screen.model_revision.wrapping_add(1);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache(3, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
         assert!(screen.balancer_runtime.len() <= settings.routing.balancers.len());
 
@@ -6080,21 +6068,17 @@ mod routing_control_render_tests {
             "an empty rules section renders the no-rules hint"
         );
 
-        let revision_before = harness.state().0.model_revision;
         harness
             .get_by_role_and_label(
                 egui::accesskit::Role::Button,
                 t(Language::En, Key::RoutingAddRule),
             )
             .click();
-        // Step one processes the click (the rule is pushed and the generation
-        // is bumped); step two renders the frame after the edit, where the
-        // view cache rebuilds for that generation and the new row can paint.
+        // Step one processes the click (the rule is pushed and the mutation
+        // hook moves the generation); step two renders the frame after the
+        // edit, where the view cache rebuilds for that generation and the new
+        // row can paint.
         harness.run_steps(2);
-        assert!(
-            harness.state().0.model_revision > revision_before,
-            "the add must advance the model generation the view cache gates on"
-        );
         assert!(
             harness
                 .query_by_label(t(Language::En, Key::RoutingNoRules))

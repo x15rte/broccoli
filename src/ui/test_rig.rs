@@ -82,6 +82,11 @@ pub(crate) struct UiTestRig {
     pub(crate) is_elevated: bool,
     pub(crate) dirty: bool,
     pub(crate) ui_dirty: bool,
+    /// The model's edit generation, as the shell publishes it. Tests that
+    /// mutate the model between frames go through [`UiTestRig::edit`], the
+    /// rig's one route to the mutation hook, so the caches a screen derived
+    /// from the old model are invalidated exactly as they are in the app.
+    pub(crate) model_generation: u64,
     pub(crate) config_revision: u64,
     pub(crate) stats_generation: u64,
     pub(crate) latency_generation: u64,
@@ -123,6 +128,7 @@ impl Default for UiTestRig {
             is_elevated: false,
             dirty: false,
             ui_dirty: false,
+            model_generation: 0,
             config_revision: 0,
             stats_generation: 0,
             latency_generation: 0,
@@ -152,6 +158,14 @@ impl UiTestRig {
     pub(crate) fn push_log(&mut self, from_core: bool, line: String) {
         self.logs_generation += 1;
         self.logs.push_back((from_core, line));
+    }
+
+    /// Record a model edit between frames through the shell's own mutation
+    /// hook: the rig assembles a `UiCtx` exactly as a frame does and calls
+    /// `mark_dirty`, so the persist request and the generation bump stay one
+    /// behaviour rather than a test-side copy of it.
+    pub(crate) fn edit(&mut self) {
+        self.ctx().mark_dirty();
     }
 
     /// Assemble the UiCtx the screen under test receives — through
@@ -186,6 +200,7 @@ impl UiTestRig {
                 probe_feedback: &mut self.probe_feedback,
                 dirty: &mut self.dirty,
                 ui_dirty: &mut self.ui_dirty,
+                model_generation: &mut self.model_generation,
                 connect_requested: &mut self.connect_requested,
                 stop_requested: &mut self.stop_requested,
                 verify_core_requested: &mut self.verify_core_requested,

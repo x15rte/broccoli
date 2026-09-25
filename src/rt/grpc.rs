@@ -106,7 +106,10 @@ const TRANSPORT_DEADLINE_SLACK: Duration = Duration::from_millis(50);
 /// computed by the runtime (the core only exposes cumulative counters); the
 /// `total_*` fields carry those cumulative counters as-is (never accumulated
 /// client-side), so a dropped tick cannot skew them.
-#[derive(Debug, Clone, Default)]
+///
+/// Equality is field-wise (`PartialEq`) so a cache keyed on the sample can
+/// state its own freshness instead of re-listing the fields it covers.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatsTick {
     /// Total uplink bytes/s across all inbounds (listener traffic).
     pub up: u64,

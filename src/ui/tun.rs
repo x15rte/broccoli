@@ -29,10 +29,9 @@ pub struct TunScreen {
     /// In-flight worker enumeration request; a worker that exits without
     /// a result clears it so the refresh cadence resumes.
     iface_request: Request<Vec<NetIf>>,
-    /// Privacy-warning references, rebuilt only when the model generation
-    /// `(config_revision, dirty)` changes (the inbounds ValidationCache
-    /// precedent) — never on idle repaint frames. `None`
-    /// until the first frame.
+    /// Privacy-warning references, rebuilt when the model generation moves
+    /// (the inbounds `ValidationCache` precedent) — never on idle repaint
+    /// frames. `None` until the first frame.
     validation: Option<ValidationCache>,
 }
 
@@ -42,7 +41,7 @@ pub struct TunScreen {
 /// validation error for a gateway list without an IPv4 entry — both
 /// computed once per model generation.
 struct ValidationCache {
-    generation: (u64, bool),
+    generation: u64,
     tun_warning: Option<String>,
     gateway_error: Option<&'static str>,
 }
@@ -109,13 +108,14 @@ impl TunScreen {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         self.poll_ifaces(ui);
 
-        // The privacy warning is rebuilt only when the model generation
-        // changes — an edit frame, a persist, or a load — never on idle
-        // repaint frames (the inbounds ValidationCache precedent).
-        // The rendered verdict therefore lags an edit by at most
-        // one frame, exactly like the inbounds posture banner.
+        // The privacy warning is rebuilt when the model generation moves —
+        // the frame after any edit, never on idle repaint frames (the inbounds
+        // ValidationCache precedent) — so the verdict lags an edit by at most
+        // one frame, exactly like the inbounds posture banner. The mode is
+        // read from the live model at rebuild time, so no second key is
+        // needed for it.
         let lang = ctx.settings.language;
-        let generation = (ctx.config_revision, *ctx.dirty);
+        let generation = *ctx.model_generation;
         if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
             // One `assess` per model generation — never per-frame.
             let findings = assess(ctx.servers, ctx.settings);

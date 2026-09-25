@@ -1664,10 +1664,10 @@ impl DraftGate {
 /// other profile's `srv-<id8>` tag in server-list order, then the built-in
 /// `direct`/`block` targets validation accepts. Memoized per editor — a
 /// rebuild costs one tag format per profile — so it reruns only when the
-/// profile-set signal `(config_revision, dirty, profile count)` or the
-/// rendered profile advances; idle repaint frames reuse the snapshot.
+/// model generation moves (the profile set or a rename) or the rendered
+/// profile advances; idle repaint frames reuse the snapshot.
 struct DialerProxyOptions {
-    generation: (u64, bool, usize),
+    generation: (u64, usize),
     /// The profile whose own tag the options exclude — a chain to itself
     /// could only produce a cycle.
     own_id: String,
@@ -1681,7 +1681,7 @@ struct DialerProxyOptions {
 /// reuse the options it holds.
 fn refresh_dialer_proxy_options<'a>(
     slot: &'a mut Option<DialerProxyOptions>,
-    set_key: (u64, bool, usize),
+    set_key: (u64, usize),
     own_id: &str,
     profiles: &[ServerProfile],
 ) -> &'a [String] {
@@ -1709,13 +1709,14 @@ fn refresh_dialer_proxy_options<'a>(
 }
 
 /// Trailing context for [`ServersScreen::advanced_tab`]:
-/// the profile-set signal the chain-target options memoize on, the memoized
+/// the model generation and profile count the chain-target options memoize
+/// on, the memoized
 /// finalmask verdicts, the memoized `stream.sockopt` verdict, and the seeded
 /// text buffers the tab's raw-JSON and PEM fields edit through. Bundled so
 /// the tab stays under clippy's argument-count ceiling without a lint
 /// suppression (zero-suppression repo contract).
 struct AdvancedTabCtx<'a> {
-    set_key: (u64, bool, usize),
+    set_key: (u64, usize),
     finalmask_errors: &'a [String],
     stream_sockopt_errors: &'a [String],
     /// The chain-target picker's memo slot for the editor rendering this
@@ -3950,11 +3951,7 @@ impl ServersScreen {
                             &mut draft.profile,
                             &ctx.servers.profiles,
                             AdvancedTabCtx {
-                                set_key: (
-                                    ctx.config_revision,
-                                    *ctx.dirty,
-                                    ctx.servers.profiles.len(),
-                                ),
+                                set_key: (*ctx.model_generation, ctx.servers.profiles.len()),
                                 finalmask_errors,
                                 stream_sockopt_errors,
                                 dialer_proxy_options: &mut self.dialer_proxy_options,
@@ -6510,8 +6507,7 @@ impl ServersScreen {
                                     &uictx.servers.profiles,
                                     AdvancedTabCtx {
                                         set_key: (
-                                            uictx.config_revision,
-                                            *uictx.dirty,
+                                            *uictx.model_generation,
                                             uictx.servers.profiles.len(),
                                         ),
                                         finalmask_errors,
@@ -9869,7 +9865,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     &mut profile,
                     &[],
                     AdvancedTabCtx {
-                        set_key: (0, false, 0),
+                        set_key: (0, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
@@ -10750,7 +10746,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 profile,
                 &[],
                 AdvancedTabCtx {
-                    set_key: (0, false, 0),
+                    set_key: (0, 0),
                     finalmask_errors: &[],
                     stream_sockopt_errors: &[],
                     dialer_proxy_options: &mut screen.dialer_proxy_options,
@@ -10781,7 +10777,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     &mut profile,
                     &[],
                     AdvancedTabCtx {
-                        set_key: (0, false, 0),
+                        set_key: (0, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.dialer_proxy_options,
@@ -12197,7 +12193,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .expect("the first Advanced frame builds the chain-target options once")
             .generation;
         assert_eq!(
-            built_for.2, 2,
+            built_for.1, 2,
             "the options must be built for the rendered profile set"
         );
         let options = harness

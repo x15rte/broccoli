@@ -556,7 +556,10 @@ impl ProbeFailure {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Equality is the cache-key rule the shell and the screens need: structural
+/// for the unit phases, payload-inclusive for [`CorePhase::Backoff`] and
+/// [`CorePhase::Error`] — a phase change is exactly what those payloads name.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CorePhase {
     Stopped,
     Starting,
@@ -613,7 +616,9 @@ impl std::fmt::Display for PhaseError {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Equality is field-wise so the shell's snapshot gate and any screen cache
+/// that keys on the download state can compare the value directly.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DownloadState {
     Idle,
     Working {
@@ -3913,7 +3918,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CoreCmd, CoreEvt, CoreTransport, DOWNLOAD_PROGRESS_INTERVAL, ExclusiveOutcome,
+        CoreCmd, CoreEvt, CorePhase, CoreTransport, DOWNLOAD_PROGRESS_INTERVAL, ExclusiveOutcome,
         LatencyProbeResult, NO_PROGRESS_EMITTED, OutboundStatusView, PhaseError, ProbeFailure,
         ProfileValidationOrigin, ProfileValidationRequest, READY_TIMEOUT, READY_TIMEOUT_APPLIED,
         Runtime, STOP_TIMEOUT, TUN_BIND_RACE_RETRIES, TUN_STOP_WINDOW, connect_after_helper_launch,
@@ -3926,6 +3931,43 @@ mod tests {
     use crate::model::{OutboundModel, Protocol, ProtocolSettings, ServerProfile};
     use crate::rt::jobs::{ExclusiveSidecar, JobKind};
     use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect, with_appdata_async};
+
+    /// The type's own equality is the cache-key rule every consumer reads: a
+    /// phase counts as changed when its payload changed (Backoff attempt,
+    /// Error message and captured tail), because the payloads are what the
+    /// captions and the terminal message render.
+    #[test]
+    fn core_phase_equality_distinguishes_payloads() {
+        assert_eq!(CorePhase::Running, CorePhase::Running);
+        assert_ne!(CorePhase::Running, CorePhase::Stopped);
+        assert_eq!(
+            CorePhase::Backoff { attempt: 2 },
+            CorePhase::Backoff { attempt: 2 }
+        );
+        assert_ne!(
+            CorePhase::Backoff { attempt: 2 },
+            CorePhase::Backoff { attempt: 3 }
+        );
+        assert_ne!(
+            CorePhase::Backoff { attempt: 2 },
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled)))
+        );
+        assert_eq!(
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled))),
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled)))
+        );
+        assert_ne!(
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled))),
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseConfigError)))
+        );
+        assert_ne!(
+            CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseConfigError))),
+            CorePhase::Error(
+                PhaseError::new(Diag::new(Key::RtPhaseConfigError)).with_tail("boom".into())
+            ),
+            "the captured tail is part of the rendered record"
+        );
+    }
 
     /// The TUN stop window must keep a kill out of wintun's create stall.
     /// `WintunCreateAdapter`'s device-interface wait is 15 000 ms, so the

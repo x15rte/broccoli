@@ -170,11 +170,16 @@ pub struct UiCtx<'a> {
     /// "changes pending"/Apply-now (the running core's config is unaffected
     /// by display preferences).
     pub(crate) ui_dirty: &'a mut bool,
+    /// The model's edit generation: bumped by every mutation hook
+    /// ([`UiCtx::mark_dirty`] and [`UiCtx::mark_ui_dirty`]), so a screen's
+    /// per-frame cache keyed on it re-derives in the frame after any edit —
+    /// including edits inside the persist throttle window, which the
+    /// persist-time [`UiCtx::config_revision`] cannot cover.
+    pub(crate) model_generation: &'a mut u64,
     /// Monotonic persistence-generation counter: bumped once per persist of
-    /// the servers/settings model. Screens memoize per-frame work on
-    /// `(config_revision, dirty)` so it re-runs only when the model changed
-    /// (the dashboard's latency grid and the inbounds validation cache key
-    /// on it).
+    /// the servers/settings model. It names *which persisted configuration* a
+    /// value belongs to (an apply verdict carries it back), never "the UI
+    /// should re-derive": screens memoize on [`UiCtx::model_generation`].
     pub config_revision: u64,
     /// Monotonic per-input generations for screens' memoization keys
     /// (dashboard plot and latency-grid caches): `stats_generation` advances
@@ -204,6 +209,7 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
     pub(crate) dirty: &'a mut bool,
     pub(crate) ui_dirty: &'a mut bool,
+    pub(crate) model_generation: &'a mut u64,
     pub(crate) connect_requested: &'a mut bool,
     pub(crate) stop_requested: &'a mut bool,
     pub(crate) connect_blocked_reason: &'a Option<String>,
@@ -267,6 +273,7 @@ impl<'a> UiCtx<'a> {
             probe_feedback,
             dirty,
             ui_dirty,
+            model_generation,
             connect_requested,
             stop_requested,
             verify_core_requested,
@@ -326,6 +333,7 @@ impl<'a> UiCtx<'a> {
             probe_feedback,
             dirty,
             ui_dirty,
+            model_generation,
             connect_requested,
             stop_requested,
             verify_core_requested,
@@ -349,8 +357,13 @@ impl<'a> UiCtx<'a> {
         }
     }
 
+    /// Record a model edit: the persist request for the config pipeline, and
+    /// the generation bump every screen's cache keys on. One hook, so no
+    /// mutation site can change the model without invalidating the caches
+    /// derived from it.
     pub fn mark_dirty(&mut self) {
         *self.dirty = true;
+        self.bump_model_generation();
     }
 
     /// Persist a display-only preference (traffic unit, language, accent):
@@ -358,6 +371,11 @@ impl<'a> UiCtx<'a> {
     /// config-apply pipeline — no "changes pending" chip, no Apply now.
     pub fn mark_ui_dirty(&mut self) {
         *self.ui_dirty = true;
+        self.bump_model_generation();
+    }
+
+    fn bump_model_generation(&mut self) {
+        *self.model_generation = self.model_generation.wrapping_add(1);
     }
 
     /// Request Connect through the shell so every screen shares persistence,
@@ -494,8 +512,9 @@ impl UiCtxSnapshot {
     /// True when `other` carries the same inputs as this snapshot. The app
     /// skips no-op rebuilds with this (e.g. the initial `State(Stopped)`
     /// drain, duplicate events), so the snapshot is replaced only when an
-    /// input actually changed. Field-wise because the payload types derive
-    /// only `Clone`, not `PartialEq`.
+    /// input actually changed. Every compared type publishes its own
+    /// equality rule, so "did this input change" has one definition per type
+    /// and no copy here to drift from it.
     pub(crate) fn same_inputs(&self, other: &UiCtxSnapshot) -> bool {
         self.stats_generation == other.stats_generation
             && self.latency_generation == other.latency_generation
@@ -503,64 +522,10 @@ impl UiCtxSnapshot {
             && self.core_version == other.core_version
             && self.core_setup == other.core_setup
             && self.terminal_error == other.terminal_error
-            && stats_tick_same(&self.stats, &other.stats)
-            && phase_same(&self.phase, &other.phase)
-            && download_same(&self.download, &other.download)
+            && self.stats == other.stats
+            && self.phase == other.phase
+            && self.download == other.download
             && self.update_check == other.update_check
-    }
-}
-
-fn stats_tick_same(a: &Option<StatsTick>, b: &Option<StatsTick>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.up == b.up
-                && a.down == b.down
-                && a.uptime_secs == b.uptime_secs
-                && a.goroutines == b.goroutines
-                && a.alloc_bytes == b.alloc_bytes
-                && a.sys_bytes == b.sys_bytes
-                && a.live_objects == b.live_objects
-                && a.num_gc == b.num_gc
-                && a.per_outbound == b.per_outbound
-                && a.per_inbound == b.per_inbound
-                && a.total_up == b.total_up
-                && a.total_down == b.total_down
-                && a.per_inbound_totals == b.per_inbound_totals
-        }
-        _ => false,
-    }
-}
-
-fn phase_same(a: &CorePhase, b: &CorePhase) -> bool {
-    match (a, b) {
-        (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::Starting, CorePhase::Starting)
-        | (CorePhase::Running, CorePhase::Running) => true,
-        (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
-        (CorePhase::Error(x), CorePhase::Error(y)) => x == y,
-        _ => false,
-    }
-}
-
-fn download_same(a: &DownloadState, b: &DownloadState) -> bool {
-    match (a, b) {
-        (DownloadState::Idle, DownloadState::Idle) => true,
-        (
-            DownloadState::Working {
-                stage: x,
-                done: xd,
-                total: xt,
-            },
-            DownloadState::Working {
-                stage: y,
-                done: yd,
-                total: yt,
-            },
-        ) => x == y && xd == yd && xt == yt,
-        (DownloadState::Done(x), DownloadState::Done(y)) => x == y,
-        (DownloadState::Failed(x), DownloadState::Failed(y)) => x == y,
-        _ => false,
     }
 }
 

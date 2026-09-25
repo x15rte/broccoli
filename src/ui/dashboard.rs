@@ -21,7 +21,7 @@ struct PlotCache {
 /// The language is part of the key because the cached captions are
 /// localized.
 struct GridCache {
-    key: (u64, bool, u64, Language),
+    key: (u64, u64, Language),
     rows: Vec<LatencyRow>,
 }
 
@@ -76,7 +76,7 @@ pub struct DashboardScreen {
     /// Throughput-plot series, rebuilt only when the stats generation
     /// advances.
     plot_cache: Option<PlotCache>,
-    /// Latency-grid rows, rebuilt only when `(config_revision, dirty,
+    /// Latency-grid rows, rebuilt only when `(model generation,
     /// latency_generation, language)` advances.
     grid_cache: Option<GridCache>,
     /// Listener-traffic rows, the session totals and the memory line,
@@ -126,12 +126,13 @@ impl DashboardScreen {
     }
 
     /// The latency grid's memoized rows for this frame: one pass per
-    /// `(config_revision, dirty, latency_generation, language)` change,
-    /// zero per-row lookups or formatting on idle frames.
+    /// `(model generation, latency_generation, language)` change, zero
+    /// per-row lookups or formatting on idle frames. The model generation is
+    /// the edit signal (a rename or an added profile); the latency generation
+    /// carries the observatory and probe results the rows render.
     fn latency_rows(&mut self, ctx: &UiCtx<'_>) -> &GridCache {
         let key = (
-            ctx.config_revision,
-            *ctx.dirty,
+            *ctx.model_generation,
             ctx.latency_generation,
             ctx.settings.language,
         );
@@ -246,19 +247,18 @@ impl DashboardScreen {
 
     /// The header-row labels for this frame (phase badge, per-endpoint
     /// status rows, API-port line): formatted only when a phase transition,
-    /// an endpoint-list change, a persist, a language change or a core
-    /// start moved them — never on repaint frames. The
-    /// status word inside each endpoint caption is phase-derived, so the
-    /// phase is part of the key (variant + payload, compared explicitly).
+    /// a model edit, a language change or a core start moved them — never on
+    /// repaint frames. The status word inside each endpoint caption is
+    /// phase-derived, so the phase is part of the key with its own
+    /// payload-inclusive equality.
     fn header_cache(&mut self, ctx: &UiCtx<'_>) -> &HeaderCache {
         let lang = ctx.settings.language;
-        let dirty = *ctx.dirty;
+        let generation = *ctx.model_generation;
         let stale = match &self.header_cache {
             Some(cache) => {
                 cache.lang != lang
-                    || cache.config_revision != ctx.config_revision
-                    || cache.dirty != dirty
-                    || !same_phase(&cache.phase, ctx.phase)
+                    || cache.model_generation != generation
+                    || cache.phase != *ctx.phase
             }
             None => true,
         };
@@ -293,8 +293,7 @@ impl DashboardScreen {
                 .collect();
             self.header_cache = Some(HeaderCache {
                 phase,
-                config_revision: ctx.config_revision,
-                dirty,
+                model_generation: generation,
                 lang,
                 badge,
                 endpoints,
@@ -908,32 +907,17 @@ enum ListenerStatus {
 /// The dashboard header-row labels: the phase-badge
 /// caption, the per-endpoint status rows (label + the derived status they
 /// were formatted for) and the API-port line — rebuilt only when a phase
-/// transition, an endpoint-list change, a persist, a language change or a
-/// core start moved them, never on repaint frames. The phase is keyed by
-/// clone-at-rebuild plus an explicit variant comparison ([`same_phase`] —
-/// `CorePhase` carries no `PartialEq`), so the per-frame staleness check
-/// never allocates.
+/// transition, a model edit, a language change or a core start moved them,
+/// never on repaint frames. The phase is keyed by clone-at-rebuild and
+/// compared with its own payload-inclusive `PartialEq`, so the per-frame
+/// staleness check never allocates.
 struct HeaderCache {
     phase: CorePhase,
-    config_revision: u64,
-    dirty: bool,
+    /// The model generation the endpoint captions were derived from.
+    model_generation: u64,
     lang: Language,
     badge: String,
     endpoints: Vec<(String, ListenerStatus)>,
-}
-
-/// Explicit `CorePhase` equality for the header-cache key — the enum
-/// carries no `PartialEq` derive (it lives in rt), and the payloads are
-/// part of the rendered captions.
-fn same_phase(a: &CorePhase, b: &CorePhase) -> bool {
-    match (a, b) {
-        (CorePhase::Stopped, CorePhase::Stopped)
-        | (CorePhase::Starting, CorePhase::Starting)
-        | (CorePhase::Running, CorePhase::Running) => true,
-        (CorePhase::Backoff { attempt: x }, CorePhase::Backoff { attempt: y }) => x == y,
-        (CorePhase::Error(x), CorePhase::Error(y)) => x == y,
-        _ => false,
-    }
 }
 
 /// Pure phase → badge caption: static phases render their `t()` string,
@@ -1911,7 +1895,7 @@ mod tests {
         }
 
         rig.borrow_mut().servers.profiles[1].name = "beta-renamed".into();
-        rig.borrow_mut().config_revision += 1;
+        rig.borrow_mut().edit();
         harness.run();
         harness
             .get_all_by_label("beta-renamed")
