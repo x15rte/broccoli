@@ -241,12 +241,24 @@ fn deferred_setup_first_install_gates_the_downloaded_core_and_settles_stopped() 
             }
             // The gate proves the downloaded binary and ends its own process:
             // the update completes without ever becoming the running session.
-            Ok(CoreEvt::State(CorePhase::Stopped)) if downloaded.is_some() => gate_settled = true,
-            Ok(CoreEvt::State(CorePhase::Starting)) if downloaded.is_some() => {}
-            Ok(CoreEvt::State(CorePhase::Running)) => {
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            }) if downloaded.is_some() => gate_settled = true,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Starting,
+                ..
+            }) if downloaded.is_some() => {}
+            Ok(CoreEvt::State {
+                phase: CorePhase::Running,
+                ..
+            }) => {
                 panic!("a post-install gate start must not become the running session")
             }
-            Ok(CoreEvt::State(CorePhase::Error(error))) => {
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => {
                 panic!("deferred first-install startup failed: {error}")
             }
             Ok(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,
@@ -326,12 +338,24 @@ fn imported_pinned_archive_gates_cleanly_and_settles_stopped() {
             }
             // The gate proves the imported binary and ends its own process:
             // the import completes without ever becoming the running session.
-            Ok(CoreEvt::State(CorePhase::Stopped)) if downloaded.is_some() => gate_settled = true,
-            Ok(CoreEvt::State(CorePhase::Starting)) if downloaded.is_some() => {}
-            Ok(CoreEvt::State(CorePhase::Running)) => {
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            }) if downloaded.is_some() => gate_settled = true,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Starting,
+                ..
+            }) if downloaded.is_some() => {}
+            Ok(CoreEvt::State {
+                phase: CorePhase::Running,
+                ..
+            }) => {
                 panic!("a post-install gate start must not become the running session")
             }
-            Ok(CoreEvt::State(CorePhase::Error(error))) => {
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => {
                 panic!("imported pinned core startup failed: {error}")
             }
             Ok(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,

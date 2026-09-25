@@ -245,7 +245,10 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     let mut running = false;
     while Instant::now() < deadline && !running {
         match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(broccoli::rt::CoreEvt::State(broccoli::rt::CorePhase::Running)) => running = true,
+            Ok(broccoli::rt::CoreEvt::State {
+                phase: broccoli::rt::CorePhase::Running,
+                ..
+            }) => running = true,
             Ok(_) => {}
             Err(_) => {}
         }

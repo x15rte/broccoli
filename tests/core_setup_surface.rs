@@ -205,9 +205,13 @@ fn phase_error_keeps_the_phase_and_persists_until_the_phase_moves() {
     common::dismiss_wizard(&mut h);
 
     let captured = "[stderr] failed to bind the API port";
-    h.state().inject_event(CoreEvt::State(CorePhase::Error(
-        PhaseError::new(Diag::new(Key::RtPhaseReadinessTimeout).arg(7)).with_tail(captured.into()),
-    )));
+    h.state().inject_event(CoreEvt::State {
+        phase: CorePhase::Error(
+            PhaseError::new(Diag::new(Key::RtPhaseReadinessTimeout).arg(7))
+                .with_tail(captured.into()),
+        ),
+        transport: None,
+    });
     h.run_steps(30);
 
     let headline = t_fmt(Language::En, Key::RtPhaseReadinessTimeout, &[&7]);
@@ -266,7 +270,10 @@ fn phase_error_keeps_the_phase_and_persists_until_the_phase_moves() {
     );
 
     // The phase moving on is the state change that clears it.
-    h.state().inject_event(CoreEvt::State(CorePhase::Stopped));
+    h.state().inject_event(CoreEvt::State {
+        phase: CorePhase::Stopped,
+        transport: None,
+    });
     h.run_steps(30);
     assert!(
         h.query_all_by_label(headline.as_str()).next().is_none(),
@@ -291,10 +298,10 @@ fn terminal_message_keeps_rendering_while_the_failure_stands() {
     let (_lock, _tmp, mut h) = boot(false);
     common::dismiss_wizard(&mut h);
 
-    h.state()
-        .inject_event(CoreEvt::State(CorePhase::Error(PhaseError::new(
-            Diag::new(Key::RtPhaseRestartCancelled),
-        ))));
+    h.state().inject_event(CoreEvt::State {
+        phase: CorePhase::Error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled))),
+        transport: None,
+    });
     h.run_steps(30);
     assert!(
         h.query_all_by_label(t(Language::En, Key::RtPhaseRestartCancelled))

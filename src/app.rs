@@ -282,8 +282,6 @@ pub struct BroccoliApp {
     stats_generation: u64,
     latency_generation: u64,
     phase: CorePhase,
-    /// Transport reported by `ActiveConfig`, held until its following start phase.
-    pending_transport: Option<CoreTransport>,
     /// The operation the shell mirrors while the runtime owns the busy window:
     /// written from the runtime's own bookends and from the kind of the
     /// command the shell just sent ([`CoreCmd::job_kind`]), never from a
@@ -791,6 +789,7 @@ impl BroccoliApp {
             evt_rx,
             evt_tx,
             ui_ctx_snapshot: UiCtxSnapshot {
+                transport: None,
                 phase: CorePhase::Stopped,
                 stats: None,
                 observatory: Vec::new(),
@@ -806,7 +805,6 @@ impl BroccoliApp {
             stats_generation: 0,
             latency_generation: 0,
             phase: CorePhase::Stopped,
-            pending_transport: None,
             active_transport: None,
             operation: None,
             stats: None,
@@ -935,7 +933,7 @@ impl BroccoliApp {
                 };
             };
             match ev {
-                CoreEvt::State(phase) => {
+                CoreEvt::State { phase, transport } => {
                     self.ui_ctx_dirty = true;
                     // The terminal message reports one phase state: a failure
                     // phase records its keyed headline plus the captured core
@@ -954,17 +952,11 @@ impl BroccoliApp {
                         }
                         _ => {}
                     }
-                    match &phase {
-                        CorePhase::Starting | CorePhase::Running => {
-                            if let Some(transport) = self.pending_transport.take() {
-                                self.active_transport = Some(transport);
-                            }
-                        }
-                        CorePhase::Stopped | CorePhase::Backoff { .. } | CorePhase::Error(_) => {
-                            self.pending_transport = None;
-                            self.active_transport = None;
-                        }
-                    }
+                    // The transport the phase describes arrives with it: a
+                    // launch owns its backend's transport, every other phase
+                    // carries none, so the shell mirrors one fact instead of
+                    // pairing this event with the last one.
+                    self.active_transport = transport;
                     self.phase = phase.clone();
                     // Any phase change means a different core session (or
                     // none): trial rules never survive a restart or config
@@ -1002,11 +994,7 @@ impl BroccoliApp {
                         );
                     }
                 }
-                CoreEvt::ActiveConfig {
-                    snapshot,
-                    transport,
-                } => {
-                    self.pending_transport = Some(transport);
+                CoreEvt::ActiveConfig { snapshot } => {
                     self.profile_preview.record_start(snapshot);
                 }
                 CoreEvt::Log { line, from_core } => self.push_log(from_core, line),
@@ -1907,6 +1895,7 @@ impl BroccoliApp {
     /// is skipped: the snapshot's own `same_inputs` compare is the gate.
     fn rebuild_ui_ctx_snapshot(&mut self) {
         let candidate = UiCtxSnapshot {
+            transport: self.active_transport,
             phase: self.phase.clone(),
             stats: self.stats.clone(),
             observatory: self.observatory.clone(),

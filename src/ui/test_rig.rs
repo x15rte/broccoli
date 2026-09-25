@@ -40,6 +40,9 @@ pub(crate) struct UiTestRig {
     /// dropped receiver); tests that assert on sent commands drain it.
     pub(crate) _cmd_rx: tokio::sync::mpsc::UnboundedReceiver<CoreCmd>,
     pub(crate) phase: CorePhase,
+    /// The transport the live phase owns, as the runtime publishes it with
+    /// the phase (see `CoreEvt::State`).
+    pub(crate) transport: Option<crate::rt::CoreTransport>,
     pub(crate) connect_blocked_reason: Option<String>,
     /// The shell's stored config-generation error — the text the dashboard
     /// renders inline under Connect, excerpt-bounded by the shell's
@@ -106,6 +109,7 @@ impl Default for UiTestRig {
             cmd,
             _cmd_rx: cmd_rx,
             phase: CorePhase::Stopped,
+            transport: None,
             connect_blocked_reason: None,
             config_error: None,
             connect_requested: false,
@@ -134,6 +138,7 @@ impl Default for UiTestRig {
             latency_generation: 0,
             snapshot: UiCtxSnapshot {
                 phase: CorePhase::Stopped,
+                transport: None,
                 stats: None,
                 observatory: Vec::new(),
                 core_version: None,
@@ -179,6 +184,7 @@ impl UiTestRig {
         // Refresh the staging snapshot from the flat fields, then borrow it.
         self.snapshot = UiCtxSnapshot {
             phase: self.phase.clone(),
+            transport: self.transport,
             stats: self.stats.clone(),
             observatory: self.observatory.clone(),
             core_version: self.core_version.clone(),

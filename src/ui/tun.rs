@@ -6,7 +6,7 @@ use crate::model::TunCfg;
 use crate::model::safety::assess;
 use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, tun_ipv4_gateway};
-use crate::rt::CorePhase;
+use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
 use crate::ui::UiCtx;
 use crate::ui::inbounds::sniffing_editor;
@@ -136,7 +136,7 @@ impl TunScreen {
 
         ui.add_space(4.0);
         let colors = status_colors_of(ui);
-        let badge_key = tun_badge(ctx.phase, ctx.settings.mode, ctx.is_elevated);
+        let badge_key = tun_badge(ctx.phase, ctx.settings.mode, ctx.transport, ctx.is_elevated);
         // The healthy states — an elevated shell, or TUN already running
         // through the helper — read in the ok color; only the note about a
         // TUN start that has not happened yet warns.
@@ -360,10 +360,22 @@ impl TunScreen {
 /// core runs the helper is the meaningful fact about how TUN started; an
 /// elevated shell outranks it, and the UAC note is what remains for a TUN
 /// start that has not happened yet.
-fn tun_badge(phase: &CorePhase, mode: Mode, is_elevated: bool) -> Key {
+/// The badge over the TUN screen: elevation is the shell's own fact, and
+/// "the helper is carrying TUN" is the transport the running core owns —
+/// read from the published transport, not re-derived from the mode setting,
+/// so the badge never claims a capture the core does not have.
+fn tun_badge(
+    phase: &CorePhase,
+    mode: Mode,
+    transport: Option<CoreTransport>,
+    is_elevated: bool,
+) -> Key {
     if is_elevated {
         Key::TunBadgeElevated
-    } else if mode == Mode::Tun && matches!(phase, CorePhase::Running) {
+    } else if mode == Mode::Tun
+        && transport == Some(CoreTransport::Tun)
+        && matches!(phase, CorePhase::Running)
+    {
         Key::TunBadgeHelperActive
     } else {
         Key::TunBadgeNotElevated
@@ -443,10 +455,18 @@ mod tests {
     /// Render the screen once for a mode/phase with the shell un-elevated
     /// (what `UiTestRig` models, and what the app always is) and assert the
     /// elevation badge: exactly `expected` of the three badge labels is on
-    /// screen.
+    /// screen. The transport follows the phase the way the runtime publishes
+    /// it: a running launch under a TUN setting owns the TUN transport.
     fn assert_rendered_badge(case: &str, mode: Mode, phase: CorePhase, expected: Key) {
         let mut rig = UiTestRig::default();
         rig.settings.mode = mode;
+        rig.transport = matches!(phase, CorePhase::Running).then(|| {
+            if mode == Mode::Tun {
+                CoreTransport::Tun
+            } else {
+                CoreTransport::Direct
+            }
+        });
         rig.phase = phase;
         let mut harness = Harness::builder().build_ui_state(
             |ui, screen| screen.show(ui, &mut rig.ctx()),
@@ -527,34 +547,59 @@ mod tests {
         let running = CorePhase::Running;
         let starting = CorePhase::Starting;
         let stopped = CorePhase::Stopped;
+        let tun = Some(CoreTransport::Tun);
+        let direct = Some(CoreTransport::Direct);
 
         // Elevation: the shell being elevated is the badge fact, whatever
         // the mode and phase.
-        assert_eq!(tun_badge(&running, Mode::Tun, true), Key::TunBadgeElevated);
-        assert_eq!(tun_badge(&starting, Mode::Tun, true), Key::TunBadgeElevated);
-        assert_eq!(tun_badge(&stopped, Mode::Tun, true), Key::TunBadgeElevated);
-        assert_eq!(tun_badge(&running, Mode::Off, true), Key::TunBadgeElevated);
+        assert_eq!(
+            tun_badge(&running, Mode::Tun, tun, true),
+            Key::TunBadgeElevated
+        );
+        assert_eq!(
+            tun_badge(&starting, Mode::Tun, None, true),
+            Key::TunBadgeElevated
+        );
+        assert_eq!(
+            tun_badge(&stopped, Mode::Tun, None, true),
+            Key::TunBadgeElevated
+        );
+        assert_eq!(
+            tun_badge(&running, Mode::Off, None, true),
+            Key::TunBadgeElevated
+        );
 
         // A TUN core the helper already runs: the app never elevates itself,
         // so the helper is what carries TUN — the note that TUN would start
         // through the helper would contradict the state on screen.
         assert_eq!(
-            tun_badge(&running, Mode::Tun, false),
+            tun_badge(&running, Mode::Tun, tun, false),
             Key::TunBadgeHelperActive
+        );
+        // A running core the helper does not carry (direct child, or a mode
+        // change not yet restarted) must keep the UAC note: the badge may not
+        // claim a capture the core does not have.
+        assert_eq!(
+            tun_badge(&running, Mode::Tun, direct, false),
+            Key::TunBadgeNotElevated
+        );
+        assert_eq!(
+            tun_badge(&running, Mode::Tun, None, false),
+            Key::TunBadgeNotElevated
         );
 
         // Not elevated, no running TUN core: the UAC note still describes
         // what a start would do.
         assert_eq!(
-            tun_badge(&starting, Mode::Tun, false),
+            tun_badge(&starting, Mode::Tun, tun, false),
             Key::TunBadgeNotElevated
         );
         assert_eq!(
-            tun_badge(&stopped, Mode::Tun, false),
+            tun_badge(&stopped, Mode::Tun, None, false),
             Key::TunBadgeNotElevated
         );
         assert_eq!(
-            tun_badge(&running, Mode::Off, false),
+            tun_badge(&running, Mode::Off, None, false),
             Key::TunBadgeNotElevated
         );
     }

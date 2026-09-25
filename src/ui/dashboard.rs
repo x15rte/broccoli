@@ -3,7 +3,7 @@
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::Mode;
 use crate::model::settings::{Language, Settings, TrafficUnit};
-use crate::rt::{CorePhase, DownloadState, OutboundStatusView};
+use crate::rt::{CorePhase, CoreTransport, DownloadState, OutboundStatusView};
 use crate::ui::inbounds::protocol_label;
 use crate::ui::status::{
     PhaseBadgeWording, StatusColors, phase_badge_color, phase_badge_text, status_colors_of,
@@ -428,7 +428,10 @@ impl DashboardScreen {
                 ui.horizontal_wrapped(|ui| {
                     let lang = ctx.settings.language;
                     let colors = status_colors_of(ui);
-                    let tun = tun_status(ctx.phase, (ctx.settings.mode, ctx.is_elevated));
+                    let tun = tun_status(
+                        ctx.phase,
+                        (ctx.settings.mode, ctx.transport, ctx.is_elevated),
+                    );
                     let tun_word = match tun {
                         TunStatus::Active => t(lang, Key::TunStatusActive),
                         TunStatus::Elevation => t(lang, Key::TunStatusElevation),
@@ -1005,8 +1008,16 @@ fn missing_inbound_listener(phase: &CorePhase, settings: &Settings) -> bool {
 
 /// Pure settings/phase → status derivation for the TUN row item. The tuple
 /// is `(mode, is_elevated)`.
-fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus {
-    if mode == Mode::Tun && matches!(phase, CorePhase::Running) {
+/// The dashboard's network-mode row: which transport the running core
+/// actually owns decides "active" (the setting decides only the states that
+/// exist before a launch), so a mode change that has not restarted the core
+/// cannot read as active — the runtime publishes the transport with the phase
+/// for exactly that reason.
+fn tun_status(
+    phase: &CorePhase,
+    (mode, transport, is_elevated): (Mode, Option<CoreTransport>, bool),
+) -> TunStatus {
+    if transport == Some(CoreTransport::Tun) && matches!(phase, CorePhase::Running) {
         return TunStatus::Active;
     }
     if mode == Mode::Tun && !is_elevated {
@@ -1024,8 +1035,8 @@ fn tun_status(phase: &CorePhase, (mode, is_elevated): (Mode, bool)) -> TunStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardScreen, LatencyCell, ListenerStatus, TunStatus, build_latency_rows, format_axis,
-        format_bytes, listener_status, missing_inbound_listener, terminal_error_block,
+        CoreTransport, DashboardScreen, LatencyCell, ListenerStatus, TunStatus, build_latency_rows,
+        format_axis, format_bytes, listener_status, missing_inbound_listener, terminal_error_block,
         truncate_chars, tun_status, y_axis_label_for,
     };
     use crate::diag::Diag;
@@ -2103,8 +2114,8 @@ mod tests {
         );
     }
 
-    /// The TUN item derivation in precedence order: running TUN
-    /// mode is active (elevation is moot), a non-elevated TUN mode explains
+    /// The TUN item derivation in precedence order: a running core that owns
+    /// the TUN is active (elevation is moot), a non-elevated TUN mode explains
     /// itself as elevation needed, other modes are off, a starting (elevated)
     /// TUN is starting, and anything else is down.
     #[test]
@@ -2112,30 +2123,53 @@ mod tests {
         let running = CorePhase::Running;
         let starting = CorePhase::Starting;
         let stopped = CorePhase::Stopped;
+        let tun = Some(CoreTransport::Tun);
+        let direct = Some(CoreTransport::Direct);
 
-        // Active: mode==Tun && Running — with or without the (moot, since it
-        // is already running) elevation flag.
-        assert_eq!(tun_status(&running, (Mode::Tun, true)), TunStatus::Active);
-        assert_eq!(tun_status(&running, (Mode::Tun, false)), TunStatus::Active);
+        // Active: the running core owns the TUN — with or without the (moot,
+        // since it is already running) elevation flag.
+        assert_eq!(
+            tun_status(&running, (Mode::Tun, tun, true)),
+            TunStatus::Active
+        );
+        assert_eq!(
+            tun_status(&running, (Mode::Tun, tun, false)),
+            TunStatus::Active
+        );
         // Elevation: mode==Tun && !is_elevated, before the starting clause.
         assert_eq!(
-            tun_status(&stopped, (Mode::Tun, false)),
+            tun_status(&stopped, (Mode::Tun, None, false)),
             TunStatus::Elevation
         );
         assert_eq!(
-            tun_status(&starting, (Mode::Tun, false)),
+            tun_status(&starting, (Mode::Tun, None, false)),
             TunStatus::Elevation
         );
         // Off: any non-TUN mode, whatever the phase.
-        assert_eq!(tun_status(&running, (Mode::Off, true)), TunStatus::Off);
-        assert_eq!(tun_status(&starting, (Mode::Off, false)), TunStatus::Off);
+        assert_eq!(
+            tun_status(&running, (Mode::Off, None, true)),
+            TunStatus::Off
+        );
+        assert_eq!(
+            tun_status(&starting, (Mode::Off, None, false)),
+            TunStatus::Off
+        );
         // Starting: mode==Tun && Starting, when elevated.
         assert_eq!(
-            tun_status(&starting, (Mode::Tun, true)),
+            tun_status(&starting, (Mode::Tun, None, true)),
             TunStatus::Starting
         );
         // Down: everything left — elevated TUN mode not running/starting.
-        assert_eq!(tun_status(&stopped, (Mode::Tun, true)), TunStatus::Down);
+        assert_eq!(
+            tun_status(&stopped, (Mode::Tun, None, true)),
+            TunStatus::Down
+        );
+        // A mode change that has not restarted the core: the running core is
+        // still a direct child, so the row must not read as active.
+        assert_eq!(
+            tun_status(&running, (Mode::Tun, direct, true)),
+            TunStatus::Down
+        );
     }
 
     /// The dashboard renders one status row per local endpoint, in list

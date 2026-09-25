@@ -179,12 +179,14 @@ fn assert_no_probe_temp_dirs(root: &Path) {
 
 fn assert_no_main_failure_event(event: &CoreEvt) {
     match event {
-        CoreEvt::State(
-            phase @ (CorePhase::Starting
-            | CorePhase::Stopped
-            | CorePhase::Backoff { .. }
-            | CorePhase::Error(_)),
-        ) => panic!("main core changed phase during isolated probe: {phase:?}"),
+        CoreEvt::State {
+            phase:
+                phase @ (CorePhase::Starting
+                | CorePhase::Stopped
+                | CorePhase::Backoff { .. }
+                | CorePhase::Error(_)),
+            ..
+        } => panic!("main core changed phase during isolated probe: {phase:?}"),
         CoreEvt::ActiveConfig { .. } => {
             panic!("main runtime emitted an ActiveConfig event during isolated probe")
         }
@@ -322,8 +324,14 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
     while Instant::now() < startup_deadline && !running {
         if let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(500)) {
             match event {
-                CoreEvt::State(CorePhase::Running) => running = true,
-                CoreEvt::State(CorePhase::Error(error)) => {
+                CoreEvt::State {
+                    phase: CorePhase::Running,
+                    ..
+                } => running = true,
+                CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                } => {
                     panic!("main core failed to start: {error}")
                 }
                 _ => {}
@@ -419,7 +427,10 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
     while Instant::now() < stop_deadline {
         if matches!(
             evt_rx.recv_timeout(Duration::from_millis(250)),
-            Ok(CoreEvt::State(CorePhase::Stopped))
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            })
         ) {
             break;
         }

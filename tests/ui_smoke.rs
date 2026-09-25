@@ -131,7 +131,10 @@ fn dashboard_session_totals_drop_on_phase_change() {
         .next()
         .expect("the inbound table must carry the downlink session total");
 
-    h.state().inject_event(CoreEvt::State(CorePhase::Stopped));
+    h.state().inject_event(CoreEvt::State {
+        phase: CorePhase::Stopped,
+        transport: None,
+    });
     h.run();
     assert!(
         h.query_all_by_label("↑ 239.5 MiB").next().is_none(),

@@ -21,12 +21,12 @@ pub mod wizard;
 pub(crate) mod test_rig;
 
 use crate::i18n::{Key, t, t_fmt};
-use crate::model::settings::{Language, Mode};
+use crate::model::settings::Language;
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
 use crate::rt::{
-    AppMessage, CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView,
-    StatsTick,
+    AppMessage, CoreCmd, CorePhase, CoreTransport, DownloadState, JobKind, LatencyProbeResult,
+    OutboundStatusView, StatsTick,
 };
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
@@ -115,6 +115,12 @@ pub struct UiCtx<'a> {
     pub settings: &'a mut Settings,
     pub cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
     pub phase: &'a CorePhase,
+    /// The transport the live phase owns: `Some` while a launch is starting
+    /// or running (the backend it manages), `None` in every other phase. The
+    /// runtime publishes it with the phase itself, so a screen asking "is the
+    /// TUN active" reads one fact instead of deriving it from the mode
+    /// setting and the phase together.
+    pub transport: Option<CoreTransport>,
     /// The busy window: the runtime-owned mutually-exclusive
     /// lifecycle/update transaction. Screens gate their controls on this
     /// value instead of deriving the window from their own inputs.
@@ -288,6 +294,7 @@ impl<'a> UiCtx<'a> {
         let idle_observatory: &'a [OutboundStatusView] = &[];
         let (
             phase,
+            transport,
             stats,
             observatory,
             core_version,
@@ -300,6 +307,7 @@ impl<'a> UiCtx<'a> {
         ) = match view {
             UiCtxView::Live { snapshot } => (
                 &snapshot.phase,
+                snapshot.transport,
                 &snapshot.stats,
                 &snapshot.observatory[..],
                 &snapshot.core_version,
@@ -312,6 +320,7 @@ impl<'a> UiCtx<'a> {
             ),
             UiCtxView::Onboarding { snapshot } => (
                 &snapshot.phase,
+                snapshot.transport,
                 &BLANK_STATS,
                 idle_observatory,
                 &snapshot.core_version,
@@ -327,6 +336,8 @@ impl<'a> UiCtx<'a> {
             servers,
             settings,
             cmd,
+            phase,
+            transport,
             stats_history,
             logs,
             logs_generation,
@@ -344,7 +355,6 @@ impl<'a> UiCtx<'a> {
             config_error,
             is_elevated,
             config_revision,
-            phase,
             stats,
             observatory,
             core_version,
@@ -465,17 +475,15 @@ impl<'a> UiCtx<'a> {
     fn send_latency_probe(&mut self, profiles: Vec<ServerProfile>) -> Result<(), String> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
-        // While TUN mode is active, carry the TUN outbound
-        // interface setting so the probe dials bypass the TUN; with TUN off
-        // there is no capture to bypass and the probe stays unbound. The
-        // TUN adapter's own name rides along so the resolution excludes it
-        // (the shared derivation's wire default when the GUI name is
-        // cleared).
-        let tun_enabled = self.settings.mode == Mode::Tun;
-        let tun_outbound_interface =
-            tun_enabled.then(|| self.settings.tun.auto_outbounds_interface.clone());
+        // The probe carries the TUN outbound interface setting and the TUN
+        // adapter's own name so its dials can bypass the capture and its
+        // resolution exclude the adapter. Whether either is *used* is the
+        // runtime's decision — its own backend's transport ownership — so the
+        // request does not re-derive it from the mode setting: one decision,
+        // taken where the live backend is known.
+        let tun_outbound_interface = Some(self.settings.tun.auto_outbounds_interface.clone());
         let tun_adapter_name =
-            tun_enabled.then(|| sys::netif::tun_adapter_name(&self.settings.tun.name).to_owned());
+            Some(sys::netif::tun_adapter_name(&self.settings.tun.name).to_owned());
         self.cmd
             .send(CoreCmd::ProbeLatency {
                 profiles,
@@ -494,6 +502,7 @@ impl<'a> UiCtx<'a> {
 /// a second one.
 pub(crate) struct UiCtxSnapshot {
     pub(crate) phase: CorePhase,
+    pub(crate) transport: Option<CoreTransport>,
     pub(crate) stats: Option<StatsTick>,
     pub(crate) observatory: Vec<OutboundStatusView>,
     pub(crate) core_version: Option<String>,
@@ -1996,6 +2005,7 @@ mod tests {
     fn resting_snapshot() -> UiCtxSnapshot {
         UiCtxSnapshot {
             phase: CorePhase::Stopped,
+            transport: None,
             stats: None,
             observatory: Vec::new(),
             core_version: None,

@@ -418,7 +418,15 @@ impl ApplyOutput {
 /// Events the runtime pushes to the GUI.
 #[derive(Debug, Clone)]
 pub enum CoreEvt {
-    State(CorePhase),
+    /// One phase transition, with the transport of the backend it describes:
+    /// a starting or running launch owns `Some(transport)`, every other phase
+    /// carries `None` (there is no live backend to attribute). The two facts
+    /// travel in one event, so no consumer has to pair this with a previous
+    /// one to learn which transport the phase refers to.
+    State {
+        phase: CorePhase,
+        transport: Option<CoreTransport>,
+    },
     /// Exact committed configuration used by a successful launch and the
     /// transport ownership mode of the backend that just launched, not the
     /// next configured setting. Whether that configuration carries a health
@@ -429,7 +437,6 @@ pub enum CoreEvt {
     /// a copy to keep current.
     ActiveConfig {
         snapshot: Result<String, AppMessage>,
-        transport: CoreTransport,
     },
     /// One raw log line (core output, or a passthrough app-authored line that
     /// has no key): complete text, rendered verbatim.
@@ -1337,15 +1344,18 @@ impl Runtime {
         self.health_extension = snapshot
             .as_ref()
             .is_ok_and(|config| apply::carries_health_extension(config));
-        self.emit(CoreEvt::ActiveConfig {
-            snapshot,
-            transport: self.backend.transport(),
-        });
+        self.emit(CoreEvt::ActiveConfig { snapshot });
     }
 
     fn set_phase(&mut self, phase: CorePhase) {
+        // The transport is published with the phase it belongs to: a launch
+        // in flight (Starting) or running owns the backend's transport, and
+        // every other phase has no live backend to attribute — so a consumer
+        // reads one event instead of pairing this with the last one.
+        let transport = matches!(phase, CorePhase::Starting | CorePhase::Running)
+            .then(|| self.backend.transport());
         self.phase = phase.clone();
-        self.emit(CoreEvt::State(phase));
+        self.emit(CoreEvt::State { phase, transport });
     }
     // -- exclusive-window helpers ----------------------
 
@@ -1651,7 +1661,10 @@ impl Runtime {
     // -- main loop -----------------------------------------------------------
 
     async fn run(mut self) {
-        self.emit(CoreEvt::State(CorePhase::Stopped));
+        self.emit(CoreEvt::State {
+            phase: CorePhase::Stopped,
+            transport: None,
+        });
         // Delay on every ticker (ready/stats/obs/dns/house), never Burst: a
         // wedged core overruns stats polls, and a zero-gap Burst catch-up
         // cycle would monopolize the runtime thread.
@@ -4327,13 +4340,22 @@ mod tests {
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
         let full_sender = sender.clone();
         let blocker = std::thread::spawn(move || {
-            queue_event(CoreEvt::State(super::CorePhase::Running), &full_sender);
+            queue_event(
+                CoreEvt::State {
+                    phase: super::CorePhase::Running,
+                    transport: None,
+                },
+                &full_sender,
+            );
         });
         // Free the slot; the waiting lifecycle event arrives next.
         assert!(matches!(receiver.recv(), Ok(CoreEvt::Operation(None))));
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(CoreEvt::State(super::CorePhase::Running))
+            Ok(CoreEvt::State {
+                phase: super::CorePhase::Running,
+                transport: None,
+            })
         ));
         blocker.join().expect("blocked send completes");
     }
@@ -4350,7 +4372,13 @@ mod tests {
         let full_sender = sender.clone();
         let started = Instant::now();
         let blocker = std::thread::spawn(move || {
-            queue_event(CoreEvt::State(super::CorePhase::Running), &full_sender);
+            queue_event(
+                CoreEvt::State {
+                    phase: super::CorePhase::Running,
+                    transport: None,
+                },
+                &full_sender,
+            );
         });
         blocker.join().expect("bounded fallback must return");
         let waited = started.elapsed();
@@ -4412,7 +4440,10 @@ mod tests {
         let handle = spawn_runtime(event_sender.clone(), egui::Context::default());
         assert!(matches!(
             event_receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(super::CoreEvt::State(super::CorePhase::Stopped))
+            Ok(super::CoreEvt::State {
+                phase: super::CorePhase::Stopped,
+                transport: None,
+            })
         ));
 
         // The GUI stops draining: fill the channel so every later event hits
@@ -4741,7 +4772,7 @@ mod tests {
                             seen_none = true;
                         }
                         super::CoreEvt::Operation(Some(_))
-                        | super::CoreEvt::State(_)
+                        | super::CoreEvt::State { .. }
                         | super::CoreEvt::Log { .. }
                         | super::CoreEvt::AppLog(..) => {}
                         other => panic!("unexpected event: {other:?}"),
@@ -5623,7 +5654,7 @@ mod tests {
         assert!(
             !emitted
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(_)))
+                .any(|event| matches!(event, CoreEvt::State { .. }))
         );
     }
 
@@ -5674,7 +5705,7 @@ mod tests {
             assert!(
                 !emitted
                     .iter()
-                    .any(|event| matches!(event, CoreEvt::State(_)))
+                    .any(|event| matches!(event, CoreEvt::State { .. }))
             );
             (runtime, events)
         })
@@ -5724,7 +5755,7 @@ mod tests {
         assert!(
             !emitted
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(_)))
+                .any(|event| matches!(event, CoreEvt::State { .. }))
         );
     }
 
@@ -5871,7 +5902,7 @@ mod tests {
         assert!(
             !emitted
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(_)))
+                .any(|event| matches!(event, CoreEvt::State { .. }))
         );
     }
 
@@ -6415,7 +6446,7 @@ mod tests {
         assert!(
             !emitted
                 .iter()
-                .any(|event| matches!(event, CoreEvt::State(_))),
+                .any(|event| matches!(event, CoreEvt::State { .. })),
             "a silenced exit must not emit a second phase record"
         );
     }
@@ -6493,7 +6524,7 @@ mod tests {
         assert_eq!(
             emitted
                 .iter()
-                .filter(|event| matches!(event, CoreEvt::State(_)))
+                .filter(|event| matches!(event, CoreEvt::State { .. }))
                 .count(),
             1,
             "the timeout must report exactly one phase record"
@@ -7392,7 +7423,10 @@ mod tests {
         assert!(
             emitted.iter().any(|event| matches!(
                 event,
-                CoreEvt::State(super::CorePhase::Error(error))
+                CoreEvt::State {
+                    phase: super::CorePhase::Error(error),
+                    transport: None,
+                }
                     if phase_message(error).key() == Key::RtPhaseConfigError && error.tail == tail
             )),
             "the phase event must carry the keyed headline plus the tail, got: {emitted:?}"
@@ -7432,7 +7466,10 @@ mod tests {
         assert!(
             emitted.iter().any(|event| matches!(
                 event,
-                CoreEvt::State(super::CorePhase::Error(error))
+                CoreEvt::State {
+                    phase: super::CorePhase::Error(error),
+                    transport: None,
+                }
                     if phase_message(error).key() == Key::RtPhaseConfigError
             )),
             "the phase event must carry the keyed headline, got: {emitted:?}"
@@ -7499,7 +7536,10 @@ mod tests {
         let handle = spawn_runtime(event_sender, egui::Context::default());
         assert!(matches!(
             event_receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(super::CoreEvt::State(super::CorePhase::Stopped))
+            Ok(super::CoreEvt::State {
+                phase: super::CorePhase::Stopped,
+                transport: None,
+            })
         ));
 
         let started = Instant::now();

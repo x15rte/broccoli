@@ -155,21 +155,21 @@ fn socks_to_freedom_e2e() {
     let mut active_snapshot = None;
     while Instant::now() < deadline && !running {
         match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(broccoli::rt::CoreEvt::ActiveConfig {
-                snapshot,
-                transport,
-            }) => {
-                assert_eq!(
-                    transport,
-                    broccoli::rt::CoreTransport::Direct,
-                    "the apply-and-start command reported a non-direct backend"
-                );
+            Ok(broccoli::rt::CoreEvt::ActiveConfig { snapshot }) => {
                 active_snapshot = Some(snapshot);
             }
-            Ok(broccoli::rt::CoreEvt::State(broccoli::rt::CorePhase::Running)) => {
+            Ok(broccoli::rt::CoreEvt::State {
+                phase: broccoli::rt::CorePhase::Running,
+                transport,
+            }) => {
                 assert!(
                     matches!(active_snapshot.as_ref(), Some(Ok(_))),
                     "core reached Running without an active config snapshot"
+                );
+                assert_eq!(
+                    transport,
+                    Some(broccoli::rt::CoreTransport::Direct),
+                    "the apply-and-start command reported a non-direct backend"
                 );
                 running = true;
             }
@@ -227,9 +227,10 @@ fn socks_to_freedom_e2e() {
     while Instant::now() < stop_deadline && !stopped {
         stopped = matches!(
             evt_rx.recv_timeout(Duration::from_millis(250)),
-            Ok(broccoli::rt::CoreEvt::State(
-                broccoli::rt::CorePhase::Stopped
-            ))
+            Ok(broccoli::rt::CoreEvt::State {
+                phase: broccoli::rt::CorePhase::Stopped,
+                ..
+            })
         );
     }
     assert!(stopped, "runtime did not confirm supervised core exit");

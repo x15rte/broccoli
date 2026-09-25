@@ -203,8 +203,14 @@ fn wait_ready(
     let mut running = false;
     while Instant::now() < deadline && (core_pid.is_none() || !running) {
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Running)) => running = true,
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Running,
+                ..
+            }) => running = true,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
             Ok(event) => {
                 if let Some(pid) = started_pid(&event) {
                     core_pid = Some(pid);
@@ -235,7 +241,10 @@ fn wait_stopped(receiver: &std::sync::mpsc::Receiver<CoreEvt>, deadline: Instant
     let mut stopped = false;
     while Instant::now() < deadline && !stopped {
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Stopped)) => stopped = true,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            }) => stopped = true,
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime stopped before the core reached Stopped")
@@ -265,8 +274,14 @@ fn assert_stays_up(receiver: &std::sync::mpsc::Receiver<CoreEvt>, window: Durati
     let mut saw_error = None;
     while Instant::now() < deadline {
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State(CorePhase::Stopped | CorePhase::Backoff { .. })) => restarts += 1,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped | CorePhase::Backoff { .. },
+                ..
+            }) => restarts += 1,
             Ok(event) => {
                 if started_pid(&event).is_some() {
                     restarts += 1;
@@ -358,8 +373,14 @@ fn downloads_and_reloads_geodata_without_restart() {
         }
         if !swapped {
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) => restarts += 1,
                 Ok(event) => {
                     if started_pid(&event).is_some() {
                         restarts += 1;
@@ -382,7 +403,10 @@ fn downloads_and_reloads_geodata_without_restart() {
     let settle = Instant::now() + Duration::from_secs(5);
     while Instant::now() < settle {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
             Ok(event) => {
                 if started_pid(&event).is_some() {
                     restarts += 1;
@@ -469,8 +493,14 @@ fn payload_files_stay_replaceable_while_core_runs() {
     let mut saw_error = None;
     while Instant::now() < settle {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            }) => restarts += 1,
             Ok(event) => {
                 if started_pid(&event).is_some() {
                     restarts += 1;
@@ -555,7 +585,10 @@ fn broken_file_rolls_back() {
     let mut saw_error = None;
     while Instant::now() < swap_deadline && !saw_rollback_log {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
             Ok(CoreEvt::Log {
                 line,
                 from_core: true,
@@ -594,8 +627,14 @@ fn broken_file_rolls_back() {
         }
         if !restored {
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) => restarts += 1,
                 Ok(event) => {
                     if started_pid(&event).is_some() {
                         restarts += 1;
@@ -618,8 +657,14 @@ fn broken_file_rolls_back() {
     let settle = Instant::now() + Duration::from_secs(5);
     while Instant::now() < settle {
         match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State(CorePhase::Stopped)) => restarts += 1,
+            Ok(CoreEvt::State {
+                phase: CorePhase::Error(error),
+                ..
+            }) => saw_error = Some(error.to_string()),
+            Ok(CoreEvt::State {
+                phase: CorePhase::Stopped,
+                ..
+            }) => restarts += 1,
             Ok(event) => {
                 if started_pid(&event).is_some() {
                     restarts += 1;
@@ -775,8 +820,14 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         }
         if stable_swaps < 3 {
             match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State(CorePhase::Error(error))) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State(CorePhase::Stopped | CorePhase::Backoff { .. })) => restarts += 1,
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Ok(CoreEvt::State {
+                    phase: CorePhase::Stopped | CorePhase::Backoff { .. },
+                    ..
+                }) => restarts += 1,
                 Ok(event) => {
                     if started_pid(&event).is_some() {
                         restarts += 1;
