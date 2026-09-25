@@ -309,13 +309,60 @@ pub struct LogsScreen {
     /// [`REFIT_EPSILON`] for [`REFIT_SETTLE_SECS`], so a drag settles with
     /// at most one re-layout (at the drag's final width).
     pending_refit: Option<PendingRefit>,
-    /// Layout-work counters: a full pass re-measures every
-    /// filtered row from scratch (fresh build, filter/level/clear change,
-    /// width re-fit); a tail pass extends the retained vectors with only
-    /// the rows a forward refresh admitted. Plain integers, bumped when the
-    /// pass runs — never on idle frames.
-    full_layout_passes: u64,
-    tail_layout_passes: u64,
+    /// What the last view refresh decided (idle frames replace it with
+    /// [`RefreshOutcome::Reused`]).
+    last_refresh: RefreshOutcome,
+    /// What the last layout pass measured: a fresh build or a re-fit
+    /// measures every row, a forward refresh measures only its admitted tail,
+    /// and an unchanged-width frame measures nothing.
+    last_layout: LayoutPass,
+}
+
+/// What one refresh of the memoized view decided. The decision is a value the
+/// caller can assert — the screen keeps the last one — instead of a layout
+/// counter standing in for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// The filter inputs and the ring are unchanged: the cached view stands.
+    Reused,
+    /// A forward refresh kept the cached rows and admitted `admitted` lines,
+    /// dropping `dropped` rows whose lines left the ring. `selection_survives`
+    /// is false when a dropped row shifted the indices the selection is keyed
+    /// on.
+    Extended {
+        admitted: usize,
+        dropped: usize,
+        selection_survives: bool,
+    },
+    /// A full rebuild admitted `rows` rows. `selection_survives` is true only
+    /// when the rebuilt rows keep the cached ones as a strict prefix (an
+    /// append, which leaves the row indices alone).
+    Rebuilt {
+        rows: usize,
+        selection_survives: bool,
+    },
+}
+
+impl RefreshOutcome {
+    /// Whether the refresh did any work (rebuilt or extended). Idle frames
+    /// answer false. The screen renders whatever the view holds either way,
+    /// so only the tests ask — they read "the view changed" off the decision
+    /// instead of a private counter.
+    #[cfg(test)]
+    fn changed(&self) -> bool {
+        !matches!(self, Self::Reused)
+    }
+}
+
+/// What one layout pass measured. A fresh build or a re-fit measures every
+/// row (`Full`); a forward refresh measures only the rows it admitted
+/// (`Tail`); a frame whose width and spacing are unchanged measures nothing
+/// (`None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutPass {
+    None,
+    Full { rows: usize },
+    Tail { rows: usize },
 }
 
 /// Memoized "visible of total lines" caption text, keyed on its inputs.
@@ -358,8 +405,8 @@ impl Default for LogsScreen {
             rows_selection: RowSelection::default(),
             line_count: None,
             pending_refit: None,
-            full_layout_passes: 0,
-            tail_layout_passes: 0,
+            last_refresh: RefreshOutcome::Reused,
+            last_layout: LayoutPass::None,
         }
     }
 }
@@ -529,7 +576,15 @@ impl LogsScreen {
     /// filter/level changes, clears, first build — rebuilds the rows from
     /// scratch. The returned flag is exactly the refresh decision: false on an
     /// idle frame (the cached view stands), true on a rebuild or extension.
-    fn refresh_view(&mut self, logs: &VecDeque<(bool, String)>, logs_generation: u64) -> bool {
+    /// Refresh the memoized view from the ring and report what it decided.
+    /// The outcome is the observable the tests assert: "reused",
+    /// "extended by N, dropped M" or "rebuilt with N rows", plus whether the
+    /// index-keyed selection survived.
+    fn refresh_view(
+        &mut self,
+        logs: &VecDeque<(bool, String)>,
+        logs_generation: u64,
+    ) -> RefreshOutcome {
         let ring = RingId::of(logs, logs_generation);
         let needle = self.text.trim();
         // Idle frames — nothing about the filter inputs changed — reuse the
@@ -542,7 +597,8 @@ impl LogsScreen {
                 && view.key.needle == needle
                 && view.key.clear_after_generation == self.clear_after_generation
         }) {
-            return false;
+            self.last_refresh = RefreshOutcome::Reused;
+            return self.last_refresh;
         }
         // Forward refresh: the ring's push counter advanced and the
         // level/needle/clear inputs are unchanged, so the cached rows are
@@ -561,7 +617,9 @@ impl LogsScreen {
             && view.key.clear_after_generation == self.clear_after_generation
         {
             let front = ring.front();
-            if view.drop_departed_rows(front) > 0 {
+            let dropped = view.drop_departed_rows(front);
+            let mut admitted = 0;
+            if dropped > 0 {
                 // Evicted lines the view had admitted shift every later
                 // row's index, so the index-keyed selection (and the copy
                 // action it drives) must go. A refresh that dropped only
@@ -586,10 +644,16 @@ impl LogsScreen {
                         level,
                         line: line.clone(),
                     });
+                    admitted += 1;
                 }
             }
             view.key.ring = ring;
-            return true;
+            self.last_refresh = RefreshOutcome::Extended {
+                admitted,
+                dropped,
+                selection_survives: dropped == 0,
+            };
+            return self.last_refresh;
         }
         // Full rebuild. The clear anchor only matters here: it is positional,
         // and idle frames never reach this point. Lines pushed at or before
@@ -646,7 +710,11 @@ impl LogsScreen {
             spacing_y: 0.0,
             prefix: Vec::new(),
         });
-        true
+        self.last_refresh = RefreshOutcome::Rebuilt {
+            rows: self.view.as_ref().map_or(0, |view| view.rows.len()),
+            selection_survives,
+        };
+        self.last_refresh
     }
 
     /// Virtualized rendering: only the rows intersecting `viewport` (content
@@ -728,6 +796,7 @@ impl LogsScreen {
             false
         };
         let Some(view) = &mut self.view else { return };
+        let mut pass = LayoutPass::None;
         if refit || view.heights.len() != view.rows.len() {
             let font_id = TextStyle::Monospace.resolve(ui.style());
             let first_unmeasured = if refit || view.heights.is_empty() {
@@ -753,11 +822,15 @@ impl LogsScreen {
             if first_unmeasured == 0 {
                 view.heights = heights;
                 view.galleys = galleys;
-                self.full_layout_passes += 1;
+                pass = LayoutPass::Full {
+                    rows: view.rows.len(),
+                };
             } else {
                 view.heights.extend(heights);
                 view.galleys.extend(galleys);
-                self.tail_layout_passes += 1;
+                pass = LayoutPass::Tail {
+                    rows: view.rows.len() - first_unmeasured,
+                };
             }
             view.measured_width = available_width;
             view.spacing_y = spacing_y;
@@ -779,6 +852,7 @@ impl LogsScreen {
                 }
             }
         }
+        self.last_layout = pass;
         let rows = view.rows.len();
         // Content height for the scrollbar range and stick-to-bottom; the
         // trailing slot's spacing is trimmed, matching egui's own layout.
@@ -1184,9 +1258,9 @@ mod tests {
         push_line(&mut logs, &mut generation, false, "[Info] connect");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert!(
             screen.view.as_ref().unwrap().rows.is_empty(),
             "Clear view must hide every line present at press time"
@@ -1206,17 +1280,17 @@ mod tests {
         push_line(&mut logs, &mut generation, false, "[Info] connect");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         // Clear pressed now, generation 3.
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
         // New lines arrive, including another textually identical
         // "status ok".
         push_line(&mut logs, &mut generation, false, "[Info] fresh A");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         push_line(&mut logs, &mut generation, false, "[Info] fresh B");
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let rows = &screen.view.as_ref().unwrap().rows;
         assert_eq!(
             rows.iter().map(|row| row.line.as_str()).collect::<Vec<_>>(),
@@ -1371,11 +1445,11 @@ mod tests {
         let mut screen = LogsScreen::default();
 
         // First frame on the screen builds the view once.
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
 
         // Idle frames never rebuild.
         for _ in 0..10 {
-            assert!(!screen.refresh_view(&logs, generation));
+            assert!(!screen.refresh_view(&logs, generation).changed());
         }
 
         // One pushed line → exactly one rebuild.
@@ -1385,19 +1459,19 @@ mod tests {
             false,
             "2026/08/10 12:00:00.123 [Info] connected",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
-        assert!(!screen.refresh_view(&logs, generation));
+        assert!(!screen.refresh_view(&logs, generation).changed());
 
         // Filter text change → exactly one rebuild, then stable.
         screen.text = "CONNECTED".to_string();
-        assert!(screen.refresh_view(&logs, generation));
-        assert!(!screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
+        assert!(!screen.refresh_view(&logs, generation).changed());
 
         // Level change → one rebuild; the Info line is hidden.
         screen.text.clear();
         screen.level = LevelFilter::WarningPlus;
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
 
         // Clear-view generation → one rebuild; rows through the clear point
@@ -1409,9 +1483,9 @@ mod tests {
             true,
             "2026/08/10 12:00:01.000 [Warning] retry",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         screen.clear_after_generation = Some(generation);
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert!(screen.view.as_ref().unwrap().rows.is_empty());
         // The pre-clear lines rotate out entirely; the positional anchor
         // survives the rotation and self-corrects to "show everything" —
@@ -1422,10 +1496,10 @@ mod tests {
             true,
             "2026/08/10 12:00:02.000 [Error] fail",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         logs.pop_front();
         logs.pop_front();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(
             screen.clear_after_generation,
             Some(2),
@@ -1471,14 +1545,14 @@ mod tests {
             false,
             "2026/08/10 12:00:01.000 [Info] second",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert!(
             screen.rows_selection.anchor.is_some(),
             "an append-only rebuild must keep the selection"
         );
         // Front eviction shifts indices → selection must go.
         logs.pop_front();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(screen.rows_selection.anchor, None);
         // Filter change → selection must go.
         screen.rows_selection = RowSelection {
@@ -1492,7 +1566,7 @@ mod tests {
             }),
         };
         screen.text = "FIRST".to_string();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(screen.rows_selection.anchor, None);
     }
 
@@ -1530,7 +1604,7 @@ mod tests {
             );
         }
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         // Simulate a measured frame over the four admitted rows: heights,
         // galleys and prefix sums cover the same prefix, as `show_rows`
         // leaves them.
@@ -1572,7 +1646,7 @@ mod tests {
             CAP,
             "2026/08/10 12:00:05.000 [Info] line 5",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let view = screen.view.as_ref().unwrap();
         let lines: Vec<&str> = view.rows.iter().map(|row| row.line.as_str()).collect();
         assert_eq!(
@@ -1604,7 +1678,7 @@ mod tests {
         // The same ring state through a view with no history: the incremental
         // refresh must agree with the rebuild row for row.
         let mut fresh = LogsScreen::default();
-        assert!(fresh.refresh_view(&logs, generation));
+        assert!(fresh.refresh_view(&logs, generation).changed());
         let rebuilt = fresh.view.as_ref().unwrap();
         assert_eq!(
             rebuilt
@@ -1618,7 +1692,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert!(
-            !screen.refresh_view(&logs, generation),
+            !screen.refresh_view(&logs, generation).changed(),
             "the refreshed key still makes the next idle frame a no-op"
         );
     }
@@ -1639,7 +1713,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::default());
         run_frame(&ctx, &mut screen, &mut rig);
-        assert_eq!(screen.full_layout_passes, 1);
+        assert!(matches!(screen.last_layout, LayoutPass::Full { .. }));
 
         // One arrival that pushes three short lines out of the ring.
         rig.push_log(
@@ -1660,11 +1734,11 @@ mod tests {
         );
         assert_eq!(view.rows.len(), view.heights.len());
         assert_eq!(view.prefix.len(), view.rows.len() + 1);
-        assert_eq!(
-            screen.full_layout_passes, 1,
-            "a multi-line eviction must not re-measure the ring"
+        assert!(
+            matches!(screen.last_layout, LayoutPass::Tail { .. }),
+            "a multi-line eviction must not re-measure the ring: {:?}",
+            screen.last_layout
         );
-        assert_eq!(screen.tail_layout_passes, 1);
 
         // The next arrival is a plain one-line rotation at the same length.
         push_capped_rig(&mut rig, 2, 5);
@@ -1680,8 +1754,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [4, 5]
         );
-        assert_eq!(screen.full_layout_passes, 1);
-        assert_eq!(screen.tail_layout_passes, 2);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::Tail { rows: 1 },
+            "the rotation measured exactly its admitted row"
+        );
     }
 
     /// Rotation that evicts lines the filter never admitted leaves the row
@@ -1712,7 +1789,7 @@ mod tests {
             text: "keep".to_string(),
             ..Default::default()
         };
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let selection = RowSelection {
             anchor: Some(RowCursor {
                 row: 1,
@@ -1732,7 +1809,7 @@ mod tests {
             CAP,
             "2026/08/10 12:00:04.000 [Info] keep 4",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(
             screen.rows_selection.anchor, selection.anchor,
             "an eviction of unadmitted lines leaves every row index alone"
@@ -1744,7 +1821,7 @@ mod tests {
             CAP,
             "2026/08/10 12:00:05.000 [Info] keep 5",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(
             screen.rows_selection.anchor, None,
             "an eviction of an admitted line must drop the index-keyed selection"
@@ -1779,18 +1856,21 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::default());
         run_frame(&ctx, &mut screen, &mut rig);
-        assert_eq!(screen.full_layout_passes, 1);
-        assert_eq!(screen.tail_layout_passes, 0);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::Full { rows: CAP },
+            "the fresh view measures every row"
+        );
 
         for index in CAP..CAP + 2 {
             push_capped_rig(&mut rig, CAP, index);
         }
         run_frame(&ctx, &mut screen, &mut rig);
-        assert_eq!(
-            screen.full_layout_passes, 1,
-            "a rotation at the cap must not re-measure the ring"
+        assert!(
+            matches!(screen.last_layout, LayoutPass::Tail { .. }),
+            "a rotation at the cap must not re-measure the ring: {:?}",
+            screen.last_layout
         );
-        assert_eq!(screen.tail_layout_passes, 1);
         let view = screen.view.as_ref().unwrap();
         assert_eq!(
             view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
@@ -2025,18 +2105,18 @@ mod tests {
         }
 
         // All: every line, including the unparseable ones.
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(rows(&screen).len(), 6);
 
         // InfoPlus: unparseable + Info + Warning + Error + WARN-token line.
         screen.level = LevelFilter::InfoPlus;
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(rows(&screen).len(), 5);
 
         // WarningPlus: the two warning-or-above lines plus the WARN-token
         // line; unparseable and below-threshold lines are hidden.
         screen.level = LevelFilter::WarningPlus;
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let warning_plus = rows(&screen);
         assert_eq!(warning_plus.len(), 3);
         assert_eq!(
@@ -2056,14 +2136,14 @@ mod tests {
 
         // ErrorPlus: only the Error line, from_core preserved.
         screen.level = LevelFilter::ErrorPlus;
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(rows(&screen).len(), 1);
         assert!(rows(&screen)[0].from_core);
 
         // Text filter: ASCII-case-insensitive, whitespace trimmed.
         screen.level = LevelFilter::All;
         screen.text = "  DNS ".to_string();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(rows(&screen).len(), 1);
         assert_eq!(
             rows(&screen)[0].line,
@@ -2075,7 +2155,7 @@ mod tests {
         // first three lines.
         screen.text.clear();
         screen.clear_after_generation = Some(3);
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let after_marker = rows(&screen);
         assert_eq!(after_marker.len(), 3);
         assert_eq!(
@@ -2096,7 +2176,7 @@ mod tests {
             push_line(&mut logs, &mut generation, false, &format!("line {i:04}"));
         }
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let rows = &screen.view.as_ref().unwrap().rows;
         assert_eq!(rows.len(), 2500);
         assert_eq!(rows[0].line, "line 0000");
@@ -2157,10 +2237,10 @@ mod tests {
                 // forces the full re-measure); the measured layout is
                 // untouched on top of that.
                 let (width_before, heights_before) = (view.measured_width, view.heights.len());
-                let passes_before = screen.full_layout_passes;
                 screen.show(ui, &mut rig.ctx());
                 assert_eq!(
-                    screen.full_layout_passes, passes_before,
+                    screen.last_layout,
+                    LayoutPass::None,
                     "an idle frame must not re-lay-out the memoized view"
                 );
                 let view = screen.view.as_ref().unwrap();
@@ -2215,8 +2295,11 @@ mod tests {
             assert_eq!(view.galleys.len(), 4);
             assert_eq!(view.prefix.len(), 5);
         }
-        assert_eq!(screen.full_layout_passes, 1);
-        assert_eq!(screen.tail_layout_passes, 0);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::Full { rows: 4 },
+            "the fresh view measures every row"
+        );
 
         // One arrival batch of three lines, of which only two pass the
         // filter: the refresh admits exactly the tail, and the layout pass
@@ -2261,13 +2344,19 @@ mod tests {
                 "the tail rows must be measured"
             );
         }
-        assert_eq!(screen.full_layout_passes, 1);
-        assert_eq!(screen.tail_layout_passes, 1);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::Tail { rows: 2 },
+            "only the two admitted rows are measured"
+        );
 
         // Idle frame: no refresh, no layout pass.
         run_frame(&ctx, &mut screen, &mut rig);
-        assert_eq!(screen.full_layout_passes, 1);
-        assert_eq!(screen.tail_layout_passes, 1);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::None,
+            "an idle frame measures nothing"
+        );
 
         // Filter change: the full rebuild discards the stale vectors and
         // the frame re-measures the single admitted row from scratch (a
@@ -2282,8 +2371,11 @@ mod tests {
             assert_eq!(view.galleys.len(), 1);
             assert_eq!(view.prefix.len(), 2);
         }
-        assert_eq!(screen.full_layout_passes, 2);
-        assert_eq!(screen.tail_layout_passes, 1);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::Full { rows: 1 },
+            "the rebuild discards the stale vectors and re-measures from scratch"
+        );
     }
 
     /// The full-rebuild paths (filter/level/clear changes,
@@ -2308,7 +2400,7 @@ mod tests {
             "2026/08/10 12:00:01.000 [Info] line B",
         );
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         // Simulate a measured frame: the layout vectors cover the two rows.
         let view = screen.view.as_mut().unwrap();
         view.heights = vec![10.0, 20.0];
@@ -2322,17 +2414,17 @@ mod tests {
             false,
             "2026/08/10 12:00:02.000 [Info] line C",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let view = screen.view.as_ref().unwrap();
         assert_eq!(view.rows.len(), 3);
         assert_eq!(view.heights, [10.0, 20.0]);
         assert_eq!(view.prefix, [0.0, 10.0, 30.0]);
         // The refreshed key keeps the following idle frame pure.
-        assert!(!screen.refresh_view(&logs, generation));
+        assert!(!screen.refresh_view(&logs, generation).changed());
 
         // Level switch: rows rebuilt from scratch, stale layout discarded.
         screen.level = LevelFilter::ErrorPlus;
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let view = screen.view.as_ref().unwrap();
         assert!(view.rows.is_empty());
         assert!(
@@ -2349,7 +2441,7 @@ mod tests {
             "2026/08/10 12:00:03.000 [Error] fatal boom",
         );
         screen.text = "fatal".to_string();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         let view = screen.view.as_ref().unwrap();
         assert_eq!(view.rows.len(), 1);
         assert_eq!(
@@ -2380,7 +2472,7 @@ mod tests {
             text: "KEEP".to_string(),
             ..Default::default()
         };
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         screen.rows_selection = RowSelection {
             anchor: Some(RowCursor {
                 row: 0,
@@ -2400,7 +2492,7 @@ mod tests {
             false,
             "2026/08/10 12:00:01.000 [Info] filtered noise",
         );
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
         assert!(
             screen.rows_selection.anchor.is_some(),
@@ -2408,7 +2500,7 @@ mod tests {
         );
 
         // The next idle frame changes nothing.
-        assert!(!screen.refresh_view(&logs, generation));
+        assert!(!screen.refresh_view(&logs, generation).changed());
         assert!(screen.rows_selection.anchor.is_some());
     }
 
@@ -2442,7 +2534,7 @@ mod tests {
         push(&mut logs, &mut generation);
         push(&mut logs, &mut generation);
         let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation));
+        assert!(screen.refresh_view(&logs, generation).changed());
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
 
         // Rotate at the cap with another empty line. Ring length, front and
@@ -2450,13 +2542,13 @@ mod tests {
         // monotonic generation moved.
         push(&mut logs, &mut generation);
         assert!(
-            screen.refresh_view(&logs, generation),
+            screen.refresh_view(&logs, generation).changed(),
             "an empty-line push at the cap must invalidate the memoized view"
         );
         assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
 
         // The refresh consumed the rotation: idle frames stay pure again.
-        assert!(!screen.refresh_view(&logs, generation));
+        assert!(!screen.refresh_view(&logs, generation).changed());
     }
 
     /// The "N of M lines" caption is re-formatted
@@ -2574,14 +2666,21 @@ mod tests {
 
         // First frame at 700 px: one full rebuild + one full layout pass.
         run_frame_at(&ctx, &mut screen, &mut rig, 700.0, 1.0);
-        assert_eq!(screen.full_layout_passes, 1);
+        assert!(
+            matches!(screen.last_layout, LayoutPass::Full { .. }),
+            "the fresh view measures every row: {:?}",
+            screen.last_layout
+        );
         let initial_width = screen.view.as_ref().unwrap().measured_width;
         assert!(initial_width > 0.0);
-        assert_eq!(screen.tail_layout_passes, 0);
 
         // An idle frame at the same width re-measures nothing.
         run_frame_at(&ctx, &mut screen, &mut rig, 700.0, 1.016);
-        assert_eq!(screen.full_layout_passes, 1);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::None,
+            "an idle frame measures nothing"
+        );
 
         // Drag: the width streams 30 px per frame. No full re-layout may
         // run on any streaming frame.
@@ -2589,7 +2688,8 @@ mod tests {
         run_frame_at(&ctx, &mut screen, &mut rig, 620.0, 1.116);
         run_frame_at(&ctx, &mut screen, &mut rig, 590.0, 1.132);
         assert_eq!(
-            screen.full_layout_passes, 1,
+            screen.last_layout,
+            LayoutPass::None,
             "streaming drag frames must not re-layout the ring"
         );
         assert_eq!(screen.view.as_ref().unwrap().measured_width, initial_width);
@@ -2597,13 +2697,21 @@ mod tests {
         // The drag pauses at 590 px, still inside the settle window: no
         // re-layout yet...
         run_frame_at(&ctx, &mut screen, &mut rig, 590.0, 1.2);
-        assert_eq!(screen.full_layout_passes, 1);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::None,
+            "a pause inside the settle window still measures nothing"
+        );
         assert_eq!(screen.view.as_ref().unwrap().measured_width, initial_width);
 
         // ...once the width has held still past the settle window, exactly
         // one full re-layout runs at the settled width.
         run_frame_at(&ctx, &mut screen, &mut rig, 590.0, 1.32);
-        assert_eq!(screen.full_layout_passes, 2);
+        assert!(
+            matches!(screen.last_layout, LayoutPass::Full { .. }),
+            "the settled width re-measures every row once: {:?}",
+            screen.last_layout
+        );
         let settled = screen.view.as_ref().unwrap().measured_width;
         assert!(
             (settled - (initial_width - 110.0)).abs() <= 2.0,
@@ -2613,7 +2721,11 @@ mod tests {
 
         // The settled layout stays put on idle frames.
         run_frame_at(&ctx, &mut screen, &mut rig, 590.0, 1.34);
-        assert_eq!(screen.full_layout_passes, 2);
+        assert_eq!(
+            screen.last_layout,
+            LayoutPass::None,
+            "an idle frame measures nothing"
+        );
         assert_eq!(screen.view.as_ref().unwrap().measured_width, settled);
     }
 }
