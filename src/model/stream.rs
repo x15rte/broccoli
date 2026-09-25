@@ -1622,6 +1622,105 @@ impl FinalmaskModel {
     }
 }
 
+/// The transport-block table: one row per `network`, naming the settings
+/// field it owns and the wire key that field serializes under.
+///
+/// `network` is a discriminator whose payload lives in seven sibling fields,
+/// so "which block does this transport use" is a fact every reader needs:
+/// selecting a transport, dropping the others on the wire, judging a
+/// transport block missing, the editor's tab, and `is_default`'s "no
+/// transport configured". The rows are the one place the correspondence is
+/// written, so a new transport is one row and no caller can be forgotten.
+macro_rules! transport_blocks {
+    ($($variant:ident : $field:ident, $settings:ty => $wire:expr;)*) => {
+        /// The selected transport's block, borrowed mutably: what an editor
+        /// tab or a transport selector edits, without a take-and-put-back
+        /// around a local copy.
+        pub enum TransportMut<'a> {
+            $($variant(&'a mut $settings),)*
+        }
+
+        impl TransportMut<'_> {
+            /// The network whose block this is.
+            pub fn network(&self) -> Network {
+                match self {
+                    $(Self::$variant(_) => Network::$variant,)*
+                }
+            }
+        }
+
+        impl StreamModel {
+            /// The block `network` names, if the model carries one.
+            pub fn transport_mut(&mut self) -> Option<TransportMut<'_>> {
+                match self.network {
+                    $(Network::$variant => self.$field.as_mut().map(TransportMut::$variant),)*
+                }
+            }
+
+            /// The block `network` names, materializing its default: what
+            /// selecting a transport does (Xray builds the selected block and
+            /// ignores the others, so a selector must leave one behind).
+            pub fn transport_or_default_mut(&mut self) -> TransportMut<'_> {
+                match self.network {
+                    $(
+                        Network::$variant => TransportMut::$variant(
+                            self.$field.get_or_insert_with(<$settings>::default),
+                        ),
+                    )*
+                }
+            }
+
+            /// Whether the selected transport's block is present at all. Xray
+            /// builds every non-nil transport block, so an absent one for the
+            /// selected network is a configuration the core refuses.
+            pub fn carries_transport_block(&self) -> bool {
+                match self.network {
+                    $(Network::$variant => self.$field.is_some(),)*
+                }
+            }
+
+            /// Whether any transport block is set, whatever the selected
+            /// network — the draft state a selector leaves behind.
+            pub fn any_transport_block(&self) -> bool {
+                false $(|| self.$field.is_some())*
+            }
+
+            /// Drop every block but the selected network's: Xray builds every
+            /// non-nil transport block, so the wire document carries the
+            /// selected one only (the draft keeps the rest so switching back
+            /// restores what the user typed).
+            pub(crate) fn clear_unselected_transport_blocks(&mut self) {
+                $(
+                    if self.network != Network::$variant {
+                        self.$field = None;
+                    }
+                )*
+            }
+        }
+
+        /// The wire key the selected transport's settings must serialize
+        /// under (`streamSettings.<key>`), or `None` when the transport needs
+        /// no block at all: `raw` carries no settings, so an absent
+        /// `tcpSettings` is a valid document while an absent `wsSettings` is
+        /// one the core refuses.
+        pub fn transport_settings_key(network: Network) -> Option<&'static str> {
+            match network {
+                $(Network::$variant => $wire,)*
+            }
+        }
+    };
+}
+
+transport_blocks! {
+    Raw: raw_settings, RawSettings => None;
+    Xhttp: xhttp_settings, XhttpSettings => Some("xhttpSettings");
+    Kcp: kcp_settings, KcpSettings => Some("kcpSettings");
+    Grpc: grpc_settings, GrpcSettings => Some("grpcSettings");
+    Ws: ws_settings, WsSettings => Some("wsSettings");
+    Httpupgrade: httpupgrade_settings, HttpupgradeSettings => Some("httpupgradeSettings");
+    Hysteria: hysteria_settings, HysteriaTransport => Some("hysteriaSettings");
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StreamModel {
@@ -1664,6 +1763,27 @@ pub struct StreamModel {
 }
 
 impl StreamModel {
+    /// The `headers` map of the selected transport, with the wire path the
+    /// rule reports it under: only these transports' settings declare one,
+    /// and Xray types each as `map[string]string` (`conf/transport_method.go`).
+    pub fn transport_headers(&self) -> Option<(&Map<String, Value>, &'static str)> {
+        match self.network {
+            Network::Xhttp => self
+                .xhttp_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.xhttpSettings.headers")),
+            Network::Ws => self
+                .ws_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.wsSettings.headers")),
+            Network::Httpupgrade => self
+                .httpupgrade_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.httpupgradeSettings.headers")),
+            _ => None,
+        }
+    }
+
     pub fn xhttp_download_depth(&self) -> usize {
         let mut depth = 0;
         let mut stream = self;
@@ -1684,27 +1804,7 @@ impl StreamModel {
     /// Remove inactive transport and security blocks on a cloned wire model.
     /// Xray builds every non-nil transport block but selects one security block.
     pub(crate) fn retain_selected_stream_blocks_for_wire(&mut self) {
-        if self.network != Network::Raw {
-            self.raw_settings = None;
-        }
-        if self.network != Network::Xhttp {
-            self.xhttp_settings = None;
-        }
-        if self.network != Network::Kcp {
-            self.kcp_settings = None;
-        }
-        if self.network != Network::Grpc {
-            self.grpc_settings = None;
-        }
-        if self.network != Network::Ws {
-            self.ws_settings = None;
-        }
-        if self.network != Network::Httpupgrade {
-            self.httpupgrade_settings = None;
-        }
-        if self.network != Network::Hysteria {
-            self.hysteria_settings = None;
-        }
+        self.clear_unselected_transport_blocks();
         match self.security {
             Security::None => {
                 self.tls_settings = None;
@@ -1765,13 +1865,7 @@ impl StreamModel {
     /// `streamSettings` key in that case.
     pub fn is_default(&self) -> bool {
         self.network == Network::Raw
-            && self.raw_settings.is_none()
-            && self.xhttp_settings.is_none()
-            && self.kcp_settings.is_none()
-            && self.grpc_settings.is_none()
-            && self.ws_settings.is_none()
-            && self.httpupgrade_settings.is_none()
-            && self.hysteria_settings.is_none()
+            && !self.any_transport_block()
             && self.security == Security::None
             && self.tls_settings.is_none()
             && self.reality_settings.is_none()
@@ -1789,35 +1883,13 @@ impl StreamModel {
             return Err(ValidationCode::RealityRequiresTransport);
         }
         self.network = network;
-        match network {
-            Network::Raw => {
-                self.raw_settings.get_or_insert_with(RawSettings::default);
-            }
-            Network::Xhttp => {
-                self.xhttp_settings
-                    .get_or_insert_with(XhttpSettings::default);
-            }
-            Network::Kcp => {
-                self.kcp_settings.get_or_insert_with(KcpSettings::default);
-            }
-            Network::Grpc => {
-                self.grpc_settings.get_or_insert_with(GrpcSettings::default);
-            }
-            Network::Ws => {
-                self.ws_settings.get_or_insert_with(WsSettings::default);
-            }
-            Network::Httpupgrade => {
-                self.httpupgrade_settings
-                    .get_or_insert_with(HttpupgradeSettings::default);
-            }
-            Network::Hysteria => {
-                let settings = self
-                    .hysteria_settings
-                    .get_or_insert_with(HysteriaTransport::default);
-                settings.version = 2;
-                self.security = Security::Tls;
-                self.tls_settings.get_or_insert_with(TlsModel::default);
-            }
+        // The selector materializes the selected block through the one table;
+        // hysteria carries two further invariants Xray's own loader would
+        // otherwise reject (version 2 and TLS are implied by the transport).
+        if let TransportMut::Hysteria(settings) = self.transport_or_default_mut() {
+            settings.version = 2;
+            self.security = Security::Tls;
+            self.tls_settings.get_or_insert_with(TlsModel::default);
         }
         Ok(())
     }
@@ -1893,11 +1965,78 @@ impl StreamModel {
 mod tests {
     use super::{
         CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs,
-        HysteriaTransport, MAX_XHTTP_DOWNLOAD_DEPTH, RawSettings, Security, SockoptModel,
-        StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings,
+        HysteriaTransport, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
+        StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings, transport_settings_key,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
+
+    /// The transport table's contract, over every variant: selecting a
+    /// transport materializes exactly the block that network names, the wire
+    /// form keeps exactly that one and drops the drafts of the others, and
+    /// the "needs a block" answer agrees with the selection.
+    #[test]
+    fn every_transport_materializes_and_keeps_its_own_block() {
+        let networks = [
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+        ];
+        for network in networks {
+            // A draft of another transport's block rides along: switching to
+            // it in the editor must not lose it, and the wire form must never
+            // carry it.
+            let mut stream = StreamModel {
+                ws_settings: Some(WsSettings::default()),
+                ..Default::default()
+            };
+            stream
+                .select_network(network)
+                .expect("every transport selects");
+            assert!(
+                stream.carries_transport_block(),
+                "{network:?} must materialize its block"
+            );
+            assert_eq!(
+                stream.transport_or_default_mut().network(),
+                network,
+                "{network:?} must hand back its own block"
+            );
+            assert_eq!(
+                transport_settings_key(network).is_some(),
+                network != Network::Raw,
+                "raw needs no settings block; every other transport does"
+            );
+
+            let mut drafts = stream.clone();
+            drafts.clear_unselected_transport_blocks();
+            assert!(
+                drafts.carries_transport_block(),
+                "{network:?}: clearing keeps the selected block"
+            );
+            assert_eq!(
+                drafts.ws_settings.is_some(),
+                network == Network::Ws,
+                "{network:?}: clearing drops every other block"
+            );
+            assert!(!drafts.is_default(), "{network:?} is not a default stream");
+
+            stream.retain_selected_stream_blocks_for_wire();
+            assert!(
+                stream.carries_transport_block(),
+                "{network:?} must survive the wire retain"
+            );
+            assert_eq!(
+                stream.ws_settings.is_some(),
+                network == Network::Ws,
+                "{network:?}: only the selected transport's block reaches the wire"
+            );
+        }
+    }
 
     #[test]
     fn raw_transport_uses_canonical_tcp_settings_wire_key() {

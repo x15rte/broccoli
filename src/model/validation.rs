@@ -1882,33 +1882,13 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
             issues.push(issue(ValidationCode::XhttpDepthExceeded, None));
             return;
         }
-        match stream.network {
-            Network::Raw => {}
-            Network::Xhttp if stream.xhttp_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Xhttp),
-                Some("stream.xhttpSettings".into()),
-            )),
-            Network::Kcp if stream.kcp_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Kcp),
-                Some("stream.kcpSettings".into()),
-            )),
-            Network::Grpc if stream.grpc_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Grpc),
-                Some("stream.grpcSettings".into()),
-            )),
-            Network::Ws if stream.ws_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Ws),
-                Some("stream.wsSettings".into()),
-            )),
-            Network::Httpupgrade if stream.httpupgrade_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Httpupgrade),
-                Some("stream.httpupgradeSettings".into()),
-            )),
-            Network::Hysteria if stream.hysteria_settings.is_none() => issues.push(issue(
-                ValidationCode::TransportSettingsMissing(Network::Hysteria),
-                Some("stream.hysteriaSettings".into()),
-            )),
-            _ => {}
+        if !stream.carries_transport_block()
+            && let Some(key) = super::stream::transport_settings_key(stream.network)
+        {
+            issues.push(issue(
+                ValidationCode::TransportSettingsMissing(stream.network),
+                Some(format!("stream.{key}")),
+            ));
         }
         // Every headers map reaches Xray's `map[string]string` fields, and a
         // non-string value (a hand-edited state file, or an extra-map key kept
@@ -1916,22 +1896,7 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
         // share-link grammar refuses the same value on import, so the state
         // load is the only way in — and generation must refuse it with a
         // message that names the rule instead of spending a core start on it.
-        let headers = match stream.network {
-            Network::Xhttp => stream
-                .xhttp_settings
-                .as_ref()
-                .map(|settings| (&settings.headers, "stream.xhttpSettings.headers")),
-            Network::Ws => stream
-                .ws_settings
-                .as_ref()
-                .map(|settings| (&settings.headers, "stream.wsSettings.headers")),
-            Network::Httpupgrade => stream
-                .httpupgrade_settings
-                .as_ref()
-                .map(|settings| (&settings.headers, "stream.httpupgradeSettings.headers")),
-            _ => None,
-        };
-        if let Some((headers, path)) = headers
+        if let Some((headers, path)) = stream.transport_headers()
             && headers.values().any(|value| !value.is_string())
         {
             issues.push(issue(
