@@ -2599,20 +2599,6 @@ pub fn safety_finding_message(finding: &SafetyFinding, lang: Language) -> String
     safety_message(&finding.code, lang)
 }
 
-/// Render the first finding whose wire path matches `path` (None when
-/// absent) — the shared inline-warning seam consumed by every warning
-/// surface; the caller places the message next to the offending field.
-pub fn safety_message_for_path(
-    findings: &[SafetyFinding],
-    path: &str,
-    lang: Language,
-) -> Option<String> {
-    findings
-        .iter()
-        .find(|finding| finding.path == path)
-        .map(|finding| safety_finding_message(finding, lang))
-}
-
 /// Hazard class label for dialog and inline summaries.
 pub fn hazard_class_label(class: HazardClass, lang: Language) -> &'static str {
     match class {

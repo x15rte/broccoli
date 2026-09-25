@@ -2,13 +2,13 @@
 //! domainStrategy, observatory + burstObservatory, and the TestRoute dialog.
 
 use crate::diag::{Diag, DiagError};
-use crate::i18n::{Key, safety_message_for_path, t, t_fmt};
+use crate::i18n::{Key, safety_message, t, t_fmt};
 use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, TUN_INBOUND_TAG,
 };
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
-use crate::model::safety::assess;
+use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::{
     Balancer, DurationMs, LeastLoadSettings, Rule, ServerProfile, ServersFile, Settings,
@@ -1318,10 +1318,12 @@ impl RoutingScreen {
         // per frame (the inbounds ValidationCache precedent). Only the
         // balancer breakage paths are consumed here; the other screens own
         // their own paths.
-        let findings = assess(servers, settings);
+        let findings = SafetyVerdicts::of(servers, settings);
         let balancer_warnings: Vec<Option<String>> = (0..settings.routing.balancers.len())
             .map(|index| {
-                safety_message_for_path(&findings, &format!("routing.balancers[{index}]"), lang)
+                findings
+                    .balancer_breakage(index)
+                    .map(|finding| safety_message(&finding.code, lang))
             })
             .collect();
 
@@ -4044,9 +4046,8 @@ mod view_cache_tests {
 /// warnings follow [`assess`] through the view cache.
 #[cfg(test)]
 mod routing_grammar_tests {
-    use super::{Language, RoutingScreen, safety_message_for_path, valid_ip_rule, valid_port_list};
+    use super::{Language, RoutingScreen, valid_ip_rule, valid_port_list};
     use crate::i18n::{Key, t};
-    use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding};
     use crate::model::{
         Balancer, OutboundModel, ServerProfile, ServersFile, Settings, StrategyCfg,
     };
@@ -4192,22 +4193,11 @@ mod routing_grammar_tests {
         }
     }
 
+    /// The cached warning vector follows the hazard projection: a selector
+    /// matching no outbound tag warns, and the warning clears once a profile
+    /// tag matches.
     #[test]
-    fn safety_message_for_path_matches_exact_paths() {
-        let findings = vec![SafetyFinding {
-            path: "routing.balancers[0]".into(),
-            class: HazardClass::Breakage,
-            code: SafetyCode::BalancerSelectorNoMatch("bal-a".into()),
-        }];
-        assert!(safety_message_for_path(&findings, "routing.balancers[0]", Language::En).is_some());
-        assert!(safety_message_for_path(&findings, "routing.balancers[1]", Language::En).is_none());
-        assert!(safety_message_for_path(&findings, "socks.listen", Language::En).is_none());
-    }
-
-    /// The cached warning vector follows [`assess`]: a selector matching no
-    /// outbound tag warns, and the warning clears once a profile tag matches.
-    #[test]
-    fn balancer_breakage_warnings_follow_assess() {
+    fn balancer_breakage_warnings_follow_the_projection() {
         let mut screen = RoutingScreen::default();
         let mut settings = Settings::default();
         settings

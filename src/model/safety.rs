@@ -74,6 +74,76 @@ fn is_exposed_listen(s: &str) -> bool {
         .is_ok_and(|address| !socket_address(address).is_loopback())
 }
 
+/// The hazards of one model generation, projected for the surfaces that show
+/// them: the shell's acknowledgment gate asks the whole set, and a screen asks
+/// by the field it renders — the path grammar (`localInbounds[i].listen`,
+/// `dokodemo[i].listen`, `tun`, `routing.balancers[i]`) belongs here, with the
+/// pass that emits those paths, so no screen formats one.
+///
+/// It reads as the finding list it is (`Deref` to the slice), so a caller that
+/// wants the taxonomy and one that wants a field's verdict share one value.
+#[derive(Debug, Default)]
+pub struct SafetyVerdicts {
+    findings: Vec<SafetyFinding>,
+}
+
+impl SafetyVerdicts {
+    /// Assess one settings + servers model. One projection per model
+    /// generation: the findings are pure functions of the model, so a caller
+    /// that caches this value per generation computes them exactly once.
+    pub fn of(servers: &ServersFile, settings: &Settings) -> Self {
+        Self {
+            findings: assess(servers, settings),
+        }
+    }
+
+    /// Every hazard, in pass order (local endpoints, dokodemo listeners, TUN
+    /// privacy, balancer breakage).
+    pub fn findings(&self) -> &[SafetyFinding] {
+        &self.findings
+    }
+
+    /// The findings as the plain list, for the callers that store one.
+    pub fn into_findings(self) -> Vec<SafetyFinding> {
+        self.findings
+    }
+
+    /// The exposure finding of the local endpoint at `index`, if it is
+    /// exposed.
+    pub fn local_inbound_exposure(&self, index: usize) -> Option<&SafetyFinding> {
+        self.at_path(&format!("localInbounds[{index}].listen"))
+    }
+
+    /// The exposure finding of the dokodemo listener at `index`, if it is
+    /// exposed.
+    pub fn dokodemo_exposure(&self, index: usize) -> Option<&SafetyFinding> {
+        self.at_path(&format!("dokodemo[{index}].listen"))
+    }
+
+    /// The privacy finding of a TUN-mode configuration without DNS, if any.
+    pub fn tun_privacy(&self) -> Option<&SafetyFinding> {
+        self.at_path("tun")
+    }
+
+    /// The breakage finding of the balancer at `index`, if its selectors
+    /// match no emitted outbound.
+    pub fn balancer_breakage(&self, index: usize) -> Option<&SafetyFinding> {
+        self.at_path(&format!("routing.balancers[{index}]"))
+    }
+
+    fn at_path(&self, path: &str) -> Option<&SafetyFinding> {
+        self.findings.iter().find(|finding| finding.path == path)
+    }
+}
+
+impl std::ops::Deref for SafetyVerdicts {
+    type Target = [SafetyFinding];
+
+    fn deref(&self) -> &Self::Target {
+        &self.findings
+    }
+}
+
 /// Assess one settings + servers model for safety hazards: one pass, no
 /// short-circuit; only enabled inbounds are examined. Exposure rules: a
 /// SOCKS or HTTP entry in `settings.local_inbounds` bound beyond loopback
@@ -85,8 +155,9 @@ fn is_exposed_listen(s: &str) -> bool {
 /// everyone (the projection drops the empty list), while SOCKS password
 /// mode always authenticates and denies every uncredentialed connection.
 /// Privacy rules: TUN mode with no DNS configuration. Breakage rules: a
-/// balancer whose selectors match no emitted outbound tag.
-pub fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
+/// balancer whose selectors match no emitted outbound tag. Private: callers
+/// hold a [`SafetyVerdicts`], which answers by path as well.
+fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     let mut findings = Vec::new();
 
     for (index, entry) in settings.local_inbounds.iter().enumerate() {
@@ -202,7 +273,7 @@ mod tests {
 
     #[test]
     fn default_settings_have_no_findings() {
-        assert!(assess(&ServersFile::default(), &Settings::default()).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &Settings::default()).is_empty());
     }
 
     #[test]
@@ -221,7 +292,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].path, "localInbounds[0].listen");
         assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -240,7 +311,7 @@ mod tests {
     #[test]
     fn noauth_socks_beyond_loopback_exposes() {
         for listen in ["192.168.1.5", "::", "::ffff:192.168.1.5"] {
-            let findings = assess(&ServersFile::default(), &with_socks(listen));
+            let findings = SafetyVerdicts::of(&ServersFile::default(), &with_socks(listen));
             assert_eq!(findings.len(), 1, "listen {listen:?} must expose");
             assert_eq!(findings[0].path, "localInbounds[0].listen");
             assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -257,11 +328,11 @@ mod tests {
         // plain forms, so neither may be reported as exposed.
         for listen in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
             assert!(
-                assess(&ServersFile::default(), &with_socks(listen)).is_empty(),
+                SafetyVerdicts::of(&ServersFile::default(), &with_socks(listen)).is_empty(),
                 "socks {listen:?} must be safe"
             );
             assert!(
-                assess(&ServersFile::default(), &with_http(listen)).is_empty(),
+                SafetyVerdicts::of(&ServersFile::default(), &with_http(listen)).is_empty(),
                 "http {listen:?} must be safe"
             );
         }
@@ -279,7 +350,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
@@ -304,7 +375,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "localInbounds[1].listen");
         assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -333,7 +404,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
@@ -350,7 +421,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                assess(&ServersFile::default(), &settings).is_empty(),
+                SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty(),
                 "http {listen:?} must be safe"
             );
         }
@@ -370,7 +441,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                assess(&ServersFile::default(), &settings).is_empty(),
+                SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty(),
                 "socks {listen:?} must be safe"
             );
         }
@@ -392,7 +463,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].path, "localInbounds[0].listen");
         assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -428,7 +499,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].path, "localInbounds[0].listen");
         assert_eq!(
@@ -452,7 +523,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
@@ -475,7 +546,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "localInbounds[1].listen");
         assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -506,7 +577,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 3);
         for (index, finding) in findings.iter().enumerate() {
             assert_eq!(finding.path, format!("localInbounds[{index}].listen"));
@@ -532,7 +603,7 @@ mod tests {
             listen: "0.0.0.0".into(),
             ..Default::default()
         }]);
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
@@ -542,7 +613,7 @@ mod tests {
             listen: "0.0.0.0".into(),
             ..Default::default()
         }]);
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "dokodemo[0].listen");
         assert_eq!(findings[0].class, HazardClass::Exposure);
@@ -566,7 +637,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "dokodemo[0].listen");
     }
@@ -582,7 +653,7 @@ mod tests {
                 ..Default::default()
             }]);
             assert!(
-                assess(&ServersFile::default(), &settings).is_empty(),
+                SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty(),
                 "network {network:?} must stay unexposed (the generator's token test is case-insensitive)"
             );
         }
@@ -595,13 +666,13 @@ mod tests {
             listen: "127.0.0.1".into(),
             ..Default::default()
         }]);
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
     fn unparseable_listen_is_skipped() {
         let settings = with_socks("localhost");
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     fn with_balancers(servers: ServersFile, balancers: Vec<Balancer>) -> (ServersFile, Settings) {
@@ -649,7 +720,7 @@ mod tests {
             dns: dns_less(),
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "tun");
         assert_eq!(findings[0].class, HazardClass::Privacy);
@@ -670,13 +741,13 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(assess(&ServersFile::default(), &settings).is_empty());
+        assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
     }
 
     #[test]
     fn off_mode_reports_exposure_but_not_privacy() {
         let settings = with_socks("0.0.0.0");
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "localInbounds[0].listen");
     }
@@ -691,7 +762,7 @@ mod tests {
                 ..Default::default()
             }],
         );
-        let findings = assess(&servers, &settings);
+        let findings = SafetyVerdicts::of(&servers, &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "routing.balancers[0]");
         assert_eq!(findings[0].class, HazardClass::Breakage);
@@ -711,7 +782,7 @@ mod tests {
                 ..Default::default()
             }],
         );
-        assert!(assess(&servers, &settings).is_empty());
+        assert!(SafetyVerdicts::of(&servers, &settings).is_empty());
     }
 
     #[test]
@@ -724,7 +795,7 @@ mod tests {
                 ..Default::default()
             }],
         );
-        assert!(assess(&servers, &settings).is_empty());
+        assert!(SafetyVerdicts::of(&servers, &settings).is_empty());
     }
 
     #[test]
@@ -736,7 +807,7 @@ mod tests {
                 ..Default::default()
             }],
         );
-        let findings = assess(&servers, &settings);
+        let findings = SafetyVerdicts::of(&servers, &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].code,
@@ -761,7 +832,7 @@ mod tests {
                 },
             ],
         );
-        let findings = assess(&servers, &settings);
+        let findings = SafetyVerdicts::of(&servers, &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "routing.balancers[1]");
     }
@@ -787,7 +858,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(assess(&servers, &settings).is_empty());
+        assert!(SafetyVerdicts::of(&servers, &settings).is_empty());
     }
 
     #[test]
@@ -807,7 +878,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let findings = assess(&servers, &settings);
+        let findings = SafetyVerdicts::of(&servers, &settings);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].code,
@@ -829,7 +900,7 @@ mod tests {
             dns: dns_less(),
             ..Default::default()
         };
-        let findings = assess(&ServersFile::default(), &settings);
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
         let paths: Vec<&str> = findings
             .iter()
             .map(|finding| finding.path.as_str())

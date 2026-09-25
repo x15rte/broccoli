@@ -1,9 +1,9 @@
 //! TUN screen: full-tunnel inbound settings + elevation state.
 
-use crate::i18n::{Key, safety_message_for_path, t, t_fmt, validation_message};
+use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::Mode;
 use crate::model::TunCfg;
-use crate::model::safety::assess;
+use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, tun_ipv4_gateway};
 use crate::rt::{CorePhase, CoreTransport};
@@ -118,10 +118,12 @@ impl TunScreen {
         let generation = *ctx.model_generation;
         if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
             // One `assess` per model generation — never per-frame.
-            let findings = assess(ctx.servers, ctx.settings);
+            let findings = SafetyVerdicts::of(ctx.servers, ctx.settings);
             self.validation = Some(ValidationCache {
                 generation,
-                tun_warning: safety_message_for_path(&findings, "tun", lang),
+                tun_warning: findings
+                    .tun_privacy()
+                    .map(|finding| safety_message(&finding.code, lang)),
                 gateway_error: tun_gateway_error(lang, ctx.settings.mode, &ctx.settings.tun),
             });
         }

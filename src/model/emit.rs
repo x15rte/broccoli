@@ -159,7 +159,7 @@ pub fn inbound_tags(settings: &Settings) -> BTreeSet<String> {
 mod tests {
     use super::*;
     use crate::r#gen::keys;
-    use crate::model::safety::assess;
+    use crate::model::safety::SafetyVerdicts;
     use crate::model::validation::{ValidationCode, validate_settings};
     use crate::model::{
         Balancer, DokodemoCfg, OutboundModel, Protocol, ProtocolSettings, Rule, VlessSettings,
@@ -387,7 +387,7 @@ mod tests {
             "the document carries every tag the state names"
         );
         assert!(
-            assess(&servers, &settings).is_empty(),
+            SafetyVerdicts::of(&servers, &settings).is_empty(),
             "the balancer's selector matches an emitted profile tag"
         );
 

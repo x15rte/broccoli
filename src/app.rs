@@ -2430,8 +2430,8 @@ fn hazard_gate_findings(servers: &ServersFile, settings: &Settings) -> Option<Ve
     if settings.raw_override.is_some() {
         return None;
     }
-    let findings = crate::model::safety::assess(servers, settings);
-    (!findings.is_empty()).then_some(findings)
+    let verdicts = crate::model::safety::SafetyVerdicts::of(servers, settings);
+    (!verdicts.is_empty()).then(|| verdicts.into_findings())
 }
 
 /// Render the hazard-acknowledgment modal: every finding's

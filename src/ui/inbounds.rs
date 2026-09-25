@@ -3,12 +3,12 @@
 //! listen address (default 127.0.0.1, any IP literal allowed); dokodemo also
 //! supports UNIX sockets.
 
-use crate::i18n::{Key, safety_message_for_path, t, t_fmt, validation_message};
+use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
     API_INBOUND_TAG, DNS_INBOUND_TAG, DokodemoNetwork, TUN_INBOUND_TAG, is_wildcard_listen,
     listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
 };
-use crate::model::safety::assess;
+use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{
     ValidationCode, inbound_auth_trap, normalize_windows_socket_path, validate_listen_address,
@@ -94,7 +94,7 @@ impl InboundsScreen {
             // One `assess` per model generation, in the same rebuild as the
             // collision references — never a second recomputation pattern
             // and never per-frame.
-            let findings = assess(ctx.servers, ctx.settings);
+            let findings = SafetyVerdicts::of(ctx.servers, ctx.settings);
             self.validation = Some(ValidationCache {
                 generation,
                 non_loopback: any_non_loopback_listen(ctx.settings),
@@ -140,20 +140,16 @@ impl InboundsScreen {
                     .collect(),
                 local_warnings: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
-                        safety_message_for_path(
-                            &findings,
-                            &format!("localInbounds[{index}].listen"),
-                            lang,
-                        )
+                        findings
+                            .local_inbound_exposure(index)
+                            .map(|finding| safety_message(&finding.code, lang))
                     })
                     .collect(),
                 doko_warnings: (0..ctx.settings.dokodemo.len())
                     .map(|index| {
-                        safety_message_for_path(
-                            &findings,
-                            &format!("dokodemo[{index}].listen"),
-                            lang,
-                        )
+                        findings
+                            .dokodemo_exposure(index)
+                            .map(|finding| safety_message(&finding.code, lang))
                     })
                     .collect(),
             });
