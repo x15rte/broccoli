@@ -576,20 +576,10 @@ fn invalid_model_error(issues: Vec<ValidationIssue>) -> Option<GenerateError> {
 /// on such a profile itself — either it names no target, or the target is a
 /// builtin (`direct`/`block`), which has no server to reach. A reference
 /// naming another profile excludes it: that hop's server is reached through
-/// the chain and resolves on the far side. Validation rejects unknown targets
-/// and cycles before generation.
+/// the chain and resolves on the far side.
 fn direct_dial_outbound_tags(servers: &ServersFile) -> BTreeSet<String> {
-    let profile_tags: BTreeSet<String> = servers.profiles.iter().map(ServerProfile::tag).collect();
-    servers
-        .profiles
-        .iter()
-        .filter(|profile| {
-            profile
-                .chain_target()
-                .is_none_or(|target| !profile_tags.contains(target))
-        })
-        .map(ServerProfile::tag)
-        .collect()
+    let tags = crate::model::emit::profile_outbound_tags(&servers.profiles);
+    crate::model::dial::DialGraph::new(&servers.profiles, &tags).direct_dial_tags()
 }
 
 /// The proxy-server host of a profile when it is a domain (not an IP

@@ -3920,46 +3920,10 @@ fn profile_set_verdict(
         }
     }
 
-    let mut outbound_chains = BTreeMap::<String, String>::new();
-    for profile in profiles {
-        let source = profile.tag();
-        let target = profile.chain_target();
-        if let Some(target) = target {
-            if !outbound_tags.contains(target) {
-                issues.push(issue(
-                    ValidationCode::OutboundChainMissing(excerpt(&source), excerpt(target)),
-                    None,
-                ));
-            } else {
-                outbound_chains.insert(source, target.to_string());
-            }
-        }
-    }
-    let mut cycle_reported = false;
-    for start in outbound_chains.keys() {
-        let mut path = Vec::<String>::new();
-        let mut current = start.as_str();
-        loop {
-            if let Some(index) = path.iter().position(|tag| tag == current) {
-                let mut cycle = path[index..].to_vec();
-                cycle.push(current.to_string());
-                issues.push(issue(
-                    ValidationCode::OutboundChainCycle(excerpt(&cycle.join(" -> "))),
-                    None,
-                ));
-                cycle_reported = true;
-                break;
-            }
-            path.push(current.to_string());
-            let Some(next) = outbound_chains.get(current) else {
-                break;
-            };
-            current = next;
-        }
-        if cycle_reported {
-            break;
-        }
-    }
+    // The chain rules (dangling hop, cycle) belong to the dial graph, which
+    // every other profile-set question reads (the generator's bootstrap
+    // scope, the probe's staged child, the delete dialog's references).
+    issues.extend(super::dial::DialGraph::new(profiles, outbound_tags).chain_findings());
 
     issues
 }

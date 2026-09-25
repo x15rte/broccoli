@@ -450,24 +450,14 @@ impl<'a> UiCtx<'a> {
     /// are left out — builtins resolve inside the child, anything else fails
     /// loudly at config generation, exactly like the all-profile probe.
     pub fn request_latency_probe_for(&mut self, profile: ServerProfile) -> Result<(), String> {
+        // The chain a probe child needs is a graph question, not a walk over
+        // the model: the same resolution the generator and the validation
+        // pass use, so a hop a builtin resolves and a dangling reference are
+        // read the same way everywhere.
+        let tags = crate::model::emit::profile_outbound_tags(&self.servers.profiles);
+        let graph = crate::model::dial::DialGraph::new(&self.servers.profiles, &tags);
         let mut chain = vec![profile];
-        let mut seen = std::collections::BTreeSet::new();
-        seen.insert(chain[0].tag());
-        let mut index = 0;
-        while index < chain.len() {
-            let target = chain[index].chain_target();
-            if let Some(target) = target
-                && seen.insert(target.to_string())
-                && let Some(dep) = self
-                    .servers
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.tag() == target)
-            {
-                chain.push(dep.clone());
-            }
-            index += 1;
-        }
+        chain.extend(graph.dependencies(&chain[0].tag()).into_iter().cloned());
         self.send_latency_probe(chain)
     }
 
@@ -1858,30 +1848,10 @@ mod tests {
         profile
     }
 
-    #[test]
-    fn request_latency_probe_for_includes_chain_dependencies() {
-        let mut rig = UiTestRig::default();
-        let dep = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
-        let main = chained_profile(Some(dep.tag()));
-        rig.servers.profiles.push(main.clone());
-        rig.servers.profiles.push(dep.clone());
-        rig.ctx()
-            .request_latency_probe_for(main.clone())
-            .expect("probe request");
-        let cmd = rig._cmd_rx.try_recv().expect("probe command");
-        if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
-            assert_eq!(profiles.len(), 2, "the chain dependency must ride along");
-            assert_eq!(
-                profiles[0].tag(),
-                main.tag(),
-                "the probed profile must stay first"
-            );
-            assert_eq!(profiles[1].tag(), dep.tag());
-        } else {
-            panic!("expected ProbeLatency, got a different command");
-        }
-    }
-
+    /// The probe's staged child carries the profile's whole chain, in walk
+    /// order, with the probed profile first. The graph's own resolution rules
+    /// (builtins, dangling targets, cycles) are pinned beside the graph; this
+    /// is the wiring that stages what the graph answers.
     #[test]
     fn request_latency_probe_for_includes_transitive_chain_dependencies() {
         // Tokyo → Osaka → Nagoya: the probe child must contain the whole chain.
@@ -1900,57 +1870,6 @@ mod tests {
         if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
             let tags: Vec<String> = profiles.iter().map(ServerProfile::tag).collect();
             assert_eq!(tags, vec![main.tag(), middle.tag(), leaf.tag()]);
-        } else {
-            panic!("expected ProbeLatency, got a different command");
-        }
-    }
-
-    #[test]
-    fn request_latency_probe_for_leaves_builtin_and_missing_targets_out() {
-        let mut rig = UiTestRig::default();
-        let via_builtin = chained_profile(Some("direct".into()));
-        let via_missing = chained_profile(Some("srv-deadbeef".into()));
-        rig.servers.profiles.push(via_builtin.clone());
-        rig.servers.profiles.push(via_missing.clone());
-        rig.ctx()
-            .request_latency_probe_for(via_builtin)
-            .expect("probe request");
-        let cmd = rig._cmd_rx.try_recv().expect("probe command");
-        if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
-            assert_eq!(profiles.len(), 1, "builtin targets are not profiles");
-        } else {
-            panic!("expected ProbeLatency, got a different command");
-        }
-        rig.ctx()
-            .request_latency_probe_for(via_missing)
-            .expect("probe request");
-        let cmd = rig._cmd_rx.try_recv().expect("probe command");
-        if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
-            assert_eq!(
-                profiles.len(),
-                1,
-                "an unresolvable target fails loudly at config generation, not here"
-            );
-        } else {
-            panic!("expected ProbeLatency, got a different command");
-        }
-    }
-
-    #[test]
-    fn request_latency_probe_for_terminates_on_a_chain_cycle() {
-        let mut rig = UiTestRig::default();
-        let b = ServerProfile::new("B", OutboundModel::new(Protocol::Freedom));
-        let a = chained_profile(Some(b.tag()));
-        let mut b = b;
-        b.outbound.chain_via(a.tag());
-        rig.servers.profiles.push(a.clone());
-        rig.servers.profiles.push(b.clone());
-        rig.ctx()
-            .request_latency_probe_for(a)
-            .expect("probe request");
-        let cmd = rig._cmd_rx.try_recv().expect("probe command");
-        if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
-            assert_eq!(profiles.len(), 2, "the expansion must terminate on a cycle");
         } else {
             panic!("expected ProbeLatency, got a different command");
         }

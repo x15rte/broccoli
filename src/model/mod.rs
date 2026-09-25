@@ -11,6 +11,7 @@
 //! - [`DurationMs`] — Go `time.Duration` strings ("10s", "1m30s"),
 //!   infra/conf/cfgcommon/duration/duration.go.
 
+pub mod dial;
 pub mod dns;
 pub mod emit;
 pub mod fingerprint;

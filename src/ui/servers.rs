@@ -17,7 +17,6 @@ use egui::{Color32, RichText, Stroke, StrokeKind};
 use crate::r#gen::keys::{DIALER_PROXY, SOCKOPT, STREAM_SETTINGS};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
-use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
     WireguardPeer, blackhole_custom_response_data_decodes, blackhole_response_is_custom,
@@ -138,6 +137,10 @@ const UPLINK_STREAM_PLACEMENTS: [&str; 3] = [
 
 // ---------- delete-confirmation reference scan ----------
 
+/// Every model site referencing `profile_id`'s outbound tag, as wire paths —
+/// the delete confirmation renders them verbatim. The scan itself belongs to
+/// the dial graph, which answers "who references this tag" for the profile
+/// half and the settings half alike.
 fn server_reference_paths(
     servers: &ServersFile,
     settings: &Settings,
@@ -151,40 +154,8 @@ fn server_reference_paths(
     else {
         return Vec::new();
     };
-    let mut references = Vec::new();
-    for (index, rule) in settings.routing.rules.iter().enumerate() {
-        if rule.outbound_tag == tag {
-            references.push(format!("routing.rules[{}].outboundTag", index + 1));
-        }
-    }
-    for (index, balancer) in settings.routing.balancers.iter().enumerate() {
-        if balancer.fallback_tag == tag {
-            references.push(format!("routing.balancers[{}].fallbackTag", index + 1));
-        }
-    }
-    for (index, profile) in servers.profiles.iter().enumerate() {
-        if profile.id == profile_id {
-            continue;
-        }
-        let label = if profile.name.is_empty() {
-            profile.tag()
-        } else {
-            profile.name.clone()
-        };
-        if profile
-            .outbound
-            .stream
-            .sockopt
-            .as_ref()
-            .is_some_and(|sockopt| sockopt.dialer_proxy == tag)
-        {
-            references.push(format!(
-                "servers[{}] ({label}).streamSettings.sockopt.dialerProxy",
-                index + 1
-            ));
-        }
-    }
-    references
+    let outbound_tags = crate::model::emit::outbound_tags(servers, settings);
+    crate::model::dial::DialGraph::new(&servers.profiles, &outbound_tags).references(settings, &tag)
 }
 
 // ---------- editor validation sweep ----------
@@ -1689,15 +1660,9 @@ fn refresh_dialer_proxy_options<'a>(
         .as_ref()
         .is_some_and(|cached| cached.generation == set_key && cached.own_id.as_str() == own_id);
     if !unchanged {
-        let options = profiles
-            .iter()
-            .filter(|profile| profile.id.as_str() != own_id)
-            .map(ServerProfile::tag)
-            .chain([
-                DIRECT_OUTBOUND_TAG.to_string(),
-                BLOCK_OUTBOUND_TAG.to_string(),
-            ])
-            .collect();
+        let outbound_tags = crate::model::emit::profile_outbound_tags(profiles);
+        let options = crate::model::dial::DialGraph::new(profiles, &outbound_tags)
+            .chain_target_options(own_id);
         *slot = Some(DialerProxyOptions {
             generation: set_key,
             own_id: own_id.to_owned(),
