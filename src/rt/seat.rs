@@ -14,7 +14,8 @@
 //! outcomes, bookend timing, preemption) — the profile validation's worker
 //! and the scratch-config contract it owns live in `rt/profiles.rs`.
 //! Declared here are the facts every shared path reads for them: the
-//! conflict rule, the busy-window bookend payload, whether a hard abort must
+//! conflict rule, the busy-reject flavour the begin runner emits for a held
+//! window, the busy-window bookend payload, whether a hard abort must
 //! leave the task to its own terminal, whether an unexpected exit cancels
 //! the in-flight task, and where the exactly-one terminal travels when the
 //! worker's own outcome cannot arrive.
@@ -90,6 +91,32 @@ pub(crate) enum BusyReject {
     /// The kind's conflict rule never checks the busy window, so the
     /// registry cannot reject it; a reject is a declaration error.
     Impossible,
+}
+
+/// How the runtime's exclusive begin runner answers a held busy window for
+/// one kind: where the rejected command's terminal lands (or that the kind
+/// preempts instead of rejecting). A flavour is a kind fact, declared with
+/// the kind's rule and never chosen by a dispatch arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExclusiveReject {
+    /// Log the shared busy line; the command owns no terminal of its own.
+    Logged,
+    /// The rule's `preemptive`: the occupant is cancelled — its own terminal
+    /// and its release — before this kind's begin, so the begin has no
+    /// occupant left to reject with. A reject reaching the runner is a wiring
+    /// error.
+    Preempting,
+    /// Answer on the request's own reply channel.
+    Reply,
+    /// Answer as the probe's failure event, tagged with the request's
+    /// profiles.
+    ProbeEvent,
+    /// Answer as the apply verdict of the rejected command.
+    ApplyVerdict,
+    /// Log the shared line, settle the update's optimistic view with the
+    /// failure, and re-emit the occupant's bookend so the GUI keeps its
+    /// owner.
+    UpdateSettled,
 }
 
 /// One accepted query job's seat: the request payload plus its per-kind
@@ -173,6 +200,28 @@ pub(crate) fn rule(kind: JobKind) -> KindRule {
         // Queries.
         JobKind::TestRoute | JobKind::Balancer | JobKind::LoggerRestart => BLOCKED_QUERY,
         JobKind::TrialRules | JobKind::RuntimeState => FREE_QUERY,
+    }
+}
+
+/// The busy-reject flavour of each exclusive kind, read by the runtime's
+/// begin runner: what the runner emits when that kind meets a held busy
+/// window. Declared with [`rule`] for the same reason the rules are — a
+/// command's rejection is a per-kind fact, so a dispatch arm never carries a
+/// copy that could drift from its siblings.
+pub(crate) fn exclusive_reject(kind: JobKind) -> ExclusiveReject {
+    match kind {
+        // Lifecycle spans: no terminal of their own to answer with.
+        JobKind::Start | JobKind::Restart => ExclusiveReject::Logged,
+        JobKind::Stop => ExclusiveReject::Preempting,
+        // The two request/reply kinds answer their requester directly.
+        JobKind::TestConfig | JobKind::ValidateProfiles => ExclusiveReject::Reply,
+        // The probe's verdict rides its event, tagged by the request.
+        JobKind::LatencyProbe => ExclusiveReject::ProbeEvent,
+        JobKind::ApplyConfig => ExclusiveReject::ApplyVerdict,
+        // The GUI marks the update optimistically, so its reject must settle
+        // that view without releasing the owner that rejected it.
+        JobKind::UpdateCore => ExclusiveReject::UpdateSettled,
+        kind => unreachable!("query kinds never occupy the busy window: {kind:?}"),
     }
 }
 
@@ -289,10 +338,15 @@ pub(crate) fn deliver_test_reply(
     }
 }
 
-/// Deliver one apply failure: exactly one `ApplyResult` settles the GUI's
-/// pending config revision.
+/// Deliver one apply failure: exactly one `ApplyResult` settles the config
+/// revision the in-flight command carried (parked where its begin put it).
 fn deliver_apply_failure(runtime: &mut Runtime, output: ApplyOutput) {
-    runtime.emit(CoreEvt::ApplyResult { ok: false, output });
+    let revision = runtime.apply_revision;
+    runtime.emit(CoreEvt::ApplyResult {
+        ok: false,
+        output,
+        revision,
+    });
 }
 
 /// Deliver a latency-probe failure with the sidecar's tags (probe:

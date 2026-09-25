@@ -25,10 +25,11 @@
 //! readiness), which is exactly the busy window contract.
 //!
 //! Boundary: the registry decides job-vs-job conflicts only. Phase guards
-//! ("core is not running"), field validation, and the two reject-message
-//! flavors (the keyed busy rejection vs the seat's busy sentence) stay with
-//! the dispatch side — in the per-kind seats and the shared query runner, or
-//! in the exclusive arms' bespoke workers (`rt/mod.rs`).
+//! ("core is not running"), field validation, and the reject flavours (the
+//! keyed busy rejection vs the seat's busy sentence, and the per-kind
+//! exclusive answers) stay with the dispatch side — in the per-kind seats and
+//! the shared query runner, or in the runtime's exclusive begin runner
+//! (`rt/mod.rs`), whose flavour per kind is declared in `rt/seat.rs`.
 //! Shutdown is not a job (the exit path drains); `SetTunMode` occupies as
 //! `Restart` when it acts, `ImportCoreArchive` runs as `UpdateCore`;
 //! `CheckUpdate` and `SetObservatory` are not jobs.
@@ -80,7 +81,7 @@ pub enum JobKind {
     Stop,
     /// `CoreCmd::Restart`; `SetTunMode` occupies as this kind when it acts.
     Restart,
-    /// `CoreCmd::ApplyConfig`.
+    /// `CoreCmd::Apply`.
     ApplyConfig,
     /// `CoreCmd::TestConfig`.
     TestConfig,
@@ -148,12 +149,11 @@ impl JobKind {
 pub enum ExclusiveOutcome {
     /// A TUN helper-connect worker (lifecycle Start/Restart span).
     HelperConnected(Result<super::helper::HelperPipe, super::HelperConnectFailure>),
-    /// An apply validation worker (`CoreCmd::ApplyConfig` family).
+    /// An apply validation worker (`CoreCmd::Apply`).
     ApplyValidated {
         ok: bool,
         output: super::ApplyOutput,
-        start_after_commit: bool,
-        tun_mode: Option<bool>,
+        intent: super::ApplyIntent,
         api_port: u16,
     },
     /// A config test validation worker (`CoreCmd::TestConfig`).

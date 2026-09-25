@@ -11,9 +11,9 @@ use crate::model::safety::SafetyFinding;
 use crate::model::settings::{Language, Mode};
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
-    AppMessage, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState, EVT_CHANNEL_CAPACITY,
-    LatencyProbeResult, OperationKind, OutboundStatusView, RuntimeHandle, StatsTick, spawn_runtime,
-    sweep_stale_scratch_configs,
+    AppMessage, ApplyIntent, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState,
+    EVT_CHANNEL_CAPACITY, LatencyProbeResult, OperationKind, OutboundStatusView, RuntimeHandle,
+    StatsTick, spawn_runtime, sweep_stale_scratch_configs,
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::sys::{self, paths};
@@ -291,9 +291,10 @@ pub struct BroccoliApp {
     /// generation fails, which keeps the gate up.
     applied_candidate: Option<serde_json::Value>,
     /// Monotonic in-memory edit generation used to prevent an older runtime
-    /// result from settling newer saved edits.
+    /// result from settling newer saved edits: an apply verdict names the
+    /// revision it applied, so a verdict for an older one cannot settle the
+    /// configuration the app holds now.
     config_revision: u64,
-    pending_apply_revisions: VecDeque<u64>,
     /// egui-clock seconds (`ctx.input(|i| i.time)`) of the last persist.
     /// `None` before the first save, so the first dirty frame after a quiet
     /// period persists immediately (discrete edits stay prompt) and only
@@ -808,7 +809,6 @@ impl BroccoliApp {
             config_dirty: persistence_error.is_some() || config_error.is_some(),
             applied_candidate,
             config_revision: 0,
-            pending_apply_revisions: VecDeque::new(),
             last_persist: None,
             persist_pending: None,
             raw_override_verdict: None,
@@ -1016,8 +1016,11 @@ impl BroccoliApp {
                         list,
                     )
                 }
-                CoreEvt::ApplyResult { ok, output } => {
-                    let applied_revision = self.pending_apply_revisions.pop_front();
+                CoreEvt::ApplyResult {
+                    ok,
+                    output,
+                    revision,
+                } => {
                     let lang = self.settings.language;
                     if let Some(save_error) = self.persistence_error.as_deref() {
                         self.config_dirty = true;
@@ -1030,7 +1033,8 @@ impl BroccoliApp {
                             ),
                         ));
                     } else {
-                        let settles_current = ok && applied_revision == Some(self.config_revision);
+                        let settles_current =
+                            apply_verdict_settles_current(ok, revision, self.config_revision);
                         if settles_current {
                             // The core accepted the config generated from the
                             // current model state (revision match: no edit
@@ -1042,6 +1046,9 @@ impl BroccoliApp {
                                     .map(normalize_candidate_for_compare);
                         }
                         self.config_dirty = !settles_current;
+                        // A success for an older revision is not a failure of
+                        // what the app holds now: the top bar reports the older
+                        // apply while newer saved changes stay pending.
                         self.apply_result = if ok && !settles_current {
                             Some((
                                 false,
@@ -1635,13 +1642,12 @@ impl BroccoliApp {
         };
         self.config_error = None;
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
-        match self.rt.cmd.send(CoreCmd::ApplyConfigWithTunMode {
+        match self.rt.cmd.send(CoreCmd::Apply {
             value: config,
-            tun_mode: want_tun,
-            start_after_commit: true,
+            intent: ApplyIntent::CommitAndStart { tun_mode: want_tun },
+            revision: self.config_revision,
         }) {
             Ok(()) => {
-                self.pending_apply_revisions.push_back(self.config_revision);
                 self.operation = Some(OperationKind::ApplyConfig);
                 Ok(())
             }
@@ -1682,10 +1688,6 @@ impl BroccoliApp {
             return Ok(());
         }
         let lang = self.settings.language;
-        if !self.pending_apply_revisions.is_empty() {
-            self.config_dirty = true;
-            self.pending_apply_revisions.clear();
-        }
         match self.rt.cmd.send(CoreCmd::Stop) {
             Ok(()) => {
                 self.operation = Some(OperationKind::Stop);
@@ -1864,13 +1866,12 @@ impl BroccoliApp {
         };
         self.config_error = None;
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
-        match self.rt.cmd.send(CoreCmd::ApplyConfigWithTunMode {
+        match self.rt.cmd.send(CoreCmd::Apply {
             value: config,
-            tun_mode: want_tun,
-            start_after_commit: false,
+            intent: ApplyIntent::Commit { tun_mode: want_tun },
+            revision: self.config_revision,
         }) {
             Ok(()) => {
-                self.pending_apply_revisions.push_back(self.config_revision);
                 self.operation = Some(OperationKind::ApplyConfig);
                 self.apply_result = None;
             }
@@ -2489,6 +2490,16 @@ fn config_gate_after_persist(
 /// refuses to save in that state.
 fn persist_blocked_by_state_error(state_error: Option<&str>) -> bool {
     state_error.is_some()
+}
+
+/// Whether one apply verdict settles the configuration the app holds now: a
+/// verdict names the revision its command was generated from, so only a
+/// success for the revision the app holds may clear the changes-pending gate
+/// and refresh the applied baseline. A success for an older revision is
+/// reported with the older-apply wording instead, and a failure is reported
+/// as its own message whichever revision it names.
+fn apply_verdict_settles_current(ok: bool, verdict_revision: u64, config_revision: u64) -> bool {
+    ok && verdict_revision == config_revision
 }
 
 /// A phase change ends the core session: the last stats tick (rates, memory,
@@ -4668,6 +4679,28 @@ mod config_gate_tests {
             normalize_candidate_for_compare(json!({"inbounds": [{"tag": "socks"}]})),
             normalize_candidate_for_compare(json!({"inbounds": [{"tag": "socks"}]})),
             "candidates without an api listener are unchanged"
+        );
+    }
+}
+
+/// The apply-verdict settle (contract): the revision a verdict names decides
+/// whether the app may claim it, so a success for an older revision cannot
+/// settle newer saved changes (the top bar reports the older apply instead)
+/// and a failure settles nothing.
+#[cfg(test)]
+mod apply_verdict_tests {
+    use super::apply_verdict_settles_current;
+
+    #[test]
+    fn only_a_success_for_the_revision_the_app_holds_settles_it() {
+        assert!(apply_verdict_settles_current(true, 7, 7));
+        assert!(
+            !apply_verdict_settles_current(true, 6, 7),
+            "a success for an older revision must leave newer changes pending"
+        );
+        assert!(
+            !apply_verdict_settles_current(false, 7, 7),
+            "a failed apply never settles the configuration"
         );
     }
 }

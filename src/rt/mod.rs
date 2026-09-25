@@ -117,22 +117,16 @@ pub enum CoreCmd {
     Start,
     Stop,
     Restart,
-    /// Validate the candidate with `xray run -test`; on success commit it and
-    /// restart the core if it was running, with automatic rollback to the last
-    /// known-good config when the new one fails fast.
-    ApplyConfig(serde_json::Value),
-    /// Atomically commit a candidate and select the transport used by the
-    /// resulting backend. This is the only command GUI apply flows should use
-    /// when changing TUN mode while the core is active.
-    ApplyConfigWithTunMode {
+    /// Validate the candidate with `xray run -test`, and on success commit it
+    /// and do what `intent` asks with the result. The revision is the app's
+    /// own identifier of the configuration the candidate was generated from:
+    /// it comes back on the verdict, so the app can tell which of its
+    /// configurations the apply settled.
+    Apply {
         value: serde_json::Value,
-        tun_mode: bool,
-        start_after_commit: bool,
+        intent: ApplyIntent,
+        revision: u64,
     },
-    /// Validate and commit the candidate, then start the core only after the
-    /// commit succeeds. Used by Connect so an invalid candidate can never
-    /// start a stale config.
-    ApplyConfigAndStart(serde_json::Value),
     /// Validate only; never committed. The terminal verdict travels the
     /// request's own reply channel.
     TestConfig {
@@ -252,6 +246,66 @@ pub enum CoreCmd {
     ListRuntimeState {
         reply: oneshot::Sender<Result<RuntimeStateView, DiagError>>,
     },
+}
+
+/// What one `CoreCmd::Apply` asks the runtime to do with a validated
+/// candidate — the two facts the runtime acts on, named instead of the call
+/// site that decided them: the transport the committed configuration is run
+/// under, and whether a stopped core starts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyIntent {
+    /// Commit the candidate and start the core on it (Connect applies the
+    /// current candidate before starting anything, so an invalid candidate
+    /// can never leave a stale configuration running).
+    CommitAndStart { tun_mode: bool },
+    /// Commit the candidate without starting a stopped core; a core that is
+    /// running restarts onto it because its transport changed (Apply now).
+    Commit { tun_mode: bool },
+}
+
+impl ApplyIntent {
+    /// The transport the committed configuration is run under: `true` runs it
+    /// through the elevated helper, so the configuration's TUN inbound can
+    /// bind the adapter; `false` runs the direct child.
+    pub fn tun_mode(self) -> bool {
+        match self {
+            Self::CommitAndStart { tun_mode } | Self::Commit { tun_mode } => tun_mode,
+        }
+    }
+
+    /// Whether a stopped core starts on the committed candidate.
+    pub fn starts_stopped_core(self) -> bool {
+        matches!(self, Self::CommitAndStart { .. })
+    }
+}
+
+/// What one exclusive command hands [`Runtime::begin_exclusive`]: the
+/// command-owned data its kind's declared busy-reject flavour answers a held
+/// window with, and that an accepted begin parks for the kind's own terminals
+/// (a reply those terminals resolve, the apply's config revision, or nothing
+/// at all). The variant is fixed by the command's kind (see
+/// [`seat::exclusive_reject`]), and an answer that does not match the declared
+/// flavour is a declaration error the runner fails loudly on.
+#[derive(Debug)]
+pub(crate) enum BusyAnswer<'a> {
+    /// The flavour answers with its own side effects alone (log-only,
+    /// preempting, update-settling).
+    Nowhere,
+    /// The config test's reply: parked on the record by an accepted begin,
+    /// answered by the reply flavour otherwise.
+    TestReply(oneshot::Sender<TestConfigReply>),
+    /// The profile validation's reply: parked on the record by an accepted
+    /// begin, answered by the reply flavour otherwise.
+    ProfileReply(oneshot::Sender<ProfileValidationReply>),
+    /// The probe request's profiles: the probe-event flavour derives the
+    /// tags its failure event carries from them (the worker parks the same
+    /// tags for its own terminal).
+    ProbeProfiles(&'a [crate::model::ServerProfile]),
+    /// The apply command's config revision: parked on the runtime by an
+    /// accepted begin, so every verdict of that apply names the
+    /// configuration it settled, and carried by the apply-verdict flavour
+    /// otherwise.
+    ApplyRevision(u64),
 }
 
 /// Transport ownership of the backend that actually launched.
@@ -382,10 +436,13 @@ pub enum CoreEvt {
     AppLog(AppMessage),
     Stats(StatsTick),
     Observatory(Vec<OutboundStatusView>),
-    /// Result of a committed apply (or its validation/commit failure).
+    /// Result of a committed apply (or its validation/commit failure). The
+    /// revision is the one the command carried, so the app can tell whether
+    /// the verdict settled the configuration it holds now.
     ApplyResult {
         ok: bool,
         output: ApplyOutput,
+        revision: u64,
     },
     /// Result of the one automatic last-good rollback attempt. This is
     /// deliberately separate from [`CorePhase`]: a successfully started
@@ -943,6 +1000,12 @@ struct Runtime {
     /// test, balancer, trial rules, logger restart, runtime state) abort on
     /// the Stop/Shutdown drain.
     jobs: JobRegistry,
+    /// The config revision the in-flight apply command carried, parked by its
+    /// begin: every verdict of that apply — the completion, the cancel and the
+    /// join-error terminal — names the configuration it settled. Only one
+    /// apply can be in flight (the exclusive rule), so a verdict that reads
+    /// this always reads its own.
+    apply_revision: u64,
     /// Busy-window bookends the registry sink queued but not yet delivered
     /// to the GUI: `Some(kind)` on exclusive begin, `None` on release. The
     /// [`Runtime::begin_exclusive`] / [`Runtime::release_exclusive`]
@@ -1190,6 +1253,7 @@ impl Runtime {
             jobs: JobRegistry::with_busy_sink(move |bookend| {
                 let _ = bookend_tx.send(bookend);
             }),
+            apply_revision: 0,
             pending_bookends: bookend_rx,
         }
     }
@@ -1266,20 +1330,132 @@ impl Runtime {
     }
     // -- exclusive-window helpers ----------------------
 
-    /// Begin one exclusive job and deliver its `Some(kind)` bookend
-    /// synchronously: `try_begin` queues the bookend on the side channel
-    /// and the drain below puts it on the GUI event channel before this
-    /// call returns, so the busy window is observable at the mutation even
-    /// when the arm body then runs a long stretch (Stop's `kill_backend`
-    /// await) before its first [`Runtime::emit`]. Query kinds keep
-    /// `jobs.try_begin` — they never emit bookends. The drain also runs on
-    /// the `Err(Busy)` side so reject re-emits (`Operation(Some(active))`)
-    /// queue behind any bookend that reached the side channel before the
-    /// rejected begin, exactly as `emit`'s drain-first would order them.
-    fn begin_exclusive(&mut self, kind: JobKind) -> Result<u64, Busy> {
+    /// Begin one exclusive command's record, or answer the held busy window
+    /// with the kind's declared flavour (see [`seat::exclusive_reject`]).
+    /// `Some(id)` is the begun record's registry id; `None` means the command
+    /// was answered and the arm must return.
+    ///
+    /// The `Some(kind)` bookend of a begin is delivered synchronously:
+    /// `try_begin` queues it on the side channel and the drain below puts it
+    /// on the GUI event channel before this call returns, so the busy window
+    /// is observable at the mutation even when the arm body then runs a long
+    /// stretch (Stop's `kill_backend` await) before its first
+    /// [`Runtime::emit`]. Query kinds keep `jobs.try_begin` — they never emit
+    /// bookends. The drain also runs on the rejected side, so a reject's own
+    /// events queue behind any bookend that reached the side channel before
+    /// the rejected begin, exactly as `emit`'s drain-first would order them.
+    fn begin_exclusive(&mut self, kind: JobKind, answer: BusyAnswer<'_>) -> Option<u64> {
         let begun = self.jobs.try_begin(kind);
         self.drain_pending_bookends();
-        begun
+        match begun {
+            Ok(id) => {
+                // The accepted begin parks the command's own terminal on the
+                // record: the kind's completion, cancel and join-error
+                // terminals all find it there, so no arm has to hand it on.
+                match answer {
+                    BusyAnswer::TestReply(reply) => {
+                        self.jobs
+                            .set_exclusive_sidecar(ExclusiveSidecar::TestReply(reply));
+                    }
+                    BusyAnswer::ProfileReply(reply) => {
+                        self.jobs
+                            .set_exclusive_sidecar(ExclusiveSidecar::ProfileReply(reply));
+                    }
+                    BusyAnswer::ApplyRevision(revision) => self.apply_revision = revision,
+                    BusyAnswer::Nowhere | BusyAnswer::ProbeProfiles(_) => {}
+                }
+                Some(id)
+            }
+            Err(Busy { active }) => {
+                self.answer_busy(kind, active, answer);
+                None
+            }
+        }
+    }
+
+    /// Begin the exclusive record of a start the runtime drives itself — the
+    /// housekeeping tick, the rollback replay, the health gate, or a
+    /// lifecycle transition's replacement start. Such a start rides the
+    /// record the operation that asked for it already holds (an
+    /// apply-then-restart, the update health gate), so a held window means it
+    /// does not re-enter the registry: the owner's own release ends it.
+    fn begin_internal_start(&mut self) {
+        if self.jobs.busy_kind().is_none() {
+            // Cannot reject: the window read and the begin are one synchronous
+            // section, and no mutation runs between them.
+            let _ = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere);
+        }
+    }
+
+    /// Emit one kind's declared busy-reject flavour — the answer that kind
+    /// fixes for a held window, with the occupant that holds it named in the
+    /// rejection text. An answer that does not match the declaration is a
+    /// wiring error, not a behaviour choice: it fails loudly rather than
+    /// dropping the request.
+    fn answer_busy(&mut self, kind: JobKind, active: JobKind, answer: BusyAnswer<'_>) {
+        match (seat::exclusive_reject(kind), answer) {
+            (seat::ExclusiveReject::Logged, BusyAnswer::Nowhere) => {
+                self.app_log(Self::busy_reject_text(active));
+            }
+            (seat::ExclusiveReject::Preempting, BusyAnswer::Nowhere) => unreachable!(
+                "{kind:?} preempts the occupant before its begin, so the registry cannot reject it"
+            ),
+            (seat::ExclusiveReject::Reply, answer) => {
+                let output = Self::busy_reject_text(active);
+                self.app_log(output.clone());
+                match answer {
+                    BusyAnswer::TestReply(reply) => {
+                        if reply.send(Err(DiagError::from(output))).is_err() {
+                            // Receiver vanished; nothing further is delivered.
+                        }
+                    }
+                    BusyAnswer::ProfileReply(reply) => {
+                        if reply.send(Err(DiagError::from(output))).is_err() {
+                            // Receiver vanished; nothing further is delivered.
+                        }
+                    }
+                    answer => unreachable!(
+                        "the reply flavour answers on the request's own terminal, got {answer:?}"
+                    ),
+                }
+                // Wake the requester's poll: the rejection did not travel the
+                // event stream.
+                self.repaint.request_repaint();
+            }
+            (seat::ExclusiveReject::ProbeEvent, BusyAnswer::ProbeProfiles(profiles)) => {
+                let output = Self::busy_reject_text(active);
+                self.app_log(output.clone());
+                let tags = profiles.iter().map(|profile| profile.tag()).collect();
+                self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
+                    tags,
+                    result: Err(ProbeFailure::plain(output)),
+                }));
+            }
+            (seat::ExclusiveReject::ApplyVerdict, BusyAnswer::ApplyRevision(revision)) => {
+                let output = Self::busy_reject_text(active);
+                self.app_log(output.clone());
+                self.emit(CoreEvt::ApplyResult {
+                    ok: false,
+                    output: ApplyOutput::Message(AppMessage::from(output)),
+                    revision,
+                });
+            }
+            (seat::ExclusiveReject::UpdateSettled, BusyAnswer::Nowhere) => {
+                let output = Self::busy_reject_text(active);
+                self.app_log(output.clone());
+                self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
+                    output,
+                ))));
+                self.emit(CoreEvt::Operation(Some(
+                    active
+                        .exclusive_operation_kind()
+                        .expect("busy occupants are exclusive kinds; queries never occupy"),
+                )));
+            }
+            (flavour, answer) => unreachable!(
+                "the {flavour:?} flavour is declared with its own answer, got {answer:?}"
+            ),
+        }
     }
 
     /// Release the busy window synchronously: `finish_exclusive` queues the
@@ -1598,14 +1774,9 @@ impl Runtime {
     async fn handle_cmd(&mut self, cmd: CoreCmd) {
         match cmd {
             CoreCmd::Start => {
-                match self.begin_exclusive(JobKind::Start) {
-                    Ok(_) => {}
-                    Err(Busy { active }) => {
-                        // Whitelist-era void arm: log-only, no terminal.
-                        self.app_log(Self::busy_reject_text(active));
-                        return;
-                    }
-                }
+                let Some(_id) = self.begin_exclusive(JobKind::Start, BusyAnswer::Nowhere) else {
+                    return;
+                };
                 self.pending_restart = None;
                 self.backoff.reset();
                 if self.exit_policy.stopping() {
@@ -1639,17 +1810,11 @@ impl Runtime {
                 let slot_kept = self.jobs.exclusive_runs_to_terminal();
                 let update_landing = matches!(self.jobs.busy_kind(), Some(JobKind::UpdateCore));
                 if self.backend.tun_owned_or_alive() && !slot_kept {
-                    // Unreachable-in-practice: every abortable exclusive
-                    // record was cancelled and released above, and a
-                    // worker-owned record is kept out by the guard above.
-                    // Stop is preemptive anyway, so this cannot reject.
-                    match self.begin_exclusive(JobKind::Stop) {
-                        Ok(_) => {}
-                        Err(_) => unreachable!(
-                            "no other exclusive record can survive into the Stop begin: \
-                             `slot_kept` keeps the worker-owned ones out"
-                        ),
-                    }
+                    // Stop preempts: the begin cannot reject here, because a
+                    // worker-owned record is kept out by the guard above and
+                    // every abortable one was cancelled and released before
+                    // it.
+                    let _ = self.begin_exclusive(JobKind::Stop, BusyAnswer::Nowhere);
                 } else if !cancelled_operation {
                     // No exclusive record existed for the release to clear,
                     // but the GUI marks Stop optimistically after send.
@@ -1675,14 +1840,9 @@ impl Runtime {
                 }
             }
             CoreCmd::Restart => {
-                match self.begin_exclusive(JobKind::Restart) {
-                    Ok(_) => {}
-                    Err(Busy { active }) => {
-                        // Whitelist-era void arm: log-only, no terminal.
-                        self.app_log(Self::busy_reject_text(active));
-                        return;
-                    }
-                }
+                let Some(_id) = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere) else {
+                    return;
+                };
                 self.pending_restart = None;
                 if self.backend.tun_owned_or_alive() {
                     self.exit_policy.begin_restart(Instant::now());
@@ -1691,16 +1851,13 @@ impl Runtime {
                     self.start_backend().await;
                 }
             }
-            CoreCmd::ApplyConfig(value) => self.dispatch_apply(value, false, None).await,
-            CoreCmd::ApplyConfigWithTunMode {
+            CoreCmd::Apply {
                 value,
-                tun_mode,
-                start_after_commit,
+                intent,
+                revision,
             } => {
-                self.dispatch_apply(value, start_after_commit, Some(tun_mode))
-                    .await
+                self.dispatch_apply(value, intent, revision).await;
             }
-            CoreCmd::ApplyConfigAndStart(value) => self.dispatch_apply(value, true, None).await,
             CoreCmd::TestConfig { config, reply } => {
                 if self.exit_policy.stopping() {
                     // The runtime is tearing down and will not run the
@@ -1713,21 +1870,12 @@ impl Runtime {
                     self.repaint.request_repaint();
                     return;
                 }
-                match self.begin_exclusive(JobKind::TestConfig) {
-                    Ok(_) => self.begin_test_work(config, reply).await,
-                    Err(Busy { active }) => {
-                        // Whitelist-era sync reject: the rejection is the
-                        // terminal result — send it on the request's own
-                        // channel and poke the repaint so the requester's
-                        // poll wakes.
-                        let output = Self::busy_reject_text(active);
-                        self.app_log(output.clone());
-                        if reply.send(Err(DiagError::from(output))).is_err() {
-                            // Receiver vanished; nothing further is delivered.
-                        }
-                        self.repaint.request_repaint();
-                    }
-                }
+                let Some(_id) =
+                    self.begin_exclusive(JobKind::TestConfig, BusyAnswer::TestReply(reply))
+                else {
+                    return;
+                };
+                self.begin_test_work(config).await;
             }
             CoreCmd::ValidateProfiles { request, reply } => {
                 if self.exit_policy.stopping() {
@@ -1741,20 +1889,12 @@ impl Runtime {
                     self.repaint.request_repaint();
                     return;
                 }
-                match self.begin_exclusive(JobKind::ValidateProfiles) {
-                    Ok(_) => self.begin_profile_validation_work(*request, reply),
-                    Err(Busy { active }) => {
-                        // The rejection is the terminal result — send it on
-                        // the request's own channel and poke the repaint so
-                        // the requester's poll wakes.
-                        let output = Self::busy_reject_text(active);
-                        self.app_log(output.clone());
-                        if reply.send(Err(DiagError::from(output))).is_err() {
-                            // Receiver vanished; nothing further is delivered.
-                        }
-                        self.repaint.request_repaint();
-                    }
-                }
+                let Some(_id) = self
+                    .begin_exclusive(JobKind::ValidateProfiles, BusyAnswer::ProfileReply(reply))
+                else {
+                    return;
+                };
+                self.begin_profile_validation_work(*request);
             }
             CoreCmd::UpdateCore => self.update_core(CoreUpdateSource::PinnedDownload),
             CoreCmd::ImportCoreArchive(path) => {
@@ -1762,13 +1902,6 @@ impl Runtime {
             }
             CoreCmd::CheckUpdate => self.check_update(),
             CoreCmd::SetTunMode(on) => {
-                // Whitelist-era guard: the command is rejected while any
-                // exclusive job holds the window, whether or not this toggle
-                // would restart the core.
-                if let Some(occupant) = self.jobs.busy_kind() {
-                    self.app_log(Self::busy_reject_text(occupant));
-                    return;
-                }
                 if on == self.requested_tun_mode {
                     return;
                 }
@@ -1777,17 +1910,13 @@ impl Runtime {
                         self.phase,
                         CorePhase::Starting | CorePhase::Running | CorePhase::Backoff { .. }
                     );
-                if active {
-                    // Cannot reject: the guard above ran in the same
-                    // synchronous section, so the window is still empty.
-                    match self.begin_exclusive(JobKind::Restart) {
-                        Ok(_) => {}
-                        Err(_) => unreachable!(
-                            "SetTunMode begin raced no mutation: the busy guard above \
-                             already confirmed an empty window"
-                        ),
-                    }
-                }
+                // The held-window guard and the begin are one call: a held
+                // window answers the toggle with the Restart kind's declared
+                // log-only flavour, whether or not this toggle would restart
+                // the core.
+                let Some(_id) = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere) else {
+                    return;
+                };
                 if active {
                     self.app_log(Diag::new(Key::RtLogTransportChangeRestart));
                     self.pending_restart = None;
@@ -1802,6 +1931,10 @@ impl Runtime {
                         self.start_backend().await;
                     }
                 } else {
+                    // A toggle with no live backend records the mode and
+                    // carries no lifecycle: the record the guard opened closes
+                    // here.
+                    self.release_exclusive();
                     self.requested_tun_mode = on;
                 }
                 self.app_log(if on {
@@ -1826,26 +1959,17 @@ impl Runtime {
                 tun_outbound_interface,
                 tun_adapter_name,
             } => {
-                match self.begin_exclusive(JobKind::LatencyProbe) {
-                    Ok(_) => self.begin_probe_work(
-                        profiles,
-                        probe_url,
-                        tun_outbound_interface,
-                        tun_adapter_name,
-                    ),
-                    Err(Busy { active }) => {
-                        // Whitelist-era reject: log the line and deliver the
-                        // headline-only failure event with the request's own
-                        // tags (no release — the owner rejects it).
-                        let output = Self::busy_reject_text(active);
-                        self.app_log(output.clone());
-                        let tags = profiles.iter().map(|profile| profile.tag()).collect();
-                        self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
-                            tags,
-                            result: Err(ProbeFailure::plain(output)),
-                        }));
-                    }
-                }
+                let Some(_id) = self
+                    .begin_exclusive(JobKind::LatencyProbe, BusyAnswer::ProbeProfiles(&profiles))
+                else {
+                    return;
+                };
+                self.begin_probe_work(
+                    profiles,
+                    probe_url,
+                    tun_outbound_interface,
+                    tun_adapter_name,
+                );
             }
             CoreCmd::GetBalancerInfo {
                 reply,
@@ -1914,39 +2038,25 @@ impl Runtime {
         }
     }
 
-    /// Validate-and-commit dispatch shared by the three apply commands.
-    /// The busy-window reject carries the whitelist-era terminal text; the
-    /// work below runs with the exclusive record already held.
+    /// Validate-and-commit dispatch of `CoreCmd::Apply`, shared by the whole
+    /// apply family: the busy window is answered with the kind's declared
+    /// verdict, and the work below runs with the exclusive record held.
     async fn dispatch_apply(
         &mut self,
         value: serde_json::Value,
-        start_after_commit: bool,
-        tun_mode: Option<bool>,
+        intent: ApplyIntent,
+        revision: u64,
     ) {
-        match self.begin_exclusive(JobKind::ApplyConfig) {
-            Ok(_) => {
-                self.begin_apply_work(value, start_after_commit, tun_mode)
-                    .await
-            }
-            Err(Busy { active }) => {
-                // Whitelist-era reject: log the line and settle the GUI's
-                // pending revision with the failure result.
-                let output = Self::busy_reject_text(active);
-                self.app_log(output.clone());
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(output)),
-                });
-            }
-        }
+        let Some(_id) =
+            self.begin_exclusive(JobKind::ApplyConfig, BusyAnswer::ApplyRevision(revision))
+        else {
+            return;
+        };
+        self.begin_apply_work(value, intent).await;
     }
 
-    async fn begin_apply_work(
-        &mut self,
-        value: serde_json::Value,
-        start_after_commit: bool,
-        tun_mode: Option<bool>,
-    ) {
+    async fn begin_apply_work(&mut self, value: serde_json::Value, intent: ApplyIntent) {
+        let revision = self.apply_revision;
         // The control-plane port is ephemeral and lives only in the
         // emitted config; derive it from the candidate the runtime will run so
         // the gRPC client polls exactly the committed listener.
@@ -1958,6 +2068,7 @@ impl Runtime {
                     output: ApplyOutput::Message(AppMessage::from(
                         DiagError::new(Diag::new(Key::RtFrameApplyRejected)).caused_by(error),
                     )),
+                    revision,
                 });
                 self.release_exclusive();
                 return;
@@ -1976,6 +2087,7 @@ impl Runtime {
                         DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed))
                             .caused_by(error),
                     )),
+                    revision,
                 });
                 self.release_exclusive();
                 return;
@@ -1986,45 +2098,33 @@ impl Runtime {
             ExclusiveOutcome::ApplyValidated {
                 ok,
                 output,
-                start_after_commit,
-                tun_mode,
+                intent,
                 api_port,
             }
         });
         self.jobs.attach_exclusive_task(task);
     }
 
-    /// Validation work of an accepted TestConfig command (the record was
-    /// begun by the arm; a write failure releases it with a pre-spawn
-    /// reject).
-    async fn begin_test_work(
-        &mut self,
-        value: serde_json::Value,
-        reply: oneshot::Sender<TestConfigReply>,
-    ) {
+    /// Validation work of an accepted TestConfig command (the record and its
+    /// parked reply were begun by the runner; a write failure releases both
+    /// with a pre-spawn reject).
+    async fn begin_test_work(&mut self, value: serde_json::Value) {
         // The candidate write is a create/write/fsync leg, so it runs on the
         // blocking pool. The exclusive record stays held across the await.
         let path = match apply::write_candidate_offloaded(value).await {
             Ok(path) => path,
             Err(error) => {
                 // Pre-spawn reject: the task never began, so the rejection is
-                // the terminal result — send it on the request's own channel
-                // and poke the repaint so the requester's poll wakes.
+                // the terminal result — take the reply the begin parked for it
+                // and deliver there, which also pokes the requester's poll.
                 let rejection =
                     DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed)).caused_by(error);
-                if reply.send(Err(rejection)).is_err() {
-                    // Receiver vanished; nothing further is delivered.
-                }
-                self.repaint.request_repaint();
+                let sidecar = self.jobs.take_exclusive_sidecar();
+                seat::deliver_test_reply(self, sidecar, Err(rejection));
                 self.release_exclusive();
                 return;
             }
         };
-        // Park the sidecar before the spawn: a completion racing the spawn
-        // must find the pairing (current-thread executor: guard + park +
-        // spawn are atomic with respect to the select loop).
-        self.jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::TestReply(reply));
         let task = tokio::spawn(async move {
             let (ok, output) = apply::validate(&path).await;
             ExclusiveOutcome::TestValidated { ok, output }
@@ -2032,22 +2132,13 @@ impl Runtime {
         self.jobs.attach_exclusive_task(task);
     }
 
-    /// Validation work of an accepted ValidateProfiles command (the record
-    /// was begun by the arm). The worker walks the profiles on the runtime's
-    /// own executor, so the scratch write, the guard and the `xray -test`
-    /// child all live with the record: cancelling is cooperative (the worker
-    /// observes the record's cancel flag between profiles), and the exit path
-    /// waits for its exactly-one terminal.
-    fn begin_profile_validation_work(
-        &mut self,
-        request: ProfileValidationRequest,
-        reply: oneshot::Sender<ProfileValidationReply>,
-    ) {
-        // Park the sidecar before the spawn: a completion racing the spawn
-        // must find the pairing (current-thread executor: guard + park +
-        // spawn are atomic with respect to the select loop).
-        self.jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::ProfileReply(reply));
+    /// Validation work of an accepted ValidateProfiles command (the record and
+    /// its parked reply were begun by the runner). The worker walks the
+    /// profiles on the runtime's own executor, so the scratch write, the
+    /// guard and the `xray -test` child all live with the record: cancelling
+    /// is cooperative (the worker observes the record's cancel flag between
+    /// profiles), and the exit path waits for its exactly-one terminal.
+    fn begin_profile_validation_work(&mut self, request: ProfileValidationRequest) {
         let cancel = self
             .jobs
             .exclusive_cancel_flag()
@@ -2159,11 +2250,10 @@ impl Runtime {
             ExclusiveOutcome::ApplyValidated {
                 ok,
                 output,
-                start_after_commit,
-                tun_mode,
+                intent,
                 api_port,
             } => {
-                self.complete_apply_validation(ok, output, start_after_commit, tun_mode, api_port)
+                self.complete_apply_validation(ok, output, intent, api_port)
                     .await;
             }
             ExclusiveOutcome::TestValidated { ok, output } => {
@@ -2244,12 +2334,18 @@ impl Runtime {
         &mut self,
         ok: bool,
         output: ApplyOutput,
-        start_after_commit: bool,
-        tun_mode: Option<bool>,
+        intent: ApplyIntent,
         api_port: u16,
     ) {
+        // The verdict names the configuration the command was generated from,
+        // read before any terminal releases the record that parked it.
+        let revision = self.apply_revision;
         if !ok {
-            self.emit(CoreEvt::ApplyResult { ok: false, output });
+            self.emit(CoreEvt::ApplyResult {
+                ok: false,
+                output,
+                revision,
+            });
             self.release_exclusive();
             return;
         }
@@ -2269,6 +2365,7 @@ impl Runtime {
                     output: ApplyOutput::Message(AppMessage::from(
                         DiagError::new(Diag::new(Key::RtFrameApplyCaptureFailed)).caused_by(error),
                     )),
+                    revision,
                 });
                 self.release_exclusive();
                 return;
@@ -2280,12 +2377,17 @@ impl Runtime {
                 output: ApplyOutput::Message(AppMessage::from(
                     DiagError::new(Diag::new(Key::RtFrameApplyCommitFailed)).caused_by(error),
                 )),
+                revision,
             });
             self.release_exclusive();
             return;
         }
         self.helper_config_bytes = Some(validated_bytes);
-        self.emit(CoreEvt::ApplyResult { ok: true, output });
+        self.emit(CoreEvt::ApplyResult {
+            ok: true,
+            output,
+            revision,
+        });
         self.app_log(Diag::new(Key::RtLogConfigApplied));
         self.pending_transition.commit_candidate();
         self.candidate_boot_retries = 0;
@@ -2303,7 +2405,7 @@ impl Runtime {
                 // graceful close request has been issued.
                 self.kill_backend().await;
             }
-            self.commit_requested_backend(tun_mode, api_port);
+            self.commit_requested_backend(intent.tun_mode(), api_port);
             if !self.backend.tun_owned_or_alive() {
                 // Do not recurse through the async start/rollback graph.
                 // Housekeeping owns the replacement after confirmed exit;
@@ -2314,21 +2416,19 @@ impl Runtime {
                     self.pending_restart = Some(Instant::now());
                 }
             }
-        } else if start_after_commit {
-            self.commit_requested_backend(tun_mode, api_port);
+        } else if intent.starts_stopped_core() {
+            self.commit_requested_backend(intent.tun_mode(), api_port);
             self.pending_restart = Some(Instant::now());
         } else {
-            self.commit_requested_backend(tun_mode, api_port);
+            self.commit_requested_backend(intent.tun_mode(), api_port);
             // The next explicit Start still carries the unproven candidate,
             // but applying while stopped has completed as an operation.
             self.release_exclusive();
         }
     }
 
-    fn commit_requested_backend(&mut self, tun_mode: Option<bool>, api_port: u16) {
-        if let Some(tun_mode) = tun_mode {
-            self.requested_tun_mode = tun_mode;
-        }
+    fn commit_requested_backend(&mut self, tun_mode: bool, api_port: u16) {
+        self.requested_tun_mode = tun_mode;
         self.api_port = api_port;
         self.grpc = GrpcClient::new(api_port);
         self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
@@ -2399,17 +2499,11 @@ impl Runtime {
     }
 
     async fn start_backend(&mut self) {
-        // Begin a Restart record only when the window is empty: internal
-        // starts (housekeeping, rollback) ride the record the caller left
-        // busy (an apply-then-restart, the update health-gate) and must not
-        // re-enter the registry.
-        if self.jobs.busy_kind().is_none()
-            && let Err(Busy { active }) = self.begin_exclusive(JobKind::Restart)
-        {
-            // Cannot reject: the gate above ran in the same synchronous
-            // section, so the window is still empty.
-            unreachable!("internal Restart begin raced no mutation: {active:?} holds the window")
-        }
+        // An internal start (housekeeping, rollback, the health gate) either
+        // opens the lifecycle record or rides the one its requester already
+        // holds; `release_exclusive` below ends whichever record owns the
+        // window.
+        self.begin_internal_start();
         if self.backend.is_alive() {
             self.app_log(Diag::new(Key::RtLogInternalStartRejected));
             self.release_exclusive();
@@ -3666,26 +3760,9 @@ impl Runtime {
             self.emit(CoreEvt::Operation(None));
             return;
         }
-        match self.begin_exclusive(JobKind::UpdateCore) {
-            Ok(_) => {}
-            Err(Busy { active }) => {
-                // Whitelist-era reject: log the line, settle the optimistic
-                // update state with the failure, then re-emit the occupant's
-                // bookend so the GUI settles its local view without releasing
-                // the operation that rejected this command.
-                let output = Self::busy_reject_text(active);
-                self.app_log(output.clone());
-                self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
-                    output,
-                ))));
-                self.emit(CoreEvt::Operation(Some(
-                    active
-                        .exclusive_operation_kind()
-                        .expect("busy occupants are exclusive kinds; queries never occupy"),
-                )));
-                return;
-            }
-        }
+        let Some(_id) = self.begin_exclusive(JobKind::UpdateCore, BusyAnswer::Nowhere) else {
+            return;
+        };
         let initial_stage = match &source {
             CoreUpdateSource::PinnedDownload => Diag::new(Key::RtFrameStageCheckingRelease),
             CoreUpdateSource::LocalArchive(_) => Diag::new(Key::RtFrameStageVerifyingArchive),
@@ -4691,75 +4768,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn conflicting_import_preserves_the_active_operation_owner() {
-        // `ImportCoreArchive` funnels into `update_core`, whose busy-reject
-        // path gates on `update_pending_health()` before the registry check;
-        // isolate from the real %APPDATA% root (same rationale as
-        // `stop_holds_update_slot_while_the_install_cannot_be_aborted`).
-        with_appdata_async(async {
-            let (mut runtime, events) = runtime_with_events();
-            occupy_exclusive(&mut runtime, JobKind::Start);
-
-            runtime
-                .handle_cmd(CoreCmd::ImportCoreArchive("selected.zip".into()))
-                .await;
-
-            assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::Start));
-            flush_bookends(&mut runtime);
-            let emitted: Vec<_> = events.try_iter().collect();
-            assert!(emitted.iter().any(|event| matches!(
-                event,
-                CoreEvt::Download(super::DownloadState::Failed(error))
-                    if error.text(Language::En) == busy_reject_text(JobKind::Start)
-            )));
-            assert!(
-                emitted
-                    .iter()
-                    .any(|event| matches!(event, CoreEvt::Operation(Some(OperationKind::Start))))
-            );
-            assert!(
-                !emitted
-                    .iter()
-                    .any(|event| matches!(event, CoreEvt::Operation(None)))
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn conflicting_update_preserves_the_active_operation_owner() {
-        // The busy-reject path gates on `update_pending_health()` before the
-        // registry check; isolate from the real %APPDATA% root (same
-        // rationale as `stop_holds_update_slot_while_the_install_cannot_be_aborted`).
-        with_appdata_async(async {
-            let (mut runtime, events) = runtime_with_events();
-            occupy_exclusive(&mut runtime, JobKind::Start);
-
-            runtime.handle_cmd(CoreCmd::UpdateCore).await;
-
-            assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::Start));
-            flush_bookends(&mut runtime);
-            let emitted: Vec<_> = events.try_iter().collect();
-            assert!(emitted.iter().any(|event| matches!(
-                event,
-                CoreEvt::Download(super::DownloadState::Failed(error))
-                    if error.text(Language::En) == busy_reject_text(JobKind::Start)
-            )));
-            assert!(
-                emitted
-                    .iter()
-                    .any(|event| matches!(event, CoreEvt::Operation(Some(OperationKind::Start))))
-            );
-            assert!(
-                !emitted
-                    .iter()
-                    .any(|event| matches!(event, CoreEvt::Operation(None)))
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn core_rollback_failure_releases_update_operation() {
         // The rollback leg renames whatever core tree the current root holds,
         // so isolate it: a concurrent test's redirected env must never decide
@@ -4947,47 +4955,266 @@ mod tests {
             "the busy-window reject must arrive on the request's reply channel"
         );
     }
+    /// The log-only flavour (Start, Restart): a held window answers with the
+    /// shared busy line naming the occupant, leaves the occupant's record
+    /// alone, and gives the command no terminal of its own — the busy line is
+    /// all the user gets.
     #[tokio::test(flavor = "current_thread")]
-    async fn conflicting_test_config_rejects_through_reply_channel() {
-        // TestConfig answers on the request's own oneshot channel.
-        // The busy-window reject (TestConfig's registry rule blocks it) must
-        // deliver the same rejection text it used to emit as an event — now
-        // straight into the requester's channel (no event, no bus).
+    async fn logged_flavour_answers_a_held_window_with_the_busy_line() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        let (reply, result) = tokio::sync::oneshot::channel();
+        occupy_exclusive(&mut runtime, JobKind::TestConfig);
 
-        runtime
-            .handle_cmd(CoreCmd::TestConfig {
-                config: serde_json::json!({}),
-                reply,
-            })
-            .await;
+        runtime.handle_cmd(CoreCmd::Start).await;
+        runtime.handle_cmd(CoreCmd::Restart).await;
 
+        assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::TestConfig));
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
         assert_eq!(
-            reply_reject_text(result.await),
-            busy_reject_text(JobKind::UpdateCore),
-            "the busy-window reject must arrive on the request's reply channel"
+            app_log_texts(&emitted),
+            vec![busy_reject_text(JobKind::TestConfig); 2],
+            "each log-only kind must report the occupant once"
         );
         assert!(
-            events
-                .try_iter()
-                .all(|event| !matches!(event, CoreEvt::Operation(None) | CoreEvt::LatencyProbe(_))),
-            "the sync reject must not release the busy owner nor emit a probe result"
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::Operation(None))),
+            "a rejected command must not release the occupant's window"
         );
     }
+
+    /// The preempting flavour (Stop): the held window never answers Stop — it
+    /// cancels the occupant (whose cancel terminal the runtime delivers), and
+    /// the window ends up owned by the Stop record.
     #[tokio::test(flavor = "current_thread")]
-    async fn conflicting_latency_probe_emits_one_error_without_releasing_owner() {
+    async fn preempting_flavour_cancels_the_occupant_and_begins() {
+        let (mut runtime, events) = runtime_with_events();
+        // A live backend makes Stop open its own lifecycle record.
+        runtime.backend = BackendState::for_test(true, false);
+        occupy_exclusive(&mut runtime, JobKind::Restart);
+        park_pending_task(&mut runtime);
+
+        runtime.handle_cmd(CoreCmd::Stop).await;
+
+        assert_eq!(
+            runtime.jobs.busy_kind(),
+            Some(JobKind::Stop),
+            "Stop must hold the window it preempted, never be rejected by it"
+        );
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            !app_log_texts(&emitted).contains(&busy_reject_text(JobKind::Restart)),
+            "a preempting kind is never told the window is busy"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter_map(|event| match event {
+                    CoreEvt::Operation(operation) => Some(*operation),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                Some(OperationKind::Restart),
+                None,
+                Some(OperationKind::Stop)
+            ],
+            "the occupant's release must be ordered before the preemptor's begin"
+        );
+    }
+
+    /// The reply flavour (config test, profile validation): a held window
+    /// answers on the request's own channel, names the occupant, leaves the
+    /// occupant's window open, and a rejected validation writes no scratch
+    /// config.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reply_flavour_answers_a_held_window_on_the_request_channel() {
+        with_appdata_async(async {
+            let (mut runtime, events) = runtime_with_events();
+            occupy_exclusive(&mut runtime, JobKind::ValidateProfiles);
+
+            let (test_reply, test_result) = tokio::sync::oneshot::channel();
+            runtime
+                .handle_cmd(CoreCmd::TestConfig {
+                    config: serde_json::json!({}),
+                    reply: test_reply,
+                })
+                .await;
+            let (profile_reply, profile_result) = tokio::sync::oneshot::channel();
+            runtime
+                .handle_cmd(CoreCmd::ValidateProfiles {
+                    request: validation_request(
+                        ProfileValidationOrigin::Import,
+                        vec![freedom_profile("rejected")],
+                    ),
+                    reply: profile_reply,
+                })
+                .await;
+
+            assert_eq!(
+                reply_reject_text(test_result.await),
+                busy_reject_text(JobKind::ValidateProfiles),
+                "a rejected config test must answer on the request's reply channel"
+            );
+            assert_eq!(
+                profile_result
+                    .await
+                    .expect("the reject answers on the reply channel")
+                    .as_ref()
+                    .err()
+                    .map(|error| error.text(Language::En)),
+                Some(busy_reject_text(JobKind::ValidateProfiles)),
+                "a rejected validation must answer on the request's reply channel"
+            );
+            assert_eq!(
+                runtime.jobs.busy_kind(),
+                Some(JobKind::ValidateProfiles),
+                "a rejected command must not touch the occupant"
+            );
+            assert!(
+                scratch_configs_in_config_dir().is_empty(),
+                "a rejected validation must not write a scratch config"
+            );
+            flush_bookends(&mut runtime);
+            let emitted: Vec<_> = events.try_iter().collect();
+            assert!(
+                emitted.iter().any(|event| matches!(
+                    event,
+                    CoreEvt::Operation(Some(OperationKind::ValidateProfiles))
+                )),
+                "the occupied window must stay visible to the UI gates"
+            );
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, CoreEvt::Operation(None))),
+                "the reject must not release the busy owner"
+            );
+        })
+        .await;
+    }
+
+    /// A transport toggle answers a held window through the same runner as
+    /// every other exclusive command: the occupant is named, the mode stays
+    /// where it was, and nothing is released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_window_answers_the_transport_toggle() {
         let (mut runtime, events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        let profile = crate::model::ServerProfile::new(
-            "probe",
-            crate::model::OutboundModel::new(crate::model::Protocol::Freedom),
+
+        runtime.handle_cmd(CoreCmd::SetTunMode(true)).await;
+
+        assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::UpdateCore));
+        assert!(
+            !runtime.requested_tun_mode,
+            "a rejected toggle must not record the mode"
         );
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            app_log_texts(&emitted).contains(&busy_reject_text(JobKind::UpdateCore)),
+            "the rejected toggle must report the occupant, got: {emitted:?}"
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::Operation(None))),
+            "the reject must not release the occupant's window"
+        );
+    }
+
+    /// A transport toggle with no live backend records the mode, logs it, and
+    /// closes the lifecycle record its begin opened — no restart work rides a
+    /// stopped core.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_transport_toggle_records_the_mode_and_closes_its_record() {
+        let (mut runtime, events) = runtime_with_events();
+
+        runtime.handle_cmd(CoreCmd::SetTunMode(true)).await;
+
+        assert!(runtime.requested_tun_mode);
+        assert!(
+            runtime.jobs.busy_kind().is_none(),
+            "the record the toggle began must be released again"
+        );
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            emitted
+                .iter()
+                .filter_map(|event| match event {
+                    CoreEvt::Operation(operation) => Some(*operation),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![Some(OperationKind::Restart), None],
+            "the toggle's own record must open and close"
+        );
+        assert_eq!(
+            app_log_texts(&emitted),
+            vec![t(Language::En, Key::RtLogTunModeOn).to_string()],
+            "an idle toggle reports the mode it recorded and nothing else"
+        );
+    }
+
+    /// An accepted config test whose candidate cannot be written still
+    /// answers its requester exactly once: the write failure is the terminal,
+    /// delivered on the reply the accepted begin parked, and the window is
+    /// released with it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_candidate_that_cannot_be_written_answers_the_test_on_its_reply() {
+        with_appdata_async(async {
+            // A file where the config directory belongs: every candidate write
+            // fails, whatever the enclosing tree's permissions are.
+            let directory = crate::sys::paths::config_dir();
+            std::fs::create_dir_all(directory.parent().expect("config dir has a parent"))
+                .expect("create the isolated app root");
+            std::fs::write(&directory, b"not a directory").expect("block the config directory");
+            let (mut runtime, events) = runtime_with_events();
+            let (reply, result) = tokio::sync::oneshot::channel();
+
+            runtime
+                .handle_cmd(CoreCmd::TestConfig {
+                    config: serde_json::json!({}),
+                    reply,
+                })
+                .await;
+
+            let verdict = result
+                .await
+                .expect("the accepted begin parked the reply, so the reject answers it");
+            let error = verdict.expect_err("a candidate that cannot be written is a rejection");
+            assert_eq!(error.diag().key(), Key::RtFrameCandidateWriteFailed);
+            assert!(
+                runtime.jobs.busy_kind().is_none(),
+                "the pre-spawn reject must release the window"
+            );
+            flush_bookends(&mut runtime);
+            assert!(
+                events
+                    .try_iter()
+                    .any(|event| matches!(event, CoreEvt::Operation(None))),
+                "the release must reach the GUI"
+            );
+        })
+        .await;
+    }
+
+    /// The probe-event flavour (latency probe): a held window answers as one
+    /// probe failure event carrying the request's own tags, and the occupant
+    /// keeps its window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_event_flavour_answers_a_held_window_as_one_probe_failure() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
 
         runtime
             .handle_cmd(CoreCmd::ProbeLatency {
-                profiles: vec![profile],
+                profiles: vec![crate::model::ServerProfile::new(
+                    "probe",
+                    crate::model::OutboundModel::new(crate::model::Protocol::Freedom),
+                )],
                 probe_url: "http://127.0.0.1:1".into(),
                 tun_outbound_interface: None,
                 tun_adapter_name: None,
@@ -4997,6 +5224,10 @@ mod tests {
         assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::UpdateCore));
         flush_bookends(&mut runtime);
         let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            app_log_texts(&emitted).contains(&busy_reject_text(JobKind::UpdateCore)),
+            "the probe reject must reach the log, got: {emitted:?}"
+        );
         let results: Vec<_> = emitted
             .iter()
             .filter_map(|event| match event {
@@ -5004,8 +5235,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].tags.len(), 1);
+        assert_eq!(results.len(), 1, "the reject is one terminal result");
+        assert_eq!(
+            results[0].tags.len(),
+            1,
+            "the failure must carry the request's own tags"
+        );
         assert!(matches!(
             &results[0].result,
             Err(error) if error.headline.key() == Key::RtFrameCommandRejectedBusy
@@ -5013,8 +5248,113 @@ mod tests {
         assert!(
             !emitted
                 .iter()
-                .any(|event| matches!(event, CoreEvt::Operation(None)))
+                .any(|event| matches!(event, CoreEvt::Operation(None))),
+            "the reject must not release the occupying probe owner"
         );
+    }
+
+    /// The apply-verdict flavour (the apply family): a held window answers
+    /// with a failed verdict naming the occupant, and the occupant keeps its
+    /// window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_verdict_flavour_answers_a_held_window_with_the_verdict() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
+
+        runtime
+            .handle_cmd(CoreCmd::Apply {
+                value: serde_json::json!({}),
+                intent: super::ApplyIntent::Commit { tun_mode: false },
+                revision: 7,
+            })
+            .await;
+
+        assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::UpdateCore));
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        let verdicts: Vec<_> = emitted
+            .iter()
+            .filter_map(|event| match event {
+                CoreEvt::ApplyResult {
+                    ok,
+                    output,
+                    revision,
+                } => Some((*ok, *revision, output)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 1, "the reject is one terminal verdict");
+        assert!(!verdicts[0].0, "a rejected apply must not claim success");
+        assert_eq!(
+            verdicts[0].1, 7,
+            "the reject must name the revision the rejected command carried"
+        );
+        assert_eq!(
+            verdicts[0].2.text(Language::En),
+            busy_reject_text(JobKind::UpdateCore),
+            "the rejected apply must report the occupant"
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::Operation(None))),
+            "the reject must not release the owner that rejected it"
+        );
+    }
+
+    /// The update-settled flavour (core update, and the archive it imports):
+    /// a held window answers with the shared busy line, settles the
+    /// optimistically-shown update state, and re-emits the occupant's own
+    /// bookend so the GUI keeps its owner.
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_settled_flavour_answers_a_held_window_and_keeps_the_owner() {
+        // The import path gates on the durable swap marker before the
+        // registry, so isolate it from the real %APPDATA% root.
+        with_appdata_async(async {
+            let (mut runtime, events) = runtime_with_events();
+            occupy_exclusive(&mut runtime, JobKind::Start);
+            // Drain the occupant's own bookend first: the re-emits asserted
+            // below are the ones a rejected update command owes the GUI.
+            flush_bookends(&mut runtime);
+            let _ = events.try_iter().count();
+
+            runtime.handle_cmd(CoreCmd::UpdateCore).await;
+            runtime
+                .handle_cmd(CoreCmd::ImportCoreArchive("selected.zip".into()))
+                .await;
+
+            assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::Start));
+            let emitted: Vec<_> = events.try_iter().collect();
+            let failures: Vec<_> = emitted
+                .iter()
+                .filter_map(|event| match event {
+                    CoreEvt::Download(super::DownloadState::Failed(error)) => {
+                        Some(error.text(Language::En))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                failures,
+                vec![busy_reject_text(JobKind::Start); 2],
+                "each update command must settle its optimistic state with the occupant's name"
+            );
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| matches!(event, CoreEvt::Operation(Some(OperationKind::Start))))
+                    .count(),
+                2,
+                "the GUI must be handed its owner back after each reject"
+            );
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, CoreEvt::Operation(None))),
+                "the owner must stay held for the command that rejected the update"
+            );
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5247,7 +5587,7 @@ mod tests {
         assert!(apply_indices[0] < none_indices[0]);
         assert!(matches!(
             &emitted[apply_indices[0]],
-            CoreEvt::ApplyResult { ok: false, output }
+            CoreEvt::ApplyResult { ok: false, output, .. }
                 if output.text(Language::En)
                     == apply_cancelled_text(Key::RtReasonStopRequested)
         ));
@@ -5298,7 +5638,7 @@ mod tests {
         assert!(apply_indices[0] < none_indices[0]);
         assert!(matches!(
             &emitted[apply_indices[0]],
-            CoreEvt::ApplyResult { ok: false, output }
+            CoreEvt::ApplyResult { ok: false, output, .. }
                 if output.text(Language::En)
                     == apply_cancelled_text(Key::RtReasonShutdownRequested)
         ));
@@ -5457,118 +5797,6 @@ mod tests {
             .expect("the worker completes without panicking");
         runtime.jobs.clear_exclusive_task();
         runtime.complete_exclusive(outcome).await;
-    }
-
-    /// The busy-window reject the verb answers when another occupying
-    /// operation holds the window (and, symmetrically, the one that
-    /// operation gets while a validation runs).
-    #[tokio::test(flavor = "current_thread")]
-    async fn validate_profiles_rejects_while_another_occupying_operation_runs() {
-        with_appdata_async(async {
-            let (mut runtime, events) = runtime_with_events();
-            occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-            let (reply, result) = tokio::sync::oneshot::channel();
-
-            runtime
-                .handle_cmd(CoreCmd::ValidateProfiles {
-                    request: validation_request(
-                        ProfileValidationOrigin::Import,
-                        vec![freedom_profile("rejected")],
-                    ),
-                    reply,
-                })
-                .await;
-
-            let verdict = result
-                .await
-                .expect("the reject answers on the reply channel");
-            assert_eq!(
-                verdict.as_ref().err().map(|error| error.text(Language::En)),
-                Some(busy_reject_text(JobKind::UpdateCore)),
-                "the busy-window reject must arrive on the request's reply channel"
-            );
-            assert_eq!(
-                runtime.jobs.busy_kind(),
-                Some(JobKind::UpdateCore),
-                "a rejected validation must not touch the occupant"
-            );
-            assert!(
-                scratch_configs_in_config_dir().is_empty(),
-                "a rejected validation must not write a scratch config"
-            );
-            assert!(
-                events
-                    .try_iter()
-                    .all(|event| !matches!(event, CoreEvt::Operation(None))),
-                "the sync reject must not release the busy owner"
-            );
-        })
-        .await;
-    }
-
-    /// The accepted validation occupies the busy window: another occupying
-    /// command rejects while it runs, and the GUI sees its bookend.
-    #[tokio::test(flavor = "current_thread")]
-    async fn occupying_operations_reject_while_a_validation_runs() {
-        with_appdata_async(async {
-            let (mut runtime, events) = runtime_with_events();
-            let (reply, mut result) = tokio::sync::oneshot::channel();
-            runtime
-                .handle_cmd(CoreCmd::ValidateProfiles {
-                    request: validation_request(
-                        ProfileValidationOrigin::Import,
-                        vec![freedom_profile("holding")],
-                    ),
-                    reply,
-                })
-                .await;
-            assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::ValidateProfiles));
-            flush_bookends(&mut runtime);
-            let emitted: Vec<_> = events.try_iter().collect();
-            assert!(
-                emitted.iter().any(|event| matches!(
-                    event,
-                    CoreEvt::Operation(Some(OperationKind::ValidateProfiles))
-                )),
-                "the accepted validation must open the busy window for the UI gates"
-            );
-
-            let (test_reply, test_result) = tokio::sync::oneshot::channel();
-            runtime
-                .handle_cmd(CoreCmd::TestConfig {
-                    config: serde_json::json!({}),
-                    reply: test_reply,
-                })
-                .await;
-            assert_eq!(
-                test_result
-                    .await
-                    .expect("the reject answers on the reply channel")
-                    .as_ref()
-                    .err()
-                    .map(|error| error.text(Language::En)),
-                Some(busy_reject_text(JobKind::ValidateProfiles)),
-                "a second occupying command must reject while the validation runs"
-            );
-
-            // The worker's own terminal releases the window exactly once.
-            runtime.handle_cmd(CoreCmd::Shutdown).await;
-            assert!(
-                result.try_recv().is_err(),
-                "the cooperative cancel must not deliver the terminal itself"
-            );
-            complete_parked_exclusive(&mut runtime).await;
-            let verdict = result
-                .await
-                .expect("the worker's terminal must be delivered");
-            assert_eq!(
-                verdict.as_ref().err().map(|error| error.text(Language::En)),
-                Some(crate::rt::profiles::validation_cancelled().text(Language::En)),
-                "the cancelled worker delivers its own exactly-one terminal"
-            );
-            assert_released_once(&mut runtime, &events);
-        })
-        .await;
     }
 
     /// Stop cancels a validation cooperatively: the child that owns the
@@ -5878,7 +6106,7 @@ mod tests {
         let apply_results: Vec<_> = emitted
             .iter()
             .filter_map(|event| match event {
-                CoreEvt::ApplyResult { ok, output } => Some((ok, output)),
+                CoreEvt::ApplyResult { ok, output, .. } => Some((ok, output)),
                 _ => None,
             })
             .collect();
@@ -6760,44 +6988,6 @@ mod tests {
         );
     }
     #[tokio::test(flavor = "current_thread")]
-    async fn latency_probe_busy_reject_is_logged() {
-        let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
-
-        runtime
-            .handle_cmd(CoreCmd::ProbeLatency {
-                profiles: vec![],
-                probe_url: "https://example.com/generate_204".into(),
-                tun_outbound_interface: None,
-                tun_adapter_name: None,
-            })
-            .await;
-
-        let emitted: Vec<_> = events.try_iter().collect();
-        let expected = busy_reject_text(JobKind::LatencyProbe);
-        assert!(
-            app_log_texts(&emitted).contains(&expected),
-            "the busy rejection must reach the log as a keyed app message, got: {emitted:?}"
-        );
-        assert!(
-            emitted.iter().any(|event| matches!(
-                event,
-                CoreEvt::LatencyProbe(result)
-                    if result.tags.is_empty()
-                        && matches!(&result.result, Err(failure)
-                            if failure.headline.key() == Key::RtFrameCommandRejectedBusy)
-            )),
-            "the busy rejection must still reach the UI as a terminal result"
-        );
-        assert!(
-            !emitted
-                .iter()
-                .any(|event| matches!(event, CoreEvt::Operation(None))),
-            "the reject must not release the occupying probe owner"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn latency_probe_no_profiles_reject_is_logged() {
         let (mut runtime, events) = runtime_with_events();
         runtime
@@ -7136,7 +7326,7 @@ mod tests {
         let apply_results: Vec<_> = emitted
             .iter()
             .filter_map(|event| match event {
-                CoreEvt::ApplyResult { ok, output } => Some((ok, output)),
+                CoreEvt::ApplyResult { ok, output, .. } => Some((ok, output)),
                 _ => None,
             })
             .collect();
@@ -7365,7 +7555,7 @@ mod tests {
         let apply_results: Vec<_> = events
             .try_iter()
             .filter_map(|event| match event {
-                CoreEvt::ApplyResult { ok, output } => Some((ok, output)),
+                CoreEvt::ApplyResult { ok, output, .. } => Some((ok, output)),
                 _ => None,
             })
             .collect();

@@ -52,7 +52,7 @@ fn free_port() -> u16 {
 /// passed verbatim — broccoli's own 5-field cron validation is not on this path,
 /// matching `core_update_e2e`'s raw-config approach. Configurations enter the
 /// runtime through the apply path — a start never replays a stored artefact —
-/// so the helper hands the value to `CoreCmd::ApplyConfigAndStart` instead of
+/// so the helper hands the value to `CoreCmd::Apply` instead of
 /// writing a file.
 fn runnable_config(
     socks_port: u16,
@@ -92,6 +92,18 @@ fn runnable_config(
             .insert("routing".into(), routing);
     }
     config
+}
+
+/// Apply and start one isolated configuration: the runtime validates it with
+/// `xray run -test`, commits it, and starts the core on it. These tests drive
+/// one runtime with a direct configuration and never compare config
+/// revisions, so the candidate is sent as the first revision.
+fn apply_and_start(config: serde_json::Value) -> CoreCmd {
+    CoreCmd::Apply {
+        value: config,
+        intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
+        revision: 0,
+    }
 }
 
 fn copy_file(source: &std::path::Path, destination: &std::path::Path) {
@@ -313,7 +325,7 @@ fn downloads_and_reloads_geodata_without_restart() {
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(config))
+        .send(apply_and_start(config))
         .expect("apply and start the isolated configuration");
 
     let (core_pid, start_logs, ready_error) =
@@ -418,7 +430,7 @@ fn payload_files_stay_replaceable_while_core_runs() {
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(config))
+        .send(apply_and_start(config))
         .expect("apply and start the isolated configuration");
 
     let (core_pid, _start_logs, ready_error) =
@@ -514,7 +526,7 @@ fn broken_file_rolls_back() {
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(config))
+        .send(apply_and_start(config))
         .expect("apply and start the isolated configuration");
 
     let (core_pid, _start_logs, ready_error) =
@@ -714,7 +726,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(config.clone()))
+        .send(apply_and_start(config.clone()))
         .expect("apply and start the isolated configuration");
 
     // First run: with the geodata block configured the core reaches Running.
@@ -799,7 +811,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(first_pid, Instant::now() + Duration::from_secs(10));
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(config.clone()))
+        .send(apply_and_start(config.clone()))
         .expect("restart the core");
     let (second_pid, second_start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));
@@ -837,7 +849,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(second_pid, Instant::now() + Duration::from_secs(10));
     rt.cmd
-        .send(CoreCmd::ApplyConfigAndStart(runnable_config(
+        .send(apply_and_start(runnable_config(
             socks_port,
             api_port,
             None,

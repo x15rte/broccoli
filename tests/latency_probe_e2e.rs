@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
-use broccoli::rt::{CoreCmd, CoreEvt, CorePhase, GrpcClient, LatencyProbeResult};
+use broccoli::rt::{ApplyIntent, CoreCmd, CoreEvt, CorePhase, GrpcClient, LatencyProbeResult};
 
 fn write_verified_release_metadata(core: &Path) {
     let metadata = serde_json::json!({
@@ -302,7 +302,11 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
     let runtime = broccoli::rt::spawn_runtime(evt_tx, egui::Context::default());
     runtime
         .cmd
-        .send(CoreCmd::ApplyConfigAndStart(main_config))
+        .send(CoreCmd::Apply {
+            value: main_config,
+            intent: ApplyIntent::CommitAndStart { tun_mode: false },
+            revision: 0,
+        })
         .expect("start main runtime");
 
     let startup_deadline = Instant::now() + Duration::from_secs(30);

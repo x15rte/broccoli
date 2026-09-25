@@ -136,7 +136,11 @@ fn socks_to_freedom_e2e() {
     // One command guarantees Start cannot race validation or launch a stale
     // config when validation fails.
     rt.cmd
-        .send(broccoli::rt::CoreCmd::ApplyConfigAndStart(config))
+        .send(broccoli::rt::CoreCmd::Apply {
+            value: config,
+            intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
+            revision: 0,
+        })
         .unwrap();
 
     // Wait for Running.
@@ -152,7 +156,7 @@ fn socks_to_freedom_e2e() {
                 assert_eq!(
                     transport,
                     broccoli::rt::CoreTransport::Direct,
-                    "ApplyConfigAndStart reported a non-direct backend"
+                    "the apply-and-start command reported a non-direct backend"
                 );
                 active_snapshot = Some(snapshot);
             }
