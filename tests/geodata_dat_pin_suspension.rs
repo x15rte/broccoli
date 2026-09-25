@@ -2,10 +2,11 @@
 //! installed managed core.
 //!
 //! A user-configured `geodata` block suspends only the geo data files'
-//! SHA-256 compare: drifted geoip.dat/geosite.dat must verify under
-//! `open_verified_core_user_managed_dats` and are never healed, while
-//! `open_verified_core` (no geodata block) restores them from the retained
-//! pin-verified pristine pair and re-verifies — failing terminally only
+//! SHA-256 compare: drifted geoip.dat/geosite.dat must verify under the
+//! config-driven open decision (`open_verified_for_config`, a config whose
+//! `geodata` block carries an asset URL) and are never healed, while a config
+//! without that block restores them from the retained pin-verified pristine
+//! pair and re-verifies — failing terminally only
 //! when the pair is missing or corrupt. A tampered xray.exe or wintun.dll
 //! must refuse to open in both modes. These tests are ignored by default:
 //! they require the real pinned managed core under `%APPDATA%\broccoli\core`
@@ -17,8 +18,25 @@ use std::path::{Path, PathBuf};
 
 use broccoli::diag::DiagError;
 use broccoli::sys::core_dl::{
-    VerifiedCore, open_verified_core, open_verified_core_user_managed_dats, pinned_release_version,
+    VerifiedCore, VerifyScope, open_verified_for_config, open_verified_for_config_at,
+    pinned_release_version,
 };
+
+/// The config a spawn would run when the user configured the core's own geo
+/// data updater: its `geodata` block is what suspends the DAT compares.
+const USER_MANAGED_CONFIG: &[u8] =
+    br#"{"geodata":{"assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#;
+
+/// The config a spawn would run with the release-managed geo data: no
+/// `geodata` block, so the DAT compares stay hard.
+const RELEASE_MANAGED_CONFIG: &[u8] = br#"{"outbounds":[]}"#;
+
+/// Open `core` the way a spawn running `config` opens it.
+fn open_for_config(core: &Path, config: &[u8]) -> Result<VerifiedCore, DiagError> {
+    let config: serde_json::Value =
+        serde_json::from_slice(config).expect("fixture config must parse");
+    open_verified_for_config(core, &config, VerifyScope::Full)
+}
 
 /// The managed-core members a verify covers; copied in pin order so a clone
 /// is a faithful stand-in for the real tree.
@@ -116,20 +134,29 @@ fn expect_verify_error(result: Result<VerifiedCore, DiagError>, message: &str) -
     }
 }
 
-/// Baseline: an unmodified clone of the release tree must verify strictly —
-/// this validates the harness itself before the drift assertions.
+/// Baseline: an unmodified clone of the release tree must verify under the
+/// config-driven open — this validates the harness itself before the drift
+/// assertions. The two adapters are the two shapes a spawn holds: a parsed
+/// config value, and the config file on disk the spawn is about to run.
 #[test]
 #[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
-fn unmodified_clone_passes_strict_verification() {
+fn unmodified_clone_passes_release_managed_verification() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
     let clone = clone_installed_core(sink.path());
-    let verified = open_verified_core(&clone).expect("pristine clone must verify strictly");
+    let verified = open_for_config(&clone, RELEASE_MANAGED_CONFIG)
+        .expect("pristine clone must verify under a release-managed config");
     assert_pinned_version(verified.version());
+
+    let config = sink.path().join("config.json");
+    fs::write(&config, RELEASE_MANAGED_CONFIG).expect("write release-managed config file");
+    let from_path = open_verified_for_config_at(&clone, &config, VerifyScope::Full)
+        .expect("the on-disk form of the same config must verify identically");
+    assert_pinned_version(from_path.version());
 }
 
-/// Drifted geo data: strict verification on a clone WITHOUT a pristine pair
+/// Drifted geo data: a release-managed open on a clone WITHOUT a pristine pair
 /// is terminal with the restore reason named (the unrestorable-heal path),
-/// the user-managed entry accepts the drift, and its stage-copy
+/// a user-managed open accepts the drift, and its stage-copy
 /// proof still holds (byte fidelity against the observed hash, not the pin).
 #[test]
 #[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
@@ -140,7 +167,7 @@ fn user_managed_dats_accept_drift_that_strict_verification_rejects() {
     drift(&clone.join("geosite.dat"));
 
     let strict = expect_verify_error(
-        open_verified_core(&clone),
+        open_for_config(&clone, RELEASE_MANAGED_CONFIG),
         "drifted geo data must fail the strict release verify without a pristine pair",
     );
     let message = strict.to_string();
@@ -157,8 +184,8 @@ fn user_managed_dats_accept_drift_that_strict_verification_rejects() {
         "the unrestorable heal must be reported as a failed auto-restore, got: {message}"
     );
 
-    let mut verified = open_verified_core_user_managed_dats(&clone)
-        .expect("drifted geo data must verify under the user-managed entry");
+    let mut verified = open_for_config(&clone, USER_MANAGED_CONFIG)
+        .expect("drifted geo data must verify under a user-managed config");
     assert_pinned_version(verified.version());
 
     // The helper-stage copy hashes each copied payload against the recorded
@@ -191,7 +218,7 @@ fn tampered_executable_or_driver_fails_in_strict_and_user_managed_modes() {
         drift(&clone.join(tampered));
 
         let strict = expect_verify_error(
-            open_verified_core(&clone),
+            open_for_config(&clone, RELEASE_MANAGED_CONFIG),
             "tampered payload must fail the strict release verify",
         );
         assert!(
@@ -199,7 +226,7 @@ fn tampered_executable_or_driver_fails_in_strict_and_user_managed_modes() {
             "strict failure must be a payload verification error, got: {strict}"
         );
         let user_managed = expect_verify_error(
-            open_verified_core_user_managed_dats(&clone),
+            open_for_config(&clone, USER_MANAGED_CONFIG),
             "tampered payload must fail the user-managed release verify too",
         );
         assert!(
@@ -212,7 +239,7 @@ fn tampered_executable_or_driver_fails_in_strict_and_user_managed_modes() {
 }
 
 /// Strict entry: drift with no geodata block self-heals. With a
-/// valid retained pristine pair, `open_verified_core` restores the drifted
+/// valid retained pristine pair, a release-managed open restores the drifted
 /// managed geo data from it, re-verifies, and proceeds — the managed files
 /// end up byte-identical to the pristine pair (which is the release pin
 /// bytes by construction of the clone).
@@ -225,7 +252,7 @@ fn strict_verify_heals_drifted_geo_data_from_the_pristine_pair() {
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
 
-    let verified = open_verified_core(&clone)
+    let verified = open_for_config(&clone, RELEASE_MANAGED_CONFIG)
         .expect("drifted geo data with a pristine pair must heal and verify strictly");
     assert_pinned_version(verified.version());
     drop(verified);
@@ -257,7 +284,7 @@ fn strict_verify_without_pristine_pair_fails_naming_the_restore_reason() {
     drift(&clone.join("geosite.dat"));
 
     let error = expect_verify_error(
-        open_verified_core(&clone),
+        open_for_config(&clone, RELEASE_MANAGED_CONFIG),
         "drifted geo data without a pristine pair must fail terminally",
     );
     let message = error.to_string();
@@ -301,7 +328,7 @@ fn strict_verify_fails_on_tampered_pristine_without_healing_managed_files() {
     .expect("tamper the pristine pair member");
 
     let error = expect_verify_error(
-        open_verified_core(&clone),
+        open_for_config(&clone, RELEASE_MANAGED_CONFIG),
         "a corrupt pristine pair must fail the strict open terminally",
     );
     let message = error.to_string();
@@ -338,8 +365,8 @@ fn strict_verify_heals_geosite_only_drift_after_geoip_is_locked() {
     pristine_from_managed(&clone);
     drift(&clone.join("geosite.dat"));
 
-    let verified =
-        open_verified_core(&clone).expect("a lone geosite drift must heal and verify strictly");
+    let verified = open_for_config(&clone, RELEASE_MANAGED_CONFIG)
+        .expect("a lone geosite drift must heal and verify strictly");
     assert_pinned_version(verified.version());
     drop(verified);
 
@@ -351,7 +378,7 @@ fn strict_verify_heals_geosite_only_drift_after_geoip_is_locked() {
     assert_no_restore_temps(&clone);
 }
 
-/// The user-managed entry never heals — drift is the expected
+/// A user-managed config never heals — drift is the expected
 /// user-managed state even when a valid pristine pair sits right there —
 /// so the managed files stay drifted after a successful open.
 #[test]
@@ -363,8 +390,8 @@ fn user_managed_entry_never_heals_drifted_geo_data_even_with_a_valid_pristine_pa
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
 
-    let verified = open_verified_core_user_managed_dats(&clone)
-        .expect("drifted geo data must verify under the user-managed entry");
+    let verified = open_for_config(&clone, USER_MANAGED_CONFIG)
+        .expect("drifted geo data must verify under a user-managed config");
     assert_pinned_version(verified.version());
     drop(verified);
 

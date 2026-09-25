@@ -60,12 +60,12 @@ pub(super) fn run_xray_bounded(
     // The verification mode follows the committed config, like every spawn
     // path: a config carrying geodata URLs leaves the DAT pair to the core's
     // own updater, so the strict entry's drift heal must not revert it here.
-    let active_config = crate::rt::apply::active_path();
-    let verified_core = if crate::sys::core_dl::dat_pins_suspended_at(&active_config) {
-        crate::sys::core_dl::open_verified_core_user_managed_dats(&core)
-    } else {
-        crate::sys::core_dl::open_verified_managed_core()
-    }
+    // One decision, shared with the spawns and the apply gate.
+    let verified_core = crate::sys::core_dl::open_verified_for_config_at(
+        &core,
+        &crate::rt::apply::active_path(),
+        crate::sys::core_dl::VerifyScope::Full,
+    )
     .map_err(|error| {
         t_fmt(
             lang,

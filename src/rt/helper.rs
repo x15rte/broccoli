@@ -1133,17 +1133,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     output
 }
 
-/// The `start` command's DAT-suspension flag, as the GUI derived it from the
-/// exact config being staged (see [`start_command`]). The elevated server
-/// trusts the flag and fails closed when it is absent, null, or not a
-/// boolean — a stale GUI must behave strictly, never the reverse.
-fn wire_dat_pins_suspended(command: &serde_json::Value) -> bool {
-    command
-        .get("dat_pins_suspended")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn path_from_wire(value: Option<&serde_json::Value>) -> Result<PathBuf, DiagError> {
     let units = value
         .and_then(serde_json::Value::as_array)
@@ -1477,19 +1466,11 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|value| u16::try_from(value).ok())
                     .filter(|value| *value != 0);
-                let dat_pins_suspended = wire_dat_pins_suspended(&command);
                 let core_source = path_from_wire(command.get("core_path_utf16"));
                 let config_bytes = config_from_wire(&command);
                 match (api_port, core_source, config_bytes) {
                     (Some(api_port), Ok(core_source), Ok(config_bytes)) => {
-                        helper_start(
-                            &current,
-                            &writer,
-                            api_port,
-                            &core_source,
-                            &config_bytes,
-                            dat_pins_suspended,
-                        );
+                        helper_start(&current, &writer, api_port, &core_source, &config_bytes);
                     }
                     (_, core, config) => {
                         let detail = core.err().or_else(|| config.err()).unwrap_or_else(|| {
@@ -1710,19 +1691,19 @@ fn helper_start(
     api_port: u16,
     core_source: &Path,
     config_bytes: &[u8],
-    dat_pins_suspended: bool,
 ) {
     let prepared = (|| -> Result<SecureRuntimeStage, DiagError> {
-        // The staged config's own geodata block suspended the geo data pins
-        // GUI-side; mirror that decision here so the stage copy accepts the
-        // user-managed DAT pair. The geo data files are staged in both modes
-        // (they are payload-set members either way); only the compare mode
-        // differs.
-        let mut verified = if dat_pins_suspended {
-            crate::sys::core_dl::open_verified_core_user_managed_dats(core_source)?
-        } else {
-            crate::sys::core_dl::open_verified_core(core_source)?
-        };
+        // The staged config's own geodata block suspends the geo data pins,
+        // through the one shared open decision: the bytes the pipe carried
+        // are the bytes this stage runs, so the elevated side reaches the
+        // same mode the launching GUI would have — with no flag to trust.
+        // The geo data files are staged in both modes (they are payload-set
+        // members either way); only the compare mode differs.
+        let mut verified = crate::sys::core_dl::open_verified_for_config_bytes(
+            core_source,
+            config_bytes,
+            crate::sys::core_dl::VerifyScope::Full,
+        )?;
         let version = verified.version().to_string();
         let mut stage = SecureRuntimeStage::create()?;
         let payload_locks = verified.copy_runtime_payloads(&stage.path)?;
@@ -2558,21 +2539,13 @@ fn send_helper_lifecycle_event(mut event: HelperEvent, sender: &mpsc::Sender<Hel
 /// Build the wire `start` command for the exact core source and config
 /// content the GUI stages. The config travels as the base64 of the exact
 /// bytes the GUI validated in the same operation, so the elevated helper
-/// stages those bytes and never
-/// re-reads the user-writable active config path. The `dat_pins_suspended`
-/// flag is the shared predicate over that same content — the
-/// same decision the direct spawn and the apply gate make from the same
-/// config, so the elevated stage copy can never disagree with what the
-/// config at hand generated. Content that does not parse fails closed
-/// toward the hard pins, mirroring `core_dl::dat_pins_suspended_at`.
+/// stages those bytes — and derives the pin mode from them with the shared
+/// open decision — and never re-reads the user-writable active config path.
 fn start_command(api_port: u16, core: &Path, config_bytes: &[u8]) -> serde_json::Value {
     let core_path_utf16: Vec<u16> = core.as_os_str().encode_wide().collect();
-    let dat_pins_suspended = serde_json::from_slice::<serde_json::Value>(config_bytes)
-        .is_ok_and(|config| crate::sys::core_dl::geodata_updater_configured(&config));
     serde_json::json!({
         "cmd":"start",
         "api_port":api_port,
-        "dat_pins_suspended":dat_pins_suspended,
         "core_path_utf16":core_path_utf16,
         "config_base64":base64::engine::general_purpose::STANDARD.encode(config_bytes)
     })
@@ -3157,14 +3130,13 @@ mod tests {
     }
 
     #[test]
-    fn start_command_derives_the_suspension_flag_from_the_staged_config() {
+    fn start_command_carries_the_staged_config_bytes_for_both_pin_modes() {
         use super::start_command;
 
         let core = std::path::Path::new(r"C:\core");
-        // The staged config is the exact config content the helper will
-        // stage and run: its own geodata block must reach the wire as the
-        // suspension flag, decided by the shared predicate over the carried
-        // bytes.
+        // The staged config is the exact config content the helper will stage
+        // and run, and the pin mode is derived from it on the elevated side:
+        // the command must deliver it byte-for-byte in both modes.
         let geodata: &[u8] =
             br#"{"geodata":{"assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#;
         let plain: &[u8] = br#"{"outbounds":[]}"#;
@@ -3172,19 +3144,16 @@ mod tests {
         let staged = start_command(12345, core, geodata);
         assert_eq!(staged["cmd"].as_str(), Some("start"));
         assert_eq!(staged["api_port"].as_u64(), Some(12345));
-        assert_eq!(staged["dat_pins_suspended"].as_bool(), Some(true));
-        let staged = start_command(12345, core, plain);
-        assert_eq!(staged["dat_pins_suspended"].as_bool(), Some(false));
-        // Config content that cannot be parsed fails closed on the wire too.
-        let staged = start_command(12345, core, b"not json");
-        assert_eq!(staged["dat_pins_suspended"].as_bool(), Some(false));
+        assert_eq!(config_from_wire(&staged).unwrap(), geodata);
+        assert_eq!(
+            config_from_wire(&start_command(12345, core, plain)).unwrap(),
+            plain
+        );
     }
 
     #[test]
     fn start_wire_stages_the_validated_bytes_not_the_swapped_disk_file() {
         use std::io::Read as _;
-
-        use super::wire_dat_pins_suspended;
 
         let core = std::path::Path::new(r"C:\core");
         // The GUI validated these bytes in the apply operation and captured
@@ -3201,7 +3170,6 @@ mod tests {
         // swapped file exists at stage time but is never consulted.
         let command = start_wire_message(12345, core, validated).expect("modest config crosses");
         assert_eq!(command["api_port"].as_u64(), Some(12345));
-        assert!(!wire_dat_pins_suspended(&command));
         let wire_bytes = config_from_wire(&command).expect("server decodes the content");
         assert_eq!(wire_bytes, validated, "wire carries the validated bytes");
         assert_ne!(
@@ -3246,33 +3214,6 @@ mod tests {
         let command = start_wire_message(12345, core, br#"{"outbounds":[]}"#)
             .expect("a modest config crosses the wire");
         assert!(config_from_wire(&command).is_ok());
-    }
-
-    #[test]
-    fn wire_dat_pins_suspended_fails_closed_on_absent_or_non_boolean_flags() {
-        use serde_json::json;
-
-        use super::wire_dat_pins_suspended;
-
-        assert!(wire_dat_pins_suspended(
-            &json!({"cmd": "start", "dat_pins_suspended": true})
-        ));
-        assert!(!wire_dat_pins_suspended(
-            &json!({"cmd": "start", "dat_pins_suspended": false})
-        ));
-        assert!(
-            !wire_dat_pins_suspended(&json!({"cmd": "start"})),
-            "an absent flag from a stale GUI must stay strict"
-        );
-        assert!(!wire_dat_pins_suspended(
-            &json!({"cmd": "start", "dat_pins_suspended": null})
-        ));
-        assert!(!wire_dat_pins_suspended(
-            &json!({"cmd": "start", "dat_pins_suspended": "yes"})
-        ));
-        assert!(!wire_dat_pins_suspended(
-            &json!({"cmd": "start", "dat_pins_suspended": 1})
-        ));
     }
 
     #[test]

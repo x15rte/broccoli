@@ -283,16 +283,6 @@ fn api_port_from_path(path: &Path) -> Result<u16, DiagError> {
     api_port_from_value(&config)
 }
 
-/// The candidate config is the config that would run, so its own emitted
-/// `geodata` block decides whether the verification DAT pins are suspended
-/// for the `-test` gate: a candidate that configured the core's geo data
-/// updater may legitimately carry a replaced pair, and the gate must accept
-/// it. Delegates to the one shared core_dl predicate — never
-/// re-implemented — and fails closed on an unreadable candidate.
-fn candidate_dat_pins_suspended(candidate_path: &Path) -> bool {
-    crate::sys::core_dl::dat_pins_suspended_at(candidate_path)
-}
-
 /// Rolling tail of the validation child's combined stdout+stderr, bounded to
 /// [`OUTPUT_TAIL`] bytes so a flooding child cannot grow the memory held for
 /// the UI message (CWE-400/770). Lines arrive
@@ -500,19 +490,24 @@ fn validation_failure(error: DiagError) -> ApplyOutput {
 /// runs on tokio's blocking pool instead of the current-thread executor,
 /// which must keep dispatching commands while a config is tested/applied.
 /// The candidate's own geodata block decides the DAT-suspension
-/// mode (see [`candidate_dat_pins_suspended`]); the verified deny-write
+/// mode (`core_dl::open_verified_for_config_at` decides it from the
+/// candidate's own bytes); the verified deny-write
 /// handles return to the executor and stay held through CreateProcess and
 /// the validation run, exactly as before.
 pub async fn validate(candidate_path: &Path) -> (bool, ApplyOutput) {
     let candidate = candidate_path.to_path_buf();
     let verify = tokio::task::spawn_blocking(move || {
-        // The decision and the payload hashes both run off the executor; the
-        // candidate file is small and the managed core tree is not.
-        if candidate_dat_pins_suspended(&candidate) {
-            crate::sys::core_dl::open_verified_core_user_managed_dats(&core_dir())
-        } else {
-            crate::sys::core_dl::open_verified_managed_core()
-        }
+        // The decision, the config read it needs, and the payload hashes all
+        // run off the executor; the candidate file is small and the managed
+        // core tree is not. The candidate is the config that would run, so
+        // its own geodata block decides the pin mode: a candidate that
+        // configured the core's geo data updater may legitimately carry a
+        // replaced pair, and the gate must accept it.
+        crate::sys::core_dl::open_verified_for_config_at(
+            &core_dir(),
+            &candidate,
+            crate::sys::core_dl::VerifyScope::Full,
+        )
     });
     let verified_core = match verify.await {
         Ok(Ok(verified_core)) => verified_core,
@@ -992,30 +987,6 @@ mod tests {
         std::fs::write(temp.path(), r#"{"api":{"listen":"0.0.0.0:54465"}}"#)
             .expect("write config fixture");
         assert!(api_port_from_path(temp.path()).is_err());
-    }
-
-    #[test]
-    fn candidate_dat_pins_suspension_uses_the_candidates_own_geodata_block() {
-        use super::candidate_dat_pins_suspended;
-
-        let dir = tempfile::tempdir().expect("candidate fixture dir");
-        // The candidate config is the config that would run, so its own
-        // geodata block — not the active config's — decides the gate's
-        // DAT-suspension mode.
-        let geodata = dir.path().join("config.candidate.json");
-        std::fs::write(
-            &geodata,
-            r#"{"geodata":{"assets":[{"url":"https://example.com/geosite.dat","file":"geosite.dat"}]}}"#,
-        )
-        .expect("write geodata candidate");
-        let plain = dir.path().join("plain.candidate.json");
-        std::fs::write(&plain, r#"{"outbounds":[]}"#).expect("write plain candidate");
-        assert!(candidate_dat_pins_suspended(&geodata));
-        assert!(!candidate_dat_pins_suspended(&plain));
-        assert!(
-            !candidate_dat_pins_suspended(&dir.path().join("missing.json")),
-            "an unreadable candidate fails closed toward the hard pins"
-        );
     }
 
     // ---------------------------------------------------------------------

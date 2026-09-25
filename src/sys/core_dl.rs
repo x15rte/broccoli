@@ -87,7 +87,7 @@ pub(crate) fn is_geo_data_payload(name: &str) -> bool {
 /// loads. The integrity guarantee that matters is on the core that carries
 /// traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyScope {
+pub enum VerifyScope {
     /// Every runtime payload: xray.exe, wintun.dll, geoip.dat, geosite.dat.
     Full,
     /// xray.exe only — the sole payload a latency-probe child executes.
@@ -225,37 +225,16 @@ pub fn update_pending_health() -> bool {
 
 /// Open a managed core only after checking that its directory, metadata, and
 /// every runtime payload path are ordinary files and that their bytes match
-/// Broccoli's compiled release pins. This is the full four-payload verify
-/// traffic-carrying spawns need; spawns whose child executes only xray.exe
-/// (the latency probe) use `open_verified_core_with_scope` with the
-/// `XrayExeOnly` scope instead. The returned value owns deny-write/
+/// Broccoli's compiled release pins. This is the full four-payload verify,
+/// strict about the geo data compares; every production spawn opens through
+/// [`open_verified_for_config`], which picks the pin mode from the config the
+/// child will run and routes back here. The returned value owns deny-write/
 /// delete handles for the verified payloads; callers executing Xray MUST
 /// retain it until CreateProcess consumes the verified paths, then release
 /// it so the core's geodata updater can replace the DAT files while the
 /// child runs.
 pub fn open_verified_core(core: &Path) -> Result<VerifiedCore, DiagError> {
-    open_verified_core_with_scope(core, VerifyScope::Full)
-}
-
-/// Open a managed core under the payload set [`VerifyScope`] names.
-///
-/// [`VerifyScope::XrayExeOnly`] serves latency-probe spawns: the probe child
-/// executes only xray.exe from an outbound-only config that never touches
-/// wintun.dll or the geodata DATs (the config shape is pinned by the
-/// probe-config test in `rt::latency`), so re-hashing 60–120 MB of payloads
-/// it cannot load on every probe click was pure spawn latency. The tamper
-/// guard on the payload that does execute — xray.exe — is identical to the
-/// full scope, and every traffic-carrying spawn still goes through
-/// [`VerifyScope::Full`]. Metadata is checked on both scopes: it is mutable
-/// AppData bookkeeping only and never introduces a new trusted release or
-/// digest. The compare is strict in every scope here: the geo data
-/// suspension is a separate, config-driven decision the call sites make
-/// with [`dat_pins_suspended_at`], never part of the scope.
-pub(crate) fn open_verified_core_with_scope(
-    core: &Path,
-    scope: VerifyScope,
-) -> Result<VerifiedCore, DiagError> {
-    open_verified_core_checked(core, scope, false)
+    open_verified_core_checked(core, VerifyScope::Full, false)
 }
 
 /// True when a config Value carries the top-level `geodata` block that a
@@ -288,25 +267,60 @@ pub fn geodata_updater_configured(config: &serde_json::Value) -> bool {
     })
 }
 
+/// A config's bytes as the value the suspension predicates judge: absent or
+/// unparseable content answers null, which [`geodata_updater_configured`]
+/// reads as "no `geodata` block" — fail closed toward the hard pins.
+fn suspension_config(config_bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(config_bytes).unwrap_or(serde_json::Value::Null)
+}
+
 /// Read the config at `config_path` and decide, with the one shared
 /// predicate [`geodata_updater_configured`], whether its `geodata` block
-/// suspends the geo data pin compare for the verification that is about to
-/// run that exact config. The three verification sites (the direct core
-/// spawn, the apply/`-test` gate, and the elevated-helper stage copy) all
-/// derive their decision from here or from the predicate — it is never
-/// re-implemented locally. Any I/O or parse failure answers `false` (fail
-/// closed): only a parsed config that carries a `geodata` asset URL lifts
-/// the pins.
+/// suspends the geo data pin compare. Any I/O or parse failure answers
+/// `false` (fail closed): only a parsed config that carries a `geodata`
+/// asset URL lifts the pins.
 pub fn dat_pins_suspended_at(config_path: &Path) -> bool {
-    let bytes = match std::fs::read(config_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let config = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(config) => config,
-        Err(_) => return false,
-    };
-    geodata_updater_configured(&config)
+    std::fs::read(config_path)
+        .is_ok_and(|bytes| geodata_updater_configured(&suspension_config(&bytes)))
+}
+
+/// The verified core tree a spawn that will run `config` must open, under
+/// `scope`.
+///
+/// One decision for every execution of the managed tree — the
+/// traffic-carrying spawn, the apply/`-test` gate, the servers screen's
+/// helper verbs and the elevated stage copy all open through here. The
+/// config's own `geodata` block suspends the two geo data compares
+/// ([`geodata_updater_configured`]); every other payload compares against its
+/// compiled pin in both modes, and content that does not carry the block
+/// fails closed toward the hard pins.
+pub fn open_verified_for_config(
+    core: &Path,
+    config: &serde_json::Value,
+    scope: VerifyScope,
+) -> Result<VerifiedCore, DiagError> {
+    open_verified_core_checked(core, scope, geodata_updater_configured(config))
+}
+
+/// [`open_verified_for_config`] over the config's own bytes — the shape the
+/// elevated helper holds after decoding the staged config from its pipe.
+pub fn open_verified_for_config_bytes(
+    core: &Path,
+    config_bytes: &[u8],
+    scope: VerifyScope,
+) -> Result<VerifiedCore, DiagError> {
+    open_verified_for_config(core, &suspension_config(config_bytes), scope)
+}
+
+/// [`open_verified_for_config`] over a config on disk.
+pub fn open_verified_for_config_at(
+    core: &Path,
+    config_path: &Path,
+    scope: VerifyScope,
+) -> Result<VerifiedCore, DiagError> {
+    let config = std::fs::read(config_path)
+        .map_or(serde_json::Value::Null, |bytes| suspension_config(&bytes));
+    open_verified_for_config(core, &config, scope)
 }
 
 /// Open a managed core under the full payload set with the geo data
@@ -333,8 +347,8 @@ fn open_verified_core_at(core: &Path, scope: VerifyScope) -> Result<VerifiedCore
 }
 
 /// Shared verify implementation behind [`open_verified_core`],
-/// [`open_verified_core_with_scope`], and
-/// [`open_verified_core_user_managed_dats`].
+/// [`open_verified_core_user_managed_dats`], and the config-driven decision
+/// [`open_verified_for_config`].
 ///
 /// With `dat_pins_suspended` set, the geo data files' SHA-256 compares are
 /// replaced by a self-hash (see [`open_verified_core_user_managed_dats`]);
@@ -356,11 +370,11 @@ fn open_verified_core_at(core: &Path, scope: VerifyScope) -> Result<VerifiedCore
 /// the open fails terminally, naming the payload and both hashes, only when
 /// the restore itself fails (missing or corrupt pristine pair) or the
 /// restored bytes still mismatch the pin. Because this is the single shared
-/// choke, the three verification sites — the direct core spawn, the
-/// apply/`-test` gate, and the elevated-helper stage copy — and the
-/// install-funnel validation below all heal identically (a staged tree
-/// carries its own freshly seeded pair, so its strict open heals from it;
-/// nothing here reorders or repeats the funnel's restore).
+/// choke, every production verification — the direct core spawn, the
+/// apply/`-test` gate, the servers screen's helper verbs, the elevated stage
+/// copy, and the install-funnel validation below — heals identically (a
+/// staged tree carries its own freshly seeded pair, so its strict open heals
+/// from it; nothing here reorders or repeats the funnel's restore).
 fn open_verified_core_checked(
     core: &Path,
     scope: VerifyScope,
@@ -2272,6 +2286,37 @@ mod pristine_tests {
         // The whole tree still passes the strict full verification every
         // traffic-carrying spawn runs.
         drop(open_verified_core(&core).expect("restored core must pass full verification"));
+    }
+
+    #[test]
+    fn dat_pins_suspended_at_fails_closed_on_unreadable_or_unparseable_configs() {
+        let dir = tempfile::tempdir().expect("config fixture dir");
+        // Unparseable bytes, a missing path, and a directory read all answer
+        // false: only a parsed config carrying a geodata asset URL lifts the
+        // pins — the same fail-closed read the open decision inherits.
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, b"not json {").expect("write garbage config");
+        assert!(!super::dat_pins_suspended_at(&garbage));
+        assert!(!super::dat_pins_suspended_at(
+            &dir.path().join("missing.json")
+        ));
+        assert!(
+            !super::dat_pins_suspended_at(dir.path()),
+            "directory read fails closed"
+        );
+        let plain = dir.path().join("plain.json");
+        std::fs::write(&plain, r#"{"api":{"listen":"127.0.0.1:1"}}"#).expect("write plain config");
+        assert!(!super::dat_pins_suspended_at(&plain));
+        let geodata = dir.path().join("geodata.json");
+        std::fs::write(
+            &geodata,
+            r#"{"geodata":{"cron":"0 0 * * *","assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#,
+        )
+        .expect("write geodata config");
+        assert!(
+            super::dat_pins_suspended_at(&geodata),
+            "the shared predicate decides"
+        );
     }
 
     #[test]

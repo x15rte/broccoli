@@ -199,22 +199,6 @@ impl SpawnFlavor {
             SpawnFlavor::LatencyProbe => crate::sys::core_dl::VerifyScope::XrayExeOnly,
         }
     }
-
-    /// Whether this flavor's spawn suspends the geo data pin compare because
-    /// the config it is about to run carries a `geodata` asset URL. Only the
-    /// traffic-carrying main core runs a config whose user-configured
-    /// updater may have replaced the DAT files; the latency-probe
-    /// config never references geo data and its exe-only scope holds no DAT
-    /// payload, so it never suspends. The decision reads `config_path`
-    /// through the one shared core_dl predicate — never re-implemented
-    /// here — and runs on the executor (the config file is small) before the
-    /// payload verify moves to the blocking pool.
-    fn dat_pins_suspended(self, config_path: &Path) -> bool {
-        match self {
-            SpawnFlavor::MainCore => crate::sys::core_dl::dat_pins_suspended_at(config_path),
-            SpawnFlavor::LatencyProbe => false,
-        }
-    }
 }
 
 /// The one app-authored line a spawn writes once release verification
@@ -240,7 +224,7 @@ pub(crate) fn verified_payloads_notice(scope: VerifyScope) -> Diag {
 /// A traffic-carrying main-core spawn always verifies the full four-payload
 /// set (xray.exe, wintun.dll, geoip.dat, geosite.dat); a config carrying a
 /// `geodata` asset URL suspends only the geo data compare, which stays
-/// hash-locked but user-managed ([`SpawnFlavor::dat_pins_suspended`]).
+/// hash-locked but user-managed (`core_dl::open_verified_for_config`).
 /// The one-shot latency probe uses [`spawn_probe`], which
 /// verifies only xray.exe. The verify is awaited off the executor (see
 /// [`spawn_for`]); the verified payload handles are then held through
@@ -265,9 +249,9 @@ pub(crate) async fn spawn_probe(config_path: &Path, log: &AppLogSink) -> Result<
 }
 
 /// Shared spawn implementation; `flavor` picks the release-pin verify scope
-/// (see [`SpawnFlavor::verify_scope`]), and a `MainCore` spawn additionally
-/// suspends the geo data compare when the config at hand carries a
-/// `geodata` asset URL (see [`SpawnFlavor::dat_pins_suspended`]).
+/// (see [`SpawnFlavor::verify_scope`]), and the open decision
+/// (`core_dl::open_verified_for_config_at`) suspends the geo data compare
+/// when the config at hand carries a `geodata` asset URL.
 ///
 /// Release verification hashes the pinned payloads in 8 KiB blocking reads
 /// (tens to hundreds of MB at the full scope), so it runs on tokio's blocking
@@ -288,21 +272,19 @@ async fn spawn_for(
     // xray.exe by path, and holding them for the child lifetime would block
     // the core's own geodata updater from replacing the DAT files.
     let scope = flavor.verify_scope();
-    // A config whose `geodata` block configured the core's updater may have
-    // replaced the geo data files while a previous core
-    // ran; that same block suspends their compare for this spawn,
-    // with the executable/driver/metadata pins hard in both modes. Read on
-    // the executor before the verify closure: the config file is small.
-    let dat_pins_suspended = flavor.dat_pins_suspended(config_path);
-    // The closure needs its own copy: the executor keeps `core` for the
-    // CreateProcess command line and cwd below.
+    // The closure needs its own copies: the executor keeps `core` for the
+    // CreateProcess command line and cwd below, and `config_path` is a
+    // borrow that cannot cross into the blocking pool.
     let verify_core = core.clone();
+    let verify_config = config_path.to_path_buf();
     let verify = tokio::task::spawn_blocking(move || {
-        let verified = if dat_pins_suspended {
-            crate::sys::core_dl::open_verified_core_user_managed_dats(&verify_core)
-        } else {
-            crate::sys::core_dl::open_verified_core_with_scope(&verify_core, scope)
-        };
+        // One decision, taken off the executor with the payload hashes it
+        // governs: the config this child will run decides whether the geo
+        // data compares are suspended (a `geodata` block means the core's own
+        // updater may have replaced the DAT pair), while the
+        // executable/driver/metadata pins stay hard in both modes.
+        let verified =
+            crate::sys::core_dl::open_verified_for_config_at(&verify_core, &verify_config, scope);
         verified.diag(Key::SupervisorVerifyFailed)
     });
     let verified_core = match verify.await {
@@ -616,37 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn dat_pins_suspended_at_fails_closed_on_unreadable_or_unparseable_configs() {
-        use crate::sys::core_dl::dat_pins_suspended_at;
-
-        let dir = tempfile::tempdir().expect("config fixture dir");
-        // Unparseable bytes, a missing path, and a directory read all answer
-        // false: only a parsed config carrying a geodata asset URL lifts the
-        // pins.
-        let garbage = dir.path().join("garbage.json");
-        std::fs::write(&garbage, b"not json {").expect("write garbage config");
-        assert!(!dat_pins_suspended_at(&garbage));
-        assert!(!dat_pins_suspended_at(&dir.path().join("missing.json")));
-        assert!(
-            !dat_pins_suspended_at(dir.path()),
-            "directory read fails closed"
-        );
-        let plain = dir.path().join("plain.json");
-        std::fs::write(&plain, r#"{"api":{"listen":"127.0.0.1:1"}}"#).expect("write plain config");
-        assert!(!dat_pins_suspended_at(&plain));
-        let geodata = dir.path().join("geodata.json");
-        std::fs::write(
-            &geodata,
-            r#"{"geodata":{"cron":"0 0 * * *","assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#,
-        )
-        .expect("write geodata config");
-        assert!(
-            dat_pins_suspended_at(&geodata),
-            "the shared predicate decides"
-        );
-    }
-
-    #[test]
     fn geo_data_payload_names_are_exactly_the_two_dat_files() {
         use crate::sys::core_dl::is_geo_data_payload;
 
@@ -680,35 +631,6 @@ mod tests {
             .map(|name| crate::sys::core_dl::is_geo_data_payload(name))
             .collect();
         assert_eq!(suspendable, [false, false, true, true]);
-    }
-
-    #[test]
-    fn main_core_spawn_suspends_dat_pins_exactly_when_the_config_carries_geodata() {
-        let dir = tempfile::tempdir().expect("config fixture dir");
-        let geodata = dir.path().join("geodata.json");
-        std::fs::write(
-            &geodata,
-            r#"{"geodata":{"assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#,
-        )
-        .expect("write geodata config");
-        let plain = dir.path().join("plain.json");
-        std::fs::write(&plain, r#"{"outbounds":[]}"#).expect("write plain config");
-        let missing = dir.path().join("missing.json");
-
-        // The traffic-carrying spawn suspends exactly when the config it is
-        // about to run carries a geodata asset URL; an unreadable config
-        // fails closed toward the hard pins.
-        assert!(SpawnFlavor::MainCore.dat_pins_suspended(&geodata));
-        assert!(!SpawnFlavor::MainCore.dat_pins_suspended(&plain));
-        assert!(
-            !SpawnFlavor::MainCore.dat_pins_suspended(&missing),
-            "fail closed"
-        );
-        // The latency probe executes only xray.exe from a config that never
-        // references geo data: it never suspends, geodata block or not.
-        assert!(!SpawnFlavor::LatencyProbe.dat_pins_suspended(&geodata));
-        assert!(!SpawnFlavor::LatencyProbe.dat_pins_suspended(&plain));
-        assert!(!SpawnFlavor::LatencyProbe.dat_pins_suspended(&missing));
     }
 
     #[tokio::test(flavor = "current_thread")]
