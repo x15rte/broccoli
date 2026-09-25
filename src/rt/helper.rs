@@ -1133,23 +1133,43 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     output
 }
 
-fn path_from_wire(value: Option<&serde_json::Value>) -> Result<PathBuf, DiagError> {
-    let units = value
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| DiagError::new(Diag::new(Key::HelperWirePathMissing)))?;
+/// One command the GUI sends an elevated helper over the authenticated pipe.
+///
+/// One type for both ends: the writer serializes it, the reader deserializes
+/// it, and a field name has exactly one definition. The shape is checked here
+/// (serde), the semantics by the decoders below — which is what keeps each
+/// refusal naming its own field instead of one generic parse error. The helper
+/// is spawned per launch from this same executable, so both ends are the same
+/// build and the tag vocabulary has no compatibility window.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum HelperCommand {
+    /// Start the core from the exact config bytes the GUI validated (base64;
+    /// never a re-read of the user-writable active config path).
+    Start {
+        api_port: u16,
+        /// UTF-16 units of the core source directory (the GUI's managed tree).
+        core_path_utf16: Vec<u16>,
+        config_base64: String,
+    },
+    Stop,
+    Status,
+    /// Authenticate with the one-shot token before anything else.
+    Auth {
+        token: String,
+    },
+}
+
+fn path_from_units(units: &[u16]) -> Result<PathBuf, DiagError> {
     if units.is_empty() || units.len() > 32_767 {
         return Err(DiagError::new(Diag::new(Key::HelperWirePathLengthInvalid)));
     }
     let mut wide = Vec::with_capacity(units.len());
     for unit in units {
-        let unit = unit
-            .as_u64()
-            .and_then(|value| u16::try_from(value).ok())
-            .ok_or_else(|| DiagError::new(Diag::new(Key::HelperWirePathUnitInvalid)))?;
-        if unit == 0 {
+        if *unit == 0 {
             return Err(DiagError::new(Diag::new(Key::HelperWirePathNul)));
         }
-        wide.push(unit);
+        wide.push(*unit);
     }
     let path = PathBuf::from(OsString::from_wide(&wide));
     if !path.is_absolute() {
@@ -1165,11 +1185,7 @@ fn path_from_wire(value: Option<&serde_json::Value>) -> Result<PathBuf, DiagErro
 /// undecodable payload is rejected; the whole wire message is already
 /// bounded by [`MAX_WIRE_MESSAGE_BYTES`] on both ends, so the decoded
 /// content is bounded by that cap minus the envelope.
-fn config_from_wire(command: &serde_json::Value) -> Result<Vec<u8>, DiagError> {
-    let encoded = command
-        .get("config_base64")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| DiagError::new(Diag::new(Key::HelperWireConfigMissing)))?;
+fn config_from_wire(encoded: &str) -> Result<Vec<u8>, DiagError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| DiagError::new(Diag::new(Key::HelperWireConfigEncodingInvalid)))?;
@@ -1322,6 +1338,65 @@ impl HelperChild {
 }
 
 /// Entry point for `broccoli --core-helper`; never returns.
+/// The flag the elevated helper is launched with, and the only thing that
+/// tells this executable it is the helper rather than the GUI.
+pub const HELPER_FLAG: &str = "--core-helper";
+
+/// Run this process as the elevated helper when `args` carry [`HELPER_FLAG`],
+/// and return `None` when they do not (the GUI path).
+///
+/// One home for the whole launch protocol as the helper sees it: the argv
+/// grammar ([`parse_helper_parent_arg`] owns the strict form of the parent
+/// pid), the credential channel (the inherited environment block first, the
+/// ProgramData file the launcher falls back to for a cross-user elevation
+/// second), the removal of the inherited token before any child can inherit
+/// it, and the exit code for a launch whose parameters do not authenticate.
+/// `main` only dispatches: [`is_helper_launch`] decides, this runs and never
+/// returns.
+pub fn is_helper_launch(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == HELPER_FLAG)
+}
+
+/// Take over the process as the elevated helper and never return.
+///
+/// Missing or invalid credentials are a hard failure, never a fallback to a
+/// well-known privileged endpoint: the one-shot auth token travels via the
+/// environment block the launcher staged (see
+/// [`crate::sys::elevation::launch_core_helper`]) or, when a cross-user UAC
+/// elevation rebuilt the child's environment, via the ProgramData token file —
+/// never via argv, which any same-user process can read for the child's
+/// lifetime. The inherited token is removed from this process's environment
+/// before the helper spawns the core, so no descendant inherits it.
+pub fn run_helper_entry(args: &[String]) -> ! {
+    let pipe_id = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--helper-pipe="));
+    let token = std::env::var(crate::sys::elevation::HELPER_TOKEN_ENV).ok();
+    let parent_pid = parse_helper_parent_arg(args);
+    // The inherited environment first (the same-user elevation), the
+    // ProgramData file second (a cross-user elevation rebuilds the child's
+    // environment for the target account, so the variable does not survive).
+    let token = match token {
+        Some(token) => Some(token),
+        None => pipe_id.and_then(crate::sys::elevation::read_helper_token_file),
+    };
+    match (pipe_id, token.as_deref(), parent_pid) {
+        (Some(pipe_id), Some(token), Ok(parent_pid)) => {
+            // SAFETY: this helper process is the sole consumer of
+            // HELPER_TOKEN_ENV (the GUI removed it after the launch), and the
+            // variable is deleted here before any child process (the xray
+            // core) is spawned, so no thread in this process reads a torn
+            // value and no descendant inherits the secret.
+            unsafe { std::env::remove_var(crate::sys::elevation::HELPER_TOKEN_ENV) };
+            run_helper(pipe_id, token, parent_pid)
+        }
+        _ => {
+            eprintln!("broccoli core-helper: missing or invalid authenticated launch parameters");
+            std::process::exit(2);
+        }
+    }
+}
+
 pub fn run_helper(pipe_id: &str, token: &str, expected_parent_pid: u32) -> ! {
     let code = match serve(pipe_id, token, expected_parent_pid) {
         Ok(()) => 0,
@@ -1456,26 +1531,28 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(_) => break,
         };
-        let Ok(command) = serde_json::from_slice::<serde_json::Value>(&command_bytes) else {
+        let Ok(command) = serde_json::from_slice::<HelperCommand>(&command_bytes) else {
             continue;
         };
-        match command.get("cmd").and_then(serde_json::Value::as_str) {
-            Some("start") => {
-                let api_port = command
-                    .get("api_port")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| u16::try_from(value).ok())
-                    .filter(|value| *value != 0);
-                let core_source = path_from_wire(command.get("core_path_utf16"));
-                let config_bytes = config_from_wire(&command);
-                match (api_port, core_source, config_bytes) {
-                    (Some(api_port), Ok(core_source), Ok(config_bytes)) => {
+        match command {
+            HelperCommand::Start {
+                api_port,
+                core_path_utf16,
+                config_base64,
+            } => {
+                let parsed = (|| -> Result<(u16, PathBuf, Vec<u8>), DiagError> {
+                    let api_port = (api_port != 0)
+                        .then_some(api_port)
+                        .ok_or_else(|| DiagError::new(Diag::new(Key::HelperWirePortInvalid)))?;
+                    let core_source = path_from_units(&core_path_utf16)?;
+                    let config_bytes = config_from_wire(&config_base64)?;
+                    Ok((api_port, core_source, config_bytes))
+                })();
+                match parsed {
+                    Ok((api_port, core_source, config_bytes)) => {
                         helper_start(&current, &writer, api_port, &core_source, &config_bytes);
                     }
-                    (_, core, config) => {
-                        let detail = core.err().or_else(|| config.err()).unwrap_or_else(|| {
-                            DiagError::new(Diag::new(Key::HelperWirePortInvalid))
-                        });
+                    Err(detail) => {
                         send_log_record(
                             &writer,
                             &DiagError::new(Diag::new(Key::HelperMalformedStartCommand))
@@ -1485,7 +1562,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     }
                 }
             }
-            Some("stop") => {
+            HelperCommand::Stop => {
                 let Ok(mut slot) = current.lock() else {
                     continue;
                 };
@@ -1499,7 +1576,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     );
                 }
             }
-            Some("status") => {
+            HelperCommand::Status => {
                 let Ok(slot) = current.lock() else {
                     continue;
                 };
@@ -1513,7 +1590,9 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     &serde_json::json!({"event":"state","state":state,"pid":pid}),
                 );
             }
-            _ => {}
+            // The auth handshake is decoded before this loop (it precedes
+            // every command); a late one is not a command this loop serves.
+            HelperCommand::Auth { .. } => {}
         }
     }
 
@@ -2541,14 +2620,12 @@ fn send_helper_lifecycle_event(mut event: HelperEvent, sender: &mpsc::Sender<Hel
 /// bytes the GUI validated in the same operation, so the elevated helper
 /// stages those bytes — and derives the pin mode from them with the shared
 /// open decision — and never re-reads the user-writable active config path.
-fn start_command(api_port: u16, core: &Path, config_bytes: &[u8]) -> serde_json::Value {
-    let core_path_utf16: Vec<u16> = core.as_os_str().encode_wide().collect();
-    serde_json::json!({
-        "cmd":"start",
-        "api_port":api_port,
-        "core_path_utf16":core_path_utf16,
-        "config_base64":base64::engine::general_purpose::STANDARD.encode(config_bytes)
-    })
+fn start_command(api_port: u16, core: &Path, config_bytes: &[u8]) -> HelperCommand {
+    HelperCommand::Start {
+        api_port,
+        core_path_utf16: core.as_os_str().encode_wide().collect(),
+        config_base64: base64::engine::general_purpose::STANDARD.encode(config_bytes),
+    }
 }
 
 /// The complete wire `start` message for `config_bytes`, refused when the
@@ -2560,9 +2637,10 @@ fn start_wire_message(
     api_port: u16,
     core: &Path,
     config_bytes: &[u8],
-) -> Result<serde_json::Value, DiagError> {
+) -> Result<HelperCommand, DiagError> {
     let command = start_command(api_port, core, config_bytes);
-    let message = command.to_string();
+    let message = serde_json::to_string(&command)
+        .expect("the wire command is a plain struct of numbers, strings and a u16 list");
     if message.len().saturating_add(1) > MAX_WIRE_MESSAGE_BYTES {
         return Err(DiagError::new(
             Diag::new(Key::HelperConfigTooLarge)
@@ -2674,10 +2752,10 @@ impl HelperPipe {
             let mut writer_guard = writer
                 .lock()
                 .map_err(|_| DiagError::new(Diag::new(Key::HelperPipeWriterPoisoned)))?;
-            let mut auth = serde_json::json!({
-                "cmd":"auth",
-                "token":token
+            let mut auth = serde_json::to_string(&HelperCommand::Auth {
+                token: token.to_string(),
             })
+            .expect("the auth command is a plain struct of strings")
             .to_string();
             auth.push('\n');
             writer_guard
@@ -2799,15 +2877,16 @@ impl HelperPipe {
     }
 
     pub fn stop(&self) -> Result<(), DiagError> {
-        self.send(&serde_json::json!({"cmd":"stop"}))
+        self.send(&HelperCommand::Stop)
     }
 
     pub fn status(&self) -> Result<(), DiagError> {
-        self.send(&serde_json::json!({"cmd":"status"}))
+        self.send(&HelperCommand::Status)
     }
 
-    fn send(&self, value: &serde_json::Value) -> Result<(), DiagError> {
-        let mut message = value.to_string();
+    fn send(&self, command: &HelperCommand) -> Result<(), DiagError> {
+        let mut message = serde_json::to_string(command)
+            .expect("the wire command is a plain struct of numbers, strings and a u16 list");
         message.push('\n');
         let mut writer = self
             .writer
@@ -2850,12 +2929,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES, ParentIdentity, STAGED_CONFIG,
-        SecureRuntimeStage, config_from_wire, current_process_user_sid, dacl_deviation_is_benign,
-        decode_helper_log, ensure_protected_directory, parent_identity_accepts,
-        parse_helper_parent_arg, path_from_wire, path_to_wide, process_creation_time_of,
-        read_pipe_message, stage_config_bytes_at, stage_entry_allowed, start_wire_message, to_wide,
-        token_matches, validated_ace, validated_pipe_name, verify_protected_directory,
+        HelperCommand, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES, ParentIdentity,
+        STAGED_CONFIG, SecureRuntimeStage, config_from_wire, current_process_user_sid,
+        dacl_deviation_is_benign, decode_helper_log, ensure_protected_directory,
+        parent_identity_accepts, parse_helper_parent_arg, path_from_units, path_to_wide,
+        process_creation_time_of, read_pipe_message, stage_config_bytes_at, stage_entry_allowed,
+        start_wire_message, to_wide, token_matches, validated_ace, validated_pipe_name,
+        verify_protected_directory,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -3116,17 +3196,20 @@ mod tests {
 
     #[test]
     fn start_source_paths_require_absolute_nul_free_utf16() {
-        let absolute = serde_json::json!(
-            "C:\\Users\\broccoli\\config.json"
-                .encode_utf16()
-                .collect::<Vec<u16>>()
-        );
+        let absolute: Vec<u16> = "C:\\Users\\broccoli\\config.json".encode_utf16().collect();
         assert_eq!(
-            path_from_wire(Some(&absolute)).unwrap(),
+            path_from_units(&absolute).unwrap(),
             std::path::PathBuf::from(r"C:\Users\broccoli\config.json")
         );
-        assert!(path_from_wire(Some(&serde_json::json!([114, 101, 108]))).is_err());
-        assert!(path_from_wire(Some(&serde_json::json!([67, 58, 92, 0]))).is_err());
+        assert!(
+            path_from_units(&[114, 101, 108]).is_err(),
+            "a relative path is refused"
+        );
+        assert!(
+            path_from_units(&[67, 58, 92, 0]).is_err(),
+            "an embedded NUL is refused"
+        );
+        assert!(path_from_units(&[]).is_err(), "an empty path is refused");
     }
 
     #[test]
@@ -3142,13 +3225,25 @@ mod tests {
         let plain: &[u8] = br#"{"outbounds":[]}"#;
 
         let staged = start_command(12345, core, geodata);
-        assert_eq!(staged["cmd"].as_str(), Some("start"));
-        assert_eq!(staged["api_port"].as_u64(), Some(12345));
-        assert_eq!(config_from_wire(&staged).unwrap(), geodata);
+        let HelperCommand::Start {
+            api_port,
+            core_path_utf16,
+            config_base64,
+        } = &staged
+        else {
+            panic!("a start command must build the start variant");
+        };
+        assert_eq!(*api_port, 12345);
         assert_eq!(
-            config_from_wire(&start_command(12345, core, plain)).unwrap(),
-            plain
+            core_path_utf16,
+            &std::os::windows::ffi::OsStrExt::encode_wide(core.as_os_str()).collect::<Vec<u16>>()
         );
+        assert_eq!(config_from_wire(config_base64).unwrap(), geodata);
+        let plain_command = start_command(12345, core, plain);
+        let HelperCommand::Start { config_base64, .. } = &plain_command else {
+            unreachable!("the start command is always the start variant");
+        };
+        assert_eq!(config_from_wire(config_base64).unwrap(), plain);
     }
 
     #[test]
@@ -3169,8 +3264,16 @@ mod tests {
         // The wire start command carries exactly the validated content; the
         // swapped file exists at stage time but is never consulted.
         let command = start_wire_message(12345, core, validated).expect("modest config crosses");
-        assert_eq!(command["api_port"].as_u64(), Some(12345));
-        let wire_bytes = config_from_wire(&command).expect("server decodes the content");
+        let HelperCommand::Start {
+            api_port,
+            config_base64,
+            ..
+        } = &command
+        else {
+            unreachable!("a start message is the start variant");
+        };
+        assert_eq!(*api_port, 12345);
+        let wire_bytes = config_from_wire(config_base64).expect("server decodes the content");
         assert_eq!(wire_bytes, validated, "wire carries the validated bytes");
         assert_ne!(
             wire_bytes,
@@ -3213,7 +3316,10 @@ mod tests {
         // A modest config still crosses with the full command shape.
         let command = start_wire_message(12345, core, br#"{"outbounds":[]}"#)
             .expect("a modest config crosses the wire");
-        assert!(config_from_wire(&command).is_ok());
+        let HelperCommand::Start { config_base64, .. } = &command else {
+            unreachable!("a start message is the start variant");
+        };
+        assert!(config_from_wire(config_base64).is_ok());
     }
 
     #[test]

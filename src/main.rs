@@ -143,43 +143,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // Elevated helper mode: no GUI, owns the core on a unique authenticated
-    // named pipe. Missing credentials are a hard failure, not a fallback to a
-    // well-known privileged endpoint.
-    if args.iter().any(|a| a == "--core-helper") {
-        let pipe_id = args.iter().find_map(|a| a.strip_prefix("--helper-pipe="));
-        // The one-shot auth token travels via the environment block the
-        // elevated child inherited from `launch_core_helper`, never via argv:
-        // argv is readable by any same-user process for the child's lifetime,
-        // the environment block is not. It is removed right after parsing so
-        // it cannot leak onward into the helper's own children (the xray core
-        // process spawned later).
-        let token = std::env::var(broccoli::sys::elevation::HELPER_TOKEN_ENV).ok();
-        let parent_pid = broccoli::rt::helper::parse_helper_parent_arg(&args);
-        // Cross-user UAC elevation rebuilds the child's environment for the
-        // target admin account, so the env token may not survive; the
-        // ProgramData token file written by the launching GUI is the fallback
-        // channel (same-user elevations keep the env path).
-        let token = match token {
-            Some(token) => Some(token),
-            None => pipe_id.and_then(broccoli::sys::elevation::read_helper_token_file),
-        };
-        match (pipe_id, token.as_deref(), parent_pid) {
-            (Some(pipe_id), Some(token), Ok(parent_pid)) => {
-                // SAFETY: this helper process is the sole consumer of
-                // HELPER_TOKEN_ENV (the GUI removed it after the launch), and
-                // the variable is deleted here before any child process (xray
-                // core) is spawned, so no thread in this process reads a torn
-                // value and no descendant inherits the secret.
-                unsafe { std::env::remove_var(broccoli::sys::elevation::HELPER_TOKEN_ENV) };
-                broccoli::rt::helper::run_helper(pipe_id, token, parent_pid)
-            }
-            _ => {
-                eprintln!(
-                    "broccoli core-helper: missing or invalid authenticated launch parameters"
-                );
-                std::process::exit(2);
-            }
-        }
+    // named pipe. The launch protocol — argv grammar, credential channels,
+    // exit codes — lives with the helper that serves it.
+    if broccoli::rt::helper::is_helper_launch(&args) {
+        broccoli::rt::helper::run_helper_entry(&args);
     }
 
     // Single instance: a second launch focuses the existing window instead.
