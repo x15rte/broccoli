@@ -12,6 +12,11 @@
 //! - No marketing adjectives and no soft two-word verbs (`BANNED_TERMS`).
 //! - Placeholder integrity: balanced braces, no `{{`/`}}` escapes, no leading
 //!   or trailing whitespace, never empty.
+//! - Placeholder arity: the number of `{` in the English text equals the count
+//!   the key declares in `keys!` ([`Key::arity`]), which every fill site is
+//!   written against. A wording change that adds or drops a placeholder fails
+//!   here even for a key no other test exercises. No key departs from its
+//!   declared count; an `EXCEPTIONS` row records the reason if one ever must.
 //!
 //! A string without an ASCII letter (a glyph, a format-only entry such as
 //! `· {}`) carries no prose: the wording rules skip it while the structural
@@ -58,6 +63,8 @@ const RULE_CONTRACTION: &str = "contraction";
 const RULE_BANNED_TERM: &str = "banned-term";
 /// Rule id: a placeholder or whitespace defect.
 const RULE_PLACEHOLDER: &str = "placeholder";
+/// Rule id: the English text's `{` count differs from the declared arity.
+const RULE_ARITY: &str = "placeholder-arity";
 /// Rule id: advisory passive voice.
 const RULE_PASSIVE: &str = "passive-voice";
 /// Rule id: advisory compound tense.
@@ -80,6 +87,7 @@ const RULE_IDS: &[&str] = &[
     RULE_CONTRACTION,
     RULE_BANNED_TERM,
     RULE_PLACEHOLDER,
+    RULE_ARITY,
     RULE_PASSIVE,
     RULE_COMPOUND_TENSE,
     RULE_NOMINALIZATION,
@@ -360,7 +368,10 @@ fn locale_table_follows_the_text_standard() {
     let mut advisories: Vec<String> = Vec::new();
     for &key in ALL {
         let text = t(Language::En, key);
-        for finding in hard_findings(text) {
+        for finding in hard_findings(text)
+            .into_iter()
+            .chain(arity_findings(key, text))
+        {
             if is_exempt(key, finding.rule) {
                 continue;
             }
@@ -483,6 +494,20 @@ fn brace_errors(text: &str) -> Vec<String> {
         errors.push(format!("{open} '{{' without a matching '}}'"));
     }
     errors
+}
+
+/// The declared placeholder count and the `{` count of the English text must
+/// agree.
+fn arity_findings(key: Key, text: &str) -> Vec<Finding> {
+    let declared = key.arity();
+    let actual = text.matches('{').count();
+    if declared == actual {
+        return Vec::new();
+    }
+    vec![Finding::new(
+        RULE_ARITY,
+        format!("declares {declared} placeholder(s), the text holds {actual}"),
+    )]
 }
 
 /// Sentences longer than their word cap.
@@ -900,6 +925,18 @@ fn placeholder_defects_fail() {
     );
     assert_eq!(hard_rules(" padded "), vec![RULE_PLACEHOLDER]);
     assert_eq!(hard_rules(""), vec![RULE_PLACEHOLDER]);
+}
+
+#[test]
+fn declared_arity_must_match_the_english_text() {
+    // The key declares one placeholder; the text must hold exactly one.
+    assert!(arity_findings(Key::LatencyMs, "{} ms").is_empty());
+    let dropped = arity_findings(Key::LatencyMs, "ms");
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].rule, RULE_ARITY);
+    let added = arity_findings(Key::Close, "{value}");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].rule, RULE_ARITY);
 }
 
 #[test]

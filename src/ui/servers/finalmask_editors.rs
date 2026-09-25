@@ -290,7 +290,7 @@ fn finalmask_transform_editor(
                             ui,
                             "metadata",
                             &mut arg.metadata,
-                            "metadata selector",
+                            t(lang, Key::SrvMetadataSelectorHint),
                         );
                     }
                     "transform" => {
@@ -607,7 +607,7 @@ fn finalmask_udphop_editor(
         lang,
         "remoteIPs",
         &mut settings.remote_ips,
-        "198.51.100.0/24 or 2001:db8::1",
+        t(lang, Key::SrvUdpHopRemoteIpsHint),
     );
     changed |= mask_sockopt_editor(ui, lang, &mut settings.sockopt);
     changed
@@ -673,7 +673,7 @@ fn finalmask_xmc_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Finalm
         ui,
         "password",
         &mut settings.password,
-        "RSA derivation password",
+        t(lang, Key::SrvXmcPasswordHint),
     );
     let mut remove = None;
     for (index, profile) in settings.profiles.iter_mut().enumerate() {
@@ -696,13 +696,13 @@ fn finalmask_xmc_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Finalm
                     ui,
                     "texturesValue",
                     &mut profile.textures_value,
-                    "signed Mojang textures value",
+                    t(lang, Key::SrvXmcTexturesValueHint),
                 );
                 changed |= widgets::text_field(
                     ui,
                     "texturesSignature",
                     &mut profile.textures_signature,
-                    "signed Mojang textures signature",
+                    t(lang, Key::SrvXmcTexturesSignatureHint),
                 );
             });
         });
@@ -777,7 +777,7 @@ pub(super) fn finalmask_tcp_settings_editor(
                 ui,
                 "packets",
                 &mut settings.packets,
-                "tlshello, N, or from-to",
+                t(lang, Key::SrvMaskPacketsHint),
             );
             changed |= range_editor(ui, "length", &mut settings.length, i32::MIN..=i32::MAX);
             changed |= range_editor(ui, "delay", &mut settings.delay, i32::MIN..=i32::MAX);
@@ -880,26 +880,26 @@ fn finalmask_realm_tls_editor(
         ui,
         "pinnedPeerCertSha256",
         &mut tls.pinned_peer_cert_sha256,
-        "comma-separated SHA-256 hex",
+        t(lang, Key::SrvRealmTlsPinnedPeerCertSha256Hint),
         |v| (!pinned_peer_cert_sha256_valid(v)).then(|| t(lang, Key::SrvCertPinHex).to_string()),
     );
     changed |= widgets::text_field(
         ui,
         "verifyPeerCertByName",
         &mut tls.verify_peer_cert_by_name,
-        "comma-separated names",
+        t(lang, Key::SrvRealmTlsVerifyPeerCertByNameHint),
     );
     changed |= widgets::text_field(
         ui,
         "echServerKeys",
         &mut tls.ech_server_keys,
-        "standard base64 ECH server keys",
+        t(lang, Key::SrvRealmTlsEchServerKeysHint),
     );
     changed |= widgets::text_field(
         ui,
         "echConfigList",
         &mut tls.ech_config_list,
-        "ECH config list",
+        t(lang, Key::SrvRealmTlsEchConfigListHint),
     );
     // The realm TLS ECH sockopt's findings already ride the memoized
     // finalmask sweep (`validate_finalmask` validates this exact field under
@@ -1048,7 +1048,7 @@ pub(super) fn finalmask_udp_settings_editor(
                 ui,
                 "value",
                 &mut settings.value,
-                "DNS domain or AES-128-GCM password",
+                t(lang, Key::SrvMkcpHeaderValueHint),
             );
             changed
         }

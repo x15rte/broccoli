@@ -897,7 +897,12 @@ fn sockopt_editor(
             t(lang, Key::NoneSelected),
             true,
         ),
-        None => widgets::text_field(ui, "dialerProxy", &mut sockopt.dialer_proxy, "outbound tag"),
+        None => widgets::text_field(
+            ui,
+            "dialerProxy",
+            &mut sockopt.dialer_proxy,
+            t(lang, Key::SrvDialerProxyHint),
+        ),
     };
     changed |= widgets::text_field(
         ui,
@@ -1013,8 +1018,12 @@ fn sockopt_editor(
                 changed |=
                     widgets::text_field(ui, "system", &mut custom.system, "windows/linux/darwin");
                 changed |= widgets::text_field(ui, "network", &mut custom.network, "tcp/udp");
-                changed |=
-                    widgets::text_field(ui, "level", &mut custom.level, "numeric socket level");
+                changed |= widgets::text_field(
+                    ui,
+                    "level",
+                    &mut custom.level,
+                    t(lang, Key::SrvCustomLevelHint),
+                );
                 changed |= widgets::combo_str_labeled(
                     ui,
                     "type",
@@ -1023,7 +1032,8 @@ fn sockopt_editor(
                     t(lang, Key::SrvDefault),
                     false,
                 );
-                changed |= widgets::text_field(ui, "opt", &mut custom.opt, "numeric socket option");
+                changed |=
+                    widgets::text_field(ui, "opt", &mut custom.opt, t(lang, Key::SrvCustomOptHint));
                 changed |= widgets::text_field(ui, "value", &mut custom.value, "");
                 if !custom.extra.is_empty() {
                     ui.weak(t_fmt(
@@ -4171,7 +4181,7 @@ impl ServersScreen {
                     ui,
                     "encryption",
                     &mut settings.encryption,
-                    "none | mlkem768x25519plus…",
+                    t(lang, Key::SrvVlessEncryptionHint),
                     |v| v_vless_encryption_required(lang, v),
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -4202,7 +4212,7 @@ impl ServersScreen {
                         ui,
                         t(lang, Key::SrvReverseTag),
                         &mut reverse.tag,
-                        "inbound tag to reverse-dial",
+                        t(lang, Key::SrvVlessReverseTagHint),
                         |v| v_required(lang, v),
                     );
                     let mut sniffing = reverse.sniffing.is_some();
@@ -4279,7 +4289,7 @@ impl ServersScreen {
                     ui,
                     "password",
                     &mut settings.password,
-                    "2022 methods: base64 key of exact length",
+                    t(lang, Key::SrvShadowsocksPasswordHint),
                     |v| v_required(lang, v),
                 );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u8::MAX.into());
@@ -4315,7 +4325,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvSecretKey),
                     &mut settings.secret_key,
-                    "base64, 32 bytes",
+                    t(lang, Key::SrvSecretKeyHint),
                     |v| v_wg_key(lang, v),
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -4410,7 +4420,7 @@ impl ServersScreen {
                                 ui,
                                 t(lang, Key::SrvPublicKey),
                                 &mut peer.public_key,
-                                "remote peer public key",
+                                t(lang, Key::SrvWgPeerPublicKeyHint),
                                 |v| v_wg_key(lang, v),
                             );
                             ui.small(t(lang, Key::SrvWgPeerPublicKeyNote));
@@ -4431,7 +4441,7 @@ impl ServersScreen {
                             changed |= widgets::string_list(
                                 ui,
                                 lang,
-                                "allowed IPs",
+                                t(lang, Key::SrvWgAllowedIps),
                                 &mut peer.allowed_ips,
                                 "0.0.0.0/0",
                             );
@@ -4488,7 +4498,7 @@ impl ServersScreen {
                         ui,
                         "packets",
                         &mut fragment.packets,
-                        "tlshello | 1-3 | empty = all",
+                        t(lang, Key::SrvPacketsHint),
                     );
                     changed |= widgets::opt_range(ui, "length", &mut fragment.length, 1..=1500);
                     changed |= widgets::opt_range(
@@ -4555,7 +4565,7 @@ impl ServersScreen {
                             ui,
                             t(lang, Key::SrvCustomResponseData),
                             &mut response.custom_response_data,
-                            "base64 (standard alphabet, = padded)",
+                            t(lang, Key::SrvBlackholeDataHint),
                             |value| {
                                 if blackhole_custom_response_data_decodes(value) {
                                     return None;
@@ -4606,8 +4616,12 @@ impl ServersScreen {
                                 t(lang, Key::SrvDefault),
                                 false,
                             );
-                            changed |=
-                                widgets::text_field(ui, "qType", &mut rule.q_type, "1,28 or 1-10");
+                            changed |= widgets::text_field(
+                                ui,
+                                "qType",
+                                &mut rule.q_type,
+                                t(lang, Key::SrvDnsRuleQTypeHint),
+                            );
                             changed |= widgets::opt_num(ui, "rCode", &mut rule.r_code, 0..=65_535);
                             if ui.button(t(lang, Key::SrvRemove)).clicked() {
                                 remove_rule = Some(index);
@@ -5518,7 +5532,7 @@ impl ServersScreen {
                     lang,
                     t(lang, Key::SrvAlpn),
                     &mut s.alpn,
-                    "h2, http/1.1",
+                    t(lang, Key::SrvAlpnHint),
                 );
                 changed |= fingerprint_editor(
                     ui,
@@ -5559,7 +5573,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvCipherSuites),
                     &mut s.cipher_suites,
-                    "colon-separated Go names",
+                    t(lang, Key::SrvCipherSuitesHint),
                 );
                 changed |= widgets::string_list(
                     ui,
@@ -5584,7 +5598,7 @@ impl ServersScreen {
                     ui,
                     "pinnedPeerCertSha256",
                     &mut s.pinned_peer_cert_sha256,
-                    "comma-separated 32-byte hex pins — replaces allowInsecure",
+                    t(lang, Key::SrvPinnedPeerCertSha256Hint),
                 );
                 if ui
                     .add_enabled(
@@ -5620,11 +5634,11 @@ impl ServersScreen {
                             ui,
                             "domain",
                             &mut self.tls_probe_domain,
-                            "example.com or example.com:8443",
+                            t(lang, Key::SrvTlsProbeDomainHint),
                         );
                         let _ = widgets::text_field(
                             ui,
-                            "IP override",
+                            t(lang, Key::SrvTlsProbeIpOverride),
                             &mut self.tls_probe_ip,
                             "optional",
                         );
@@ -5814,7 +5828,7 @@ impl ServersScreen {
                     ui,
                     "echConfigList",
                     &mut s.ech_config_list,
-                    "base64 ECHConfigList or https://1.1.1.1/dns-query",
+                    t(lang, Key::SrvEchConfigListHint),
                 );
                 changed |= ech_sockopt_editor(ui, lang, &mut s.ech_sockopt, ech_sockopt_errors);
                 if s.alpn.len() > 1 && s.alpn.iter().any(|value| value == "fromMitm") {
@@ -5968,7 +5982,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvPublicKeyPassword),
                     &mut s.password,
-                    "unpadded base64url X25519 public key",
+                    t(lang, Key::SrvRealityPublicKeyHint),
                     |_| None,
                     &KeygenButton {
                         label: t(lang, Key::SrvDerive),
@@ -5995,7 +6009,7 @@ impl ServersScreen {
                     ui,
                     "shortId",
                     &mut s.short_id,
-                    "hex, ≤ 16 chars",
+                    t(lang, Key::SrvShortIdHint),
                     |_| None,
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -6012,7 +6026,7 @@ impl ServersScreen {
                     ui,
                     "mldsa65Verify",
                     &mut s.mldsa65_verify,
-                    "base64url ML-DSA-65 seed→verify",
+                    t(lang, Key::SrvMldsa65VerifyHint),
                     |_| None,
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -6090,7 +6104,7 @@ impl ServersScreen {
                 ui,
                 "sendThrough",
                 &mut o.send_through,
-                "local IP, CIDR, origin, or srcip",
+                t(lang, Key::SrvSendThroughHint),
             );
             if let Some(value) = o.send_through.as_mut() {
                 changed |= widgets::combo_str_labeled(
@@ -7079,7 +7093,12 @@ fn noises_editor(ui: &mut egui::Ui, lang: Language, noises: &mut Vec<Noise>) -> 
                     t(lang, Key::SrvDefault),
                     false,
                 );
-                changed |= widgets::text_field(ui, "packet", &mut n.packet, "payload or range");
+                changed |= widgets::text_field(
+                    ui,
+                    "packet",
+                    &mut n.packet,
+                    t(lang, Key::SrvNoisePacketHint),
+                );
                 changed |=
                     widgets::opt_range(ui, t(lang, Key::SrvDelayMs), &mut n.delay, 0..=10_000);
                 changed |= widgets::combo_str_labeled(

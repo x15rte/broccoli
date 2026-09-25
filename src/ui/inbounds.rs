@@ -324,10 +324,11 @@ impl InboundsScreen {
                                 egui::Button::new(t(lang, Key::DeleteRow)),
                             )
                             .on_hover_text(t(lang, Key::InboundsDeleteDokodemo))
-                            .on_disabled_hover_text(
-                                t(lang, Key::InboundsUsedByRules)
-                                    .replace("{reference_count}", &reference_count.to_string()),
-                            );
+                            .on_disabled_hover_text(t_fmt(
+                                lang,
+                                Key::InboundsUsedByRules,
+                                &[&reference_count],
+                            ));
                         if delete.clicked() {
                             remove = Some(i);
                         }
@@ -336,10 +337,11 @@ impl InboundsScreen {
                     inline_error(ui, validation.doko_collisions[i].as_deref());
                     if reference_count != 0 {
                         ui.label(
-                            egui::RichText::new(
-                                t(lang, Key::InboundsDeleteBlocked)
-                                    .replace("{reference_count}", &reference_count.to_string()),
-                            )
+                            egui::RichText::new(t_fmt(
+                                lang,
+                                Key::InboundsDeleteBlocked,
+                                &[&reference_count],
+                            ))
                             .small()
                             .color(ui.visuals().warn_fg_color),
                         );
@@ -741,7 +743,7 @@ fn listener_collision(
                 .collect::<Vec<_>>();
             (
                 conflicts,
-                t(lang, Key::CollisionEndpoint).replace("{path:?}", &format!("{path:?}")),
+                t_fmt(lang, Key::CollisionEndpoint, &[&format!("{path:?}")]),
             )
         }
         ListenerEndpoint::Invalid(_) => unreachable!(),
@@ -771,7 +773,7 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
     if matches!(tag, API_INBOUND_TAG | DNS_INBOUND_TAG | TUN_INBOUND_TAG)
         || settings.local_inbounds.iter().any(|entry| entry.tag == tag)
     {
-        return Some(t(lang, Key::DokodemoTagBuiltin).replace("{tag:?}", &format!("{tag:?}")));
+        return Some(t_fmt(lang, Key::DokodemoTagBuiltin, &[&format!("{tag:?}")]));
     }
     if settings
         .dokodemo
@@ -779,7 +781,11 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
         .enumerate()
         .any(|(other, entry)| other != index && entry.tag == tag)
     {
-        return Some(t(lang, Key::DokodemoTagDuplicate).replace("{tag:?}", &format!("{tag:?}")));
+        return Some(t_fmt(
+            lang,
+            Key::DokodemoTagDuplicate,
+            &[&format!("{tag:?}")],
+        ));
     }
     None
 }
