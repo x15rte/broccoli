@@ -1381,9 +1381,17 @@ impl Runtime {
     /// does not re-enter the registry: the owner's own release ends it.
     fn begin_internal_start(&mut self) {
         if self.jobs.busy_kind().is_none() {
-            // Cannot reject: the window read and the begin are one synchronous
-            // section, and no mutation runs between them.
-            let _ = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere);
+            // The free-window read above and this begin are one synchronous
+            // section whose only step between them is the begin's own first
+            // act, the registry's `try_begin`: no registry call and no await
+            // runs in between, so the occupying begin cannot meet an occupant
+            // and a reject here is a wiring error. Debug builds fail loudly on
+            // it rather than dropping the internal start on the floor.
+            let begun = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere);
+            debug_assert!(
+                begun.is_some(),
+                "nothing mutates the registry between the free-window read and the begin"
+            );
         }
     }
 
@@ -1903,6 +1911,16 @@ impl Runtime {
             CoreCmd::CheckUpdate => self.check_update(),
             CoreCmd::SetTunMode(on) => {
                 if on == self.requested_tun_mode {
+                    // A toggle that asks for the mode already requested changes
+                    // nothing: no record, no bookend, in either registry state.
+                    // A held window still answers it — the occupant is named
+                    // through the Restart kind's declared log-only flavour, the
+                    // same line a refused toggle prints. The registry read and
+                    // the answer are one synchronous section, so the occupant
+                    // cannot change between them.
+                    if let Some(occupant) = self.jobs.busy_kind() {
+                        self.answer_busy(JobKind::Restart, occupant, BusyAnswer::Nowhere);
+                    }
                     return;
                 }
                 let active = self.backend.tun_owned_or_alive()
@@ -5121,6 +5139,68 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CoreEvt::Operation(None))),
             "the reject must not release the occupant's window"
+        );
+    }
+
+    /// A toggle that asks for the mode already requested opens no record and
+    /// prints no bookend — but a held window still answers it: the occupant is
+    /// named through the same line a refused toggle prints, and it keeps the
+    /// window it held.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_no_op_transport_toggle_answers_a_held_window() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::UpdateCore);
+        flush_bookends(&mut runtime);
+        let before: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            before.len(),
+            1,
+            "only the test's own occupation bookend precedes the toggle, got: {before:?}"
+        );
+
+        runtime.handle_cmd(CoreCmd::SetTunMode(false)).await;
+
+        assert_eq!(
+            runtime.jobs.busy_kind(),
+            Some(JobKind::UpdateCore),
+            "a no-op toggle must leave the occupant's record alone"
+        );
+        assert!(
+            !runtime.requested_tun_mode,
+            "a no-op toggle stays on the mode it already holds"
+        );
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            app_log_texts(&emitted),
+            vec![busy_reject_text(JobKind::UpdateCore)],
+            "a no-op toggle reports the occupant exactly as a refused one does, got: {emitted:?}"
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::Operation(_))),
+            "a no-op toggle must not open or close a record"
+        );
+    }
+
+    /// The same no-op toggle against a free window says nothing at all: no busy
+    /// line, no bookend, no record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_no_op_transport_toggle_against_a_free_window_stays_silent() {
+        let (mut runtime, events) = runtime_with_events();
+
+        runtime.handle_cmd(CoreCmd::SetTunMode(false)).await;
+
+        assert!(
+            runtime.jobs.busy_kind().is_none(),
+            "a no-op toggle must not open a record"
+        );
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            emitted.is_empty(),
+            "a no-op toggle on a free window emits nothing, got: {emitted:?}"
         );
     }
 
