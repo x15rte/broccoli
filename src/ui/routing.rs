@@ -15,6 +15,7 @@ use crate::model::{
 };
 use crate::rt::{BalancerInfoView, CoreCmd, CorePhase, RuntimeStateView, TrialRuleAddOutcome};
 use crate::sys::geodata::{GeodataCatalog, GeodataError, GeodataSnapshot};
+use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
 use crate::ui::{UiCtx, widgets};
@@ -137,7 +138,8 @@ enum BalancerControlAction {
 struct RuntimeControl<'a> {
     cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
     running: bool,
-    runtime_busy: bool,
+    /// The busy window: an exclusive job holds it.
+    busy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -740,14 +742,23 @@ impl RoutingScreen {
     /// into a per-frame `String`; it is attached only while a control is
     /// actually disabled (`on_disabled_hover_text` arguments evaluate
     /// eagerly).
+    ///
+    /// Trial-rule requests are free queries — the runtime answers them while a
+    /// job holds the busy window, so nothing here refuses on the window — and
+    /// the ladder is asked without one.
     fn trial_gate(&self, ctx: &UiCtx, lang: Language) -> (bool, Option<&'static str>) {
-        if !matches!(ctx.phase, CorePhase::Running) {
-            (false, Some(t(lang, Key::TrialRulesNotRunning)))
-        } else if self.trial_busy() {
-            (false, Some(t(lang, Key::TrialRulesPending)))
-        } else {
-            (true, None)
-        }
+        let gate = verdict(
+            matches!(ctx.phase, CorePhase::Running),
+            false,
+            self.trial_busy(),
+        );
+        let reason = match gate.rung {
+            Rung::NotRunning => Some(t(lang, Key::TrialRulesNotRunning)),
+            Rung::Pending => Some(t(lang, Key::TrialRulesPending)),
+            // The gate states no window fact, so the busy rung cannot arise.
+            Rung::Ready | Rung::Busy => None,
+        };
+        (gate.enabled, reason)
     }
 
     /// Poll the in-flight live outbound-tag read. Success stores the tags the
@@ -2120,20 +2131,27 @@ impl RoutingScreen {
             }
 
             let pending = state.pending_request.is_some();
-            let available =
-                control.running && !control.runtime_busy && !pending && !tag.trim().is_empty();
-            if !control.running {
-                ui.label(
-                    RichText::new(t(lang, Key::CoreNotRunningControls))
-                        .color(ui.visuals().warn_fg_color),
-                );
-            } else if control.runtime_busy {
-                ui.label(
-                    RichText::new(t(lang, Key::OperationInProgress))
-                        .color(ui.visuals().warn_fg_color),
-                );
-            } else if pending {
-                ui.label(RichText::new(t(lang, Key::WaitingForXrayEllipsis)).weak());
+            let gate = verdict(control.running, control.busy, pending);
+            // The override target is this control's own extra condition: a
+            // refusal on the rungs above paints its own sentence below.
+            let available = gate.enabled && !tag.trim().is_empty();
+            match gate.rung {
+                Rung::NotRunning => {
+                    ui.label(
+                        RichText::new(t(lang, Key::CoreNotRunningControls))
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                Rung::Busy => {
+                    ui.label(
+                        RichText::new(t(lang, Key::OperationInProgress))
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                Rung::Pending => {
+                    ui.label(RichText::new(t(lang, Key::WaitingForXrayEllipsis)).weak());
+                }
+                Rung::Ready => {}
             }
 
             let mut action = None;
@@ -2312,11 +2330,11 @@ impl RoutingScreen {
         // closure captures `self` uniquely for `balancer_editor`.
         let control_cmd = ctx.cmd.clone();
         let control_running = matches!(ctx.phase, CorePhase::Running);
-        let control_busy = ctx.operation.is_some();
+        let control_busy = ctx.busy.is_held();
         let runtime_control = RuntimeControl {
             cmd: &control_cmd,
             running: control_running,
-            runtime_busy: control_busy,
+            busy: control_busy,
         };
 
         widgets::section(ui, t(lang, Key::BalancersSection), |ui| {
@@ -3158,21 +3176,28 @@ impl RoutingScreen {
                 }
                 let prepared_request = self.prepared_route_test.as_ref();
                 let validation_error = prepared_request.and_then(|result| result.as_ref().err());
-                let running = matches!(ctx.phase, CorePhase::Running);
-                let runtime_busy = ctx.operation.is_some();
-                let pending = self.test_pending_request.is_pending();
-                if !running {
-                    ui.label(
-                        RichText::new(t(lang, Key::TestCoreNotRunning))
-                            .color(ui.visuals().warn_fg_color),
-                    );
-                } else if runtime_busy {
-                    ui.label(
-                        RichText::new(t(lang, Key::OperationInProgress))
-                            .color(ui.visuals().warn_fg_color),
-                    );
-                } else if pending {
-                    ui.label(RichText::new(t(lang, Key::WaitingForXrayEllipsis)).weak());
+                let gate = verdict(
+                    matches!(ctx.phase, CorePhase::Running),
+                    ctx.busy.is_held(),
+                    self.test_pending_request.is_pending(),
+                );
+                match gate.rung {
+                    Rung::NotRunning => {
+                        ui.label(
+                            RichText::new(t(lang, Key::TestCoreNotRunning))
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                    Rung::Busy => {
+                        ui.label(
+                            RichText::new(t(lang, Key::OperationInProgress))
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                    Rung::Pending => {
+                        ui.label(RichText::new(t(lang, Key::WaitingForXrayEllipsis)).weak());
+                    }
+                    Rung::Ready => {}
                 }
                 if let Some(error) = validation_error {
                     ui.label(RichText::new(error.as_str()).color(ui.visuals().error_fg_color));
@@ -3192,10 +3217,7 @@ impl RoutingScreen {
                         });
                 }
                 ui.horizontal(|ui| {
-                    let can_run = running
-                        && !runtime_busy
-                        && !pending
-                        && prepared_request.is_some_and(Result::is_ok);
+                    let can_run = gate.enabled && prepared_request.is_some_and(Result::is_ok);
                     let button =
                         ui.add_enabled(can_run, egui::Button::new(t(lang, Key::TestExactContext)));
                     // The disabled reason may be a static string or the
@@ -3205,16 +3227,15 @@ impl RoutingScreen {
                     let button = if can_run {
                         button
                     } else {
-                        let disabled_reason = if !running {
-                            t(lang, Key::TestDisabledNotRunning)
-                        } else if runtime_busy {
-                            t(lang, Key::TestDisabledBusy)
-                        } else if pending {
-                            t(lang, Key::TestDisabledPending)
-                        } else {
-                            validation_error
+                        let disabled_reason = match gate.rung {
+                            Rung::NotRunning => t(lang, Key::TestDisabledNotRunning),
+                            Rung::Busy => t(lang, Key::TestDisabledBusy),
+                            Rung::Pending => t(lang, Key::TestDisabledPending),
+                            // No rung refuses the control: its own request is
+                            // incomplete or invalid.
+                            Rung::Ready => validation_error
                                 .map(String::as_str)
-                                .unwrap_or(t(lang, Key::TestDisabledIncomplete))
+                                .unwrap_or(t(lang, Key::TestDisabledIncomplete)),
                         };
                         button.on_disabled_hover_text(disabled_reason)
                     };

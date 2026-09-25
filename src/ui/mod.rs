@@ -3,6 +3,7 @@
 pub mod about;
 pub mod dashboard;
 pub mod dns;
+pub(crate) mod gate;
 pub mod inbounds;
 pub mod logs;
 pub mod profile_preview;
@@ -114,8 +115,10 @@ pub struct UiCtx<'a> {
     pub settings: &'a mut Settings,
     pub cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
     pub phase: &'a CorePhase,
-    /// Runtime-owned mutually-exclusive lifecycle/update transaction.
-    pub operation: Option<OperationKind>,
+    /// The busy window: the runtime-owned mutually-exclusive
+    /// lifecycle/update transaction. Screens gate their controls on this
+    /// value instead of deriving the window from their own inputs.
+    pub(crate) busy: gate::BusyWindow,
     /// Persistent reason Connect is disabled. Screens must use this instead of
     /// deriving capability from `phase` or managed-core presence alone.
     pub connect_blocked_reason: &'a Option<String>,
@@ -210,6 +213,9 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) verify_core_requested: &'a mut bool,
     pub(crate) open_core_folder_requested: &'a mut bool,
     pub(crate) open_core_setup_requested: &'a mut bool,
+    /// The raw window the shell drained from the runtime's operation
+    /// bookends: [`UiCtx::new`] derives [`UiCtx::busy`] from it once per
+    /// frame, and screens read the window through that value.
     pub(crate) operation: Option<OperationKind>,
     pub(crate) is_elevated: bool,
     pub(crate) config_revision: u64,
@@ -325,7 +331,7 @@ impl<'a> UiCtx<'a> {
             verify_core_requested,
             open_core_folder_requested,
             open_core_setup_requested,
-            operation,
+            busy: gate::BusyWindow::from_operation(operation),
             connect_blocked_reason,
             config_error,
             is_elevated,
@@ -560,7 +566,7 @@ fn download_same(a: &DownloadState, b: &DownloadState) -> bool {
 
 /// Whether a core setup source is currently owned by the runtime.
 pub(crate) fn core_setup_busy(ctx: &UiCtx<'_>) -> bool {
-    matches!(&ctx.download, DownloadState::Working { .. }) || ctx.operation.is_some()
+    matches!(&ctx.download, DownloadState::Working { .. }) || ctx.busy.is_held()
 }
 
 /// The managed core's setup state as the core setup surface renders it.
@@ -859,7 +865,7 @@ pub(crate) fn show_core_setup(
                     egui::Color32::LIGHT_GREEN,
                     t_fmt(lang, Key::CoreSetupInstalledVersion, &[&done_version]),
                 );
-                if ctx.operation.is_some() {
+                if ctx.busy.is_held() {
                     ui.add_space(8.0);
                     ui.spinner();
                     ui.weak(t(lang, Key::CoreSetupHealthCheck));

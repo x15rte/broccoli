@@ -37,6 +37,7 @@ use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
     ProfileValidationRequest, ToolTarget,
 };
+use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::{StatusColors, status_colors_of};
@@ -2477,7 +2478,7 @@ impl ServersScreen {
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
                                 if self
-                                    .existing_gate(uictx.operation.is_some())
+                                    .existing_gate(uictx.busy.is_held())
                                     .is_some_and(DraftGate::dirty)
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
@@ -2519,7 +2520,7 @@ impl ServersScreen {
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
                                 if self
-                                    .add_gate(uictx.operation.is_some())
+                                    .add_gate(uictx.busy.is_held())
                                     .is_some_and(|gate| gate.changed_from_source)
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
@@ -2920,13 +2921,19 @@ impl ServersScreen {
         ui.separator();
 
         // One-probe-at-a-time gate shared by the toolbar button and every
-        // per-row probe button.
-        let probe_gate = if self.pending_latency_probe.is_some() {
-            (false, t(lang, Key::SrvLatencyTestAlreadyRunning))
-        } else if ctx.operation.is_some() {
-            (false, t(lang, Key::SrvAnotherOperationWorking))
-        } else {
-            (true, "")
+        // per-row probe button. The probe dials through its own isolated
+        // core, so no phase rung refuses it; its own request is the window's
+        // occupant while it runs, so the window is read for other jobs only —
+        // that is what keeps the "already running" rung ahead of the busy
+        // rung the probe's own job would otherwise state.
+        let probe_pending = self.pending_latency_probe.is_some();
+        let probe_verdict = verdict(true, ctx.busy.is_held() && !probe_pending, probe_pending);
+        let probe_gate = match probe_verdict.rung {
+            Rung::Ready => (true, ""),
+            Rung::Pending => (false, t(lang, Key::SrvLatencyTestAlreadyRunning)),
+            // The not-running rung cannot arise: the probe dials its own
+            // core, so the verdict above states no phase fact.
+            Rung::NotRunning | Rung::Busy => (false, t(lang, Key::SrvAnotherOperationWorking)),
         };
         let mut action: Option<ListAction> = None;
         let list_height = (ui.available_height() - 120.0).max(80.0);
@@ -3509,7 +3516,7 @@ impl ServersScreen {
     /// success or clears it on rejection. Failure to start clears the
     /// staged action and shows the status error.
     fn save_leave_action(&mut self, action: LeaveAction, lang: Language, uictx: &mut UiCtx) {
-        let busy = uictx.operation.is_some();
+        let busy = uictx.busy.is_held();
         let target = if let Some(draft) = &self.existing_draft
             && self
                 .existing_gate(busy)
@@ -3590,7 +3597,7 @@ impl ServersScreen {
         // Each draft's Save reads the same gate as its editor's own commit
         // control: `committable` refuses a raw-buffer-only dirty state, whose
         // commit would be a no-op that leaves the unsaved indicator on.
-        let busy = uictx.operation.is_some();
+        let busy = uictx.busy.is_held();
         let existing_saveable = self.existing_gate(busy).is_some_and(DraftGate::committable);
         let add_saveable = self.add_gate(busy).is_some_and(DraftGate::committable);
         let saveable = existing_saveable || add_saveable;
@@ -3962,7 +3969,7 @@ impl ServersScreen {
         // validation job (read here so the dot, the tabs' gates and the
         // action row all see one value) and the busy window.
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
-        let busy = ctx.operation.is_some();
+        let busy = ctx.busy.is_held();
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvName));
@@ -6554,6 +6561,7 @@ impl ServersScreen {
         let draft_id = draft.id.clone();
         let lang = uictx.settings.language;
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
+        let core_busy = uictx.busy.is_held();
         let mut open = true;
         let mut validate_clicked = false;
         let mut cancel = false;
@@ -6704,7 +6712,7 @@ impl ServersScreen {
                     self.add_draft_validation_cache.as_ref(),
                     &self.finalmask_raw,
                     validating,
-                    uictx.operation.is_some(),
+                    core_busy,
                 );
                 if !errors.is_empty() {
                     ui.separator();
@@ -6731,7 +6739,7 @@ impl ServersScreen {
                         );
                     }
                 }
-                if uictx.operation.is_some() {
+                if core_busy {
                     ui.colored_label(
                         status_colors_of(ui).warn,
                         t(lang, Key::SrvWaitCoreOperation),
@@ -6865,6 +6873,7 @@ impl ServersScreen {
         // Import links.
         if self.import_open {
             let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Import);
+            let core_busy = uictx.busy.is_held();
             let mut open = self.import_open;
             let mut validate_profiles: Option<Vec<ServerProfile>> = None;
             let window = egui::Window::new(t(lang, Key::SrvImportShareLinks))
@@ -6950,7 +6959,7 @@ impl ServersScreen {
                                 }
                             },
                         );
-                        if uictx.operation.is_some() {
+                        if core_busy {
                             ui.colored_label(
                                 status_colors_of(ui).warn,
                                 t(lang, Key::SrvWaitCoreOperationImports),
@@ -6958,7 +6967,7 @@ impl ServersScreen {
                         }
                         if ui
                             .add_enabled(
-                                ok > 0 && uictx.operation.is_none(),
+                                ok > 0 && !core_busy,
                                 egui::Button::new(t_fmt(
                                     lang,
                                     Key::SrvValidateAndAddServers,

@@ -15,6 +15,7 @@ use crate::i18n::{Key, t, t_fmt};
 use crate::model::settings::Language;
 use crate::rt::{CoreCmd, CorePhase};
 use crate::sys;
+use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
 use crate::ui::routing::contains_ascii_case_insensitive;
 use crate::ui::status::{status_colors, status_colors_of};
@@ -379,8 +380,11 @@ impl LogsScreen {
         }
         let logger_cmd = ctx.cmd.clone();
         let logs: &VecDeque<(bool, String)> = ctx.logs;
-        let logger_running = matches!(ctx.phase, CorePhase::Running);
-        let logger_busy = ctx.operation.is_some();
+        let logger_gate = verdict(
+            matches!(ctx.phase, CorePhase::Running),
+            ctx.busy.is_held(),
+            self.pending_logger_request.is_pending(),
+        );
         // The filtered view is memoized on
         // (ring identity, level, needle, clear generation); idle frames
         // never rebuild it, and forward refreshes extend the cached view —
@@ -436,23 +440,24 @@ impl LogsScreen {
                     Err(e) => self.last_error = Some(t_fmt(lang, Key::LogsOpenFolderFailed, &[&e])),
                 }
             }
-            let restart_available =
-                logger_running && !logger_busy && !self.pending_logger_request.is_pending();
-            if ui
+            let mut restart = ui
                 .add_enabled(
-                    restart_available,
+                    logger_gate.enabled,
                     egui::Button::new(t(lang, Key::LogsRestartLogger)),
                 )
-                .on_hover_text(t(lang, Key::LogsRestartLoggerHint))
-                .on_disabled_hover_text(if !logger_running {
-                    t(lang, Key::LogsRestartDisabledNotRunning)
-                } else if logger_busy {
-                    t(lang, Key::LogsRestartDisabledBusy)
-                } else {
-                    t(lang, Key::WaitingForXray)
-                })
-                .clicked()
-            {
+                .on_hover_text(t(lang, Key::LogsRestartLoggerHint));
+            // The disabled reason is attached only while the rung refuses the
+            // button: hover-text arguments evaluate eagerly every frame.
+            let disabled_reason = match logger_gate.rung {
+                Rung::Ready => None,
+                Rung::NotRunning => Some(t(lang, Key::LogsRestartDisabledNotRunning)),
+                Rung::Busy => Some(t(lang, Key::LogsRestartDisabledBusy)),
+                Rung::Pending => Some(t(lang, Key::WaitingForXray)),
+            };
+            if let Some(reason) = disabled_reason {
+                restart = restart.on_disabled_hover_text(reason);
+            }
+            if restart.clicked() {
                 let (reply, receiver) = tokio::sync::oneshot::channel();
                 self.logger_restart_feedback = None;
                 if logger_cmd.send(CoreCmd::RestartLogger { reply }).is_err() {

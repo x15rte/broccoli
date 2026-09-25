@@ -4,6 +4,7 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::rt::{AppMessage, CoreCmd, CorePhase, RuntimeEntryView, RuntimeStateView};
 use crate::ui::UiCtx;
+use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
 
 enum PreviewState {
@@ -140,15 +141,16 @@ impl ProfilePreviewScreen {
         ctx: &mut UiCtx,
         lang: crate::model::settings::Language,
     ) {
-        let running = matches!(ctx.phase, CorePhase::Running);
-        let busy = self.pending_request.is_pending();
-        if ui
-            .add_enabled(
-                running && !busy,
-                egui::Button::new(t(lang, Key::RuntimeRefresh)),
-            )
-            .clicked()
-        {
+        // The runtime-state read is a free query — the runtime answers it
+        // while a job holds the busy window — so the ladder is asked without
+        // a window fact.
+        let gate = verdict(
+            matches!(ctx.phase, CorePhase::Running),
+            false,
+            self.pending_request.is_pending(),
+        );
+        let refresh = egui::Button::new(t(lang, Key::RuntimeRefresh));
+        if ui.add_enabled(gate.enabled, refresh).clicked() {
             let (reply, receiver) = tokio::sync::oneshot::channel();
             if ctx.cmd.send(CoreCmd::ListRuntimeState { reply }).is_err() {
                 self.runtime = Some(Err(DiagError::from(Diag::new(Key::RuntimeChannelClosed))));
@@ -157,7 +159,7 @@ impl ProfilePreviewScreen {
             }
         }
 
-        if !running {
+        if matches!(gate.rung, Rung::NotRunning) {
             ui.colored_label(
                 crate::ui::status::status_colors_of(ui).warn,
                 t(lang, Key::RuntimeNotRunning),
