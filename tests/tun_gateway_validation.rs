@@ -20,7 +20,7 @@ use broccoli::app::BroccoliApp;
 use broccoli::r#gen::generate_with_api_port;
 use broccoli::i18n::{Key, t_fmt, validation_message};
 use broccoli::model::settings::{Language, Mode, Settings};
-use broccoli::model::validation::{ValidationCode, ValidationIssue, validate_settings};
+use broccoli::model::validation::{ValidationCode, Verdict, validate_settings};
 use broccoli::model::{ServersFile, TunCfg};
 use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
 use parking_lot::MutexGuard;
@@ -34,8 +34,10 @@ fn gateway_error() -> &'static str {
 }
 
 /// The settings-level verdict for `settings`, with no server profiles and a
-/// fixed API port — the one entry point generation, editors and tests use.
-fn verdict(settings: &Settings) -> Vec<ValidationIssue> {
+/// fixed API port — the same scope and entry point generation judges, with
+/// the port named because this suite is about the TUN gateway rules rather
+/// than the collision rule the real port participates in.
+fn verdict(settings: &Settings) -> Verdict {
     validate_settings(settings, &ServersFile::default(), 19999)
 }
 

@@ -25,7 +25,7 @@ use crate::model::outbound::{
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
 use crate::model::validation::{
-    self, DNS_OUT_ACTIONS, Severity, ValidationCode, ValidationIssue, XUDP_PROXY_UDP443_MODES,
+    self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
     dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
     pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
     send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
@@ -278,12 +278,12 @@ struct EditorValidationFindings {
     advisory: Vec<ValidationIssue>,
     /// The Advanced tab's inline finalmask verdict: `validate_finalmask`
     /// findings in model order (TCP masks, UDP masks, QUIC params).
-    finalmask: Vec<ValidationIssue>,
+    finalmask: Verdict,
     /// The Advanced tab's inline `stream.sockopt` verdict.
-    stream_sockopt: Vec<ValidationIssue>,
+    stream_sockopt: Verdict,
     /// The Security tab's inline verdict for the TLS settings' ECH DNS-query
     /// socket options (`stream.tlsSettings.echSockopt`).
-    ech_sockopt: Vec<ValidationIssue>,
+    ech_sockopt: Verdict,
 }
 
 /// The rendered form of one sweep: one `path: message` string per finding, in
@@ -345,25 +345,25 @@ impl EditorValidationFindings {
 /// The Advanced tab's inline finalmask verdict, in model order (TCP masks,
 /// UDP masks, QUIC params) — the exact findings the tab renders under the
 /// mask list.
-fn finalmask_findings(profile: &ServerProfile) -> Vec<ValidationIssue> {
+fn finalmask_findings(profile: &ServerProfile) -> Verdict {
     profile
         .outbound
         .stream
         .finalmask
         .as_ref()
-        .map_or_else(Vec::new, validate_finalmask)
+        .map_or_else(Verdict::default, validate_finalmask)
 }
 
-/// `validate_sockopt` findings for one sockopt block, under the wire path
+/// `validate_sockopt` verdict for one sockopt block, under the wire path
 /// prefix its usage mounts it at.
-fn sockopt_findings(sockopt: &SockoptModel, usage: SockoptUsage) -> Vec<ValidationIssue> {
+fn sockopt_findings(sockopt: &SockoptModel, usage: SockoptUsage) -> Verdict {
     validate_sockopt(sockopt, usage.path_prefix())
 }
 
 /// The sockopt blocks' inline verdicts for one draft: the stream's own
 /// `stream.sockopt` block and — when TLS carries ECH — the
 /// `stream.tlsSettings.echSockopt` block.
-fn sockopt_findings_for(profile: &ServerProfile) -> (Vec<ValidationIssue>, Vec<ValidationIssue>) {
+fn sockopt_findings_for(profile: &ServerProfile) -> (Verdict, Verdict) {
     let stream = &profile.outbound.stream;
     let stream_findings = stream
         .sockopt
@@ -533,14 +533,12 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
         }
     }
     // Model validation pass: protocol + stream + transport security in one
-    // sweep. Advisory findings (Severity::Warning) never block save — they
-    // render amber in the warnings list instead of the error list.
-    for issue in validate_outbound(&profile.outbound) {
-        match issue.severity {
-            Severity::Warning => advisory.push(issue),
-            Severity::Error => blocking.push(issue),
-        }
-    }
+    // sweep. Its blocking findings join the editor's own draft requirements;
+    // its advisory ones render amber in the warnings list instead of the
+    // error list — the verdict answers which is which.
+    let model = validate_outbound(&profile.outbound);
+    blocking.extend(model.blocking().cloned());
+    advisory.extend(model.advisory().cloned());
 
     // The stream sweep: every rule it used to re-derive lives in the model
     // pass above — header-map JSON values (`HeaderValuesNotStrings`, one path

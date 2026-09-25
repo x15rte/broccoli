@@ -2,12 +2,27 @@
 //! exporter, the config generator, and the editor.
 //!
 //! Pure model checks: no i18n here. Every issue carries a [`ValidationCode`],
-//! an optional wire path, and its [`Severity`] tier (`Error` findings block
-//! save/import/apply; `Warning` findings are advisory); callers
-//! render codes through `crate::i18n::validation_message` /
-//! `validation_issue_message`. One pass per model, no short-circuit — a
-//! single `validate_outbound` call surfaces every protocol, stream, and
-//! transport-security problem.
+//! an optional wire path, and its [`Severity`] tier; callers render codes
+//! through `crate::i18n::validation_message`. Each pass returns a [`Verdict`],
+//! which answers the tier questions (`blocking`, `advisory`, `first_blocking`)
+//! so no caller re-filters findings by severity. One pass per model, no
+//! short-circuit — a single `validate_outbound` call surfaces every protocol,
+//! stream, and transport-security problem.
+//!
+//! The passes nest, and which one a gate asks is the gate's scope:
+//!
+//! - [`validate_outbound`] — one profile's protocol, stream and transport
+//!   security. What the share-link paste gate and the editor sweep judge.
+//! - [`validate_profiles`] — that plus the profile-set rules (identity,
+//!   generated tags, the dial graph's chain findings), judged against the
+//!   emitted outbound universe. `active_id` and `require_nonempty` are the
+//!   scope's own inputs: the latency probe requires at least one profile and
+//!   judges no active selection.
+//! - [`validate_settings`] — that plus every settings-wide rule (balancers,
+//!   listeners, TUN, routing, DNS, geodata), including the listener collisions
+//!   the control-plane port participates in — which is why generation, the one
+//!   caller that knows the port it is about to bind, supplies it. Every gate
+//!   that can apply a configuration judges this scope (`gen::generate`).
 //!
 //! `Network::supports_reality` stays in `stream.rs` as the shared fact; this
 //! module only consumes it.
@@ -782,6 +797,112 @@ impl ValidationIssue {
     }
 }
 
+/// The verdict of one validation scope: every finding a pass produced, in
+/// pass order, with the severity tier answered here instead of at each call
+/// site — "the first thing that refuses this" and "the amber ones the UI
+/// shows" were spellings of `Severity::Error`/`Severity::Warning` filters
+/// repeated at every consumer.
+///
+/// It reads as the finding list it is (`Deref` to the slice), so a caller
+/// that wants the raw order and a caller that wants the tier do not need
+/// different values.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    issues: Vec<ValidationIssue>,
+}
+
+impl PartialEq<Vec<ValidationIssue>> for Verdict {
+    fn eq(&self, other: &Vec<ValidationIssue>) -> bool {
+        self.issues == *other
+    }
+}
+
+impl PartialEq<[ValidationIssue]> for Verdict {
+    fn eq(&self, other: &[ValidationIssue]) -> bool {
+        self.issues == other
+    }
+}
+
+impl Verdict {
+    fn from_issues(issues: Vec<ValidationIssue>) -> Self {
+        Self { issues }
+    }
+
+    /// Every finding, in pass order.
+    pub fn issues(&self) -> &[ValidationIssue] {
+        &self.issues
+    }
+
+    /// The blocking findings — [`Severity::Error`] — in pass order: what
+    /// refuses save, import and apply.
+    pub fn blocking(&self) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == Severity::Error)
+    }
+
+    /// The advisory findings — [`Severity::Warning`]: legal configurations
+    /// whose value cannot work as written, surfaced beside the editors.
+    pub fn advisory(&self) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == Severity::Warning)
+    }
+
+    /// Whether any finding refuses the configuration.
+    pub fn has_blocking(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == Severity::Error)
+    }
+
+    /// The first blocking finding: the refusal a gate reports.
+    pub fn first_blocking(&self) -> Option<&ValidationIssue> {
+        self.issues
+            .iter()
+            .find(|issue| issue.severity == Severity::Error)
+    }
+
+    /// [`Self::first_blocking`], consuming the verdict.
+    pub fn into_first_blocking(self) -> Option<ValidationIssue> {
+        self.issues
+            .into_iter()
+            .find(|issue| issue.severity == Severity::Error)
+    }
+
+    /// The findings as the plain list, for the callers that store or extend
+    /// one.
+    pub fn into_issues(self) -> Vec<ValidationIssue> {
+        self.issues
+    }
+}
+
+impl std::ops::Deref for Verdict {
+    type Target = [ValidationIssue];
+
+    fn deref(&self) -> &Self::Target {
+        &self.issues
+    }
+}
+
+impl IntoIterator for Verdict {
+    type Item = ValidationIssue;
+    type IntoIter = std::vec::IntoIter<ValidationIssue>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.issues.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Verdict {
+    type Item = &'a ValidationIssue;
+    type IntoIter = std::slice::Iter<'a, ValidationIssue>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.issues.iter()
+    }
+}
+
 fn issue(code: ValidationCode, path: Option<String>) -> ValidationIssue {
     ValidationIssue {
         code,
@@ -1454,7 +1575,7 @@ pub fn sniffing_dest_override_supported(protocol: &str) -> bool {
 /// like that load refusal. Emits one issue per offending item — never on
 /// `fakedns`/`fakedns+others`, which Xray accepts and the generator
 /// appends at wire time.
-pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Vec<ValidationIssue> {
+pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Verdict {
     let mut issues = Vec::new();
     for item in &sniffing.dest_override {
         if !sniffing_dest_override_supported(item) {
@@ -1464,13 +1585,13 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Vec<ValidationIss
             ));
         }
     }
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
-pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
+pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     let mut issues = Vec::new();
 
     // The retired `proxySettings` key left this mark behind: the pinned core
@@ -1871,12 +1992,12 @@ pub fn validate_outbound(o: &OutboundModel) -> Vec<ValidationIssue> {
     }
 
     issues.extend(validate_stream(&o.stream));
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// Validate a stream model, recursing over every modeled XHTTP download
 /// stream. Mirrors the old `StreamModel::validation_errors` visit logic.
-pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
+pub fn validate_stream(s: &StreamModel) -> Verdict {
     fn visit(stream: &StreamModel, depth: usize, issues: &mut Vec<ValidationIssue>) {
         if depth > MAX_XHTTP_DOWNLOAD_DEPTH {
             issues.push(issue(ValidationCode::XhttpDepthExceeded, None));
@@ -2494,7 +2615,7 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
 
     let mut issues = Vec::new();
     visit(s, 0, &mut issues);
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// The sockopt `domainStrategy` vocabulary: the empty wire default plus the
@@ -2548,7 +2669,7 @@ pub fn sockopt_address_port_strategy_supported(strategy: &str) -> bool {
 
 /// Validate one sockopt block. `prefix` is the wire path prefix that scopes
 /// every field finding (e.g. `"stream.sockopt"`).
-pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Vec<ValidationIssue> {
+pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Verdict {
     let mut issues = Vec::new();
     if !sockopt_domain_strategy_supported(&s.domain_strategy) {
         issues.push(issue(
@@ -2624,7 +2745,7 @@ pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Vec<ValidationIssue> 
             Some(format!("{prefix}.tproxy")),
         ));
     }
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// Validate a listen address: always a concrete IP literal.
@@ -2648,7 +2769,7 @@ fn finalmask_range_bounds(value: Int32Range) -> (i32, i32) {
 /// Validate one finalmask block. Paths are wire paths suitable for inline UI
 /// and share-link diagnostics; they mirror the rejections of the current Xray
 /// finalmask loader and QUIC parameter builder.
-pub fn validate_finalmask(fm: &FinalmaskModel) -> Vec<ValidationIssue> {
+pub fn validate_finalmask(fm: &FinalmaskModel) -> Verdict {
     let mut issues = Vec::new();
     for (index, mask) in fm.tcp.iter().enumerate() {
         finalmask_validate_tcp_mask(index, mask, &mut issues);
@@ -2660,7 +2781,7 @@ pub fn validate_finalmask(fm: &FinalmaskModel) -> Vec<ValidationIssue> {
     if let Some(quic) = &fm.quic_params {
         finalmask_validate_quic_params("finalmask.quicParams", quic, &mut issues);
     }
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// Gate the UDP mask positions the wrap refuses. The manager reverses the
@@ -3768,7 +3889,7 @@ pub fn validate_profiles(
     profiles: &[ServerProfile],
     active_id: Option<&str>,
     require_nonempty: bool,
-) -> Vec<ValidationIssue> {
+) -> Verdict {
     let outbound_tags = emit::profile_outbound_tags(profiles);
     profile_set_verdict(profiles, active_id, require_nonempty, &outbound_tags)
 }
@@ -3782,7 +3903,7 @@ fn profile_set_verdict(
     active_id: Option<&str>,
     require_nonempty: bool,
     outbound_tags: &BTreeSet<String>,
-) -> Vec<ValidationIssue> {
+) -> Verdict {
     let mut issues = Vec::new();
     if require_nonempty && profiles.is_empty() {
         issues.push(issue(ValidationCode::ProfilesRequired, None));
@@ -3890,7 +4011,7 @@ fn profile_set_verdict(
     // scope, the probe's staged child, the delete dialog's references).
     issues.extend(super::dial::DialGraph::new(profiles, outbound_tags).chain_findings());
 
-    issues
+    Verdict::from_issues(issues)
 }
 
 /// One settings-level verdict for the whole configuration: the server
@@ -3900,11 +4021,7 @@ fn profile_set_verdict(
 /// order. `api_port` is the loopback control-plane port generation will
 /// bind; the API listener participates in the collision rule like every
 /// other listener. `settings.mode` selects the TUN rules.
-pub fn validate_settings(
-    settings: &Settings,
-    servers: &ServersFile,
-    api_port: u16,
-) -> Vec<ValidationIssue> {
+pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u16) -> Verdict {
     // The emitted outbound universe first: every check below — the profile
     // verdict's chain targets, the balancer fallbacks, the rules — judges the
     // tags the generated document carries.
@@ -3914,7 +4031,8 @@ pub fn validate_settings(
         servers.active.as_deref(),
         false,
         &outbound_tags,
-    );
+    )
+    .into_issues();
     let tun_on = emit::tun_inbound_emitted(settings);
 
     let mut balancer_tags = BTreeSet::new();
@@ -4265,7 +4383,7 @@ pub fn validate_settings(
         }
     }
 
-    issues
+    Verdict::from_issues(issues)
 }
 
 #[cfg(test)]

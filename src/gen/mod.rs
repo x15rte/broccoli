@@ -12,7 +12,7 @@ use crate::model::emit;
 use crate::model::inbound::{API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG};
 use crate::model::settings::Language;
 use crate::model::validation::{
-    Severity, ValidationIssue, tun_ipv4_gateway, validate_profiles, validate_settings,
+    ValidationIssue, Verdict, tun_ipv4_gateway, validate_profiles, validate_settings,
 };
 use crate::model::{
     DnsCfg, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile, Settings, TunCfg,
@@ -562,12 +562,12 @@ pub fn generate_latency_probe(
     Ok(Value::Object(root))
 }
 
-/// The first `Severity::Error` finding as the generator's invalid-model
-/// error; warning findings never gate generation.
-fn invalid_model_error(issues: Vec<ValidationIssue>) -> Option<GenerateError> {
-    issues
-        .into_iter()
-        .find(|issue| issue.severity == Severity::Error)
+/// The verdict's first blocking finding as the generator's invalid-model
+/// error; warning findings never gate generation. The tier rule itself lives
+/// on the verdict.
+fn invalid_model_error(verdict: Verdict) -> Option<GenerateError> {
+    verdict
+        .into_first_blocking()
         .map(|issue| GenerateError::InvalidFinding(Box::new(issue)))
 }
 
@@ -1218,11 +1218,9 @@ mod dokodemo_unix_tests {
 
 #[cfg(test)]
 mod error_text_tests {
-    use super::{
-        Diag, GenerateError, Key, Language, Severity, ValidationIssue, validation_issue_message,
-    };
+    use super::{Diag, GenerateError, Key, Language, ValidationIssue, validation_issue_message};
     use crate::i18n::{t_fmt, validation_message};
-    use crate::model::validation::ValidationCode;
+    use crate::model::validation::{Severity, ValidationCode};
 
     #[test]
     fn generate_error_text_renders_through_the_locale_table() {

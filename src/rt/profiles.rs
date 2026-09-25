@@ -35,7 +35,7 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::links;
 use crate::model::settings::Language;
-use crate::model::validation::{Severity, validate_outbound};
+use crate::model::validation::validate_outbound;
 use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 
 use super::apply;
@@ -128,10 +128,7 @@ pub(crate) fn validation_cancelled() -> DiagError {
 fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
     let mut snapshot = servers.clone();
     for profile in &mut snapshot.profiles {
-        if validate_outbound(&profile.outbound)
-            .iter()
-            .any(|finding| finding.severity == Severity::Error)
-        {
+        if validate_outbound(&profile.outbound).has_blocking() {
             *profile = ServerProfile {
                 id: profile.id.clone(),
                 name: profile.name.clone(),

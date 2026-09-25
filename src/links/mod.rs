@@ -61,7 +61,7 @@ use crate::model::stream::{
     XhttpSettings,
 };
 use crate::model::validation::{
-    Severity, ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
+    ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
 };
 
 /// A share-link failure that has no language yet. `Display` renders English
@@ -2394,14 +2394,11 @@ pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
     }
 
     // Model validation pass: protocol, stream, and transport-security
-    // invariants in one sweep (no short-circuit). The first Severity::Error
-    // finding blocks the import/export; Warning findings are
-    // advisory — the profile is xray-legal and imports fine. Remaining #716
+    // invariants in one sweep (no short-circuit). The verdict's first
+    // blocking finding blocks the import/export; its advisory findings are
+    // the profile that is xray-legal and imports fine. Remaining #716
     // grammar checks run below.
-    if let Some(issue) = validate_outbound(&profile.outbound)
-        .into_iter()
-        .find(|issue| issue.severity == Severity::Error)
-    {
+    if let Some(issue) = validate_outbound(&profile.outbound).into_first_blocking() {
         return Err(LinkError::InvalidModel {
             prefix: None,
             issue: Box::new(issue),
@@ -4917,7 +4914,7 @@ mod tests {
         let issue = ValidationIssue {
             code: crate::model::validation::ValidationCode::StreamOneNoDownload,
             path: Some("stream.xhttpSettings".into()),
-            severity: Severity::Error,
+            severity: crate::model::validation::Severity::Error,
         };
         let bare = LinkError::InvalidModel {
             prefix: None,
