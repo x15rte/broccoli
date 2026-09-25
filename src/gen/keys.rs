@@ -115,12 +115,6 @@ pub const PROTOCOL: &str = "protocol";
 /// listener derivation read it back.
 pub const SETTINGS: &str = "settings";
 
-/// The inbound detour's `sniffing` envelope
-/// (`InboundDetourConfig.SniffingConfig`, infra/conf/xray.go:134): the
-/// destination-sniffing block, emitted with the inbound rather than inside
-/// its protocol settings.
-pub const SNIFFING: &str = "sniffing";
-
 /// The outbound detour's `streamSettings` block
 /// (`OutboundDetourConfig.StreamSetting`, infra/conf/xray.go:219), whose
 /// `sockopt` the generator patches caller-side dial policy into.

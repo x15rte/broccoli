@@ -178,19 +178,11 @@ fn golden_tun_tags_match_runtime_consts() {
 
 #[test]
 fn golden_nested_keys_match_schema_consts() {
-    // These byte-compared fixtures also carry the nested keys whose emitting
+    // These byte-compared fixtures also carry nested keys whose emitting
     // side is the model's own serialization rather than a generator `json!`
-    // literal: the inbound envelope's `sniffing` block and the chain target's
-    // `streamSettings.sockopt.dialerProxy`. Reading them through the schema
-    // consts fails if the emitted spelling drifts from the const readers name.
-    let tun: Value = serde_json::from_str(include_str!("../src/gen/goldens/tun.json"))
-        .expect("golden tun.json must parse");
-    let socks = inbound(&tun, "socks").expect("tun.json carries the SOCKS inbound");
-    assert!(
-        socks.get(keys::SNIFFING).is_some(),
-        "the emitted inbound envelope must carry sniffing: {socks}"
-    );
-
+    // literal: the chain target's `streamSettings.sockopt.dialerProxy`.
+    // Reading them through the schema consts fails if the emitted spelling
+    // drifts from the consts the readers name.
     let chain_json = include_str!("../src/gen/goldens/chain_dialer_proxy.json");
     let chain: Value =
         serde_json::from_str(chain_json).expect("golden chain_dialer_proxy.json must parse");

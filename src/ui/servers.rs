@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Stroke, StrokeKind};
 
+// The generated document's schema keys also name the profile source the
+// editor's draft readers walk: the stored profile serializes the core's flat
+// `streamSettings` outbound shape by design, so one vocabulary covers both
+// documents.
+use crate::r#gen::keys::{DIALER_PROXY, SOCKOPT, STREAM_SETTINGS};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
 use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
@@ -1680,9 +1685,9 @@ struct AdvancedTabCtx<'a> {
 fn source_chain_target(source: &serde_json::Value) -> Option<&str> {
     source
         .get("outbound")?
-        .get("streamSettings")?
-        .get("sockopt")?
-        .get("dialerProxy")?
+        .get(STREAM_SETTINGS)?
+        .get(SOCKOPT)?
+        .get(DIALER_PROXY)?
         .as_str()
         .filter(|tag| !tag.is_empty())
 }
@@ -1744,7 +1749,7 @@ fn udphop_masks(profile: &ServerProfile) -> Vec<serde_json::Value> {
 fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
     source
         .get("outbound")
-        .and_then(|outbound| outbound.get("streamSettings"))
+        .and_then(|outbound| outbound.get(STREAM_SETTINGS))
         .and_then(|stream| stream.get("finalmask"))
         .and_then(|finalmask| finalmask.get("udp"))
         .and_then(serde_json::Value::as_array)
@@ -7410,7 +7415,7 @@ mod tests {
     };
     use super::raw_editor::JsonBuf;
     use super::{
-        AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftGate,
+        AddDraftValidationCache, AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog,
         DraftTargetKind, EditorTab, EditorValidationCache, EditorValidationFindings,
         EditorValidationRender, ExistingProfileDraft, FINGERPRINTS, FeedbackLevel, FieldKey,
         Language, LatencyBadge, LeaveAction, RawBuffers, RawField, Request, RowProbeState,
@@ -7434,7 +7439,7 @@ mod tests {
         XhttpSettings,
     };
     use crate::rt::{
-        CoreCmd, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
+        CoreCmd, LatencyProbeResult, OperationKind, OutboundStatusView, ProfileValidationOrigin,
         ProfileValidationResult, ToolTarget,
     };
     use crate::ui::test_rig::UiTestRig;
@@ -11889,39 +11894,15 @@ TLS ping finished"#;
         profile
     }
 
-    /// The gate's two compositions over every combination of its five facts:
-    /// unsaved changes is the union of the draft's two dirty flags, and a
-    /// commit needs a draft that differs from its source and that no
-    /// error-severity finding blocks. The two facts that move without a draft
-    /// edit (the validation job, the busy window) are the compositions' own
-    /// business at the site — the action row's reading of them is pinned by
-    /// `editor_action_row_renders_the_gate_fact_combinations`.
-    #[test]
-    fn draft_gate_compositions_read_every_fact() {
-        for bits in 0..32u8 {
-            let changed = bits & 1 != 0;
-            let raw = bits & 2 != 0;
-            let blocking = bits & 4 != 0;
-            let gate = DraftGate {
-                changed_from_source: changed,
-                raw_buffers_dirty: raw,
-                blocking,
-                validating: bits & 8 != 0,
-                busy: bits & 16 != 0,
-            };
-            assert_eq!(gate.dirty(), changed || raw, "unsaved changes: {bits:05b}");
-            assert_eq!(
-                gate.committable(),
-                changed && !blocking,
-                "a commit needs an edited draft that nothing blocks: {bits:05b}"
-            );
-        }
-    }
-
-    /// The editor action row's rendered enablement for the three fact
-    /// combinations a user can reach: an edited draft that carries a blocking
-    /// finding (nothing to save, something to discard), an edited draft that
-    /// nothing blocks (both controls live), and a pristine draft (neither).
+    /// The editor action row's rendered enablement, one gate fact moved at a
+    /// time: a pristine draft (neither control), an edited draft that nothing
+    /// blocks (both live), a draft that still matches its source while a raw
+    /// buffer holds text that never reached it (Discard only), an edited
+    /// draft carrying a blocking finding (Discard only), an edited draft
+    /// whose validation job is in flight (neither), and an edited draft under
+    /// a held busy window (Discard only). Every fact the row's gate reads
+    /// moves in one of these, so a fact that stops reaching the rendered
+    /// enablement reds this test.
     #[test]
     fn editor_action_row_renders_the_gate_fact_combinations() {
         fn install(screen: &mut ServersScreen, profile: &ServerProfile, source: serde_json::Value) {
@@ -11966,6 +11947,33 @@ TLS ping finished"#;
             "an edited draft that nothing blocks must be saveable and discardable"
         );
 
+        // A raw buffer holding text that never reached the draft: the draft
+        // itself still matches its source, so Save must refuse (committing
+        // it would leave the unsaved text behind) while Discard stays live,
+        // or the user would be stuck with the error text.
+        install(
+            &mut harness.state_mut().0,
+            &clean,
+            serde_json::to_value(&clean).unwrap(),
+        );
+        harness.state_mut().0.finalmask_raw.insert(
+            egui::Id::new("finalmask-raw-action-row"),
+            JsonBuf {
+                key: None,
+                text: "{ invalid".into(),
+                error: Some("parse failed".into()),
+                dirty: true,
+                profile: clean.id.clone(),
+            },
+        );
+        harness.run();
+        assert_eq!(
+            action_row_disabled(&harness),
+            (true, false),
+            "uncommitted raw text must offer Discard even when the draft is unchanged"
+        );
+        harness.state_mut().0.finalmask_raw.clear();
+
         // The edit plus a blocking finding: Discard stays, Save goes dark.
         let mut blocked = edited.clone();
         blocked.outbound.stream.finalmask = Some(bad_finalmask_model());
@@ -11984,6 +11992,35 @@ TLS ping finished"#;
             (true, false),
             "a blocking finding must take Save dark without touching Discard"
         );
+
+        // The edited draft while its validation job is in flight: the row
+        // waits the job out rather than offering a commit its answer may
+        // refuse.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        harness.state_mut().0.profile_validation_request = Request::reply(rx);
+        harness.state_mut().0.profile_validation_origin = Some(ProfileValidationOrigin::Draft);
+        // The in-flight state shows the validation spinner, whose repaint
+        // request never settles, so the frame budget is pinned instead of run
+        // to quiescence.
+        harness.run_steps(4);
+        assert_eq!(
+            action_row_disabled(&harness),
+            (true, true),
+            "an in-flight validation must hold the whole action row"
+        );
+
+        // The edited draft under a held busy window: the exclusive job owns
+        // the commit, so Save waits it out; Discard is not a commit.
+        harness.state_mut().0.profile_validation_request.cancel();
+        harness.state_mut().0.profile_validation_origin = None;
+        harness.state_mut().1.operation = Some(OperationKind::Start);
+        harness.run();
+        assert_eq!(
+            action_row_disabled(&harness),
+            (true, false),
+            "a held busy window must take Save dark without touching Discard"
+        );
+        drop(tx);
     }
 
     /// The editor action row's two controls on the frame just rendered, as

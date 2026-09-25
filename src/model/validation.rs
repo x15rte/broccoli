@@ -1365,8 +1365,8 @@ fn freedom_domain_strategy_supported(strategy: &str) -> bool {
 /// The `settings.domainStrategy` vocabulary the WireGuard editor offers —
 /// the resolution strategies the core's WireGuard endpoint dial runs a peer
 /// host through, plus the empty zero value that leaves the core's own
-/// `forceip` default in place. The WireGuard profile's own default is spelled
-/// `forceip`, so comparison folds case.
+/// `forceip` default in place. The combo offers the list verbatim, and the
+/// dial keeps its own default for an unknown value, so no rule judges one.
 pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "",
     "ForceIP",
@@ -1375,17 +1375,6 @@ pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "ForceIPv4v6",
     "ForceIPv6v4",
 ];
-
-/// True when a WireGuard `settings.domainStrategy` is one of
-/// [`WG_TARGET_STRATEGY_OPTIONS`]. The field is a *hint* to the dial: the
-/// core keeps its own default for an unknown value, so the profile still
-/// runs and no model rule gates on this predicate — the editor combo and
-/// this predicate are its whole reach.
-pub fn wg_target_strategy_supported(strategy: &str) -> bool {
-    WG_TARGET_STRATEGY_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
-}
 
 // ---------- outbound envelope / DNS-rule vocabularies ----------
 //
@@ -4315,7 +4304,9 @@ mod tests {
     /// near-misses the list does not hold (a case variant of a case-sensitive
     /// vocabulary, a spelling with stray whitespace, a value one step past
     /// the set). A combo that offers a value its own rule refuses, or a rule
-    /// that drifts off its list, reds here.
+    /// that drifts off its list, reds here. `WG_TARGET_STRATEGY_OPTIONS` is
+    /// the one published list without a pair: the dial keeps its own default
+    /// for an unknown value, so nothing judges it.
     #[test]
     fn field_vocabularies_and_their_predicates_agree() {
         fn couples(options: &[&str], accepts: impl Fn(&str) -> bool, refused: &[&str]) {
@@ -4341,11 +4332,6 @@ mod tests {
             TARGET_STRATEGY_OPTIONS,
             target_strategy_supported,
             &["ForceIPv6v4 ", "asis+", "bogus"],
-        );
-        couples(
-            WG_TARGET_STRATEGY_OPTIONS,
-            wg_target_strategy_supported,
-            &["ForceIPv6v4 ", "UseIP", "bogus"],
         );
         couples(
             SOCKOPT_DOMAIN_STRATEGY_OPTIONS,
