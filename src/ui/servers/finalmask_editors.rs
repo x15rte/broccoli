@@ -607,7 +607,7 @@ fn finalmask_udphop_editor(
         lang,
         "remoteIPs",
         &mut settings.remote_ips,
-        t(lang, Key::SrvUdpHopRemoteIpsHint),
+        "198.51.100.0/24 or 2001:db8::1",
     );
     changed |= mask_sockopt_editor(ui, lang, &mut settings.sockopt);
     changed
@@ -777,7 +777,7 @@ pub(super) fn finalmask_tcp_settings_editor(
                 ui,
                 "packets",
                 &mut settings.packets,
-                t(lang, Key::SrvMaskPacketsHint),
+                "tlshello, N, or from-to",
             );
             changed |= range_editor(ui, "length", &mut settings.length, i32::MIN..=i32::MAX);
             changed |= range_editor(ui, "delay", &mut settings.delay, i32::MIN..=i32::MAX);

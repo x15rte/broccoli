@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 
 use super::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
-    LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
+    DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
 use super::servers::{ServerProfile, ServersFile};
 use super::settings::{Mode, Settings};
@@ -42,14 +42,13 @@ pub fn tun_inbound_emitted(settings: &Settings) -> bool {
     settings.mode == Mode::Tun
 }
 
-/// The enabled SOCKS endpoints, in list order — the endpoints whose UDP:53
+/// The emitted SOCKS endpoints, in list order — the endpoints whose UDP:53
 /// traffic the DNS module answers. HTTP endpoints are TCP-only, so they can
 /// never carry DNS and never appear in the interception rules.
 fn dns_capable_socks(settings: &Settings) -> impl Iterator<Item = &LocalInboundCfg> {
-    settings
-        .local_inbounds
-        .iter()
-        .filter(|entry| entry.enabled && entry.protocol == LocalInboundProtocol::Socks)
+    settings.local_inbounds.iter().filter(|entry| {
+        local_inbound_emitted(entry) && entry.protocol == LocalInboundProtocol::Socks
+    })
 }
 
 /// The interception rules' inbound tags, in list order.
@@ -104,30 +103,53 @@ pub fn outbound_tags(servers: &ServersFile, settings: &Settings) -> BTreeSet<Str
     tags
 }
 
+/// True when a local endpoint reaches the wire: `gen::inbounds` emits the
+/// enabled entries, in list order, and drops the rest.
+pub fn local_inbound_emitted(entry: &LocalInboundCfg) -> bool {
+    entry.enabled
+}
+
+/// True when a dokodemo listener reaches the wire: `gen::inbounds` emits the
+/// enabled entries, in list order, and drops the rest.
+pub fn dokodemo_emitted(entry: &DokodemoCfg) -> bool {
+    entry.enabled
+}
+
+/// The inbound tags `gen::inbounds` writes besides the settings' entries, in
+/// the order it appends them: the tun inbound in TUN mode, then the in-tun DNS
+/// listener while [`dns_inbound_emitted`]. The control-plane listener is not
+/// part of this list — the top-level `api` object carries [`API_INBOUND_TAG`]
+/// ahead of every configured entry. A caller that walks the configured entries
+/// for tag uniqueness reserves these after its walk, so the insert that fails —
+/// the collision report — names the same arm this module carries.
+pub fn appended_inbound_tags(settings: &Settings) -> impl Iterator<Item = &'static str> {
+    tun_inbound_emitted(settings)
+        .then_some(TUN_INBOUND_TAG)
+        .into_iter()
+        .chain(dns_inbound_emitted(settings).then_some(DNS_INBOUND_TAG))
+}
+
 /// The inbound tags the running configuration carries: the control-plane
-/// listener, the tun inbound in TUN mode, the in-tun DNS listener while
-/// [`dns_inbound_emitted`], every enabled local endpoint, and every enabled
-/// dokodemo listener. Disabled entries stay off the wire (`gen::inbounds`).
+/// listener, the tags [`appended_inbound_tags`] adds, every local endpoint
+/// [`local_inbound_emitted`] keeps, and every dokodemo listener
+/// [`dokodemo_emitted`] keeps. The same two predicates are what the collision
+/// walk reads, so the readers of this universe can never disagree about which
+/// entries are emitted.
 pub fn inbound_tags(settings: &Settings) -> BTreeSet<String> {
     let mut tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
-    if tun_inbound_emitted(settings) {
-        tags.insert(TUN_INBOUND_TAG.into());
-    }
-    if dns_inbound_emitted(settings) {
-        tags.insert(DNS_INBOUND_TAG.into());
-    }
+    tags.extend(appended_inbound_tags(settings).map(str::to_string));
     tags.extend(
         settings
             .local_inbounds
             .iter()
-            .filter(|entry| entry.enabled)
+            .filter(|entry| local_inbound_emitted(entry))
             .map(|entry| entry.tag.clone()),
     );
     tags.extend(
         settings
             .dokodemo
             .iter()
-            .filter(|entry| entry.enabled)
+            .filter(|entry| dokodemo_emitted(entry))
             .map(|entry| entry.tag.clone()),
     );
     tags

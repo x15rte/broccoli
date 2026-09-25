@@ -1005,11 +1005,6 @@ impl BroccoliApp {
                 CoreEvt::ActiveConfig {
                     snapshot,
                     transport,
-                    // The launch's health-engine fact arms the runtime's own
-                    // observatory read (`CoreCmd::SetObservatory`); the shell
-                    // paints the launched configuration and nothing else about
-                    // it.
-                    health_extension: _,
                 } => {
                     self.pending_transport = Some(transport);
                     self.profile_preview.record_start(snapshot);

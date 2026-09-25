@@ -167,8 +167,8 @@ pub enum CoreCmd {
     /// outbound tags (empty = every observed tag). The shell sends this once
     /// the core reports `Running`, carrying only the tags it owns; whether a
     /// read can answer at all follows the launched configuration's own health
-    /// engine (`ActiveConfig`), which the runtime holds and arms this read
-    /// with.
+    /// engine, which the runtime records from the launch it reports and arms
+    /// this read with.
     SetObservatory {
         tags: Vec<String>,
     },
@@ -421,15 +421,15 @@ pub enum CoreEvt {
     State(CorePhase),
     /// Exact committed configuration used by a successful launch and the
     /// transport ownership mode of the backend that just launched, not the
-    /// next configured setting.
+    /// next configured setting. Whether that configuration carries a health
+    /// engine (the `observatory` or the `burstObservatory` block, see
+    /// [`apply::carries_health_extension`]) is not published here: the runtime
+    /// records that fact for itself as it emits this event and arms its own
+    /// observatory status read with it, so no consumer outside the runtime has
+    /// a copy to keep current.
     ActiveConfig {
         snapshot: Result<String, AppMessage>,
         transport: CoreTransport,
-        /// Whether the launched configuration carries a health engine (the
-        /// `observatory` or the `burstObservatory` block, see
-        /// [`apply::carries_health_extension`]): the fact the runtime arms the
-        /// observatory status read with, published with the launch.
-        health_extension: bool,
     },
     /// One raw log line (core output, or a passthrough app-authored line that
     /// has no key): complete text, rendered verbatim.
@@ -1335,7 +1335,6 @@ impl Runtime {
         self.emit(CoreEvt::ActiveConfig {
             snapshot,
             transport: self.backend.transport(),
-            health_extension: self.health_extension,
         });
     }
 

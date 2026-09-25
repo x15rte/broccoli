@@ -308,10 +308,12 @@ struct BalancerHeaderText {
 struct RoutingViewCache {
     generation: (u64, u64, Language),
     out_tags: Vec<String>,
-    /// Whether the emitted outbound tags (`emit::outbound_tags`) include a
-    /// server profile's (`srv-…`): the balancer Add button and the rule
-    /// editor's "select all servers" shortcut exist only then. Derived from
-    /// the emission universe, not from the narrower `out_tags` menu.
+    /// Whether the document carries a server profile's outbound (`srv-…`): the
+    /// balancer Add button and the rule editor's "select all servers" shortcut
+    /// exist only then. The generator emits an outbound for every profile
+    /// unconditionally, so the fact is whether the state has profiles at all —
+    /// a question about the emission rule, not about the narrower `out_tags`
+    /// menu.
     server_outbound_emitted: bool,
     /// Non-empty balancer tags, as offered by the rule editor's target combo.
     bal_tags: Vec<String>,
@@ -1239,12 +1241,12 @@ impl RoutingScreen {
                     .map(|(_, tag)| (*tag).to_string()),
             )
             .collect();
-        // Whether the document carries a server outbound (`srv-…`): the two
-        // prefix checks below ask the emitted universe, not the menu vector
-        // above — a selector only ever matches a tag that reaches the wire.
-        let server_outbound_emitted = emit::outbound_tags(servers, settings)
-            .iter()
-            .any(|tag| tag.starts_with("srv-"));
+        // Whether the document carries a server outbound: every profile emits
+        // an outbound unconditionally and every profile tag is `srv-…`, so the
+        // fact is whether the state has profiles at all. The two prefix checks
+        // below ask this — a selector only ever matches a tag that reaches the
+        // wire, which the menu vector above is deliberately narrower than.
+        let server_outbound_emitted = !servers.profiles.is_empty();
         let bal_tags: Vec<String> = settings
             .routing
             .balancers
@@ -3766,12 +3768,12 @@ mod view_cache_tests {
         assert_eq!(screen.view_cache.as_ref().unwrap().out_tags.len(), 4);
     }
 
-    /// The balancer rows' "is there a server outbound" fact is read from the
-    /// emitted tag universe: only a profile contributes a `srv-…` tag, so the
-    /// Add button and the "select all servers" shortcut follow the profiles
-    /// the document would carry.
+    /// The balancer rows' "is there a server outbound" fact follows the state's
+    /// profiles: the generator emits an outbound for every profile, so an empty
+    /// profile list is the only state without one — exactly when the Add button
+    /// and the "select all servers" shortcut stay hidden.
     #[test]
-    fn cached_server_outbound_fact_follows_the_emitted_tags() {
+    fn cached_server_outbound_fact_follows_the_profiles() {
         let mut screen = RoutingScreen::default();
         let settings = Settings::default();
         screen.refresh_view_cache(0, Language::En, &ServersFile::default(), &settings);
@@ -3787,7 +3789,7 @@ mod view_cache_tests {
         screen.refresh_view_cache(1, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().server_outbound_emitted,
-            "a profile tag is a server outbound"
+            "a profile is a server outbound"
         );
     }
 

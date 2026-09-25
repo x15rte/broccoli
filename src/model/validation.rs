@@ -15,8 +15,8 @@
 use super::Int32Range;
 use super::dns::parse_pool_cidr;
 use super::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DokodemoNetwork,
-    LocalInboundCfg, LocalInboundProtocol, Sniffing, TUN_INBOUND_TAG, listen_endpoints_conflict,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
+    LocalInboundProtocol, Sniffing, listen_endpoints_conflict,
 };
 use super::outbound::{
     MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
@@ -187,10 +187,12 @@ pub enum ValidationCode {
     /// is allowed in "alpn" when using "fromMitm" in it). The finalmask realm
     /// TLS mount has its own code ([`Self::FinalmaskRealmAlpnFromMitm`]).
     TlsFromMitmAlpnShort,
-    /// An outbound TLS certificate row names no `certificateFile` and holds no
-    /// non-blank inline `certificate` line: Xray's conf build refuses the entry
-    /// (infra/conf: both file and bytes are empty). The finding's path names
-    /// the offending row. The finalmask realm TLS mount has its own code
+    /// An outbound TLS certificate row names no non-blank `certificateFile`
+    /// and holds no non-blank inline `certificate` line — both values are
+    /// trimmed before the emptiness test, so a whitespace-only value counts as
+    /// absent: Xray's conf build refuses such an entry (infra/conf: both file
+    /// and bytes are empty). The finding's path names the offending row. The
+    /// finalmask realm TLS mount has its own code
     /// ([`Self::FinalmaskRealmCertRequired`]).
     TlsCertificateRequired,
     // ---- transport security (validate_outbound) ----
@@ -2204,11 +2206,16 @@ pub fn validate_stream(s: &StreamModel) -> Vec<ValidationIssue> {
             }
             // A certificate row with neither a file nor inline PEM lines has
             // no key material to load (infra/conf: both file and bytes are
-            // empty); the path names the row so the finding points at the
-            // entry the user has to fill in.
+            // empty). Both tests are trimmed: a whitespace-only path names no
+            // readable file and a blank-only line list parses no certificate,
+            // so the row has nothing to load. The path names the row so the
+            // finding points at the entry the user has to fill in.
             for (index, certificate) in tls.certificates.iter().enumerate() {
-                if certificate.certificate_file.is_empty()
-                    && certificate.certificate.iter().all(String::is_empty)
+                if certificate.certificate_file.trim().is_empty()
+                    && certificate
+                        .certificate
+                        .iter()
+                        .all(|line| line.trim().is_empty())
                 {
                     issues.push(issue(
                         ValidationCode::TlsCertificateRequired,
@@ -4017,17 +4024,20 @@ pub fn validate_settings(
 
     let mut ip_listeners = vec![("API".to_string(), "127.0.0.1".to_string(), api_port, 1_u8)];
     // The set this walk grows is the emitted inbound universe
-    // (`emit::inbound_tags`: API, TUN, dns-in, the enabled local endpoints,
-    // the enabled dokodemo listeners). It is built by insertion because the
+    // (`emit::inbound_tags`: API, TUN, dns-in, the emitted local endpoints,
+    // the emitted dokodemo listeners). It is built by insertion because the
     // insert that fails IS the duplicate rule — the arm that inserts second
     // reports the collision, in emission order, so the findings below stay in
-    // the order their refusal reads.
+    // the order their refusal reads. Which entries are emitted and which tags
+    // the emitter adds itself are `emit`'s answers (`local_inbound_emitted`,
+    // `dokodemo_emitted`, `appended_inbound_tags`), so the two readers of the
+    // universe can never drift apart.
     let mut inbound_tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
-    // Local endpoints: every enabled entry must bind a valid listen address
+    // Local endpoints: every emitted entry must bind a valid listen address
     // on a non-zero port, and its tag must be unique among all emitted
     // inbound tags (local endpoints, TUN, dns-in, API, dokodemo).
     for (index, entry) in settings.local_inbounds.iter().enumerate() {
-        if !entry.enabled {
+        if !emit::local_inbound_emitted(entry) {
             continue;
         }
         // "Require authentication" ticked with zero accounts is a lie at
@@ -4089,7 +4099,7 @@ pub fn validate_settings(
 
     let mut unix_listeners = BTreeMap::<String, String>::new();
     for (index, inbound) in settings.dokodemo.iter().enumerate() {
-        if !inbound.enabled {
+        if !emit::dokodemo_emitted(inbound) {
             continue;
         }
         if inbound.tag.is_empty() {
@@ -4180,28 +4190,26 @@ pub fn validate_settings(
     if tun_on && tun_gateway.is_none() {
         issues.push(issue(ValidationCode::TunIpv4GatewayRequired, None));
     }
-    if tun_on && !inbound_tags.insert(TUN_INBOUND_TAG.into()) {
-        issues.push(issue(
-            ValidationCode::InboundTagDuplicated(TUN_INBOUND_TAG.into()),
-            None,
-        ));
-    }
-    // The in-tun DNS listener (TUN gateway:53, TCP+UDP) is added to the
-    // running TUN core while a DNS module exists; a user listener on the
-    // same endpoint must be rejected like any other collision, and no other
-    // inbound may reuse its tag. `emit::dns_inbound_emitted` is the one
-    // statement of that arm — the tag is part of the emitted universe
-    // exactly then.
-    if emit::dns_inbound_emitted(settings) {
-        if !inbound_tags.insert(DNS_INBOUND_TAG.into()) {
+    // The tags the emitter appends behind the configured entries reserve their
+    // slots here, in the emitter's own order: the insert that fails reports
+    // the collision for the arm walked second, so a configured entry reusing
+    // one of these tags is reported on the reserved arm exactly as the
+    // document carries it.
+    for tag in emit::appended_inbound_tags(settings) {
+        if !inbound_tags.insert(tag.to_string()) {
             issues.push(issue(
-                ValidationCode::InboundTagDuplicated(DNS_INBOUND_TAG.into()),
+                ValidationCode::InboundTagDuplicated(tag.into()),
                 None,
             ));
         }
-        if let Some(address) = tun_gateway {
-            ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
-        }
+    }
+    // The in-tun DNS listener (TUN gateway:53, TCP+UDP) is added to the
+    // running TUN core while a DNS module exists; a user listener on the
+    // same endpoint must be rejected like any other collision.
+    if emit::dns_inbound_emitted(settings)
+        && let Some(address) = tun_gateway
+    {
+        ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
     }
     // The conjunction itself is one definition
     // (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps
@@ -7576,9 +7584,11 @@ mod tests {
     /// An outbound TLS certificate row that names no file and carries no
     /// non-blank PEM line has no key material for Xray's conf build to load,
     /// which refuses the entry (infra/conf: both file and bytes are empty).
-    /// The rule fires from the model pass with the offending row's index —
-    /// the row the user has to fill in — and stays silent in a block
-    /// `security` does not select, which Xray never reads.
+    /// A whitespace-only path opens no file and a blank-only line list parses
+    /// no certificate, so both count as absent. The rule fires from the model
+    /// pass with the offending row's index — the row the user has to fill in —
+    /// and stays silent in a block `security` does not select, which Xray
+    /// never reads.
     #[test]
     fn tls_certificate_row_without_material_gates_from_the_model_pass() {
         let tls_stream = |tls: crate::model::stream::TlsModel| StreamModel {
@@ -7590,6 +7600,14 @@ mod tests {
         let issues = validate_stream(&tls_stream(crate::model::stream::TlsModel {
             certificates: vec![
                 crate::model::stream::TlsCert::default(),
+                crate::model::stream::TlsCert {
+                    certificate_file: "   ".into(),
+                    ..Default::default()
+                },
+                crate::model::stream::TlsCert {
+                    certificate: vec!["  ".into(), "\t".into()],
+                    ..Default::default()
+                },
                 crate::model::stream::TlsCert {
                     certificate_file: "c.pem".into(),
                     ..Default::default()
@@ -7612,9 +7630,14 @@ mod tests {
             issues
                 .iter()
                 .filter(|issue| issue.code == ValidationCode::TlsCertificateRequired)
-                .count(),
-            1,
-            "only the empty row may fire: {issues:#?}"
+                .map(|issue| issue.path.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("stream.tlsSettings.certificates[0]"),
+                Some("stream.tlsSettings.certificates[1]"),
+                Some("stream.tlsSettings.certificates[2]"),
+            ],
+            "only the rows without material — blank-only text included — may fire: {issues:#?}"
         );
 
         // A block under another security selection is inert state (the wire
@@ -9130,6 +9153,81 @@ mod tests {
         assert!(
             !issues.iter().any(|issue| issue.severity == Severity::Error),
             "{issues:#?}"
+        );
+    }
+
+    /// The collision walk judges exactly the entries the emitter carries: a tag
+    /// shared with an entry `emit` leaves off the wire is no collision, and
+    /// turning that entry on is one. The expectations are read from the
+    /// emitter's own enablement predicates, so a walk that keeps its own copy
+    /// of the policy fails here; `emit`'s emitted-document agreement test pins
+    /// the other reader against the same predicates.
+    #[test]
+    fn inbound_collisions_follow_the_emitted_entries() {
+        use crate::model::DokodemoCfg;
+
+        let duplicates = |settings: &Settings| {
+            validate_settings(settings, &ServersFile::default(), 10853)
+                .into_iter()
+                .filter(|issue| matches!(issue.code, ValidationCode::InboundTagDuplicated(_)))
+                .collect::<Vec<_>>()
+        };
+
+        // The dokodemo arm: the disabled listener reuses an emitted endpoint's
+        // tag, but it is off the wire, so nothing collides.
+        let mut settings = Settings::default();
+        let seeded_tag = settings.local_inbounds[0].tag.clone();
+        assert!(
+            emit::local_inbound_emitted(&settings.local_inbounds[0]),
+            "the seeded endpoint is on the wire"
+        );
+        settings.dokodemo = vec![DokodemoCfg {
+            tag: seeded_tag.clone(),
+            ..Default::default()
+        }];
+        assert!(!emit::dokodemo_emitted(&settings.dokodemo[0]));
+        assert!(
+            duplicates(&settings).is_empty(),
+            "a listener the emitter drops cannot collide"
+        );
+
+        settings.dokodemo[0].enabled = true;
+        assert!(emit::dokodemo_emitted(&settings.dokodemo[0]));
+        let found = duplicates(&settings);
+        assert_eq!(
+            found.len(),
+            1,
+            "the emitted listener collides on the shared tag: {found:#?}"
+        );
+        assert_eq!(
+            found[0].code,
+            ValidationCode::InboundTagDuplicated(seeded_tag.clone())
+        );
+        assert_eq!(found[0].path, None, "a tag collision carries no path");
+
+        // The local-endpoint arm: a disabled duplicate of an emitted tag is
+        // off the wire too.
+        let mut settings = Settings::default();
+        let mut copy = settings.local_inbounds[0].clone();
+        copy.enabled = false;
+        settings.local_inbounds.push(copy);
+        let copy_index = settings.local_inbounds.len() - 1;
+        assert!(!emit::local_inbound_emitted(
+            &settings.local_inbounds[copy_index]
+        ));
+        assert!(
+            duplicates(&settings).is_empty(),
+            "an endpoint the emitter drops cannot collide"
+        );
+
+        settings.local_inbounds[copy_index].enabled = true;
+        assert!(emit::local_inbound_emitted(
+            &settings.local_inbounds[copy_index]
+        ));
+        assert_eq!(
+            duplicates(&settings).len(),
+            1,
+            "the emitted endpoint collides on the shared tag"
         );
     }
 }

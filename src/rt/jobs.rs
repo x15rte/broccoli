@@ -140,12 +140,24 @@ impl JobKind {
 impl super::CoreCmd {
     /// The job kind this command runs as, or `None` when the command is no job
     /// at all (`Shutdown`, `CheckUpdate`, `SetObservatory`). The kind is the
-    /// one the command's dispatch arm begins the record with, declared here so
-    /// a caller names the work it is about to start instead of copying the
-    /// kind by hand: `ImportCoreArchive` runs as [`JobKind::UpdateCore`], and
-    /// `SetTunMode` occupies as [`JobKind::Restart`] when it acts. Only the
-    /// begin is named — what is in flight, and when the window is released,
-    /// stays the registry's own bookends.
+    /// one the command's dispatch arm begins the record with when it acts,
+    /// declared here so a caller names the work it is about to start instead
+    /// of copying the kind by hand: `ImportCoreArchive` runs as
+    /// [`JobKind::UpdateCore`], and `SetTunMode` occupies as
+    /// [`JobKind::Restart`] when it acts.
+    ///
+    /// A row names the kind of a window, never a promise that one opens: the
+    /// table is keyed by command, so it cannot carry the preconditions the
+    /// dispatch arm applies itself. Two rows are conditional. `SetTunMode`
+    /// asking for the mode already requested returns with no record and no
+    /// bookend in either registry state, so a caller mirroring the busy window
+    /// from that row must not treat it as a promise that the runtime opened
+    /// one — nothing arrives to close a mirror such a caller wrote.
+    /// `UpdateCore`/`ImportCoreArchive` refused by the phase gate or a pending
+    /// health check begins nothing either, and settles the optimistic view
+    /// itself with a `None` bookend. Only the begin is named — what is in
+    /// flight, and when the window is released, stays the registry's own
+    /// bookends.
     pub(crate) fn job_kind(&self) -> Option<JobKind> {
         Some(match self {
             Self::Start => JobKind::Start,
@@ -155,6 +167,11 @@ impl super::CoreCmd {
             Self::TestConfig { .. } => JobKind::TestConfig,
             Self::ValidateProfiles { .. } => JobKind::ValidateProfiles,
             Self::UpdateCore | Self::ImportCoreArchive(_) => JobKind::UpdateCore,
+            // Conditional row: the arm begins this record only when the mode
+            // the toggle asks for differs from the one already requested. A
+            // toggle asking for the mode in effect returns with no record and
+            // no bookend, so a caller mirroring the busy window from this kind
+            // must not treat the row as a promise that the runtime opened one.
             Self::SetTunMode(_) => JobKind::Restart,
             Self::ProbeLatency { .. } => JobKind::LatencyProbe,
             Self::TestRoute { .. } => JobKind::TestRoute,

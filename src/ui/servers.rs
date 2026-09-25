@@ -1465,6 +1465,15 @@ impl ToolTarget {
             | ToolTarget::AddDraft { generation, .. } => *generation,
         }
     }
+
+    /// True when this target names the same slot, profile id and generation
+    /// as the borrowed identity an editor holds: the memo keys hold the owned
+    /// form and compare it against the frame's draft in place.
+    fn matches(&self, target: DraftTarget<'_>) -> bool {
+        self.draft_kind() == target.kind
+            && self.profile_id() == target.profile_id
+            && self.generation() == target.generation
+    }
 }
 
 /// Which of the screen's two draft slots a draft or a request names: the
@@ -1477,12 +1486,37 @@ enum DraftKind {
     Add,
 }
 
+/// The borrowed form of a draft identity: the slot, the profile id the draft
+/// mirrors, and the generation a verdict must still match to be applied. The
+/// editor entry points take this one named value instead of a positional
+/// `(kind, id, generation)` triple spelled out at every call site.
+///
+/// The tab closures build it field-wise from the draft they hold: a
+/// constructor borrowing the whole draft would collide with the `&mut
+/// draft.profile` the same call passes. The owned [`ToolTarget`] is built from
+/// it only where a request is staged, so an idle repaint never allocates the
+/// profile id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraftTarget<'a> {
+    kind: DraftKind,
+    profile_id: &'a str,
+    generation: u64,
+}
+
+impl DraftTarget<'_> {
+    /// The owned request target for this identity, cloning the profile id
+    /// only on the click path.
+    fn owned(self) -> ToolTarget {
+        ToolTarget::draft(self.kind, self.profile_id, self.generation)
+    }
+}
+
 /// One open editor draft, in either slot. The existing-profile editor and the
 /// add-server dialog differ in where the draft commits to and what "changed"
 /// is measured against — which is what `kind` and the baseline spell — so one
-/// type holds both. The tab closures pass a borrowed identity (`kind`, `id`,
-/// `generation`) and the owned [`ToolTarget`] is built only on the click
-/// path, so repaints never allocate the 36-char profile id.
+/// type holds both. The tab closures pass a borrowed [`DraftTarget`] and the
+/// owned [`ToolTarget`] is built only on the click path, so repaints never
+/// allocate the 36-char profile id.
 struct ProfileDraft {
     kind: DraftKind,
     /// The profile id, mirrored from `profile.id`. Profile ids are immutable
@@ -1951,13 +1985,14 @@ struct ImportPreviewRow {
 /// Memoized pretty print of one preserved over-limit `downloadSettings`
 /// subtree: its header body re-runs on every frame it stays open, and the
 /// subtree is as large as the configuration behind it. The key is the draft
-/// the text belongs to — kind, profile or add-draft id, and edit generation,
-/// which every editor change advances — plus the nesting depth, so the text is
-/// rebuilt exactly when the subtree it describes can have moved.
+/// the text belongs to — the owned request target, whose generation every
+/// editor change advances — plus the nesting depth the subtree sits at and the
+/// language the frame renders under, so the text is rebuilt exactly when the
+/// subtree it describes can have moved.
 struct OverLimitJson {
     /// `None` for a render-only caller with no draft identity to key on: the
     /// text is refilled on every such call and never reused.
-    key: Option<(DraftKind, String, u64, u32, Language)>,
+    key: Option<(ToolTarget, u32, Language)>,
     text: String,
 }
 
@@ -3838,6 +3873,15 @@ impl ServersScreen {
         // edge (mirrors the servers.list reserve above and the add-draft
         // dialog's fixed cap).
         let tab_height = (ui.available_height() - 240.0).max(160.0);
+        // The borrowed identity the three tabs below take, built once per
+        // frame from the draft's own fields (see [`DraftTarget`]): it carries
+        // the generation the sweep above covers, so a request staged from it
+        // is dropped only once an edit moves the draft on.
+        let target = DraftTarget {
+            kind: DraftKind::Existing,
+            profile_id: draft.id.as_str(),
+            generation: draft.generation,
+        };
         egui::ScrollArea::vertical()
             .id_salt("servers.editor.scroll")
             .max_height(tab_height)
@@ -3853,7 +3897,7 @@ impl ServersScreen {
                             ui,
                             lang,
                             &mut draft.profile,
-                            Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
+                            Some(target),
                             inline_errors,
                         )
                     }
@@ -3862,7 +3906,7 @@ impl ServersScreen {
                         lang,
                         &mut draft.profile.outbound.stream,
                         0,
-                        Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
+                        Some(target),
                     ),
                     EditorTab::Security => {
                         let address = draft.profile.server_address();
@@ -3874,7 +3918,7 @@ impl ServersScreen {
                         self.security_tab_for_target(
                             ui,
                             lang,
-                            Some((DraftKind::Existing, draft.id.as_str(), draft.generation)),
+                            Some(target),
                             &mut draft.profile.outbound.stream,
                             address.as_deref(),
                             ech_sockopt_errors,
@@ -4126,7 +4170,7 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         profile: &mut ServerProfile,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
         // The Basic tab's memoized inline outbound verdicts (the
         // public-endpoint TLS rules), rendered under the protocol fields.
         inline_errors: &[String],
@@ -4690,18 +4734,16 @@ impl ServersScreen {
         &mut self,
         ui: &egui::Ui,
         lang: Language,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
         kind: XrayToolKind,
         args: Vec<String>,
     ) {
-        let Some((target_kind, profile_id, generation)) = target else {
+        let Some(target) = target else {
             self.set_status(StatusLine::err(t(lang, Key::SrvKeygenDraftOnly)));
             return;
         };
-        // The owned target is built only on the click path; repaints just
-        // pass a borrowed id and the generation.
-        let target = ToolTarget::draft(target_kind, profile_id, generation);
-        if let Err(error) = self.queue_xray_tool(lang, ui.ctx().clone(), target, kind, args) {
+        if let Err(error) = self.queue_xray_tool(lang, ui.ctx().clone(), target.owned(), kind, args)
+        {
             self.set_status(StatusLine::err(error));
         }
     }
@@ -4710,7 +4752,7 @@ impl ServersScreen {
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
         stream: &mut StreamModel,
         server_address: Option<&str>,
         ech_sockopt_errors: &[String],
@@ -4727,19 +4769,21 @@ impl ServersScreen {
     /// draft's text.
     fn over_limit_json_for(
         &mut self,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
         depth: u32,
         lang: Language,
         download: &StreamModel,
     ) -> &str {
-        // The cached key's fields are compared in place — nothing is
-        // allocated on a hit, and the header body runs every frame it stays
-        // open.
+        // The cached key is compared in place — nothing is allocated on a
+        // hit, and the header body runs every frame it stays open.
         let unchanged = match (target, self.over_limit_json.as_ref()) {
-            (Some((kind, id, generation)), Some(cached)) => {
-                cached.key.as_ref().is_some_and(|key| {
-                    key.0 == kind && key.1 == id && key.2 == generation && key.3 == depth
-                })
+            (Some(target), Some(cached)) => {
+                cached
+                    .key
+                    .as_ref()
+                    .is_some_and(|(cached, cached_depth, _)| {
+                        cached.matches(target) && *cached_depth == depth
+                    })
             }
             _ => false,
         };
@@ -4747,8 +4791,7 @@ impl ServersScreen {
             let text = serde_json::to_string_pretty(download)
                 .unwrap_or_else(|error| t_fmt(lang, Key::SrvSerializationError, &[&error]));
             self.over_limit_json = Some(OverLimitJson {
-                key: target
-                    .map(|(kind, id, generation)| (kind, id.to_owned(), generation, depth, lang)),
+                key: target.map(|target| (target.owned(), depth, lang)),
                 text,
             });
         }
@@ -4763,7 +4806,7 @@ impl ServersScreen {
         lang: Language,
         st: &mut StreamModel,
         depth: u32,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -5445,7 +5488,7 @@ impl ServersScreen {
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
-        target: Option<(DraftKind, &str, u64)>,
+        target: Option<DraftTarget<'_>>,
         st: &mut StreamModel,
         // The edited profile's server endpoint (`host:port`, IPv6-bracketed)
         // for the probe panel's "Use server address:port" fill; `None` when
@@ -5726,10 +5769,10 @@ impl ServersScreen {
                                 );
                             }
                         }
-                        let probe_is_for_target =
-                            self.tls_probe_profile.as_deref().is_some_and(|id| {
-                                target.is_some_and(|(_, target_id, _)| target_id == id)
-                            });
+                        let probe_is_for_target = self
+                            .tls_probe_profile
+                            .as_deref()
+                            .is_some_and(|id| target.is_some_and(|target| target.profile_id == id));
                         if self.tls_probe_handshake_ok && probe_is_for_target {
                             match &self.tls_probe_leaf_pin {
                                 Some(pin) => {
@@ -5850,7 +5893,7 @@ impl ServersScreen {
                 // The profile id is part of the id salt so widgets inside the
                 // group (including the seeded PEM editor buffers) re-seed
                 // when the draft switches to another profile.
-                let profile_id = target.map_or("", |(_, id, _)| id);
+                let profile_id = target.map_or("", |target| target.profile_id);
                 for (i, c) in s.certificates.iter_mut().enumerate() {
                     ui.push_id(("tls-cert", profile_id, i), |ui| {
                         ui.group(|ui| {
@@ -5991,9 +6034,9 @@ impl ServersScreen {
                 );
                 changed |= c;
                 if g {
-                    if let Some((target_kind, profile_id, generation)) = target {
+                    if let Some(target) = target {
                         self.derive_dialog = Some(DeriveDialog {
-                            target: ToolTarget::draft(target_kind, profile_id, generation),
+                            target: target.owned(),
                             private_key: String::new(),
                             error: None,
                             pending: false,
@@ -6390,6 +6433,13 @@ impl ServersScreen {
                     }
                 });
                 ui.separator();
+                // The borrowed identity the three tabs below take, built once
+                // per frame from the draft's own fields (see [`DraftTarget`]).
+                let target = DraftTarget {
+                    kind: DraftKind::Add,
+                    profile_id: draft.id.as_str(),
+                    generation: draft.generation,
+                };
                 egui::ScrollArea::vertical()
                     .id_salt("servers.add-draft.scroll")
                     .max_height(430.0)
@@ -6405,7 +6455,7 @@ impl ServersScreen {
                                     ui,
                                     lang,
                                     &mut draft.profile,
-                                    Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
+                                    Some(target),
                                     inline_errors,
                                 )
                             }
@@ -6414,7 +6464,7 @@ impl ServersScreen {
                                 lang,
                                 &mut draft.profile.outbound.stream,
                                 0,
-                                Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
+                                Some(target),
                             ),
                             EditorTab::Security => {
                                 let address = draft.profile.server_address();
@@ -6426,7 +6476,7 @@ impl ServersScreen {
                                 self.security_tab_for_target(
                                     ui,
                                     lang,
-                                    Some((DraftKind::Add, draft.id.as_str(), draft.generation)),
+                                    Some(target),
                                     &mut draft.profile.outbound.stream,
                                     address.as_deref(),
                                     ech_sockopt_errors,
@@ -7185,7 +7235,7 @@ mod tests {
     use super::keygen::{keygen_value, redacted_tool_args};
     use super::raw_editor::JsonBuf;
     use super::{
-        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftKind, EditorTab,
+        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftKind, DraftTarget, EditorTab,
         EditorValidationCache, EditorValidationFindings, EditorValidationRender, FINGERPRINTS,
         FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft, RawField,
         Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
@@ -7237,6 +7287,16 @@ mod tests {
     /// has run yet.
     fn draft_for(profile: &ServerProfile) -> ProfileDraft {
         ProfileDraft::existing(profile).expect("the fixture serializes")
+    }
+
+    /// The borrowed draft identity a tab entry point takes, for the tests that
+    /// drive one directly.
+    fn draft_target(kind: DraftKind, profile_id: &str, generation: u64) -> Option<DraftTarget<'_>> {
+        Some(DraftTarget {
+            kind,
+            profile_id,
+            generation,
+        })
     }
 
     /// An add-server draft for `profile` carrying the memo a rendered dialog
@@ -9617,7 +9677,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let id = "0123456789abcdef";
         let mut screen = ServersScreen::default();
         let preserved = subtree("/preserved");
-        let target = || Some((DraftKind::Existing, id, 7));
+        let target = || draft_target(DraftKind::Existing, id, 7);
 
         let first = {
             let text = screen.over_limit_json_for(target(), 2, Language::En, &preserved);
@@ -9640,7 +9700,12 @@ Authentication: ML-KEM-768, Post-Quantum
         let edited = subtree("/edited");
         assert!(
             screen
-                .over_limit_json_for(Some((DraftKind::Existing, id, 8)), 2, Language::En, &edited)
+                .over_limit_json_for(
+                    draft_target(DraftKind::Existing, id, 8),
+                    2,
+                    Language::En,
+                    &edited
+                )
                 .contains("/edited"),
             "a new edit generation must re-serialize the edited subtree"
         );
@@ -9650,7 +9715,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             screen
                 .over_limit_json_for(
-                    Some((DraftKind::Add, "fedcba9876543210", 8)),
+                    draft_target(DraftKind::Add, "fedcba9876543210", 8),
                     2,
                     Language::En,
                     &preserved
@@ -9722,7 +9787,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         Language::En,
                         &mut stream,
                         0,
-                        Some((DraftKind::Existing, "0123456789abcdef", 1)),
+                        draft_target(DraftKind::Existing, "0123456789abcdef", 1),
                     );
                 },
                 ServersScreen::default(),
@@ -9930,7 +9995,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 let _ = screen_for_ui.borrow_mut().security_tab(
                     ui,
                     Language::En,
-                    Some((DraftKind::Existing, "profile-1", 0)),
+                    draft_target(DraftKind::Existing, "profile-1", 0),
                     &mut stream_for_ui.borrow_mut(),
                     None,
                     &[],
@@ -9996,7 +10061,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftKind::Existing, "profile-1", 0)),
+                draft_target(DraftKind::Existing, "profile-1", 0),
                 &mut stream,
                 None,
                 &[],
@@ -10027,7 +10092,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftKind::Existing, "profile-2", 0)),
+                draft_target(DraftKind::Existing, "profile-2", 0),
                 &mut stream_for_ui.borrow_mut(),
                 None,
                 &[],
@@ -10075,7 +10140,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
-                Some((DraftKind::Existing, "profile-1", 0)),
+                draft_target(DraftKind::Existing, "profile-1", 0),
                 &mut stream_for_ui.borrow_mut(),
                 Some(&address),
                 &[],
