@@ -152,41 +152,9 @@ pub fn generate_with_api_port(
 
     let mut root = Map::new();
 
-    // log: loglevel plus the access-channel pin (GUI captures core stdout
-    // anyway). Xray's per-connection access log is a separate channel that
-    // loglevel cannot gate (its config key alone defaults to console), so it
-    // is pinned off unless the user enabled it.
-    let log = if settings.access_log {
-        json!({ "loglevel": settings.log_level })
-    } else {
-        json!({ "loglevel": settings.log_level, "access": "none" })
-    };
-    root.insert(keys::LOG.into(), log);
-
-    // stats + api + policy (system stats always on → traffic counters).
-    root.insert(keys::STATS.into(), json!({}));
-    let mut services: Vec<&str> = API_SERVICES.to_vec();
-    if observatory_emitted || burst_emitted {
-        services.push("ObservatoryService");
-    }
-    root.insert(
-        keys::API.into(),
-        json!({
-            keys::TAG: API_INBOUND_TAG,
-            keys::LISTEN: format!("127.0.0.1:{}", api_port),
-            keys::SERVICES: services,
-        }),
-    );
+    // The user's policy document (levels included), written with the stats
+    // switches by the control plane below.
     let mut policy = settings.policy.extra.clone();
-    policy.insert(
-        "system".into(),
-        json!({
-            "statsInboundUplink": true,
-            "statsInboundDownlink": true,
-            "statsOutboundUplink": true,
-            "statsOutboundDownlink": true,
-        }),
-    );
     let levels: Map<String, Value> = settings
         .policy
         .levels
@@ -205,7 +173,19 @@ pub fn generate_with_api_port(
     if !levels.is_empty() {
         policy.insert("levels".into(), Value::Object(levels));
     }
-    root.insert(keys::POLICY.into(), Value::Object(policy));
+    let mut services: Vec<&str> = API_SERVICES.to_vec();
+    if observatory_emitted || burst_emitted {
+        services.push("ObservatoryService");
+    }
+    ControlPlane {
+        api_port,
+        log_level: &settings.log_level,
+        access_log: settings.access_log,
+        services,
+        stats: true,
+        policy,
+    }
+    .write(&mut root);
 
     let dns_wire = dns(&settings.dns, fakedns);
     // Enabled SOCKS entries (in list order) carry DNS UDP:53 to dns-out;
@@ -257,26 +237,23 @@ pub fn generate_with_api_port(
             .push(bootstrap.clone());
     }
 
-    root.insert(
-        keys::OUTBOUNDS.into(),
-        outbounds(servers, dns_intercept, bootstrap.is_some(), &direct_dial),
-    );
-    root.insert(
-        keys::INBOUNDS.into(),
-        inbounds(settings, fakedns, tun_on, dns_wire.is_some()),
-    );
-    root.insert(
-        keys::ROUTING.into(),
-        routing(
-            &settings.routing,
-            tun_on,
-            &socks_tags,
-            dns_intercept,
-            dns_wire.is_some(),
-            &dns_upstreams,
-            active,
-        ),
-    );
+    // The derived facts the stages read, assembled once: a stage asks this
+    // value instead of receiving positional facts it could swap for one
+    // another.
+    let emission = Emission {
+        direct_dial,
+        bootstrap: bootstrap.is_some(),
+        dns_on: dns_wire.is_some(),
+        dns_intercept,
+        socks_tags,
+        dns_upstreams,
+        tun_on,
+        fakedns,
+        active,
+    };
+    root.insert(keys::OUTBOUNDS.into(), outbounds(servers, &emission));
+    root.insert(keys::INBOUNDS.into(), inbounds(settings, &emission));
+    root.insert(keys::ROUTING.into(), routing(&settings.routing, &emission));
     if let Some(dns) = dns_wire {
         root.insert(keys::DNS.into(), dns);
     }
@@ -450,30 +427,17 @@ pub fn generate_core_gate(api_port: u16) -> Result<Value, GenerateError> {
         )));
     }
     let mut root = Map::new();
-    root.insert(
-        keys::LOG.into(),
+    ControlPlane {
+        api_port,
         // Access log pinned off: the gate's captured stdout is a failure
         // diagnostic, never a traffic record.
-        json!({ "loglevel": "warning", "access": "none" }),
-    );
-    root.insert(keys::STATS.into(), json!({}));
-    root.insert(
-        keys::API.into(),
-        json!({
-            keys::TAG: API_INBOUND_TAG,
-            keys::LISTEN: format!("127.0.0.1:{api_port}"),
-            keys::SERVICES: API_SERVICES,
-        }),
-    );
-    root.insert(
-        keys::POLICY.into(),
-        json!({ "system": {
-            "statsInboundUplink": true,
-            "statsInboundDownlink": true,
-            "statsOutboundUplink": true,
-            "statsOutboundDownlink": true,
-        } }),
-    );
+        log_level: "warning",
+        access_log: false,
+        services: API_SERVICES.to_vec(),
+        stats: true,
+        policy: Map::new(),
+    }
+    .write(&mut root);
     let mut out = Vec::new();
     append_builtin_outbounds(&mut out);
     root.insert(keys::OUTBOUNDS.into(), Value::Array(out));
@@ -525,20 +489,17 @@ pub fn generate_latency_probe(
     };
 
     let mut root = Map::new();
-    root.insert(
-        keys::LOG.into(),
+    ControlPlane {
+        api_port,
         // Access log pinned off: the probe's stdout feeds failure
         // diagnostics, and the access channel is not gated by loglevel.
-        json!({ "loglevel": "warning", "access": "none" }),
-    );
-    root.insert(
-        keys::API.into(),
-        json!({
-            keys::TAG: API_INBOUND_TAG,
-            keys::LISTEN: format!("127.0.0.1:{api_port}"),
-            keys::SERVICES: ["ObservatoryService"],
-        }),
-    );
+        log_level: "warning",
+        access_log: false,
+        services: vec!["ObservatoryService"],
+        stats: false,
+        policy: Map::new(),
+    }
+    .write(&mut root);
     root.insert(
         keys::OBSERVATORY.into(),
         json!({
@@ -837,12 +798,113 @@ fn append_builtin_outbounds(out: &mut Vec<Value>) {
 /// disagree. The DNS outbound is appended last so the default outbound (the
 /// first entry) is unchanged; it only ever receives UDP:53 via the
 /// interception rules.
-fn outbounds(
-    servers: &ServersFile,
-    dns_intercept: bool,
+/// The derived facts every emission stage reads, computed once per document:
+/// which families reach the wire and which of them attach to the DNS module.
+/// The stages take this value instead of the positional booleans they used to
+/// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
+/// the compiler noticing.
+struct Emission<'a> {
+    /// The direct-dial outbound tags: the only profiles whose server address
+    /// this machine dials directly, so the only ones whose domain the
+    /// bootstrap resolver may answer.
+    direct_dial: BTreeSet<String>,
+    /// Whether a scoped bootstrap resolver was emitted at all: a DNS module
+    /// exists and a direct-dial server domain needs one.
     bootstrap: bool,
-    direct_dial: &BTreeSet<String>,
-) -> Value {
+    /// Whether the DNS module reaches the wire at all.
+    dns_on: bool,
+    /// Whether port-53 traffic is intercepted into the DNS module.
+    dns_intercept: bool,
+    /// The enabled SOCKS endpoints' tags, in list order.
+    socks_tags: Vec<String>,
+    /// The DNS upstream endpoints the DoH outbound dials.
+    dns_upstreams: Vec<(String, u16)>,
+    /// Whether the TUN inbound reaches the wire.
+    tun_on: bool,
+    /// Whether the FakeDNS pool is enabled (every inbound that carries a
+    /// `sniffing.destOverride` needs the same answer).
+    fakedns: bool,
+    /// The active profile, whose outbound is the document's default route.
+    active: Option<&'a ServerProfile>,
+}
+
+impl Emission<'_> {
+    /// Whether this profile's own dial goes through the scoped bootstrap DNS
+    /// server: only a direct-dial outbound's domain is in its scope (a chained
+    /// hop's server is reached through the chain and resolves on the far
+    /// side — see [`crate::model::dial`]).
+    fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
+        self.bootstrap && self.direct_dial.contains(&profile.tag())
+    }
+}
+
+/// The control-plane blocks every generated document carries: the log pin, the
+/// stats switch, the loopback API listener on the chosen port, and the stats
+/// policy the app's polling reads. One builder for all three documents (the
+/// full configuration, the core health gate, the latency probe), so the
+/// services list is the only thing that differs between them — no document can
+/// drift into a different listen address, log pin or stats policy.
+struct ControlPlane<'a> {
+    /// The port the API listener binds on loopback. The runtime learns it from
+    /// the committed document, never from this value.
+    api_port: u16,
+    log_level: &'a str,
+    /// Whether the core may write its access log. The GUI captures stdout for
+    /// diagnostics; access logging is a separate channel `loglevel` cannot
+    /// gate, so it is pinned off unless the user enabled it.
+    access_log: bool,
+    /// The gRPC services the document registers.
+    services: Vec<&'a str>,
+    /// Whether the document carries the `stats` switch and the stats policy.
+    /// The documents the app polls a running managed core through (the full
+    /// configuration and the core health gate) carry both; the one-shot probe
+    /// child is minimal and carries neither.
+    stats: bool,
+    /// The user's `policy` document (levels included, when any level is set);
+    /// the stats switches are added here.
+    policy: Map<String, Value>,
+}
+
+impl ControlPlane<'_> {
+    /// Whether the core may write its access log.
+    fn log(&self) -> Value {
+        if self.access_log {
+            json!({ "loglevel": self.log_level })
+        } else {
+            json!({ "loglevel": self.log_level, "access": "none" })
+        }
+    }
+
+    /// Write the four control-plane blocks into a document root.
+    fn write(self, root: &mut Map<String, Value>) {
+        root.insert(keys::LOG.into(), self.log());
+        root.insert(
+            keys::API.into(),
+            json!({
+                keys::TAG: API_INBOUND_TAG,
+                keys::LISTEN: format!("127.0.0.1:{}", self.api_port),
+                keys::SERVICES: self.services,
+            }),
+        );
+        if !self.stats {
+            return;
+        }
+        root.insert(keys::STATS.into(), json!({}));
+        let mut policy = self.policy;
+        policy.insert(
+            "system".into(),
+            json!({
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": true,
+            }),
+        );
+        root.insert(keys::POLICY.into(), Value::Object(policy));
+    }
+}
+
+fn outbounds(servers: &ServersFile, emission: &Emission<'_>) -> Value {
     let mut out = Vec::new();
     for profile in &servers.profiles {
         let policy = OutboundWirePolicy {
@@ -850,24 +912,24 @@ fn outbounds(
             interface: None,
             // A chained hop never dials its server from here: only a
             // direct-dial outbound resolves through the bootstrap.
-            bootstrap: bootstrap && direct_dial.contains(&profile.tag()),
+            bootstrap: emission.bootstrap_reaches(profile),
         };
         out.push(profile_wire_outbound(profile, policy));
     }
     append_builtin_outbounds(&mut out);
-    if dns_intercept {
+    if emission.dns_intercept {
         out.push(json!({ keys::PROTOCOL: "dns", keys::TAG: DNS_OUTBOUND_TAG }));
     }
     Value::Array(out)
 }
 
-fn inbounds(settings: &Settings, fakedns: bool, tun_on: bool, dns_on: bool) -> Value {
+fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
     let mut list: Vec<Value> = Vec::new();
 
     // Local endpoints emit in list order; disabled entries stay off the wire.
     for entry in &settings.local_inbounds {
         if entry.enabled {
-            list.push(entry.to_wire(fakedns));
+            list.push(entry.to_wire(emission.fakedns));
         }
     }
     // Enabled entries always carry a stable GUI-owned tag: validate_settings
@@ -876,10 +938,10 @@ fn inbounds(settings: &Settings, fakedns: bool, tun_on: bool, dns_on: bool) -> V
         if !d.enabled {
             continue;
         }
-        list.push(d.to_wire(&d.tag, fakedns));
+        list.push(d.to_wire(&d.tag, emission.fakedns));
     }
-    if tun_on {
-        let mut wire = settings.tun.to_wire(fakedns);
+    if emission.tun_on {
+        let mut wire = settings.tun.to_wire(emission.fakedns);
         // With a DNS module the adapter DNS is pinned to the in-tun
         // listener — dnscache queries converge on the TUN gateway address
         // no matter which adapter it picks (the WFP DNS shield permits
@@ -888,7 +950,7 @@ fn inbounds(settings: &Settings, fakedns: bool, tun_on: bool, dns_on: bool) -> V
         // module nothing listens there, so fall back to the previous
         // behavior (stored list, or plaintext resolvers when empty): leaky
         // but functional, as the TUN screen banner states.
-        if dns_on {
+        if emission.dns_on {
             if let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut) {
                 o.insert(keys::DNS.into(), json!([tun_dns_address(&settings.tun)]));
             }
@@ -911,15 +973,7 @@ fn inbounds(settings: &Settings, fakedns: bool, tun_on: bool, dns_on: bool) -> V
     Value::Array(list)
 }
 
-fn routing(
-    cfg: &RoutingCfg,
-    tun_on: bool,
-    socks_tags: &[String],
-    dns_intercept: bool,
-    dns_on: bool,
-    dns_upstreams: &[(String, u16)],
-    active: Option<&ServerProfile>,
-) -> Value {
+fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
     // The app's own rules are emitted FIRST and the user's configured rules
     // LAST: Xray's router takes the first match, and the interception rules
     // below own DNS for the intercepted inbounds — a user rule that matches
@@ -940,8 +994,10 @@ fn routing(
     // END of the live rule list, and an unconditional in-tun catch-all
     // would swallow every TUN connection before an injected trial rule is
     // ever evaluated.)
-    if dns_on && let Some(tag) = active.map(ServerProfile::tag) {
-        for (host, port) in dns_upstreams {
+    if emission.dns_on
+        && let Some(tag) = emission.active.map(ServerProfile::tag)
+    {
+        for (host, port) in &emission.dns_upstreams {
             rules.push(json!({
                 "ip": [host],
                 "port": port.to_string(),
@@ -954,8 +1010,8 @@ fn routing(
     // queries are as well. The module's own upstream DoH traffic is
     // TCP:443, which never matches these rules and falls through
     // to the active outbound — no loop.
-    if dns_intercept {
-        if dns_on && tun_on {
+    if emission.dns_intercept {
+        if emission.dns_on && emission.tun_on {
             rules.push(json!({
                 "inboundTag": [DNS_INBOUND_TAG],
                 "network": "udp,tcp",
@@ -963,7 +1019,7 @@ fn routing(
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
         }
-        if tun_on {
+        if emission.tun_on {
             rules.push(json!({
                 "inboundTag": [TUN_INBOUND_TAG],
                 "network": "udp",
@@ -971,9 +1027,9 @@ fn routing(
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
         }
-        if !socks_tags.is_empty() {
+        if !emission.socks_tags.is_empty() {
             rules.push(json!({
-                "inboundTag": socks_tags,
+                "inboundTag": emission.socks_tags,
                 "network": "udp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
