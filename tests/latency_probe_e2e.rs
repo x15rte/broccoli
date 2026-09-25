@@ -1,4 +1,12 @@
 //! Ignored real-core coverage for the isolated one-shot latency child.
+//!
+//! Runtime level, not screen level: it drives `spawn_runtime` with its own
+//! `egui::Context` and never builds the app, so it carries its own guards — the
+//! shared screen-test fixture only ever boots the app under kittest, and an app
+//! boot sweeps stale probe scratch directories, which are exactly the leftovers
+//! its leftover check reads. `TMP`/`TEMP` point at a staging directory of their
+//! own under the isolated root: the probe stages its scratch in the process
+//! temp dir, and it stays a sibling of the APPDATA tree this test pins.
 //! Run with: cargo test --test latency_probe_e2e -- --ignored --nocapture
 
 use std::net::TcpListener;

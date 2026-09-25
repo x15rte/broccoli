@@ -18,61 +18,57 @@ use broccoli::model::{
     FinalmaskModel, FinalmaskTcpMask, OutboundModel, Protocol, ServerProfile, ServersFile, Settings,
 };
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 use serde_json::json;
 
-/// Serializes every test in this binary that mutates the process APPDATA env
-/// var (the `tests/ui_smoke.rs` convention).
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-/// Boot the app against a temp APPDATA seeded with one active profile whose
-/// finalmask holds an unknown (preserved-raw) TCP mask.
+/// Boot the app through the shared fixture against a temp APPDATA seeded with
+/// one active profile whose finalmask holds an unknown (preserved-raw) TCP
+/// mask.
 fn harness_with_raw(
     raw: serde_json::Value,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK excludes every test in this process that changes
-    // or reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-
-    let broccoli_root = tmp.path().join("broccoli");
-    std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-    std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
-    let mut profile = ServerProfile::new("raw-editor", OutboundModel::new(Protocol::Freedom));
-    profile.id = "0123456789abcdef".into();
-    profile.outbound.stream.finalmask = Some(FinalmaskModel {
-        tcp: vec![FinalmaskTcpMask::Unknown(raw)],
-        udp: Vec::new(),
-        quic_params: None,
-        extra: Default::default(),
-    });
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Default::default(),
-    };
-    std::fs::write(
-        broccoli_root.join("state/servers.json"),
-        serde_json::to_vec_pretty(&servers).unwrap(),
+    common::boot(
+        |root| {
+            let broccoli_root = root.join("broccoli");
+            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
+            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
+            let mut profile =
+                ServerProfile::new("raw-editor", OutboundModel::new(Protocol::Freedom));
+            profile.id = "0123456789abcdef".into();
+            profile.outbound.stream.finalmask = Some(FinalmaskModel {
+                tcp: vec![FinalmaskTcpMask::Unknown(raw)],
+                udp: Vec::new(),
+                quic_params: None,
+                extra: Default::default(),
+            });
+            let servers = ServersFile {
+                version: 1,
+                active: Some(profile.id.clone()),
+                profiles: vec![profile],
+                extra: Default::default(),
+            };
+            std::fs::write(
+                broccoli_root.join("state/servers.json"),
+                serde_json::to_vec_pretty(&servers).unwrap(),
+            )
+            .unwrap();
+            let mut settings = Settings::default();
+            settings.routing.observatory.enabled = false;
+            settings.routing.burst_observatory.enabled = false;
+            std::fs::write(
+                broccoli_root.join("state/settings.json"),
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
     )
-    .unwrap();
-    let mut settings = Settings::default();
-    settings.routing.observatory.enabled = false;
-    settings.routing.burst_observatory.enabled = false;
-    std::fs::write(
-        broccoli_root.join("state/settings.json"),
-        serde_json::to_vec_pretty(&settings).unwrap(),
-    )
-    .unwrap();
-
-    let h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
-    (lock, tmp, h)
 }
 
 /// The only multiline text input on the Advanced tab: the preserved-raw JSON
@@ -89,9 +85,7 @@ fn raw_editor<'a>(h: &'a Harness<'a, BroccoliApp>) -> egui_kittest::Node<'a> {
 fn open_advanced_tab(h: &mut Harness<'static, BroccoliApp>) {
     h.set_size(egui::Vec2::new(1100.0, 1000.0));
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Servers")
         .click();
     h.run();

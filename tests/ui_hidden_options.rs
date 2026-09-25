@@ -26,57 +26,52 @@ use broccoli::model::{
 };
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 use serde_json::Map;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-/// Boot the real app against `profiles` persisted into a temp APPDATA
-/// (settings seeded with the observatory off, like the other harness tests),
-/// dismiss the first-run wizard, and open the Servers screen with the first
-/// profile active. The window is the default 1100x720.
+/// Boot the real app through the shared fixture against `profiles` persisted
+/// into the temp APPDATA (settings seeded with the observatory off, like the
+/// other harness tests), dismiss the first-run wizard, and open the Servers
+/// screen with the first profile active. The window is the default 1100x720.
 fn boot_servers(
     profiles: Vec<ServerProfile>,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes every test that reads or writes
-    // broccoli state through a harness in this process.
-    unsafe {
-        std::env::set_var("APPDATA", tmp.path());
-    }
-    let state_dir = tmp.path().join("broccoli/state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let servers = ServersFile {
-        version: 1,
-        active: profiles.first().map(|profile| profile.id.clone()),
-        profiles,
-        extra: Map::new(),
-    };
-    std::fs::write(
-        state_dir.join("servers.json"),
-        serde_json::to_vec_pretty(&servers).unwrap(),
-    )
-    .unwrap();
-    let mut settings = Settings::default();
-    settings.routing.observatory.enabled = false;
-    settings.routing.burst_observatory.enabled = false;
-    std::fs::write(
-        state_dir.join("settings.json"),
-        serde_json::to_vec_pretty(&settings).unwrap(),
-    )
-    .unwrap();
+    let (lock, tmp, mut h) = common::boot(
+        |root| {
+            let state_dir = root.join("broccoli/state");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            let servers = ServersFile {
+                version: 1,
+                active: profiles.first().map(|profile| profile.id.clone()),
+                profiles,
+                extra: Map::new(),
+            };
+            std::fs::write(
+                state_dir.join("servers.json"),
+                serde_json::to_vec_pretty(&servers).unwrap(),
+            )
+            .unwrap();
+            let mut settings = Settings::default();
+            settings.routing.observatory.enabled = false;
+            settings.routing.burst_observatory.enabled = false;
+            std::fs::write(
+                state_dir.join("settings.json"),
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    h.get_by_role_and_label(Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(Role::Button, "Servers").click();
     h.run();
     (lock, tmp, h)

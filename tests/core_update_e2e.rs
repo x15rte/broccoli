@@ -8,6 +8,14 @@
 //! stored artefact from a previous build can never reach the new core. These
 //! tests are ignored by default because they require the official release
 //! payload and a runnable Xray core.
+//!
+//! Runtime level, not screen level: each test drives `spawn_runtime` directly
+//! and never builds the app, so it carries its own `APPDATA` guard. The real
+//! `%APPDATA%` read — the installed managed core it copies into the isolated
+//! root, and the bytes a rollback must restore — happens under the
+//! process-wide lock but BEFORE the redirect, which the shared screen-test
+//! fixture does not expose: its lock, redirect and kittest harness are one
+//! step.
 
 use std::net::TcpListener;
 use std::path::PathBuf;

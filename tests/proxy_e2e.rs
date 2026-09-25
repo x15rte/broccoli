@@ -2,6 +2,12 @@
 //! core → traffic through the local SOCKS inbound → gRPC stats counter moves.
 //! Requires a real xray.exe (`$XRAY_EXE` or `%APPDATA%\broccoli\core\xray.exe`);
 //! all writable Broccoli state is redirected to a temporary APPDATA root.
+//!
+//! Runtime level, not screen level: it drives `spawn_runtime` with its own
+//! `egui::Context` and never builds the app, so it carries its own `APPDATA`
+//! guard — the shared screen-test fixture only ever boots the app under
+//! kittest, an instance that must not exist in the isolated tree whose
+//! committed config this test asserts.
 //! Run with: cargo test --test proxy_e2e -- --ignored --nocapture
 
 use std::net::TcpListener;

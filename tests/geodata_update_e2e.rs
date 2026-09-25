@@ -6,6 +6,13 @@
 //! files on its own cron schedule — broccoli never downloads anything. These
 //! tests are ignored by default because they hit the real network, verify
 //! real TLS, and require a runnable managed core (`%APPDATA%\broccoli\core`).
+//!
+//! Runtime level, not screen level: each test drives `spawn_runtime` directly
+//! and never builds the app, so it carries its own `APPDATA` guard. The real
+//! `%APPDATA%` read — the installed core it copies into the isolated root, and
+//! the geodata bytes it pins — happens under the process-wide lock but BEFORE
+//! the redirect, which the shared screen-test fixture does not expose: its
+//! lock, redirect and kittest harness are one step.
 
 use std::net::TcpListener;
 use std::time::{Duration, Instant};

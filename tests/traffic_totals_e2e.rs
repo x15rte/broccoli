@@ -12,6 +12,12 @@
 //! renders per_inbound/per_inbound_totals — all four must come from the same
 //! inbound counter sweep. Requires a real xray.exe
 //! (`$XRAY_EXE` or `%APPDATA%\broccoli\core\xray.exe`); self-skips otherwise.
+//!
+//! Runtime level, not screen level: it drives `spawn_runtime` with its own
+//! `egui::Context` and never builds the app, so it carries its own `APPDATA`
+//! guard — the shared screen-test fixture only ever boots the app under
+//! kittest, an instance that must not run beside the two cores this test
+//! supervises.
 //! Run with: cargo test --test traffic_totals_e2e -- --ignored --nocapture
 
 use std::io::Read as _;

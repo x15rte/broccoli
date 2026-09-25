@@ -2,6 +2,13 @@
 //! through kittest: the temporary `APPDATA` tree, the process-wide environment
 //! lock, the headless eframe harness, and the first-run wizard dismissal.
 //!
+//! The fixture is harness-bound by design: the lock, the redirect and the app
+//! under kittest are one step, which is what a screen test needs. The
+//! runtime-level tests that drive `spawn_runtime` directly keep guards of their
+//! own: they never build the app, and an app boot is not inert — it sweeps
+//! scratch state out of the temp tree and creates the state directories, in the
+//! very tree those tests assert on.
+//!
 //! Safety: production startup is read-only with respect to Windows settings.
 //! A temporary APPDATA still isolates persistence, downloaded assets, and
 //! logs. Tests are serialized because changing a process environment variable
