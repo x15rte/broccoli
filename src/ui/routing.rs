@@ -4051,8 +4051,8 @@ mod routing_grammar_tests {
     use crate::model::{
         Balancer, OutboundModel, ServerProfile, ServersFile, Settings, StrategyCfg,
     };
-    use crate::ui::test_rig::UiTestRig;
-    use egui_kittest::{Harness, kittest::Queryable as _};
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
+    use egui_kittest::kittest::Queryable as _;
 
     /// A balancer that reads live health data pins the health engine: its
     /// coverage cannot be narrowed, so the burst toggle renders disabled and a
@@ -4070,14 +4070,8 @@ mod routing_grammar_tests {
             },
             ..Default::default()
         });
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 700.0))
-            .build_ui_state(
-                |ui, state: &mut (RoutingScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                },
-                (RoutingScreen::default(), rig),
-            );
+        let mut harness =
+            screen_harness_at(egui::vec2(900.0, 700.0), rig, RoutingScreen::default());
         harness.run();
 
         let label = t(Language::En, Key::BurstObservatory);
@@ -6259,7 +6253,7 @@ mod route_test_poll_tests {
 #[cfg(test)]
 mod routing_local_os_tests {
     use super::{Key, Language, RoutingScreen, Rule, t};
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable as _;
 
@@ -6276,14 +6270,7 @@ mod routing_local_os_tests {
             outbound_tag: "direct".into(),
             ..Rule::default()
         }];
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 1600.0))
-            .build_ui_state(
-                |ui, state: &mut (RoutingScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                },
-                (screen, rig),
-            );
+        let mut harness = screen_harness_at(egui::vec2(900.0, 1600.0), rig, screen);
         harness.run();
         harness
     }

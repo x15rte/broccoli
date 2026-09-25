@@ -24,10 +24,11 @@ use egui_kittest::{Harness, kittest::Queryable};
 
 mod common;
 
-/// The dashboard plot's explicit global id (`Plot::id` in `dashboard.rs`) —
-/// the `PlotMemory` key under which its bounds are observable.
+/// The dashboard plot's explicit global id — the `PlotMemory` key under which
+/// its bounds are observable. The screen owns the value, so a rename cannot
+/// leave this test bound to a key nothing writes.
 fn plot_id() -> egui::Id {
-    egui::Id::new("throughput-chart")
+    broccoli::ui::dashboard::throughput_plot_id()
 }
 
 /// Push a synthetic stats tick through the real event-drain path.

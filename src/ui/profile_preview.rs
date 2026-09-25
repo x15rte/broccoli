@@ -228,8 +228,8 @@ mod tests {
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
     use crate::rt::{CoreCmd, CorePhase, RuntimeStateView};
-    use crate::ui::test_rig::UiTestRig;
-    use egui_kittest::{Harness, kittest::Queryable as _};
+    use crate::ui::test_rig::{UiTestRig, screen_harness};
+    use egui_kittest::kittest::Queryable as _;
     use tokio::sync::oneshot;
 
     #[test]
@@ -308,12 +308,7 @@ mod tests {
             phase: CorePhase::Running,
             ..UiTestRig::default()
         };
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ProfilePreviewScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ProfilePreviewScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ProfilePreviewScreen::default());
         harness.run();
         harness
             .get_by_label(t(Language::En, Key::PreviewRuntimeTab))

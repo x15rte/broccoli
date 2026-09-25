@@ -7221,7 +7221,9 @@ mod tests {
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
         ProfileValidationResult, ToolTarget,
     };
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{
+        DEFAULT_TEST_VIEWPORT, UiTestRig, screen_harness, screen_harness_at, servers_frame_harness,
+    };
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable};
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -7894,12 +7896,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     fn drag_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
-        Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        )
+        screen_harness(rig, ServersScreen::default())
     }
 
     /// Press `from` and move past egui's click threshold, leaving a row drag
@@ -8179,14 +8176,8 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn holding_a_drag_at_the_lists_bottom_edge_auto_scrolls_and_drops_in_order() {
         let (rig, _ids) = seeded_rig(40);
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(800.0, 600.0))
-            .build_ui_state(
-                |ui, state: &mut (ServersScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                },
-                (ServersScreen::default(), rig),
-            );
+        let mut harness =
+            screen_harness_at(egui::vec2(800.0, 600.0), rig, ServersScreen::default());
         harness.run();
         let band = laid_out_list_rows(&harness) as usize;
         assert!(band < 40, "the list must be longer than the visible band");
@@ -8265,12 +8256,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness
             .get_all_by_label("⚡")
             .next()
@@ -8372,12 +8358,7 @@ Authentication: ML-KEM-768, Post-Quantum
         tokyo.outbound.chain_via(osaka.tag());
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness
             .get_all_by_label("⚡")
             .next()
@@ -8447,12 +8428,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness
             .get_by_label(t(Language::En, Key::TestLatency))
             .click();
@@ -8526,12 +8502,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness
             .get_by_label(t(Language::En, Key::TestLatency))
             .click();
@@ -10957,29 +10928,24 @@ Authentication: ML-KEM-768, Post-Quantum
     /// Full-servers-screen harness that also renders the leave modal every
     /// frame, mirroring the app-shell wiring.
     fn unsaved_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
-        Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-                state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        )
+        leave_modal_harness(DEFAULT_TEST_VIEWPORT, rig)
     }
 
     /// Like [`unsaved_harness`] in a window tall enough that the Advanced
     /// tab's finalmask section (below the envelope section) is on screen for
-    /// click-driven tests; the kittest default 800x600 would fold it under
-    /// the editor's scroll viewport.
+    /// click-driven tests; the app-sized default would fold it under the
+    /// editor's scroll viewport.
     fn wide_servers_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
-        Harness::builder()
-            .with_size(egui::vec2(1100.0, 700.0))
-            .build_ui_state(
-                |ui, state: &mut (ServersScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                    state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
-                },
-                (ServersScreen::default(), rig),
-            )
+        leave_modal_harness(egui::vec2(1100.0, 700.0), rig)
+    }
+
+    /// The servers screen plus the every-frame leave modal the app shell
+    /// wires after it — the shell's frame tail, through the shared harness.
+    fn leave_modal_harness(
+        size: egui::Vec2,
+        rig: UiTestRig,
+    ) -> Harness<'static, (ServersScreen, UiTestRig)> {
+        servers_frame_harness(size, rig, |_, _, _| {})
     }
 
     /// Dirty the selected profile's editor draft the way an edit does:
@@ -11361,10 +11327,9 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         // The add draft contributes independently.
         screen.seeded_buffers.clear();
-        screen.add_draft = Some(rendered_add_draft(
-            &ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless)),
-            true,
-        ));
+        let new_profile =
+            ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
+        screen.add_draft = Some(rendered_add_draft(&new_profile, true));
         assert!(
             screen.unsaved_changes(),
             "a dirty add draft must count as unsaved"

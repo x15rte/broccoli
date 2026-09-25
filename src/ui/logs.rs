@@ -1152,7 +1152,7 @@ fn logger_restart_feedback(lang: Language, result: Result<(), DiagError>) -> (bo
 mod tests {
     use super::*;
     use crate::model::settings::Language;
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{UiTestRig, screen_harness};
     use egui_kittest::{Harness, kittest::Queryable as _};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1381,12 +1381,7 @@ mod tests {
             phase: CorePhase::Running,
             ..UiTestRig::default()
         };
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (LogsScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (LogsScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, LogsScreen::default());
         harness.run();
         harness
             .get_by_label(t(Language::En, Key::LogsRestartLogger))

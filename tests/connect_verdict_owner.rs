@@ -49,20 +49,16 @@ fn generation_error(settings: &Settings) -> String {
 }
 
 /// The shell's stored text for a generation failure: the `GenerationFailed`
-/// template around the 48-char excerpt every surface is bounded to before a
-/// label or the log can see the raw message.
+/// template around the bounded excerpt every surface applies before a label or
+/// the log can see the raw message. The bound and the truncation are the
+/// crate's own ([`broccoli::excerpt`]), so this asserts the shell's choice of
+/// template, not a copy of how the bound is applied.
 fn shell_generation_error(message: &str) -> String {
-    const MAX_EXCERPT_CHARS: usize = 48;
-    let mut end = MAX_EXCERPT_CHARS.min(message.len());
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    let excerpt = if end < message.len() {
-        format!("{}…", &message[..end])
-    } else {
-        message.to_owned()
-    };
-    t_fmt(Language::En, Key::GenerationFailed, &[&excerpt])
+    t_fmt(
+        Language::En,
+        Key::GenerationFailed,
+        &[&broccoli::excerpt::excerpt(message)],
+    )
 }
 
 /// Boot through the shared fixture against `settings` persisted into the temp

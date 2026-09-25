@@ -4,6 +4,7 @@ use crate::i18n::{Key, t, t_fmt};
 use crate::model::Mode;
 use crate::model::settings::{Language, Settings, TrafficUnit};
 use crate::rt::{CorePhase, CoreTransport, DownloadState, OutboundStatusView};
+
 use crate::ui::inbounds::protocol_label;
 use crate::ui::status::{
     PhaseBadgeWording, StatusColors, phase_badge_color, phase_badge_text, status_colors_of,
@@ -597,7 +598,7 @@ impl DashboardScreen {
                 // the Y zoom at the peak scale once a spike passes. A live
                 // throughput chart must always auto-fit its window instead.
                 egui_plot::Plot::new("throughput")
-                    .id(egui::Id::new("throughput-chart"))
+                    .id(throughput_plot_id())
                     .height(160.0)
                     .include_y(0.0)
                     .allow_drag(false)
@@ -839,6 +840,15 @@ pub(crate) fn format_bytes(v: u64, unit: TrafficUnit) -> String {
 /// A byte rate in the selected unit: [`format_bytes`] plus the `/s` suffix.
 fn format_rate(v: u64, unit: TrafficUnit) -> String {
     format!("{}/s", format_bytes(v, unit))
+}
+
+/// The throughput plot's explicit global id: `egui_plot`'s `PlotMemory` is
+/// keyed by it, so the chart's bounds are observable from outside the screen
+/// (the auto-fit contract's test reads them) and the id does not shift when
+/// the surrounding layout changes. One definition, so a rename cannot leave a
+/// test bound to a key nothing writes.
+pub fn throughput_plot_id() -> egui::Id {
+    egui::Id::new("throughput-chart")
 }
 
 /// Axis-mark label for the throughput plot: [`format_bytes`] on an `f64`

@@ -209,8 +209,10 @@ pub const MAX_BULK_LEN: usize = 4 * MAX_LINK_LEN; // 4 MiB
 
 /// Maximum characters of attacker-controlled input embedded in a rendered
 /// diagnostic. Errors must never echo the full raw input; the bounded
-/// echo surfaces listed on [`excerpt`] all share this one bound.
-pub(crate) const MAX_ERROR_EXCERPT_CHARS: usize = 48;
+/// echo surfaces listed on [`excerpt`] all share this one bound. Public
+/// through `crate::excerpt`, so a test asserting the bound reads it here
+/// instead of copying the number.
+pub const MAX_ERROR_EXCERPT_CHARS: usize = 48;
 
 /// Maximum bytes of a decoded profile name derived from a `#fragment`.
 /// Names are persisted in `servers.json` and laid out every frame by the
@@ -227,7 +229,7 @@ const MAX_PROFILE_NAME_LEN: usize = 512;
 /// errors, raw-override generation and parse errors, and the dashboard's
 /// echoed generation errors. A hostile value can never inflate rendered
 /// error text; identity below the bound keeps short values byte-identical.
-pub(crate) fn excerpt(s: &str) -> String {
+pub fn excerpt(s: &str) -> String {
     let mut end = MAX_ERROR_EXCERPT_CHARS.min(s.len());
     while !s.is_char_boundary(end) {
         end -= 1;

@@ -20,7 +20,10 @@ use crate::rt::{
     CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView, StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
-use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
+use crate::ui::{
+    CoreSetupState, Screen, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
+};
+use egui_kittest::Harness;
 use std::collections::VecDeque;
 
 /// Minimal UiCtx backing shared by screen-level and app-shell-wiring tests:
@@ -142,6 +145,95 @@ impl Default for UiTestRig {
     }
 }
 
+/// The viewport the screen harnesses render at: the app's minimum window
+/// size, so a screen test lays out the width a user's window can actually
+/// have. A test that needs another width asks for one explicitly.
+pub(crate) const DEFAULT_TEST_VIEWPORT: egui::Vec2 = egui::Vec2::new(900.0, 600.0);
+
+/// One screen's frame entry: the signature every screen presents, so the
+/// shared rig can drive any of them without a per-test closure.
+pub(crate) trait ScreenShow {
+    fn show_frame(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>);
+}
+
+macro_rules! screen_show {
+    ($($screen:ty),* $(,)?) => {
+        $(impl ScreenShow for $screen {
+            fn show_frame(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+                self.show(ui, ctx);
+            }
+        })*
+    };
+}
+
+screen_show!(
+    crate::ui::about::AboutScreen,
+    crate::ui::dashboard::DashboardScreen,
+    crate::ui::dns::DnsScreen,
+    crate::ui::inbounds::InboundsScreen,
+    crate::ui::logs::LogsScreen,
+    crate::ui::profile_preview::ProfilePreviewScreen,
+    crate::ui::routing::RoutingScreen,
+    crate::ui::servers::ServersScreen,
+    crate::ui::settings::SettingsScreen,
+    crate::ui::tun::TunScreen,
+);
+
+/// Drive one screen over the shared rig through a kittest harness: the
+/// pair-shaped state the screen tests already read (`(screen, rig)`), the
+/// frame closure that hands the screen its context, and the app-sized
+/// viewport — the three things every screen test used to restate.
+pub(crate) fn screen_harness<S: ScreenShow + 'static>(
+    rig: UiTestRig,
+    screen: S,
+) -> Harness<'static, (S, UiTestRig)> {
+    screen_harness_at(DEFAULT_TEST_VIEWPORT, rig, screen)
+}
+
+/// [`screen_harness`] at an explicit viewport, for the tests that assert
+/// layout at a width of their own.
+pub(crate) fn screen_harness_at<S: ScreenShow + 'static>(
+    size: egui::Vec2,
+    rig: UiTestRig,
+    screen: S,
+) -> Harness<'static, (S, UiTestRig)> {
+    Harness::builder().with_size(size).build_ui_state(
+        |ui, state: &mut (S, UiTestRig)| state.0.show_frame(ui, &mut state.1.ctx()),
+        (screen, rig),
+    )
+}
+
+/// The servers screen plus the every-frame tail the app shell wires after it.
+///
+/// The shell runs the screen, then the leave modal, then the staged-quit
+/// resume — a sequence the app-level tests have to reproduce to exercise the
+/// quit paths at all. That reproduction lives here, once: a test passes what
+/// its own case adds after the screen (`tail`), and the shell's own ordering
+/// cannot drift from the tests that verify it.
+pub(crate) fn servers_frame_harness<F>(
+    size: egui::Vec2,
+    rig: UiTestRig,
+    tail: F,
+) -> Harness<'static, (crate::ui::servers::ServersScreen, UiTestRig)>
+where
+    F: Fn(&mut crate::ui::servers::ServersScreen, &mut UiTestRig, &egui::Ui) + 'static,
+{
+    Harness::builder().with_size(size).build_ui_state(
+        move |ui, state: &mut (crate::ui::servers::ServersScreen, UiTestRig)| {
+            state.0.show(ui, &mut state.1.ctx());
+            state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
+            tail(&mut state.0, &mut state.1, ui);
+        },
+        (crate::ui::servers::ServersScreen::default(), rig),
+    )
+}
+
+/// The screens the app shell reaches through [`Screen`]: the harness a
+/// `Screen`-driving test booting the app itself needs lives in `tests/common`.
+pub(crate) fn _assert_screen_enum_covers_the_harness(screen: Screen) -> Screen {
+    screen
+}
+
 impl UiTestRig {
     /// Push one log line exactly like the app's `LogBuffer::push`:
     /// advances the ring's monotonic generation alongside the push.
@@ -214,7 +306,7 @@ impl UiTestRig {
 /// the disabled control and the text it shows — and each fails on its own if
 /// the gate stops reading the busy window.
 mod busy_window_gates {
-    use super::UiTestRig;
+    use super::{UiTestRig, screen_harness};
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ServerProfile};
@@ -222,7 +314,7 @@ mod busy_window_gates {
     use crate::ui::logs::LogsScreen;
     use crate::ui::servers::ServersScreen;
     use egui::accesskit::Role;
-    use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
+    use egui_kittest::{kittest::NodeT as _, kittest::Queryable as _};
 
     #[test]
     fn a_busy_window_disables_the_latency_probe_and_states_the_reason() {
@@ -236,12 +328,7 @@ mod busy_window_gates {
             "Tokyo",
             OutboundModel::new(Protocol::Freedom),
         ));
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (ServersScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (ServersScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
 
         let label = t(Language::En, Key::TestLatency);
@@ -270,12 +357,7 @@ mod busy_window_gates {
             operation: Some(JobKind::Start),
             ..UiTestRig::default()
         };
-        let mut harness = Harness::new_ui_state(
-            |ui, state: &mut (LogsScreen, UiTestRig)| {
-                state.0.show(ui, &mut state.1.ctx());
-            },
-            (LogsScreen::default(), rig),
-        );
+        let mut harness = screen_harness(rig, LogsScreen::default());
         harness.run();
 
         let label = t(Language::En, Key::LogsRestartLogger);

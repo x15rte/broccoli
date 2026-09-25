@@ -4214,8 +4214,8 @@ mod unsaved_changes_tests {
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ServerProfile};
-    use crate::ui::servers::{LeaveAction, ServersScreen};
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::servers::LeaveAction;
+    use crate::ui::test_rig::{UiTestRig, servers_frame_harness};
 
     /// The topbar unsaved chip renders exactly while the Servers screen
     /// reports unsaved changes (the call site passes `unsaved_changes()`
@@ -4269,7 +4269,7 @@ mod unsaved_changes_tests {
     /// modal renders; Cancel keeps the draft and never resumes the quit.
     #[test]
     fn quit_is_deferred_while_the_servers_screen_has_unsaved_changes() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -4282,20 +4282,16 @@ mod unsaved_changes_tests {
         let deferred_ui = Rc::clone(&deferred);
         let attempt_quit = Rc::new(Cell::new(false));
         let attempt_quit_ui = Rc::clone(&attempt_quit);
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1100.0, 700.0))
-            .build_ui_state(
-                move |ui, state: &mut (ServersScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                    // Same every-frame tail wiring as `BroccoliApp::ui`.
-                    state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
-                    if attempt_quit_ui.replace(false) {
-                        // Same call `BroccoliApp::quit` makes.
-                        deferred_ui.set(Some(quit_or_stage_leave(&mut state.0, ui.ctx())));
-                    }
-                },
-                (ServersScreen::default(), rig),
-            );
+        // The shared harness wires the shell's own frame tail (the screen,
+        // then the leave modal); this case adds the quit attempt the shell
+        // makes when the window's close is requested.
+        let mut harness =
+            servers_frame_harness(egui::vec2(1100.0, 700.0), rig, move |screen, _rig, ui| {
+                if attempt_quit_ui.replace(false) {
+                    // Same call `BroccoliApp::quit` makes.
+                    deferred_ui.set(Some(quit_or_stage_leave(screen, ui.ctx())));
+                }
+            });
         harness.run();
 
         // Select the profile through the real list; the editor draft opens.
@@ -4355,18 +4351,13 @@ mod unsaved_changes_tests {
     /// from re-entering while a quit is already in flight.
     #[test]
     fn quit_resumes_after_the_leave_modal_resolves_and_never_reenters() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1100.0, 700.0))
-            .build_ui_state(
-                |ui, state: &mut (ServersScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
-                    // Same every-frame tail wiring as `BroccoliApp::ui`.
-                    state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
-                },
-                (ServersScreen::default(), UiTestRig::default()),
-            );
+        let mut harness = servers_frame_harness(
+            egui::vec2(1100.0, 700.0),
+            UiTestRig::default(),
+            |_, _, _| {},
+        );
         harness.run();
 
         // Stage a quit and resolve it through the modal's Discard: the
