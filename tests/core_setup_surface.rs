@@ -17,9 +17,9 @@ use broccoli::rt::{CoreEvt, CorePhase, DownloadState, PhaseError};
 use broccoli::sys::core_dl;
 use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable as _};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 /// The release version a seeded stale tree names: a build other than this one.
 const STALE_VERSION: &str = "26.7.28";
@@ -27,66 +27,52 @@ const STALE_VERSION: &str = "26.7.28";
 /// The managed core's release metadata file name.
 const RELEASE_METADATA: &str = ".broccoli-official-release.json";
 
-/// Boot the real app against a temp APPDATA, optionally seeded with a managed
-/// core tree that names another build's release — the stale install an app
-/// update leaves behind (its payloads are not this build's, and its own
+/// Boot through the shared fixture, optionally seeding the temp APPDATA with a
+/// managed core tree that names another build's release — the stale install an
+/// app update leaves behind (its payloads are not this build's, and its own
 /// metadata says so).
 fn boot(
     stale_core: bool,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    if stale_core {
-        let core = tmp.path().join("broccoli").join("core");
-        std::fs::create_dir_all(&core).unwrap();
-        // Every field of the release metadata must be present for it to parse;
-        // the version is what makes this tree a stale install, and the pin
-        // compares fail on the metadata before any payload is hashed.
-        for payload in ["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"] {
-            std::fs::write(core.join(payload), b"another build's payload").unwrap();
-        }
-        let metadata = serde_json::json!({
-            "schema": 0,
-            "archive_asset": "other-build.zip",
-            "archive_sha256": "0".repeat(64),
-            "xray_sha256": "0".repeat(64),
-            "wintun_sha256": "0".repeat(64),
-            "geoip_sha256": "0".repeat(64),
-            "geosite_sha256": "0".repeat(64),
-            "version": STALE_VERSION,
-        });
-        std::fs::write(
-            core.join(RELEASE_METADATA),
-            serde_json::to_vec(&metadata).unwrap(),
-        )
-        .unwrap();
-    }
-    // SAFETY: APPDATA_LOCK excludes every test in this process that changes or
-    // reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
+    let (lock, tmp, mut h) = common::boot(
+        |root| {
+            if !stale_core {
+                return;
+            }
+            let core = root.join("broccoli").join("core");
+            std::fs::create_dir_all(&core).unwrap();
+            // Every field of the release metadata must be present for it to parse;
+            // the version is what makes this tree a stale install, and the pin
+            // compares fail on the metadata before any payload is hashed.
+            for payload in ["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"] {
+                std::fs::write(core.join(payload), b"another build's payload").unwrap();
+            }
+            let metadata = serde_json::json!({
+                "schema": 0,
+                "archive_asset": "other-build.zip",
+                "archive_sha256": "0".repeat(64),
+                "xray_sha256": "0".repeat(64),
+                "wintun_sha256": "0".repeat(64),
+                "geoip_sha256": "0".repeat(64),
+                "geosite_sha256": "0".repeat(64),
+                "version": STALE_VERSION,
+            });
+            std::fs::write(
+                core.join(RELEASE_METADATA),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
     (lock, tmp, h)
-}
-
-/// Dismiss the first-run wizard ("Set up later") — a fresh temp APPDATA has no
-/// core, so the modal covers the window until then.
-fn dismiss_wizard(h: &mut Harness<'static, BroccoliApp>) {
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
-    assert!(
-        h.query_all_by_label(t(Language::En, Key::WizardWelcome))
-            .next()
-            .is_none(),
-        "the first-run wizard must be dismissed before probing the shell"
-    );
 }
 
 /// A stale tree is an update, not a first install: the startup dialog names
@@ -147,7 +133,7 @@ fn stale_core_dialog_names_both_versions_and_the_reason() {
 #[test]
 fn connect_without_a_core_fails_in_the_content_area_and_opens_setup() {
     let (_lock, _tmp, mut h) = boot(false);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     h.get_all_by_role_and_label(
         egui::accesskit::Role::Button,
@@ -216,7 +202,7 @@ fn connect_without_a_core_fails_in_the_content_area_and_opens_setup() {
 #[test]
 fn phase_error_keeps_the_phase_and_persists_until_the_phase_moves() {
     let (_lock, _tmp, mut h) = boot(false);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     let captured = "[stderr] failed to bind the API port";
     h.state().inject_event(CoreEvt::State(CorePhase::Error(
@@ -303,7 +289,7 @@ fn phase_error_keeps_the_phase_and_persists_until_the_phase_moves() {
 #[test]
 fn terminal_message_keeps_rendering_while_the_failure_stands() {
     let (_lock, _tmp, mut h) = boot(false);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     h.state()
         .inject_event(CoreEvt::State(CorePhase::Error(PhaseError::new(
@@ -331,7 +317,7 @@ fn terminal_message_keeps_rendering_while_the_failure_stands() {
 #[test]
 fn connect_with_a_stale_core_names_both_versions() {
     let (_lock, _tmp, mut h) = boot(true);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     h.get_all_by_role_and_label(
         egui::accesskit::Role::Button,
@@ -366,7 +352,7 @@ fn connect_with_a_stale_core_names_both_versions() {
 #[test]
 fn a_rollback_terminal_re_derives_the_installed_tree() {
     let (_lock, _tmp, mut h) = boot(false);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     // The synthetic install runs to its verified success while no tree
     // exists on disk (the state a gate rollback leaves behind, where the
@@ -422,7 +408,7 @@ fn a_rollback_terminal_re_derives_the_installed_tree() {
 #[test]
 fn a_rollback_leaves_the_gate_reading_the_restored_tree() {
     let (_lock, _tmp, mut h) = boot(true);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     h.state()
         .inject_event(CoreEvt::Download(DownloadState::Working {
@@ -474,7 +460,7 @@ fn core_setup_note_renders_in_the_settings_section() {
         "the note belongs to the Settings section, not to the dialog"
     );
 
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(
         egui::accesskit::Role::Button,
         Screen::Settings.label(Language::En),
@@ -533,7 +519,7 @@ fn verify_rechecks_the_installed_tree_on_demand() {
 #[test]
 fn install_success_clears_the_message_without_resuming_the_attempt() {
     let (_lock, _tmp, mut h) = boot(false);
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
 
     h.get_all_by_role_and_label(
         egui::accesskit::Role::Button,

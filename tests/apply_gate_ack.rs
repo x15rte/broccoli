@@ -31,39 +31,36 @@ use broccoli::model::Settings;
 use broccoli::model::inbound::{LocalInboundCfg, LocalInboundProtocol};
 use broccoli::model::settings::Language;
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::Mutex;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 fn harness_with_hazardous_settings() -> (
     parking_lot::MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    let broccoli_root = tmp.path().join("broccoli");
-    std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-    // Unauthenticated SOCKS listener bound beyond loopback: an Exposure
-    // hazard by every model rule (src/model/safety.rs).
-    let settings = Settings {
-        local_inbounds: vec![LocalInboundCfg {
-            protocol: LocalInboundProtocol::Socks,
-            listen: "0.0.0.0".into(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    std::fs::write(
-        broccoli_root.join("state/settings.json"),
-        serde_json::to_vec_pretty(&settings).unwrap(),
+    common::boot(
+        |root| {
+            let broccoli_root = root.join("broccoli");
+            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
+            // Unauthenticated SOCKS listener bound beyond loopback: an Exposure
+            // hazard by every model rule (src/model/safety.rs).
+            let settings = Settings {
+                local_inbounds: vec![LocalInboundCfg {
+                    protocol: LocalInboundProtocol::Socks,
+                    listen: "0.0.0.0".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            std::fs::write(
+                broccoli_root.join("state/settings.json"),
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
     )
-    .unwrap();
-    // SAFETY: APPDATA_LOCK excludes every test in this process that changes
-    // or reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-    let h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
-    (lock, tmp, h)
 }
 
 #[test]
@@ -73,14 +70,8 @@ fn hazardous_settings_boot_without_a_dialog_and_existing_gates_still_block() {
     h.run();
 
     // Fresh temp APPDATA -> no core -> the first-run wizard modal covers the
-    // whole screen. Dismiss it exactly like the sibling harness tests.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
-    assert!(
-        h.query_all_by_label("Welcome to broccoli").next().is_none(),
-        "the first-run wizard must be dismissed before probing the top bar"
-    );
+    // whole screen, so the top bar is only probeable once it is dismissed.
+    common::dismiss_wizard(&mut h);
 
     // The hazard dialog is the response to a gated apply request — it must
     // not appear spontaneously, however hazardous the persisted settings.

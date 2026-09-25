@@ -15,61 +15,9 @@ use broccoli::rt::{CoreEvt, CorePhase, StatsTick};
 use broccoli::sys::core_dl;
 use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
-use std::ffi::OsString;
 use std::time::Duration;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
-struct TempDirectoryEnv {
-    tmp: Option<OsString>,
-    temp: Option<OsString>,
-}
-
-impl TempDirectoryEnv {
-    fn set(path: &std::path::Path) -> Self {
-        let previous = Self {
-            tmp: std::env::var_os("TMP"),
-            temp: std::env::var_os("TEMP"),
-        };
-        // SAFETY: APPDATA_LOCK serializes every test that changes process
-        // environment variables used by Broccoli and tempfile.
-        unsafe {
-            std::env::set_var("TMP", path);
-            std::env::set_var("TEMP", path);
-        }
-        previous
-    }
-}
-
-impl Drop for TempDirectoryEnv {
-    fn drop(&mut self) {
-        // SAFETY: the guard restores values while APPDATA_LOCK is held.
-        unsafe {
-            match self.tmp.take() {
-                Some(value) => std::env::set_var("TMP", value),
-                None => std::env::remove_var("TMP"),
-            }
-            match self.temp.take() {
-                Some(value) => std::env::set_var("TEMP", value),
-                None => std::env::remove_var("TEMP"),
-            }
-        }
-    }
-}
-
-fn harness() -> (
-    MutexGuard<'static, ()>,
-    tempfile::TempDir,
-    Harness<'static, BroccoliApp>,
-) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK excludes every test in this process that changes or
-    // reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-    let h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
-    (lock, tmp, h)
-}
+mod common;
 
 /// The Logs screen's filter input — the only text input on that screen.
 fn logs_filter<'a>(h: &'a Harness<'a, BroccoliApp>) -> egui_kittest::Node<'a> {
@@ -105,20 +53,14 @@ fn screen_rendered_label(screen: Screen) -> String {
 
 #[test]
 fn app_boots_and_every_screen_renders() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
     // Fresh temp APPDATA -> no core -> the first-run wizard modal covers the
-    // whole screen and swallows nav clicks. Dismiss it exactly like the
-    // sibling tests so the loop below actually reaches every screen.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
-    assert!(
-        h.query_all_by_label("Welcome to broccoli").next().is_none(),
-        "the first-run wizard must be dismissed before navigating"
-    );
+    // whole screen and swallows nav clicks. Dismiss it so the loop below
+    // actually reaches every screen.
+    common::dismiss_wizard(&mut h);
 
     for screen in Screen::ALL {
         // Sidebar items are buttons; scope the click by role so a
@@ -139,7 +81,7 @@ fn app_boots_and_every_screen_renders() {
 
 #[test]
 fn dashboard_shows_core_state_badge() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.run();
     // Stopped badge is always present on a fresh boot (top bar + dashboard).
     assert!(h.get_all_by_label("Stopped").next().is_some());
@@ -158,16 +100,14 @@ fn dashboard_shows_core_state_badge() {
 /// contract used to be pinned on was emptied (nav only).
 #[test]
 fn dashboard_session_totals_drop_on_phase_change() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
     // Fresh temp APPDATA -> the first-run wizard modal covers the dashboard.
-    // Dismiss it (as the sibling tests do) so the asserted surfaces are the
-    // real rendered ones, not widgets hidden under the modal.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    // Dismiss it so the asserted surfaces are the real rendered ones, not
+    // widgets hidden under the modal.
+    common::dismiss_wizard(&mut h);
 
     // The exhibition shape: an idle-but-live core carrying session volume.
     h.state().inject_event(CoreEvt::Stats(StatsTick {
@@ -211,7 +151,7 @@ fn dashboard_session_totals_drop_on_phase_change() {
 
 #[test]
 fn topbar_pins_app_version_on_the_right() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -230,7 +170,7 @@ fn topbar_pins_app_version_on_the_right() {
 
 #[test]
 fn first_run_wizard_exposes_anchored_release_controls_and_copies_link() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -281,13 +221,11 @@ fn first_run_wizard_exposes_anchored_release_controls_and_copies_link() {
 
 #[test]
 fn settings_exposes_same_core_setup_after_defer() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -331,13 +269,11 @@ fn settings_exposes_same_core_setup_after_defer() {
 
 #[test]
 fn routing_exposes_probe_interval_and_one_health_engine() {
-    let (_lock, tmp, mut h) = harness();
+    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Routing")
         .click();
     h.run();
@@ -381,7 +317,7 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
     field.type_text("30s");
     h.run_steps(4);
 
-    let settings = persisted_settings(&tmp);
+    let settings = persisted_settings(tmp.path());
     assert_eq!(settings["routing"]["observatory"]["probeInterval"], "30s");
     assert_eq!(settings["routing"]["observatory"]["enabled"], true);
 
@@ -408,7 +344,7 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
         h.query_by_label("Destination").is_some(),
         "the burst group must render its own fields"
     );
-    let settings = persisted_settings(&tmp);
+    let settings = persisted_settings(tmp.path());
     assert_eq!(
         settings["routing"]["burstObservatory"]["enabled"], true,
         "the burst toggle must persist"
@@ -419,21 +355,19 @@ fn routing_exposes_probe_interval_and_one_health_engine() {
     );
 }
 
-fn persisted_settings(tmp: &tempfile::TempDir) -> serde_json::Value {
+fn persisted_settings(root: &std::path::Path) -> serde_json::Value {
     let settings_bytes =
-        std::fs::read(tmp.path().join("broccoli/state/settings.json")).expect("settings state");
+        std::fs::read(root.join("broccoli/state/settings.json")).expect("settings state");
     serde_json::from_slice(&settings_bytes).expect("persisted settings must be JSON")
 }
 
 #[test]
 fn delete_first_digit_of_non_loopback_listen_keeps_focus() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     if let Some(node) = h.get_all_by_label("Inbounds").next() {
         node.click();
     }
@@ -510,13 +444,11 @@ fn delete_first_digit_of_non_loopback_listen_keeps_focus() {
 
 #[test]
 fn typing_partial_listen_address_keeps_input_focus() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     if let Some(node) = h.get_all_by_label("Inbounds").next() {
         node.click();
     }
@@ -580,13 +512,11 @@ fn typing_partial_listen_address_keeps_input_focus() {
 
 #[test]
 fn settings_edits_persist_without_applying_the_runtime_candidate() {
-    let (_lock, tmp, mut h) = harness();
+    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -630,13 +560,11 @@ fn settings_edits_persist_without_applying_the_runtime_candidate() {
 /// cleared, so reverting an edit left the yellow chip up until Connect.
 #[test]
 fn reverting_a_settings_edit_clears_the_changes_pending_chip() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -682,13 +610,11 @@ fn reverting_a_settings_edit_clears_the_changes_pending_chip() {
 /// depend on a unit choice.
 #[test]
 fn traffic_unit_change_persists_without_demanding_apply() {
-    let (_lock, tmp, mut h) = harness();
+    let (_lock, tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
 
     // The dashboard's unit combo shows the current unit as its value.
     h.get_all_by_role(egui::accesskit::Role::ComboBox)
@@ -778,22 +704,13 @@ fn saved_settings(path: &std::path::Path) -> serde_json::Value {
 /// until the next edit, or until a clean exit.
 #[test]
 fn the_persist_deadline_flushes_the_last_edit_of_a_burst() {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes every test in this process that changes
-    // or reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
     // The harness's default frame step is a quarter second, which is longer
     // than the persist window this test reasons about; a 60 Hz step keeps
     // every frame a small, known distance from the pinned clock.
-    let mut h = Harness::builder()
-        .with_step_dt(1.0 / 60.0)
-        .with_size(egui::Vec2::new(1100.0, 720.0))
-        .build_eframe(|cc| BroccoliApp::new_headless(cc));
+    let (_lock, tmp, mut h) = common::boot(|_| {}, Some(1.0 / 60.0));
+    h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     // Every pin below sits at least a window away from the save it must not
     // see, and inside one of the save it must: a click's own frames drift at
     // most a few 60 Hz steps from the frame it pinned.
@@ -819,18 +736,15 @@ fn the_persist_deadline_flushes_the_last_edit_of_a_burst() {
         "miBps",
         "the deadline frame must flush the deferred edit"
     );
-    drop(lock);
 }
 
 #[test]
 fn settings_appearance_theme_radio_switches_preference() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -864,25 +778,23 @@ fn settings_appearance_theme_radio_switches_preference() {
 
 #[test]
 fn settings_appearance_accent_reapplied_at_startup_and_reset() {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes all Broccoli state access in this test
-    // process.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-
-    let broccoli_root = tmp.path().join("broccoli");
-    std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
     let settings = Settings {
         accent_color: Some(0x4f_af_4f_ff),
         ..Default::default()
     };
-    std::fs::write(
-        broccoli_root.join("state/settings.json"),
-        serde_json::to_vec_pretty(&settings).unwrap(),
-    )
-    .unwrap();
+    let (_lock, tmp, mut h) = common::boot(
+        |root| {
+            let broccoli_root = root.join("broccoli");
+            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
+            std::fs::write(
+                broccoli_root.join("state/settings.json"),
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
@@ -898,9 +810,7 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
     }
 
     // Live reset clears both themes and persists the cleared model.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -916,22 +826,19 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
             "{theme:?} reset must restore stock"
         );
     }
+    let settings_path = tmp.path().join("broccoli/state/settings.json");
     let persisted: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(broccoli_root.join("state/settings.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(settings_path).unwrap())
             .expect("settings state must persist");
     assert!(
         persisted.get("accentColor").is_none(),
         "reset must clear the persisted accent"
     );
-
-    drop(h);
-    drop(tmp);
-    drop(lock);
 }
 
 #[test]
 fn window_close_request_hides_to_tray() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.run();
 
     h.input_mut()
@@ -963,18 +870,6 @@ fn window_close_request_hides_to_tray() {
 }
 #[test]
 fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes all Broccoli state access in this test
-    // process.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-    let probe_tmp = tmp.path().join("probe-tmp");
-    std::fs::create_dir_all(&probe_tmp).unwrap();
-    let _temp_env = TempDirectoryEnv::set(&probe_tmp);
-
-    let broccoli_root = tmp.path().join("broccoli");
-    std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-    std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
     let mut profile = ServerProfile::new("isolated", OutboundModel::new(Protocol::Freedom));
     profile.id = "0123456789abcdef".into();
     let servers = ServersFile {
@@ -988,17 +883,28 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
     settings.routing.burst_observatory.enabled = false;
     let servers_bytes = serde_json::to_vec_pretty(&servers).unwrap();
     let settings_bytes = serde_json::to_vec_pretty(&settings).unwrap();
-    std::fs::write(broccoli_root.join("state/servers.json"), &servers_bytes).unwrap();
-    std::fs::write(broccoli_root.join("state/settings.json"), &settings_bytes).unwrap();
+
+    // The probe stages its throwaway core in the process temp directory, which
+    // the fixture points at its own temp root: the leftover scan at the end of
+    // this test reads exactly where a leaked probe directory would land.
+    let (_lock, tmp, mut h) = common::boot(
+        |root| {
+            let broccoli_root = root.join("broccoli");
+            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
+            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
+            std::fs::write(broccoli_root.join("state/servers.json"), &servers_bytes).unwrap();
+            std::fs::write(broccoli_root.join("state/settings.json"), &settings_bytes).unwrap();
+        },
+        None,
+    );
+
+    let broccoli_root = tmp.path().join("broccoli");
     let config_path = broccoli_root.join("config/config.json");
     let config_before = std::fs::read(&config_path).ok();
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Servers")
         .click();
     h.run();
@@ -1041,7 +947,7 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
         h.query_by_label("changes pending").is_none(),
         "one-shot probing must not mark the model dirty"
     );
-    let leftovers: Vec<_> = std::fs::read_dir(&probe_tmp)
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -1055,23 +961,10 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
         leftovers.is_empty(),
         "temporary latency probe directories leaked: {leftovers:?}"
     );
-
-    drop(h);
-    drop(_temp_env);
-    drop(lock);
 }
 
 #[test]
 fn visible_delete_button_removes_selected_server() {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes all Broccoli state access in this test
-    // process.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-
-    let broccoli_root = tmp.path().join("broccoli");
-    std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
-    std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
     let mut profile = ServerProfile::new("visible-delete", OutboundModel::new(Protocol::Freedom));
     profile.id = "0123456789abcdef".into();
     let servers = ServersFile {
@@ -1084,19 +977,23 @@ fn visible_delete_button_removes_selected_server() {
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
     let servers_bytes = serde_json::to_vec_pretty(&servers).unwrap();
-    std::fs::write(broccoli_root.join("state/servers.json"), &servers_bytes).unwrap();
-    std::fs::write(
-        broccoli_root.join("state/settings.json"),
-        serde_json::to_vec_pretty(&settings).unwrap(),
-    )
-    .unwrap();
+    let settings_bytes = serde_json::to_vec_pretty(&settings).unwrap();
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
+    let (_lock, tmp, mut h) = common::boot(
+        |root| {
+            let broccoli_root = root.join("broccoli");
+            std::fs::create_dir_all(broccoli_root.join("state")).unwrap();
+            std::fs::create_dir_all(broccoli_root.join("config")).unwrap();
+            std::fs::write(broccoli_root.join("state/servers.json"), &servers_bytes).unwrap();
+            std::fs::write(broccoli_root.join("state/settings.json"), &settings_bytes).unwrap();
+        },
+        None,
+    );
+    let broccoli_root = tmp.path().join("broccoli");
+
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Servers")
         .click();
     h.run();
@@ -1147,20 +1044,15 @@ fn visible_delete_button_removes_selected_server() {
             .unwrap();
     assert!(persisted.profiles.is_empty());
     assert!(persisted.active.is_none());
-
-    drop(tmp);
-    drop(lock);
 }
 
 #[test]
 fn settings_renders_geodata_section() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
         .click();
     h.run();
@@ -1181,13 +1073,11 @@ fn settings_renders_geodata_section() {
 /// removed (the logs toolbar's "Copy all" button remains).
 #[test]
 fn right_click_never_offers_copy() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
 
     // A selectable static label.
     let badge = h
@@ -1258,16 +1148,13 @@ fn right_click_never_offers_copy() {
 /// memoization gates per screen and the runtime arm gates.
 #[test]
 fn idle_frames_keep_the_app_rendering() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
 
     // Fresh temp APPDATA -> no core -> the first-run wizard modal covers the
-    // whole screen; dismiss it so the render assertion below targets the
-    // shell, exactly like the sibling tests.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    // whole screen; dismiss it so the render assertion below targets the shell.
+    common::dismiss_wizard(&mut h);
 
     const IDLE_FRAMES: u64 = 120;
     h.run_steps(IDLE_FRAMES as usize);
@@ -1286,11 +1173,9 @@ fn idle_frames_keep_the_app_rendering() {
 /// the app in the active language with the log prefix raw lines carry.
 #[test]
 fn app_log_events_render_in_the_active_language_with_the_prefix() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
 
     h.state()
         .inject_event(CoreEvt::AppLog(Diag::new(Key::RtLogCoreReady).into()));

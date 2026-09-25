@@ -16,15 +16,16 @@
 //! a process environment variable while another harness reads it is
 //! undefined behavior.
 
+use broccoli::app::BroccoliApp;
 use broccoli::r#gen::generate_with_api_port;
 use broccoli::i18n::{Key, t_fmt, validation_message};
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::model::validation::{ValidationCode, ValidationIssue, validate_settings};
 use broccoli::model::{ServersFile, TunCfg};
 use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 /// The gateway rule's message, rendered from the model code the verdict
 /// pass emits (the same bytes the generator surfaces and the screen shows).
@@ -182,41 +183,34 @@ fn tun_disabled_with_cleared_gateway_is_valid() {
 
 // ---------- UI: inline error + Apply/Connect blocking ----------
 
-/// Boot the real app against `settings` persisted into a temp APPDATA,
-/// dismiss the first-run wizard, and optionally navigate to the given
-/// screen (None = stay on the dashboard). The window is tall so every
-/// section renders into the AccessKit tree without scrolling.
+/// Boot through the shared fixture against `settings` persisted into the temp
+/// APPDATA, dismiss the first-run wizard, and optionally navigate to the given
+/// screen (None = stay on the dashboard). The window is tall so every section
+/// renders into the AccessKit tree without scrolling.
 fn boot(
     settings: &Settings,
     screen: Option<&str>,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
-    Harness<'static, broccoli::app::BroccoliApp>,
+    common::TempEnvironment,
+    Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes every test that reads or writes
-    // broccoli state through a harness in this process.
-    unsafe {
-        std::env::set_var("APPDATA", tmp.path());
-    }
-    let state_dir = tmp.path().join("broccoli/state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    std::fs::write(
-        state_dir.join("settings.json"),
-        serde_json::to_vec_pretty(settings).unwrap(),
-    )
-    .unwrap();
+    let (lock, tmp, mut h) = common::boot(
+        |root| {
+            let state_dir = root.join("broccoli/state");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::write(
+                state_dir.join("settings.json"),
+                serde_json::to_vec_pretty(settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| broccoli::app::BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 2800.0));
     h.run();
-    // First-run wizard over everything until "Set up later": dismissing it
-    // unblocks the nav panel.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     // The dashboard's mode selector carries its own "TUN" selectable label
     // (same Button role in the AccessKit tree), so the sidebar item is
     // ambiguous while the dashboard is showing; stage through the DNS screen

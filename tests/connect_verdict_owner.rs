@@ -19,9 +19,9 @@ use broccoli::model::ServersFile;
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::rt::{CoreEvt, DownloadState};
 use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 /// A raw override that fails generation with a message longer than the
 /// shell's 48-char excerpt, so the stored label is visibly bounded.
@@ -65,37 +65,32 @@ fn shell_generation_error(message: &str) -> String {
     t_fmt(Language::En, Key::GenerationFailed, &[&excerpt])
 }
 
-/// Boot the real app against `settings` persisted into a temp APPDATA and
-/// dismiss the first-run wizard (no core is installed, so the wizard modal
-/// covers the dashboard until then).
+/// Boot through the shared fixture against `settings` persisted into the temp
+/// APPDATA and dismiss the first-run wizard (no core is installed, so the
+/// wizard modal covers the dashboard until then).
 fn boot(
     settings: &Settings,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes every test that reads or writes
-    // broccoli state through a harness in this process.
-    unsafe {
-        std::env::set_var("APPDATA", tmp.path());
-    }
-    let state_dir = tmp.path().join("broccoli/state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    std::fs::write(
-        state_dir.join("settings.json"),
-        serde_json::to_vec_pretty(settings).unwrap(),
-    )
-    .unwrap();
+    let (lock, tmp, mut h) = common::boot(
+        |root| {
+            let state_dir = root.join("broccoli/state");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::write(
+                state_dir.join("settings.json"),
+                serde_json::to_vec_pretty(settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     (lock, tmp, h)
 }
 

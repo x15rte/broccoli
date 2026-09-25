@@ -19,9 +19,9 @@ use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Mode};
 use broccoli::model::{DnsCfg, DnsServer, FakeDnsCfg, Settings};
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 /// The expected inline message for one privacy finding, rendered through
 /// the i18n renderer the UI itself consumes.
@@ -76,41 +76,34 @@ fn invalid_pool_cidr_shows_inline_error() {
     );
 }
 
-/// Boot the real app against `settings` persisted into a temp APPDATA,
-/// dismiss the first-run wizard, and navigate to the given screen ("DNS" or
-/// "TUN"). The window is tall so every section renders into the AccessKit
-/// tree without scrolling.
+/// Boot through the shared fixture against `settings` persisted into the temp
+/// APPDATA, dismiss the first-run wizard, and navigate to the given screen
+/// ("DNS" or "TUN"). The window is tall so every section renders into the
+/// AccessKit tree without scrolling.
 fn boot(
     settings: &Settings,
     screen: &str,
 ) -> (
     MutexGuard<'static, ()>,
-    tempfile::TempDir,
+    common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK serializes every test that reads or writes
-    // broccoli state through a harness in this process.
-    unsafe {
-        std::env::set_var("APPDATA", tmp.path());
-    }
-    let state_dir = tmp.path().join("broccoli/state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    std::fs::write(
-        state_dir.join("settings.json"),
-        serde_json::to_vec_pretty(settings).unwrap(),
-    )
-    .unwrap();
+    let (lock, tmp, mut h) = common::boot(
+        |root| {
+            let state_dir = root.join("broccoli/state");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::write(
+                state_dir.join("settings.json"),
+                serde_json::to_vec_pretty(settings).unwrap(),
+            )
+            .unwrap();
+        },
+        None,
+    );
 
-    let mut h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
     h.set_size(egui::Vec2::new(1100.0, 2800.0));
     h.run();
-    // First-run wizard over everything until "Set up later": dismissing it
-    // unblocks the nav panel.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
+    common::dismiss_wizard(&mut h);
     // The dashboard's mode selector carries its own "TUN" selectable label
     // (same Button role in the AccessKit tree), so the sidebar item is
     // ambiguous while the dashboard is showing; stage through the DNS screen

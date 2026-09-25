@@ -17,7 +17,8 @@
 
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
-    CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OutboundStatusView, StatsTick,
+    CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OperationKind, OutboundStatusView,
+    StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
@@ -74,6 +75,12 @@ pub(crate) struct UiTestRig {
     pub(crate) terminal_error: Option<TerminalErrorView>,
     pub(crate) download: DownloadState,
     pub(crate) update_check: UpdateCheckState,
+    /// The runtime's exclusive operation as the shell mirrors it — the busy
+    /// window every gated control reads. `None` is the resting shell.
+    pub(crate) operation: Option<OperationKind>,
+    /// Whether this process runs elevated: the TUN badge and the TUN hover
+    /// copy read it.
+    pub(crate) is_elevated: bool,
     pub(crate) dirty: bool,
     pub(crate) ui_dirty: bool,
     pub(crate) config_revision: u64,
@@ -113,6 +120,8 @@ impl Default for UiTestRig {
             terminal_error: None,
             download: DownloadState::Idle,
             update_check: UpdateCheckState::Idle,
+            operation: None,
+            is_elevated: false,
             dirty: false,
             ui_dirty: false,
             config_revision: 0,
@@ -150,9 +159,9 @@ impl UiTestRig {
     /// [`UiCtx::new`], the same single constructor the app shell uses, with
     /// the same two bundles: [`UiCtxParts`] over the rig's fields and a
     /// live [`UiCtxView`] over a snapshot cloned from the rig's runtime
-    /// fields. Inert runtime inputs take their resting values (phase
-    /// `Stopped`, no stats or observatory, no operation); the per-test
-    /// state lives on the rig's mutable fields.
+    /// fields. Runtime inputs take their resting values unless a test sets
+    /// them (phase `Stopped`, no stats or observatory, no operation, not
+    /// elevated); the per-test state lives on the rig's mutable fields.
     pub(crate) fn ctx(&mut self) -> UiCtx<'_> {
         // Refresh the staging snapshot from the flat fields, then borrow it.
         self.snapshot = UiCtxSnapshot {
@@ -185,13 +194,101 @@ impl UiTestRig {
                 open_core_setup_requested: &mut self.open_core_setup_requested,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
-                operation: None,
-                is_elevated: false,
+                operation: self.operation,
+                is_elevated: self.is_elevated,
                 config_revision: self.config_revision,
             },
             UiCtxView::Live {
                 snapshot: &self.snapshot,
             },
         )
+    }
+}
+
+/// The busy window as the two screens that own a gated control show it: while
+/// an exclusive operation is in flight, the control is disabled and its
+/// disabled hover states the reason. Both assertions are what a user meets —
+/// the disabled control and the text it shows — and each fails on its own if
+/// the gate stops reading the busy window.
+mod busy_window_gates {
+    use super::UiTestRig;
+    use crate::i18n::{Key, t};
+    use crate::model::settings::Language;
+    use crate::model::{OutboundModel, Protocol, ServerProfile};
+    use crate::rt::{CorePhase, OperationKind};
+    use crate::ui::logs::LogsScreen;
+    use crate::ui::servers::ServersScreen;
+    use egui::accesskit::Role;
+    use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
+
+    #[test]
+    fn a_busy_window_disables_the_latency_probe_and_states_the_reason() {
+        let mut rig = UiTestRig {
+            operation: Some(OperationKind::Start),
+            ..UiTestRig::default()
+        };
+        // A profile, so the gate under test is the busy window and not the
+        // empty list's own "add a server first" reason.
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let mut harness = Harness::new_ui_state(
+            |ui, state: &mut (ServersScreen, UiTestRig)| {
+                state.0.show(ui, &mut state.1.ctx());
+            },
+            (ServersScreen::default(), rig),
+        );
+        harness.run();
+
+        let label = t(Language::En, Key::TestLatency);
+        {
+            let probe = harness.get_by_role_and_label(Role::Button, label);
+            assert!(
+                probe.accesskit_node().is_disabled(),
+                "an operation in flight must disable the latency probe"
+            );
+            probe.hover();
+        }
+        // The disabled hover waits out egui's tooltip delay, so the reason is
+        // only on screen once a few frames have passed with the pointer still.
+        harness.run_steps(4);
+        let reason = t(Language::En, Key::SrvAnotherOperationWorking);
+        assert!(
+            harness.query_all_by_label(reason).next().is_some(),
+            "the disabled latency probe must state why: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_busy_window_disables_the_logger_restart_and_states_the_reason() {
+        let rig = UiTestRig {
+            phase: CorePhase::Running,
+            operation: Some(OperationKind::Start),
+            ..UiTestRig::default()
+        };
+        let mut harness = Harness::new_ui_state(
+            |ui, state: &mut (LogsScreen, UiTestRig)| {
+                state.0.show(ui, &mut state.1.ctx());
+            },
+            (LogsScreen::default(), rig),
+        );
+        harness.run();
+
+        let label = t(Language::En, Key::LogsRestartLogger);
+        {
+            let restart = harness.get_by_role_and_label(Role::Button, label);
+            assert!(
+                restart.accesskit_node().is_disabled(),
+                "an operation in flight must disable the logger restart"
+            );
+            restart.hover();
+        }
+        harness.run_steps(4);
+        let reason = t(Language::En, Key::LogsRestartDisabledBusy);
+        assert!(
+            harness.query_all_by_label(reason).next().is_some(),
+            "the disabled logger restart must state why: {reason}"
+        );
     }
 }

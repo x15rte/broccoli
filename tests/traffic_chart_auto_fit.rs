@@ -21,42 +21,13 @@ use broccoli::model::settings::Language;
 use broccoli::rt::{CoreEvt, StatsTick};
 use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
-use parking_lot::{Mutex, MutexGuard};
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
 /// The dashboard plot's explicit global id (`Plot::id` in `dashboard.rs`) —
 /// the `PlotMemory` key under which its bounds are observable.
 fn plot_id() -> egui::Id {
     egui::Id::new("throughput-chart")
-}
-
-/// `%APPDATA%` pointed at a fresh tempdir; the guard serializes every test
-/// that mutates the process env vars (the `ui_smoke` convention).
-fn harness() -> (
-    MutexGuard<'static, ()>,
-    tempfile::TempDir,
-    Harness<'static, BroccoliApp>,
-) {
-    let lock = APPDATA_LOCK.lock();
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: APPDATA_LOCK excludes every test in this process that changes
-    // or reads APPDATA through a BroccoliApp harness.
-    unsafe { std::env::set_var("APPDATA", tmp.path()) };
-    let h = Harness::new_eframe(|cc| BroccoliApp::new_headless(cc));
-    (lock, tmp, h)
-}
-
-/// Dismiss the first-run wizard ("Set up later") — a fresh temp APPDATA has
-/// no core, so the modal swallows nav clicks until it is dismissed.
-fn dismiss_wizard(h: &mut Harness<'static, BroccoliApp>) {
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Set up later")
-        .click();
-    h.run();
-    assert!(
-        h.query_all_by_label("Welcome to broccoli").next().is_none(),
-        "the first-run wizard must be dismissed before navigating"
-    );
 }
 
 /// Push a synthetic stats tick through the real event-drain path.
@@ -121,10 +92,10 @@ fn wheel_scroll_over_chart(h: &mut Harness<'static, BroccoliApp>) {
 /// the zoom at the peak scale forever).
 #[test]
 fn chart_y_axis_auto_fits_and_releases_after_peak() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(
         egui::accesskit::Role::Button,
         Screen::Dashboard.label(Language::En),
@@ -176,10 +147,10 @@ fn chart_y_axis_auto_fits_and_releases_after_peak() {
 /// no-scroll baseline the scroll case builds on.
 #[test]
 fn chart_y_axis_auto_fits_without_interaction() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(
         egui::accesskit::Role::Button,
         Screen::Dashboard.label(Language::En),
@@ -212,10 +183,10 @@ fn chart_y_axis_auto_fits_without_interaction() {
 /// (navigation proof, the `ui_smoke` convention).
 #[test]
 fn chart_still_renders_on_the_dashboard() {
-    let (_lock, _tmp, mut h) = harness();
+    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
-    dismiss_wizard(&mut h);
+    common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(
         egui::accesskit::Role::Button,
         Screen::Dashboard.label(Language::En),
