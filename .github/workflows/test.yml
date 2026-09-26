@@ -132,14 +132,15 @@ jobs:
 
       # The live-core suites — golden_validation, the two *_live_core
       # targets, proxy_e2e, traffic_totals_e2e, latency_probe_e2e,
-      # core_update_e2e, and geodata_dat_pin_suspension — are #[ignore]d by
-      # default, so CI must supply the core and lift the ignore for those
-      # targets or they never run. Pin the same verified release the app
-      # downloads (Cargo.toml [package.metadata.broccoli.release] —
-      # xray_version, xray_archive, xray_sha256), verify the archive SHA-256
-      # before extraction, and export XRAY_EXE for the suites that spawn a
-      # core plus BROCCOLI_TEST_XRAY_ARCHIVE for the ones that stage a
-      # managed core from the ZIP.
+      # core_update_e2e, geodata_dat_pin_suspension, and geodata_update_e2e —
+      # are #[ignore]d by default, so CI must supply the core and lift the
+      # ignore for those targets or they never run. Pin the same verified
+      # release the app downloads (Cargo.toml
+      # [package.metadata.broccoli.release]: xray_version, xray_archive,
+      # xray_sha256), verify the archive SHA-256 before extraction, and export
+      # XRAY_EXE for the suites that spawn a core plus
+      # BROCCOLI_TEST_XRAY_ARCHIVE for the ones that stage a managed core
+      # from the ZIP.
       - name: Download and verify pinned Xray core
         run: |
           $ErrorActionPreference = 'Stop'
@@ -211,7 +212,7 @@ jobs:
               --test dns_inbound_live_core --test core_update_e2e `
               --test geodata_dat_pin_suspension `
               --test proxy_e2e --test traffic_totals_e2e `
-              --test latency_probe_e2e -- --ignored
+              --test latency_probe_e2e --test geodata_update_e2e -- --ignored
           if ($LASTEXITCODE -ne 0) { throw "cargo test (live-core suites) failed with exit code $LASTEXITCODE" }
 
       # A GitHub-hosted Windows runner executes steps as an administrator with
@@ -221,9 +222,12 @@ jobs:
       # binds this machine's LAN address and expects the installed shield to
       # block it, so the address comes from the default route instead of a
       # compiled-in default. The install oracle needs the same verified ZIP the
-      # download step kept. The four oracles that want a core installed into
-      # the machine's own APPDATA stay manual: CI installs none of them.
-      - name: Run the elevated and archive-backed oracles
+      # download step kept, and the QUIC oracle only outbound UDP.
+      #
+      # Four oracles want a managed core in the machine's own AppData, so the
+      # install funnel runs first from that same archive. It runs after the
+      # ordinary suite, whose expectations assume nothing is installed.
+      - name: Run the elevated, installed-core and network oracles
         run: |
           $ErrorActionPreference = 'Stop'
           $lanIp = Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
@@ -238,8 +242,20 @@ jobs:
           }
           $env:BROCCOLI_PROBE_LAN_IP = $lanIp
           $env:BROCCOLI_PROBE_XRAY = $env:XRAY_EXE
-          cargo test --locked --lib --target $env:BROCCOLI_TARGET -- --ignored `
+          cargo test --locked --target $env:BROCCOLI_TARGET --test install_managed_core -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw "cargo test (managed-core install) failed with exit code $LASTEXITCODE" }
+          # One thread, because the WFP probe installs a machine-wide block on
+          # remote port 53 and holds it across its two two-second waits: any
+          # test that resolves a name while it stands fails for a scheduling
+          # reason rather than a defect. Serial execution also keeps the
+          # oracles that redirect APPDATA from overlapping.
+          cargo test --locked --lib --target $env:BROCCOLI_TARGET -- --ignored --test-threads=1 `
               rt::wfp::tests::empirical_port53_is_blocked_outside_the_tun `
               rt::helper::tests::protected_stage_acl_is_verified_and_stage_is_removed_on_drop `
-              sys::core_dl::pristine_tests::installing_the_pinned_archive_retains_a_pin_matching_pristine_pair
-          if ($LASTEXITCODE -ne 0) { throw "cargo test (elevated and archive-backed oracles) failed with exit code $LASTEXITCODE" }
+              quic_probe::tests::live_capture_smoke `
+              sys::core_dl::pristine_tests::installing_the_pinned_archive_retains_a_pin_matching_pristine_pair `
+              sys::core_dl::pristine_tests::restore_replaces_drifted_managed_geo_data_and_passes_strict_verify `
+              sys::core_dl::pristine_tests::suspended_verify_keeps_drifted_dats_and_strict_verify_heals_them `
+              sys::core_dl::provenance_tests::provenance_follows_drift_and_restore_round_trip `
+              ui::settings::tests::restore_round_trip_flips_the_section_back_to_release_managed
+          if ($LASTEXITCODE -ne 0) { throw "cargo test (elevated, installed-core and network oracles) failed with exit code $LASTEXITCODE" }
