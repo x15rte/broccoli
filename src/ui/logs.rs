@@ -171,9 +171,9 @@ struct RowCursor {
 /// can evict or rotate entries between rebuilds, so it cannot borrow from
 /// the buffer.
 /// `PartialEq` backs the selection-survival check in
-/// [`LogsScreen::refresh_view`]: on the full-rebuild path, whether the
-/// rebuilt rows keep the cached ones as a strict prefix (only possible when
-/// evicted lines were unadmitted).
+/// [`FilteredView::refresh`]: on the full-rebuild path, whether the rebuilt
+/// rows keep the cached ones as a strict prefix (only possible when evicted
+/// lines were unadmitted).
 #[derive(PartialEq)]
 struct FilteredRow {
     /// Absolute push index of the line this row was admitted from (the ring's
@@ -211,18 +211,51 @@ struct ViewKey {
     clear_after_generation: Option<u64>,
 }
 
-/// Memoized filtered view plus its layout bookkeeping:
-/// only rows intersecting the scroll viewport are laid out per frame; row
+impl ViewKey {
+    /// Whether the rows cached under this key were admitted from exactly
+    /// these filter inputs. The ring is compared as its own field: it
+    /// identifies the lines those rows cover, not a filter choice.
+    fn admits(
+        &self,
+        level: LevelFilter,
+        needle: &str,
+        clear_after_generation: Option<u64>,
+    ) -> bool {
+        self.level == level
+            && self.needle == needle
+            && self.clear_after_generation == clear_after_generation
+    }
+}
+
+/// One measured row: the height its text wrapped to and the galley that
+/// height came from. One layout yields both, and the galley is what the
+/// custom row selection does its cursor math on.
+struct RowMeasurement {
+    height: f32,
+    galley: std::sync::Arc<egui::text::Galley>,
+}
+
+/// The log view: the rows the filter admits, their measured virtualized
+/// layout, and every decision that keeps the two in step.
+///
+/// Only rows intersecting the scroll viewport are painted per frame; row
 /// heights are measured once per rebuild and re-fitted when the wrap width
 /// changes (window resize, scrollbar appearance). A re-fit is a layout pass,
-/// not a filter rebuild: it re-measures inside the retained view, so only the
-/// screen's own layout-pass counts ([`LogsScreen::show_rows`]) move. A forward
-/// refresh (pushes, with or without eviction) extends `rows` in place (see
-/// [`LogsScreen::refresh_view`]); the measured vectors then cover a prefix of
-/// `rows` — the retained prefix stays valid, and eviction truncates it — and
-/// [`LogsScreen::show_rows`] extends them with the admitted tail only.
+/// not a filter rebuild: it re-measures the retained rows, so only the
+/// screen's own layout-pass counts ([`LayoutPass`]) move. A forward refresh
+/// (pushes, with or without eviction) extends `rows` in place (see
+/// [`Self::refresh`]); the measured vectors then cover a prefix of `rows` —
+/// the retained prefix stays valid, and eviction truncates it — so
+/// [`Self::measure`] extends them with the admitted tail only.
+///
+/// The view owns that state end to end: the screen hands it the ring and the
+/// filter inputs, measures through an injected measurer and reads the paint
+/// data through [`Self::plan`].
+#[derive(Default)]
 struct FilteredView {
-    key: ViewKey,
+    /// The inputs the rows were admitted from; `None` until the first
+    /// refresh builds them.
+    key: Option<ViewKey>,
     rows: Vec<FilteredRow>,
     /// Wrapped text height per row, measured at `measured_width` with the
     /// same fonts and width the render pass uses, so painted rows always
@@ -243,6 +276,221 @@ struct FilteredView {
 }
 
 impl FilteredView {
+    /// Refresh the memoized view when its inputs — ring identity, level,
+    /// needle, clear generation — changed. A forward refresh (the ring only
+    /// took pushes, filter inputs unchanged) extends the cached rows in
+    /// place: the rows whose lines rotated out are dropped with their
+    /// measured layout, and the admitted tail is appended — so a push at a
+    /// cap costs the tail, not the ring. Anything else — a backwards or
+    /// shrinking ring, filter/level changes, clears, first build — rebuilds
+    /// the rows from scratch. The inputs are explicit; the view reads no
+    /// screen state.
+    ///
+    /// `needle` is the text filter as typed; it is matched whitespace-
+    /// trimmed and ASCII-case-insensitively, the semantics of the previous
+    /// per-frame pass. The returned decision is the observable the tests
+    /// assert: "reused", "extended by N, dropped M" or "rebuilt with N
+    /// rows", plus whether the index-keyed selection survived.
+    fn refresh(
+        &mut self,
+        logs: &VecDeque<(bool, String)>,
+        logs_generation: u64,
+        level: LevelFilter,
+        needle: &str,
+        clear_after_generation: Option<u64>,
+    ) -> RefreshOutcome {
+        let ring = RingId::of(logs, logs_generation);
+        let needle = needle.trim();
+        // The ring the cached rows were built from and whether this refresh's
+        // filter choices match that build's key, copied out so the walk below
+        // borrows no view state.
+        let cached_ring = self.key.as_ref().map(|key| key.ring);
+        let unchanged = self
+            .key
+            .as_ref()
+            .is_some_and(|key| key.admits(level, needle, clear_after_generation));
+        // Idle frames — nothing about the filter inputs changed — reuse the
+        // cached view and keep the index-keyed custom selection intact.
+        if cached_ring == Some(ring) && unchanged {
+            return RefreshOutcome::Reused;
+        }
+        // Forward refresh: the ring's push counter advanced and the
+        // level/needle/clear inputs are unchanged, so the cached rows are
+        // still the new view's rows minus the ones whose lines left the
+        // ring, followed by the unexamined tail. Drop the departed rows
+        // (their measured heights, galleys and prefix sums with them, so the
+        // retained layout stays index-aligned) and admit the tail; the
+        // clear anchor is positional and unchanged, so no tail line can be
+        // hidden by it. The push counter is the watermark: every line with a
+        // sequence below the ring's front is gone, and the cached key's
+        // counter is the first line this view has not examined.
+        let forward = cached_ring.filter(|prev| ring.extends_from(*prev));
+        if unchanged && let Some(previous) = forward {
+            let front = ring.front();
+            let dropped = self.drop_departed_rows(front);
+            // `max` covers the ring having rotated past the view's watermark
+            // (the Logs screen was not painted while lines streamed): those
+            // lines are gone, so the walk starts at the oldest survivor.
+            let from = previous.generation.max(front);
+            let mut admitted = 0;
+            for (offset, (from_core, line)) in logs.iter().enumerate().skip((from - front) as usize)
+            {
+                let seq = front + offset as u64;
+                if seq >= ring.generation {
+                    break;
+                }
+                let row_level = line_level(line);
+                if passes(level, row_level) && contains_ascii_case_insensitive(line, needle) {
+                    self.rows.push(FilteredRow {
+                        seq,
+                        from_core: *from_core,
+                        level: row_level,
+                        line: line.clone(),
+                    });
+                    admitted += 1;
+                }
+            }
+            // The retained rows now cover the ring; the filter choices in the
+            // key are the ones this refresh was called with.
+            if let Some(key) = self.key.as_mut() {
+                key.ring = ring;
+            }
+            return RefreshOutcome::Extended {
+                admitted,
+                dropped,
+                selection_survives: dropped == 0,
+            };
+        }
+        // Full rebuild. The clear anchor only matters here: it is positional,
+        // and idle frames never reach this point. Lines pushed at or before
+        // the clear generation are "old" and sit at the ring's front; the
+        // retained lines pushed after Clear are exactly the tail of length
+        // `generation - clear` (eviction is oldest-first, so a retained new
+        // line can never be preceded by an evicted old one). Hiding that
+        // front prefix hides every old line and nothing new.
+        let mut start = 0;
+        if let Some(clear_gen) = clear_after_generation {
+            let pushed = logs_generation.saturating_sub(clear_gen) as usize;
+            start = start.max(logs.len().saturating_sub(pushed));
+        }
+        let mut rows = Vec::new();
+        for (offset, (from_core, line)) in logs.iter().enumerate().skip(start) {
+            let row_level = line_level(line);
+            if passes(level, row_level) && contains_ascii_case_insensitive(line, needle) {
+                rows.push(FilteredRow {
+                    seq: ring.front() + offset as u64,
+                    from_core: *from_core,
+                    level: row_level,
+                    line: line.clone(),
+                });
+            }
+        }
+        // A pure append (new lines only) keeps the old rows as a strict
+        // prefix, so index-keyed selection stays valid — a line arriving
+        // mid-drag in a live session must not silently move the selection
+        // (and the copy action) onto other rows. Rotation, filter changes
+        // and clears shift indices and drop the selection. (The append-only
+        // case itself is handled above; this prefix check only decides
+        // whether an eviction of unadmitted lines left the indices alone.)
+        let selection_survives = self.key.is_some()
+            && self.rows.len() < rows.len()
+            && self.rows.iter().zip(&rows).all(|(old, new)| old == new);
+        // A rebuild replaces every measured row: the fresh rows start
+        // unmeasured.
+        self.rows = rows;
+        self.heights.clear();
+        self.galleys.clear();
+        self.prefix.clear();
+        self.measured_width = 0.0;
+        self.spacing_y = 0.0;
+        self.key = Some(ViewKey {
+            ring,
+            level,
+            needle: needle.to_owned(),
+            clear_after_generation,
+        });
+        RefreshOutcome::Rebuilt {
+            rows: self.rows.len(),
+            selection_survives,
+        }
+    }
+
+    /// Lay the rows out at `width` with `spacing_y`, measuring through
+    /// `measurer`: every row when `refit` (a fresh build, or a re-fit at a new
+    /// width or spacing), otherwise only the rows no measurement reaches yet
+    /// — a forward refresh's admitted tail — with the retained prefix keeping
+    /// its measurements and its prefix sums extended past the tail.
+    /// `measurer` runs one layout per row and yields that row's height and
+    /// galley: the screen backs it with the egui font set, a test with fixed
+    /// heights, so the layout is exercisable without a `Ui`.
+    ///
+    /// Returns what the pass measured: [`LayoutPass::None`] when every row
+    /// already has a measurement at this width.
+    fn measure(
+        &mut self,
+        width: f32,
+        spacing_y: f32,
+        refit: bool,
+        measurer: &mut dyn FnMut(&str, f32) -> RowMeasurement,
+    ) -> LayoutPass {
+        if !refit && self.heights.len() == self.rows.len() {
+            return LayoutPass::None;
+        }
+        let first_unmeasured = if refit { 0 } else { self.heights.len() };
+        let mut heights = Vec::with_capacity(self.rows.len() - first_unmeasured);
+        let mut galleys = Vec::with_capacity(self.rows.len() - first_unmeasured);
+        for row in &self.rows[first_unmeasured..] {
+            let measured = measurer(&row.line, width);
+            heights.push(measured.height);
+            galleys.push(measured.galley);
+        }
+        let pass = if first_unmeasured == 0 {
+            self.heights = heights;
+            self.galleys = galleys;
+            let mut prefix = Vec::with_capacity(self.heights.len() + 1);
+            let mut y = 0.0;
+            prefix.push(0.0);
+            for &height in &self.heights {
+                y += height + spacing_y;
+                prefix.push(y);
+            }
+            self.prefix = prefix;
+            LayoutPass::Full {
+                rows: self.rows.len(),
+            }
+        } else {
+            self.heights.extend(heights);
+            self.galleys.extend(galleys);
+            // Extend the retained prefix sums past the measured tail.
+            let mut y = self.prefix[self.prefix.len() - 1];
+            for &height in &self.heights[first_unmeasured..] {
+                y += height + spacing_y;
+                self.prefix.push(y);
+            }
+            LayoutPass::Tail {
+                rows: self.rows.len() - first_unmeasured,
+            }
+        };
+        self.measured_width = width;
+        self.spacing_y = spacing_y;
+        pass
+    }
+
+    /// The paint data of the measured layout: the admitted rows, their
+    /// heights, y offsets (prefix sums) and galleys behind one accessor, so
+    /// the paint path reads the layout instead of indexing the view's
+    /// fields.
+    fn plan(&self) -> PaintPlan<'_> {
+        PaintPlan {
+            rows: &self.rows,
+            heights: &self.heights,
+            galleys: &self.galleys,
+            prefix: &self.prefix,
+            measured_width: self.measured_width,
+            spacing_y: self.spacing_y,
+        }
+    }
+
     /// Drop the rows whose lines left the ring, keeping the measured layout
     /// index-aligned with the survivors: each dropped row takes its height,
     /// galley and prefix-sum entry with it, and the retained prefix sums are
@@ -272,6 +520,101 @@ impl FilteredView {
     }
 }
 
+/// The view's paint data: the admitted rows, their measured heights, the
+/// prefix sums that place them and the galleys the row selection's cursor
+/// math runs on. Borrowed from the view, so the paint path reads one
+/// accessor instead of the view's fields.
+///
+/// Heights, galleys and offsets cover the rows the last layout pass reached;
+/// a refresh that admitted a tail no pass has measured yet leaves `rows`
+/// longer than those vectors (the paint path measures first, see
+/// [`FilteredView::measure`]).
+#[derive(Clone, Copy)]
+struct PaintPlan<'a> {
+    rows: &'a [FilteredRow],
+    heights: &'a [f32],
+    galleys: &'a [std::sync::Arc<egui::text::Galley>],
+    /// Prefix sums of the row slots (see [`Self::offsets`]).
+    prefix: &'a [f32],
+    measured_width: f32,
+    spacing_y: f32,
+}
+
+impl<'a> PaintPlan<'a> {
+    /// The admitted rows, in push order.
+    fn rows(&self) -> &'a [FilteredRow] {
+        self.rows
+    }
+
+    /// Wrapped text height per row, measured at the layout's content width.
+    fn heights(&self) -> &'a [f32] {
+        self.heights
+    }
+
+    /// The galleys the heights were measured into, for the custom row
+    /// selection's cursor math.
+    fn galleys(&self) -> &'a [std::sync::Arc<egui::text::Galley>] {
+        self.galleys
+    }
+
+    /// Prefix sums of the row slots: `offsets()[i]` is row `i`'s y-offset in
+    /// content coordinates, `offsets()[rows().len()]` the total content
+    /// height including the trailing item spacing.
+    fn offsets(&self) -> &'a [f32] {
+        self.prefix
+    }
+
+    /// Content width the heights were measured at; zero while unmeasured.
+    /// The paint path only reads the slots it paints, so this accessor is
+    /// the tests': it pins the coalesced re-fit at a settled width.
+    #[cfg(test)]
+    fn measured_width(&self) -> f32 {
+        self.measured_width
+    }
+
+    /// Total content height for the scrollbar range and stick-to-bottom: the
+    /// last offset with the trailing slot's spacing trimmed, matching egui's
+    /// own layout. Zero while the rows are unmeasured.
+    fn content_height(&self) -> f32 {
+        let total = self.prefix.get(self.rows.len()).copied().unwrap_or(0.0);
+        (total - self.spacing_y).max(0.0)
+    }
+
+    /// Rows whose slots (prefix sums) intersect the viewport band, in content
+    /// coordinates.
+    fn visible_band(&self, viewport_min_y: f32, viewport_max_y: f32) -> std::ops::Range<usize> {
+        visible_band(self.prefix, self.heights, viewport_min_y, viewport_max_y)
+    }
+
+    /// How the measurement in hand relates to a frame's width and item
+    /// spacing. The caller picks the response: an unmeasured layout must be
+    /// measured before it can paint, a width change may wait for the width to
+    /// hold still (see [`REFIT_EPSILON`]), a current one measures nothing.
+    fn staleness(&self, width: f32, spacing_y: f32) -> Staleness {
+        if self.heights.is_empty() || self.spacing_y != spacing_y {
+            Staleness::Unmeasured
+        } else if (self.measured_width - width).abs() > REFIT_EPSILON {
+            Staleness::Width
+        } else {
+            Staleness::Current
+        }
+    }
+}
+
+/// How a [`PaintPlan`]'s measurement relates to the frame's own layout
+/// inputs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Staleness {
+    /// Nothing measured yet, or measured at a different item spacing: the
+    /// rows cannot paint as they are and are measured immediately.
+    Unmeasured,
+    /// Measured at a different wrap width: the re-fit may be deferred until
+    /// the width holds still within [`REFIT_EPSILON`].
+    Width,
+    /// Measured at this width and spacing.
+    Current,
+}
+
 pub struct LogsScreen {
     level: LevelFilter,
     text: String,
@@ -291,10 +634,11 @@ pub struct LogsScreen {
     /// none is in flight).
     pending_logger_request: Request<Result<(), DiagError>>,
     logger_restart_feedback: Option<(bool, String)>,
-    /// Memoized filtered view: rebuilt only when the ring identity, level,
-    /// needle, or clear generation change — never per frame; a forward
-    /// refresh extends it in place.
-    view: Option<FilteredView>,
+    /// The log view: the rows admitted by the filter plus their measured
+    /// layout, refreshed only when the ring identity, level, needle, or clear
+    /// generation change — never per frame; a forward refresh extends it in
+    /// place.
+    view: FilteredView,
     /// Custom log-row selection (see [`RowSelection`]); cleared when the
     /// filtered view rebuilds, because the row indices shift.
     rows_selection: RowSelection,
@@ -344,6 +688,22 @@ enum RefreshOutcome {
 }
 
 impl RefreshOutcome {
+    /// Whether the index-keyed selection still addresses the same rows after
+    /// this refresh: a reuse changes nothing, an extension only when it
+    /// dropped no admitted row, a rebuild only when the rebuilt rows keep the
+    /// cached ones as a strict prefix.
+    fn selection_survives(&self) -> bool {
+        match self {
+            Self::Reused => true,
+            Self::Extended {
+                selection_survives, ..
+            }
+            | Self::Rebuilt {
+                selection_survives, ..
+            } => *selection_survives,
+        }
+    }
+
     /// Whether the refresh did any work (rebuilt or extended). Idle frames
     /// answer false. The screen renders whatever the view holds either way,
     /// so only the tests ask — they read "the view changed" off the decision
@@ -401,7 +761,7 @@ impl Default for LogsScreen {
             last_error: None,
             pending_logger_request: Request::default(),
             logger_restart_feedback: None,
-            view: None,
+            view: FilteredView::default(),
             rows_selection: RowSelection::default(),
             line_count: None,
             pending_refit: None,
@@ -465,7 +825,7 @@ impl LogsScreen {
             ui.separator();
             if ui.button(t(lang, Key::LogsCopyAll)).clicked() {
                 let mut joined = String::new();
-                for row in self.view.iter().flat_map(|view| &view.rows) {
+                for row in self.view.plan().rows() {
                     if !joined.is_empty() {
                         joined.push('\n');
                     }
@@ -538,7 +898,7 @@ impl LogsScreen {
             );
         }
 
-        let visible_count = self.view.as_ref().map_or(0, |view| view.rows.len());
+        let visible_count = self.view.plan().rows().len();
         // Memoized "N of M lines" caption: formatted only when
         // the visible/total counts or the language moved, never per painted
         // frame. The label borrows the cached text.
@@ -566,153 +926,75 @@ impl LogsScreen {
             .show_viewport(ui, |ui, viewport| self.show_rows(ui, viewport, lang));
     }
 
-    /// Refresh the memoized filtered view when its inputs — ring identity,
-    /// level, needle, clear generation — changed. A forward refresh (the ring
-    /// only took pushes, filter inputs unchanged) extends the cached rows in
-    /// place: the rows whose lines rotated out are dropped with their measured
-    /// layout, and the admitted tail is appended — so a push at a cap costs
-    /// the tail, not the ring. Anything else — a backwards or shrinking ring,
-    /// filter/level changes, clears, first build — rebuilds the rows from
-    /// scratch.
+    /// The screen's door to the view's refresh: it hands the view the ring and
+    /// the current filter controls, then applies the decision to the screen's
+    /// own state — the index-keyed selection survives only when no admitted
+    /// row moved, and a rebuild discards a deferred width re-fit (the fresh
+    /// rows are unmeasured and are laid out at the current width immediately).
     ///
-    /// The returned decision is the observable the tests assert: "reused",
-    /// "extended by N, dropped M" or "rebuilt with N rows", plus whether the
-    /// index-keyed selection survived.
+    /// The returned decision is the observable the tests assert; the render
+    /// path paints whatever the view holds either way.
     fn refresh_view(
         &mut self,
         logs: &VecDeque<(bool, String)>,
         logs_generation: u64,
     ) -> RefreshOutcome {
-        let ring = RingId::of(logs, logs_generation);
-        let needle = self.text.trim();
-        // Idle frames — nothing about the filter inputs changed — reuse the
-        // cached view and keep the index-keyed custom selection intact. The
-        // key fields are compared in place, so no key is allocated per
-        // frame.
-        if self.view.as_ref().is_some_and(|view| {
-            view.key.ring == ring
-                && view.key.level == self.level
-                && view.key.needle == needle
-                && view.key.clear_after_generation == self.clear_after_generation
-        }) {
-            self.last_refresh = RefreshOutcome::Reused;
-            return self.last_refresh;
-        }
-        // Forward refresh: the ring's push counter advanced and the
-        // level/needle/clear inputs are unchanged, so the cached rows are
-        // still the new view's rows minus the ones whose lines left the
-        // ring, followed by the unexamined tail. Drop the departed rows
-        // (their measured heights, galleys and prefix sums with them, so the
-        // retained layout stays index-aligned) and admit the tail; the
-        // clear anchor is positional and unchanged, so no tail line can be
-        // hidden by it. The push counter is the watermark: every line with a
-        // sequence below the ring's front is gone, and the cached key's
-        // counter is the first line this view has not examined.
-        if let Some(view) = self.view.as_mut()
-            && ring.extends_from(view.key.ring)
-            && view.key.level == self.level
-            && view.key.needle == needle
-            && view.key.clear_after_generation == self.clear_after_generation
-        {
-            let front = ring.front();
-            let dropped = view.drop_departed_rows(front);
-            let mut admitted = 0;
-            if dropped > 0 {
-                // Evicted lines the view had admitted shift every later
-                // row's index, so the index-keyed selection (and the copy
-                // action it drives) must go. A refresh that dropped only
-                // unadmitted lines leaves the indices alone and keeps it.
-                self.rows_selection = RowSelection::default();
-            }
-            // `max` covers the ring having rotated past the view's watermark
-            // (the Logs screen was not painted while lines streamed): those
-            // lines are gone, so the walk starts at the oldest survivor.
-            let from = view.key.ring.generation.max(front);
-            for (offset, (from_core, line)) in logs.iter().enumerate().skip((from - front) as usize)
-            {
-                let seq = front + offset as u64;
-                if seq >= ring.generation {
-                    break;
-                }
-                let level = line_level(line);
-                if passes(self.level, level) && contains_ascii_case_insensitive(line, needle) {
-                    view.rows.push(FilteredRow {
-                        seq,
-                        from_core: *from_core,
-                        level,
-                        line: line.clone(),
-                    });
-                    admitted += 1;
-                }
-            }
-            view.key.ring = ring;
-            self.last_refresh = RefreshOutcome::Extended {
-                admitted,
-                dropped,
-                selection_survives: dropped == 0,
-            };
-            return self.last_refresh;
-        }
-        // Full rebuild. The clear anchor only matters here: it is positional,
-        // and idle frames never reach this point. Lines pushed at or before
-        // the clear generation are "old" and sit at the ring's front; the
-        // retained lines pushed after Clear are exactly the tail of length
-        // `generation - clear` (eviction is oldest-first, so a retained new
-        // line can never be preceded by an evicted old one). Hiding that
-        // front prefix hides every old line and nothing new.
-        let mut start = 0;
-        if let Some(clear_gen) = self.clear_after_generation {
-            let pushed = logs_generation.saturating_sub(clear_gen) as usize;
-            start = start.max(logs.len().saturating_sub(pushed));
-        }
-        let mut rows = Vec::new();
-        for (offset, (from_core, line)) in logs.iter().enumerate().skip(start) {
-            let level = line_level(line);
-            if passes(self.level, level) && contains_ascii_case_insensitive(line, needle) {
-                rows.push(FilteredRow {
-                    seq: ring.front() + offset as u64,
-                    from_core: *from_core,
-                    level,
-                    line: line.clone(),
-                });
-            }
-        }
-        // A pure append (new lines only) keeps the old rows as a strict
-        // prefix, so index-keyed selection stays valid — a line arriving
-        // mid-drag in a live session must not silently move the selection
-        // (and the copy action) onto other rows. Rotation, filter changes
-        // and clears shift indices and drop the selection. (The append-only
-        // case itself is handled above; this prefix check only decides
-        // whether an eviction of unadmitted lines left the indices alone.)
-        let selection_survives = self.view.as_ref().is_some_and(|view| {
-            view.rows.len() < rows.len() && view.rows.iter().zip(&rows).all(|(old, new)| old == new)
-        });
-        if !selection_survives {
+        let outcome = self.view.refresh(
+            logs,
+            logs_generation,
+            self.level,
+            &self.text,
+            self.clear_after_generation,
+        );
+        if !outcome.selection_survives() {
             self.rows_selection = RowSelection::default();
         }
-        // A rebuild replaces every measured row: a width re-fit pending
-        // from before the rebuild is stale (the fresh view starts
-        // unmeasured and is laid out at the current width immediately).
-        self.pending_refit = None;
-        self.view = Some(FilteredView {
-            key: ViewKey {
-                ring,
-                level: self.level,
-                needle: needle.to_owned(),
-                clear_after_generation: self.clear_after_generation,
-            },
-            rows,
-            heights: Vec::new(),
-            galleys: Vec::new(),
-            measured_width: 0.0,
-            spacing_y: 0.0,
-            prefix: Vec::new(),
+        if matches!(outcome, RefreshOutcome::Rebuilt { .. }) {
+            self.pending_refit = None;
+        }
+        self.last_refresh = outcome;
+        outcome
+    }
+
+    /// Whether a re-fit may run now at `width`. The settle tracker is the
+    /// screen's, not the view's: the clock and the repaint request are the
+    /// frame's. A candidate width must hold still within [`REFIT_EPSILON`] for
+    /// [`REFIT_SETTLE_SECS`]; a width that moves on replaces the candidate, so
+    /// a streaming drag re-fits only once, at its final width.
+    fn width_settled(&mut self, ui: &Ui, width: f32) -> bool {
+        let now = ui.input(|i| i.time);
+        let settled = self.pending_refit.as_ref().is_some_and(|pending| {
+            (pending.width - width).abs() <= REFIT_EPSILON
+                && now - pending.since >= REFIT_SETTLE_SECS
         });
-        self.last_refresh = RefreshOutcome::Rebuilt {
-            rows: self.view.as_ref().map_or(0, |view| view.rows.len()),
-            selection_survives,
-        };
-        self.last_refresh
+        if settled {
+            self.pending_refit = None;
+            return true;
+        }
+        if self
+            .pending_refit
+            .as_ref()
+            .is_none_or(|pending| (pending.width - width).abs() > REFIT_EPSILON)
+        {
+            self.pending_refit = Some(PendingRefit { width, since: now });
+        }
+        // Arm a frame at the settle deadline so the re-fit is not starved in
+        // reactive repaint mode.
+        if let Some(pending) = &self.pending_refit {
+            let remaining = REFIT_SETTLE_SECS - (now - pending.since);
+            if remaining > 0.0 {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+            }
+        }
+        false
+    }
+
+    /// The view's paint data, for the tests: the same accessor the paint path
+    /// reads the layout with.
+    #[cfg(test)]
+    fn plan(&self) -> PaintPlan<'_> {
+        self.view.plan()
     }
 
     /// Virtualized rendering: only the rows intersecting `viewport` (content
@@ -722,140 +1004,65 @@ impl LogsScreen {
     /// spacing changes; a forward refresh lays out only its admitted tail.
     /// Both are layout passes, not filter rebuilds.
     fn show_rows(&mut self, ui: &mut Ui, viewport: egui::Rect, lang: Language) {
-        // The re-fit decision and its settle tracker must run before `view`
-        // is borrowed mutably below: `pending_refit` updates
-        // are field-local, so they compose with the shared `view` read.
-        let Some(view_snapshot) = self.view.as_ref() else {
-            return;
-        };
-        if view_snapshot.rows.is_empty() {
+        // The re-fit decision reads the view's measurement state; the settle
+        // tracker below is the screen's, because its clock and repaint
+        // requests are the frame's.
+        if self.view.plan().rows().is_empty() {
             return;
         }
         let available_width = ui.available_width();
         let spacing_y = ui.spacing().item_spacing.y;
-        // One layout pass serves both the row heights and the galleys the
-        // custom row selection does its cursor math on. Laid out with the
-        // placeholder color: they are never painted — the label paints the
-        // text with the per-frame color. A full re-measure runs only when
-        // the measured width/spacing changed (a re-fit) or no rows have
-        // been measured yet (a fresh rebuild); a forward refresh leaves the
-        // cached vectors as a measured prefix of `rows`, so only the newly
-        // admitted tail is laid out here.
-        //
         // Width re-fits are coalesced: a window drag streams
         // the available width at frame rate, and a full re-measure lays
         // out every filtered row (up to the full ring cap) — re-fitting
-        // per frame turned a drag into several full-ring re-layouts. An
-        // already-measured layout re-fits only once the width has held
-        // still within [`REFIT_EPSILON`] for [`REFIT_SETTLE_SECS`], so a
-        // drag performs at most one full re-layout, at its final width. A
-        // fresh rebuild's layout is never deferred (nothing would paint),
+        // per frame turned a drag into several full-ring re-layouts. Only a
+        // layout measured at another width re-fits, and only once that width
+        // has held still within [`REFIT_EPSILON`] for [`REFIT_SETTLE_SECS`],
+        // so a drag performs at most one full re-layout, at its final width.
+        // A fresh rebuild's layout is never deferred (nothing would paint),
         // and spacing changes (style-level, never streaming) re-fit
         // immediately.
-        let refit = if view_snapshot.heights.is_empty() || view_snapshot.spacing_y != spacing_y {
-            true
-        } else if (view_snapshot.measured_width - available_width).abs() > REFIT_EPSILON {
-            // The layout is stale and the width may still be streaming:
-            // run the settle tracker (field-local updates).
-            let now = ui.input(|i| i.time);
-            let settled = self.pending_refit.as_ref().is_some_and(|pending| {
-                (pending.width - available_width).abs() <= REFIT_EPSILON
-                    && now - pending.since >= REFIT_SETTLE_SECS
-            });
-            if settled {
+        let staleness = self.view.plan().staleness(available_width, spacing_y);
+        let refit = match staleness {
+            Staleness::Unmeasured => true,
+            Staleness::Width => self.width_settled(ui, available_width),
+            Staleness::Current => {
+                // The layout is current (sub-epsilon drift): drop any stale
+                // settle candidate.
                 self.pending_refit = None;
-                true
-            } else {
-                if self
-                    .pending_refit
-                    .as_ref()
-                    .is_none_or(|pending| (pending.width - available_width).abs() > REFIT_EPSILON)
-                {
-                    self.pending_refit = Some(PendingRefit {
-                        width: available_width,
-                        since: now,
-                    });
-                }
-                // Arm a frame at the settle deadline so the re-fit is not
-                // starved in reactive repaint mode.
-                if let Some(pending) = &self.pending_refit {
-                    let remaining = REFIT_SETTLE_SECS - (now - pending.since);
-                    if remaining > 0.0 {
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
-                    }
-                }
                 false
             }
-        } else {
-            // The layout is current (sub-epsilon drift): drop any stale
-            // settle candidate.
-            self.pending_refit = None;
-            false
         };
-        let Some(view) = &mut self.view else { return };
-        let mut pass = LayoutPass::None;
-        if refit || view.heights.len() != view.rows.len() {
-            let font_id = TextStyle::Monospace.resolve(ui.style());
-            let first_unmeasured = if refit || view.heights.is_empty() {
-                0
-            } else {
-                view.heights.len()
-            };
-            let mut heights = Vec::with_capacity(view.rows.len() - first_unmeasured);
-            let mut galleys = Vec::with_capacity(view.rows.len() - first_unmeasured);
-            for row in &view.rows[first_unmeasured..] {
-                let galley = ui.ctx().fonts_mut(|fonts| {
-                    fonts.layout(
-                        row.line.clone(),
-                        font_id.clone(),
-                        Color32::PLACEHOLDER,
-                        available_width,
-                    )
-                });
-                let height = galley.rect.height();
-                heights.push(height);
-                galleys.push(galley);
+        // The measurer is the screen's half of the layout seam: one layout
+        // serves both the row height and the galley the custom row selection
+        // does its cursor math on. A pass measures every row when `refit`,
+        // and otherwise only the rows a refresh admitted that no pass has
+        // reached; galleys are never painted (the label paints the text with
+        // the per-frame color), so they are laid out with the placeholder
+        // color.
+        let font_id = TextStyle::Monospace.resolve(ui.style());
+        let mut measurer = |text: &str, wrap_width: f32| {
+            let galley = ui.ctx().fonts_mut(|fonts| {
+                fonts.layout(
+                    text.to_owned(),
+                    font_id.clone(),
+                    Color32::PLACEHOLDER,
+                    wrap_width,
+                )
+            });
+            RowMeasurement {
+                height: galley.rect.height(),
+                galley,
             }
-            if first_unmeasured == 0 {
-                view.heights = heights;
-                view.galleys = galleys;
-                pass = LayoutPass::Full {
-                    rows: view.rows.len(),
-                };
-            } else {
-                view.heights.extend(heights);
-                view.galleys.extend(galleys);
-                pass = LayoutPass::Tail {
-                    rows: view.rows.len() - first_unmeasured,
-                };
-            }
-            view.measured_width = available_width;
-            view.spacing_y = spacing_y;
-            if first_unmeasured == 0 {
-                let mut prefix = Vec::with_capacity(view.heights.len() + 1);
-                let mut y = 0.0;
-                prefix.push(0.0);
-                for &height in &view.heights {
-                    y += height + spacing_y;
-                    prefix.push(y);
-                }
-                view.prefix = prefix;
-            } else {
-                // Extend the retained prefix sums past the measured tail.
-                let mut y = view.prefix[view.prefix.len() - 1];
-                for &height in &view.heights[first_unmeasured..] {
-                    y += height + spacing_y;
-                    view.prefix.push(y);
-                }
-            }
-        }
-        self.last_layout = pass;
-        let rows = view.rows.len();
+        };
+        self.last_layout = self
+            .view
+            .measure(available_width, spacing_y, refit, &mut measurer);
+        let plan = self.view.plan();
         // Content height for the scrollbar range and stick-to-bottom; the
         // trailing slot's spacing is trimmed, matching egui's own layout.
-        ui.set_height((view.prefix[rows] - view.spacing_y).max(0.0));
-        let band = visible_band(&view.prefix, &view.heights, viewport.min.y, viewport.max.y);
+        ui.set_height(plan.content_height());
+        let band = plan.visible_band(viewport.min.y, viewport.max.y);
         if band.start >= band.end {
             return;
         }
@@ -867,8 +1074,8 @@ impl LogsScreen {
         // the offset and inflate the measured content height.
         let band_rect = egui::Rect::from_x_y_ranges(
             ui.max_rect().x_range(),
-            ui.max_rect().top() + view.prefix[band.start]
-                ..=ui.max_rect().top() + view.prefix[band.end],
+            ui.max_rect().top() + plan.offsets()[band.start]
+                ..=ui.max_rect().top() + plan.offsets()[band.end],
         );
         // Screen rect per visible row, for the selection widget and the
         // press-elsewhere deselect.
@@ -878,9 +1085,9 @@ impl LogsScreen {
                 egui::Rect::from_min_size(
                     egui::pos2(
                         band_rect.left(),
-                        band_rect.top() + view.prefix[index] - view.prefix[band.start],
+                        band_rect.top() + plan.offsets()[index] - plan.offsets()[band.start],
                     ),
-                    egui::vec2(band_rect.width(), view.heights[index]),
+                    egui::vec2(band_rect.width(), plan.heights()[index]),
                 )
             })
             .collect();
@@ -919,9 +1126,9 @@ impl LogsScreen {
                         .any(|event| matches!(event, egui::Event::Copy))
                 });
             for (slot, index) in band.enumerate() {
-                let row = &view.rows[index];
+                let row = &plan.rows()[index];
                 let row_rect = rects[slot];
-                let galley = &view.galleys[index];
+                let galley = &plan.galleys()[index];
                 let color = line_color(row.from_core, row.level, dark);
                 // Selection highlight, painted under the label.
                 if let Some((start, end)) = Self::selection_range(selection, index, &row.line) {
@@ -1011,7 +1218,7 @@ impl LogsScreen {
             }
             self.rows_selection = selection;
             if copy_requested {
-                let text = Self::selection_text(selection, &view.rows);
+                let text = Self::selection_text(selection, plan.rows());
                 if !text.is_empty() {
                     ui.ctx().copy_text(text);
                 }
@@ -1157,8 +1364,8 @@ mod tests {
 
     /// Push one line exactly like the app's `LogBuffer::push`:
     /// every push advances the ring's monotonic generation — the identity
-    /// the memoized filtered view is keyed on. Direct-ring tests below must
-    /// route their pushes through this helper, or `refresh_view` would see
+    /// the memoized view is keyed on. Direct-ring tests below must route
+    /// their pushes through this helper, or the view's `refresh` would see
     /// an unchanged ring and keep a stale view.
     fn push_line(
         logs: &mut VecDeque<(bool, String)>,
@@ -1168,6 +1375,30 @@ mod tests {
     ) {
         *generation += 1;
         logs.push_back((from_core, line.to_string()));
+    }
+
+    /// A warmed headless font set: laying a galley out needs a completed
+    /// pass. The view's layout seam takes its measurer as an argument, so a
+    /// test can measure with this and no `Ui`.
+    fn warmed_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        ctx
+    }
+
+    /// A real galley from a warmed font set, for measurers that pin the
+    /// height themselves.
+    fn galley_of(ctx: &egui::Context, text: &str) -> std::sync::Arc<egui::text::Galley> {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.to_owned(),
+                egui::FontId::default(),
+                egui::Color32::PLACEHOLDER,
+                100.0,
+            )
+        })
     }
 
     /// User report: after [Clear view], newly arrived log lines were hidden
@@ -1260,7 +1491,7 @@ mod tests {
         screen.clear_after_generation = Some(generation);
         assert!(screen.refresh_view(&logs, generation).changed());
         assert!(
-            screen.view.as_ref().unwrap().rows.is_empty(),
+            screen.plan().rows().is_empty(),
             "Clear view must hide every line present at press time"
         );
     }
@@ -1282,14 +1513,14 @@ mod tests {
         // Clear pressed now, generation 3.
         screen.clear_after_generation = Some(generation);
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert!(screen.view.as_ref().unwrap().rows.is_empty());
+        assert!(screen.plan().rows().is_empty());
         // New lines arrive, including another textually identical
         // "status ok".
         push_line(&mut logs, &mut generation, false, "[Info] fresh A");
         push_line(&mut logs, &mut generation, false, "[Info] status ok");
         push_line(&mut logs, &mut generation, false, "[Info] fresh B");
         assert!(screen.refresh_view(&logs, generation).changed());
-        let rows = &screen.view.as_ref().unwrap().rows;
+        let rows = screen.plan().rows();
         assert_eq!(
             rows.iter().map(|row| row.line.as_str()).collect::<Vec<_>>(),
             ["[Info] fresh A", "[Info] status ok", "[Info] fresh B"]
@@ -1453,7 +1684,7 @@ mod tests {
             "2026/08/10 12:00:00.123 [Info] connected",
         );
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(screen.plan().rows().len(), 1);
         assert!(!screen.refresh_view(&logs, generation).changed());
 
         // Filter text change → exactly one rebuild, then stable.
@@ -1465,7 +1696,7 @@ mod tests {
         screen.text.clear();
         screen.level = LevelFilter::WarningPlus;
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert!(screen.view.as_ref().unwrap().rows.is_empty());
+        assert!(screen.plan().rows().is_empty());
 
         // Clear-view generation → one rebuild; rows through the clear point
         // hidden.
@@ -1479,7 +1710,7 @@ mod tests {
         assert!(screen.refresh_view(&logs, generation).changed());
         screen.clear_after_generation = Some(generation);
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert!(screen.view.as_ref().unwrap().rows.is_empty());
+        assert!(screen.plan().rows().is_empty());
         // The pre-clear lines rotate out entirely; the positional anchor
         // survives the rotation and self-corrects to "show everything" —
         // no old line remains to hide. One rebuild per ring change.
@@ -1498,9 +1729,9 @@ mod tests {
             Some(2),
             "the clear anchor survives full rotation"
         );
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(screen.plan().rows().len(), 1);
         assert_eq!(
-            screen.view.as_ref().unwrap().rows[0].line,
+            screen.plan().rows()[0].line,
             "2026/08/10 12:00:02.000 [Error] fail"
         );
     }
@@ -1596,35 +1827,24 @@ mod tests {
                 &format!("2026/08/10 12:00:0{index}.000 [Info] line {index}"),
             );
         }
-        let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation).changed());
+        let mut view = FilteredView::default();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
         // Simulate a measured frame over the four admitted rows: heights,
-        // galleys and prefix sums cover the same prefix, as `show_rows`
-        // leaves them.
-        let ctx = egui::Context::default();
-        ctx.set_fonts(egui::FontDefinitions::default());
-        // Fonts are only usable after a pass has run, and the seam test needs
-        // galleys to hand the view as its measured prefix.
-        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
-        output.textures_delta.clear();
-        let galley = |text: &str| {
-            ctx.fonts_mut(|fonts| {
-                fonts.layout(
-                    text.to_owned(),
-                    egui::FontId::default(),
-                    egui::Color32::PLACEHOLDER,
-                    100.0,
-                )
-            })
+        // galleys and prefix sums cover the same prefix a painted frame
+        // leaves them at. The layout seam takes the measurer, so the fixed
+        // heights need no `Ui`.
+        let ctx = warmed_ctx();
+        let mut fixed = |_: &str, _: f32| RowMeasurement {
+            height: 10.0,
+            galley: galley_of(&ctx, "line 0"),
         };
-        {
-            let view = screen.view.as_mut().unwrap();
-            view.heights = vec![10.0; CAP];
-            view.galleys = (0..CAP)
-                .map(|index| galley(&format!("line {index}")))
-                .collect();
-            view.prefix = vec![0.0, 10.0, 20.0, 30.0, 40.0];
-        }
+        assert_eq!(
+            view.measure(100.0, 0.0, true, &mut fixed),
+            LayoutPass::Full { rows: CAP }
+        );
 
         // Two arrivals, two evictions: the ring stays at its cap.
         push_capped(
@@ -1639,9 +1859,12 @@ mod tests {
             CAP,
             "2026/08/10 12:00:05.000 [Info] line 5",
         );
-        assert!(screen.refresh_view(&logs, generation).changed());
-        let view = screen.view.as_ref().unwrap();
-        let lines: Vec<&str> = view.rows.iter().map(|row| row.line.as_str()).collect();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let plan = view.plan();
+        let lines: Vec<&str> = plan.rows().iter().map(|row| row.line.as_str()).collect();
         assert_eq!(
             lines,
             [
@@ -1653,41 +1876,247 @@ mod tests {
             "the two evicted rows are gone and both arrivals are admitted"
         );
         assert_eq!(
-            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
             [2, 3, 4, 5],
             "each row carries the ring position of its line"
         );
         assert_eq!(
-            view.heights,
-            [10.0, 10.0],
+            plan.heights(),
+            &[10.0, 10.0],
             "the survivors keep their measurements; the tail is left to the layout pass"
         );
         assert_eq!(
-            view.prefix,
-            [0.0, 10.0, 20.0],
+            plan.offsets(),
+            &[0.0, 10.0, 20.0],
             "the prefix sums are rebased on the survivor front"
         );
 
         // The same ring state through a view with no history: the incremental
         // refresh must agree with the rebuild row for row.
-        let mut fresh = LogsScreen::default();
-        assert!(fresh.refresh_view(&logs, generation).changed());
-        let rebuilt = fresh.view.as_ref().unwrap();
+        let mut fresh = FilteredView::default();
+        assert!(
+            fresh
+                .refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let rebuilt = fresh.plan();
         assert_eq!(
             rebuilt
-                .rows
+                .rows()
                 .iter()
                 .map(|row| (row.seq, row.line.as_str()))
                 .collect::<Vec<_>>(),
-            view.rows
+            plan.rows()
                 .iter()
                 .map(|row| (row.seq, row.line.as_str()))
                 .collect::<Vec<_>>(),
         );
         assert!(
-            !screen.refresh_view(&logs, generation).changed(),
+            !view
+                .refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed(),
             "the refreshed key still makes the next idle frame a no-op"
         );
+    }
+
+    /// Admission is by push sequence: a refresh admits every surviving line
+    /// past its watermark once, in ring order — even when lines arrived and
+    /// rotated out between two refreshes, so the watermark fell behind the
+    /// ring's front. The rows are the ring's content, never a history of it,
+    /// and they agree row for row with a view built from scratch at the same
+    /// ring state.
+    #[test]
+    fn refresh_admits_only_the_surviving_tail_in_push_order() {
+        const CAP: usize = 4;
+        let mut logs = VecDeque::new();
+        let mut generation = 0u64;
+        for index in 0..CAP {
+            push_capped(
+                &mut logs,
+                &mut generation,
+                CAP,
+                &format!("2026/08/10 12:00:0{index}.000 [Info] line {index}"),
+            );
+        }
+        let mut view = FilteredView::default();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        assert_eq!(view.plan().rows().len(), CAP);
+
+        // Six arrivals at the cap, all between two refreshes: every row the
+        // first refresh had admitted is gone by the next one, so the view's
+        // watermark sits behind the ring's front.
+        for index in CAP..CAP + 6 {
+            push_capped(
+                &mut logs,
+                &mut generation,
+                CAP,
+                &format!("2026/08/10 12:00:0{index}.000 [Info] line {index}"),
+            );
+        }
+        assert_eq!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None),
+            RefreshOutcome::Extended {
+                admitted: 4,
+                dropped: 4,
+                selection_survives: false,
+            },
+            "the refresh drops every departed row and admits only the survivors"
+        );
+        assert!(
+            !view
+                .refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed(),
+            "the refreshed key still makes the next idle frame a no-op"
+        );
+
+        let plan = view.plan();
+        assert_eq!(
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [6, 7, 8, 9],
+            "rows are admitted in push order, each line once"
+        );
+        assert_eq!(
+            plan.rows()
+                .iter()
+                .map(|row| row.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026/08/10 12:00:06.000 [Info] line 6",
+                "2026/08/10 12:00:07.000 [Info] line 7",
+                "2026/08/10 12:00:08.000 [Info] line 8",
+                "2026/08/10 12:00:09.000 [Info] line 9",
+            ]
+        );
+
+        // The same ring state through a view with no history agrees.
+        let mut fresh = FilteredView::default();
+        assert!(
+            fresh
+                .refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        assert_eq!(
+            fresh
+                .plan()
+                .rows()
+                .iter()
+                .map(|row| (row.seq, row.line.as_str()))
+                .collect::<Vec<_>>(),
+            plan.rows()
+                .iter()
+                .map(|row| (row.seq, row.line.as_str()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Eviction rebases the retained measurements on the first survivor: the
+    /// departed rows take their heights and offsets with them, and the
+    /// offsets of the rows that remain start at zero again. Only the prefix
+    /// the layout actually measured is drained — a tail a refresh admitted
+    /// before the next pass never had offsets to lose.
+    #[test]
+    fn eviction_rebases_offsets_and_drains_only_the_measured_prefix() {
+        const CAP: usize = 4;
+        let mut logs = VecDeque::new();
+        let mut generation = 0u64;
+        for index in 0..CAP {
+            push_capped(
+                &mut logs,
+                &mut generation,
+                CAP,
+                &format!("2026/08/10 12:00:0{index}.000 [Info] line {index}"),
+            );
+        }
+        let mut view = FilteredView::default();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let ctx = warmed_ctx();
+        let mut fixed = |_: &str, _: f32| RowMeasurement {
+            height: 10.0,
+            galley: galley_of(&ctx, "line 0"),
+        };
+        assert_eq!(
+            view.measure(100.0, 2.0, true, &mut fixed),
+            LayoutPass::Full { rows: CAP }
+        );
+        assert_eq!(view.plan().offsets(), &[0.0, 12.0, 24.0, 36.0, 48.0]);
+
+        // Two arrivals at the cap: the two oldest rows rotate out with their
+        // measurements, and the two admitted rows have no measurement yet.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:04.000 [Info] line 4",
+        );
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:05.000 [Info] line 5",
+        );
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let plan = view.plan();
+        assert_eq!(
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(
+            plan.heights(),
+            &[10.0, 10.0],
+            "the survivors keep their measurements"
+        );
+        assert_eq!(
+            plan.offsets(),
+            &[0.0, 12.0, 24.0],
+            "the retained offsets are rebased on the survivor front"
+        );
+
+        // One more arrival: one admitted row rotates out while the tail is
+        // still unmeasured, so only that row's measurement is drained — the
+        // offsets keep placing the rows they were measured for.
+        push_capped(
+            &mut logs,
+            &mut generation,
+            CAP,
+            "2026/08/10 12:00:06.000 [Info] line 6",
+        );
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let plan = view.plan();
+        assert_eq!(
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [3, 4, 5, 6]
+        );
+        assert_eq!(
+            plan.heights(),
+            &[10.0],
+            "only the departed row's measurement went"
+        );
+        assert_eq!(plan.offsets(), &[0.0, 12.0]);
+        assert_eq!(
+            plan.staleness(100.0, 2.0),
+            Staleness::Current,
+            "a refresh leaves the retained measurements current"
+        );
+        assert_eq!(
+            view.measure(100.0, 2.0, false, &mut fixed),
+            LayoutPass::Tail { rows: 3 },
+            "the next pass measures exactly the rows the refresh admitted"
+        );
+        let plan = view.plan();
+        assert_eq!(plan.heights(), &[10.0, 10.0, 10.0, 10.0]);
+        assert_eq!(plan.offsets(), &[0.0, 12.0, 24.0, 36.0, 48.0]);
     }
 
     /// One push can evict several lines at once: the byte cap binds against a
@@ -1719,14 +2148,14 @@ mod tests {
         assert_eq!(rig.logs.len(), CAP - 2);
         run_frame(&ctx, &mut screen, &mut rig);
 
-        let view = screen.view.as_ref().unwrap();
+        let plan = screen.plan();
         assert_eq!(
-            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
             [3, 4],
             "the survivors keep their positions and the arrival is admitted"
         );
-        assert_eq!(view.rows.len(), view.heights.len());
-        assert_eq!(view.prefix.len(), view.rows.len() + 1);
+        assert_eq!(plan.rows().len(), plan.heights().len());
+        assert_eq!(plan.offsets().len(), plan.rows().len() + 1);
         assert!(
             matches!(screen.last_layout, LayoutPass::Tail { .. }),
             "a multi-line eviction must not re-measure the ring: {:?}",
@@ -1736,15 +2165,9 @@ mod tests {
         // The next arrival is a plain one-line rotation at the same length.
         push_capped_rig(&mut rig, 2, 5);
         run_frame(&ctx, &mut screen, &mut rig);
+        let plan = screen.plan();
         assert_eq!(
-            screen
-                .view
-                .as_ref()
-                .unwrap()
-                .rows
-                .iter()
-                .map(|row| row.seq)
-                .collect::<Vec<_>>(),
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
             [4, 5]
         );
         assert_eq!(
@@ -1864,16 +2287,77 @@ mod tests {
             "a rotation at the cap must not re-measure the ring: {:?}",
             screen.last_layout
         );
-        let view = screen.view.as_ref().unwrap();
+        let plan = screen.plan();
         assert_eq!(
-            view.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            plan.rows().iter().map(|row| row.seq).collect::<Vec<_>>(),
             [2, 3, 4, 5]
         );
-        assert_eq!(view.rows.len(), CAP);
-        assert_eq!(view.heights.len(), CAP, "survivors plus the admitted tail");
-        assert_eq!(view.galleys.len(), CAP);
-        assert_eq!(view.prefix.len(), CAP + 1);
-        assert_eq!(view.prefix[0], 0.0);
+        assert_eq!(plan.rows().len(), CAP);
+        assert_eq!(
+            plan.heights().len(),
+            CAP,
+            "survivors plus the admitted tail"
+        );
+        assert_eq!(plan.galleys().len(), CAP);
+        assert_eq!(plan.offsets().len(), CAP + 1);
+        assert_eq!(plan.offsets()[0], 0.0);
+    }
+
+    /// The layout seam measures through the caller's measurer, so a re-fit at
+    /// a new width is checkable without a `Ui`: measuring a different width
+    /// replaces every row's height and rebuilds the prefix sums around the
+    /// new heights. The plan reports the width it was measured at, and the
+    /// staleness the screen runs its coalesced re-fit on.
+    #[test]
+    fn measurement_at_a_changed_width_replaces_every_row_height() {
+        let mut logs = VecDeque::new();
+        let mut generation = 0u64;
+        for index in 0..3 {
+            push_line(&mut logs, &mut generation, false, &format!("line {index}"));
+        }
+        let mut view = FilteredView::default();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let ctx = warmed_ctx();
+        // Row heights scale with the wrap width, so two runs of the measurer
+        // are distinguishable row for row.
+        let mut wide = |_: &str, wrap_width: f32| RowMeasurement {
+            height: wrap_width,
+            galley: galley_of(&ctx, "line 0"),
+        };
+        assert_eq!(view.plan().staleness(100.0, 2.0), Staleness::Unmeasured);
+        assert_eq!(
+            view.measure(100.0, 2.0, true, &mut wide),
+            LayoutPass::Full { rows: 3 }
+        );
+        let plan = view.plan();
+        assert_eq!(plan.measured_width(), 100.0);
+        assert_eq!(plan.heights(), &[100.0, 100.0, 100.0]);
+        assert_eq!(plan.offsets(), &[0.0, 102.0, 204.0, 306.0]);
+        assert_eq!(plan.content_height(), 304.0);
+        assert_eq!(plan.staleness(100.0, 2.0), Staleness::Current);
+        // A different width leaves the measurement stale but paintable: the
+        // screen re-fits once the width settles. A different item spacing
+        // invalidates every row instead.
+        assert_eq!(plan.staleness(60.0, 2.0), Staleness::Width);
+        assert_eq!(plan.staleness(100.0, 4.0), Staleness::Unmeasured);
+
+        let mut narrow = |_: &str, wrap_width: f32| RowMeasurement {
+            height: wrap_width,
+            galley: galley_of(&ctx, "line 0"),
+        };
+        assert_eq!(
+            view.measure(60.0, 2.0, true, &mut narrow),
+            LayoutPass::Full { rows: 3 }
+        );
+        let plan = view.plan();
+        assert_eq!(plan.measured_width(), 60.0);
+        assert_eq!(plan.heights(), &[60.0, 60.0, 60.0]);
+        assert_eq!(plan.offsets(), &[0.0, 62.0, 124.0, 186.0]);
+        assert_eq!(plan.content_height(), 184.0);
+        assert_eq!(plan.staleness(60.0, 2.0), Staleness::Current);
     }
 
     /// Build one filtered row the way the view does, so the copy-text
@@ -2051,7 +2535,7 @@ mod tests {
         // Warm-up frame: builds the filtered view the selection indexes
         // into.
         run_frame_at(&ctx, &mut screen, &mut rig, 700.0, 1.0);
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), 3);
+        assert_eq!(screen.plan().rows().len(), 3);
 
         // A selection whose active cursor sits on the boundary past the
         // first "charlie" character (cursors are character boundaries, so
@@ -2094,7 +2578,7 @@ mod tests {
         }
         let mut screen = LogsScreen::default();
         fn rows(screen: &LogsScreen) -> &[FilteredRow] {
-            &screen.view.as_ref().unwrap().rows
+            screen.plan().rows()
         }
 
         // All: every line, including the unparseable ones.
@@ -2170,7 +2654,7 @@ mod tests {
         }
         let mut screen = LogsScreen::default();
         assert!(screen.refresh_view(&logs, generation).changed());
-        let rows = &screen.view.as_ref().unwrap().rows;
+        let rows = screen.plan().rows();
         assert_eq!(rows.len(), 2500);
         assert_eq!(rows[0].line, "line 0000");
         assert_eq!(rows[2499].line, "line 2499");
@@ -2218,27 +2702,27 @@ mod tests {
 
                 // First frame: the view is built and the virtualized layout
                 // was measured.
-                let view = screen.view.as_ref().unwrap();
-                assert_eq!(view.rows.len(), 40);
-                assert_eq!(view.heights.len(), 40);
-                assert_eq!(view.prefix.len(), 41);
-                assert!(view.measured_width > 0.0);
+                let plan = screen.plan();
+                assert_eq!(plan.rows().len(), 40);
+                assert_eq!(plan.heights().len(), 40);
+                assert_eq!(plan.offsets().len(), 41);
+                assert!(plan.measured_width() > 0.0);
 
                 // Idle second frame: no rebuild, no re-measure. A frame that
                 // re-laid the ring out would advance the screen's own
-                // layout-pass counter (a rebuild empties `heights`, which
-                // forces the full re-measure); the measured layout is
+                // layout-pass counter (a rebuild empties the measurements,
+                // which forces the full re-measure); the measured layout is
                 // untouched on top of that.
-                let (width_before, heights_before) = (view.measured_width, view.heights.len());
+                let (width_before, heights_before) = (plan.measured_width(), plan.heights().len());
                 screen.show(ui, &mut rig.ctx());
                 assert_eq!(
                     screen.last_layout,
                     LayoutPass::None,
                     "an idle frame must not re-lay-out the memoized view"
                 );
-                let view = screen.view.as_ref().unwrap();
-                assert_eq!(view.measured_width, width_before);
-                assert_eq!(view.heights.len(), heights_before);
+                let plan = screen.plan();
+                assert_eq!(plan.measured_width(), width_before);
+                assert_eq!(plan.heights().len(), heights_before);
             });
         });
         // A headless run has no renderer to apply texture deltas to; drop
@@ -2282,11 +2766,11 @@ mod tests {
         // admitted rows.
         run_frame(&ctx, &mut screen, &mut rig);
         {
-            let view = screen.view.as_ref().unwrap();
-            assert_eq!(view.rows.len(), 4);
-            assert_eq!(view.heights.len(), 4);
-            assert_eq!(view.galleys.len(), 4);
-            assert_eq!(view.prefix.len(), 5);
+            let plan = screen.plan();
+            assert_eq!(plan.rows().len(), 4);
+            assert_eq!(plan.heights().len(), 4);
+            assert_eq!(plan.galleys().len(), 4);
+            assert_eq!(plan.offsets().len(), 5);
         }
         assert_eq!(
             screen.last_layout,
@@ -2310,30 +2794,30 @@ mod tests {
         );
         run_frame(&ctx, &mut screen, &mut rig);
         {
-            let view = screen.view.as_ref().unwrap();
-            assert_eq!(view.rows.len(), 6);
-            assert_eq!(view.heights.len(), 6);
-            assert_eq!(view.galleys.len(), 6);
-            assert_eq!(view.prefix.len(), 7);
+            let plan = screen.plan();
+            assert_eq!(plan.rows().len(), 6);
+            assert_eq!(plan.heights().len(), 6);
+            assert_eq!(plan.galleys().len(), 6);
+            assert_eq!(plan.offsets().len(), 7);
             assert_eq!(
-                view.rows[4].line,
+                plan.rows()[4].line,
                 "2026/08/10 12:01:01.000 [Info] keep line 4"
             );
             assert_eq!(
-                view.rows[5].line,
+                plan.rows()[5].line,
                 "2026/08/10 12:01:02.000 [Info] keep line 5"
             );
             // Layout vectors stay index-aligned with the filtered rows: one
             // prefix entry per row plus the total, strictly increasing.
-            assert_eq!(view.prefix.len(), view.heights.len() + 1);
-            assert_eq!(view.prefix[0], 0.0);
+            assert_eq!(plan.offsets().len(), plan.heights().len() + 1);
+            assert_eq!(plan.offsets()[0], 0.0);
             assert!(
-                view.prefix
+                plan.offsets()
                     .windows(2)
                     .all(|slot| slot[1] > slot[0] && slot[1] - slot[0] > 0.0)
             );
             assert!(
-                view.heights.iter().all(|&height| height > 0.0),
+                plan.heights().iter().all(|&height| height > 0.0),
                 "the tail rows must be measured"
             );
         }
@@ -2357,12 +2841,12 @@ mod tests {
         screen.text = "noise".to_string();
         run_frame(&ctx, &mut screen, &mut rig);
         {
-            let view = screen.view.as_ref().unwrap();
-            assert_eq!(view.rows.len(), 1);
-            assert_eq!(view.rows[0].line, "2026/08/10 12:01:00.000 [Info] noise");
-            assert_eq!(view.heights.len(), 1);
-            assert_eq!(view.galleys.len(), 1);
-            assert_eq!(view.prefix.len(), 2);
+            let plan = screen.plan();
+            assert_eq!(plan.rows().len(), 1);
+            assert_eq!(plan.rows()[0].line, "2026/08/10 12:01:00.000 [Info] noise");
+            assert_eq!(plan.heights().len(), 1);
+            assert_eq!(plan.galleys().len(), 1);
+            assert_eq!(plan.offsets().len(), 2);
         }
         assert_eq!(
             screen.last_layout,
@@ -2372,10 +2856,9 @@ mod tests {
     }
 
     /// The full-rebuild paths (filter/level/clear changes,
-    /// rotation, first build) discard the measured layout vectors for a
-    /// fresh measure; only a pure append keeps them index-aligned with the
-    /// extended rows. Asserted at the refresh seam, so no UI frame is
-    /// needed.
+    /// rotation, first build) discard the measured layout for a fresh
+    /// measure; only a pure append keeps it index-aligned with the extended
+    /// rows. Asserted at the view's own seam, so no UI frame is needed.
     #[test]
     fn full_rebuild_resets_layout_vectors_but_pure_append_keeps_them() {
         let mut logs = VecDeque::new();
@@ -2392,58 +2875,80 @@ mod tests {
             false,
             "2026/08/10 12:00:01.000 [Info] line B",
         );
-        let mut screen = LogsScreen::default();
-        assert!(screen.refresh_view(&logs, generation).changed());
-        // Simulate a measured frame: the layout vectors cover the two rows.
-        let view = screen.view.as_mut().unwrap();
-        view.heights = vec![10.0, 20.0];
-        view.prefix = vec![0.0, 10.0, 30.0];
+        let mut view = FilteredView::default();
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        // Measure the two rows: the heights differ per row, so a stale
+        // vector cannot pass for a re-measured one.
+        let ctx = warmed_ctx();
+        let mut varied = |text: &str, _: f32| RowMeasurement {
+            height: if text.ends_with("line A") { 10.0 } else { 20.0 },
+            galley: galley_of(&ctx, text),
+        };
+        assert_eq!(
+            view.measure(100.0, 0.0, true, &mut varied),
+            LayoutPass::Full { rows: 2 }
+        );
+        assert_eq!(view.plan().heights(), &[10.0, 20.0]);
+        assert_eq!(view.plan().offsets(), &[0.0, 10.0, 30.0]);
 
         // Pure append: the cached rows are extended in place and the layout
-        // vectors are left untouched for show_rows to extend.
+        // is left untouched for the next pass to extend.
         push_line(
             &mut logs,
             &mut generation,
             false,
             "2026/08/10 12:00:02.000 [Info] line C",
         );
-        assert!(screen.refresh_view(&logs, generation).changed());
-        let view = screen.view.as_ref().unwrap();
-        assert_eq!(view.rows.len(), 3);
-        assert_eq!(view.heights, [10.0, 20.0]);
-        assert_eq!(view.prefix, [0.0, 10.0, 30.0]);
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
+        let plan = view.plan();
+        assert_eq!(plan.rows().len(), 3);
+        assert_eq!(plan.heights(), &[10.0, 20.0]);
+        assert_eq!(plan.offsets(), &[0.0, 10.0, 30.0]);
         // The refreshed key keeps the following idle frame pure.
-        assert!(!screen.refresh_view(&logs, generation).changed());
+        assert!(
+            !view
+                .refresh(&logs, generation, LevelFilter::All, "", None)
+                .changed()
+        );
 
         // Level switch: rows rebuilt from scratch, stale layout discarded.
-        screen.level = LevelFilter::ErrorPlus;
-        assert!(screen.refresh_view(&logs, generation).changed());
-        let view = screen.view.as_ref().unwrap();
-        assert!(view.rows.is_empty());
         assert!(
-            view.heights.is_empty() && view.galleys.is_empty() && view.prefix.is_empty(),
-            "a level change must drop the measured vectors"
+            view.refresh(&logs, generation, LevelFilter::ErrorPlus, "", None)
+                .changed()
+        );
+        let plan = view.plan();
+        assert!(plan.rows().is_empty());
+        assert!(
+            plan.heights().is_empty() && plan.galleys().is_empty() && plan.offsets().is_empty(),
+            "a level change must drop the measured layout"
         );
 
         // Needle change after another append: same reset contract.
-        screen.level = LevelFilter::All;
         push_line(
             &mut logs,
             &mut generation,
             false,
             "2026/08/10 12:00:03.000 [Error] fatal boom",
         );
-        screen.text = "fatal".to_string();
-        assert!(screen.refresh_view(&logs, generation).changed());
-        let view = screen.view.as_ref().unwrap();
-        assert_eq!(view.rows.len(), 1);
+        assert!(
+            view.refresh(&logs, generation, LevelFilter::All, "fatal", None)
+                .changed()
+        );
+        let plan = view.plan();
+        assert_eq!(plan.rows().len(), 1);
         assert_eq!(
-            view.rows[0].line,
+            plan.rows()[0].line,
             "2026/08/10 12:00:03.000 [Error] fatal boom"
         );
         assert!(
-            view.heights.is_empty() && view.galleys.is_empty() && view.prefix.is_empty(),
-            "a needle change must drop the measured vectors"
+            plan.heights().is_empty() && plan.galleys().is_empty() && plan.offsets().is_empty(),
+            "a needle change must drop the measured layout"
         );
     }
 
@@ -2486,7 +2991,7 @@ mod tests {
             "2026/08/10 12:00:01.000 [Info] filtered noise",
         );
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(screen.plan().rows().len(), 1);
         assert!(
             screen.rows_selection.anchor.is_some(),
             "a pure append that admits nothing must keep the selection"
@@ -2528,7 +3033,7 @@ mod tests {
         push(&mut logs, &mut generation);
         let mut screen = LogsScreen::default();
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
+        assert_eq!(screen.plan().rows().len(), CAP);
 
         // Rotate at the cap with another empty line. Ring length, front and
         // back pointers are all unchanged by the rotation — only the
@@ -2538,7 +3043,7 @@ mod tests {
             screen.refresh_view(&logs, generation).changed(),
             "an empty-line push at the cap must invalidate the memoized view"
         );
-        assert_eq!(screen.view.as_ref().unwrap().rows.len(), CAP);
+        assert_eq!(screen.plan().rows().len(), CAP);
 
         // The refresh consumed the rotation: idle frames stay pure again.
         assert!(!screen.refresh_view(&logs, generation).changed());
@@ -2664,7 +3169,7 @@ mod tests {
             "the fresh view measures every row: {:?}",
             screen.last_layout
         );
-        let initial_width = screen.view.as_ref().unwrap().measured_width;
+        let initial_width = screen.plan().measured_width();
         assert!(initial_width > 0.0);
 
         // An idle frame at the same width re-measures nothing.
@@ -2685,7 +3190,7 @@ mod tests {
             LayoutPass::None,
             "streaming drag frames must not re-layout the ring"
         );
-        assert_eq!(screen.view.as_ref().unwrap().measured_width, initial_width);
+        assert_eq!(screen.plan().measured_width(), initial_width);
 
         // The drag pauses at 590 px, still inside the settle window: no
         // re-layout yet...
@@ -2695,7 +3200,7 @@ mod tests {
             LayoutPass::None,
             "a pause inside the settle window still measures nothing"
         );
-        assert_eq!(screen.view.as_ref().unwrap().measured_width, initial_width);
+        assert_eq!(screen.plan().measured_width(), initial_width);
 
         // ...once the width has held still past the settle window, exactly
         // one full re-layout runs at the settled width.
@@ -2705,7 +3210,7 @@ mod tests {
             "the settled width re-measures every row once: {:?}",
             screen.last_layout
         );
-        let settled = screen.view.as_ref().unwrap().measured_width;
+        let settled = screen.plan().measured_width();
         assert!(
             (settled - (initial_width - 110.0)).abs() <= 2.0,
             "the re-layout must measure at the settled width: {settled} vs {}",
@@ -2719,6 +3224,6 @@ mod tests {
             LayoutPass::None,
             "an idle frame measures nothing"
         );
-        assert_eq!(screen.view.as_ref().unwrap().measured_width, settled);
+        assert_eq!(screen.plan().measured_width(), settled);
     }
 }
