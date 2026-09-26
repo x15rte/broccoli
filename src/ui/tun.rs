@@ -357,11 +357,6 @@ impl TunScreen {
     }
 }
 
-/// Pure phase/mode/elevation → badge key for the TUN screen. The app itself
-/// never runs elevated (the elevated helper owns the core), so while a TUN
-/// core runs the helper is the meaningful fact about how TUN started; an
-/// elevated shell outranks it, and the UAC note is what remains for a TUN
-/// start that has not happened yet.
 /// The badge over the TUN screen: elevation is the shell's own fact, and
 /// "the helper is carrying TUN" is the transport the running core owns —
 /// read from the published transport, not re-derived from the mode setting,

@@ -53,13 +53,10 @@ fn harness_with_hazardous_settings() -> (
         }],
         ..Default::default()
     };
-    screen::boot_state(
-        screen::BootState {
-            settings,
-            servers: ServersFile::default(),
-        },
-        None,
-    )
+    screen::boot_state(screen::BootState {
+        settings,
+        servers: ServersFile::default(),
+    })
 }
 
 #[test]

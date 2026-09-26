@@ -74,13 +74,10 @@ fn boot(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = screen::boot_state(
-        screen::BootState {
-            settings: settings.clone(),
-            servers: ServersFile::default(),
-        },
-        None,
-    );
+    let (lock, tmp, mut h) = screen::boot_state(screen::BootState {
+        settings: settings.clone(),
+        servers: ServersFile::default(),
+    });
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
     common::dismiss_wizard(&mut h);

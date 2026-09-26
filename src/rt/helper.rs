@@ -1133,6 +1133,20 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     output
 }
 
+/// Whether a message that failed to deserialize still announces a `start`:
+/// the tag is readable even when a field's type is not.
+fn is_start_tag(command_bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(command_bytes)
+        .ok()
+        .and_then(|command| {
+            command
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .map(|tag| tag == "start")
+        })
+        .unwrap_or(false)
+}
+
 /// One command the GUI sends an elevated helper over the authenticated pipe.
 ///
 /// One type for both ends: the writer serializes it, the reader deserializes
@@ -1141,7 +1155,10 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 /// refusal naming its own field instead of one generic parse error. The helper
 /// is spawned per launch from this same executable, so both ends are the same
 /// build and the tag vocabulary has no compatibility window.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// No `Debug`: the auth arm carries the one-shot token, and a derived impl
+/// would print it into any diagnostic that formats a command — the same secret
+/// `redacted_tool_args` masks on the keygen path. Nothing needs it.
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum HelperCommand {
     /// Start the core from the exact config bytes the GUI validated (base64;
@@ -1531,8 +1548,25 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(_) => break,
         };
-        let Ok(command) = serde_json::from_slice::<HelperCommand>(&command_bytes) else {
-            continue;
+        let command = match serde_json::from_slice::<HelperCommand>(&command_bytes) {
+            Ok(command) => command,
+            Err(error) => {
+                // An unreadable message is ignored: the pipe carries
+                // newline-framed JSON from this same build, so a stray byte
+                // cannot be a command. A *start* whose shape does not match is
+                // different — the GUI asked this helper to launch a core and
+                // the helper cannot serve the request — so it is reported and
+                // ends the helper, exactly like an invalid field.
+                if is_start_tag(&command_bytes) {
+                    send_log_record(
+                        &writer,
+                        &DiagError::new(Diag::new(Key::HelperMalformedStartCommand))
+                            .caused_by_text(error.to_string()),
+                    );
+                    send_event(&writer, &serde_json::json!({"event":"exit","code":-1}));
+                }
+                continue;
+            }
         };
         match command {
             HelperCommand::Start {
@@ -3303,8 +3337,10 @@ mod tests {
     fn start_wire_refuses_over_cap_config_without_a_fallback() {
         let core = std::path::Path::new(r"C:\core");
         let over_cap = vec![b'x'; MAX_WIRE_MESSAGE_BYTES];
-        let error = start_wire_message(12345, core, &over_cap)
-            .expect_err("an over-cap config must be refused, never truncated");
+        let error = match start_wire_message(12345, core, &over_cap) {
+            Ok(_) => panic!("an over-cap config must be refused, never truncated"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.text(Language::En),
             t_fmt(

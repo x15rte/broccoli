@@ -82,7 +82,7 @@ fn harness() -> (
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
-    screen::boot_state(screen::BootState { settings, servers }, None)
+    screen::boot_state(screen::BootState { settings, servers })
 }
 
 /// A 32-byte Wireguard key in hex (64 hex digits — any 64-hex-digit value
@@ -122,7 +122,7 @@ fn harness_wg() -> (
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
-    screen::boot_state(screen::BootState { settings, servers }, None)
+    screen::boot_state(screen::BootState { settings, servers })
 }
 
 /// Dismiss the first-run wizard and open the Servers screen at the DEFAULT

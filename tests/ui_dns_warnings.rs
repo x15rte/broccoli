@@ -99,7 +99,7 @@ fn boot(
             settings: settings.clone(),
             servers: ServersFile::default(),
         },
-        screen,
+        Some(screen),
         egui::Vec2::new(1100.0, 2800.0),
     )
 }

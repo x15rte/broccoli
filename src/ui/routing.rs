@@ -3260,7 +3260,7 @@ impl RoutingScreen {
                         // clears exactly this request.
                         let (reply, receiver) = oneshot::channel();
                         self.test_result = None;
-                        if ctx.cmd.send(CoreCmd::TestRoute { reply, request }).is_err() {
+                        if !ctx.send(CoreCmd::TestRoute { reply, request }) {
                             let error = DiagError::from(Diag::new(Key::RuntimeChannelClosed));
                             self.test_result = Some(Err(error));
                         } else {

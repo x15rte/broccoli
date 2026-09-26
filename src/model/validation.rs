@@ -828,11 +828,6 @@ impl Verdict {
         Self { issues }
     }
 
-    /// Every finding, in pass order.
-    pub fn issues(&self) -> &[ValidationIssue] {
-        &self.issues
-    }
-
     /// The blocking findings — [`Severity::Error`] — in pass order: what
     /// refuses save, import and apply.
     pub fn blocking(&self) -> impl Iterator<Item = &ValidationIssue> {
@@ -856,14 +851,8 @@ impl Verdict {
             .any(|issue| issue.severity == Severity::Error)
     }
 
-    /// The first blocking finding: the refusal a gate reports.
-    pub fn first_blocking(&self) -> Option<&ValidationIssue> {
-        self.issues
-            .iter()
-            .find(|issue| issue.severity == Severity::Error)
-    }
-
-    /// [`Self::first_blocking`], consuming the verdict.
+    /// The first blocking finding, consuming the verdict: the refusal a gate
+    /// reports.
     pub fn into_first_blocking(self) -> Option<ValidationIssue> {
         self.issues
             .into_iter()

@@ -175,11 +175,6 @@ pub struct UiCtx<'a> {
     /// including edits inside the persist throttle window, which the
     /// persist-time [`UiCtx::config_revision`] cannot cover.
     pub(crate) model_generation: &'a mut u64,
-    /// Monotonic persistence-generation counter: bumped once per persist of
-    /// the servers/settings model. It names *which persisted configuration* a
-    /// value belongs to (an apply verdict carries it back), never "the UI
-    /// should re-derive": screens memoize on [`UiCtx::model_generation`].
-    pub config_revision: u64,
     /// Monotonic per-input generations for screens' memoization keys
     /// (dashboard plot and latency-grid caches): `stats_generation` advances
     /// once per stats tick, `latency_generation` once per observatory tick
@@ -241,7 +236,6 @@ pub(crate) struct UiCtxParts<'a> {
     /// frame, and screens read the window through that value.
     pub(crate) operation: Option<JobKind>,
     pub(crate) is_elevated: bool,
-    pub(crate) config_revision: u64,
 }
 
 /// Which runtime presentation a [`UiCtx::new`] construction site wants: the
@@ -294,7 +288,6 @@ impl<'a> UiCtx<'a> {
             config_error,
             operation,
             is_elevated,
-            config_revision,
         } = parts;
         let idle_observatory: &'a [OutboundStatusView] = &[];
         let (
@@ -353,7 +346,6 @@ impl<'a> UiCtx<'a> {
             connect_blocked_reason,
             config_error,
             is_elevated,
-            config_revision,
             stats,
             observatory,
             core_version,
@@ -426,14 +418,19 @@ impl<'a> UiCtx<'a> {
     /// it explains, so a user-initiated action can never vanish silently.
     /// `true` when the command reached the runtime.
     pub fn send(&mut self, cmd: CoreCmd) -> bool {
-        if let Some(kind) = cmd.job_kind() {
-            self.requests.mirror_operation = Some(kind);
-        }
+        let kind = cmd.job_kind();
         let sent = self.cmd.send(cmd).is_ok();
         if !sent {
             tracing::warn!("core command not sent: runtime control channel is closed");
+            return false;
         }
-        sent
+        // The mirror only for a command the runtime actually received: a
+        // command that never arrived has no bookend coming to release it, and
+        // the busy window it would pin never opens.
+        if let Some(kind) = kind {
+            self.requests.mirror_operation = Some(kind);
+        }
+        true
     }
     /// Launch an isolated one-shot probe over every server profile (probe
     /// scope "all"). No settings mutation or dirty marker is involved. The
@@ -530,6 +527,7 @@ impl UiCtxSnapshot {
             && self.terminal_error == other.terminal_error
             && self.stats == other.stats
             && self.phase == other.phase
+            && self.transport == other.transport
             && self.download == other.download
             && self.update_check == other.update_check
     }

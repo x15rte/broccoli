@@ -20,9 +20,7 @@ use crate::rt::{
     CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView, StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
-use crate::ui::{
-    CoreSetupState, Screen, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
-};
+use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
 use egui_kittest::Harness;
 use std::collections::VecDeque;
 
@@ -88,7 +86,6 @@ pub(crate) struct UiTestRig {
     /// rig's one route to the mutation hook, so the caches a screen derived
     /// from the old model are invalidated exactly as they are in the app.
     pub(crate) model_generation: u64,
-    pub(crate) config_revision: u64,
     pub(crate) stats_generation: u64,
     pub(crate) latency_generation: u64,
     /// Staging store for [`UiTestRig::ctx`]: the runtime inputs are
@@ -125,7 +122,6 @@ impl Default for UiTestRig {
             operation: None,
             is_elevated: false,
             model_generation: 0,
-            config_revision: 0,
             stats_generation: 0,
             latency_generation: 0,
             snapshot: UiCtxSnapshot {
@@ -228,12 +224,6 @@ where
     )
 }
 
-/// The screens the app shell reaches through [`Screen`]: the harness a
-/// `Screen`-driving test booting the app itself needs lives in `tests/common`.
-pub(crate) fn _assert_screen_enum_covers_the_harness(screen: Screen) -> Screen {
-    screen
-}
-
 impl UiTestRig {
     /// Push one log line exactly like the app's `LogBuffer::push`:
     /// advances the ring's monotonic generation alongside the push.
@@ -291,7 +281,6 @@ impl UiTestRig {
                 config_error: &self.config_error,
                 operation: self.operation,
                 is_elevated: self.is_elevated,
-                config_revision: self.config_revision,
             },
             UiCtxView::Live {
                 snapshot: &self.snapshot,

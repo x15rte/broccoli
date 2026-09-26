@@ -23,24 +23,27 @@ use crate::common::{TempEnvironment, dismiss_wizard};
 use crate::screen::{BootState, boot_state};
 
 /// Boot with a [`BootState`], size the window, dismiss the first-run wizard and
-/// navigate to `screen` — the four steps every screen test opens with.
+/// land on `screen` — the steps every screen test opens with. `None` stays
+/// where the boot lands (the dashboard).
 ///
 /// The window is sized before the first frame so the whole screen is laid out
 /// (a taller window keeps sections below the fold in the AccessKit tree).
 pub fn boot_screen(
     state: BootState,
-    screen: Screen,
+    screen: Option<Screen>,
     size: egui::Vec2,
 ) -> (
     MutexGuard<'static, ()>,
     TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let (lock, tmp, mut h) = boot_state(state, None);
+    let (lock, tmp, mut h) = boot_state(state);
     h.set_size(size);
     h.run();
     dismiss_wizard(&mut h);
-    nav(&mut h, screen);
+    if let Some(screen) = screen {
+        nav(&mut h, screen);
+    }
     (lock, tmp, h)
 }
 

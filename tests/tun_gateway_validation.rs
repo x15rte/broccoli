@@ -207,17 +207,7 @@ fn boot(
         settings: settings.clone(),
         servers: ServersFile::default(),
     };
-    let size = egui::Vec2::new(1100.0, 2800.0);
-    match screen {
-        Some(screen) => nav::boot_screen(state, screen, size),
-        None => {
-            let (lock, tmp, mut h) = screen::boot_state(state, None);
-            h.set_size(size);
-            h.run();
-            common::dismiss_wizard(&mut h);
-            (lock, tmp, h)
-        }
-    }
+    nav::boot_screen(state, screen, egui::Vec2::new(1100.0, 2800.0))
 }
 
 #[test]
@@ -274,21 +264,14 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
 }
 
 /// The label the shell stores for a generation failure: the
-/// `GenerationFailed` template around the 48-char excerpt every
-/// generation-failure surface is bounded to before a label or the log can
-/// see the raw message (the shell's echo boundary).
+/// `GenerationFailed` template around the crate's bounded excerpt (the shell's
+/// echo boundary), so this asserts the template, not a copy of the bound.
 fn shell_generation_error(message: &str) -> String {
-    const MAX_EXCERPT_CHARS: usize = 48;
-    let mut end = MAX_EXCERPT_CHARS.min(message.len());
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    let excerpt = if end < message.len() {
-        format!("{}…", &message[..end])
-    } else {
-        message.to_owned()
-    };
-    t_fmt(Language::En, Key::GenerationFailed, &[&excerpt])
+    t_fmt(
+        Language::En,
+        Key::GenerationFailed,
+        &[&broccoli::excerpt::excerpt(message)],
+    )
 }
 
 #[test]

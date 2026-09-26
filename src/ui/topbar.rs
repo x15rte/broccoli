@@ -404,7 +404,7 @@ fn mode_label(mode: Mode, lang: Language) -> &'static str {
 /// The dynamic top-bar status inputs the chip zone renders; bundled so the
 /// rendering fn stays under clippy's argument-count ceiling (the same
 /// pattern as the servers editor's `AdvancedTabContext`).
-pub(crate) struct TopbarStatus<'a> {
+struct TopbarStatus<'a> {
     pub(crate) lang: Language,
     pub(crate) mode_caption: &'a str,
     pub(crate) active_caption: Option<&'a str>,
@@ -425,7 +425,7 @@ pub(crate) struct TopbarStatus<'a> {
 
 /// The click outcomes of one chip-zone frame.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TopbarClicks {
+struct TopbarClicks {
     pub apply: bool,
     pub retry: bool,
     pub open_folder: bool,
@@ -444,11 +444,17 @@ fn chip(ui: &mut egui::Ui, color: egui::Color32, text: impl Into<String>) {
 }
 
 /// Render the dynamic status/error zone. The caller lays this out inside a
-/// child capped to the row remainder and clips that child, so the chips can
+/// child capped to the row remainder and clipped that child, so the chips can
 /// never cover the right cluster; every piece of text truncates to its
-/// remaining budget instead of overflowing. Returns the click outcomes (the
-/// shell dispatches the actions).
-pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -> TopbarClicks {
+/// remaining budget instead of overflowing.
+///
+/// The zone's order is a precedence: the controls (the Apply-now button, the
+/// retry/open-folder pair, the error chip that jumps to the message) paint
+/// before the informational chips, because the cap can clip the tail — a
+/// clipped control is invisible *and* unreachable, while a clipped informational
+/// chip only loses its text (its hover still carries the full value). Returns
+/// the click outcomes (the row's caller dispatches them).
+fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -> TopbarClicks {
     let lang = status.lang;
     let colors = status_colors_of(ui);
     let mut clicks = TopbarClicks::default();
@@ -459,13 +465,39 @@ pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -
             .truncate()
             .show_tooltip_when_elided(true),
     );
-    if let Some(active) = status.active_caption {
+
+    // ---- controls -------------------------------------------------------
+    // The dirty-config pair: the pending change and the one control that
+    // applies it.
+    if status.config_dirty {
         ui.separator();
-        ui.add(
-            egui::Label::new(egui::RichText::new(active))
-                .truncate()
-                .show_tooltip_when_elided(true),
+        chip(ui, colors.warn, t(lang, Key::TopbarChangesPending));
+        let response = ui.add_enabled(
+            status.can_apply,
+            egui::Button::new(t(lang, Key::TopbarApplyNow)),
         );
+        let response = if let Some(reason) = status.apply_block {
+            response.on_disabled_hover_text(reason)
+        } else {
+            response
+        };
+        clicks.apply = response.clicked();
+    }
+    // The unwritable state's pair: both controls sit here, before the error
+    // text that explains them.
+    if let Some(error) = status.persistence_error {
+        ui.separator();
+        clicks.retry = ui.small_button(t(lang, Key::TopbarRetrySave)).clicked();
+        clicks.open_folder = ui
+            .small_button(t(lang, Key::TopbarOpenStateFolder))
+            .clicked();
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(t(lang, Key::TopbarSettingsNotSaved)).color(colors.err),
+            )
+            .truncate(),
+        )
+        .on_hover_text(error);
     }
     // The terminal error chip: the phase badge above keeps the phase readout
     // (an error never replaces it), so this is the status zone's pointer at
@@ -486,6 +518,16 @@ pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -
             .on_hover_text(error)
             .clicked();
     }
+
+    // ---- informational chips -------------------------------------------
+    if let Some(active) = status.active_caption {
+        ui.separator();
+        ui.add(
+            egui::Label::new(egui::RichText::new(active))
+                .truncate()
+                .show_tooltip_when_elided(true),
+        );
+    }
     if status.unsaved_changes {
         ui.separator();
         chip(ui, colors.warn, t(lang, Key::TopbarServerEditsUnsaved));
@@ -501,20 +543,6 @@ pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -
     if !status.core_available {
         ui.separator();
         chip(ui, colors.warn, t(lang, Key::TopbarCoreNotInstalled));
-    }
-    if status.config_dirty {
-        ui.separator();
-        chip(ui, colors.warn, t(lang, Key::TopbarChangesPending));
-        let response = ui.add_enabled(
-            status.can_apply,
-            egui::Button::new(t(lang, Key::TopbarApplyNow)),
-        );
-        let response = if let Some(reason) = status.apply_block {
-            response.on_disabled_hover_text(reason)
-        } else {
-            response
-        };
-        clicks.apply = response.clicked();
     }
     if let Some((ok, output)) = status.apply_result {
         ui.separator();
@@ -555,20 +583,6 @@ pub(crate) fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -
             .truncate(),
         )
         .on_hover_text(error);
-    }
-    if let Some(error) = status.persistence_error {
-        ui.separator();
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(t(lang, Key::TopbarSettingsNotSaved)).color(colors.err),
-            )
-            .truncate(),
-        )
-        .on_hover_text(error);
-        clicks.retry = ui.small_button(t(lang, Key::TopbarRetrySave)).clicked();
-        clicks.open_folder = ui
-            .small_button(t(lang, Key::TopbarOpenStateFolder))
-            .clicked();
     }
 
     clicks
@@ -710,6 +724,31 @@ mod tests {
             )
     }
 
+    /// The Apply-now control's enablement, at the row's own seam: the button
+    /// exists whenever the config is dirty, and is enabled exactly while the
+    /// core runs and nothing blocks the apply — the predicate the shell used
+    /// to compute before handing the zone a flag.
+    #[test]
+    fn the_apply_button_is_enabled_only_for_a_running_core_without_a_block() {
+        use egui_kittest::kittest::NodeT as _;
+
+        let mut h = row_harness(1400.0, RowCase::Heavy);
+        h.run();
+        let blocked = h.get_by_label(t(Language::En, Key::TopbarApplyNow));
+        assert!(
+            blocked.accesskit_node().is_disabled(),
+            "an operation in flight must disable the apply button"
+        );
+
+        let mut h = row_harness(1400.0, RowCase::ApplyReady);
+        h.run();
+        let ready = h.get_by_label(t(Language::En, Key::TopbarApplyNow));
+        assert!(
+            !ready.accesskit_node().is_disabled(),
+            "a dirty config over a running core applies"
+        );
+    }
+
     #[test]
     fn the_row_memoizes_its_captions_on_the_model_generation() {
         let mut h = row_harness(900.0, RowCase::Heavy);
@@ -796,18 +835,19 @@ mod tests {
         );
 
         // A row whose Apply-now button is enabled (no operation holding the
-        // window) reports the apply request. The wide row keeps every chip
-        // inside the budget: a widget past the cap is clipped out of
-        // hit-testing, so it could not be clicked at all.
-        let mut h = row_harness(1400.0, RowCase::ApplyReady);
+        // window) reports the apply request — at the app's minimum window
+        // width, with the worst-case caption live: the zone paints its
+        // controls before its informational chips, so the cap can clip the
+        // latter and never the button.
+        let mut h = row_harness(900.0, RowCase::ApplyReady);
         h.run();
         h.get_by_label(t(Language::En, Key::TopbarApplyNow)).click();
         h.run();
         assert!(h.state().clicks.apply, "Apply now must ask for an apply");
 
-        // A row carrying only the unwritable-state chips keeps Retry save
-        // and Open state folder inside the budget, where they are clickable.
-        let mut h = row_harness(1400.0, RowCase::PersistenceOnly);
+        // The unwritable state's pair is a control too, and equally out of the
+        // cap's reach.
+        let mut h = row_harness(900.0, RowCase::PersistenceOnly);
         h.run();
         h.get_by_label(t(Language::En, Key::TopbarRetrySave))
             .click();

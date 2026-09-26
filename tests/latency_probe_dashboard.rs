@@ -57,13 +57,10 @@ fn harness() -> (
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    screen::boot_state(
-        screen::BootState {
-            settings: Settings::default(),
-            servers: seeded_servers(),
-        },
-        None,
-    )
+    screen::boot_state(screen::BootState {
+        settings: Settings::default(),
+        servers: seeded_servers(),
+    })
 }
 
 /// Push one probe result through the real event-drain path.

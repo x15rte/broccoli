@@ -39,7 +39,6 @@ pub struct BootState {
 /// Boot with a [`BootState`] pre-written through the app's own writers.
 pub fn boot_state(
     state: BootState,
-    frame_step: Option<f32>,
 ) -> (
     MutexGuard<'static, ()>,
     TempEnvironment,
@@ -56,6 +55,8 @@ pub fn boot_state(
                 .save()
                 .expect("seed servers.json through the app's own writer");
         },
-        frame_step,
+        // The fixture's screens do not pin the frame clock; a test that does
+        // drives `common::boot` itself.
+        None,
     )
 }

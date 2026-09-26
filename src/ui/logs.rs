@@ -425,7 +425,6 @@ impl LogsScreen {
             // before the sender drops.
             Some(Terminal::Exited) | None => {}
         }
-        let logger_cmd = ctx.cmd.clone();
         let logs: &VecDeque<(bool, String)> = ctx.logs;
         let logger_gate = verdict(
             matches!(ctx.phase, CorePhase::Running),
@@ -510,7 +509,7 @@ impl LogsScreen {
             if restart.clicked() {
                 let (reply, receiver) = tokio::sync::oneshot::channel();
                 self.logger_restart_feedback = None;
-                if logger_cmd.send(CoreCmd::RestartLogger { reply }).is_err() {
+                if !ctx.send(CoreCmd::RestartLogger { reply }) {
                     self.logger_restart_feedback =
                         Some((false, t(lang, Key::RuntimeChannelClosed).into()));
                 } else {
@@ -574,10 +573,9 @@ impl LogsScreen {
     /// layout, and the admitted tail is appended — so a push at a cap costs
     /// the tail, not the ring. Anything else — a backwards or shrinking ring,
     /// filter/level changes, clears, first build — rebuilds the rows from
-    /// scratch. The returned flag is exactly the refresh decision: false on an
-    /// idle frame (the cached view stands), true on a rebuild or extension.
-    /// Refresh the memoized view from the ring and report what it decided.
-    /// The outcome is the observable the tests assert: "reused",
+    /// scratch.
+    ///
+    /// The returned decision is the observable the tests assert: "reused",
     /// "extended by N, dropped M" or "rebuilt with N rows", plus whether the
     /// index-keyed selection survived.
     fn refresh_view(

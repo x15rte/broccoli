@@ -54,7 +54,7 @@ fn boot_servers(
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
-    let (lock, tmp, mut h) = screen::boot_state(screen::BootState { settings, servers }, None);
+    let (lock, tmp, mut h) = screen::boot_state(screen::BootState { settings, servers });
 
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();

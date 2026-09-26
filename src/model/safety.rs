@@ -97,13 +97,8 @@ impl SafetyVerdicts {
         }
     }
 
-    /// Every hazard, in pass order (local endpoints, dokodemo listeners, TUN
-    /// privacy, balancer breakage).
-    pub fn findings(&self) -> &[SafetyFinding] {
-        &self.findings
-    }
-
-    /// The findings as the plain list, for the callers that store one.
+    /// The findings, in pass order (local endpoints, dokodemo listeners, TUN
+    /// privacy, balancer breakage), for the callers that store the list.
     pub fn into_findings(self) -> Vec<SafetyFinding> {
         self.findings
     }

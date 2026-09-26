@@ -111,10 +111,21 @@ impl<'a> DialGraph<'a> {
             .collect()
     }
 
-    /// Every model site that references `tag`, as wire paths: routing rules,
-    /// balancer fallbacks, and other profiles' chain hops. The delete
-    /// confirmation renders these verbatim.
-    pub fn references(&self, settings: &Settings, tag: &str) -> Vec<String> {
+    /// Every model site that references `profile_id`'s outbound tag, as wire
+    /// paths: routing rules, balancer fallbacks, and other profiles' chain
+    /// hops. The delete confirmation renders these verbatim — which is why the
+    /// profile being deleted is excluded by *identity*: two profiles can carry
+    /// one tag (a hand-edited state file), and a tag comparison would drop the
+    /// other one's real reference to the same outbound.
+    pub fn references(&self, settings: &Settings, profile_id: &str) -> Vec<String> {
+        let Some(tag) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(ServerProfile::tag)
+        else {
+            return Vec::new();
+        };
         let mut references = Vec::new();
         for (index, rule) in settings.routing.rules.iter().enumerate() {
             if rule.outbound_tag == tag {
@@ -127,10 +138,10 @@ impl<'a> DialGraph<'a> {
             }
         }
         for (index, profile) in self.profiles.iter().enumerate() {
-            if profile.tag() == tag {
+            if profile.id == profile_id {
                 continue;
             }
-            if profile.chain_target() == Some(tag) {
+            if profile.chain_target() == Some(tag.as_str()) {
                 let label = if profile.name.is_empty() {
                     profile.tag()
                 } else {
@@ -341,7 +352,7 @@ mod tests {
             ..Default::default()
         });
 
-        let references = graph.references(&settings, &target.tag());
+        let references = graph.references(&settings, &target.id);
         assert!(
             references
                 .iter()

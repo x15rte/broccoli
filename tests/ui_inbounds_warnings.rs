@@ -56,7 +56,7 @@ fn boot_inbounds(
             settings: settings.clone(),
             servers: ServersFile::default(),
         },
-        Screen::Inbounds,
+        Some(Screen::Inbounds),
         egui::Vec2::new(1100.0, 2800.0),
     )
 }

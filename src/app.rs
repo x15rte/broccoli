@@ -2118,7 +2118,6 @@ impl eframe::App for BroccoliApp {
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
-                    config_revision: self.config_revision,
                 },
                 UiCtxView::Live { snapshot },
             );
@@ -2166,7 +2165,6 @@ impl eframe::App for BroccoliApp {
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
-                    config_revision: self.config_revision,
                 },
                 UiCtxView::Onboarding { snapshot },
             );
@@ -2203,7 +2201,6 @@ impl eframe::App for BroccoliApp {
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
-                    config_revision: self.config_revision,
                 },
                 UiCtxView::Live { snapshot },
             );
@@ -4203,11 +4200,10 @@ mod safety_ack_tests {
 /// interception, and the quit-resume tail. The app shell itself is not
 /// constructible in tests (needs `eframe::CreationContext` + profile I/O),
 /// so the wiring lives in small free functions and seams
-/// ([`ui::topbar::topbar_status_zone`], [`quit_or_stage_leave`],
-/// [`quit_resume_ready`]) that are exercised here through the real
-/// ServersScreen UI (list selection, draft edits, the leave modal) and the
-/// shared screen-test rig (`crate::ui::test_rig::UiTestRig`) that every
-/// screen test builds through.
+/// ([`ui::topbar::show_row`], [`quit_or_stage_leave`], [`quit_resume_ready`])
+/// exercised here through the real ServersScreen UI (list selection, draft
+/// edits, the leave modal) and the shared screen-test rig
+/// (`crate::ui::test_rig::UiTestRig`) that every screen test builds through.
 #[cfg(test)]
 mod unsaved_changes_tests {
     use super::{quit_or_stage_leave, quit_resume_ready};
@@ -4216,6 +4212,7 @@ mod unsaved_changes_tests {
     use crate::model::{OutboundModel, Protocol, ServerProfile};
     use crate::ui::servers::LeaveAction;
     use crate::ui::test_rig::{UiTestRig, servers_frame_harness};
+    use crate::ui::topbar::{TopbarMemos, TopbarRowState, show_row};
 
     /// The topbar unsaved chip renders exactly while the Servers screen
     /// reports unsaved changes (the call site passes `unsaved_changes()`
@@ -4223,42 +4220,56 @@ mod unsaved_changes_tests {
     /// quit-deferral test).
     #[test]
     fn topbar_chip_renders_only_while_the_servers_screen_has_unsaved_changes() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
-        let status = |unsaved: bool| crate::ui::topbar::TopbarStatus {
-            lang: Language::En,
-            mode_caption: "mode: TUN",
-            active_caption: None,
-            unsaved_changes: unsaved,
-            trial_rule_count: 0,
-            core_available: true,
-            config_dirty: false,
-            can_apply: false,
-            apply_block: None,
-            apply_result: None,
-            terminal_error: None,
-            config_error: None,
-            state_error: None,
-            persistence_error: None,
-        };
-        let mut harness = Harness::new_ui(|ui| {
-            crate::ui::topbar::topbar_status_zone(ui, &status(true));
-        });
-        harness.run();
-        assert!(
+        let row = |unsaved: bool| {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::Vec2::new(1100.0, 60.0))
+                .build_ui_state(
+                    move |ui, memos: &mut TopbarMemos| {
+                        let phase = crate::rt::CorePhase::Running;
+                        let _ = show_row(
+                            ui,
+                            &TopbarRowState {
+                                lang: Language::En,
+                                phase: &phase,
+                                mode: crate::model::Mode::Off,
+                                active_name: None,
+                                core_version: None,
+                                model_generation: 0,
+                                blocked_reason: None,
+                                unsaved_changes: unsaved,
+                                trial_rule_count: 0,
+                                core_available: true,
+                                config_dirty: false,
+                                apply_block: None,
+                                apply_result: None,
+                                terminal_error: None,
+                                config_error: None,
+                                state_error: None,
+                                persistence_error: None,
+                                stats_generation: 0,
+                                unit: crate::model::settings::TrafficUnit::Auto,
+                                stats: None,
+                            },
+                            memos,
+                        );
+                    },
+                    TopbarMemos::default(),
+                );
+            harness.run();
             harness
-                .query_by_label(t(Language::En, Key::TopbarServerEditsUnsaved))
+        };
+
+        let h = row(true);
+        assert!(
+            h.query_by_label(t(Language::En, Key::TopbarServerEditsUnsaved))
                 .is_some(),
             "the chip must render while the servers screen reports unsaved changes"
         );
-
-        let mut harness = Harness::new_ui(|ui| {
-            crate::ui::topbar::topbar_status_zone(ui, &status(false));
-        });
-        harness.run();
+        let h = row(false);
         assert!(
-            harness
-                .query_by_label(t(Language::En, Key::TopbarServerEditsUnsaved))
+            h.query_by_label(t(Language::En, Key::TopbarServerEditsUnsaved))
                 .is_none(),
             "the chip must not render while the servers screen is clean"
         );

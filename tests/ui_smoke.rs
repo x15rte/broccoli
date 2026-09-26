@@ -797,13 +797,10 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
         accent_color: Some(0x4f_af_4f_ff),
         ..Default::default()
     };
-    let (_lock, _tmp, mut h) = screen::boot_state(
-        screen::BootState {
-            settings: settings.clone(),
-            servers: ServersFile::default(),
-        },
-        None,
-    );
+    let (_lock, _tmp, mut h) = screen::boot_state(screen::BootState {
+        settings: settings.clone(),
+        servers: ServersFile::default(),
+    });
 
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();

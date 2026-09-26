@@ -146,16 +146,9 @@ fn server_reference_paths(
     settings: &Settings,
     profile_id: &str,
 ) -> Vec<String> {
-    let Some(tag) = servers
-        .profiles
-        .iter()
-        .find(|profile| profile.id == profile_id)
-        .map(ServerProfile::tag)
-    else {
-        return Vec::new();
-    };
     let outbound_tags = crate::model::emit::outbound_tags(servers, settings);
-    crate::model::dial::DialGraph::new(&servers.profiles, &outbound_tags).references(settings, &tag)
+    crate::model::dial::DialGraph::new(&servers.profiles, &outbound_tags)
+        .references(settings, profile_id)
 }
 
 // ---------- editor validation sweep ----------
@@ -2265,11 +2258,16 @@ impl ServersScreen {
             reply,
         }) {
             // The runtime's command channel is gone: no terminal can arrive,
-            // so nothing may stay pending (the send verb logged the refusal
-            // with the closed channel's own text).
+            // so nothing may stay pending. The refusal names why — the send
+            // verb logged the closed channel, and the user's message carries
+            // the same fact.
             self.profile_validation_origin = None;
             self.profile_validation_count = 0;
-            return Err(t(lang, Key::SrvStartValidationFailed).to_string());
+            return Err(t_fmt(
+                lang,
+                Key::SrvStartValidationFailed,
+                &[&t(lang, Key::CoreRuntimeUnavailable)],
+            ));
         }
         self.profile_validation_request = Request::reply(rx);
         Ok(())

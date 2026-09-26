@@ -580,22 +580,9 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Open the configured managed core under compiled-pin verification and retain
-/// its payload locks for the caller. Execution paths use this instead of a
-/// check-then-spawn sequence.
-pub fn open_verified_managed_core() -> Result<VerifiedCore, DiagError> {
-    open_verified_core(&core_dir())
-}
-
-/// Reject an absent, tampered, or foreign managed core without executing it.
-pub fn ensure_managed_core() -> Result<(), DiagError> {
-    drop(open_verified_managed_core()?);
-    Ok(())
-}
-
 /// A short-lived, process-local result for the expensive pinned-payload
-/// verification. Render passes only consume this cache; launch and validation
-/// still call [`open_verified_managed_core`] and rehash every payload.
+/// verification. Render passes only consume this cache; every launch and
+/// validation rehashes the payloads through [`open_verified_for_config`].
 const PRESENCE_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// The managed core tree as one verification pass saw it.

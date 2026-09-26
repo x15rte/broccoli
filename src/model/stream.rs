@@ -1650,13 +1650,6 @@ macro_rules! transport_blocks {
         }
 
         impl StreamModel {
-            /// The block `network` names, if the model carries one.
-            pub fn transport_mut(&mut self) -> Option<TransportMut<'_>> {
-                match self.network {
-                    $(Network::$variant => self.$field.as_mut().map(TransportMut::$variant),)*
-                }
-            }
-
             /// The block `network` names, materializing its default: what
             /// selecting a transport does (Xray builds the selected block and
             /// ignores the others, so a selector must leave one behind).

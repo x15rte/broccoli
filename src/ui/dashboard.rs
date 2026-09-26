@@ -1016,8 +1016,6 @@ fn missing_inbound_listener(phase: &CorePhase, settings: &Settings) -> bool {
         && !settings.dokodemo.iter().any(|entry| entry.enabled)
 }
 
-/// Pure settings/phase → status derivation for the TUN row item. The tuple
-/// is `(mode, is_elevated)`.
 /// The dashboard's network-mode row: which transport the running core
 /// actually owns decides "active" (the setting decides only the states that
 /// exist before a launch), so a mode change that has not restarted the core

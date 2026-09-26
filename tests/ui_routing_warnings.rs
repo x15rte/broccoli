@@ -64,7 +64,7 @@ fn boot_routing(
         settings: settings.clone(),
         servers: servers.cloned().unwrap_or_default(),
     };
-    nav::boot_screen(state, Screen::Routing, Vec2::new(1100.0, 2800.0))
+    nav::boot_screen(state, Some(Screen::Routing), Vec2::new(1100.0, 2800.0))
 }
 
 /// A rule with a valid built-in target and a fixed tag.

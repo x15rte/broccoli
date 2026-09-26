@@ -792,12 +792,6 @@ fn append_builtin_outbounds(out: &mut Vec<Value>) {
 }
 
 /// The user's server order, then the built-in `direct`/`block` tags and the
-/// optional `dns-out`. Server profiles emit in list order, and the list keeps
-/// the active (default) profile in its first slot — Xray's default route is
-/// the first outbound — so the emitted order and the GUI list can never
-/// disagree. The DNS outbound is appended last so the default outbound (the
-/// first entry) is unchanged; it only ever receives UDP:53 via the
-/// interception rules.
 /// The derived facts every emission stage reads, computed once per document:
 /// which families reach the wire and which of them attach to the DNS module.
 /// The stages take this value instead of the positional booleans they used to
@@ -904,6 +898,12 @@ impl ControlPlane<'_> {
     }
 }
 
+/// optional `dns-out`. Server profiles emit in list order, and the list keeps
+/// the active (default) profile in its first slot — Xray's default route is
+/// the first outbound — so the emitted order and the GUI list can never
+/// disagree. The DNS outbound is appended last so the default outbound (the
+/// first entry) is unchanged; it only ever receives UDP:53 via the
+/// interception rules.
 fn outbounds(servers: &ServersFile, emission: &Emission<'_>) -> Value {
     let mut out = Vec::new();
     for profile in &servers.profiles {
