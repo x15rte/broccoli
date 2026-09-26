@@ -11,6 +11,7 @@ pub mod grpc;
 pub mod helper;
 pub mod jobs;
 mod latency;
+mod lifecycle;
 mod policy;
 mod profiles;
 mod readiness;
@@ -20,15 +21,15 @@ pub mod supervisor;
 mod wfp;
 
 use policy::{
-    CANDIDATE_RETRY_DELAY, CoreExitFacts, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure,
-    READY_TIMEOUT, READY_TIMEOUT_APPLIED, ReadinessTimeout, TUN_BIND_RACE_RETRIES,
-    candidate_retry_budget, classify_core_exit, classify_pre_readiness_exit,
-    readiness_timeout_verdict, spend_retry_attempt, update_retries_bind_race,
+    CANDIDATE_RETRY_DELAY, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure, READY_TIMEOUT,
+    READY_TIMEOUT_APPLIED, ReadinessTimeout, TUN_BIND_RACE_RETRIES, candidate_retry_budget,
+    classify_core_exit, classify_pre_readiness_exit, readiness_timeout_verdict,
+    spend_retry_attempt, update_retries_bind_race,
 };
-use state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
 
 use self::events::{AppLogSink, EventStream};
-use self::readiness::{Poll, Readiness};
+use self::lifecycle::Lifecycle;
+use self::readiness::Poll;
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
@@ -939,6 +940,9 @@ struct PollArmCounters {
 }
 
 struct Runtime {
+    /// The phase, the live backend and the transition state a start, an
+    /// exit or a rollback moves through.
+    lifecycle: Lifecycle,
     events: EventStream,
     cmd: mpsc::UnboundedReceiver<CoreCmd>,
     grpc: GrpcClient,
@@ -947,27 +951,6 @@ struct Runtime {
     /// tests are their only readers (see [`PollArmCounters`]).
     poll_fires: Arc<PollArmCounters>,
 
-    /// Owns the live backend slot (direct child or helper pipe), its event
-    /// channel, and the derived alive/tun-ownership flags.
-    backend: BackendState,
-    /// Stop/restart/silence policy for the in-flight expected exit.
-    exit_policy: ExitPolicy,
-    /// A just-committed config candidate plus its armed rollback.
-    pending_transition: PendingTransition,
-    /// The exact config content a helper start must stage. A start that
-    /// generated its configuration captures those bytes directly (regenerate,
-    /// gate, rollback replay); a start carrying a fresh apply's committed
-    /// artefact keeps the bytes the apply gate validated. The elevated helper
-    /// never re-reads the user-writable active path, so a same-user swap after
-    /// capture cannot reach the stage; `None` means no start has captured yet.
-    helper_config_bytes: Option<Vec<u8>>,
-    /// The core-swap candidate (durable health marker) plus its rollback.
-    core_update: CoreUpdatePending,
-    /// Unexpected-exit backoff and the stability clock that resets it.
-    backoff: Backoff,
-    phase: CorePhase,
-
-    requested_tun_mode: bool,
     /// True when the configuration the core launched carries a health engine
     /// (the `observatory` or the `burstObservatory` block), read from the exact
     /// configuration text the launch was reported with (see
@@ -982,44 +965,6 @@ struct Runtime {
     /// to *stdout* (Go `fmt.Println`, main/run.go), so both streams are kept —
     /// a stderr-only ring would be empty exactly on exit 23.
     output_ring: Arc<Mutex<VecDeque<String>>>,
-
-    shutting_down: bool,
-
-    /// The next start is a completed core update's health gate: it runs the
-    /// app-owned configuration, never the user's profiles, so the gate
-    /// answers only "does this binary run and answer". Armed when an install
-    /// lands and when a durable pending-swap marker is adopted; consumed by
-    /// the start it belongs to. A fresh apply supersedes it — the user's own
-    /// start then carries the update's verdict.
-    update_gate_start: bool,
-    /// The next start replays the restored last-known-good artefact instead of
-    /// regenerating, because regeneration would reproduce the configuration a
-    /// rolled-back candidate failed on. Set only where a deliberate rollback
-    /// completed; the replay checks the artefact's stamp first and regenerates
-    /// when it names another build.
-    replay_after_rollback: bool,
-    /// The live backend is the health gate's proof process: it runs the
-    /// app-owned configuration, so its first readiness ACKs the update and
-    /// then ends the process (the phase settles to Stopped). Set by the start
-    /// that ran `SpawnConfigSource::CoreGate`, cleared on any backend exit.
-    gate_backend_alive: bool,
-    /// Automatic retry count for a TUN candidate that exits before
-    /// readiness. Reset on every fresh commit and on first readiness; the
-    /// budget for one exit is a single attempt for the adapter teardown
-    /// window and [`TUN_BIND_RACE_RETRIES`] extra for the dns-in bind race.
-    candidate_boot_retries: u8,
-    pending_restart: Option<Instant>,
-    /// The in-tun DNS listener this start must add to its running core,
-    /// armed from the config the core runs. `None` means nothing is pending:
-    /// the add was not needed, succeeded, or spent its attempt budget.
-    dns_in_listener: Option<dns_in::Listener>,
-    /// Add attempts spent for `dns_in_listener`, capped through the shared
-    /// [`spend_retry_attempt`] rule ([`DNS_IN_ADD_ATTEMPTS`]).
-    dns_in_attempts: u8,
-    /// The readiness clock of this start: armed after the child is
-    /// confirmed alive, disarmed while a TUN start is still staging in the
-    /// elevated helper.
-    readiness: Readiness,
 
     prev_traffic: HashMap<String, (u64, u64)>,
     /// Cumulative inbound (listener traffic) counters, one baseline per tag,
@@ -1103,27 +1048,11 @@ impl Runtime {
             // Settings. 0 is a placeholder until the first derivation.
             grpc: GrpcClient::new(0),
             api_port: 0,
-            backend: BackendState::new(),
-            exit_policy: ExitPolicy::idle(),
-            pending_transition: PendingTransition::new(),
-            helper_config_bytes: None,
-            core_update: CoreUpdatePending::new(),
-            backoff: Backoff::new(),
-            phase: CorePhase::Stopped,
-            requested_tun_mode: false,
+            lifecycle: Lifecycle::new(),
             health_extension: false,
             obs_enabled: false,
             obs_tags: Vec::new(),
             output_ring: Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_RING))),
-            shutting_down: false,
-            update_gate_start: false,
-            replay_after_rollback: false,
-            gate_backend_alive: false,
-            candidate_boot_retries: 0,
-            pending_restart: None,
-            dns_in_listener: None,
-            dns_in_attempts: 0,
-            readiness: Readiness::new(),
             prev_traffic: HashMap::new(),
             prev_inbound_traffic: HashMap::new(),
             // xorshift64* state must be non-zero.
@@ -1196,8 +1125,8 @@ impl Runtime {
         // every other phase has no live backend to attribute — so a consumer
         // reads one event instead of pairing this with the last one.
         let transport = matches!(phase, CorePhase::Starting | CorePhase::Running)
-            .then(|| self.backend.transport());
-        self.phase = phase.clone();
+            .then(|| self.lifecycle.backend.transport());
+        self.lifecycle.phase = phase.clone();
         self.emit(CoreEvt::State { phase, transport });
     }
     // -- exclusive-window helpers ----------------------
@@ -1529,12 +1458,12 @@ impl Runtime {
                 // Once Shutdown was handled the command channel is drained
                 // and closed; an enabled arm would spin on the closed channel
                 // while a worker-owned task still runs out its terminal.
-                cmd = self.cmd.recv(), if !self.shutting_down => {
+                cmd = self.cmd.recv(), if !self.lifecycle.shutting_down => {
                     match cmd {
                         Some(cmd) => self.handle_cmd(cmd).await,
                         None => {
                             self.cancel_exclusive(&Diag::new(Key::RtReasonGuiChannelClosed));
-                            self.shutting_down = true;
+                            self.lifecycle.shutting_down = true;
                         }
                     }
                 }
@@ -1578,34 +1507,34 @@ impl Runtime {
                     // itself; the select loop is shutting down regardless.
                 }
                 status = async {
-                    match self.backend.slot.as_mut() {
+                    match self.lifecycle.backend.slot.as_mut() {
                         Some(Backend::Direct(child)) => child.wait().await.ok(),
                         _ => unreachable!(),
                     }
-                }, if matches!(self.backend.slot, Some(Backend::Direct(_))) => {
+                }, if matches!(self.lifecycle.backend.slot, Some(Backend::Direct(_))) => {
                     let code = status.and_then(|s| s.code());
                     self.on_core_exit(code).await;
                 }
                 ev = async {
-                    match self.backend.events.as_mut() {
+                    match self.lifecycle.backend.events.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => unreachable!(),
                     }
-                }, if self.backend.events.is_some() => {
+                }, if self.lifecycle.backend.events.is_some() => {
                     match ev {
                         Some(helper::HelperEvent::Log(record)) => self.emit_helper_log(record),
                         Some(helper::HelperEvent::Exit(code)) => {
                             self.on_core_exit(Some(code)).await;
                         }
                         Some(helper::HelperEvent::State { state, pid }) => {
-                            self.on_helper_state(&state, pid);
+                            self.lifecycle.on_helper_state(&state, pid);
                         }
                         None => {
                             // Pipe EOF is watchdog ownership release, but it is
                             // not an Xray Exit acknowledgement. Never launch a
                             // rollback/restart against possibly occupied ports.
-                            let active = self.backend.is_alive() || self.exit_policy.stopping();
-                            self.backend.force_release();
+                            let active = self.lifecycle.backend.is_alive() || self.lifecycle.exit_policy.stopping();
+                            self.lifecycle.backend.force_release();
                             self.app_log(Diag::new(Key::RtLogHelperDisconnected));
                             if active {
                                 self.on_unconfirmed_backend_loss();
@@ -1613,22 +1542,22 @@ impl Runtime {
                         }
                     }
                 }
-                _ = ready_tick.tick(), if matches!(self.phase, CorePhase::Starting) => {
+                _ = ready_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Starting) => {
                     self.ready_poll().await;
                     self.poll_fires.ready.fetch_add(1, Ordering::Relaxed);
                 }
-                _ = dns_tick.tick(), if matches!(self.phase, CorePhase::Running) && self.dns_in_listener.is_some() => {
+                _ = dns_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) && self.lifecycle.dns_in_listener.is_some() => {
                     self.dns_in_poll().await;
                 }
-                _ = stats_tick.tick(), if matches!(self.phase, CorePhase::Running) => {
+                _ = stats_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) => {
                     self.stats_poll().await;
                     self.poll_fires.stats.fetch_add(1, Ordering::Relaxed);
                 }
-                _ = obs_tick.tick(), if matches!(self.phase, CorePhase::Running) && self.obs_enabled => {
+                _ = obs_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) && self.obs_enabled => {
                     self.obs_poll().await;
                     self.poll_fires.observatory.fetch_add(1, Ordering::Relaxed);
                 }
-                _ = house_tick.tick(), if self.exit_policy.stopping() || self.pending_restart.is_some() => {
+                _ = house_tick.tick(), if self.lifecycle.exit_policy.stopping() || self.lifecycle.pending_restart.is_some() => {
                     self.housekeeping().await;
                 }
             }
@@ -1638,7 +1567,7 @@ impl Runtime {
             // secrets and orphan the child. The loop keeps polling the task
             // arm (bounded by the child's own timeout) until that terminal
             // clears the record.
-            if self.shutting_down && !self.jobs.exclusive_runs_to_terminal() {
+            if self.lifecycle.shutting_down && !self.jobs.exclusive_runs_to_terminal() {
                 break;
             }
         }
@@ -1663,13 +1592,16 @@ impl Runtime {
                 let Some(_id) = self.begin_exclusive(JobKind::Start, BusyAnswer::Nowhere) else {
                     return;
                 };
-                self.pending_restart = None;
-                self.backoff.reset();
-                if self.exit_policy.stopping() {
+                self.lifecycle.pending_restart = None;
+                self.lifecycle.backoff.reset();
+                if self.lifecycle.exit_policy.stopping() {
                     self.app_log(Diag::new(Key::RtLogConnectRejectedStopping));
                     self.release_exclusive();
-                } else if self.backend.is_alive()
-                    || matches!(self.phase, CorePhase::Starting | CorePhase::Running)
+                } else if self.lifecycle.backend.is_alive()
+                    || matches!(
+                        self.lifecycle.phase,
+                        CorePhase::Starting | CorePhase::Running
+                    )
                 {
                     self.app_log(Diag::new(Key::RtLogConnectIgnoredRunning));
                     self.release_exclusive();
@@ -1695,7 +1627,7 @@ impl Runtime {
                 // update landing keeps the state it is mid-transaction with.
                 let slot_kept = self.jobs.exclusive_runs_to_terminal();
                 let update_landing = matches!(self.jobs.busy_kind(), Some(JobKind::UpdateCore));
-                if self.backend.tun_owned_or_alive() && !slot_kept {
+                if self.lifecycle.backend.tun_owned_or_alive() && !slot_kept {
                     // Stop preempts: the begin cannot reject here, because a
                     // worker-owned record is kept out by the guard above and
                     // every abortable one was cancelled and released before
@@ -1706,18 +1638,18 @@ impl Runtime {
                     // but the GUI marks Stop optimistically after send.
                     self.emit(CoreEvt::Operation(None));
                 }
-                self.pending_restart = None;
-                self.pending_transition.clear();
+                self.lifecycle.pending_restart = None;
+                self.lifecycle.pending_transition.clear();
                 if !update_landing {
-                    self.core_update.clear();
+                    self.lifecycle.core_update.clear();
                 }
-                if self.backend.tun_owned_or_alive() {
-                    self.exit_policy.begin_stop(Instant::now());
+                if self.lifecycle.backend.tun_owned_or_alive() {
+                    self.lifecycle.exit_policy.begin_stop(Instant::now());
                     self.kill_backend().await;
                 } else {
-                    self.exit_policy.finish();
-                    self.backend.force_release();
-                    if !matches!(self.phase, CorePhase::Stopped) {
+                    self.lifecycle.exit_policy.finish();
+                    self.lifecycle.backend.force_release();
+                    if !matches!(self.lifecycle.phase, CorePhase::Stopped) {
                         self.set_phase(CorePhase::Stopped);
                     }
                     if !update_landing {
@@ -1729,9 +1661,9 @@ impl Runtime {
                 let Some(_id) = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere) else {
                     return;
                 };
-                self.pending_restart = None;
-                if self.backend.tun_owned_or_alive() {
-                    self.exit_policy.begin_restart(Instant::now());
+                self.lifecycle.pending_restart = None;
+                if self.lifecycle.backend.tun_owned_or_alive() {
+                    self.lifecycle.exit_policy.begin_restart(Instant::now());
                     self.kill_backend().await;
                 } else {
                     self.start_backend().await;
@@ -1745,7 +1677,7 @@ impl Runtime {
                 self.dispatch_apply(value, intent, revision).await;
             }
             CoreCmd::TestConfig { config, reply } => {
-                if self.exit_policy.stopping() {
+                if self.lifecycle.exit_policy.stopping() {
                     // The runtime is tearing down and will not run the
                     // validation; reject on the request's own channel and
                     // poke the repaint so the requester's poll wakes
@@ -1764,7 +1696,7 @@ impl Runtime {
                 self.begin_test_work(config).await;
             }
             CoreCmd::ValidateProfiles { request, reply } => {
-                if self.exit_policy.stopping() {
+                if self.lifecycle.exit_policy.stopping() {
                     // The runtime is tearing down and will not run the
                     // validation; reject on the request's own channel and
                     // poke the repaint so the requester's poll wakes
@@ -1788,7 +1720,7 @@ impl Runtime {
             }
             CoreCmd::CheckUpdate => self.check_update(),
             CoreCmd::SetTunMode(on) => {
-                if on == self.requested_tun_mode {
+                if on == self.lifecycle.requested_tun_mode {
                     // A toggle that asks for the mode already requested changes
                     // nothing: no record, no bookend, in either registry state.
                     // A held window still answers it — the occupant is named
@@ -1801,9 +1733,9 @@ impl Runtime {
                     }
                     return;
                 }
-                let active = self.backend.tun_owned_or_alive()
+                let active = self.lifecycle.backend.tun_owned_or_alive()
                     || matches!(
-                        self.phase,
+                        self.lifecycle.phase,
                         CorePhase::Starting | CorePhase::Running | CorePhase::Backoff { .. }
                     );
                 // The held-window guard and the begin are one call: a held
@@ -1815,15 +1747,15 @@ impl Runtime {
                 };
                 if active {
                     self.app_log(Diag::new(Key::RtLogTransportChangeRestart));
-                    self.pending_restart = None;
-                    if self.backend.tun_owned_or_alive() {
-                        self.exit_policy.begin_restart(Instant::now());
+                    self.lifecycle.pending_restart = None;
+                    if self.lifecycle.backend.tun_owned_or_alive() {
+                        self.lifecycle.exit_policy.begin_restart(Instant::now());
                         // `kill_backend` consults current ownership. Do not flip
                         // the requested next mode until TUN close was attempted.
                         self.kill_backend().await;
-                        self.requested_tun_mode = on;
+                        self.lifecycle.requested_tun_mode = on;
                     } else {
-                        self.requested_tun_mode = on;
+                        self.lifecycle.requested_tun_mode = on;
                         self.start_backend().await;
                     }
                 } else {
@@ -1831,7 +1763,7 @@ impl Runtime {
                     // carries no lifecycle: the record the guard opened closes
                     // here.
                     self.release_exclusive();
-                    self.requested_tun_mode = on;
+                    self.lifecycle.requested_tun_mode = on;
                 }
                 self.app_log(if on {
                     Diag::new(Key::RtLogTunModeOn)
@@ -1927,11 +1859,11 @@ impl Runtime {
             CoreCmd::Shutdown => {
                 self.cancel_exclusive(&Diag::new(Key::RtReasonShutdownRequested));
                 self.jobs.abort_all();
-                self.pending_restart = None;
-                self.pending_transition.clear();
-                self.core_update.clear();
-                self.exit_policy.finish();
-                self.shutting_down = true;
+                self.lifecycle.pending_restart = None;
+                self.lifecycle.pending_transition.clear();
+                self.lifecycle.core_update.clear();
+                self.lifecycle.exit_policy.finish();
+                self.lifecycle.shutting_down = true;
             }
         }
     }
@@ -2074,7 +2006,8 @@ impl Runtime {
         // is Running and owns it; with the core down or TUN off there is no
         // capture to bypass, and binding would let a stale adapter name fail
         // a probe nothing would have polluted.
-        let tun_active = matches!(self.phase, CorePhase::Running) && self.backend.is_tun_owned();
+        let tun_active = matches!(self.lifecycle.phase, CorePhase::Running)
+            && self.lifecycle.backend.is_tun_owned();
         let log = self.log_sink();
         let task = tokio::spawn(async move {
             let result = latency::run(
@@ -2121,7 +2054,7 @@ impl Runtime {
                     }
                 };
                 let events = pipe.take_events();
-                let Some(config_bytes) = self.helper_config_bytes.as_deref() else {
+                let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
                     self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
                         Key::RtPhaseHelperConfigLost,
                     ))));
@@ -2135,12 +2068,12 @@ impl Runtime {
                     self.release_exclusive();
                     return;
                 }
-                self.backend.attach_tun(pipe, events);
-                self.backend.mark_tun_started();
+                self.lifecycle.backend.attach_tun(pipe, events);
+                self.lifecycle.backend.mark_tun_started();
                 // The TUN adapter is up; drop stale resolver answers cached
                 // before it existed.
                 self.flush_dns_cache();
-                self.readiness.defer();
+                self.lifecycle.readiness.defer();
                 self.emit_active_config();
                 self.set_phase(CorePhase::Starting);
                 self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
@@ -2212,12 +2145,12 @@ impl Runtime {
                     // through the health-gate startup so no second update can
                     // race the candidate before it is acknowledged or rolled
                     // back. This work still runs entirely off the UI thread.
-                    self.core_update.commit_candidate();
+                    self.lifecycle.core_update.commit_candidate();
                     // The gate proves the installed binary with the app-owned
                     // configuration; it starts on the next housekeeping tick.
-                    self.update_gate_start = true;
+                    self.lifecycle.update_gate_start = true;
                     self.set_phase(CorePhase::Stopped);
-                    self.pending_restart = Some(Instant::now());
+                    self.lifecycle.pending_restart = Some(Instant::now());
                     return;
                 }
                 if succeeded && cancelled {
@@ -2280,43 +2213,43 @@ impl Runtime {
             self.release_exclusive();
             return;
         }
-        self.helper_config_bytes = Some(validated_bytes);
+        self.lifecycle.helper_config_bytes = Some(validated_bytes);
         self.emit(CoreEvt::ApplyResult {
             ok: true,
             output,
             revision,
         });
         self.app_log(Diag::new(Key::RtLogConfigApplied));
-        self.pending_transition.commit_candidate();
-        self.candidate_boot_retries = 0;
-        let active = self.backend.tun_owned_or_alive()
+        self.lifecycle.pending_transition.commit_candidate();
+        self.lifecycle.candidate_boot_retries = 0;
+        let active = self.lifecycle.backend.tun_owned_or_alive()
             || matches!(
-                self.phase,
+                self.lifecycle.phase,
                 CorePhase::Starting | CorePhase::Running | CorePhase::Backoff { .. }
             );
         if active {
-            self.pending_restart = None;
-            if self.backend.tun_owned_or_alive() {
-                self.exit_policy.begin_restart(Instant::now());
+            self.lifecycle.pending_restart = None;
+            if self.lifecycle.backend.tun_owned_or_alive() {
+                self.lifecycle.exit_policy.begin_restart(Instant::now());
                 // Cleanup and stop polling still use the old API endpoint and
                 // old TUN ownership. Commit next-backend state only after the
                 // graceful close request has been issued.
                 self.kill_backend().await;
             }
             self.commit_requested_backend(intent.tun_mode(), api_port);
-            if !self.backend.tun_owned_or_alive() {
+            if !self.lifecycle.backend.tun_owned_or_alive() {
                 // Do not recurse through the async start/rollback graph.
                 // Housekeeping owns the replacement after confirmed exit;
                 // inactive Backoff starts on its next tick.
-                if self.exit_policy.stopping() {
-                    self.exit_policy.begin_restart(Instant::now());
+                if self.lifecycle.exit_policy.stopping() {
+                    self.lifecycle.exit_policy.begin_restart(Instant::now());
                 } else {
-                    self.pending_restart = Some(Instant::now());
+                    self.lifecycle.pending_restart = Some(Instant::now());
                 }
             }
         } else if intent.starts_stopped_core() {
             self.commit_requested_backend(intent.tun_mode(), api_port);
-            self.pending_restart = Some(Instant::now());
+            self.lifecycle.pending_restart = Some(Instant::now());
         } else {
             self.commit_requested_backend(intent.tun_mode(), api_port);
             // The next explicit Start still carries the unproven candidate,
@@ -2326,7 +2259,7 @@ impl Runtime {
     }
 
     fn commit_requested_backend(&mut self, tun_mode: bool, api_port: u16) {
-        self.requested_tun_mode = tun_mode;
+        self.lifecycle.requested_tun_mode = tun_mode;
         self.api_port = api_port;
         self.grpc = GrpcClient::new(api_port);
         self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
@@ -2339,9 +2272,9 @@ impl Runtime {
     /// candidate supersedes the gate: the user's own start then carries the
     /// update's verdict (the gate flag is consumed either way).
     fn take_spawn_config_source(&mut self) -> SpawnConfigSource {
-        let gate = std::mem::take(&mut self.update_gate_start);
-        let replay = std::mem::take(&mut self.replay_after_rollback);
-        if self.pending_transition.is_candidate_pending() {
+        let gate = std::mem::take(&mut self.lifecycle.update_gate_start);
+        let replay = std::mem::take(&mut self.lifecycle.replay_after_rollback);
+        if self.lifecycle.pending_transition.is_candidate_pending() {
             return SpawnConfigSource::Committed;
         }
         if gate {
@@ -2359,7 +2292,7 @@ impl Runtime {
     /// the elevation ceremony nor the consent prompt a user's TUN session
     /// justifies.
     fn uses_elevated_helper(&self) -> bool {
-        self.requested_tun_mode && !self.gate_backend_alive
+        self.lifecycle.requested_tun_mode && !self.lifecycle.gate_backend_alive
     }
 
     /// Land a failure to produce the spawn's configuration — the app's own
@@ -2381,9 +2314,9 @@ impl Runtime {
         // Read before the ACK consumes it: only a pending update candidate
         // makes this failure keep the installed, hash-verified core, and the
         // line must say so before the phase error is read.
-        let kept_installed_core = self.core_update.is_candidate_pending();
+        let kept_installed_core = self.lifecycle.core_update.is_candidate_pending();
         // A no-op when no update candidate is unproven (`ack_ready` checks).
-        if let Err(error) = self.core_update.ack_ready() {
+        if let Err(error) = self.lifecycle.core_update.ack_ready() {
             self.app_log(error);
         }
         if kept_installed_core {
@@ -2402,17 +2335,17 @@ impl Runtime {
         // holds; `release_exclusive` below ends whichever record owns the
         // window.
         self.begin_internal_start();
-        if self.backend.is_alive() {
+        if self.lifecycle.backend.is_alive() {
             self.app_log(Diag::new(Key::RtLogInternalStartRejected));
             self.release_exclusive();
             return;
         }
-        if self.backend.is_tun_owned() {
+        if self.lifecycle.backend.is_tun_owned() {
             // This should only be reachable after an abnormal transport loss.
             // Attempt cleanup, release the owner, and refuse replacement:
             // without a confirmed exit, spawning on the same ports is unsafe.
             self.cleanup_tun().await;
-            self.backend.force_release();
+            self.lifecycle.backend.force_release();
             self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
                 Key::RtPhaseBackendReplacementCancelled,
             ))));
@@ -2430,13 +2363,14 @@ impl Runtime {
         // it still needs this session's first readiness verdict. Preserve the
         // in-memory candidate set by the completed install while also adopting
         // any durable pending swap recovered at startup.
-        let update_pending_before = self.core_update.is_candidate_pending();
-        self.core_update
+        let update_pending_before = self.lifecycle.core_update.is_candidate_pending();
+        self.lifecycle
+            .core_update
             .adopt_durable_marker(crate::sys::core_dl::update_pending_health());
-        if !update_pending_before && self.core_update.is_candidate_pending() {
+        if !update_pending_before && self.lifecycle.core_update.is_candidate_pending() {
             // A swap landed but was never proven: the first start of the
             // session is its health gate, with the app-owned configuration.
-            self.update_gate_start = true;
+            self.lifecycle.update_gate_start = true;
         }
 
         // Every spawn runs a configuration this build produced. A stored
@@ -2450,7 +2384,7 @@ impl Runtime {
         self.app_log(source.notice());
         // The gate's proof process is the one backend whose readiness does not
         // become the user's session; its first readiness ends it.
-        self.gate_backend_alive = matches!(source, SpawnConfigSource::CoreGate);
+        self.lifecycle.gate_backend_alive = matches!(source, SpawnConfigSource::CoreGate);
         let (api_port, generated_bytes) = match source {
             SpawnConfigSource::Committed => {
                 // A fresh apply this session wrote and validated the
@@ -2499,16 +2433,16 @@ impl Runtime {
             // `api.listen` is the endpoint the app must poll.
             self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
         }
-        self.backoff.reset_since();
-        self.core_update.clear_last_error();
+        self.lifecycle.backoff.reset_since();
+        self.lifecycle.core_update.clear_last_error();
         self.prev_traffic.clear();
         self.prev_inbound_traffic.clear();
         // The previous core's listener died with it: a start never inherits a
         // pending add. Only the TUN branch below arms one, from the config
         // that core will run — a direct child never owns the adapter whose
         // gateway the listener binds.
-        self.dns_in_listener = None;
-        self.dns_in_attempts = 0;
+        self.lifecycle.dns_in_listener = None;
+        self.lifecycle.dns_in_attempts = 0;
 
         // TUN always runs behind the authenticated helper, even when the GUI
         // itself happens to be elevated. That independent owner observes pipe
@@ -2525,23 +2459,25 @@ impl Runtime {
             // validated bytes; only a start without one falls back to the
             // active file.
             if let Some(bytes) = generated_bytes {
-                self.helper_config_bytes = Some(bytes);
-            } else if self.helper_config_bytes.is_none() {
-                self.helper_config_bytes = Some(match std::fs::read(apply::active_path()) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        self.settle_spawn_config_failure(
-                            DiagError::new(Diag::new(Key::RtPhaseConfigReadFailed))
-                                .caused_by(error),
-                        );
-                        return;
-                    }
-                });
+                self.lifecycle.helper_config_bytes = Some(bytes);
+            } else if self.lifecycle.helper_config_bytes.is_none() {
+                self.lifecycle.helper_config_bytes =
+                    Some(match std::fs::read(apply::active_path()) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            self.settle_spawn_config_failure(
+                                DiagError::new(Diag::new(Key::RtPhaseConfigReadFailed))
+                                    .caused_by(error),
+                            );
+                            return;
+                        }
+                    });
             }
             // Arm the in-tun DNS listener from the exact bytes the helper
             // stages: the listener binds the address this config pins as the
             // tun adapter's DNS, so the two can never drift.
-            self.dns_in_listener = self
+            self.lifecycle.dns_in_listener = self
+                .lifecycle
                 .helper_config_bytes
                 .as_deref()
                 .and_then(dns_in::listener_for_bytes);
@@ -2551,7 +2487,7 @@ impl Runtime {
 
         // A stopped helper is still an elevated process. Close its authenticated
         // pipe before replacing the backend with a direct child.
-        self.backend.release_pipe();
+        self.lifecycle.backend.release_pipe();
         // Every source above promoted its artefact to the active path, so the
         // child the runtime spawns is exactly the configuration this start
         // produced. The release-pin verify runs on the blocking pool; the
@@ -2574,25 +2510,25 @@ impl Runtime {
                     // core cannot grow the event queue.
                     sink.core_line(line);
                 }));
-                self.backend.spawn_direct(Box::new(child));
-                self.readiness.arm(
-                    self.pending_transition.is_candidate_pending(),
-                    self.backend.is_tun_owned(),
+                self.lifecycle.backend.spawn_direct(Box::new(child));
+                self.lifecycle.readiness.arm(
+                    self.lifecycle.pending_transition.is_candidate_pending(),
+                    self.lifecycle.backend.is_tun_owned(),
                 );
                 self.emit_active_config();
                 self.set_phase(CorePhase::Starting);
                 self.app_log(Diag::new(Key::RtLogCoreStartedDirect).arg(pid));
             }
             Err(error) => {
-                if self.core_update.is_candidate_pending() {
-                    self.core_update.clear_candidate();
+                if self.lifecycle.core_update.is_candidate_pending() {
+                    self.lifecycle.core_update.clear_candidate();
                     match crate::sys::core_dl::rollback_unhealthy_update() {
                         Ok(true) => {
                             self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
                                 DiagError::new(Diag::new(Key::RtFrameUpdatedCoreSpawnRestored))
                                     .caused_by(error),
                             ))));
-                            self.pending_restart = Some(Instant::now());
+                            self.lifecycle.pending_restart = Some(Instant::now());
                         }
                         Ok(false) => {
                             self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
@@ -2626,12 +2562,12 @@ impl Runtime {
     }
 
     fn start_via_helper(&mut self) {
-        if let Some(Backend::Pipe(pipe)) = self.backend.as_backend() {
+        if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
             // `start_backend` guaranteed the captured bytes before this
             // restart branch; a missing
             // capture is an invariant break and must fail loudly, never
             // fall back to a file re-read.
-            let Some(config_bytes) = self.helper_config_bytes.as_deref() else {
+            let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
                 self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
                     Key::RtPhaseHelperConfigLost,
                 ))));
@@ -2640,11 +2576,11 @@ impl Runtime {
             };
             match pipe.start(self.api_port, config_bytes) {
                 Ok(()) => {
-                    self.backend.mark_tun_started();
+                    self.lifecycle.backend.mark_tun_started();
                     // The TUN adapter is up; drop stale resolver answers
                     // cached before it existed.
                     self.flush_dns_cache();
-                    self.readiness.defer();
+                    self.lifecycle.readiness.defer();
                     self.emit_active_config();
                     self.set_phase(CorePhase::Starting);
                     self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
@@ -2710,27 +2646,10 @@ impl Runtime {
         self.app_log(Diag::new(Key::RtLogHelperLaunchWait));
     }
 
-    /// The elevated helper reports `starting` immediately after the xray child
-    /// was spawned and attached to its kill-on-close job. That is the spawn
-    /// confirmation the readiness clock may start from; other states are
-    /// informational — readiness itself comes from the gRPC poll. The reported
-    /// PID is the spawned child, recorded for the owning-PID readiness check;
-    /// an unknown (0) PID never records.
-    fn on_helper_state(&mut self, state: &str, pid: u32) {
-        if state == "starting" || state == "running" {
-            self.backend.set_child_pid(pid);
-        }
-        self.readiness.on_helper_state(
-            state,
-            self.pending_transition.is_candidate_pending(),
-            self.backend.is_tun_owned(),
-        );
-    }
-
     /// Returns whether the graceful close succeeded (or was not applicable:
     /// the backend does not own a TUN).
     async fn cleanup_tun(&mut self) -> bool {
-        if !self.backend.is_tun_owned() {
+        if !self.lifecycle.backend.is_tun_owned() {
             return true;
         }
         // Xray's Windows TUN cleanup lives in the inbound handler's Close.
@@ -2757,13 +2676,30 @@ impl Runtime {
         }
     }
 
+    /// How long a live backend may take to end on its own.
+    ///
+    /// A TUN-owned (or still-alive) child gets the wintun create window:
+    /// terminating a core stuck inside `WintunCreateAdapter`'s device-install
+    /// wait wedges PnP device creation for every wintun user on the machine,
+    /// and the create resolves by itself inside the window. Everything else
+    /// gets the generic stop timeout. The graceful-close miss in
+    /// `kill_backend`, the final shutdown wait and the exit-not-reported
+    /// check in `housekeeping` all read the window here.
+    fn stop_window(&self) -> Duration {
+        if self.lifecycle.backend.tun_owned_or_alive() {
+            TUN_STOP_WINDOW
+        } else {
+            STOP_TIMEOUT
+        }
+    }
+
     /// Wait until the backend's child reports exit. Returns whether an exit
     /// was observed before the caller's timeout.
     async fn wait_backend_exit(&mut self) -> bool {
-        if let Some(child) = self.backend.child_mut() {
+        if let Some(child) = self.lifecycle.backend.child_mut() {
             child.wait().await.is_ok()
-        } else if self.backend.is_pipe()
-            && let Some(events) = self.backend.events_mut()
+        } else if self.lifecycle.backend.is_pipe()
+            && let Some(events) = self.lifecycle.backend.events_mut()
         {
             while let Some(event) = events.recv().await {
                 if matches!(event, helper::HelperEvent::Exit(_)) {
@@ -2779,10 +2715,10 @@ impl Runtime {
     async fn kill_backend(&mut self) {
         // The in-tun DNS listener dies with the core it was added to; the
         // next start arms its own from the config that core runs.
-        self.dns_in_listener = None;
+        self.lifecycle.dns_in_listener = None;
         // Ownership, not the requested next mode, controls cleanup. This call
         // always precedes Direct::start_kill, helper Stop, or backend drop.
-        let tun = self.backend.is_tun_owned();
+        let tun = self.lifecycle.backend.is_tun_owned();
         let gracefully_closed = self.cleanup_tun().await;
         // PnP wedge prevention (2026-08-28, replayed 2026-09-09): a
         // TUN core that ignored the graceful close is likely stuck inside
@@ -2792,9 +2728,9 @@ impl Runtime {
         // window — the child either exits (create failed) or serves the API
         // again (create succeeded) — so wait it out before the kill. When the
         // child exits on its own nothing is left to stop.
-        if tun && !gracefully_closed && self.backend.is_alive() {
+        if tun && !gracefully_closed && self.lifecycle.backend.is_alive() {
             self.app_log(Diag::new(Key::RtLogTunCoreStopWindow));
-            match tokio::time::timeout(TUN_STOP_WINDOW, self.wait_backend_exit()).await {
+            match tokio::time::timeout(self.stop_window(), self.wait_backend_exit()).await {
                 Ok(true) => {
                     self.app_log(Diag::new(Key::RtLogTunCoreExited));
                     return;
@@ -2803,7 +2739,7 @@ impl Runtime {
                 Err(_) => self.app_log(Diag::new(Key::RtLogTunCoreAlive)),
             }
         }
-        match self.backend.as_backend_mut() {
+        match self.lifecycle.backend.as_backend_mut() {
             Some(Backend::Direct(child)) => child.start_kill(),
             Some(Backend::Pipe(pipe)) => {
                 if let Err(error) = pipe.stop() {
@@ -2820,35 +2756,31 @@ impl Runtime {
     /// the elevated helper to report that Xray exited after TUN cleanup instead
     /// of relying on destructor order while the GUI process is disappearing.
     async fn shutdown_backend(&mut self) {
-        self.pending_restart = None;
-        self.pending_transition.clear();
-        self.core_update.clear();
-        self.gate_backend_alive = false;
-        self.exit_policy.finish();
-        if self.backend.as_backend().is_none() {
-            self.backend.force_release();
+        self.lifecycle.pending_restart = None;
+        self.lifecycle.pending_transition.clear();
+        self.lifecycle.core_update.clear();
+        self.lifecycle.gate_backend_alive = false;
+        self.lifecycle.exit_policy.finish();
+        if self.lifecycle.backend.as_backend().is_none() {
+            self.lifecycle.backend.force_release();
             return;
         }
-        self.exit_policy.begin_stop(Instant::now());
-        if self.backend.tun_owned_or_alive() {
+        self.lifecycle.exit_policy.begin_stop(Instant::now());
+        if self.lifecycle.backend.tun_owned_or_alive() {
             self.kill_backend().await;
         }
         // Long-lived TUN children may still be inside the wintun create
         // window when their kill lands; give them the same TUN-aware window
-        // instead of the short generic timeout (PnP wedge prevention, 08-28 /
-        // 09-09). kill_backend above already waited the window when
-        // the graceful close failed, so this wait normally returns instantly.
-        let window = if self.backend.tun_owned_or_alive() {
-            TUN_STOP_WINDOW
-        } else {
-            STOP_TIMEOUT
-        };
+        // instead of the short generic timeout. `kill_backend` above already
+        // waited the window when the graceful close failed, so this wait
+        // normally returns instantly.
+        let window = self.stop_window();
         let _ = tokio::time::timeout(window, self.wait_backend_exit()).await;
         // Dropping Direct closes the kill-on-close job. Dropping Pipe closes
         // the watchdog channel; the helper performs its own bounded TUN close
         // before terminating its job.
-        self.backend.force_release();
-        self.exit_policy.finish();
+        self.lifecycle.backend.force_release();
+        self.lifecycle.exit_policy.finish();
     }
 
     // -- exit handling -------------------------------------------------------
@@ -2879,17 +2811,17 @@ impl Runtime {
         // Same invariant as on_core_exit: a foreign in-flight user operation
         // must not be silently dropped when the helper transport dies.
         self.cancel_exclusive_for_exit(&Diag::new(Key::RtReasonHelperDisconnected));
-        self.gate_backend_alive = false;
-        let explicit_stop = self.exit_policy.is_explicit_stop();
-        let was_tun = self.backend.is_tun_owned();
-        self.backend.force_release();
+        self.lifecycle.gate_backend_alive = false;
+        let explicit_stop = self.lifecycle.exit_policy.is_explicit_stop();
+        let was_tun = self.lifecycle.backend.is_tun_owned();
+        self.lifecycle.backend.force_release();
         if was_tun {
             // Helper died while owning the TUN; the adapter is gone too.
             self.flush_dns_cache();
         }
-        self.exit_policy.finish();
+        self.lifecycle.exit_policy.finish();
 
-        if let Some(reason) = self.pending_transition.drain_failure() {
+        if let Some(reason) = self.lifecycle.pending_transition.drain_failure() {
             let output = AppMessage::from(
                 Diag::new(Key::RtFrameConfigRollbackCancelled).arg_message(reason),
             );
@@ -2897,14 +2829,14 @@ impl Runtime {
             self.emit(CoreEvt::RollbackResult { ok: false, output });
         }
 
-        if let Some(reason) = self.core_update.drain_failure() {
+        if let Some(reason) = self.lifecycle.core_update.drain_failure() {
             let output =
                 AppMessage::from(Diag::new(Key::RtFrameCoreRollbackCancelled).arg_message(reason));
             self.app_log(output.clone());
             self.emit(CoreEvt::Download(DownloadState::Failed(output)));
         }
 
-        if !self.shutting_down {
+        if !self.lifecycle.shutting_down {
             if explicit_stop {
                 self.set_phase(CorePhase::Stopped);
             } else {
@@ -2922,9 +2854,9 @@ impl Runtime {
         // restart path would leave the operation to `start_backend`'s foreign
         // child, whose readiness would drop the JoinHandle and its result.
         self.cancel_exclusive_for_exit(&Diag::new(Key::RtReasonCoreExitedUnexpectedly));
-        self.gate_backend_alive = false;
-        let was_tun = self.backend.is_tun_owned();
-        self.backend.confirm_exit();
+        self.lifecycle.gate_backend_alive = false;
+        let was_tun = self.lifecycle.backend.is_tun_owned();
+        self.lifecycle.backend.confirm_exit();
         if was_tun {
             // The TUN adapter is gone; the next boot would otherwise serve
             // stale cached answers from before the switch.
@@ -2936,41 +2868,33 @@ impl Runtime {
 
         // The classifier owns the branch precedence; every arm below keeps
         // the side effects it had when the chain was inline.
-        match classify_core_exit(CoreExitFacts {
-            config_rollback_armed: self.pending_transition.rollback_pending().is_some(),
-            update_rollback_armed: self.core_update.rollback_pending().is_some(),
-            intent: self.exit_policy.kind(),
-            config_candidate_pending: self.pending_transition.is_candidate_pending(),
-            update_candidate_pending: self.core_update.is_candidate_pending(),
-            starting: matches!(self.phase, CorePhase::Starting),
-            code,
-        }) {
+        match classify_core_exit(self.lifecycle.exit_facts(code)) {
             // A candidate timeout sets the armed rollback before requesting
             // termination; the rollback is deliberately reached only from this
             // confirmed-exit path.
             ExitBranch::ConfigRollback => {
-                self.exit_policy.finish();
+                self.lifecycle.exit_policy.finish();
                 self.complete_pending_rollback().await;
             }
             ExitBranch::CoreRollback => {
-                self.exit_policy.finish();
+                self.lifecycle.exit_policy.finish();
                 self.complete_pending_core_rollback().await;
             }
             ExitBranch::Silenced => {
-                self.exit_policy.finish();
+                self.lifecycle.exit_policy.finish();
                 self.release_exclusive();
             }
             ExitBranch::RestartQueued => {
-                self.exit_policy.finish();
+                self.lifecycle.exit_policy.finish();
                 // Exit confirmation is the sequencing barrier. Queue the
                 // replacement so this handler never recursively enters the
                 // start graph and the busy owner remains held.
-                self.pending_restart = Some(Instant::now());
+                self.lifecycle.pending_restart = Some(Instant::now());
             }
             ExitBranch::StopSettled => {
-                self.exit_policy.finish();
-                if !self.shutting_down {
-                    self.backend.force_release();
+                self.lifecycle.exit_policy.finish();
+                if !self.lifecycle.shutting_down {
+                    self.lifecycle.backend.force_release();
                     self.set_phase(CorePhase::Stopped);
                     self.release_exclusive();
                 }
@@ -2982,7 +2906,8 @@ impl Runtime {
                 // apply); the budget rule lives in `policy`.
                 let failure = classify_pre_readiness_exit(was_tun, &tail);
                 let budget = candidate_retry_budget(failure);
-                if let Some(attempt) = spend_retry_attempt(&mut self.candidate_boot_retries, budget)
+                if let Some(attempt) =
+                    spend_retry_attempt(&mut self.lifecycle.candidate_boot_retries, budget)
                 {
                     let key = if matches!(failure, Some(PreReadinessFailure::DnsInBindRace)) {
                         Key::RtFrameCandidateRetryBindRace
@@ -2990,17 +2915,17 @@ impl Runtime {
                         Key::RtFrameCandidateRetryTeardownRace
                     };
                     self.app_log(Diag::new(key).arg_message(reason).arg(attempt).arg(budget));
-                    self.pending_restart = Some(Instant::now() + CANDIDATE_RETRY_DELAY);
+                    self.lifecycle.pending_restart = Some(Instant::now() + CANDIDATE_RETRY_DELAY);
                     return;
                 }
-                if self.pending_transition.arm_rollback(reason) {
+                if self.lifecycle.pending_transition.arm_rollback(reason) {
                     self.complete_pending_rollback().await;
                 }
             }
             ExitBranch::UpdatePreReadiness => {
                 let reason = pre_readiness_reason(Key::RtFrameUpdatedCoreExited, code, &tail);
                 if update_retries_bind_race(was_tun, &tail)
-                    && let Some(attempt) = self.core_update.spend_bind_race_retry()
+                    && let Some(attempt) = self.lifecycle.core_update.spend_bind_race_retry()
                 {
                     self.app_log(
                         Diag::new(Key::RtFrameUpdateRetryBindRace)
@@ -3008,13 +2933,13 @@ impl Runtime {
                             .arg(attempt)
                             .arg(TUN_BIND_RACE_RETRIES),
                     );
-                    self.pending_restart = Some(Instant::now() + CANDIDATE_RETRY_DELAY);
+                    self.lifecycle.pending_restart = Some(Instant::now() + CANDIDATE_RETRY_DELAY);
                     return;
                 }
                 // Every other pre-readiness failure rolls the update back
                 // immediately: only the fresh Go-map-order roll of the race
                 // can come up healthy on the next attempt.
-                self.core_update.fail_before_readiness(reason);
+                self.lifecycle.core_update.fail_before_readiness(reason);
                 self.complete_pending_core_rollback().await;
             }
             ExitBranch::UpdateConfigError => {
@@ -3042,7 +2967,7 @@ impl Runtime {
             ExitBranch::Backoff => {
                 // Any other unexpected exit: exponential backoff with jitter.
                 let jitter_ms = self.next_rand() % 250;
-                let (attempt, delay_ms) = self.backoff.next(Instant::now(), jitter_ms);
+                let (attempt, delay_ms) = self.lifecycle.backoff.next(Instant::now(), jitter_ms);
                 self.app_log(
                     Diag::new(Key::RtLogCoreExitBackoff)
                         .arg(exit_code_text(code))
@@ -3050,13 +2975,24 @@ impl Runtime {
                         .arg(delay_ms),
                 );
                 self.set_phase(CorePhase::Backoff { attempt });
-                self.pending_restart = Some(Instant::now() + Duration::from_millis(delay_ms));
+                self.lifecycle.pending_restart =
+                    Some(Instant::now() + Duration::from_millis(delay_ms));
             }
         }
     }
 
+    /// The exit is over and nothing replaces it: settle the phase to
+    /// `Stopped` and hand the operation slot back. Both rollback completions
+    /// end here when their replacement cannot come up, and so does an exit
+    /// that ran out its stop window with no restart wanted.
+    fn settle_stopped(&mut self) {
+        self.set_phase(CorePhase::Stopped);
+        self.release_exclusive();
+    }
+
     async fn complete_pending_rollback(&mut self) {
         let Some(reason) = self
+            .lifecycle
             .pending_transition
             .take_rollback_after_confirmed_exit(true)
         else {
@@ -3064,7 +3000,7 @@ impl Runtime {
         };
         // Clearing this before the filesystem operation makes the retry
         // one-shot even if the last-good replacement also fails to start.
-        self.pending_transition.clear_candidate();
+        self.lifecycle.pending_transition.clear_candidate();
         match apply::rollback_offloaded().await {
             Ok(()) => {
                 let output =
@@ -3074,13 +3010,13 @@ impl Runtime {
                 // The next start replays the restored last-known-good
                 // artefact instead of regenerating: regeneration would
                 // produce the configuration the candidate just failed on.
-                self.replay_after_rollback = true;
+                self.lifecycle.replay_after_rollback = true;
                 // The active config changed under us; the next start must
                 // capture the rolled-back file instead of the rejected
                 // candidate's bytes.
-                self.helper_config_bytes = None;
+                self.lifecycle.helper_config_bytes = None;
                 // Queue rather than recursively awaiting the start graph.
-                self.pending_restart = Some(Instant::now());
+                self.lifecycle.pending_restart = Some(Instant::now());
             }
             Err(error) => {
                 let output = AppMessage::from(
@@ -3089,23 +3025,26 @@ impl Runtime {
                 );
                 self.app_log(output.clone());
                 self.emit(CoreEvt::RollbackResult { ok: false, output });
-                self.set_phase(CorePhase::Stopped);
-                self.release_exclusive();
+                self.settle_stopped();
             }
         }
     }
 
     async fn complete_pending_core_rollback(&mut self) {
-        let Some(reason) = self.core_update.take_rollback_after_confirmed_exit(true) else {
+        let Some(reason) = self
+            .lifecycle
+            .core_update
+            .take_rollback_after_confirmed_exit(true)
+        else {
             return;
         };
-        self.core_update.clear_candidate();
+        self.lifecycle.core_update.clear_candidate();
 
         // `Backend::Direct` retains deny-write/delete handles for every
         // verified payload until its `Child` is dropped. Drop that owner only
         // after the exit has been confirmed, before renaming the managed core
         // directory back to its retained last-good sibling.
-        self.backend.force_release();
+        self.lifecycle.backend.force_release();
 
         let (output, restart) = match crate::sys::core_dl::rollback_unhealthy_update() {
             Ok(true) => (
@@ -3135,10 +3074,9 @@ impl Runtime {
             // `start_backend` will acquire its own Restart operation on the
             // next housekeeping tick. Release UpdateCore first.
             self.release_exclusive();
-            self.pending_restart = Some(Instant::now());
+            self.lifecycle.pending_restart = Some(Instant::now());
         } else {
-            self.set_phase(CorePhase::Stopped);
-            self.release_exclusive();
+            self.settle_stopped();
         }
     }
 
@@ -3151,38 +3089,38 @@ impl Runtime {
         // "starting"`). Helper staging/validation must not count against the
         // deadline, and a timeout or explicit stop may race a final successful
         // RPC; once termination is requested, the exit path owns the verdict.
-        if !self.backend.is_alive() || self.exit_policy.stopping() {
+        if !self.lifecycle.backend.is_alive() || self.lifecycle.exit_policy.stopping() {
             return;
         }
-        match self.readiness.poll(Instant::now()) {
+        match self.lifecycle.readiness.poll(Instant::now()) {
             Poll::Unarmed => return,
             Poll::Pending => {}
             Poll::Fired => {
                 match readiness_timeout_verdict(
-                    self.pending_transition.is_candidate_pending(),
-                    self.core_update.is_candidate_pending(),
-                    self.core_update.rollback_pending().is_some(),
+                    self.lifecycle.pending_transition.is_candidate_pending(),
+                    self.lifecycle.core_update.is_candidate_pending(),
+                    self.lifecycle.core_update.rollback_pending().is_some(),
                 ) {
                     ReadinessTimeout::AppliedCandidate => {
-                        let _ = self.pending_transition.arm_rollback(
+                        let _ = self.lifecycle.pending_transition.arm_rollback(
                             Diag::new(Key::RtFrameCandidateReadyTimeout)
                                 .arg(READY_TIMEOUT_APPLIED.as_secs()),
                         );
-                        self.exit_policy.begin_stop(Instant::now());
+                        self.lifecycle.exit_policy.begin_stop(Instant::now());
                         self.kill_backend().await;
                     }
                     ReadinessTimeout::UpdatedCore => {
                         // The last readiness miss is its own keyed sentence,
                         // nested so it renders in the same language.
-                        let reason = match self.core_update.last_readiness_error() {
+                        let reason = match self.lifecycle.core_update.last_readiness_error() {
                             Some(miss) => Diag::new(Key::RtFrameUpdatedCoreReadyTimeoutApi)
                                 .arg(READY_TIMEOUT.as_secs())
                                 .arg_message(miss.clone()),
                             None => Diag::new(Key::RtFrameUpdatedCoreReadyTimeout)
                                 .arg(READY_TIMEOUT.as_secs()),
                         };
-                        if self.core_update.arm_rollback(reason) {
-                            self.exit_policy.begin_stop(Instant::now());
+                        if self.lifecycle.core_update.arm_rollback(reason) {
+                            self.lifecycle.exit_policy.begin_stop(Instant::now());
                             self.kill_backend().await;
                         } else {
                             self.silence_readiness_timeout().await;
@@ -3202,12 +3140,13 @@ impl Runtime {
                 // proves the responder is this child. The adapter may still
                 // be coming up when readiness lands, so a failed first
                 // attempt stays pending for the retry arm.
-                if listener_owned && matches!(self.phase, CorePhase::Running) {
+                if listener_owned && matches!(self.lifecycle.phase, CorePhase::Running) {
                     self.dns_in_poll().await;
                 }
             }
             Err(error) => {
-                self.core_update
+                self.lifecycle
+                    .core_update
                     .record_readiness_error(Diag::new(Key::RtFrameApiProbeFailed).arg(error));
             } // bounded miss; next tick retries
         }
@@ -3220,12 +3159,12 @@ impl Runtime {
     /// Best-effort, like the helper's DNS shield: a core that is serving
     /// traffic is never torn down because a listener could not be added.
     async fn dns_in_poll(&mut self) {
-        let Some(listener) = self.dns_in_listener else {
+        let Some(listener) = self.lifecycle.dns_in_listener else {
             return;
         };
         match self.grpc.add_dns_in_listener(&listener).await {
             Ok(()) => {
-                self.dns_in_listener = None;
+                self.lifecycle.dns_in_listener = None;
                 self.app_log(
                     Diag::new(Key::RtLogDnsInListenerAdded)
                         .arg(listener.address)
@@ -3233,8 +3172,10 @@ impl Runtime {
                 );
             }
             Err(error) => {
-                if spend_retry_attempt(&mut self.dns_in_attempts, DNS_IN_ADD_ATTEMPTS).is_none() {
-                    self.dns_in_listener = None;
+                if spend_retry_attempt(&mut self.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS)
+                    .is_none()
+                {
+                    self.lifecycle.dns_in_listener = None;
                     self.app_log(Diag::new(Key::RtLogDnsInListenerNotAdded).arg(error));
                 }
             }
@@ -3247,7 +3188,9 @@ impl Runtime {
     /// shared diagnostics wall, matching probe-failure records. The silenced
     /// exit policy keeps the confirmed exit from reporting a second time.
     async fn silence_readiness_timeout(&mut self) {
-        self.exit_policy.begin_silenced_stop(Instant::now());
+        self.lifecycle
+            .exit_policy
+            .begin_silenced_stop(Instant::now());
         self.kill_backend().await;
         let tail = self.output_tail(START_FAILURE_EXCERPT_LINES);
         self.set_phase(CorePhase::Error(
@@ -3262,7 +3205,8 @@ impl Runtime {
     /// rollback gate or ACK the core-update backup. Mismatch or
     /// unverifiable → `false` (never trust).
     fn api_listener_owned_by_child(&self) -> bool {
-        self.backend
+        self.lifecycle
+            .backend
             .child_pid()
             .is_some_and(|pid| readiness::api_listener_owned_by(self.api_port, pid))
     }
@@ -3271,7 +3215,8 @@ impl Runtime {
     /// The gate/backup side effects run only for the verified responder.
     async fn complete_readiness_probe(&mut self, listener_owned: bool) {
         if !listener_owned {
-            self.core_update
+            self.lifecycle
+                .core_update
                 .record_readiness_error(Diag::new(Key::RtFrameApiListenerNotOwned));
             return;
         }
@@ -3279,11 +3224,11 @@ impl Runtime {
         // or the update operation is released. Otherwise a failed
         // backup/marker cleanup could be misreported healthy and allow
         // another overlapping transaction.
-        if let Err(message) = self.core_update.ack_ready() {
+        if let Err(message) = self.lifecycle.core_update.ack_ready() {
             self.app_log(message);
             return;
         }
-        if self.gate_backend_alive {
+        if self.lifecycle.gate_backend_alive {
             // The health gate proved the installed binary and the update is
             // installed (the ACK above consumed the marker and the retained
             // tree). Its process runs the app-owned configuration, which
@@ -3292,15 +3237,15 @@ impl Runtime {
             // releases the update operation. The user's configuration enters
             // through the next apply.
             self.app_log(Diag::new(Key::RtLogHealthGateCompleted));
-            self.gate_backend_alive = false;
-            self.exit_policy.begin_stop(Instant::now());
+            self.lifecycle.gate_backend_alive = false;
+            self.lifecycle.exit_policy.begin_stop(Instant::now());
             self.kill_backend().await;
             return;
         }
         self.set_phase(CorePhase::Running);
-        self.backoff.mark_ready(Instant::now());
-        self.pending_transition.clear_candidate();
-        self.candidate_boot_retries = 0;
+        self.lifecycle.backoff.mark_ready(Instant::now());
+        self.lifecycle.pending_transition.clear_candidate();
+        self.lifecycle.candidate_boot_retries = 0;
         self.app_log(Diag::new(Key::RtLogCoreReady));
         self.release_exclusive();
     }
@@ -3395,7 +3340,7 @@ impl Runtime {
 
     async fn stats_poll(&mut self) {
         // Reset backoff after a stable minute.
-        self.backoff.maybe_reset(Instant::now());
+        self.lifecycle.backoff.maybe_reset(Instant::now());
 
         // Both sweeps hit the same loopback channel; a failure means the core
         // is unreachable or restarting — drop the whole sample (the exit
@@ -3482,34 +3427,33 @@ impl Runtime {
     /// window classifies as an unexpected one, re-arms the restart machinery,
     /// and would otherwise start a core this teardown is about to reap.
     fn restart_due(&self) -> bool {
-        !self.shutting_down
-            && self.pending_restart.is_some_and(|at| Instant::now() >= at)
-            && !self.exit_policy.stopping()
-            && !self.backend.is_alive()
+        !self.lifecycle.shutting_down
+            && self
+                .lifecycle
+                .pending_restart
+                .is_some_and(|at| Instant::now() >= at)
+            && !self.lifecycle.exit_policy.stopping()
+            && !self.lifecycle.backend.is_alive()
     }
 
     async fn housekeeping(&mut self) {
         if self.restart_due() {
-            self.pending_restart = None;
+            self.lifecycle.pending_restart = None;
             self.start_backend().await;
         }
-        if !self.exit_policy.stopping()
-            || !self.exit_policy.stop_timed_out(
-                Instant::now(),
-                if self.backend.tun_owned_or_alive() {
-                    TUN_STOP_WINDOW
-                } else {
-                    STOP_TIMEOUT
-                },
-            )
+        if !self.lifecycle.exit_policy.stopping()
+            || !self
+                .lifecycle
+                .exit_policy
+                .stop_timed_out(Instant::now(), self.stop_window())
         {
             return;
         }
 
         self.app_log(Diag::new(Key::RtLogExitNotReported));
-        if self.backend.is_direct() {
+        if self.lifecycle.backend.is_direct() {
             let status = {
-                let child = match self.backend.child_mut() {
+                let child = match self.lifecycle.backend.child_mut() {
                     Some(child) => child,
                     None => unreachable!(),
                 };
@@ -3526,31 +3470,28 @@ impl Runtime {
         // owning Job/pipe is the final fallback, but it does not prove the old
         // child exited. A pending rollback/restart is therefore cancelled
         // instead of spawning against possibly occupied ports.
-        self.backend.force_release();
-        let wanted_restart = self.exit_policy.finish();
-        if let Some(reason) = self.pending_transition.drain_rollback() {
+        self.lifecycle.backend.force_release();
+        let wanted_restart = self.lifecycle.exit_policy.finish();
+        if let Some(reason) = self.lifecycle.pending_transition.drain_rollback() {
             let output = AppMessage::from(
                 Diag::new(Key::RtFrameConfigRollbackCancelled).arg_message(reason),
             );
             self.app_log(output.clone());
             self.emit(CoreEvt::RollbackResult { ok: false, output });
-            self.set_phase(CorePhase::Stopped);
-            self.release_exclusive();
-        } else if let Some(reason) = self.core_update.drain_rollback() {
+            self.settle_stopped();
+        } else if let Some(reason) = self.lifecycle.core_update.drain_rollback() {
             let output =
                 AppMessage::from(Diag::new(Key::RtFrameCoreRollbackCancelled).arg_message(reason));
             self.app_log(output.clone());
             self.emit(CoreEvt::Download(DownloadState::Failed(output)));
-            self.set_phase(CorePhase::Stopped);
-            self.release_exclusive();
+            self.settle_stopped();
         } else if wanted_restart {
             self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
                 Key::RtPhaseRestartCancelled,
             ))));
             self.release_exclusive();
-        } else if !self.shutting_down {
-            self.set_phase(CorePhase::Stopped);
-            self.release_exclusive();
+        } else if !self.lifecycle.shutting_down {
+            self.settle_stopped();
         }
     }
 
@@ -3574,8 +3515,10 @@ impl Runtime {
     /// marker-first swap plus `recover_interrupted_swap` keep the managed
     /// core directory consistent for the next launch.
     fn update_core(&mut self, source: CoreUpdateSource) {
-        if !matches!(self.phase, CorePhase::Stopped | CorePhase::Error(_))
-            || self.backend.is_alive()
+        if !matches!(
+            self.lifecycle.phase,
+            CorePhase::Stopped | CorePhase::Error(_)
+        ) || self.lifecycle.backend.is_alive()
         {
             self.emit(CoreEvt::Download(DownloadState::Failed(AppMessage::from(
                 Diag::new(Key::RtFrameUpdateStopCoreFirst),
@@ -4277,23 +4220,23 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unverified_responder_never_clears_gates_or_acks_backup() {
         let mut runtime = runtime();
-        runtime.backend = BackendState::for_test(true, false);
-        runtime.backend.set_child_pid(4242);
-        runtime.pending_transition.commit_candidate();
-        runtime.core_update.commit_candidate();
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.backend.set_child_pid(4242);
+        runtime.lifecycle.pending_transition.commit_candidate();
+        runtime.lifecycle.core_update.commit_candidate();
 
         runtime.complete_readiness_probe(false).await;
 
         assert!(
-            runtime.pending_transition.is_candidate_pending(),
+            runtime.lifecycle.pending_transition.is_candidate_pending(),
             "a spoofed responder must not clear the config-rollback gate"
         );
         assert!(
-            runtime.core_update.is_candidate_pending(),
+            runtime.lifecycle.core_update.is_candidate_pending(),
             "a spoofed responder must not ACK (delete) the core-update backup"
         );
         assert!(
-            !matches!(runtime.phase, super::CorePhase::Running),
+            !matches!(runtime.lifecycle.phase, super::CorePhase::Running),
             "readiness must not be trusted without owning-PID verification"
         );
     }
@@ -4304,16 +4247,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn verified_listener_clears_the_rollback_gate() {
         let mut runtime = runtime();
-        runtime.backend = BackendState::for_test(true, false);
-        runtime.backend.set_child_pid(4242);
-        runtime.pending_transition.commit_candidate();
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.backend.set_child_pid(4242);
+        runtime.lifecycle.pending_transition.commit_candidate();
 
         runtime.complete_readiness_probe(true).await;
 
-        assert!(!runtime.pending_transition.is_candidate_pending());
-        assert!(matches!(runtime.phase, super::CorePhase::Running));
+        assert!(!runtime.lifecycle.pending_transition.is_candidate_pending());
+        assert!(matches!(runtime.lifecycle.phase, super::CorePhase::Running));
         assert!(
-            !runtime.core_update.is_candidate_pending(),
+            !runtime.lifecycle.core_update.is_candidate_pending(),
             "a no-op ack must stay a no-op"
         );
     }
@@ -4321,25 +4264,26 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn tun_readiness_deadline_arms_only_after_helper_confirms_spawn() {
         let mut runtime = runtime();
-        runtime.pending_transition.commit_candidate();
-        runtime.requested_tun_mode = true;
-        runtime.backend = BackendState::for_test(true, true);
+        runtime.lifecycle.pending_transition.commit_candidate();
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.backend = BackendState::for_test(true, true);
 
         // `pipe.start()` has been accepted, but the elevated helper is still
         // staging/validating (up to CONFIG_TEST_TIMEOUT plus the payload copy)
         // — the xray child does not exist yet, so no deadline may be armed.
-        runtime.readiness.defer();
+        runtime.lifecycle.readiness.defer();
         assert!(
-            !runtime.readiness.armed(),
+            !runtime.lifecycle.readiness.armed(),
             "TUN staging must not arm the readiness clock before spawn confirmation"
         );
 
         // The helper reports the child spawned; the clock starts here, never
         // earlier than the confirmation instant.
         let confirmation = Instant::now();
-        runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness.armed());
+        runtime.lifecycle.on_helper_state("starting", 4242);
+        assert!(runtime.lifecycle.readiness.armed());
         let ahead = runtime
+            .lifecycle
             .readiness
             .deadline()
             .expect("armed deadline")
@@ -4357,22 +4301,23 @@ mod tests {
         );
 
         // A later informational state must not re-arm (or extend) the clock.
-        let armed = runtime.readiness.deadline();
-        runtime.on_helper_state("running", 4242);
-        assert_eq!(runtime.readiness.deadline(), armed);
+        let armed = runtime.lifecycle.readiness.deadline();
+        runtime.lifecycle.on_helper_state("running", 4242);
+        assert_eq!(runtime.lifecycle.readiness.deadline(), armed);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn tun_plain_start_arms_deadline_with_cold_start_timeout() {
         let mut runtime = runtime();
-        runtime.requested_tun_mode = true;
-        runtime.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
 
-        runtime.readiness.defer();
+        runtime.lifecycle.readiness.defer();
         let confirmation = Instant::now();
-        runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness.armed());
+        runtime.lifecycle.on_helper_state("starting", 4242);
+        assert!(runtime.lifecycle.readiness.armed());
         let ahead = runtime
+            .lifecycle
             .readiness
             .deadline()
             .expect("armed deadline")
@@ -4387,53 +4332,63 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn slow_tun_staging_never_triggers_candidate_rollback() {
         let mut runtime = runtime();
-        runtime.pending_transition.commit_candidate();
-        runtime.requested_tun_mode = true;
-        runtime.backend = BackendState::for_test(true, false);
-        runtime.readiness.defer();
+        runtime.lifecycle.pending_transition.commit_candidate();
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.readiness.defer();
 
         // While the readiness clock is unarmed (helper still staging), ready_poll
         // must no-op: no rollback, the candidate stays pending, no stop begun.
         runtime.ready_poll().await;
 
         assert!(
-            runtime.pending_transition.rollback_pending().is_none(),
+            runtime
+                .lifecycle
+                .pending_transition
+                .rollback_pending()
+                .is_none(),
             "slow staging must not queue a candidate rollback"
         );
         assert!(
-            runtime.pending_transition.is_candidate_pending(),
+            runtime.lifecycle.pending_transition.is_candidate_pending(),
             "the applied candidate must stay pending while staging"
         );
-        assert!(!runtime.exit_policy.stopping());
+        assert!(!runtime.lifecycle.exit_policy.stopping());
 
         // The helper finally confirms the spawn: the clock starts now, and a
         // genuine post-confirmation timeout still queues exactly one rollback.
-        runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness.armed());
+        runtime.lifecycle.on_helper_state("starting", 4242);
+        assert!(runtime.lifecycle.readiness.armed());
         runtime
+            .lifecycle
             .readiness
             .arm_at(Instant::now() - Duration::from_millis(1));
         runtime.ready_poll().await;
         assert!(
-            runtime.pending_transition.rollback_pending().is_some(),
+            runtime
+                .lifecycle
+                .pending_transition
+                .rollback_pending()
+                .is_some(),
             "a genuine readiness timeout after spawn confirmation must roll back"
         );
-        assert!(!runtime.pending_transition.is_candidate_pending());
-        assert!(runtime.exit_policy.stopping());
+        assert!(!runtime.lifecycle.pending_transition.is_candidate_pending());
+        assert!(runtime.lifecycle.exit_policy.stopping());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn direct_start_arms_readiness_deadline_immediately() {
         let mut runtime = runtime();
-        runtime.pending_transition.commit_candidate();
+        runtime.lifecycle.pending_transition.commit_candidate();
         // The direct path arms right after `supervisor::spawn` succeeds; the
         // clock must be live immediately, before any ready poll.
-        runtime.readiness.arm(
-            runtime.pending_transition.is_candidate_pending(),
-            runtime.backend.is_tun_owned(),
+        runtime.lifecycle.readiness.arm(
+            runtime.lifecycle.pending_transition.is_candidate_pending(),
+            runtime.lifecycle.backend.is_tun_owned(),
         );
-        assert!(runtime.readiness.armed());
+        assert!(runtime.lifecycle.readiness.armed());
         let remaining = runtime
+            .lifecycle
             .readiness
             .deadline()
             .expect("armed deadline")
@@ -4475,7 +4430,7 @@ mod tests {
                 runtime.jobs.is_cancel_requested(),
                 "the held record must record the cancellation"
             );
-            assert!(!runtime.backend.is_alive());
+            assert!(!runtime.lifecycle.backend.is_alive());
 
             // A second update while the first install still owns the slot
             // must be rejected: the single in-flight install invariant
@@ -4607,9 +4562,9 @@ mod tests {
             })
             .await;
 
-        assert!(runtime.core_update.is_candidate_pending());
+        assert!(runtime.lifecycle.core_update.is_candidate_pending());
         assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::UpdateCore));
-        assert!(runtime.pending_restart.is_some());
+        assert!(runtime.lifecycle.pending_restart.is_some());
         flush_bookends(&mut runtime);
         assert!(
             !events
@@ -4621,8 +4576,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejected_update_emits_a_terminal_operation_event() {
         let (mut runtime, events) = runtime_with_events();
-        runtime.phase = super::CorePhase::Running;
-        runtime.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
 
         runtime.handle_cmd(CoreCmd::UpdateCore).await;
 
@@ -4642,8 +4597,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejected_import_emits_a_terminal_operation_event() {
         let (mut runtime, events) = runtime_with_events();
-        runtime.phase = super::CorePhase::Running;
-        runtime.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
 
         runtime
             .handle_cmd(CoreCmd::ImportCoreArchive("selected.zip".into()))
@@ -4672,13 +4627,16 @@ mod tests {
         with_appdata_async(async {
             let (mut runtime, events) = runtime_with_events();
             occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-            runtime.core_update.commit_candidate();
-            runtime.core_update.arm_rollback(rollback_reason());
+            runtime.lifecycle.core_update.commit_candidate();
+            runtime
+                .lifecycle
+                .core_update
+                .arm_rollback(rollback_reason());
 
             runtime.complete_pending_core_rollback().await;
 
             assert!(runtime.jobs.busy_kind().is_none());
-            assert!(matches!(runtime.phase, super::CorePhase::Stopped));
+            assert!(matches!(runtime.lifecycle.phase, super::CorePhase::Stopped));
             flush_bookends(&mut runtime);
             let emitted: Vec<_> = events.try_iter().collect();
             assert!(emitted.iter().any(|event| matches!(
@@ -4741,13 +4699,16 @@ mod tests {
         )
         .expect("write update marker");
         occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        runtime.core_update.commit_candidate();
-        runtime.core_update.arm_rollback(rollback_reason());
+        runtime.lifecycle.core_update.commit_candidate();
+        runtime
+            .lifecycle
+            .core_update
+            .arm_rollback(rollback_reason());
 
         runtime.complete_pending_core_rollback().await;
 
         assert!(runtime.jobs.busy_kind().is_none());
-        assert!(runtime.pending_restart.is_some());
+        assert!(runtime.lifecycle.pending_restart.is_some());
         flush_bookends(&mut runtime);
         let emitted: Vec<_> = events.try_iter().collect();
         assert!(
@@ -4782,8 +4743,8 @@ mod tests {
 
         let mut runtime = runtime();
         runtime.grpc = crate::rt::grpc::GrpcClient::new(port);
-        runtime.phase = super::CorePhase::Running;
-        runtime.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
         let started = Instant::now();
         runtime.stats_poll().await;
         assert!(
@@ -4815,13 +4776,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn requested_tun_mode_never_rewrites_current_backend_ownership() {
         let mut runtime = runtime();
-        runtime.backend = BackendState::for_test(true, true);
-        runtime.requested_tun_mode = false;
-        assert!(runtime.backend.is_tun_owned());
-        runtime.requested_tun_mode = true;
-        assert!(runtime.backend.is_tun_owned());
-        runtime.requested_tun_mode = false;
-        assert!(runtime.backend.is_tun_owned());
+        runtime.lifecycle.backend = BackendState::for_test(true, true);
+        runtime.lifecycle.requested_tun_mode = false;
+        assert!(runtime.lifecycle.backend.is_tun_owned());
+        runtime.lifecycle.requested_tun_mode = true;
+        assert!(runtime.lifecycle.backend.is_tun_owned());
+        runtime.lifecycle.requested_tun_mode = false;
+        assert!(runtime.lifecycle.backend.is_tun_owned());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4885,7 +4846,7 @@ mod tests {
     async fn preempting_flavour_cancels_the_occupant_and_begins() {
         let (mut runtime, events) = runtime_with_events();
         // A live backend makes Stop open its own lifecycle record.
-        runtime.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
         occupy_exclusive(&mut runtime, JobKind::Restart);
         park_pending_task(&mut runtime);
 
@@ -4998,7 +4959,7 @@ mod tests {
 
         assert_eq!(runtime.jobs.busy_kind(), Some(JobKind::UpdateCore));
         assert!(
-            !runtime.requested_tun_mode,
+            !runtime.lifecycle.requested_tun_mode,
             "a rejected toggle must not record the mode"
         );
         flush_bookends(&mut runtime);
@@ -5039,7 +5000,7 @@ mod tests {
             "a no-op toggle must leave the occupant's record alone"
         );
         assert!(
-            !runtime.requested_tun_mode,
+            !runtime.lifecycle.requested_tun_mode,
             "a no-op toggle stays on the mode it already holds"
         );
         flush_bookends(&mut runtime);
@@ -5086,7 +5047,7 @@ mod tests {
 
         runtime.handle_cmd(CoreCmd::SetTunMode(true)).await;
 
-        assert!(runtime.requested_tun_mode);
+        assert!(runtime.lifecycle.requested_tun_mode);
         assert!(
             runtime.jobs.busy_kind().is_none(),
             "the record the toggle began must be released again"
@@ -5563,7 +5524,7 @@ mod tests {
         runtime.handle_cmd(CoreCmd::Shutdown).await;
 
         assert!(runtime.jobs.busy_kind().is_none());
-        assert!(runtime.shutting_down);
+        assert!(runtime.lifecycle.shutting_down);
         flush_bookends(&mut runtime);
         let emitted: Vec<_> = events.try_iter().collect();
         let apply_indices: Vec<usize> = emitted
@@ -5664,7 +5625,7 @@ mod tests {
         runtime.handle_cmd(CoreCmd::Shutdown).await;
 
         assert!(runtime.jobs.busy_kind().is_none());
-        assert!(runtime.shutting_down);
+        assert!(runtime.lifecycle.shutting_down);
         flush_bookends(&mut runtime);
         let emitted: Vec<_> = events.try_iter().collect();
         let probe_indices: Vec<usize> = emitted
@@ -5996,28 +5957,28 @@ mod tests {
 
         // The backoff arm's shape: a deadline that has passed and no live
         // backend.
-        runtime.pending_restart = Some(Instant::now());
+        runtime.lifecycle.pending_restart = Some(Instant::now());
         assert!(
             runtime.restart_due(),
             "an elapsed restart with no live backend is due"
         );
 
-        runtime.shutting_down = true;
+        runtime.lifecycle.shutting_down = true;
         assert!(!runtime.restart_due(), "a shutdown must refuse the restart");
 
-        runtime.shutting_down = false;
-        runtime.exit_policy.begin_stop(Instant::now());
+        runtime.lifecycle.shutting_down = false;
+        runtime.lifecycle.exit_policy.begin_stop(Instant::now());
         assert!(
             !runtime.restart_due(),
             "a requested stop still refuses the restart"
         );
 
-        runtime.exit_policy.finish();
+        runtime.lifecycle.exit_policy.finish();
         assert!(
             runtime.restart_due(),
             "clearing the stop request makes the same restart due again"
         );
-        runtime.pending_restart = None;
+        runtime.lifecycle.pending_restart = None;
         assert!(
             !runtime.restart_due(),
             "no pending restart means nothing to start"
@@ -6051,7 +6012,7 @@ mod tests {
             "exit must clear the foreign in-flight apply"
         );
         assert!(
-            runtime.pending_restart.is_some(),
+            runtime.lifecycle.pending_restart.is_some(),
             "backoff restart must still be scheduled"
         );
         flush_bookends(&mut runtime);
@@ -6217,19 +6178,22 @@ mod tests {
         let (mut runtime, events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::Restart);
         let reported = Diag::new(Key::RtPhaseRestartCancelled);
-        runtime.phase = super::CorePhase::Error(PhaseError::new(reported.clone()));
-        runtime.exit_policy.begin_silenced_stop(Instant::now());
+        runtime.lifecycle.phase = super::CorePhase::Error(PhaseError::new(reported.clone()));
+        runtime
+            .lifecycle
+            .exit_policy
+            .begin_silenced_stop(Instant::now());
 
         runtime.on_core_exit(None).await;
 
-        assert!(!runtime.exit_policy.stopping());
+        assert!(!runtime.lifecycle.exit_policy.stopping());
         assert!(
             runtime.jobs.busy_kind().is_none(),
             "the silenced exit owns the operation release"
         );
         assert!(
             matches!(
-                &runtime.phase,
+                &runtime.lifecycle.phase,
                 super::CorePhase::Error(error) if *phase_message(error) == reported
             ),
             "the reported phase payload stays the one record"
@@ -6249,13 +6213,13 @@ mod tests {
     async fn restart_queues_replacement_after_confirmed_exit() {
         let (mut runtime, events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::Restart);
-        runtime.exit_policy.begin_restart(Instant::now());
+        runtime.lifecycle.exit_policy.begin_restart(Instant::now());
 
         runtime.on_core_exit(None).await;
 
-        assert!(!runtime.exit_policy.stopping());
+        assert!(!runtime.lifecycle.exit_policy.stopping());
         assert!(
-            runtime.pending_restart.is_some(),
+            runtime.lifecycle.pending_restart.is_some(),
             "the confirmed exit queues the replacement"
         );
         assert_eq!(
@@ -6278,15 +6242,15 @@ mod tests {
     async fn plain_stop_settles_stopped_after_confirmed_exit() {
         let (mut runtime, _events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::Stop);
-        runtime.exit_policy.begin_stop(Instant::now());
+        runtime.lifecycle.exit_policy.begin_stop(Instant::now());
 
         runtime.on_core_exit(None).await;
 
-        assert!(!runtime.exit_policy.stopping());
-        assert!(matches!(runtime.phase, super::CorePhase::Stopped));
+        assert!(!runtime.lifecycle.exit_policy.stopping());
+        assert!(matches!(runtime.lifecycle.phase, super::CorePhase::Stopped));
         assert!(runtime.jobs.busy_kind().is_none());
         assert!(
-            runtime.pending_restart.is_none(),
+            runtime.lifecycle.pending_restart.is_none(),
             "a plain stop never restarts"
         );
     }
@@ -6296,23 +6260,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn plain_readiness_timeout_reports_one_error_and_silences_the_exit() {
         let (mut runtime, events) = runtime_with_events();
-        runtime.backend = BackendState::for_test(true, false);
-        runtime.phase = super::CorePhase::Starting;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.phase = super::CorePhase::Starting;
         runtime
+            .lifecycle
             .readiness
             .arm_at(Instant::now() - Duration::from_millis(1));
 
         runtime.ready_poll().await;
 
-        assert!(runtime.exit_policy.stopping());
+        assert!(runtime.lifecycle.exit_policy.stopping());
         assert!(
             matches!(
-                &runtime.phase,
+                &runtime.lifecycle.phase,
                 super::CorePhase::Error(error)
                     if phase_message(error).key() == Key::RtPhaseReadinessTimeout
             ),
             "the timeout must report its keyed terminal record, got {:?}",
-            runtime.phase
+            runtime.lifecycle.phase
         );
         let emitted: Vec<_> = events.try_iter().collect();
         assert_eq!(
@@ -6327,8 +6292,11 @@ mod tests {
         // The child's confirmed exit is silenced: the phase payload remains
         // the one record and the exit policy finishes.
         runtime.on_core_exit(None).await;
-        assert!(!runtime.exit_policy.stopping());
-        assert!(matches!(runtime.phase, super::CorePhase::Error(_)));
+        assert!(!runtime.lifecycle.exit_policy.stopping());
+        assert!(matches!(
+            runtime.lifecycle.phase,
+            super::CorePhase::Error(_)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6338,21 +6306,31 @@ mod tests {
         // single retry past the adapter teardown window; only the dns-in
         // bind race draws on a larger budget.
         let (mut runtime, events) = runtime_with_events();
-        runtime.backend = BackendState::for_test(false, true);
-        runtime.pending_transition.commit_candidate();
+        runtime.lifecycle.backend = BackendState::for_test(false, true);
+        runtime.lifecycle.pending_transition.commit_candidate();
 
         runtime.on_core_exit(Some(-1)).await;
 
         assert!(
-            runtime.pending_transition.is_candidate_pending(),
+            runtime.lifecycle.pending_transition.is_candidate_pending(),
             "the retry must keep the candidate armed"
         );
         assert!(
-            runtime.pending_transition.rollback_pending().is_none(),
+            runtime
+                .lifecycle
+                .pending_transition
+                .rollback_pending()
+                .is_none(),
             "the first failure must not arm a rollback"
         );
-        assert_eq!(runtime.candidate_boot_retries, 1, "retry budget spent");
-        let retry_at = runtime.pending_restart.expect("retry must be scheduled");
+        assert_eq!(
+            runtime.lifecycle.candidate_boot_retries, 1,
+            "retry budget spent"
+        );
+        let retry_at = runtime
+            .lifecycle
+            .pending_restart
+            .expect("retry must be scheduled");
         assert!(
             retry_at > Instant::now(),
             "the retry must wait out the teardown window"
@@ -6384,23 +6362,27 @@ mod tests {
         // real config directory; with no last-good there it fails closed.
         let (runtime, events) = with_appdata_async(async {
             let (mut runtime, events) = runtime_with_events();
-            runtime.backend = BackendState::for_test(false, true);
-            runtime.pending_transition.commit_candidate();
-            runtime.candidate_boot_retries = 1; // budget spent by the first exit
+            runtime.lifecycle.backend = BackendState::for_test(false, true);
+            runtime.lifecycle.pending_transition.commit_candidate();
+            runtime.lifecycle.candidate_boot_retries = 1; // budget spent by the first exit
 
             runtime.on_core_exit(Some(-1)).await;
 
             assert!(
-                !runtime.pending_transition.is_candidate_pending(),
+                !runtime.lifecycle.pending_transition.is_candidate_pending(),
                 "the second failure must arm the rollback (candidate cleared)"
             );
             assert!(
-                runtime.pending_transition.rollback_pending().is_none(),
+                runtime
+                    .lifecycle
+                    .pending_transition
+                    .rollback_pending()
+                    .is_none(),
                 "the rollback must be consumed by the completion path"
             );
-            assert_eq!(runtime.candidate_boot_retries, 1);
+            assert_eq!(runtime.lifecycle.candidate_boot_retries, 1);
             assert!(
-                matches!(runtime.phase, super::CorePhase::Stopped),
+                matches!(runtime.lifecycle.phase, super::CorePhase::Stopped),
                 "rollback without a last-good in the temp dir must fail closed"
             );
             let emitted: Vec<_> = events.try_iter().collect();
@@ -6434,15 +6416,21 @@ mod tests {
         // instead of the single teardown retry — this is what keeps a
         // ~1/8-per-roll race off the user-visible surface.
         let (mut runtime, events) = runtime_with_events();
-        runtime.backend = BackendState::for_test(false, true);
-        runtime.pending_transition.commit_candidate();
+        runtime.lifecycle.backend = BackendState::for_test(false, true);
+        runtime.lifecycle.pending_transition.commit_candidate();
         runtime.push_ring(DNS_IN_BIND_RACE_LINE);
 
         runtime.on_core_exit(Some(-1)).await;
 
-        assert!(runtime.pending_transition.is_candidate_pending());
-        assert!(runtime.pending_transition.rollback_pending().is_none());
-        assert_eq!(runtime.candidate_boot_retries, 1);
+        assert!(runtime.lifecycle.pending_transition.is_candidate_pending());
+        assert!(
+            runtime
+                .lifecycle
+                .pending_transition
+                .rollback_pending()
+                .is_none()
+        );
+        assert_eq!(runtime.lifecycle.candidate_boot_retries, 1);
         let emitted: Vec<_> = events.try_iter().collect();
         assert!(
             app_log_texts(&emitted)
@@ -6458,14 +6446,20 @@ mod tests {
         for expected in 2..=TUN_BIND_RACE_RETRIES {
             // Each retry restarts through the helper, which re-establishes
             // TUN ownership before the child can exit.
-            runtime.backend = BackendState::for_test(true, true);
+            runtime.lifecycle.backend = BackendState::for_test(true, true);
             runtime.on_core_exit(Some(-1)).await;
             assert_eq!(
-                runtime.candidate_boot_retries, expected,
+                runtime.lifecycle.candidate_boot_retries, expected,
                 "every race exit inside the budget must retry"
             );
-            assert!(runtime.pending_transition.is_candidate_pending());
-            assert!(runtime.pending_transition.rollback_pending().is_none());
+            assert!(runtime.lifecycle.pending_transition.is_candidate_pending());
+            assert!(
+                runtime
+                    .lifecycle
+                    .pending_transition
+                    .rollback_pending()
+                    .is_none()
+            );
         }
     }
 
@@ -6477,16 +6471,19 @@ mod tests {
         // config directory; with no last-good there it fails closed.
         let (runtime, events) = with_appdata_async(async {
             let (mut runtime, events) = runtime_with_events();
-            runtime.backend = BackendState::for_test(false, true);
-            runtime.pending_transition.commit_candidate();
-            runtime.candidate_boot_retries = TUN_BIND_RACE_RETRIES;
+            runtime.lifecycle.backend = BackendState::for_test(false, true);
+            runtime.lifecycle.pending_transition.commit_candidate();
+            runtime.lifecycle.candidate_boot_retries = TUN_BIND_RACE_RETRIES;
             runtime.push_ring(DNS_IN_BIND_RACE_LINE);
 
             runtime.on_core_exit(Some(-1)).await;
 
-            assert_eq!(runtime.candidate_boot_retries, TUN_BIND_RACE_RETRIES);
+            assert_eq!(
+                runtime.lifecycle.candidate_boot_retries,
+                TUN_BIND_RACE_RETRIES
+            );
             assert!(
-                !runtime.pending_transition.is_candidate_pending(),
+                !runtime.lifecycle.pending_transition.is_candidate_pending(),
                 "an exhausted race budget must arm the rollback"
             );
             let rollbacks: Vec<_> = events
@@ -6520,23 +6517,23 @@ mod tests {
         // healthy update back.
         let (mut runtime, events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-        runtime.core_update.commit_candidate();
-        runtime.phase = super::CorePhase::Starting;
-        runtime.backend = BackendState::for_test(false, true);
+        runtime.lifecycle.core_update.commit_candidate();
+        runtime.lifecycle.phase = super::CorePhase::Starting;
+        runtime.lifecycle.backend = BackendState::for_test(false, true);
         runtime.push_ring(DNS_IN_BIND_RACE_LINE);
 
         runtime.on_core_exit(Some(-1)).await;
 
         assert!(
-            runtime.core_update.is_candidate_pending(),
+            runtime.lifecycle.core_update.is_candidate_pending(),
             "the retry must keep the update candidate armed"
         );
         assert!(
-            runtime.core_update.rollback_pending().is_none(),
+            runtime.lifecycle.core_update.rollback_pending().is_none(),
             "no rollback may be armed on a race retry"
         );
         assert!(
-            runtime.pending_restart.is_some(),
+            runtime.lifecycle.pending_restart.is_some(),
             "the retry must reschedule the candidate boot"
         );
         assert_eq!(
@@ -6572,15 +6569,15 @@ mod tests {
         with_appdata_async(async {
             let (mut runtime, events) = runtime_with_events();
             occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-            runtime.core_update.commit_candidate();
-            runtime.phase = super::CorePhase::Starting;
-            runtime.backend = BackendState::for_test(false, false);
+            runtime.lifecycle.core_update.commit_candidate();
+            runtime.lifecycle.phase = super::CorePhase::Starting;
+            runtime.lifecycle.backend = BackendState::for_test(false, false);
             runtime.push_ring(DNS_IN_BIND_RACE_LINE);
 
             runtime.on_core_exit(Some(-1)).await;
 
             assert!(
-                !runtime.core_update.is_candidate_pending(),
+                !runtime.lifecycle.core_update.is_candidate_pending(),
                 "a direct-mode candidate must roll straight back"
             );
             assert!(
@@ -6603,19 +6600,19 @@ mod tests {
         with_appdata_async(async {
             let (mut runtime, events) = runtime_with_events();
             occupy_exclusive(&mut runtime, JobKind::UpdateCore);
-            runtime.core_update.commit_candidate();
-            runtime.phase = super::CorePhase::Starting;
-            runtime.backend = BackendState::for_test(false, true);
+            runtime.lifecycle.core_update.commit_candidate();
+            runtime.lifecycle.phase = super::CorePhase::Starting;
+            runtime.lifecycle.backend = BackendState::for_test(false, true);
             runtime.push_ring(DNS_IN_BIND_RACE_LINE);
             for expected in 1..=TUN_BIND_RACE_RETRIES {
                 assert_eq!(
-                    runtime.core_update.spend_bind_race_retry(),
+                    runtime.lifecycle.core_update.spend_bind_race_retry(),
                     Some(expected),
                     "every attempt inside the budget must be granted"
                 );
             }
             assert_eq!(
-                runtime.core_update.spend_bind_race_retry(),
+                runtime.lifecycle.core_update.spend_bind_race_retry(),
                 None,
                 "the budget must stay capped"
             );
@@ -6623,7 +6620,7 @@ mod tests {
             runtime.on_core_exit(Some(-1)).await;
 
             assert!(
-                !runtime.core_update.is_candidate_pending(),
+                !runtime.lifecycle.core_update.is_candidate_pending(),
                 "an exhausted race budget must arm the update rollback"
             );
             assert!(
@@ -6651,9 +6648,9 @@ mod tests {
             );
 
             // A fresh install arms a new transaction with a full budget.
-            runtime.core_update.commit_candidate();
+            runtime.lifecycle.core_update.commit_candidate();
             assert_eq!(
-                runtime.core_update.spend_bind_race_retry(),
+                runtime.lifecycle.core_update.spend_bind_race_retry(),
                 Some(1),
                 "a new install must start with a fresh race budget"
             );
@@ -6664,13 +6661,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn candidate_retry_budget_resets_on_readiness() {
         let mut runtime = runtime();
-        runtime.pending_transition.commit_candidate();
-        runtime.candidate_boot_retries = 1;
+        runtime.lifecycle.pending_transition.commit_candidate();
+        runtime.lifecycle.candidate_boot_retries = 1;
 
         runtime.complete_readiness_probe(true).await;
 
         assert_eq!(
-            runtime.candidate_boot_retries, 0,
+            runtime.lifecycle.candidate_boot_retries, 0,
             "first readiness must restore the retry budget for the next apply"
         );
     }
@@ -6687,8 +6684,8 @@ mod tests {
         };
         let (mut runtime, events) = runtime_with_events();
         runtime.grpc = crate::rt::grpc::GrpcClient::new(dead_port);
-        runtime.phase = super::CorePhase::Running;
-        runtime.dns_in_listener = Some(super::dns_in::Listener {
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.dns_in_listener = Some(super::dns_in::Listener {
             address: std::net::Ipv4Addr::new(10, 255, 0, 1),
         });
 
@@ -6696,11 +6693,11 @@ mod tests {
             runtime.dns_in_poll().await;
         }
         assert_eq!(
-            runtime.dns_in_attempts, DNS_IN_ADD_ATTEMPTS,
+            runtime.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS,
             "every attempt inside the budget must be spent"
         );
         assert!(
-            runtime.dns_in_listener.is_some(),
+            runtime.lifecycle.dns_in_listener.is_some(),
             "inside the budget the listener stays pending for the retry arm"
         );
         assert!(
@@ -6712,7 +6709,7 @@ mod tests {
 
         runtime.dns_in_poll().await;
         assert!(
-            runtime.dns_in_listener.is_none(),
+            runtime.lifecycle.dns_in_listener.is_none(),
             "a spent budget clears the pending listener"
         );
         let emitted: Vec<_> = events.try_iter().collect();
@@ -6725,7 +6722,7 @@ mod tests {
 
         runtime.dns_in_poll().await;
         assert_eq!(
-            runtime.dns_in_attempts, DNS_IN_ADD_ATTEMPTS,
+            runtime.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS,
             "with nothing pending the poll must be a no-op"
         );
     }
@@ -7196,10 +7193,10 @@ mod tests {
         runtime.on_core_exit(Some(23)).await;
 
         let tail = "[stdout] 2026/09/05 failed to parse config\n[stdout] invalid field 'routing'";
-        let super::CorePhase::Error(error) = &runtime.phase else {
+        let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
             panic!(
                 "the exit-23 branch must land in the Error phase, got {:?}",
-                runtime.phase
+                runtime.lifecycle.phase
             );
         };
         assert_eq!(phase_message(error).key(), Key::RtPhaseConfigError);
@@ -7240,10 +7237,10 @@ mod tests {
         let (mut runtime, events) = runtime_with_events();
         runtime.on_core_exit(Some(23)).await;
 
-        let super::CorePhase::Error(error) = &runtime.phase else {
+        let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
             panic!(
                 "the exit-23 branch must land in the Error phase, got {:?}",
-                runtime.phase
+                runtime.lifecycle.phase
             );
         };
         assert!(
@@ -7373,7 +7370,7 @@ mod tests {
         // The ready arm is gated on Starting; the stats/obs arms are gated on
         // Running. With no backend, ready_poll returns immediately, so each
         // interval tick still fires the ready arm.
-        runtime.phase = super::CorePhase::Starting;
+        runtime.lifecycle.phase = super::CorePhase::Starting;
         let run = tokio::spawn(runtime.run());
 
         // READY_POLL is 250 ms and tokio's first interval tick fires
@@ -7417,7 +7414,7 @@ mod tests {
         // doing, not the resting flag's.
         runtime.obs_enabled = true;
         let fires = Arc::clone(&runtime.poll_fires);
-        runtime.phase = super::CorePhase::Stopped;
+        runtime.lifecycle.phase = super::CorePhase::Stopped;
         let run = tokio::spawn(runtime.run());
 
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -7492,15 +7489,19 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn confirmed_core_rollback_clears_direct_backend_before_filesystem_swap() {
         let mut runtime = runtime();
-        runtime.core_update.commit_candidate();
-        runtime.core_update.arm_rollback(rollback_reason());
+        runtime.lifecycle.core_update.commit_candidate();
+        runtime
+            .lifecycle
+            .core_update
+            .arm_rollback(rollback_reason());
         // The direct child owns deny-write/delete payload handles. The
         // rollback path must release that backend before it touches core/.
-        assert!(runtime.backend.as_backend().is_none());
-        assert!(runtime.core_update.is_candidate_pending());
-        assert!(runtime.core_update.rollback_pending().is_some());
+        assert!(runtime.lifecycle.backend.as_backend().is_none());
+        assert!(runtime.lifecycle.core_update.is_candidate_pending());
+        assert!(runtime.lifecycle.core_update.rollback_pending().is_some());
         assert!(
             runtime
+                .lifecycle
                 .core_update
                 .take_rollback_after_confirmed_exit(true)
                 .is_some()
@@ -7712,17 +7713,17 @@ mod tests {
             !runtime.uses_elevated_helper(),
             "a direct session never uses the helper"
         );
-        runtime.requested_tun_mode = true;
+        runtime.lifecycle.requested_tun_mode = true;
         assert!(
             runtime.uses_elevated_helper(),
             "a TUN session runs behind the helper"
         );
-        runtime.gate_backend_alive = true;
+        runtime.lifecycle.gate_backend_alive = true;
         assert!(
             !runtime.uses_elevated_helper(),
             "the gate's proof process is always a direct child"
         );
-        runtime.gate_backend_alive = false;
+        runtime.lifecycle.gate_backend_alive = false;
         assert!(runtime.uses_elevated_helper());
     }
 
@@ -7795,7 +7796,7 @@ mod tests {
             let installed_before = tree_hash(&crate::sys::paths::core_dir());
 
             let (mut runtime, events) = runtime_with_events();
-            runtime.core_update.commit_candidate();
+            runtime.lifecycle.core_update.commit_candidate();
             runtime.set_phase(super::CorePhase::Starting);
             runtime.push_ring("[stdout] 2026/09/18 failed to parse config");
             runtime.on_core_exit(Some(23)).await;
@@ -7813,11 +7814,11 @@ mod tests {
                 !crate::sys::paths::broccoli_root().join("core.bak").exists(),
                 "ending the update as installed consumes the retained tree"
             );
-            assert!(!runtime.core_update.is_candidate_pending());
-            let super::CorePhase::Error(error) = &runtime.phase else {
+            assert!(!runtime.lifecycle.core_update.is_candidate_pending());
+            let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
                 panic!(
                     "expected the config-class Error phase, got {:?}",
-                    runtime.phase
+                    runtime.lifecycle.phase
                 );
             };
             assert_eq!(phase_message(error).key(), Key::RtPhaseConfigError);
@@ -7853,11 +7854,11 @@ mod tests {
             seed_pending_swap(b"installed-v26.9.9", b"retained-v26.7.28");
 
             let (mut runtime, events) = runtime_with_events();
-            runtime.core_update.commit_candidate();
+            runtime.lifecycle.core_update.commit_candidate();
             runtime.set_phase(super::CorePhase::Starting);
             // The start that proved the binary ran the app-owned
             // configuration; its readiness ACKs the update and ends it.
-            runtime.gate_backend_alive = true;
+            runtime.lifecycle.gate_backend_alive = true;
             runtime.complete_readiness_probe(true).await;
 
             assert!(
@@ -7868,16 +7869,16 @@ mod tests {
                 !crate::sys::paths::broccoli_root().join("core.bak").exists(),
                 "a completed update consumes the retained tree"
             );
-            assert!(!runtime.core_update.is_candidate_pending());
+            assert!(!runtime.lifecycle.core_update.is_candidate_pending());
             assert!(
-                runtime.exit_policy.stopping(),
+                runtime.lifecycle.exit_policy.stopping(),
                 "the gate's proof process must be ended, not left serving the app-owned config"
             );
-            assert!(!runtime.gate_backend_alive);
+            assert!(!runtime.lifecycle.gate_backend_alive);
             assert!(
-                !matches!(runtime.phase, super::CorePhase::Running),
+                !matches!(runtime.lifecycle.phase, super::CorePhase::Running),
                 "a gate start must never become the running session, got {:?}",
-                runtime.phase
+                runtime.lifecycle.phase
             );
             let emitted: Vec<_> = events.try_iter().collect();
             assert!(
@@ -7896,7 +7897,7 @@ mod tests {
             // The confirmed exit settles the phase and releases the update
             // operation.
             runtime.on_core_exit(Some(0)).await;
-            assert!(matches!(runtime.phase, super::CorePhase::Stopped));
+            assert!(matches!(runtime.lifecycle.phase, super::CorePhase::Stopped));
             assert!(runtime.jobs.busy_kind().is_none());
         })
         .await;
@@ -7925,7 +7926,7 @@ mod tests {
             servers.save().expect("save the marked profile set");
 
             let (mut runtime, events) = runtime_with_events();
-            runtime.core_update.commit_candidate();
+            runtime.lifecycle.core_update.commit_candidate();
             runtime.start_backend().await;
 
             let emitted: Vec<_> = events.try_iter().collect();
@@ -7956,11 +7957,11 @@ mod tests {
                 !crate::sys::paths::broccoli_root().join("core.bak").exists(),
                 "ending the update as installed consumes the retained tree"
             );
-            assert!(!runtime.core_update.is_candidate_pending());
-            let super::CorePhase::Error(error) = &runtime.phase else {
+            assert!(!runtime.lifecycle.core_update.is_candidate_pending());
+            let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
                 panic!(
                     "expected the configuration-finding Error phase, got {:?}",
-                    runtime.phase
+                    runtime.lifecycle.phase
                 );
             };
             let text = error.message.text(Language::En);
@@ -8053,8 +8054,8 @@ mod tests {
             servers.save().expect("save the server list");
 
             let (mut runtime, events) = runtime_with_events();
-            runtime.core_update.commit_candidate();
-            runtime.update_gate_start = true;
+            runtime.lifecycle.core_update.commit_candidate();
+            runtime.lifecycle.update_gate_start = true;
             runtime.start_backend().await;
 
             let emitted: Vec<_> = events.try_iter().collect();
@@ -8115,7 +8116,7 @@ mod tests {
             )
             .expect("write the foreign stamp");
             let (mut runtime, _events) = runtime_with_events();
-            runtime.replay_after_rollback = true;
+            runtime.lifecycle.replay_after_rollback = true;
             runtime.start_backend().await;
             let regenerated = std::fs::read_to_string(super::apply::active_path())
                 .expect("read the regenerated artefact");
@@ -8139,7 +8140,7 @@ mod tests {
                 super::apply::stamp_is_current(),
                 "a stamp describing the stored bytes must match"
             );
-            runtime.replay_after_rollback = true;
+            runtime.lifecycle.replay_after_rollback = true;
             runtime.start_backend().await;
             assert_eq!(
                 std::fs::read(super::apply::active_path()).expect("read the replayed artefact"),

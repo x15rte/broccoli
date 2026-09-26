@@ -462,7 +462,7 @@ impl QuerySeat for RouteTestSeat {
     const BUSY: BusyReject = BusyReject::Logged;
 
     fn gate(&self, runtime: &Runtime) -> Result<router_cmd::RoutingContext, DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         routing_context(&self.request)
@@ -494,7 +494,7 @@ impl QuerySeat for BalancerInfoSeat {
     const BUSY: BusyReject = BusyReject::Text;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         if self.balancer_tag.is_empty() {
@@ -527,7 +527,7 @@ impl QuerySeat for SetBalancerOverrideSeat {
     const BUSY: BusyReject = BusyReject::Text;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         if self.balancer_tag.is_empty() {
@@ -562,7 +562,7 @@ impl QuerySeat for ClearBalancerOverrideSeat {
     const BUSY: BusyReject = BusyReject::Text;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         if self.balancer_tag.is_empty() {
@@ -596,7 +596,7 @@ impl QuerySeat for RestartLoggerSeat {
     const BUSY: BusyReject = BusyReject::Text;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         Ok(())
@@ -629,7 +629,7 @@ impl QuerySeat for AddTrialRuleSeat {
     const RUNS_TO_OWN_TERMINAL: bool = true;
 
     fn gate(&self, runtime: &Runtime) -> Result<router_cfg::RoutingRule, DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         trial_rule_to_pb(&self.rule)
@@ -679,7 +679,7 @@ impl QuerySeat for RemoveTrialRuleSeat {
     const RUNS_TO_OWN_TERMINAL: bool = true;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         if self.rule_tag.is_empty() {
@@ -714,7 +714,7 @@ impl QuerySeat for ListTrialRulesSeat {
     const BUSY: BusyReject = BusyReject::Impossible;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         Ok(())
@@ -743,7 +743,7 @@ impl QuerySeat for ListRuntimeStateSeat {
     const BUSY: BusyReject = BusyReject::Impossible;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.phase, CorePhase::Running) {
+        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
             return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
         }
         Ok(())
