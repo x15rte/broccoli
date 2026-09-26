@@ -45,6 +45,11 @@
 //! captured diagnostics, the QUIC transcript — is passthrough: show it
 //! verbatim, and write nothing that looks like it.
 //!
+//! The machine check of these rules over this table lives in the test tree:
+//! `tests/i18n_text_rules.rs` drives `tests/common/standard.rs`. The app never
+//! runs it: a lint in the frame loop would cost frames for a verdict no user
+//! reads.
+//!
 //! # Adding a string
 //!
 //! 1. Add one [`Key`] variant.
