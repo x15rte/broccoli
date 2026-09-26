@@ -14,73 +14,21 @@
 //! (`$XRAY_EXE` or `%APPDATA%\broccoli\core\xray.exe`); self-skips otherwise.
 //!
 //! Runtime level, not screen level: it drives `spawn_runtime` with its own
-//! `egui::Context` and never builds the app, so it carries its own `APPDATA`
-//! guard — the shared screen-test fixture only ever boots the app under
-//! kittest, an instance that must not run beside the two cores this test
-//! supervises.
+//! `egui::Context` and never builds the app, so the live-core fixture owns the
+//! `APPDATA` redirect and the throwaway core tree — the shared screen-test
+//! fixture only ever boots the app under kittest, an instance that must not
+//! run beside the two cores this test supervises.
 //! Run with: cargo test --test traffic_totals_e2e -- --ignored --nocapture
 
 use std::io::Read as _;
-use std::net::TcpListener;
-use std::path::PathBuf;
+use std::ops::ControlFlow;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "common/live_core.rs"]
+pub mod live_core;
+
 const UUID: &str = "8f4e0a2e-9b3c-4d5e-8f6a-7b8c9d0e1f2a";
-
-fn write_verified_release_metadata(core: &std::path::Path) {
-    let metadata = serde_json::json!({
-        "schema": 3,
-        "archive_asset": env!("BROCCOLI_XRAY_ARCHIVE"),
-        "archive_sha256": env!("BROCCOLI_XRAY_SHA256"),
-        "xray_sha256": env!("BROCCOLI_XRAY_EXE_SHA256"),
-        "wintun_sha256": env!("BROCCOLI_WINTUN_SHA256"),
-        "geoip_sha256": env!("BROCCOLI_GEOIP_SHA256"),
-        "geosite_sha256": env!("BROCCOLI_GEOSITE_SHA256"),
-        "version": env!("BROCCOLI_XRAY_VERSION").trim_start_matches('v'),
-    });
-    std::fs::write(
-        core.join(".broccoli-official-release.json"),
-        serde_json::to_vec(&metadata).expect("serialize pinned core metadata"),
-    )
-    .expect("write pinned core metadata");
-}
-
-fn xray() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("XRAY_EXE") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let p = PathBuf::from(std::env::var_os("APPDATA")?)
-        .join("broccoli")
-        .join("core")
-        .join("xray.exe");
-    p.is_file().then_some(p)
-}
-
-struct AppDataGuard(Option<std::ffi::OsString>);
-
-impl AppDataGuard {
-    fn install(root: &std::path::Path) -> Self {
-        let saved = std::env::var_os("APPDATA");
-        // SAFETY: single-threaded test setup; no other thread reads APPDATA
-        // while it is redirected.
-        unsafe { std::env::set_var("APPDATA", root) };
-        Self(saved)
-    }
-}
-
-impl Drop for AppDataGuard {
-    fn drop(&mut self) {
-        // SAFETY: test teardown; the runtime thread is joined before this runs.
-        match &self.0 {
-            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
-            None => unsafe { std::env::remove_var("APPDATA") },
-        }
-    }
-}
 
 /// Kills a spawned xray on drop, however the test exits.
 struct CoreGuard {
@@ -92,14 +40,6 @@ impl Drop for CoreGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 fn wait_for_port(port: u16, label: &str) {
@@ -116,28 +56,16 @@ fn wait_for_port(port: u16, label: &str) {
 #[test]
 #[ignore = "needs a real xray.exe core"]
 fn totals_rates_and_table_share_one_counter_sweep() {
-    let Some(xray_source) = xray() else {
+    let Some(xray_source) = live_core::discover_xray() else {
         eprintln!("SKIP: no xray.exe");
         return;
     };
 
     // Isolated APPDATA with the real core payload (the runtime validates the
     // managed core before spawning).
-    let isolated = tempfile::tempdir().expect("isolated APPDATA");
-    let isolated_core = isolated.path().join("broccoli").join("core");
-    std::fs::create_dir_all(&isolated_core).expect("create isolated core");
-    if let Some(source_core) = xray_source.parent() {
-        for entry in std::fs::read_dir(source_core).expect("list source core") {
-            let entry = entry.expect("source core entry");
-            if entry.file_type().expect("source entry type").is_file() {
-                std::fs::copy(entry.path(), isolated_core.join(entry.file_name()))
-                    .expect("copy isolated core asset");
-            }
-        }
-    }
-    std::fs::copy(&xray_source, isolated_core.join("xray.exe")).expect("copy isolated xray.exe");
-    write_verified_release_metadata(&isolated_core);
-    let _appdata = AppDataGuard::install(isolated.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_pinned_core(&xray_source);
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     // Local HTTP target serving a 32 MiB payload.
     let payload: Vec<u8> = vec![0x5a; 32 * 1024 * 1024];
@@ -162,7 +90,7 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     // allow rule is required: Xray 26.x blocks private-IP targets from
     // server-side inbounds by default (anti-SSRF), and this harness's HTTP
     // target lives on 127.0.0.1.
-    let vless_port = free_port();
+    let vless_port = live_core::free_port();
     let server_config = serde_json::json!({
         "log": { "loglevel": "warning" },
         "inbounds": [{
@@ -201,8 +129,8 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     wait_for_port(vless_port, "vless server");
 
     // The app's runtime against a client config mirroring the generated one.
-    let socks_port = free_port();
-    let api_port = free_port();
+    let socks_port = live_core::free_port();
+    let api_port = live_core::free_port();
     let config = serde_json::json!({
         "log": { "loglevel": "warning" },
         "stats": {},
@@ -243,16 +171,27 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     // Wait for Running.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut running = false;
-    while Instant::now() < deadline && !running {
-        match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(broccoli::rt::CoreEvt::State {
-                phase: broccoli::rt::CorePhase::Running,
-                ..
-            }) => running = true,
-            Ok(_) => {}
-            Err(_) => {}
-        }
-    }
+    live_core::drive_events(
+        &evt_rx,
+        deadline,
+        "before the core reached Running",
+        |event| {
+            if matches!(
+                event,
+                Some(broccoli::rt::CoreEvt::State {
+                    phase: broccoli::rt::CorePhase::Running,
+                    ..
+                })
+            ) {
+                running = true;
+            }
+            if running {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(running, "core did not reach Running within 30 s");
     wait_for_port(socks_port, "socks inbound");
 
@@ -293,27 +232,28 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     let mut last: Option<broccoli::rt::StatsTick> = None;
     let mut saw_traffic = false;
     let mut stable = 0;
-    while Instant::now() < deadline && (stable < 3 || !saw_traffic) {
-        match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(broccoli::rt::CoreEvt::Stats(tick)) => {
-                if tick.total_up > 0 || tick.total_down > 0 {
-                    saw_traffic = true;
-                }
-                if saw_traffic
-                    && last.as_ref().is_some_and(|prev| {
-                        prev.total_up == tick.total_up && prev.total_down == tick.total_down
-                    })
-                {
-                    stable += 1;
-                } else {
-                    stable = 0;
-                }
-                last = Some(tick);
+    live_core::drive_events(&evt_rx, deadline, "while collecting stats ticks", |event| {
+        if let Some(broccoli::rt::CoreEvt::Stats(tick)) = event {
+            if tick.total_up > 0 || tick.total_down > 0 {
+                saw_traffic = true;
             }
-            Ok(_) => {}
-            Err(_) => {}
+            if saw_traffic
+                && last.as_ref().is_some_and(|prev| {
+                    prev.total_up == tick.total_up && prev.total_down == tick.total_down
+                })
+            {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            last = Some(tick);
         }
-    }
+        if saw_traffic && stable >= 3 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
     let tick = last.expect("no Stats tick within 20 s");
     let sum_in_up: u64 = tick.per_inbound_totals.iter().map(|(_, u, _)| u).sum();
     let sum_in_down: u64 = tick.per_inbound_totals.iter().map(|(_, _, d)| d).sum();

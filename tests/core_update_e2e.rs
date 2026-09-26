@@ -10,55 +10,22 @@
 //! payload and a runnable Xray core.
 //!
 //! Runtime level, not screen level: each test drives `spawn_runtime` directly
-//! and never builds the app, so it carries its own `APPDATA` guard. The real
-//! `%APPDATA%` read — the installed managed core it copies into the isolated
-//! root, and the bytes a rollback must restore — happens under the
-//! process-wide lock but BEFORE the redirect, which the shared screen-test
-//! fixture does not expose: its lock, redirect and kittest harness are one
-//! step.
+//! and never builds the app, so the live-core fixture's lock and redirect
+//! stand in for the shared screen-test fixture — whose lock, redirect and
+//! kittest harness are one step. The real `%APPDATA%` read — the installed
+//! managed core it copies into the isolated root, and the bytes a rollback
+//! must restore — happens under the process-wide lock but BEFORE the redirect.
 
-use std::net::TcpListener;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use broccoli::i18n::{Key, t, t_fmt};
 use broccoli::model::settings::Language;
 use broccoli::rt::{CoreCmd, CoreEvt, CorePhase, DownloadState, spawn_runtime};
-use parking_lot::{Mutex, MutexGuard};
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
-
-struct AppDataGuard(Option<std::ffi::OsString>);
-
-impl AppDataGuard {
-    fn install(root: &std::path::Path) -> Self {
-        let previous = std::env::var_os("APPDATA");
-        // SAFETY: APPDATA_LOCK serializes this integration test's process-wide
-        // environment mutation for its complete runtime lifetime.
-        unsafe { std::env::set_var("APPDATA", root) };
-        Self(previous)
-    }
-}
-
-impl Drop for AppDataGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            // SAFETY: APPDATA_LOCK remains held until this guard is dropped.
-            unsafe { std::env::set_var("APPDATA", previous) };
-        } else {
-            // SAFETY: APPDATA_LOCK remains held until this guard is dropped.
-            unsafe { std::env::remove_var("APPDATA") };
-        }
-    }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind loopback port")
-        .local_addr()
-        .expect("read loopback port")
-        .port()
-}
+#[path = "common/live_core.rs"]
+pub mod live_core;
 
 /// Leave a runnable-looking but unstamped `config/config.json` behind, the
 /// way a previous build's start artefact could survive an app update. No test
@@ -94,41 +61,29 @@ fn write_runnable_config(root: &std::path::Path, socks_port: u16, api_port: u16)
     .expect("write isolated config");
 }
 
-fn copy_file(source: &std::path::Path, destination: &std::path::Path) {
-    std::fs::copy(source, destination).expect("copy managed core payload");
-}
-
-fn copy_installed_core(source_root: &std::path::Path, destination_root: &std::path::Path) {
-    let source = source_root.join("broccoli/core");
-    let destination = destination_root.join("broccoli/core");
-    std::fs::create_dir_all(&destination).expect("create isolated managed core");
-    for name in [
-        ".broccoli-official-release.json",
-        "xray.exe",
-        "wintun.dll",
-        "geoip.dat",
-        "geosite.dat",
-    ] {
-        copy_file(&source.join(name), &destination.join(name));
-    }
-}
-
 fn expect_terminal_update_failure(
     receiver: &std::sync::mpsc::Receiver<CoreEvt>,
     deadline: Instant,
 ) -> String {
     let mut failure = None;
     let mut operation_finished = false;
-    while Instant::now() < deadline && !(failure.is_some() && operation_finished) {
-        match receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok(CoreEvt::Download(DownloadState::Failed(error))) => failure = Some(error),
-            Ok(CoreEvt::Operation(None)) => operation_finished = true,
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped before update failure reached a terminal state")
+    live_core::drive_events(
+        receiver,
+        deadline,
+        "before update failure reached a terminal state",
+        |event| {
+            match event {
+                Some(CoreEvt::Download(DownloadState::Failed(error))) => failure = Some(error),
+                Some(CoreEvt::Operation(None)) => operation_finished = true,
+                Some(_) | None => {}
             }
-        }
-    }
+            if failure.is_some() && operation_finished {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(
         operation_finished,
         "failed update did not release its operation"
@@ -141,16 +96,14 @@ fn expect_terminal_update_failure(
 #[test]
 #[ignore = "starts the pinned official Xray release to verify update rollback"]
 fn failed_updated_core_spawn_restores_retained_tree_and_releases_settings() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let installed_root = std::path::PathBuf::from(
-        std::env::var_os("APPDATA").expect("real APPDATA must be available"),
-    );
-    assert!(
-        installed_root.join("broccoli/core/xray.exe").is_file(),
-        "the managed core must be installed before exercising rollback"
-    );
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    copy_installed_core(&installed_root, isolated.path());
+    let _appdata_lock = live_core::appdata_lock();
+    let isolated = live_core::IsolatedRoot::empty();
+    // The rollback case needs a core the verification accepts, wherever it
+    // comes from: the pinned archive when the fixture names one, else the
+    // machine's install.
+    let source = tempfile::tempdir().expect("managed core staging root");
+    let installed_core = live_core::managed_core_source(source.path());
+    isolated.install_managed_core(&installed_core);
     // The landed candidate is unstartable; the verified copy is the retained
     // last-good tree. The durable marker makes the first start the update's
     // health gate, whose spawn failure is a genuine start failure — the class
@@ -168,7 +121,7 @@ fn failed_updated_core_spawn_restores_retained_tree_and_releases_settings() {
         b"broccoli-core-swap-v1\n",
     )
     .expect("write the durable swap marker");
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
@@ -185,8 +138,7 @@ fn failed_updated_core_spawn_restores_retained_tree_and_releases_settings() {
     assert_eq!(
         std::fs::read(isolated.path().join("broccoli/core/xray.exe"))
             .expect("rollback must restore the last-known-good managed core"),
-        std::fs::read(installed_root.join("broccoli/core/xray.exe"))
-            .expect("read the pinned executable"),
+        std::fs::read(installed_core.join("xray.exe")).expect("read the pinned executable"),
         "the restored tree must be the retained bytes"
     );
     assert!(
@@ -207,13 +159,17 @@ fn failed_updated_core_spawn_restores_retained_tree_and_releases_settings() {
 #[test]
 #[ignore = "downloads and health-gates the pinned official Xray release"]
 fn deferred_setup_first_install_gates_the_downloaded_core_and_settles_stopped() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata_lock = live_core::appdata_lock();
+    let isolated = live_core::IsolatedRoot::empty();
+    let _appdata = live_core::redirect_appdata(isolated.path());
     // An unstamped artefact a previous build could have left behind: the
     // health-gate start writes and runs its own app-owned configuration and
     // must never replay this file.
-    write_runnable_config(isolated.path(), free_port(), free_port());
+    write_runnable_config(
+        isolated.path(),
+        live_core::free_port(),
+        live_core::free_port(),
+    );
     assert!(
         !isolated.path().join("broccoli/core/xray.exe").exists(),
         "this must begin with the deferred first-install state"
@@ -232,42 +188,49 @@ fn deferred_setup_first_install_gates_the_downloaded_core_and_settles_stopped() 
     let mut downloaded = None;
     let mut gate_settled = false;
     let mut operation_finished = false;
-    while Instant::now() < deadline && !(downloaded.is_some() && gate_settled && operation_finished)
-    {
-        match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(CoreEvt::Download(DownloadState::Done(version))) => downloaded = Some(version),
-            Ok(CoreEvt::Download(DownloadState::Failed(error))) => {
-                panic!("deferred first-install update failed: {error}")
+    live_core::drive_events(
+        &evt_rx,
+        deadline,
+        "before the deferred first-install completed",
+        |event| {
+            match event {
+                Some(CoreEvt::Download(DownloadState::Done(version))) => downloaded = Some(version),
+                Some(CoreEvt::Download(DownloadState::Failed(error))) => {
+                    panic!("deferred first-install update failed: {error}")
+                }
+                // The gate proves the downloaded binary and ends its own
+                // process: the update completes without ever becoming the
+                // running session.
+                Some(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) if downloaded.is_some() => gate_settled = true,
+                Some(CoreEvt::State {
+                    phase: CorePhase::Starting,
+                    ..
+                }) if downloaded.is_some() => {}
+                Some(CoreEvt::State {
+                    phase: CorePhase::Running,
+                    ..
+                }) => {
+                    panic!("a post-install gate start must not become the running session")
+                }
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => {
+                    panic!("deferred first-install startup failed: {error}")
+                }
+                Some(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,
+                Some(_) | None => {}
             }
-            // The gate proves the downloaded binary and ends its own process:
-            // the update completes without ever becoming the running session.
-            Ok(CoreEvt::State {
-                phase: CorePhase::Stopped,
-                ..
-            }) if downloaded.is_some() => gate_settled = true,
-            Ok(CoreEvt::State {
-                phase: CorePhase::Starting,
-                ..
-            }) if downloaded.is_some() => {}
-            Ok(CoreEvt::State {
-                phase: CorePhase::Running,
-                ..
-            }) => {
-                panic!("a post-install gate start must not become the running session")
+            if downloaded.is_some() && gate_settled && operation_finished {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => {
-                panic!("deferred first-install startup failed: {error}")
-            }
-            Ok(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped before the deferred first-install completed")
-            }
-        }
-    }
+        },
+    );
 
     assert_eq!(downloaded.as_deref(), Some(expected_version));
     assert!(
@@ -297,7 +260,7 @@ fn deferred_setup_first_install_gates_the_downloaded_core_and_settles_stopped() 
 #[test]
 #[ignore = "imports and health-gates the pinned official Xray release"]
 fn imported_pinned_archive_gates_cleanly_and_settles_stopped() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
+    let _appdata_lock = live_core::appdata_lock();
     let archive = PathBuf::from(
         std::env::var_os("BROCCOLI_TEST_XRAY_ARCHIVE")
             .expect("BROCCOLI_TEST_XRAY_ARCHIVE must point to the official pinned ZIP"),
@@ -308,8 +271,8 @@ fn imported_pinned_archive_gates_cleanly_and_settles_stopped() {
         archive.display()
     );
 
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    let _appdata = AppDataGuard::install(isolated.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    let _appdata = live_core::redirect_appdata(isolated.path());
     assert!(
         !isolated.path().join("broccoli/core/xray.exe").exists(),
         "this must begin without a managed core"
@@ -329,43 +292,50 @@ fn imported_pinned_archive_gates_cleanly_and_settles_stopped() {
     let mut gate_settled = false;
     let mut operation_finished = false;
     let mut app_logs = Vec::new();
-    while Instant::now() < deadline && !(downloaded.is_some() && gate_settled && operation_finished)
-    {
-        match evt_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(CoreEvt::Download(DownloadState::Done(version))) => downloaded = Some(version),
-            Ok(CoreEvt::Download(DownloadState::Failed(error))) => {
-                panic!("pinned archive import failed: {error}")
+    live_core::drive_events(
+        &evt_rx,
+        deadline,
+        "before the imported archive completed",
+        |event| {
+            match event {
+                Some(CoreEvt::Download(DownloadState::Done(version))) => downloaded = Some(version),
+                Some(CoreEvt::Download(DownloadState::Failed(error))) => {
+                    panic!("pinned archive import failed: {error}")
+                }
+                // The gate proves the imported binary and ends its own process:
+                // the import completes without ever becoming the running
+                // session.
+                Some(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) if downloaded.is_some() => gate_settled = true,
+                Some(CoreEvt::State {
+                    phase: CorePhase::Starting,
+                    ..
+                }) if downloaded.is_some() => {}
+                Some(CoreEvt::State {
+                    phase: CorePhase::Running,
+                    ..
+                }) => {
+                    panic!("a post-install gate start must not become the running session")
+                }
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => {
+                    panic!("imported pinned core startup failed: {error}")
+                }
+                Some(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,
+                Some(CoreEvt::AppLog(message)) => app_logs.push(message.text(Language::En)),
+                Some(_) | None => {}
             }
-            // The gate proves the imported binary and ends its own process:
-            // the import completes without ever becoming the running session.
-            Ok(CoreEvt::State {
-                phase: CorePhase::Stopped,
-                ..
-            }) if downloaded.is_some() => gate_settled = true,
-            Ok(CoreEvt::State {
-                phase: CorePhase::Starting,
-                ..
-            }) if downloaded.is_some() => {}
-            Ok(CoreEvt::State {
-                phase: CorePhase::Running,
-                ..
-            }) => {
-                panic!("a post-install gate start must not become the running session")
+            if downloaded.is_some() && gate_settled && operation_finished {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => {
-                panic!("imported pinned core startup failed: {error}")
-            }
-            Ok(CoreEvt::Operation(None)) if downloaded.is_some() => operation_finished = true,
-            Ok(CoreEvt::AppLog(message)) => app_logs.push(message.text(Language::En)),
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped before the imported archive completed")
-            }
-        }
-    }
+        },
+    );
 
     assert_eq!(downloaded.as_deref(), Some(expected_version));
     assert!(

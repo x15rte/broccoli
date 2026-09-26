@@ -3,8 +3,9 @@
 //! ListRule` through the exact client path the app uses (`rt::grpc`), proving
 //! the proto-only `xray.app.router.Config` payload, append semantics,
 //! duplicate-ruleTag atomicity, and the rule grammar converter end to end.
-//! Requires an xray.exe — located via `$XRAY_EXE` or the managed
-//! `%APPDATA%\broccoli\core\xray.exe` — plus geoip.dat/geosite.dat next to it.
+//! Requires an xray.exe — the live-core fixture locates it via `$XRAY_EXE`
+//! or the managed `%APPDATA%\broccoli\core\xray.exe` — plus
+//! geoip.dat/geosite.dat next to it.
 //! The test is `#[ignore]`d by default so a core-less machine reports it as
 //! ignored instead of green-without-running; the body still skips cleanly when
 //! the ignore is lifted without a core present.
@@ -13,8 +14,7 @@
 //! target with the ignore lifted.
 
 use std::io::Write as _;
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,19 +22,8 @@ use broccoli::model::routing::Rule;
 use broccoli::rt::TrialRuleAddOutcome;
 use broccoli::rt::grpc::{GrpcClient, add_rule_outcome, pb, trial_rule_to_pb};
 
-fn xray() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("XRAY_EXE") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let p = PathBuf::from(std::env::var_os("APPDATA")?)
-        .join("broccoli")
-        .join("core")
-        .join("xray.exe");
-    p.is_file().then_some(p)
-}
+#[path = "common/live_core.rs"]
+pub mod live_core;
 
 /// Kills the core on drop, however the test exits.
 struct CoreGuard {
@@ -46,14 +35,6 @@ impl Drop for CoreGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 fn wait_for_api(port: u16) {
@@ -70,7 +51,7 @@ fn wait_for_api(port: u16) {
 #[tokio::test]
 #[ignore = "needs a real xray.exe core"]
 async fn trial_rules_roundtrip_against_live_core() {
-    let Some(xray) = xray() else {
+    let Some(xray) = live_core::discover_xray() else {
         eprintln!("SKIP: no xray.exe (set XRAY_EXE or download the core)");
         return;
     };
@@ -81,7 +62,7 @@ async fn trial_rules_roundtrip_against_live_core() {
         assets.display()
     );
 
-    let port = free_port();
+    let port = live_core::free_port();
     let config_path =
         std::env::temp_dir().join(format!("broccoli-trial-rules-{}.json", std::process::id()));
     let config = format!(

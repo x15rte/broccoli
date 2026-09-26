@@ -173,6 +173,9 @@ jobs:
               throw "extracted xray.exe is missing: $xrayPath"
           }
           "XRAY_EXE=$xrayPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # The archive-import case of core_update_e2e opens the pinned ZIP itself, so
+          # the verified download above is also published as its fixture path.
+          "BROCCOLI_TEST_XRAY_ARCHIVE=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # cargo fmt must pass 100%; CI never enforced it
       # before the test workflow existed.
@@ -196,16 +199,16 @@ jobs:
           cargo test --locked --all-targets --target $env:BROCCOLI_TARGET
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
           # Default runs never execute #[ignore]d tests, so re-run the
-          # live-core targets with the ignore lifted (XRAY_EXE is exported
-          # above, and the extracted core dir also holds geoip.dat/geosite.dat
-          # for the trial suite's asset assertion). Two ignored suites stay
-          # out: geodata_dat_pin_suspension needs a real installed managed
-          # core, and core_update_e2e needs BROCCOLI_TEST_XRAY_ARCHIVE (a
-          # pinned ZIP path) for its archive-import case and downloads a
-          # release in its update cases; enable it once that fixture is wired.
+          # live-core targets with the ignore lifted. XRAY_EXE and
+          # BROCCOLI_TEST_XRAY_ARCHIVE are exported above: the extracted core
+          # directory supplies the suites that spawn a core, and the verified
+          # ZIP is what geodata_dat_pin_suspension stages a managed core from,
+          # so that suite runs here instead of only on a machine with an
+          # installed core.
           cargo test --locked --target $env:BROCCOLI_TARGET `
               --test golden_validation --test trial_rules_live_core `
-              --test dns_inbound_live_core `
+              --test dns_inbound_live_core --test core_update_e2e `
+              --test geodata_dat_pin_suspension `
               --test proxy_e2e --test traffic_totals_e2e `
               --test latency_probe_e2e -- --ignored
           if ($LASTEXITCODE -ne 0) { throw "cargo test (live-core suites) failed with exit code $LASTEXITCODE" }

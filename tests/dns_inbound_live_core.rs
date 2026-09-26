@@ -10,8 +10,8 @@
 //! The production bind address (the TUN gateway) exists only with a TUN
 //! adapter, so the oracle binds the listener on loopback instead; the
 //! address is the only thing it changes — the payload is the runtime's.
-//! Requires an xray.exe — located via `$XRAY_EXE` or the managed
-//! `%APPDATA%\broccoli\core\xray.exe`.
+//! Requires an xray.exe — the live-core fixture locates it via `$XRAY_EXE`
+//! or the managed `%APPDATA%\broccoli\core\xray.exe`.
 //! The test is `#[ignore]`d by default so a core-less machine reports it as
 //! ignored instead of green-without-running; the body still skips cleanly when
 //! the ignore is lifted without a core present.
@@ -20,8 +20,7 @@
 //! target with the ignore lifted.
 
 use std::io::Write as _;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -29,19 +28,8 @@ use broccoli::model::inbound::DNS_INBOUND_TAG;
 use broccoli::rt::dns_in::{Listener, PORT};
 use broccoli::rt::grpc::GrpcClient;
 
-fn xray() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("XRAY_EXE") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let p = PathBuf::from(std::env::var_os("APPDATA")?)
-        .join("broccoli")
-        .join("core")
-        .join("xray.exe");
-    p.is_file().then_some(p)
-}
+#[path = "common/live_core.rs"]
+pub mod live_core;
 
 /// Kills the core on drop, however the test exits.
 struct CoreGuard {
@@ -53,14 +41,6 @@ impl Drop for CoreGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 fn wait_for_api(port: u16) {
@@ -87,13 +67,13 @@ fn listener_is_bound(pid: u32) -> bool {
 #[tokio::test]
 #[ignore = "needs a real xray.exe core"]
 async fn in_tun_dns_listener_adds_to_a_live_core() {
-    let Some(xray) = xray() else {
+    let Some(xray) = live_core::discover_xray() else {
         eprintln!("SKIP: no xray.exe (set XRAY_EXE or download the core)");
         return;
     };
     let assets = xray.parent().expect("core dir");
 
-    let api_port = free_port();
+    let api_port = live_core::free_port();
     let config_path =
         std::env::temp_dir().join(format!("broccoli-dns-inbound-{}.json", std::process::id()));
     let config = format!(

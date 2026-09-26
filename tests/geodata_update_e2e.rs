@@ -8,52 +8,20 @@
 //! real TLS, and require a runnable managed core (`%APPDATA%\broccoli\core`).
 //!
 //! Runtime level, not screen level: each test drives `spawn_runtime` directly
-//! and never builds the app, so it carries its own `APPDATA` guard. The real
-//! `%APPDATA%` read — the installed core it copies into the isolated root, and
-//! the geodata bytes it pins — happens under the process-wide lock but BEFORE
-//! the redirect, which the shared screen-test fixture does not expose: its
-//! lock, redirect and kittest harness are one step.
+//! and never builds the app, so the live-core fixture's lock and redirect
+//! stand in for the shared screen-test fixture — whose lock, redirect and
+//! kittest harness are one step. The real `%APPDATA%` read — the installed
+//! core it copies into the isolated root, and the geodata bytes it pins —
+//! happens under the process-wide lock but BEFORE the redirect.
 
-use std::net::TcpListener;
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use broccoli::rt::{CoreCmd, CoreEvt, CorePhase, spawn_runtime};
-use parking_lot::{Mutex, MutexGuard};
 use sha2::{Digest, Sha256};
 
-static APPDATA_LOCK: Mutex<()> = Mutex::new(());
-
-struct AppDataGuard(Option<std::ffi::OsString>);
-
-impl AppDataGuard {
-    fn install(root: &std::path::Path) -> Self {
-        let previous = std::env::var_os("APPDATA");
-        // SAFETY: APPDATA_LOCK serializes this integration test's process-wide
-        // environment mutation for its complete runtime lifetime.
-        unsafe { std::env::set_var("APPDATA", root) };
-        Self(previous)
-    }
-}
-
-impl Drop for AppDataGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            // SAFETY: APPDATA_LOCK remains held until this guard is dropped.
-            unsafe { std::env::set_var("APPDATA", previous) };
-        } else {
-            // SAFETY: APPDATA_LOCK remains held until this guard is dropped.
-            unsafe { std::env::remove_var("APPDATA") };
-        }
-    }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind loopback port")
-        .local_addr()
-        .expect("read loopback port")
-        .port()
-}
+#[path = "common/live_core.rs"]
+pub mod live_core;
 
 /// Isolated runnable config; `geodata` (when Some) is the core-native block
 /// passed verbatim — broccoli's own 5-field cron validation is not on this path,
@@ -110,25 +78,6 @@ fn apply_and_start(config: serde_json::Value) -> CoreCmd {
         value: config,
         intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
         revision: 0,
-    }
-}
-
-fn copy_file(source: &std::path::Path, destination: &std::path::Path) {
-    std::fs::copy(source, destination).expect("copy managed core payload");
-}
-
-fn copy_installed_core(source_root: &std::path::Path, destination_root: &std::path::Path) {
-    let source = source_root.join("broccoli/core");
-    let destination = destination_root.join("broccoli/core");
-    std::fs::create_dir_all(&destination).expect("create isolated managed core");
-    for name in [
-        ".broccoli-official-release.json",
-        "xray.exe",
-        "wintun.dll",
-        "geoip.dat",
-        "geosite.dat",
-    ] {
-        copy_file(&source.join(name), &destination.join(name));
     }
 }
 
@@ -201,28 +150,35 @@ fn wait_ready(
     let mut start_logs = 0usize;
     let mut saw_error = None;
     let mut running = false;
-    while Instant::now() < deadline && (core_pid.is_none() || !running) {
-        match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
-                phase: CorePhase::Running,
-                ..
-            }) => running = true,
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => saw_error = Some(error.to_string()),
-            Ok(event) => {
-                if let Some(pid) = started_pid(&event) {
-                    core_pid = Some(pid);
-                    start_logs += 1;
+    live_core::drive_events(
+        receiver,
+        deadline,
+        "before the core became ready",
+        |event| {
+            match event {
+                Some(CoreEvt::State {
+                    phase: CorePhase::Running,
+                    ..
+                }) => running = true,
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Some(event) => {
+                    if let Some(pid) = started_pid(&event) {
+                        core_pid = Some(pid);
+                        start_logs += 1;
+                    }
                 }
+                None => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped before the core became ready")
+            if core_pid.is_some() && running {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
-        }
-    }
+        },
+    );
     assert!(
         running,
         "core did not become gRPC-ready: {:?}",
@@ -239,18 +195,25 @@ fn wait_ready(
 /// deadline expiry.
 fn wait_stopped(receiver: &std::sync::mpsc::Receiver<CoreEvt>, deadline: Instant) {
     let mut stopped = false;
-    while Instant::now() < deadline && !stopped {
-        match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
+    live_core::drive_events(
+        receiver,
+        deadline,
+        "before the core reached Stopped",
+        |event| {
+            if let Some(CoreEvt::State {
                 phase: CorePhase::Stopped,
                 ..
-            }) => stopped = true,
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped before the core reached Stopped")
+            }) = event
+            {
+                stopped = true;
             }
-        }
-    }
+            if stopped {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(stopped, "core did not stop cleanly within the deadline");
 }
 
@@ -272,27 +235,21 @@ fn assert_stays_up(receiver: &std::sync::mpsc::Receiver<CoreEvt>, window: Durati
     let deadline = Instant::now() + window;
     let mut restarts = 0usize;
     let mut saw_error = None;
-    while Instant::now() < deadline {
-        match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
+    live_core::drive_events(receiver, deadline, &format!("while {context}"), |event| {
+        match event {
+            Some(CoreEvt::State {
                 phase: CorePhase::Error(error),
                 ..
             }) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State {
+            Some(CoreEvt::State {
                 phase: CorePhase::Stopped | CorePhase::Backoff { .. },
                 ..
             }) => restarts += 1,
-            Ok(event) => {
-                if started_pid(&event).is_some() {
-                    restarts += 1;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped while {context}");
-            }
+            Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+            None => {}
         }
-    }
+        ControlFlow::Continue(())
+    });
     assert_eq!(restarts, 0, "{context}: the core must not restart");
     assert!(
         saw_error.is_none(),
@@ -304,17 +261,15 @@ fn assert_stays_up(receiver: &std::sync::mpsc::Receiver<CoreEvt>, window: Durati
 #[test]
 #[ignore = "downloads geoip.dat from the real network through the pinned official Xray release"]
 fn downloads_and_reloads_geodata_without_restart() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let installed_root = std::path::PathBuf::from(
-        std::env::var_os("APPDATA").expect("real APPDATA must be available"),
-    );
-    assert!(
-        installed_root.join("broccoli/core/xray.exe").is_file(),
-        "the managed core must be installed before exercising geodata updates"
-    );
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    copy_installed_core(&installed_root, isolated.path());
-    let (socks_port, api_port) = (free_port(), free_port());
+    let _appdata_lock = live_core::appdata_lock();
+    // The geodata payloads are swapped on a tree the verification accepts,
+    // wherever it comes from: the pinned archive when the fixture names one,
+    // else the machine's install.
+    let source = tempfile::tempdir().expect("managed core staging root");
+    let installed_core = live_core::managed_core_source(source.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_managed_core(&installed_core);
+    let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     // Xray-core releases carry geoip.dat only inside the platform zips (the
     // upload glob is `Xray-*.zip*`), so the canonical standalone source is the
     // provenance repo itself: Loyalsoldier/v2ray-rules-dat @ release — the
@@ -342,7 +297,7 @@ fn downloads_and_reloads_geodata_without_restart() {
         .expect("copied geoip.dat")
         .modified()
         .expect("read geoip.dat mtime");
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
@@ -364,35 +319,36 @@ fn downloads_and_reloads_geodata_without_restart() {
     let mut swapped = false;
     let mut restarts = 0usize;
     let mut saw_error = None;
-    while Instant::now() < swap_deadline && !swapped {
-        if let Ok(metadata) = std::fs::metadata(&geoip_path)
-            && let Ok(modified) = metadata.modified()
-            && modified != mtime_before
-        {
-            swapped = true;
-        }
-        if !swapped {
-            match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State {
+    live_core::drive_events(
+        &evt_rx,
+        swap_deadline,
+        "while waiting for the geodata swap",
+        |event| {
+            if let Ok(metadata) = std::fs::metadata(&geoip_path)
+                && let Ok(modified) = metadata.modified()
+                && modified != mtime_before
+            {
+                swapped = true;
+            }
+            match event {
+                Some(CoreEvt::State {
                     phase: CorePhase::Error(error),
                     ..
                 }) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State {
+                Some(CoreEvt::State {
                     phase: CorePhase::Stopped,
                     ..
                 }) => restarts += 1,
-                Ok(event) => {
-                    if started_pid(&event).is_some() {
-                        restarts += 1;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("runtime stopped while waiting for the geodata swap")
-                }
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-        }
-    }
+            if swapped {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(
         swapped,
         "geoip.dat was never swapped by the geodata scheduler (deadline 120s)"
@@ -401,23 +357,22 @@ fn downloads_and_reloads_geodata_without_restart() {
     // Let the scheduled reloads keep running a little longer: the core must
     // stay the same process, with no error phase and no second start.
     let settle = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < settle {
-        match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => saw_error = Some(error.to_string()),
-            Ok(event) => {
-                if started_pid(&event).is_some() {
-                    restarts += 1;
-                }
+    live_core::drive_events(
+        &evt_rx,
+        settle,
+        "while confirming the core stayed alive",
+        |event| {
+            match event {
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped while confirming the core stayed alive")
-            }
-        }
-    }
+            ControlFlow::Continue(())
+        },
+    );
     assert_eq!(start_logs, 1, "the core must be started exactly once");
     assert_eq!(restarts, 0, "geodata reload must not restart the core");
     assert!(
@@ -440,23 +395,21 @@ fn payload_files_stay_replaceable_while_core_runs() {
     // must not pin the payload files for the child lifetime: this
     // probe performs the updater's exact swap while the runtime supervises a
     // live core, with no network and no scheduler wait.
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let installed_root = std::path::PathBuf::from(
-        std::env::var_os("APPDATA").expect("real APPDATA must be available"),
-    );
-    assert!(
-        installed_root.join("broccoli/core/xray.exe").is_file(),
-        "the managed core must be installed before probing payload replaceability"
-    );
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    copy_installed_core(&installed_root, isolated.path());
-    let (socks_port, api_port) = (free_port(), free_port());
+    let _appdata_lock = live_core::appdata_lock();
+    // The geodata payloads are swapped on a tree the verification accepts,
+    // wherever it comes from: the pinned archive when the fixture names one,
+    // else the machine's install.
+    let source = tempfile::tempdir().expect("managed core staging root");
+    let installed_core = live_core::managed_core_source(source.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_managed_core(&installed_core);
+    let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     // No `geodata` block: the probe swaps the file itself, so no download.
     let config = runnable_config(socks_port, api_port, None, None);
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
     let original = std::fs::read(&geoip_path).expect("read copied geoip.dat");
     let original_sha = sha256_hex(&original);
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
@@ -491,27 +444,26 @@ fn payload_files_stay_replaceable_while_core_runs() {
     let settle = Instant::now() + Duration::from_secs(5);
     let mut restarts = 0usize;
     let mut saw_error = None;
-    while Instant::now() < settle {
-        match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State {
-                phase: CorePhase::Stopped,
-                ..
-            }) => restarts += 1,
-            Ok(event) => {
-                if started_pid(&event).is_some() {
-                    restarts += 1;
-                }
+    live_core::drive_events(
+        &evt_rx,
+        settle,
+        "while confirming the core stayed alive",
+        |event| {
+            match event {
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Some(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) => restarts += 1,
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped while confirming the core stayed alive")
-            }
-        }
-    }
+            ControlFlow::Continue(())
+        },
+    );
     assert_eq!(restarts, 0, "payload replacement must not restart the core");
     assert!(
         saw_error.is_none(),
@@ -530,17 +482,15 @@ fn payload_files_stay_replaceable_while_core_runs() {
 #[test]
 #[ignore = "downloads a broken geodata payload from the real network to verify rollback"]
 fn broken_file_rolls_back() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let installed_root = std::path::PathBuf::from(
-        std::env::var_os("APPDATA").expect("real APPDATA must be available"),
-    );
-    assert!(
-        installed_root.join("broccoli/core/xray.exe").is_file(),
-        "the managed core must be installed before exercising geodata rollback"
-    );
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    copy_installed_core(&installed_root, isolated.path());
-    let (socks_port, api_port) = (free_port(), free_port());
+    let _appdata_lock = live_core::appdata_lock();
+    // The geodata payloads are swapped on a tree the verification accepts,
+    // wherever it comes from: the pinned archive when the fixture names one,
+    // else the machine's install.
+    let source = tempfile::tempdir().expect("managed core staging root");
+    let installed_core = live_core::managed_core_source(source.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_managed_core(&installed_core);
+    let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     // 200 OK but Go source text, not a dat: reload must fail and roll back.
     let geodata = serde_json::json!({
         "cron": "@every 1s",
@@ -558,7 +508,7 @@ fn broken_file_rolls_back() {
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
     let original = std::fs::read(&geoip_path).expect("read copied geoip.dat");
     let original_sha = sha256_hex(&original);
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
@@ -583,27 +533,35 @@ fn broken_file_rolls_back() {
     let swap_deadline = Instant::now() + Duration::from_secs(120);
     let mut saw_rollback_log = false;
     let mut saw_error = None;
-    while Instant::now() < swap_deadline && !saw_rollback_log {
-        match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::Log {
-                line,
-                from_core: true,
-            }) => {
-                if line.contains("failed to reload geodata after downloading assets, rolling back")
-                {
-                    saw_rollback_log = true;
+    live_core::drive_events(
+        &evt_rx,
+        swap_deadline,
+        "while waiting for the geodata rollback",
+        |event| {
+            match event {
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Some(CoreEvt::Log {
+                    line,
+                    from_core: true,
+                }) => {
+                    if line
+                        .contains("failed to reload geodata after downloading assets, rolling back")
+                    {
+                        saw_rollback_log = true;
+                    }
                 }
+                Some(_) | None => {}
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped while waiting for the geodata rollback")
+            if saw_rollback_log {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
-        }
-    }
+        },
+    );
     assert!(
         saw_rollback_log,
         "the core must log the all-files rollback after a failed reload (deadline 120s)"
@@ -621,32 +579,33 @@ fn broken_file_rolls_back() {
     let restore_deadline = Instant::now() + Duration::from_secs(30);
     let mut restored = false;
     let mut restarts = 0usize;
-    while Instant::now() < restore_deadline && !restored {
-        if let Ok(current) = std::fs::read(&geoip_path) {
-            restored = sha256_hex(&current) == original_sha;
-        }
-        if !restored {
-            match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State {
+    live_core::drive_events(
+        &evt_rx,
+        restore_deadline,
+        "while waiting for the geodata restore",
+        |event| {
+            if let Ok(current) = std::fs::read(&geoip_path) {
+                restored = sha256_hex(&current) == original_sha;
+            }
+            match event {
+                Some(CoreEvt::State {
                     phase: CorePhase::Error(error),
                     ..
                 }) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State {
+                Some(CoreEvt::State {
                     phase: CorePhase::Stopped,
                     ..
                 }) => restarts += 1,
-                Ok(event) => {
-                    if started_pid(&event).is_some() {
-                        restarts += 1;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("runtime stopped while waiting for the geodata restore")
-                }
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-        }
-    }
+            if restored {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(
         restored,
         "the rolled-back geoip.dat must match the original bytes (sha256)"
@@ -655,27 +614,26 @@ fn broken_file_rolls_back() {
     // Drain any events queued after the restore snapshot so a late error or
     // restart from the rollback window is still observed.
     let settle = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < settle {
-        match evt_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(CoreEvt::State {
-                phase: CorePhase::Error(error),
-                ..
-            }) => saw_error = Some(error.to_string()),
-            Ok(CoreEvt::State {
-                phase: CorePhase::Stopped,
-                ..
-            }) => restarts += 1,
-            Ok(event) => {
-                if started_pid(&event).is_some() {
-                    restarts += 1;
-                }
+    live_core::drive_events(
+        &evt_rx,
+        settle,
+        "while confirming the restore held",
+        |event| {
+            match event {
+                Some(CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                }) => saw_error = Some(error.to_string()),
+                Some(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                }) => restarts += 1,
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("runtime stopped while confirming the restore held")
-            }
-        }
-    }
+            ControlFlow::Continue(())
+        },
+    );
     assert_eq!(restarts, 0, "geodata rollback must not restart the core");
     assert!(
         saw_error.is_none(),
@@ -720,16 +678,14 @@ const SWAPPED_GEOIP_SHA256: &str =
 #[test]
 #[ignore = "downloads a frozen upstream geoip.dat from the real network and restarts the managed core"]
 fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release_bytes() {
-    let _appdata_lock: MutexGuard<'static, ()> = APPDATA_LOCK.lock();
-    let installed_root = std::path::PathBuf::from(
-        std::env::var_os("APPDATA").expect("real APPDATA must be available"),
-    );
-    assert!(
-        installed_root.join("broccoli/core/xray.exe").is_file(),
-        "the managed core must be installed before exercising restart-after-swap"
-    );
-    let isolated = tempfile::tempdir().expect("create isolated APPDATA");
-    copy_installed_core(&installed_root, isolated.path());
+    let _appdata_lock = live_core::appdata_lock();
+    // The geodata payloads are swapped on a tree the verification accepts,
+    // wherever it comes from: the pinned archive when the fixture names one,
+    // else the machine's install.
+    let source = tempfile::tempdir().expect("managed core staging root");
+    let installed_core = live_core::managed_core_source(source.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_managed_core(&installed_core);
     let core_dir = isolated.path().join("broccoli/core");
     let geoip_path = core_dir.join("geoip.dat");
     let geosite_path = core_dir.join("geosite.dat");
@@ -753,9 +709,10 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     // install funnel).
     let pristine_dir = core_dir.join("pristine");
     std::fs::create_dir_all(&pristine_dir).expect("create fixture pristine dir");
-    copy_file(&geoip_path, &pristine_dir.join("geoip.dat"));
-    copy_file(&geosite_path, &pristine_dir.join("geosite.dat"));
-    let (socks_port, api_port) = (free_port(), free_port());
+    std::fs::copy(&geoip_path, pristine_dir.join("geoip.dat")).expect("copy managed core payload");
+    std::fs::copy(&geosite_path, pristine_dir.join("geosite.dat"))
+        .expect("copy managed core payload");
+    let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     let geodata = serde_json::json!({
         "cron": "@every 1s",
         "assets": [{
@@ -773,7 +730,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         ]
     });
     let config = runnable_config(socks_port, api_port, Some(geodata), Some(routing.clone()));
-    let _appdata = AppDataGuard::install(isolated.path());
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(broccoli::rt::EVT_CHANNEL_CAPACITY);
     let rt = spawn_runtime(evt_tx, egui::Context::default());
@@ -804,42 +761,43 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     let mut stable_swaps = 0u32;
     let mut restarts = 0usize;
     let mut saw_error = None;
-    while Instant::now() < swap_deadline && stable_swaps < 3 {
-        if let Ok(metadata) = std::fs::metadata(&geoip_path)
-            && let Ok(modified) = metadata.modified()
-            && modified != last_mtime
-        {
-            last_mtime = modified;
-            if let Ok(current) = std::fs::read(&geoip_path) {
-                if sha256_hex(&current) == SWAPPED_GEOIP_SHA256 {
-                    stable_swaps += 1;
-                } else {
-                    stable_swaps = 0;
+    live_core::drive_events(
+        &evt_rx,
+        swap_deadline,
+        "while waiting for the geodata swap",
+        |event| {
+            if let Ok(metadata) = std::fs::metadata(&geoip_path)
+                && let Ok(modified) = metadata.modified()
+                && modified != last_mtime
+            {
+                last_mtime = modified;
+                if let Ok(current) = std::fs::read(&geoip_path) {
+                    if sha256_hex(&current) == SWAPPED_GEOIP_SHA256 {
+                        stable_swaps += 1;
+                    } else {
+                        stable_swaps = 0;
+                    }
                 }
             }
-        }
-        if stable_swaps < 3 {
-            match evt_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(CoreEvt::State {
+            match event {
+                Some(CoreEvt::State {
                     phase: CorePhase::Error(error),
                     ..
                 }) => saw_error = Some(error.to_string()),
-                Ok(CoreEvt::State {
+                Some(CoreEvt::State {
                     phase: CorePhase::Stopped | CorePhase::Backoff { .. },
                     ..
                 }) => restarts += 1,
-                Ok(event) => {
-                    if started_pid(&event).is_some() {
-                        restarts += 1;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("runtime stopped while waiting for the geodata swap")
-                }
+                Some(event) => restarts += usize::from(started_pid(&event).is_some()),
+                None => {}
             }
-        }
-    }
+            if stable_swaps >= 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(
         stable_swaps >= 3,
         "geoip.dat never settled on the frozen upstream bytes (deadline 120s)"

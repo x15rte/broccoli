@@ -1,77 +1,24 @@
 //! Ignored real-core coverage for the isolated one-shot latency child.
 //!
 //! Runtime level, not screen level: it drives `spawn_runtime` with its own
-//! `egui::Context` and never builds the app, so it carries its own guards — the
-//! shared screen-test fixture only ever boots the app under kittest, and an app
-//! boot sweeps stale probe scratch directories, which are exactly the leftovers
-//! its leftover check reads. `TMP`/`TEMP` point at a staging directory of their
-//! own under the isolated root: the probe stages its scratch in the process
-//! temp dir, and it stays a sibling of the APPDATA tree this test pins.
+//! `egui::Context` and never builds the app, so the live-core fixture owns the
+//! app-data redirect and the throwaway core tree. It keeps a `TMP`/`TEMP`
+//! guard of its own: an app boot sweeps stale probe scratch directories, which
+//! are exactly the leftovers this test's leftover check reads. `TMP`/`TEMP`
+//! point at a staging directory of their own under the isolated root: the
+//! probe stages its scratch in the process temp dir, and it stays a sibling of
+//! the APPDATA tree this test pins.
 //! Run with: cargo test --test latency_probe_e2e -- --ignored --nocapture
 
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::ops::ControlFlow;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 use broccoli::rt::{ApplyIntent, CoreCmd, CoreEvt, CorePhase, GrpcClient, LatencyProbeResult};
 
-fn write_verified_release_metadata(core: &Path) {
-    let metadata = serde_json::json!({
-        "schema": 3,
-        "archive_asset": env!("BROCCOLI_XRAY_ARCHIVE"),
-        "archive_sha256": env!("BROCCOLI_XRAY_SHA256"),
-        "xray_sha256": env!("BROCCOLI_XRAY_EXE_SHA256"),
-        "wintun_sha256": env!("BROCCOLI_WINTUN_SHA256"),
-        "geoip_sha256": env!("BROCCOLI_GEOIP_SHA256"),
-        "geosite_sha256": env!("BROCCOLI_GEOSITE_SHA256"),
-        "version": env!("BROCCOLI_XRAY_VERSION").trim_start_matches('v'),
-    });
-    std::fs::write(
-        core.join(".broccoli-official-release.json"),
-        serde_json::to_vec(&metadata).expect("serialize pinned core metadata"),
-    )
-    .expect("write pinned core metadata");
-}
-
-fn xray() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XRAY_EXE") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let path = PathBuf::from(std::env::var_os("APPDATA")?)
-        .join("broccoli")
-        .join("core")
-        .join("xray.exe");
-    path.is_file().then_some(path)
-}
-
-struct AppDataGuard(Option<std::ffi::OsString>);
-
-impl AppDataGuard {
-    fn install(root: &Path) -> Self {
-        let previous = std::env::var_os("APPDATA");
-        // SAFETY: this ignored test owns process-global environment access for
-        // its whole run.
-        unsafe { std::env::set_var("APPDATA", root) };
-        Self(previous)
-    }
-}
-
-impl Drop for AppDataGuard {
-    fn drop(&mut self) {
-        // SAFETY: the test has finished all Broccoli threads before this guard
-        // restores the process environment.
-        unsafe {
-            match self.0.take() {
-                Some(value) => std::env::set_var("APPDATA", value),
-                None => std::env::remove_var("APPDATA"),
-            }
-        }
-    }
-}
+#[path = "common/live_core.rs"]
+pub mod live_core;
 
 struct TempEnvGuard {
     tmp: Option<std::ffi::OsString>,
@@ -110,13 +57,6 @@ impl Drop for TempEnvGuard {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind free loopback port")
-        .local_addr()
-        .expect("read free loopback port")
-        .port()
-}
 /// The machine's LAN IPv4, discovered via a route lookup: `connect` on a UDP
 /// socket never sends packets, it only selects the outgoing interface. The
 /// latency probe guard rejects loopback/link-local/cloud-metadata literals
@@ -203,21 +143,21 @@ fn wait_for_latency_result(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut operation_released = false;
     let mut result = None;
-    while Instant::now() < deadline {
-        if let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(250)) {
-            assert_no_main_failure_event(&event);
-            match event {
-                // Single-flight per child: the next LatencyProbe event is
-                // this request's outcome (no correlation id).
-                CoreEvt::LatencyProbe(value) => {
-                    result = Some(value);
-                }
-                CoreEvt::Operation(None) if result.is_some() => {
-                    operation_released = true;
-                    break;
-                }
-                _ => {}
+    live_core::drive_events(evt_rx, deadline, "during the isolated probe", |event| {
+        if let Some(event) = event.as_ref() {
+            assert_no_main_failure_event(event);
+        }
+        match event {
+            // Single-flight per child: the next LatencyProbe event is
+            // this request's outcome (no correlation id).
+            Some(CoreEvt::LatencyProbe(value)) => {
+                result = Some(value);
             }
+            Some(CoreEvt::Operation(None)) if result.is_some() => {
+                operation_released = true;
+                return ControlFlow::Break(());
+            }
+            _ => {}
         }
         let stats = io
             .block_on(main_grpc.get_sys_stats())
@@ -226,7 +166,8 @@ fn wait_for_latency_result(
             stats.uptime >= initial_uptime,
             "main core uptime regressed during isolated probe"
         );
-    }
+        ControlFlow::Continue(())
+    });
     assert!(operation_released, "latency operation did not release");
     result.expect("latency probe result")
 }
@@ -234,26 +175,14 @@ fn wait_for_latency_result(
 #[test]
 #[ignore = "needs a real xray.exe core"]
 fn latency_probe_isolated_child_preserves_running_main_core() {
-    let Some(xray_source) = xray() else {
+    let Some(xray_source) = live_core::discover_xray() else {
         eprintln!("SKIP: no xray.exe");
         return;
     };
 
-    let isolated = tempfile::tempdir().expect("isolated APPDATA");
-    let isolated_core = isolated.path().join("broccoli/core");
-    std::fs::create_dir_all(&isolated_core).expect("create isolated core");
-    if let Some(source_core) = xray_source.parent() {
-        for entry in std::fs::read_dir(source_core).expect("list source core") {
-            let entry = entry.expect("source core entry");
-            if entry.file_type().expect("source entry type").is_file() {
-                std::fs::copy(entry.path(), isolated_core.join(entry.file_name()))
-                    .expect("copy isolated core asset");
-            }
-        }
-    }
-    std::fs::copy(&xray_source, isolated_core.join("xray.exe")).expect("copy isolated xray.exe");
-    write_verified_release_metadata(&isolated_core);
-    let _appdata = AppDataGuard::install(isolated.path());
+    let isolated = live_core::IsolatedRoot::empty();
+    isolated.install_pinned_core(&xray_source);
+    let _appdata = live_core::redirect_appdata(isolated.path());
 
     let probe_temp = isolated.path().join("probe-temp");
     std::fs::create_dir_all(&probe_temp).expect("create isolated probe temp root");
@@ -268,7 +197,7 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
         }
     });
 
-    let main_api_port = free_port();
+    let main_api_port = live_core::free_port();
     let main_config = serde_json::json!({
         "log": { "loglevel": "warning" },
         "stats": {},
@@ -321,23 +250,31 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
 
     let startup_deadline = Instant::now() + Duration::from_secs(30);
     let mut running = false;
-    while Instant::now() < startup_deadline && !running {
-        if let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(500)) {
+    live_core::drive_events(
+        &evt_rx,
+        startup_deadline,
+        "before the main core reached Running",
+        |event| {
             match event {
-                CoreEvt::State {
+                Some(CoreEvt::State {
                     phase: CorePhase::Running,
                     ..
-                } => running = true,
-                CoreEvt::State {
+                }) => running = true,
+                Some(CoreEvt::State {
                     phase: CorePhase::Error(error),
                     ..
-                } => {
+                }) => {
                     panic!("main core failed to start: {error}")
                 }
-                _ => {}
+                Some(_) | None => {}
             }
-        }
-    }
+            if running {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     assert!(running, "main core did not reach Running");
 
     let active_config_path = isolated.path().join("broccoli/config/config.json");
@@ -391,7 +328,7 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
         .cmd
         .send(CoreCmd::ProbeLatency {
             profiles: vec![profile.clone()],
-            probe_url: format!("http://{lan}:{}/dead", free_port()),
+            probe_url: format!("http://{lan}:{}/dead", live_core::free_port()),
             tun_outbound_interface: None,
             tun_adapter_name: None,
         })
@@ -424,17 +361,24 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
 
     runtime.cmd.send(CoreCmd::Stop).expect("stop main runtime");
     let stop_deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < stop_deadline {
-        if matches!(
-            evt_rx.recv_timeout(Duration::from_millis(250)),
-            Ok(CoreEvt::State {
-                phase: CorePhase::Stopped,
-                ..
-            })
-        ) {
-            break;
-        }
-    }
+    live_core::drive_events(
+        &evt_rx,
+        stop_deadline,
+        "before the main core stopped",
+        |event| {
+            if matches!(
+                event,
+                Some(CoreEvt::State {
+                    phase: CorePhase::Stopped,
+                    ..
+                })
+            ) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
     runtime
         .cmd
         .send(CoreCmd::Shutdown)
