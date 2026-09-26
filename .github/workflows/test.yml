@@ -130,15 +130,16 @@ jobs:
           }
           "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # The live-core suites (tests/golden_validation.rs,
-      # tests/trial_rules_live_core.rs, tests/dns_inbound_live_core.rs,
-      # tests/proxy_e2e.rs,
-      # tests/traffic_totals_e2e.rs, tests/latency_probe_e2e.rs) are
-      # #[ignore]d by default, so CI must supply the core and lift the ignore
-      # for those targets or they never run. Pin the same verified release the
-      # app downloads (Cargo.toml [package.metadata.broccoli.release] —
+      # The live-core suites — golden_validation, the two *_live_core
+      # targets, proxy_e2e, traffic_totals_e2e, latency_probe_e2e,
+      # core_update_e2e, and geodata_dat_pin_suspension — are #[ignore]d by
+      # default, so CI must supply the core and lift the ignore for those
+      # targets or they never run. Pin the same verified release the app
+      # downloads (Cargo.toml [package.metadata.broccoli.release] —
       # xray_version, xray_archive, xray_sha256), verify the archive SHA-256
-      # before extraction, and export it as XRAY_EXE for the test step.
+      # before extraction, and export XRAY_EXE for the suites that spawn a
+      # core plus BROCCOLI_TEST_XRAY_ARCHIVE for the ones that stage a
+      # managed core from the ZIP.
       - name: Download and verify pinned Xray core
         run: |
           $ErrorActionPreference = 'Stop'
@@ -212,3 +213,33 @@ jobs:
               --test proxy_e2e --test traffic_totals_e2e `
               --test latency_probe_e2e -- --ignored
           if ($LASTEXITCODE -ne 0) { throw "cargo test (live-core suites) failed with exit code $LASTEXITCODE" }
+
+      # A GitHub-hosted Windows runner executes steps as an administrator with
+      # UAC disabled, so the two oracles that need an elevated token — the WFP
+      # shield probe and the protected-stage ACL — run here rather than only in
+      # a developer's elevated shell. The probe is per-machine by design: it
+      # binds this machine's LAN address and expects the installed shield to
+      # block it, so the address comes from the default route instead of a
+      # compiled-in default. The install oracle needs the same verified ZIP the
+      # download step kept. The four oracles that want a core installed into
+      # the machine's own APPDATA stay manual: CI installs none of them.
+      - name: Run the elevated and archive-backed oracles
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lanIp = Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
+              Sort-Object RouteMetric, ifIndex |
+              Select-Object -First 1 |
+              ForEach-Object {
+                  Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 |
+                      Select-Object -First 1 -ExpandProperty IPAddress
+              }
+          if ([string]::IsNullOrWhiteSpace($lanIp)) {
+              throw 'the default route has no IPv4 address for the probe to bind'
+          }
+          $env:BROCCOLI_PROBE_LAN_IP = $lanIp
+          $env:BROCCOLI_PROBE_XRAY = $env:XRAY_EXE
+          cargo test --locked --lib --target $env:BROCCOLI_TARGET -- --ignored `
+              rt::wfp::tests::empirical_port53_is_blocked_outside_the_tun `
+              rt::helper::tests::protected_stage_acl_is_verified_and_stage_is_removed_on_drop `
+              sys::core_dl::pristine_tests::installing_the_pinned_archive_retains_a_pin_matching_pristine_pair
+          if ($LASTEXITCODE -ne 0) { throw "cargo test (elevated and archive-backed oracles) failed with exit code $LASTEXITCODE" }
