@@ -1844,6 +1844,16 @@ impl RoutingScreen {
         }
     }
 
+    /// The "Add geosite…"/"Add geoip…" picker: a toggle button opening
+    /// [`Self::geodata_picker_body`] in a menu-shaped popup.
+    ///
+    /// The picker carries its own search field, so it has to stay open while
+    /// the user works inside it: an egui menu's default close behavior is
+    /// "any click", which would dismiss the popup the moment the field is
+    /// clicked. `CloseOnClickOutside` keeps it open for every click in its
+    /// body — the field, the scroll bar — while an outside click, Escape, a
+    /// second click of the button, and the body's own `ui.close()` after a
+    /// code is chosen all close it.
     fn geodata_picker_menu(
         &mut self,
         ui: &mut Ui,
@@ -1851,150 +1861,164 @@ impl RoutingScreen {
         kind: GeodataPickerKind,
         rule_values: &mut Vec<String>,
     ) -> bool {
+        let button = ui.button(kind.button_label(lang));
+        egui::Popup::from_toggle_button_response(&button)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .style(egui::containers::menu::menu_style)
+            .show(|ui| self.geodata_picker_body(ui, lang, kind, rule_values))
+            .is_some_and(|opened| opened.inner)
+    }
+
+    /// The picker popup's body: the header (data file, code and byte
+    /// counts, refresh), the search field, and the code rows. Returns true
+    /// when a code was appended to `rule_values`.
+    fn geodata_picker_body(
+        &mut self,
+        ui: &mut Ui,
+        lang: Language,
+        kind: GeodataPickerKind,
+        rule_values: &mut Vec<String>,
+    ) -> bool {
         let mut changed = false;
-        ui.menu_button(kind.button_label(lang), |ui| {
-            if matches!(self.geodata_load_state, GeodataLoadState::Idle) {
+        if matches!(self.geodata_load_state, GeodataLoadState::Idle) {
+            self.start_geodata_load(lang, ui.ctx().clone());
+        }
+
+        ui.set_min_width(320.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(kind.file_name()).strong());
+            let loading = self.geodata_load_state.is_loading();
+            if loading {
+                ui.spinner();
+                ui.label(RichText::new(t(lang, Key::GeodataLoading)).small().weak());
+            }
+            if ui
+                .add_enabled(
+                    !loading,
+                    egui::Button::new(t(lang, Key::GeodataRefresh)).small(),
+                )
+                .on_disabled_hover_text(t(lang, Key::GeodataRefreshBusy))
+                .clicked()
+            {
                 self.start_geodata_load(lang, ui.ctx().clone());
             }
+        });
+        if let GeodataLoadState::Failed(error) = &self.geodata_load_state {
+            ui.label(
+                RichText::new(error)
+                    .small()
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
 
-            ui.set_min_width(320.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(kind.file_name()).strong());
-                let loading = self.geodata_load_state.is_loading();
-                if loading {
-                    ui.spinner();
-                    ui.label(RichText::new(t(lang, Key::GeodataLoading)).small().weak());
-                }
-                if ui
-                    .add_enabled(
-                        !loading,
-                        egui::Button::new(t(lang, Key::GeodataRefresh)).small(),
-                    )
-                    .on_disabled_hover_text(t(lang, Key::GeodataRefreshBusy))
-                    .clicked()
-                {
-                    self.start_geodata_load(lang, ui.ctx().clone());
-                }
-            });
-            if let GeodataLoadState::Failed(error) = &self.geodata_load_state {
+        let Some(snapshot) = self.geodata_snapshot.as_ref() else {
+            ui.label(RichText::new(t(lang, Key::GeodataReading)).small().weak());
+            return false;
+        };
+        match kind.catalog(snapshot) {
+            Err(error) => {
                 ui.label(
-                    RichText::new(error)
+                    RichText::new(error.text(lang))
                         .small()
                         .color(ui.visuals().error_fg_color),
                 );
             }
-
-            let Some(snapshot) = self.geodata_snapshot.as_ref() else {
-                ui.label(RichText::new(t(lang, Key::GeodataReading)).small().weak());
-                return;
-            };
-            match kind.catalog(snapshot) {
-                Err(error) => {
-                    ui.label(
-                        RichText::new(error.text(lang))
-                            .small()
-                            .color(ui.visuals().error_fg_color),
-                    );
+            Ok(catalog) => {
+                let codes_bytes = ui.label(
+                    RichText::new(t_fmt(
+                        lang,
+                        Key::GeodataCodesBytes,
+                        &[&catalog.codes.len(), &catalog.metadata.byte_len],
+                    ))
+                    .small()
+                    .weak(),
+                );
+                // The modified-time hover needs two String builds (path
+                // display + SystemTime debug) plus a `t_fmt`; egui
+                // evaluates `on_hover_text` arguments eagerly on every
+                // open-menu frame, so the tooltip is attached only on
+                // the frames the label is actually hovered.
+                // The popup renders only while open and pointer
+                // motion over the label is an interaction frame, which
+                // bounds the hover build to interaction.
+                if codes_bytes.hovered() {
+                    let path = catalog.metadata.path.display().to_string();
+                    let modified = catalog
+                        .metadata
+                        .modified
+                        .as_ref()
+                        .map(|modified| format!("{modified:?}"))
+                        .unwrap_or_else(|| t(lang, Key::GeodataModifiedUnavailable).to_owned());
+                    codes_bytes.on_hover_text(t_fmt(
+                        lang,
+                        Key::GeodataModified,
+                        &[&path, &modified],
+                    ));
                 }
-                Ok(catalog) => {
-                    let codes_bytes = ui.label(
-                        RichText::new(t_fmt(
-                            lang,
-                            Key::GeodataCodesBytes,
-                            &[&catalog.codes.len(), &catalog.metadata.byte_len],
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    // The modified-time hover needs two String builds (path
-                    // display + SystemTime debug) plus a `t_fmt`; egui
-                    // evaluates `on_hover_text` arguments eagerly on every
-                    // open-menu frame, so the tooltip is attached only on
-                    // the frames the label is actually hovered.
-                    // The popup renders only while open and pointer
-                    // motion over the label is an interaction frame, which
-                    // bounds the hover build to interaction.
-                    if codes_bytes.hovered() {
-                        let path = catalog.metadata.path.display().to_string();
-                        let modified = catalog
-                            .metadata
-                            .modified
-                            .as_ref()
-                            .map(|modified| format!("{modified:?}"))
-                            .unwrap_or_else(|| t(lang, Key::GeodataModifiedUnavailable).to_owned());
-                        codes_bytes.on_hover_text(t_fmt(
-                            lang,
-                            Key::GeodataModified,
-                            &[&path, &modified],
-                        ));
-                    }
 
-                    let search = match kind {
-                        GeodataPickerKind::Geosite => &mut self.geosite_search,
-                        GeodataPickerKind::Geoip => &mut self.geoip_search,
+                let search = match kind {
+                    GeodataPickerKind::Geosite => &mut self.geosite_search,
+                    GeodataPickerKind::Geoip => &mut self.geoip_search,
+                };
+                ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text(t(lang, Key::GeodataSearch))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.separator();
+
+                let query = search.trim();
+                let row_height = ui.spacing().interact_size.y;
+                let mut selected = None;
+                if query.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_salt(ui.auto_id_with(kind.file_name()))
+                        .max_height(260.0)
+                        .show_rows(ui, row_height, catalog.codes.len(), |ui, rows| {
+                            for code in &catalog.codes[rows] {
+                                if ui.selectable_label(false, code.as_str()).clicked() {
+                                    selected = Some(code.as_str());
+                                }
+                            }
+                        });
+                } else {
+                    // Scan only when the query text or the dataset changed;
+                    // identical renders reuse the memoized match indices.
+                    let memo = match kind {
+                        GeodataPickerKind::Geosite => &mut self.geosite_search_memo,
+                        GeodataPickerKind::Geoip => &mut self.geoip_search_memo,
                     };
-                    ui.add(
-                        egui::TextEdit::singleline(search)
-                            .hint_text(t(lang, Key::GeodataSearch))
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.separator();
-
-                    let query = search.trim();
-                    let row_height = ui.spacing().interact_size.y;
-                    let mut selected = None;
-                    if query.is_empty() {
+                    let matches =
+                        geodata_search_matches(memo, self.geodata_revision, &catalog.codes, query);
+                    if matches.is_empty() {
+                        ui.label(RichText::new(t(lang, Key::GeodataNoMatches)).weak());
+                    } else {
                         egui::ScrollArea::vertical()
                             .id_salt(ui.auto_id_with(kind.file_name()))
                             .max_height(260.0)
-                            .show_rows(ui, row_height, catalog.codes.len(), |ui, rows| {
-                                for code in &catalog.codes[rows] {
-                                    if ui.selectable_label(false, code.as_str()).clicked() {
-                                        selected = Some(code.as_str());
+                            .show_rows(ui, row_height, matches.len(), |ui, rows| {
+                                for &index in &matches[rows] {
+                                    let code = catalog.codes[index as usize].as_str();
+                                    if ui.selectable_label(false, code).clicked() {
+                                        selected = Some(code);
                                     }
                                 }
                             });
-                    } else {
-                        // Scan only when the query text or the dataset changed;
-                        // identical renders reuse the memoized match indices.
-                        let memo = match kind {
-                            GeodataPickerKind::Geosite => &mut self.geosite_search_memo,
-                            GeodataPickerKind::Geoip => &mut self.geoip_search_memo,
-                        };
-                        let matches = geodata_search_matches(
-                            memo,
-                            self.geodata_revision,
-                            &catalog.codes,
-                            query,
-                        );
-                        if matches.is_empty() {
-                            ui.label(RichText::new(t(lang, Key::GeodataNoMatches)).weak());
-                        } else {
-                            egui::ScrollArea::vertical()
-                                .id_salt(ui.auto_id_with(kind.file_name()))
-                                .max_height(260.0)
-                                .show_rows(ui, row_height, matches.len(), |ui, rows| {
-                                    for &index in &matches[rows] {
-                                        let code = catalog.codes[index as usize].as_str();
-                                        if ui.selectable_label(false, code).clicked() {
-                                            selected = Some(code);
-                                        }
-                                    }
-                                });
-                        }
-                    }
-
-                    if let Some(code) = selected {
-                        let value = format!("{}{code}", kind.prefix());
-                        if !rule_values.iter().any(|existing| existing == &value) {
-                            rule_values.push(value);
-                            changed = true;
-                        }
-                        ui.close();
                     }
                 }
+
+                if let Some(code) = selected {
+                    let value = format!("{}{code}", kind.prefix());
+                    if !rule_values.iter().any(|existing| existing == &value) {
+                        rule_values.push(value);
+                        changed = true;
+                    }
+                    ui.close();
+                }
             }
-        });
+        }
         changed
     }
 
@@ -6163,14 +6187,27 @@ mod routing_control_render_tests {
         );
 
         // The picker's search field: the text input carrying the picker's own
-        // hint (the field's placeholder), focused and typed into like the
-        // app-shell tests do.
+        // hint (the field's placeholder), clicked like a user clicks it. The
+        // picker is a menu-shaped popup with an input in it, so the click must
+        // leave it open (a menu's default close behavior is "any click").
         let search_hint = t(Language::En, Key::GeodataSearch);
         let field = harness
             .query_all_by_role(egui::accesskit::Role::TextInput)
             .find(|node| node.accesskit_node().placeholder() == Some(search_hint))
             .expect("the picker's search field must render with its hint");
-        field.focus();
+        field.click();
+        harness.run_steps(2);
+
+        let field = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.accesskit_node().placeholder() == Some(search_hint))
+            .expect("clicking the search field must not dismiss the picker");
+        assert!(field.is_focused(), "the clicked search field takes focus");
+        assert!(
+            harness.query_by_label(&size_label).is_some(),
+            "the whole picker stays up, not just its field"
+        );
+
         field.type_text("geo");
         harness.run_steps(2);
 
@@ -6186,17 +6223,26 @@ mod routing_control_render_tests {
                 .is_none(),
             "a catalog code the query does not match must not render"
         );
-    }
-}
 
-/// Route-test reply polling: the pending receiver
-/// lives on the screen, so a landed result survives dialog close/reopen and
-/// is consumed on the reopen poll without re-running. Pure unit tests — no
-/// egui, no runtime.
-#[cfg(test)]
-mod route_test_poll_tests {
-    use super::*;
-    use tokio::sync::oneshot;
+        // Choosing a row appends the prefixed code to the rule's list and hands
+        // the popup its own close, rather than the selection being lost on the
+        // click that made it.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "geolocation-!cn")
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness.state().1.settings.routing.rules[0].domain,
+            vec!["geosite:geolocation-!cn".to_owned()],
+            "the chosen code lands in the rule's domain list"
+        );
+        assert!(
+            harness
+                .query_all_by_role(egui::accesskit::Role::TextInput)
+                .all(|node| node.accesskit_node().placeholder() != Some(search_hint)),
+            "choosing a code closes the picker"
+        );
+    }
 
     #[test]
     fn landed_result_is_applied_by_the_poll() {
