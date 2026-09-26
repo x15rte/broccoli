@@ -2756,16 +2756,9 @@ impl Runtime {
     /// the elevated helper to report that Xray exited after TUN cleanup instead
     /// of relying on destructor order while the GUI process is disappearing.
     async fn shutdown_backend(&mut self) {
-        self.lifecycle.pending_restart = None;
-        self.lifecycle.pending_transition.clear();
-        self.lifecycle.core_update.clear();
-        self.lifecycle.gate_backend_alive = false;
-        self.lifecycle.exit_policy.finish();
-        if self.lifecycle.backend.as_backend().is_none() {
-            self.lifecycle.backend.force_release();
+        if !self.lifecycle.begin_shutdown() {
             return;
         }
-        self.lifecycle.exit_policy.begin_stop(Instant::now());
         if self.lifecycle.backend.tun_owned_or_alive() {
             self.kill_backend().await;
         }
@@ -2991,16 +2984,9 @@ impl Runtime {
     }
 
     async fn complete_pending_rollback(&mut self) {
-        let Some(reason) = self
-            .lifecycle
-            .pending_transition
-            .take_rollback_after_confirmed_exit(true)
-        else {
+        let Some(reason) = self.lifecycle.take_config_rollback() else {
             return;
         };
-        // Clearing this before the filesystem operation makes the retry
-        // one-shot even if the last-good replacement also fails to start.
-        self.lifecycle.pending_transition.clear_candidate();
         match apply::rollback_offloaded().await {
             Ok(()) => {
                 let output =
@@ -3031,14 +3017,9 @@ impl Runtime {
     }
 
     async fn complete_pending_core_rollback(&mut self) {
-        let Some(reason) = self
-            .lifecycle
-            .core_update
-            .take_rollback_after_confirmed_exit(true)
-        else {
+        let Some(reason) = self.lifecycle.take_core_rollback() else {
             return;
         };
-        self.lifecycle.core_update.clear_candidate();
 
         // `Backend::Direct` retains deny-write/delete handles for every
         // verified payload until its `Child` is dropped. Drop that owner only

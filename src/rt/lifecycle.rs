@@ -16,6 +16,7 @@ use super::dns_in;
 use super::policy::CoreExitFacts;
 use super::readiness::Readiness;
 use super::state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
+use crate::diag::Diag;
 
 /// One runtime's lifecycle state.
 pub(super) struct Lifecycle {
@@ -128,5 +129,46 @@ impl Lifecycle {
             self.pending_transition.is_candidate_pending(),
             self.backend.is_tun_owned(),
         );
+    }
+
+    /// Begin the final shutdown: drop every pending transition, close the
+    /// exit policy, and open the stop window. The answer says whether a live
+    /// backend still needs the runtime's stop sequence — with nothing live
+    /// the shutdown is already over, and the caller has nothing left to stop.
+    pub(super) fn begin_shutdown(&mut self) -> bool {
+        self.pending_restart = None;
+        self.pending_transition.clear();
+        self.core_update.clear();
+        self.gate_backend_alive = false;
+        self.exit_policy.finish();
+        if self.backend.as_backend().is_none() {
+            self.backend.force_release();
+            return false;
+        }
+        self.exit_policy.begin_stop(Instant::now());
+        true
+    }
+
+    /// Take the armed config rollback now that the candidate's exit is
+    /// confirmed. The candidate is cleared before the filesystem operation
+    /// runs, which makes the retry one-shot even if the last-good replacement
+    /// also fails to start. `None` means nothing was armed.
+    pub(super) fn take_config_rollback(&mut self) -> Option<Diag> {
+        let reason = self
+            .pending_transition
+            .take_rollback_after_confirmed_exit(true)?;
+        self.pending_transition.clear_candidate();
+        Some(reason)
+    }
+
+    /// Take the armed core rollback now that the candidate's exit is
+    /// confirmed, under the same one-shot rule as the config rollback: the
+    /// candidate is cleared before the swap, so a restored core that also
+    /// fails cannot arm the same rollback twice. `None` means nothing was
+    /// armed.
+    pub(super) fn take_core_rollback(&mut self) -> Option<Diag> {
+        let reason = self.core_update.take_rollback_after_confirmed_exit(true)?;
+        self.core_update.clear_candidate();
+        Some(reason)
     }
 }
