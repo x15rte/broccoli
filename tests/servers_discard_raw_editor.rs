@@ -14,6 +14,8 @@
 //! editor holds the persisted text again.
 
 use broccoli::app::BroccoliApp;
+use broccoli::i18n::{Key, t};
+use broccoli::model::settings::Language;
 use broccoli::model::{
     FinalmaskModel, FinalmaskTcpMask, OutboundModel, Protocol, ServerProfile, ServersFile, Settings,
 };
@@ -56,10 +58,18 @@ fn harness_with_raw(
     screen::boot_state(screen::BootState { settings, servers })
 }
 
-/// The only multiline text input on the Advanced tab: the preserved-raw JSON
-/// editor of the unknown finalmask.
+/// The preserved-raw JSON editor's own label: the editor is addressed by this
+/// accessible name, never as the Advanced tab's only multiline field.
+fn raw_editor_label() -> &'static str {
+    t(Language::En, Key::SrvPreservedRawValue)
+}
+
+/// The preserved-raw JSON editor of the unknown finalmask.
 fn raw_editor<'a>(h: &'a Harness<'a, BroccoliApp>) -> egui_kittest::Node<'a> {
-    h.get_by_role(egui::accesskit::Role::MultilineTextInput)
+    h.get_by_role_and_label(
+        egui::accesskit::Role::MultilineTextInput,
+        raw_editor_label(),
+    )
 }
 
 /// Dismiss the first-run wizard, open the Servers screen (the seeded profile

@@ -14,7 +14,7 @@
 
 use broccoli::app::BroccoliApp;
 use broccoli::i18n::safety_finding_message;
-use broccoli::i18n::{Key, t};
+use broccoli::i18n::{Key, t, t_fmt};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Mode};
 use broccoli::model::{DnsCfg, DnsServer, FakeDnsCfg, ServersFile, Settings};
@@ -60,18 +60,20 @@ fn invalid_pool_cidr_shows_inline_error() {
     let (_lock, _tmp, mut h) = boot(&settings, Screen::Dns);
 
     // Replace the first pool's CIDR with a non-CIDR value, exactly like the
-    // shared smoke-test editing flow.
-    let field = h
-        .get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some("198.18.0.0/15"))
-        .expect("fakeDNS pool ip_pool input");
-    field.click();
+    // shared smoke-test editing flow. Every pool's CIDR field spells the same
+    // "IP pool" label, so the first pool's field is addressed by the name its
+    // own group title composes with that label ("Pool 1 IP pool").
+    let pool_field_name = format!(
+        "{} {}",
+        t_fmt(Language::En, Key::DnsPoolTitle, &[&1_u32]),
+        t(Language::En, Key::DnsIpPool)
+    );
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, pool_field_name.as_str())
+        .click();
     h.run();
     h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
     h.run();
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some("198.18.0.0/15"))
-        .expect("pool input should keep the typed value")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, pool_field_name.as_str())
         .type_text("300.1.1.1/8");
     h.run_steps(4);
 

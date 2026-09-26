@@ -453,19 +453,20 @@ pub struct RoutingScreen {
     edit_rule: Option<usize>,
     /// Index of the balancer with the inline editor open.
     edit_balancer: Option<usize>,
-    /// (rule_tag, rows) — kv editing buffer for `Rule.attrs` (a map, so rows
-    /// with empty/duplicate keys must survive mid-edit outside the model).
-    attrs_buf: Option<(String, Vec<(String, String)>)>,
-    /// (rule_tag, rows) — kv editing buffer for `Webhook.headers`.
-    headers_buf: Option<(String, Vec<(String, String)>)>,
+    /// Edit draft for `Rule.attrs`, keyed on the edited rule's tag (a map, so
+    /// rows with empty/duplicate keys must survive mid-edit outside the
+    /// model; only the rows `map_from_kv` accepts reach it).
+    attrs_buf: widgets::Draft<Vec<(String, String)>>,
+    /// Edit draft for `Webhook.headers`, keyed on the edited rule's tag.
+    headers_buf: widgets::Draft<Vec<(String, String)>>,
     /// (rule_tag, buffers) — commit-gated edit buffers for the rule editor's
     /// PortList text fields (port, source_port, local_port, vless_route).
     /// Valid edits write the model; invalid ones stay in the buffer with an
     /// inline error, so a malformed list can never reach a saved or applied
     /// config.
     port_bufs: Option<(String, RulePortBuf)>,
-    /// (balancer tag, buffers) for the expanded leastload form.
-    ll_buf: Option<(String, LeastLoadBuf)>,
+    /// Edit draft for the expanded leastload form, keyed on the balancer.
+    ll_buf: widgets::Draft<LeastLoadBuf>,
     /// Local edit buffer for the observatory probe interval.
     probe_interval: Option<String>,
     ping_interval: Option<String>,
@@ -483,9 +484,10 @@ pub struct RoutingScreen {
     /// re-validation), recomputed only when a dialog editor reports
     /// `changed()` this frame instead of on every repaint.
     prepared_route_test: Option<Result<RouteTestRequest, String>>,
-    /// Draft tag for the open balancer; committed only through
-    /// `RoutingCfg::rename_balancer`, which rewrites rule references.
-    balancer_tag_buf: String,
+    /// Draft tag for the open balancer, seeded from the model tag when the
+    /// editor opens; committed only through `RoutingCfg::rename_balancer`,
+    /// which rewrites rule references.
+    balancer_tag_buf: widgets::Draft,
     balancer_error: Option<String>,
     /// Live per-balancer runtime UI state, keyed by balancer tag; entries
     /// are evicted when their tag leaves the routing model (see
@@ -1648,19 +1650,17 @@ impl RoutingScreen {
 
         // attrs: map key → regexp matched against HTTP sniff headers.
         ui.label(RichText::new(t(lang, Key::Attrs)).small().weak());
-        if !matches!(&self.attrs_buf, Some((t, _)) if *t == rule.rule_tag) {
-            self.attrs_buf = Some((rule.rule_tag.clone(), kv_from_map(&rule.attrs)));
-        }
-        if let Some((_, buf)) = &mut self.attrs_buf
-            && widgets::kv_table(
-                ui,
-                lang,
-                buf,
-                t(lang, Key::AttrsKeyHint),
-                t(lang, Key::AttrsValueHint),
-            )
-        {
-            rule.attrs = map_from_kv(buf);
+        let attrs = self
+            .attrs_buf
+            .begin_keyed(rule.rule_tag.as_str(), || kv_from_map(&rule.attrs));
+        if widgets::kv_table(
+            ui,
+            lang,
+            attrs,
+            t(lang, Key::AttrsKeyHint),
+            t(lang, Key::AttrsValueHint),
+        ) {
+            rule.attrs = map_from_kv(attrs);
             changed = true;
         }
 
@@ -1686,20 +1686,18 @@ impl RoutingScreen {
                     &mut wh.deduplication,
                     0..=86_400,
                 );
-                if !matches!(&self.headers_buf, Some((t, _)) if *t == rule.rule_tag) {
-                    self.headers_buf = Some((rule.rule_tag.clone(), kv_from_map(&wh.headers)));
-                }
                 ui.label(RichText::new(t(lang, Key::Headers)).small().weak());
-                if let Some((_, buf)) = &mut self.headers_buf
-                    && widgets::kv_table(
-                        ui,
-                        lang,
-                        buf,
-                        t(lang, Key::HeadersKeyHint),
-                        t(lang, Key::HeadersValueHint),
-                    )
-                {
-                    wh.headers = map_from_kv(buf);
+                let headers = self
+                    .headers_buf
+                    .begin_keyed(rule.rule_tag.as_str(), || kv_from_map(&wh.headers));
+                if widgets::kv_table(
+                    ui,
+                    lang,
+                    headers,
+                    t(lang, Key::HeadersKeyHint),
+                    t(lang, Key::HeadersValueHint),
+                ) {
+                    wh.headers = map_from_kv(headers);
                     changed = true;
                 }
             });
@@ -2409,9 +2407,14 @@ impl RoutingScreen {
                                     {
                                         if open {
                                             self.edit_balancer = None;
+                                            // The tag draft belongs to the
+                                            // open editor: closing it drops
+                                            // the seeded identity, so the
+                                            // next open reloads the model tag
+                                            // instead of the closed draft.
+                                            self.balancer_tag_buf.reset();
                                         } else {
                                             self.edit_balancer = Some(i);
-                                            self.balancer_tag_buf = bal.tag.clone();
                                             self.balancer_error = None;
                                         }
                                     }
@@ -2466,7 +2469,9 @@ impl RoutingScreen {
                     ctx.settings.routing.rename_balancer(index, &tag);
                 match result {
                     Ok(_) => {
-                        self.balancer_tag_buf = tag.trim().to_string();
+                        // The model tag moved, so the draft's identity no
+                        // longer matches and the next frame reseeds it from
+                        // the renamed balancer.
                         self.balancer_error = None;
                         *changed = true;
                     }
@@ -2482,6 +2487,11 @@ impl RoutingScreen {
                             Some(open) if open > index => Some(open - 1),
                             open => open,
                         };
+                        if self.edit_balancer.is_none() {
+                            // The closed editor's tag draft must not leak
+                            // into the next open.
+                            self.balancer_tag_buf.reset();
+                        }
                         self.balancer_error = None;
                         *changed = true;
                     }
@@ -2507,9 +2517,10 @@ impl RoutingScreen {
                 ctx.settings
                     .routing
                     .balancers
-                    .push(Balancer::new(tag.clone(), selector.into()));
+                    .push(Balancer::new(tag, selector.into()));
+                // The new balancer's editor seeds the tag draft from its own
+                // tag on the next frame.
                 self.edit_balancer = Some(ctx.settings.routing.balancers.len() - 1);
-                self.balancer_tag_buf = tag;
                 self.balancer_error = None;
                 *changed = true;
             }
@@ -2551,10 +2562,15 @@ impl RoutingScreen {
                 .expect("view cache populated above")
                 .balancer_tags,
         ));
+        // The tag draft belongs to the open editor: keyed on the same
+        // synthetic row identity the widget ids use (the tag, or the row
+        // index for a never-saved balancer), so switching editors reseeds it,
+        // and `reset` on close reloads the model on every reopen.
+        let tag = self.balancer_tag_buf.begin_keyed(key, || bal.tag.clone());
         widgets::validated_field_with_revision(
             ui,
             t(lang, Key::Tag),
-            &mut self.balancer_tag_buf,
+            tag,
             t(lang, Key::BalancerNameHint),
             tags_revision,
             |candidate| {
@@ -2576,7 +2592,7 @@ impl RoutingScreen {
                 }
             },
         );
-        let candidate = self.balancer_tag_buf.trim();
+        let candidate = self.balancer_tag_buf.text().trim();
         let valid = !candidate.is_empty()
             && self
                 .view_cache
@@ -2686,15 +2702,12 @@ impl RoutingScreen {
     ) -> bool {
         let mut changed = false;
         ui.indent(("ll", key), |ui| {
-            if !matches!(&self.ll_buf, Some((t, _)) if *t == key) {
-                self.ll_buf = Some((
-                    key.to_string(),
-                    LeastLoadBuf {
-                        baselines: s.baselines.iter().map(|d| d.to_go_string()).collect(),
-                        max_rtt: s.max_rtt.map(|d| d.to_go_string()).unwrap_or_default(),
-                    },
-                ));
-            }
+            // Seeded from the model when the open balancer changes; both
+            // fields commit on their own parse below.
+            let buf = self.ll_buf.begin_keyed(key, || LeastLoadBuf {
+                baselines: s.baselines.iter().map(|d| d.to_go_string()).collect(),
+                max_rtt: s.max_rtt.map(|d| d.to_go_string()).unwrap_or_default(),
+            });
 
             // costs table
             ui.label(RichText::new(t(lang, Key::Costs)).small().weak());
@@ -2740,36 +2753,34 @@ impl RoutingScreen {
             }
 
             // baselines as Go-duration strings, committed on successful parse
-            if let Some((_, buf)) = &mut self.ll_buf {
-                if widgets::string_list(
-                    ui,
-                    lang,
-                    t(lang, Key::Baselines),
-                    &mut buf.baselines,
-                    t(lang, Key::BaselinesHint),
-                ) {
-                    s.baselines = buf
-                        .baselines
-                        .iter()
-                        .filter_map(|b| DurationMs::parse(b))
-                        .collect();
-                    changed = true;
+            if widgets::string_list(
+                ui,
+                lang,
+                t(lang, Key::Baselines),
+                &mut buf.baselines,
+                t(lang, Key::BaselinesHint),
+            ) {
+                s.baselines = buf
+                    .baselines
+                    .iter()
+                    .filter_map(|b| DurationMs::parse(b))
+                    .collect();
+                changed = true;
+            }
+            let max_rtt = &mut buf.max_rtt;
+            if widgets::validated_field(ui, t(lang, Key::MaxRtt), max_rtt, "1s", |s| {
+                if s.trim().is_empty() || DurationMs::parse(s).is_some() {
+                    None
+                } else {
+                    Some(t(lang, Key::InvalidGoDurationExample).into())
                 }
-                let max_rtt = &mut buf.max_rtt;
-                if widgets::validated_field(ui, t(lang, Key::MaxRtt), max_rtt, "1s", |s| {
-                    if s.trim().is_empty() || DurationMs::parse(s).is_some() {
-                        None
-                    } else {
-                        Some(t(lang, Key::InvalidGoDurationExample).into())
-                    }
-                }) {
-                    s.max_rtt = if max_rtt.trim().is_empty() {
-                        None
-                    } else {
-                        DurationMs::parse(max_rtt)
-                    };
-                    changed = true;
-                }
+            }) {
+                s.max_rtt = if max_rtt.trim().is_empty() {
+                    None
+                } else {
+                    DurationMs::parse(max_rtt)
+                };
+                changed = true;
             }
 
             changed |=
@@ -6278,7 +6289,10 @@ mod routing_local_os_tests {
     #[test]
     fn the_local_os_row_renders_the_model_and_writes_it_back() {
         let mut harness = harness_with_local_os_rule();
-        let label = harness.get_by_label(t(Language::En, Key::LocalOs)).rect();
+        // The list's rows carry its label as the accessible name, so the
+        // label query resolves to the one localOS row's field, not to the
+        // label above it.
+        let field = harness.get_by_label(t(Language::En, Key::LocalOs)).rect();
         assert!(
             harness
                 .get_all_by_role(egui::accesskit::Role::TextInput)
@@ -6286,13 +6300,13 @@ mod routing_local_os_tests {
             "the stored localOS name must render in its field"
         );
 
-        // The row's remove button sits on the label's line, right of the
-        // label cell; every other remove button is on a different line.
+        // The row's remove button sits on the field's line, right of the
+        // field; every other remove button is on a different line.
         harness
             .query_all_by_label(t(Language::En, Key::DeleteRow))
             .find(|node| {
                 let rect = node.rect();
-                rect.min.x > label.max.x && rect.min.y >= label.min.y && rect.min.y <= label.max.y
+                rect.min.x > field.max.x && rect.min.y >= field.min.y && rect.min.y <= field.max.y
             })
             .expect("the localOS row's remove button")
             .click();

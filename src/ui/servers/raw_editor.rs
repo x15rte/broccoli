@@ -206,6 +206,7 @@ impl JsonBuf {
         &mut self,
         ui: &mut egui::Ui,
         lang: Language,
+        label_id: egui::Id,
         id: FieldKey<'_>,
         value: &mut T,
         spec: &JsonEditorSpec<'_>,
@@ -222,13 +223,15 @@ impl JsonBuf {
             self.dirty = false;
         }
         let mut pass = EditPass { changed: false };
-        let resp = ui.add(
-            egui::TextEdit::multiline(&mut self.text)
-                .font(egui::TextStyle::Monospace)
-                .hint_text(spec.hint)
-                .desired_rows(spec.rows)
-                .desired_width(f32::INFINITY),
-        );
+        let resp = ui
+            .add(
+                egui::TextEdit::multiline(&mut self.text)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text(spec.hint)
+                    .desired_rows(spec.rows)
+                    .desired_width(f32::INFINITY),
+            )
+            .labelled_by(label_id);
         // Any edit leaves text that never reached the draft until the next
         // successful parse commits it — invalid JSON never does, so mark the
         // buffer dirty on every edit and let the commit below clear it.
@@ -284,16 +287,18 @@ pub(super) fn raw_buffer_edit<T>(
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Clone,
 {
-    ui.label(label);
+    // The label is the editor's accessible name: the field can be addressed
+    // by the label it renders instead of by position or current text.
+    let label = ui.label(label);
     // One lookup per field per frame: re-use the existing buffer, or create
     // the entry and seed it.
     match field.buffers.json_entry(field.id.key) {
-        std::collections::hash_map::Entry::Occupied(mut occupied) => {
-            occupied.get_mut().edit(ui, lang, field.id, value, spec)
-        }
+        std::collections::hash_map::Entry::Occupied(mut occupied) => occupied
+            .get_mut()
+            .edit(ui, lang, label.id, field.id, value, spec),
         std::collections::hash_map::Entry::Vacant(vacant) => {
             let mut buffer = JsonBuf::default();
-            let pass = buffer.edit(ui, lang, field.id, value, spec);
+            let pass = buffer.edit(ui, lang, label.id, field.id, value, spec);
             vacant.insert(buffer);
             pass
         }

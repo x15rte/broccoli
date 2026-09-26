@@ -19,7 +19,8 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::model::settings::Settings;
+use broccoli::i18n::{Key, t};
+use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{
     OutboundModel, Protocol, ProtocolSettings, Security, ServerProfile, ServersFile, SockoptModel,
     TlsModel, WireguardPeer,
@@ -136,7 +137,7 @@ fn wireguard_editor_hides_non_applicable_fields() {
         "the wireguard editor must render with its protocol selector showing wireguard"
     );
     assert!(
-        h.query_all_by_role(Role::TextInput)
+        h.query_all_by_role_and_label(Role::TextInput, t(Language::En, Key::SrvPublicKey))
             .any(|node| node.value().as_deref() == Some("peer-a")),
         "the seeded wireguard peer row must render its public key field"
     );

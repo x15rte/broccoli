@@ -14,7 +14,7 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::safety_finding_message;
+use broccoli::i18n::{Key, safety_finding_message, t};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, ServersFile};
@@ -147,19 +147,16 @@ fn editing_listen_to_loopback_live_clears_warning() {
         "the warning must render before the edit"
     );
 
-    // Replace the SOCKS listen address (the only field holding 0.0.0.0) with
-    // a loopback address, exactly like the shared smoke-test editing flow.
-    let field = h
-        .get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some("0.0.0.0"))
-        .expect("SOCKS listen address input");
-    field.click();
+    // Replace the SOCKS listen address (the field named by its own "listen
+    // address" label) with a loopback address, exactly like the shared
+    // smoke-test editing flow.
+    let listen_label = t(Language::En, Key::InboundsListenAddress);
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, listen_label)
+        .click();
     h.run();
     h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
     h.run();
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some("0.0.0.0"))
-        .expect("listen input should keep the typed value")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, listen_label)
         .type_text("127.0.0.1");
     h.run_steps(4);
 

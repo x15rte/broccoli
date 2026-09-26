@@ -17,9 +17,10 @@ use serde_json::{Map, Value};
 pub struct DnsScreen {
     /// Index of the DNS server with the inline editor open.
     edit_server: Option<usize>,
-    /// Editing buffer for the hosts map (rows with empty keys must survive
-    /// mid-edit, so they can't live in the model directly).
-    hosts_buf: Option<Vec<(String, String)>>,
+    /// Edit draft for the hosts map (rows with empty keys must survive
+    /// mid-edit, so they can't live in the model directly; only the rows
+    /// `rows_to_hosts` accepts reach it).
+    hosts_buf: widgets::Draft<Vec<(String, String)>>,
     /// Per-server `domains` hover text, pre-joined when a row is edited or
     /// the list is restructured — the row loop renders these instead of
     /// re-joining on every frame. Always aligned with `dns.servers`.
@@ -205,7 +206,7 @@ impl DnsScreen {
         widgets::section(ui, t(lang, Key::DnsSectionHosts), |ui| {
             let buf = self
                 .hosts_buf
-                .get_or_insert_with(|| hosts_to_rows(&ctx.settings.dns.hosts));
+                .begin(|| hosts_to_rows(&ctx.settings.dns.hosts));
             if widgets::kv_table(
                 ui,
                 lang,
@@ -332,14 +333,23 @@ impl DnsScreen {
                 let mut delete = None;
                 for (index, pool) in fd.pools.iter_mut().enumerate() {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(t_fmt(lang, Key::DnsPoolTitle, &[&(index + 1)]));
-                            if ui.small_button(t(lang, Key::Remove)).clicked() {
-                                delete = Some(index);
-                            }
-                        });
-                        *changed |= widgets::validated_field(
+                        // The pool's own title labels its CIDR field: every
+                        // pool spells the field "IP pool", so the caption is
+                        // what distinguishes them on the accessibility
+                        // surface.
+                        let title = ui
+                            .horizontal(|ui| {
+                                let caption = t_fmt(lang, Key::DnsPoolTitle, &[&(index + 1)]);
+                                let title = ui.strong(caption);
+                                if ui.small_button(t(lang, Key::Remove)).clicked() {
+                                    delete = Some(index);
+                                }
+                                title
+                            })
+                            .inner;
+                        *changed |= widgets::validated_field_captioned(
                             ui,
+                            title.id,
                             t(lang, Key::DnsIpPool),
                             &mut pool.ip_pool,
                             if index == 0 {

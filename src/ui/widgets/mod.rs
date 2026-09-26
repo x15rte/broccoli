@@ -1,7 +1,11 @@
 //! Shared form widgets for broccoli screens.
 //!
 //! Every editor returns `true` iff the wrapped value changed this frame, so
-//! screens can OR the results and call `UiCtx::mark_dirty()` once.
+//! screens can OR the results and call `UiCtx::mark_dirty()` once. The
+//! commit-gated edit drafts ([`Draft`], [`Scratch`]) hold the uncommitted
+//! text such an editor shows, and every labelled text field carries its own
+//! label as the widget's accessible name, so a field is addressable by the
+//! label it renders.
 
 use egui::{RichText, Stroke, StrokeKind};
 
@@ -10,6 +14,148 @@ use crate::model::DurationMs;
 use crate::model::Int32Range;
 use crate::model::settings::Language;
 use crate::ui::status::status_colors_of;
+
+/// A commit-gated edit draft: one buffer a screen's widget edits for the
+/// frame, plus the identity the buffer was seeded from.
+///
+/// [`Self::begin_keyed`] seeds the buffer from the model when the field's
+/// identity key changes and [`Self::begin`] seeds it once for a field with a
+/// single identity, so two rows or profiles never share a draft. The widget
+/// then edits the `&mut B` for the frame, and [`Self::commit_if`] writes the
+/// model only for text the caller's own rule accepts: a rejected draft stays
+/// in the buffer — with the inline error its field's widget renders — and
+/// the model keeps its last good value.
+///
+/// `B` is the buffer shape the widget needs: the plain `String` of a text
+/// field, a row list for the table widgets, or a small bundle of field
+/// buffers.
+#[derive(Default)]
+pub struct Draft<B = String> {
+    /// Identity the buffer was seeded for: the caller's key, or the empty key
+    /// the seed-once form [`Self::begin`] records. `None` until the first
+    /// seed; one draft uses one seeding form, never both.
+    key: Option<String>,
+    /// Whether the last seed call reset the buffer from the model.
+    reseeded: bool,
+    buf: B,
+}
+
+impl<B> Draft<B> {
+    /// The buffer for this frame, seeded from the model once: the form for a
+    /// field whose identity never changes, like a settings field loaded on
+    /// first open.
+    pub fn begin(&mut self, seed: impl FnOnce() -> B) -> &mut B {
+        if self.key.is_none() {
+            self.key = Some(String::new());
+            self.reseeded = true;
+            self.buf = seed();
+        } else {
+            self.reseeded = false;
+        }
+        &mut self.buf
+    }
+
+    /// The buffer for this frame, seeded from the model when the identity
+    /// `key` changed — the edited rule's tag, a balancer's key. A steady key
+    /// only compares: it neither allocates nor touches the buffer, so an
+    /// uncommitted draft survives every idle frame.
+    pub fn begin_keyed(&mut self, key: &str, seed: impl FnOnce() -> B) -> &mut B {
+        self.reseeded = self.key.as_deref() != Some(key);
+        if self.reseeded {
+            self.key = Some(key.to_owned());
+            self.buf = seed();
+        }
+        &mut self.buf
+    }
+
+    /// Whether the last seed call (re)loaded the buffer from the model, so a
+    /// caller with seed-side work — starting the raw override's parse, say —
+    /// runs it exactly on the seeding frame.
+    pub fn reseeded(&self) -> bool {
+        self.reseeded
+    }
+
+    /// Drop the seeded identity: the next seed call reloads the model even
+    /// for the same key, the form an editor reopening must show the committed
+    /// value again instead of the draft it was closed with.
+    pub fn reset(&mut self) {
+        self.key = None;
+        self.reseeded = false;
+    }
+
+    /// Write the buffer into the model when `accept` accepts it, reporting
+    /// whether the model changed. `accept` is the site's own rule and may
+    /// read state beside the buffer (the raw override's parse verdict, the
+    /// other rows of a table); a rejected draft stays in the buffer.
+    pub fn commit_if(&self, accept: impl FnOnce(&B) -> bool, write: impl FnOnce(&B)) -> bool {
+        if accept(&self.buf) {
+            write(&self.buf);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Draft<String> {
+    /// The buffer text.
+    pub fn text(&self) -> &str {
+        &self.buf
+    }
+
+    /// A direct edit of the buffer, for a test that wants text the seeding
+    /// flow would not produce.
+    #[cfg(test)]
+    pub fn text_mut(&mut self) -> &mut String {
+        &mut self.buf
+    }
+}
+
+/// A shared scratch buffer for a widget's row editors: [`Self::edit`] seeds
+/// it from the row's own text — a key, or a non-string value's formatted
+/// text — without dropping the buffer's capacity, and the row reads the
+/// result back through [`Self::text`] only when its widget reports an edit.
+/// One buffer thus serves every row of a table across every frame, where a
+/// buffer per row would allocate per row per frame.
+///
+/// Unlike [`Draft`], a scratch carries no identity between frames: every call
+/// seeds it explicitly, because the rows it serves share the one buffer.
+#[derive(Default)]
+pub struct Scratch {
+    text: String,
+}
+
+impl Scratch {
+    /// Seed from `text` and hand the buffer to this frame's widget. The seed
+    /// is whatever the row shows (`Display` covers both a row's key and a
+    /// non-string value's formatted text) and reuses the buffer's capacity.
+    pub fn edit(&mut self, text: impl std::fmt::Display) -> &mut String {
+        use std::fmt::Write as _;
+        self.text.clear();
+        // `fmt::Write` for `String` is infallible: the write cannot fail.
+        let _ = write!(self.text, "{text}");
+        &mut self.text
+    }
+
+    /// The text the last [`Self::edit`] seeded, plus any edit the widget
+    /// wrote over it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Write the edited text into the model when `accept` accepts it,
+    /// reporting whether the model changed. `accept` is the site's own rule —
+    /// a row's key must be non-empty and different from the committed one —
+    /// and a rejected edit stays in the buffer.
+    pub fn commit_if(&self, accept: impl FnOnce(&str) -> bool, write: impl FnOnce(&str)) -> bool {
+        if accept(&self.text) {
+            write(&self.text);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// One validated field's memoized verdict: the buffer text and the revision
 /// value the validator saw beside it (see [`validated_field_with_revision`]),
@@ -40,15 +186,26 @@ pub fn context_revision(value: impl std::hash::Hash) -> u64 {
 /// Label + single-line text field with a hint. Grows to fill the row.
 pub fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.horizontal(|ui| {
-        ui.label(label);
+        let label = ui.label(label);
         ui.add(
             egui::TextEdit::singleline(value)
                 .hint_text(hint)
                 .desired_width(f32::INFINITY),
         )
+        .labelled_by(label.id)
         .changed()
     })
     .inner
+}
+
+/// The state beside the buffer a validated field's verdict and its accessible
+/// name read: the memo revision ([`context_revision`] of whatever the
+/// validator reads beside the text) and the caption of the group the field
+/// belongs to, when the caller rendered one.
+#[derive(Clone, Copy, Default)]
+struct FieldContext {
+    revision: u64,
+    caption: Option<egui::Id>,
 }
 
 /// Label + validated single-line text field. When `validate` returns
@@ -63,7 +220,15 @@ pub fn validated_field(
     hint: &str,
     validate: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    validated_field_impl(ui, label, value, hint, 0, validate, None)
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext::default(),
+        validate,
+        None,
+    )
 }
 
 /// Label + validated single-line text field whose verdict also reads state
@@ -80,7 +245,18 @@ pub fn validated_field_with_revision(
     revision: u64,
     validate: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    validated_field_impl(ui, label, value, hint, revision, validate, None)
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext {
+            revision,
+            ..FieldContext::default()
+        },
+        validate,
+        None,
+    )
 }
 
 /// Label + validated single-line text field with an additional amber warning
@@ -97,7 +273,43 @@ pub fn validated_field_with_warning(
     validate: impl Fn(&str) -> Option<String>,
     warning: Option<&str>,
 ) -> bool {
-    validated_field_impl(ui, label, value, hint, 0, validate, warning)
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext::default(),
+        validate,
+        warning,
+    )
+}
+
+/// [`validated_field`] whose field also carries the caption of the group it
+/// belongs to: `caption` is the id of a label the caller has already rendered
+/// (a fakeDNS pool's title), and the field's accessible name reads
+/// `"{caption} {label}"`. The form for a field that repeats once per group —
+/// every pool's CIDR field spells the same label — where the bare label names
+/// every instance alike. Rendering is identical to [`validated_field`].
+pub fn validated_field_captioned(
+    ui: &mut egui::Ui,
+    caption: egui::Id,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    validate: impl Fn(&str) -> Option<String>,
+) -> bool {
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext {
+            caption: Some(caption),
+            ..FieldContext::default()
+        },
+        validate,
+        None,
+    )
 }
 
 /// The verdict cache behind every validated field: the validator is a pure
@@ -188,27 +400,33 @@ fn paint_validation(
     }
 }
 
-/// Shared body of [`validated_field`], [`validated_field_with_revision`], and
-/// [`validated_field_with_warning`]: renders the labeled field, then the
-/// error/warning lines.
+/// Shared body of the [`validated_field`] family: renders the labelled field,
+/// then the error/warning lines.
 fn validated_field_impl(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut String,
     hint: &str,
-    revision: u64,
+    context: FieldContext,
     validate: impl Fn(&str) -> Option<String>,
     warning: Option<&str>,
 ) -> bool {
     let (changed, rect, error) = ui
         .horizontal(|ui| {
-            ui.label(label);
-            let r = ui.add(
+            let label = ui.label(label);
+            let mut r = ui.add(
                 egui::TextEdit::singleline(value)
                     .hint_text(hint)
                     .desired_width(f32::INFINITY),
             );
-            let error = validation_verdict(ui, &r, value, revision, &validate);
+            // The group caption (when the caller rendered one) reads before
+            // the field's own label, so the name of a field that repeats once
+            // per group distinguishes the instances: "Pool 1 IP pool".
+            if let Some(caption) = context.caption {
+                r = r.labelled_by(caption);
+            }
+            let r = r.labelled_by(label.id);
+            let error = validation_verdict(ui, &r, value, context.revision, &validate);
             let r = match error.as_deref().or(warning) {
                 Some(message) => r.on_hover_text(message),
                 None => r,
@@ -474,9 +692,7 @@ pub fn string_list(
     hint: &str,
 ) -> bool {
     let mut changed = false;
-    if !label.is_empty() {
-        ui.label(label);
-    }
+    let label_id = (!label.is_empty()).then(|| ui.label(label).id);
     let mut remove = None;
     for (i, item) in items.iter_mut().enumerate() {
         ui.horizontal(|ui| {
@@ -488,13 +704,16 @@ pub fn string_list(
                 if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
                     remove = Some(i);
                 }
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(item)
-                            .hint_text(hint)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed();
+                let field = ui.add(
+                    egui::TextEdit::singleline(item)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                );
+                let field = match label_id {
+                    Some(label_id) => field.labelled_by(label_id),
+                    None => field,
+                };
+                changed |= field.changed();
             });
         });
     }
@@ -530,9 +749,7 @@ pub fn validated_string_list(
     validate: impl Fn(&str, usize) -> Option<String>,
 ) -> bool {
     let mut changed = false;
-    if !label.is_empty() {
-        ui.label(label);
-    }
+    let label_id = (!label.is_empty()).then(|| ui.label(label).id);
     // Read before the rows borrow the list: this frame's length is both the
     // verdict's context and the rows' memo revision.
     let list_len = items.len();
@@ -549,6 +766,10 @@ pub fn validated_string_list(
                             .hint_text(hint)
                             .desired_width(f32::INFINITY),
                     );
+                    let r = match label_id {
+                        Some(label_id) => r.labelled_by(label_id),
+                        None => r,
+                    };
                     let error = validation_verdict(ui, &r, item, list_len as u64, &|text: &str| {
                         validate(text, list_len)
                     });
@@ -809,6 +1030,78 @@ mod tests {
         assert!(set_if_different(&mut value, None));
         assert_eq!(value, None);
         assert!(!set_if_different(&mut value, None));
+    }
+
+    /// The draft shapes carry the contract the screens' edit buffers rely on:
+    /// a buffer seeds per identity (not per frame), a steady identity keeps
+    /// the uncommitted text, and only text the site's own rule accepts
+    /// reaches the model. A regression here would silently drop a user's
+    /// half-typed value or write an unvalidated one into the config.
+    #[test]
+    fn draft_seeds_per_identity_and_commits_only_accepted_text() {
+        // Seed-once form: the first call loads the model, later frames keep
+        // the draft even though the model could have moved on.
+        let mut once = Draft::default();
+        once.begin(|| "model".to_owned());
+        assert!(once.reseeded(), "the first seed must report itself");
+        once.begin(|| "model-moved".to_owned()).push('!');
+        assert!(!once.reseeded(), "a seeded draft must not reload");
+        assert_eq!(once.text(), "model!");
+
+        // Commit gate: rejected text stays in the buffer, accepted text
+        // reaches the model.
+        let mut model = String::from("model");
+        assert!(!once.commit_if(|text| text.len() < 6, |text| model = text.to_owned()));
+        assert_eq!(model, "model", "a rejected draft must not reach the model");
+        assert_eq!(once.text(), "model!");
+        assert!(once.commit_if(|text| text.len() >= 6, |text| model = text.to_owned()));
+        assert_eq!(model, "model!");
+
+        // Keyed form: a new key reseeds, the same key keeps the draft, and
+        // reset forces the reload a reopened editor needs.
+        let mut keyed: Draft<Vec<(String, String)>> = Draft::default();
+        keyed
+            .begin_keyed("a", || vec![("a".to_owned(), "1".to_owned())])
+            .push(("edited".to_owned(), "2".to_owned()));
+        assert_eq!(keyed.begin_keyed("a", Vec::new).len(), 2);
+        assert!(!keyed.reseeded(), "a steady key must keep the draft");
+        assert_eq!(keyed.begin_keyed("b", Vec::new).len(), 0);
+        assert!(keyed.reseeded(), "a new key must reseed");
+        keyed.reset();
+        assert!(
+            keyed
+                .begin_keyed("b", || vec![("b".to_owned(), "1".to_owned())])
+                .len()
+                == 1,
+            "reset must force the same key to reseed"
+        );
+    }
+
+    /// A scratch serves every row of its table from one buffer: each call
+    /// reseeds it explicitly, and its own commit gate decides whether the
+    /// edited text reaches the model.
+    #[test]
+    fn scratch_reseeds_per_row_and_gates_its_commit() {
+        let mut scratch = Scratch::default();
+        scratch.edit("row-key");
+        assert_eq!(scratch.text(), "row-key");
+
+        let mut model = String::new();
+        assert!(
+            !scratch.commit_if(
+                |text| !text.is_empty() && text != "row-key",
+                |text| model = text.to_owned()
+            ),
+            "a rename equal to the committed key must be rejected"
+        );
+        assert!(model.is_empty(), "a rejected edit must not reach the model");
+
+        scratch.edit("row-key").push('2');
+        assert!(scratch.commit_if(
+            |text| !text.is_empty() && text != "row-key",
+            |text| model = text.to_owned()
+        ));
+        assert_eq!(model, "row-key2");
     }
 
     /// Validation is a pure parse of the buffer, so the

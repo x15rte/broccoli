@@ -328,10 +328,9 @@ impl GeoDataProvenanceState {
 
 #[derive(Default)]
 pub struct SettingsScreen {
-    /// Local edit buffer for the raw override, loaded from settings on first
-    /// open of the collapsing header.
-    raw_buf: String,
-    raw_loaded: bool,
+    /// Edit draft for the raw override, seeded from settings on first open of
+    /// the collapsing header.
+    raw_buf: widgets::Draft,
     /// Latest parse state of `raw_buf`, kept current by the worker (or the
     /// size-cap refusal); never parsed on the UI thread.
     raw_parse: Option<RawParseState>,
@@ -341,11 +340,12 @@ pub struct SettingsScreen {
     /// Buffer generation counter: bumped on every edit, so a stale worker
     /// result (from an older buffer) is detected and respawned.
     raw_parse_generation: u64,
-    /// Local edit buffers for the geodata URL/cron fields (Option<String>
-    /// model, String edit buffers), loaded from settings on first open.
-    geoip_url_buf: Option<String>,
-    geosite_url_buf: Option<String>,
-    geodata_cron_buf: Option<String>,
+    /// Edit drafts for the geodata URL/cron fields (Option<String> model),
+    /// seeded from settings on first open and committed only when the field's
+    /// own rule accepts the text.
+    geoip_url_buf: widgets::Draft,
+    geosite_url_buf: widgets::Draft,
+    geodata_cron_buf: widgets::Draft,
     /// Session state of the geo data provenance status line and the Restore
     /// action: memoized hash result + one in-flight job per
     /// action, kept while the screen lives so a re-open never re-hashes
@@ -411,9 +411,9 @@ impl SettingsScreen {
     /// detected by its generation and a fresh worker is spawned then.
     fn bump_raw_parse(&mut self, repaint: egui::Context, lang: Language) {
         self.raw_parse_generation = self.raw_parse_generation.wrapping_add(1);
-        if self.raw_buf.len() > RAW_OVERRIDE_MAX_BYTES {
+        if self.raw_buf.text().len() > RAW_OVERRIDE_MAX_BYTES {
             self.raw_parse = Some(RawParseState::TooLarge(
-                self.raw_buf.len(),
+                self.raw_buf.text().len(),
                 RAW_OVERRIDE_MAX_BYTES,
             ));
             // Drop any in-flight job: its stale result can never be applied.
@@ -431,7 +431,7 @@ impl SettingsScreen {
 
     fn spawn_raw_parse(&mut self, repaint: egui::Context, lang: Language) {
         let generation = self.raw_parse_generation;
-        let buf = self.raw_buf.clone();
+        let buf = self.raw_buf.text().to_owned();
         match Request::worker("broccoli-raw-parse", &repaint, move |_| {
             Some(RawParseResult {
                 generation,
@@ -941,7 +941,7 @@ impl SettingsScreen {
             // resource file paths the core resolves.
             let geoip_url = self
                 .geoip_url_buf
-                .get_or_insert_with(|| ctx.settings.geodata.geoip_url.clone().unwrap_or_default());
+                .begin(|| ctx.settings.geodata.geoip_url.clone().unwrap_or_default());
             // Commit + mark dirty only when the value validates (probe_interval
             // pattern): an invalid draft stays in the edit buffer with its
             // inline error and can never block later generation.
@@ -952,14 +952,20 @@ impl SettingsScreen {
                 t(lang, Key::UrlHint),
                 |value| geodata_url_error(value, lang),
             );
-            if changed && geodata_url_error(geoip_url, lang).is_none() {
-                ctx.settings.geodata.geoip_url =
-                    (!geoip_url.is_empty()).then_some(geoip_url.clone());
+            if changed
+                && self.geoip_url_buf.commit_if(
+                    |value| geodata_url_error(value, lang).is_none(),
+                    |value| {
+                        ctx.settings.geodata.geoip_url =
+                            (!value.is_empty()).then_some(value.clone());
+                    },
+                )
+            {
                 ctx.mark_dirty();
             }
-            let geosite_url = self.geosite_url_buf.get_or_insert_with(|| {
-                ctx.settings.geodata.geosite_url.clone().unwrap_or_default()
-            });
+            let geosite_url = self
+                .geosite_url_buf
+                .begin(|| ctx.settings.geodata.geosite_url.clone().unwrap_or_default());
             let changed = widgets::validated_field(
                 ui,
                 "geosite.dat",
@@ -967,14 +973,20 @@ impl SettingsScreen {
                 t(lang, Key::UrlHint),
                 |value| geodata_url_error(value, lang),
             );
-            if changed && geodata_url_error(geosite_url, lang).is_none() {
-                ctx.settings.geodata.geosite_url =
-                    (!geosite_url.is_empty()).then_some(geosite_url.clone());
+            if changed
+                && self.geosite_url_buf.commit_if(
+                    |value| geodata_url_error(value, lang).is_none(),
+                    |value| {
+                        ctx.settings.geodata.geosite_url =
+                            (!value.is_empty()).then_some(value.clone());
+                    },
+                )
+            {
                 ctx.mark_dirty();
             }
             let cron = self
                 .geodata_cron_buf
-                .get_or_insert_with(|| ctx.settings.geodata.cron.clone().unwrap_or_default());
+                .begin(|| ctx.settings.geodata.cron.clone().unwrap_or_default());
             let changed = widgets::validated_field(
                 ui,
                 t(lang, Key::SettingsGeodataCronLabel),
@@ -982,8 +994,14 @@ impl SettingsScreen {
                 crate::model::settings::DEFAULT_GEODATA_CRON,
                 |value| geodata_cron_error(value, lang),
             );
-            if changed && geodata_cron_error(cron, lang).is_none() {
-                ctx.settings.geodata.cron = (!cron.is_empty()).then_some(cron.clone());
+            if changed
+                && self.geodata_cron_buf.commit_if(
+                    |value| geodata_cron_error(value, lang).is_none(),
+                    |value| {
+                        ctx.settings.geodata.cron = (!value.is_empty()).then_some(value.clone());
+                    },
+                )
+            {
                 ctx.mark_dirty();
             }
             ui.label(
@@ -1116,28 +1134,32 @@ impl SettingsScreen {
             egui::CollapsingHeader::new(t(lang, Key::SettingsRawOverrideHeader))
                 .id_salt("settings_raw_override")
                 .show(ui, |ui| {
-                    if !self.raw_loaded {
-                        self.raw_buf = ctx.settings.raw_override.clone().unwrap_or_default();
-                        self.raw_loaded = true;
-                        self.bump_raw_parse(ui.ctx().clone(), lang);
-                    }
-                    self.poll_raw_parse(ui.ctx().clone(), lang);
                     ui.label(
                         RichText::new(t(lang, Key::SettingsRawOverrideExplain))
                             .weak()
                             .small(),
                     );
-                    let raw_changed = ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.raw_buf)
+                    let raw_changed = {
+                        // Seeded on first open; afterwards the draft is the
+                        // buffer on screen until Enable override commits it.
+                        let raw = self
+                            .raw_buf
+                            .begin(|| ctx.settings.raw_override.clone().unwrap_or_default());
+                        ui.add(
+                            egui::TextEdit::multiline(raw)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_rows(14)
                                 .desired_width(f32::INFINITY),
                         )
-                        .changed();
-                    if raw_changed {
+                        .changed()
+                    };
+                    // The seeding frame is the first open; every edit drives
+                    // a fresh parse too, so the verdict always describes the
+                    // buffer on screen.
+                    if raw_changed || self.raw_buf.reseeded() {
                         self.bump_raw_parse(ui.ctx().clone(), lang);
                     }
+                    self.poll_raw_parse(ui.ctx().clone(), lang);
                     // `raw_parse` is kept current by the worker (or by the
                     // size-cap refusal); it is never parsed on the UI thread.
                     match self.raw_parse.as_ref() {
@@ -1211,8 +1233,14 @@ impl SettingsScreen {
                             )
                             .on_hover_text(t(lang, Key::SettingsEnableOverrideHint))
                             .clicked()
+                            && self.raw_buf.commit_if(
+                                // The worker's parse report is the gate: an
+                                // override may only be enabled once the
+                                // buffer itself parses.
+                                |_| parsed_ok,
+                                |text| ctx.settings.raw_override = Some(text.to_owned()),
+                            )
                         {
-                            ctx.settings.raw_override = Some(self.raw_buf.clone());
                             ctx.mark_dirty();
                         }
                         if ctx.settings.raw_override.is_some()
@@ -2602,10 +2630,10 @@ mod tests {
 
     #[test]
     fn raw_override_refuses_oversized_buffer_before_any_worker() {
-        let mut screen = SettingsScreen {
-            raw_buf: "x".repeat(RAW_OVERRIDE_MAX_BYTES + 1),
-            ..Default::default()
-        };
+        let mut screen = SettingsScreen::default();
+        screen
+            .raw_buf
+            .begin(|| "x".repeat(RAW_OVERRIDE_MAX_BYTES + 1));
         screen.bump_raw_parse(egui::Context::default(), Language::En);
         assert!(
             !screen.raw_parse_job.is_pending(),
@@ -2622,10 +2650,10 @@ mod tests {
 
     #[test]
     fn raw_override_worker_delivers_ok_via_poll() {
-        let mut screen = SettingsScreen {
-            raw_buf: r#"{"log": {"loglevel": "info"}}"#.to_string(),
-            ..Default::default()
-        };
+        let mut screen = SettingsScreen::default();
+        screen
+            .raw_buf
+            .begin(|| r#"{"log": {"loglevel": "info"}}"#.to_owned());
         screen.bump_raw_parse(egui::Context::default(), Language::En);
         assert!(
             screen.raw_parse_job.is_pending(),
@@ -2644,10 +2672,8 @@ mod tests {
 
     #[test]
     fn raw_override_worker_delivers_error_via_poll() {
-        let mut screen = SettingsScreen {
-            raw_buf: "{ not json".to_string(),
-            ..Default::default()
-        };
+        let mut screen = SettingsScreen::default();
+        screen.raw_buf.begin(|| "{ not json".to_owned());
         screen.bump_raw_parse(egui::Context::default(), Language::En);
         drain_raw_parse(
             &mut screen,
@@ -2662,15 +2688,14 @@ mod tests {
 
     #[test]
     fn raw_override_stale_result_respawns_for_current_buffer() {
-        let mut screen = SettingsScreen {
-            raw_buf: r#"{"a": 1}"#.to_string(),
-            ..Default::default()
-        };
+        let mut screen = SettingsScreen::default();
+        screen.raw_buf.begin(|| r#"{"a": 1}"#.to_owned());
         // First edit spawns a worker for the valid buffer.
         screen.bump_raw_parse(egui::Context::default(), Language::En);
         // Second edit while the first worker is in flight: no new worker
         // spawns yet; the stale result must respawn for the current buffer.
-        screen.raw_buf = "{ broken".to_string();
+        screen.raw_buf.text_mut().clear();
+        screen.raw_buf.text_mut().push_str("{ broken");
         screen.bump_raw_parse(egui::Context::default(), Language::En);
         assert!(
             screen.raw_parse.is_none(),
@@ -2715,14 +2740,16 @@ mod tests {
     /// header opens straight onto the parsed state (worker-free, so the
     /// Validate button is deterministic from the first open frame).
     fn seeded_raw_override_screen() -> SettingsScreen {
-        SettingsScreen {
-            raw_buf: r#"{"log":{"loglevel":"info"}}"#.to_string(),
-            raw_loaded: true,
-            raw_parse: Some(RawParseState::Ok(serde_json::json!({
-                "log": { "loglevel": "info" }
-            }))),
-            ..Default::default()
-        }
+        let mut screen = SettingsScreen::default();
+        // The draft is already seeded, so opening the header keeps this text
+        // instead of reloading the (absent) model override.
+        screen
+            .raw_buf
+            .begin(|| r#"{"log":{"loglevel":"info"}}"#.to_owned());
+        screen.raw_parse = Some(RawParseState::Ok(serde_json::json!({
+            "log": { "loglevel": "info" }
+        })));
+        screen
     }
 
     #[test]

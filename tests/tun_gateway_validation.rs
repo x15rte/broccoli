@@ -18,7 +18,7 @@
 
 use broccoli::app::BroccoliApp;
 use broccoli::r#gen::generate_with_api_port;
-use broccoli::i18n::{Key, t_fmt, validation_message};
+use broccoli::i18n::{Key, t, t_fmt, validation_message};
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::model::validation::{ValidationCode, Verdict, validate_settings};
 use broccoli::model::{ServersFile, TunCfg};
@@ -244,15 +244,13 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
         .expect("gateways add button")
         .click();
     h.run_steps(4);
-    let field = h
-        .get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some(""))
-        .expect("new gateway row input");
-    field.click();
+    // The row fields carry their list's label ("gateways") as the accessible
+    // name, so the new row is addressed by name, not by its empty value.
+    let gateway_label = t(Language::En, Key::TunGatewaysLabel);
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, gateway_label)
+        .click();
     h.run();
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .find(|node| node.value().as_deref() == Some(""))
-        .expect("gateway input should keep the typed value")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, gateway_label)
         .type_text("10.255.0.1/30");
     h.run_steps(4);
 

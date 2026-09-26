@@ -4,7 +4,6 @@
 //! (sendThrough / targetStrategy / finalmask / sockopt).
 
 use base64::Engine as _;
-use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -1159,7 +1158,7 @@ fn json_map_kv(
     map: &mut serde_json::Map<String, serde_json::Value>,
     key_hint: &str,
     val_hint: &str,
-    scratch: &mut String,
+    scratch: &mut widgets::Scratch,
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<String> = None;
@@ -1176,15 +1175,17 @@ fn json_map_kv(
             for (k, v) in map.iter_mut() {
                 // Seed the shared buffer with the row's key and read it back
                 // only on an edit: the rename pair is built on the edit path.
-                scratch.clear();
-                scratch.push_str(k);
                 let kr = ui.add(
-                    egui::TextEdit::singleline(scratch)
+                    egui::TextEdit::singleline(scratch.edit(k))
                         .hint_text(key_hint)
                         .desired_width(150.0),
                 );
-                if kr.changed() && !scratch.is_empty() && scratch.as_str() != k.as_str() {
-                    rename = Some((k.clone(), scratch.clone()));
+                if kr.changed() {
+                    // A key must be non-empty and different to be a rename.
+                    scratch.commit_if(
+                        |text| !text.is_empty() && text != k.as_str(),
+                        |text| rename = Some((k.clone(), text.to_owned())),
+                    );
                 }
                 // Right-to-left: the remove button pins to the row's right
                 // edge and the value field fills exactly the remaining
@@ -1209,19 +1210,17 @@ fn json_map_kv(
                             .changed();
                     } else {
                         // Every other value round-trips through the shared
-                        // buffer (fmt::Write for a String is infallible) and
-                        // becomes a string only when it is edited.
-                        scratch.clear();
-                        let _ = write!(scratch, "{v}");
+                        // buffer and becomes a string only when it is edited;
+                        // `&*v` seeds without moving the row's `&mut`.
                         if ui
                             .add(
-                                egui::TextEdit::singleline(scratch)
+                                egui::TextEdit::singleline(scratch.edit(&*v))
                                     .hint_text(val_hint)
                                     .desired_width(f32::INFINITY),
                             )
                             .changed()
                         {
-                            *v = serde_json::Value::String(scratch.clone());
+                            *v = serde_json::Value::String(scratch.text().to_owned());
                             changed = true;
                         }
                     }
@@ -1257,7 +1256,7 @@ fn transport_headers(
     ui: &mut egui::Ui,
     lang: Language,
     map: &mut serde_json::Map<String, serde_json::Value>,
-    scratch: &mut String,
+    scratch: &mut widgets::Scratch,
 ) -> bool {
     let had_host = map.keys().any(|key| key.eq_ignore_ascii_case("host"));
     let mut changed = json_map_kv(
@@ -1285,7 +1284,7 @@ fn websocket_transport_headers(
     ui: &mut egui::Ui,
     lang: Language,
     settings: &mut WsSettings,
-    scratch: &mut String,
+    scratch: &mut widgets::Scratch,
 ) -> bool {
     let mut changed = json_map_kv(
         ui,
@@ -2057,7 +2056,7 @@ pub struct ServersScreen {
     /// for the frame, and one owned buffer per row would allocate on every
     /// repaint. Seeded from the row's own text before each widget and read
     /// back only when that widget reports an edit.
-    json_key_scratch: String,
+    json_key_scratch: widgets::Scratch,
     profile_validation_origin: Option<ProfileValidationOrigin>,
     profile_validation_count: usize,
     /// In-flight profile validation: the request's own reply channel,
@@ -3784,9 +3783,10 @@ impl ServersScreen {
         let busy = ctx.busy.is_held();
         let mut changed = false;
         ui.horizontal(|ui| {
-            ui.label(t(lang, Key::SrvName));
+            let name_label = ui.label(t(lang, Key::SrvName));
             changed |= ui
                 .add(egui::TextEdit::singleline(&mut draft.profile.name).desired_width(220.0))
+                .labelled_by(name_label.id)
                 .changed();
             ui.separator();
             ui.monospace(draft.tag.as_str());

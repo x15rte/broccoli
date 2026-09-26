@@ -21,6 +21,8 @@
 //! Wireguard tab.
 
 use broccoli::app::BroccoliApp;
+use broccoli::i18n::{Key, t};
+use broccoli::model::settings::Language;
 use broccoli::model::{
     FinalmaskModel, FinalmaskTcpMask, OutboundModel, Protocol, ProtocolSettings, ServerProfile,
     ServersFile, Settings, WireguardPeer,
@@ -36,6 +38,12 @@ mod common;
 
 /// The seeded profile name; Discard must restore it after an edit.
 const SEEDED_NAME: &str = "editor-actions";
+
+/// The profile name field's own label: the field is addressed by this
+/// accessible name, never by its position in the editor header.
+fn name_field_label() -> &'static str {
+    t(Language::En, Key::SrvName)
+}
 
 /// The editor's tabs, in UI order (the action row sits below the tab content
 /// on every one of them).
@@ -147,22 +155,16 @@ fn viewport() -> egui::Rect {
 /// append `text` to it (a name edit marks the draft changed and enables
 /// Discard regardless of the active tab).
 fn append_to_name(h: &mut Harness<'static, BroccoliApp>, text: &str) {
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .next()
-        .expect("profile name field")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, name_field_label())
         .focus();
     h.run();
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .next()
-        .expect("profile name field")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, name_field_label())
         .type_text(text);
     h.run();
 }
 
 fn name_value(h: &Harness<'static, BroccoliApp>) -> String {
-    h.get_all_by_role(egui::accesskit::Role::TextInput)
-        .next()
-        .expect("profile name field")
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, name_field_label())
         .value()
         .expect("profile name value")
 }
