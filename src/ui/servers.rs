@@ -7213,7 +7213,7 @@ mod tests {
         FinalmaskQuicParams, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask,
         FreedomFinalRule, HysteriaTransport, Network, Noise, OutboundModel, Protocol,
         ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-        WsSettings, XhttpSettings,
+        WireguardPeer, WsSettings, XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -13146,6 +13146,118 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(profile.clone());
         rig.servers.active = Some(profile.id.clone());
         rig
+    }
+
+    /// The peer fields of a WireGuard profile whose secret key is set and
+    /// whose first peer is empty.
+    fn wireguard_peer_rig() -> UiTestRig {
+        let mut profile = ServerProfile::new("wg", OutboundModel::new(Protocol::Wireguard));
+        if let ProtocolSettings::Wireguard(settings) = &mut profile.outbound.settings {
+            settings.secret_key = "01".repeat(32);
+            settings.peers.push(WireguardPeer::default());
+        }
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id.clone());
+        rig
+    }
+
+    /// Type `text` into the peer field the editor labels `label`: click it like
+    /// a user, then send the keystrokes.
+    fn type_into_peer_field(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        label: &str,
+        text: &str,
+    ) {
+        let field = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, label)
+            .next()
+            .unwrap_or_else(|| panic!("the {label:?} row must render"));
+        field.scroll_to_me();
+        harness.run();
+        harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, label)
+            .next()
+            .expect("the field renders")
+            .click();
+        harness.run_steps(2);
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .unwrap_or_else(|| panic!("the clicked {label:?} field takes focus"))
+            .type_text(text);
+        harness.run_steps(2);
+    }
+
+    /// Every inline verdict line the peers section paints between two fields,
+    /// as its text.
+    fn verdict_rows_between(
+        harness: &Harness<'static, (ServersScreen, UiTestRig)>,
+        above: egui::Rect,
+        below: egui::Rect,
+    ) -> Vec<String> {
+        let mut rows: Vec<(f32, String)> = harness
+            .query_all_by_role(egui::accesskit::Role::Label)
+            .filter_map(|node| {
+                let rect = node.rect();
+                let text = node.accesskit_node().value()?;
+                (rect.top() >= above.bottom() && rect.top() < below.top())
+                    .then_some((rect.top(), text))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// A peer filled in one row at a time: every edit drops the filled row's
+    /// verdict line, which moves the auto ids of the fields below it. A
+    /// verdict must follow the field it belongs to and not the slot — an
+    /// empty pre-shared key carries no error (`v_optional_wg_key` accepts
+    /// empty), so the endpoint's disappearing "required" line must not land
+    /// there.
+    #[test]
+    fn filling_a_peer_row_by_row_keeps_each_verdict_on_its_own_field() {
+        let key = "01".repeat(32);
+        let mut harness = wide_servers_harness(wireguard_peer_rig());
+        harness.run();
+
+        type_into_peer_field(&mut harness, "public key", &key);
+        type_into_peer_field(&mut harness, "endpoint", "peer.example:51820");
+
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open");
+        let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
+            panic!("the draft stays a WireGuard profile");
+        };
+        let peer = settings.peers.first().expect("the peer stays");
+        assert_eq!(peer.public_key, key, "the public key edit must land");
+        assert_eq!(
+            peer.endpoint, "peer.example:51820",
+            "the endpoint edit must land"
+        );
+        assert!(
+            peer.pre_shared_key.is_empty(),
+            "the test leaves the peer's pre-shared key empty"
+        );
+
+        let psk = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, "pre-shared key")
+            .next()
+            .expect("the pre-shared key row renders");
+        // The row's paint area: from the field's own line down to the header of
+        // the next row (the peer's allowed-IPs list).
+        let allowed_header = harness
+            .query_by_label(t(Language::En, Key::SrvWgAllowedIps))
+            .expect("the allowed-IPs header renders under the pre-shared key row");
+        let rows = verdict_rows_between(&harness, psk.rect(), allowed_header.rect());
+        assert!(
+            rows.is_empty(),
+            "the empty pre-shared key row must carry no verdict, found {rows:?}"
+        );
     }
 
     /// The editor's `remoteDNS` row currently showing `value`.

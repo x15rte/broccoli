@@ -157,16 +157,19 @@ impl Scratch {
     }
 }
 
-/// One validated field's memoized verdict: the buffer text and the revision
-/// value the validator saw beside it (see [`validated_field_with_revision`]),
-/// plus the verdict itself. Validators are pure functions of that pair, so an
-/// unchanged pair (idle repaint frames) reuses the memoized verdict —
+/// One validated field's memoized verdict: the field's label (its identity —
+/// see [`validation_verdict`]), the buffer text, and the revision value the
+/// validator saw beside it (see [`validated_field_with_revision`]), plus the
+/// verdict itself. Validators are pure functions of that triple, so an
+/// unchanged triple (idle repaint frames) reuses the memoized verdict —
 /// validation runs only on the frame the text first appears or changed
-/// (typed, or rewritten by the model) or the revision changed (a row added,
-/// another row's value committed). Stored in egui temp data (never persisted)
-/// keyed by the TextEdit's own id, the `timeout_editor` buffer precedent.
+/// (typed, or rewritten by the model), the revision changed (a row added,
+/// another row's value committed), or another field's buffer landed on this
+/// slot. Stored in egui temp data (never persisted) keyed by the TextEdit's
+/// own id, the `timeout_editor` buffer precedent.
 #[derive(Clone)]
 struct ValidationMemo {
+    label: String,
     value: String,
     revision: u64,
     error: Option<String>,
@@ -316,19 +319,36 @@ pub fn validated_field_captioned(
 /// function of the field's text and its revision ([`context_revision`] of
 /// whatever else it reads, `0` for a text-only field, the list length for a
 /// list row) — every call site's contract — so the verdict is memoized per
-/// widget id and recomputed only when either input no longer matches the
-/// memo: the frame the user typed, the field's first display, an external
-/// rewrite of the buffer, or a change in the state the revision covers. Temp
-/// data (the `timeout_editor` buffer precedent) keys off the TextEdit's own
-/// id, so the memo follows egui focus semantics for free; a stale memo from a
-/// recycled widget slot self-heals through the input comparison.
+/// field and recomputed only when an input no longer matches the memo: the
+/// frame the user typed, the field's first display, an external rewrite of
+/// the buffer, a change in the state the revision covers, or another field
+/// landing on the slot. Temp data (the `timeout_editor` buffer precedent)
+/// keys off the TextEdit's own id, so the memo follows egui focus semantics
+/// for free.
+///
+/// The memo also carries the field's label, because the widget id is not the
+/// field's identity: [`paint_validation`] renders the verdict rows
+/// conditionally, so a verdict appearing or disappearing above a field shifts
+/// the auto ids of every field below it — a field can land on the slot
+/// another field used last frame, and a verdict keyed on the slot alone would
+/// follow the slot (an empty pre-shared key showing the endpoint's "required"
+/// line until the user edited it). A field's label names what the field is,
+/// so the memo follows the field: it is reused only by a call site that
+/// renders the same label, and every call site renders one validator per
+/// label — the field's meaning is the validator's ([`validated_string_list`]
+/// rows share their list's label and its one validator, keyed on the row's
+/// own text and the list length).
 fn validation_verdict(
     ui: &mut egui::Ui,
     response: &egui::Response,
+    label: &str,
     value: &str,
     revision: u64,
     validate: &impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    let matches_memo = |memo: &ValidationMemo| {
+        memo.label == *label && memo.value == *value && memo.revision == revision
+    };
     ui.data_mut(|data| {
         match data
             .get_temp_raw_mut(egui::util::id_type_map::RawKey::new::<ValidationMemo>(
@@ -336,9 +356,10 @@ fn validation_verdict(
             ))
             .and_then(|slot| slot.downcast_mut::<ValidationMemo>())
         {
-            Some(memo) if memo.value == *value && memo.revision == revision => memo.error.clone(),
+            Some(memo) if matches_memo(memo) => memo.error.clone(),
             Some(memo) => {
                 *memo = ValidationMemo {
+                    label: label.to_owned(),
                     value: value.to_owned(),
                     revision,
                     error: validate(value),
@@ -350,6 +371,7 @@ fn validation_verdict(
                 data.insert_temp(
                     response.id,
                     ValidationMemo {
+                        label: label.to_owned(),
                         value: value.to_owned(),
                         revision,
                         error: error.clone(),
@@ -413,7 +435,7 @@ fn validated_field_impl(
 ) -> bool {
     let (changed, rect, error) = ui
         .horizontal(|ui| {
-            let label = ui.label(label);
+            let label_response = ui.label(label);
             let mut r = ui.add(
                 egui::TextEdit::singleline(value)
                     .hint_text(hint)
@@ -425,8 +447,8 @@ fn validated_field_impl(
             if let Some(caption) = context.caption {
                 r = r.labelled_by(caption);
             }
-            let r = r.labelled_by(label.id);
-            let error = validation_verdict(ui, &r, value, context.revision, &validate);
+            let r = r.labelled_by(label_response.id);
+            let error = validation_verdict(ui, &r, label, value, context.revision, &validate);
             let r = match error.as_deref().or(warning) {
                 Some(message) => r.on_hover_text(message),
                 None => r,
@@ -770,9 +792,10 @@ pub fn validated_string_list(
                         Some(label_id) => r.labelled_by(label_id),
                         None => r,
                     };
-                    let error = validation_verdict(ui, &r, item, list_len as u64, &|text: &str| {
-                        validate(text, list_len)
-                    });
+                    let error =
+                        validation_verdict(ui, &r, label, item, list_len as u64, &|text: &str| {
+                            validate(text, list_len)
+                        });
                     let r = match error.as_deref() {
                         Some(message) => r.on_hover_text(message),
                         None => r,
