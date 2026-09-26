@@ -36,6 +36,12 @@
 //! and export spellings, the model facts it cannot carry, and its settings
 //! block. Import, export and the representability ladder all walk that table.
 //! The shareable protocols are declared the same way in [`SHAREABLE`].
+//!
+//! Import also accepts the upstream aliases for a transport's `type` value —
+//! `raw` for `tcp`, `mkcp` for `kcp`, `splithttp` for `xhttp`, `websocket`
+//! for `ws` (infra/conf/transport_internet.go:14-28, the same set the model's
+//! `Network::parse` carries) — and canonicalizes them: export always writes
+//! the spec spelling, and RAW's is nothing at all.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -790,6 +796,12 @@ struct TransportSpec {
     /// at all (hysteria), which import reports as an unknown transport and
     /// export refuses through [`unshareable_transport`].
     type_string: Option<&'static str>,
+    /// The upstream alias spellings of `type_string` that import accepts
+    /// (`raw` for `tcp`, `mkcp` for `kcp`, `splithttp` for `xhttp`,
+    /// `websocket` for `ws`; infra/conf/transport_internet.go:16-24, the same
+    /// set [`Network::parse`] carries). Export never writes one:
+    /// `type_string` is the only spelling the grammar emits.
+    type_aliases: &'static [&'static str],
     /// The fields the grammar carries, in export order. Their setters
     /// materialize the settings block, so a link that omits every field still
     /// imports the block Xray would build for the transport.
@@ -854,7 +866,7 @@ fn transport_for_type(ty: &str) -> Result<&'static TransportSpec, LinkError> {
         ))),
         other => TRANSPORTS
             .iter()
-            .find(|spec| spec.type_string == Some(other))
+            .find(|spec| spec.type_string == Some(other) || spec.type_aliases.contains(&other))
             .ok_or_else(|| {
                 malformed(Diag::new(Key::LinkTransportUnknown).arg(excerpt_debug(other)))
             }),
@@ -897,6 +909,7 @@ const RAW: TransportSpec = TransportSpec {
     network: Network::Raw,
     path: "streamSettings.rawSettings",
     type_string: Some(DEFAULT_TYPE),
+    type_aliases: &["raw"],
     fields: &[],
     refused: &[Refused {
         key: Key::LinkLossyRawCamouflage,
@@ -911,6 +924,7 @@ const KCP: TransportSpec = TransportSpec {
     network: Network::Kcp,
     path: "streamSettings.kcpSettings",
     type_string: Some("kcp"),
+    type_aliases: &["mkcp"],
     fields: &[
         Field {
             key: "mtu",
@@ -971,6 +985,7 @@ const WS: TransportSpec = TransportSpec {
     network: Network::Ws,
     path: "streamSettings.wsSettings",
     type_string: Some("ws"),
+    type_aliases: &["websocket"],
     fields: &[
         Field {
             key: "host",
@@ -1036,6 +1051,7 @@ const GRPC: TransportSpec = TransportSpec {
     network: Network::Grpc,
     path: "streamSettings.grpcSettings",
     type_string: Some("grpc"),
+    type_aliases: &[],
     fields: &[
         Field {
             key: "serviceName",
@@ -1123,6 +1139,7 @@ const HTTPUPGRADE: TransportSpec = TransportSpec {
     network: Network::Httpupgrade,
     path: "streamSettings.httpupgradeSettings",
     type_string: Some("httpupgrade"),
+    type_aliases: &[],
     fields: &[
         Field {
             key: "host",
@@ -1193,6 +1210,7 @@ const XHTTP: TransportSpec = TransportSpec {
     network: Network::Xhttp,
     path: "streamSettings.xhttpSettings",
     type_string: Some("xhttp"),
+    type_aliases: &["splithttp"],
     fields: &[
         Field {
             key: "host",
@@ -1335,6 +1353,7 @@ const HYSTERIA: TransportSpec = TransportSpec {
     network: Network::Hysteria,
     path: "streamSettings.hysteriaSettings",
     type_string: None,
+    type_aliases: &[],
     fields: &[],
     refused: &[],
     is_present: |stream| option_has_fields(&stream.hysteria_settings),
@@ -1723,7 +1742,7 @@ fn parse_legacy_vmess(body: &str) -> Result<ServerProfile, LinkError> {
     let host = get("host");
     let path = get("path");
     match net.to_ascii_lowercase().as_str() {
-        "" | "tcp" => {
+        "" | "tcp" | "raw" => {
             stream.network = Network::Raw;
             match typ.as_str() {
                 "" | "none" => {
@@ -3426,6 +3445,20 @@ mod tests {
         assert_eq!(p.outbound.stream.network, Network::Raw);
     }
 
+    /// The legacy Base64-JSON form's `net` carries the same transport
+    /// vocabulary as the URL grammar's `type` (infra/conf/transport_internet.go:16),
+    /// so upstream's canonical `raw` imports the RAW transport instead of
+    /// failing as an unknown net.
+    #[test]
+    fn vmess_legacy_net_raw_imports_the_raw_transport() {
+        let link = vmess_json(serde_json::json!({
+            "v": "2", "ps": "RAW", "add": "raw.example.com", "port": "443",
+            "id": UUID, "aid": "0", "net": "raw", "tls": ""
+        }));
+        let (profile, _) = round_trip(&link);
+        assert_eq!(profile.outbound.stream.network, Network::Raw);
+    }
+
     #[test]
     fn vmess_official_none_encryption_normalizes_to_auto_and_omits_it() {
         // #716 permits `none`, but current Xray maps that JSON string through
@@ -3585,6 +3618,74 @@ mod tests {
         assert!(canonical.starts_with(&format!("vmess://{UUID}@vm.example.com:443?")));
         assert!(canonical.contains("encryption=chacha20-poly1305"));
         assert!(canonical.contains("type=xhttp"));
+    }
+
+    /// The RAW transport's spec spelling is `tcp`; upstream's config parser
+    /// accepts `raw` too (infra/conf/transport_internet.go:16), and provider
+    /// links carry it. Import names the same row for both, and canonical
+    /// output carries no `type` token at all.
+    #[test]
+    fn raw_transport_alias_imports_and_exports_without_a_type_token() {
+        let public_key = reality_public_key();
+        let link = format!(
+            "vless://{UUID}@jp.example.com:42299?encryption=none&flow=xtls-rprx-vision&type=raw&security=reality&sni=swdist.apple.com&fp=ios&pbk={public_key}&sid=48495f#JP06"
+        );
+        let (profile, canonical) = round_trip(&link);
+        assert_eq!(profile.outbound.stream.network, Network::Raw);
+        assert_eq!(profile.outbound.stream.security, Security::Reality);
+        assert!(!canonical.contains("type="), "{canonical}");
+    }
+
+    /// Every upstream alias imports its transport, and canonical output
+    /// writes the spec spelling — `kcp`, `ws`, `xhttp` — never the alias.
+    #[test]
+    fn url_transport_aliases_canonicalize_to_the_spec_spelling() {
+        for (token, network, canonical_token) in [
+            ("mkcp", Network::Kcp, "kcp"),
+            ("websocket", Network::Ws, "ws"),
+            ("splithttp", Network::Xhttp, "xhttp"),
+        ] {
+            let link = format!("vmess://{UUID}@{token}.example.com:443?type={token}");
+            let (profile, canonical) = round_trip(&link);
+            assert_eq!(profile.outbound.stream.network, network, "{token}");
+            // The exact `type` value, not a substring: `type=websocket`
+            // also contains `type=ws`.
+            let query = canonical
+                .split_once('?')
+                .expect("the exported link carries a query")
+                .1
+                .split('#')
+                .next()
+                .expect("str::split always yields one piece");
+            assert_eq!(
+                parse_query(query).unwrap().get("type"),
+                Some(canonical_token),
+                "{token} must export {canonical_token:?}: {canonical}"
+            );
+        }
+    }
+
+    /// Every `type` token the grammar accepts must name the row's network
+    /// through the model's own alias set ([`Network::parse`], the config
+    /// loader's vocabulary): a token the loader does not know, or one mapped
+    /// to a different transport, fails here instead of drifting silently.
+    #[test]
+    fn transport_type_tokens_agree_with_the_model_alias_set() {
+        for spec in TRANSPORTS {
+            let tokens = spec
+                .type_string
+                .iter()
+                .copied()
+                .chain(spec.type_aliases.iter().copied());
+            for token in tokens {
+                assert_eq!(
+                    Network::parse(token),
+                    Some(spec.network),
+                    "the grammar accepts {token:?} for {}",
+                    spec.path
+                );
+            }
+        }
     }
 
     #[test]
@@ -4549,6 +4650,9 @@ mod tests {
         expect_malformed(&format!("vless://{UUID}@h.example.com:0"));
         expect_malformed(&format!("vless://{UUID}@h.example.com:99999"));
         expect_malformed(&format!("vless://{UUID}@h.example.com:443?type=bogus"));
+        // #716 §2 keeps parameter names and constant strings case-sensitive:
+        // the transport aliases import in lowercase only.
+        expect_malformed(&format!("vless://{UUID}@h.example.com:443?type=RAW"));
         expect_malformed(&format!("vless://{UUID}@h.example.com:443?flow=vision"));
         expect_malformed(&format!("vless://{UUID}@h.example.com:443?x=1&x=2"));
         expect_invalid_model(
