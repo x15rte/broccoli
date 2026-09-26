@@ -6,13 +6,13 @@
 //! must advance the grid's memoization key or the table keeps rendering the
 //! pre-probe cells until an unrelated persist/revision change.
 //!
-//! Phase-2 minimisation record (diagnosing-bugs flow, 2026-09-11): the
-//! smallest red-capable repro is the first test minus the wizard dismissal —
+//! Each test is the smallest repro that can go red for that memoization bug:
 //! a seeded single profile, one injected probe status, one frame, one
-//! assertion. The dismissal is retained per the repo's test contract
-//! ("dismiss wizards before ... assert navigation/rendering"); the
-//! dead-status test is retained because no other test drives a dead probe
-//! status through the app's `apply_observatory_statuses` seam.
+//! assertion. Both dismiss the first-run wizard even though the bug does not
+//! need it, because a fresh APPDATA shows the wizard and it must be dismissed
+//! before the window can navigate or assert (`common::dismiss_wizard`). The
+//! dead-status test stays because no other test drives a dead probe status
+//! through the app's `apply_observatory_statuses` seam.
 //!
 //! Safety: production startup is read-only with respect to Windows settings.
 //! A temporary APPDATA still isolates persistence, downloaded assets, and
