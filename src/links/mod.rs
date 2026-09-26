@@ -3984,11 +3984,7 @@ mod tests {
                     "{message:?} did not name {field:?}"
                 );
             }
-            other => panic!(
-                "expected Lossy({field}) for {}, got {}",
-                profile.name,
-                outcome_shape(&other)
-            ),
+            other => panic!("expected Lossy({field}), got {}", outcome_shape(&other)),
         }
     }
 
@@ -4037,25 +4033,27 @@ mod tests {
         }
     }
 
-    /// The failure's shape without its payload: a `Diag`'s args can quote the
-    /// link text, so a panic message names the variant and its key instead of
-    /// dumping a value that may carry the credential.
     /// The same shape for a parse outcome: a test that matched the error's
-    /// variant by pattern still holds the whole `Result`, and its message must
-    /// name what came back without dumping a profile or a link either.
-    fn outcome_shape<T>(outcome: &Result<T, LinkError>) -> String {
+    /// variant by pattern still holds the whole `Result`, and its message names
+    /// the variant rather than dumping a profile or a link either.
+    fn outcome_shape<T>(outcome: &Result<T, LinkError>) -> &'static str {
         match outcome {
-            Ok(_) => "Ok(_)".to_owned(),
+            Ok(_) => "Ok(_)",
             Err(error) => error_shape(error),
         }
     }
 
-    fn error_shape(error: &LinkError) -> String {
+    /// Which failure came back, as a literal per variant. Everything an error
+    /// carries descends from the link its case parsed, and a panic message is a
+    /// CI log line, so the tests name the variant and nothing that travelled
+    /// with it — the key a payload holds is an identifier, not data, but it is
+    /// read out of the same value and stays out of the message all the same.
+    fn error_shape(error: &LinkError) -> &'static str {
         match error {
-            LinkError::Unsupported(message) => format!("Unsupported({:?})", message.key()),
-            LinkError::Malformed(message) => format!("Malformed({:?})", message.key()),
-            LinkError::Lossy(message) => format!("Lossy({:?})", message.key()),
-            LinkError::InvalidModel { issue, .. } => format!("InvalidModel({:?})", issue.code),
+            LinkError::Unsupported(_) => "Unsupported",
+            LinkError::Malformed(_) => "Malformed",
+            LinkError::Lossy(_) => "Lossy",
+            LinkError::InvalidModel { .. } => "InvalidModel",
         }
     }
 
@@ -4079,7 +4077,7 @@ mod tests {
         let malformed =
             parse_link("vless://7f0a9c4e-0000-0000-0000-000000000000@h.example.com").unwrap_err();
         let shape = error_shape(&malformed);
-        assert!(shape.starts_with("Malformed("), "{shape}");
+        assert_eq!(shape, "Malformed");
         assert!(
             !shape.contains("7f0a9c4e"),
             "the shape must not carry the payload: {shape}"
