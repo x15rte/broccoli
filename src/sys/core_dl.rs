@@ -299,7 +299,22 @@ pub fn open_verified_for_config(
     config: &serde_json::Value,
     scope: VerifyScope,
 ) -> Result<VerifiedCore, DiagError> {
-    open_verified_core_checked(core, scope, geodata_updater_configured(config))
+    open_verified_for_config_with(core, config, scope, open_verified_core_checked)
+}
+
+/// [`open_verified_for_config`] with the managed-tree reader as a parameter.
+///
+/// The configuration chooses the pin mode and the reader consumes it. Passing
+/// the reader in is what makes that wiring checkable without a real managed
+/// tree — a test records the mode a configuration chose — while production
+/// always passes [`open_verified_core_checked`].
+fn open_verified_for_config_with(
+    core: &Path,
+    config: &serde_json::Value,
+    scope: VerifyScope,
+    open: impl FnOnce(&Path, VerifyScope, bool) -> Result<VerifiedCore, DiagError>,
+) -> Result<VerifiedCore, DiagError> {
+    open(core, scope, geodata_updater_configured(config))
 }
 
 /// [`open_verified_for_config`] over the config's own bytes — the shape the
@@ -1556,6 +1571,40 @@ mod tests {
         let directory = root.join(name);
         fs::create_dir_all(&directory).expect("create transaction fixture");
         fs::write(directory.join("sentinel"), sentinel).expect("write transaction sentinel");
+    }
+
+    #[test]
+    fn the_geodata_block_decides_the_pin_mode_the_open_hands_to_the_reader() {
+        // A config the generator emitted for a configured geo data updater
+        // suspends the two geo data compares; every other shape keeps the hard
+        // pins. The end-to-end check of this needs the real installed core,
+        // so the wiring itself is recorded here: the reader receives the mode
+        // the configuration chose.
+        let configured = serde_json::json!({
+            "geodata": {"assets": [{"url": "https://example.invalid/geoip.dat"}]},
+        });
+        let unconfigured = serde_json::json!({
+            "geodata": {"assets": [{"url": ""}]},
+        });
+        let core = Path::new(r"C:\managed-core");
+        for (config, expected) in [(&configured, true), (&unconfigured, false)] {
+            let mut recorded = None;
+            let opened = super::open_verified_for_config_with(
+                core,
+                config,
+                VerifyScope::Full,
+                |core, scope, dat_pins_suspended| {
+                    recorded = Some((core.to_path_buf(), scope, dat_pins_suspended));
+                    Err(DiagError::new(Diag::new(Key::CoreDlCorePathNotAbsolute)))
+                },
+            );
+            assert!(opened.is_err(), "the recorder must stand in for the reader");
+            assert_eq!(
+                recorded,
+                Some((core.to_path_buf(), VerifyScope::Full, expected)),
+                "the configuration decides the pin mode the reader is given"
+            );
+        }
     }
 
     #[test]

@@ -9,18 +9,40 @@
 //! pair and re-verifies — failing terminally only
 //! when the pair is missing or corrupt. A tampered xray.exe or wintun.dll
 //! must refuse to open in both modes. These tests are ignored by default:
-//! they require the real pinned managed core under `%APPDATA%\broccoli\core`
-//! (the only source of bytes that match the compiled pins) and copy tens of
-//! MB per clone.
+//! they copy tens of MB per clone and need bytes that match the compiled
+//! pins, which come either from the pinned release archive
+//! (`BROCCOLI_TEST_XRAY_ARCHIVE`, the fixture the update suites share) or from
+//! the real installed core under `%APPDATA%\broccoli\core`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use broccoli::diag::DiagError;
+use broccoli::i18n::Key;
 use broccoli::sys::core_dl::{
     VerifiedCore, VerifyScope, open_verified_for_config, open_verified_for_config_at,
     pinned_release_version,
 };
+
+#[path = "common/live_core.rs"]
+pub mod live_core;
+
+/// The diagnostic keys of `error` and of every cause under it.
+///
+/// The rendered message flattens the chain into one sentence, so checking the
+/// chained keys pins *which* failures the open names without depending on the
+/// English wording that carries them.
+fn error_keys(error: &DiagError) -> Vec<Key> {
+    let mut keys = vec![error.diag().key()];
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(diag_error) = cause.downcast_ref::<DiagError>() {
+            keys.push(diag_error.diag().key());
+        }
+        source = cause.source();
+    }
+    keys
+}
 
 /// The config a spawn would run when the user configured the core's own geo
 /// data updater: its `geodata` block is what suspends the DAT compares.
@@ -57,14 +79,10 @@ const DRIFTED_BYTES: &[u8] = b"user-managed replacement bytes, not the release p
 /// verified but never staged, so fidelity checks must not expect it.
 const PAYLOAD_FILES: &[&str] = &["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"];
 
-fn installed_core() -> PathBuf {
-    let appdata = std::env::var_os("APPDATA").expect("APPDATA must be set for the real core");
-    PathBuf::from(appdata).join("broccoli").join("core")
-}
-
-/// Clone the real installed core into a fresh directory inside `sink`.
-fn clone_installed_core(sink: &Path) -> PathBuf {
-    let source = installed_core();
+/// Clone the managed core this suite runs against into a fresh directory
+/// inside `sink`.
+fn clone_managed_core(sink: &Path) -> PathBuf {
+    let source = live_core::managed_core_source(sink);
     let destination = sink.join("core");
     fs::create_dir_all(&destination).expect("create cloned core directory");
     for name in CORE_FILES {
@@ -139,10 +157,10 @@ fn expect_verify_error(result: Result<VerifiedCore, DiagError>, message: &str) -
 /// assertions. The two adapters are the two shapes a spawn holds: a parsed
 /// config value, and the config file on disk the spawn is about to run.
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn unmodified_clone_passes_release_managed_verification() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     let verified = open_for_config(&clone, RELEASE_MANAGED_CONFIG)
         .expect("pristine clone must verify under a release-managed config");
     assert_pinned_version(verified.version());
@@ -159,10 +177,10 @@ fn unmodified_clone_passes_release_managed_verification() {
 /// a user-managed open accepts the drift, and its stage-copy
 /// proof still holds (byte fidelity against the observed hash, not the pin).
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn user_managed_dats_accept_drift_that_strict_verification_rejects() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
 
@@ -170,18 +188,25 @@ fn user_managed_dats_accept_drift_that_strict_verification_rejects() {
         open_for_config(&clone, RELEASE_MANAGED_CONFIG),
         "drifted geo data must fail the strict release verify without a pristine pair",
     );
+    let keys = error_keys(&strict);
+    assert!(
+        keys.contains(&Key::CoreDlPayloadRestoreFailed),
+        "strict failure must report the failed payload restore, got: {keys:?}"
+    );
+    assert!(
+        keys.contains(&Key::CoreDlRestoreUnavailable),
+        "the unrestorable heal must name the restore reason, got: {keys:?}"
+    );
     let message = strict.to_string();
     assert!(
-        message.contains("failed release verification"),
-        "strict failure must name the failed release verification, got: {message}"
-    );
-    assert!(
-        message.contains("restore unavailable"),
-        "the unrestorable heal must name the restore reason, got: {message}"
-    );
-    assert!(
-        message.contains("auto-restore failed"),
-        "the unrestorable heal must be reported as a failed auto-restore, got: {message}"
+        message.contains(
+            &clone
+                .join("pristine")
+                .join("geoip.dat")
+                .display()
+                .to_string()
+        ),
+        "the restore reason must name the pristine file the heal needed, got: {message}"
     );
 
     let mut verified = open_for_config(&clone, USER_MANAGED_CONFIG)
@@ -210,11 +235,11 @@ fn user_managed_dats_accept_drift_that_strict_verification_rejects() {
 /// Executable/driver tampering stays terminal in both modes — the
 /// suspension never widens past the two geo data files.
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn tampered_executable_or_driver_fails_in_strict_and_user_managed_modes() {
     for tampered in ["xray.exe", "wintun.dll"] {
         let sink = tempfile::tempdir().expect("temporary clone sink");
-        let clone = clone_installed_core(sink.path());
+        let clone = clone_managed_core(sink.path());
         drift(&clone.join(tampered));
 
         let strict = expect_verify_error(
@@ -244,10 +269,10 @@ fn tampered_executable_or_driver_fails_in_strict_and_user_managed_modes() {
 /// end up byte-identical to the pristine pair (which is the release pin
 /// bytes by construction of the clone).
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn strict_verify_heals_drifted_geo_data_from_the_pristine_pair() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     pristine_from_managed(&clone);
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
@@ -276,10 +301,10 @@ fn strict_verify_heals_drifted_geo_data_from_the_pristine_pair() {
 /// terminally naming both the release-verification failure and the restore
 /// reason — no silent continue, no partial write.
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn strict_verify_without_pristine_pair_fails_naming_the_restore_reason() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
 
@@ -287,14 +312,25 @@ fn strict_verify_without_pristine_pair_fails_naming_the_restore_reason() {
         open_for_config(&clone, RELEASE_MANAGED_CONFIG),
         "drifted geo data without a pristine pair must fail terminally",
     );
-    let message = error.to_string();
+    let keys = error_keys(&error);
     assert!(
-        message.contains("failed release verification"),
-        "the terminal error must keep the release-verification failure, got: {message}"
+        keys.contains(&Key::CoreDlPayloadRestoreFailed),
+        "the terminal error must keep the failed payload restore, got: {keys:?}"
     );
     assert!(
-        message.contains("restore unavailable"),
-        "the terminal error must name why the heal was impossible, got: {message}"
+        keys.contains(&Key::CoreDlRestoreUnavailable),
+        "the terminal error must name why the heal was impossible, got: {keys:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            &clone
+                .join("pristine")
+                .join("geoip.dat")
+                .display()
+                .to_string()
+        ),
+        "the terminal error must name the pristine file the heal needed, got: {message}"
     );
     assert_eq!(
         fs::read(clone.join("geoip.dat")).unwrap(),
@@ -314,10 +350,10 @@ fn strict_verify_without_pristine_pair_fails_naming_the_restore_reason() {
 /// release-verification failure) and leaves the drifted managed files
 /// byte-identical.
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn strict_verify_fails_on_tampered_pristine_without_healing_managed_files() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     pristine_from_managed(&clone);
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
@@ -358,10 +394,10 @@ fn strict_verify_fails_on_tampered_pristine_without_healing_managed_files() {
 /// files, so the lock on the already-verified geoip is released and
 /// re-established (regression for the Windows sharing-violation trap).
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn strict_verify_heals_geosite_only_drift_after_geoip_is_locked() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     pristine_from_managed(&clone);
     drift(&clone.join("geosite.dat"));
 
@@ -382,10 +418,10 @@ fn strict_verify_heals_geosite_only_drift_after_geoip_is_locked() {
 /// user-managed state even when a valid pristine pair sits right there —
 /// so the managed files stay drifted after a successful open.
 #[test]
-#[ignore = "requires the real installed managed core under %APPDATA%\\broccoli\\core"]
+#[ignore = "needs the pinned release archive (BROCCOLI_TEST_XRAY_ARCHIVE) or the installed managed core"]
 fn user_managed_entry_never_heals_drifted_geo_data_even_with_a_valid_pristine_pair() {
     let sink = tempfile::tempdir().expect("temporary clone sink");
-    let clone = clone_installed_core(sink.path());
+    let clone = clone_managed_core(sink.path());
     pristine_from_managed(&clone);
     drift(&clone.join("geoip.dat"));
     drift(&clone.join("geosite.dat"));
