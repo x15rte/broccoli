@@ -79,6 +79,7 @@ const NATIVE_THEME_SAMPLE_INTERVAL_SECS: f64 = 2.0;
 enum TrayAction {
     Show,
     ToggleConnection,
+    Restart,
     Quit,
 }
 
@@ -157,6 +158,7 @@ struct TrayEventTarget {
     tray_id: Option<tray_icon::TrayIconId>,
     show_id: tray_icon::menu::MenuId,
     connect_id: tray_icon::menu::MenuId,
+    restart_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
     action_tx: Sender<TrayAction>,
     ctx: egui::Context,
@@ -421,7 +423,10 @@ pub struct BroccoliApp {
     wizard: ui::wizard::WizardScreen,
 
     icon_assets: IconAssets,
-    last_icon_presentation: Option<IconPresentation>,
+    /// Last `(icon state, render lost)` presentation pushed to the window and
+    /// tray icons. The render-lost flag is part of the identity because the
+    /// tooltip names that state while it lasts.
+    last_icon_presentation: Option<(IconPresentation, bool)>,
     /// Kept alive for the process lifetime — dropping it removes the icon.
     tray: Option<tray_icon::TrayIcon>,
     tray_registration_id: u64,
@@ -444,6 +449,24 @@ pub struct BroccoliApp {
     /// language/phase change, the enabled state only on phase/block state
     /// (mirrors `last_icon_presentation`).
     last_tray_connect: Option<TrayConnectPresentation>,
+    /// Last render-lost state applied to the tray items that follow it (`None`
+    /// before the first sync): the restart is the way back from that state, and
+    /// Show cannot reopen a window that has no renderer.
+    last_tray_render_lost: Option<bool>,
+    /// The graphics device was lost: the app cannot draw, so its window is
+    /// hidden and painting stops until a restart. Set once, on the first
+    /// `logic` pass after the callback below signalled the loss.
+    render_lost_entered: bool,
+    /// Signalled by wgpu's device-lost callback (which may run on any thread),
+    /// read once per `logic` pass.
+    render_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Raise native dialogs (the device-lost notice). False in the headless
+    /// test boot, which must not raise a modal box.
+    native_notices: bool,
+    /// Debug-only fault injection for the render-loss path
+    /// (see [`crate::sys::inject`]).
+    #[cfg(debug_assertions)]
+    injections: Option<Injections>,
     /// Native theme (dark/light + reachable HWNDs) last applied to Windows
     /// surfaces. `None` before the first apply; drives the cheap per-frame
     /// comparison in `logic` so the tray popup is only re-themed on change.
@@ -455,6 +478,37 @@ pub struct BroccoliApp {
     /// `last_native_theme` still gates the actual apply.
     #[cfg(windows)]
     native_theme_sample: Option<(bool, f64)>,
+}
+
+/// Debug-only fault injection for the render-loss recovery path (see
+/// [`crate::sys::inject`]). A run that orders no injection carries `None`, and
+/// a release build never builds one.
+#[cfg(debug_assertions)]
+struct Injections {
+    /// The device the device-loss hook destroys. `None` without a renderer,
+    /// which is the headless test boot's case.
+    device: Option<eframe::wgpu::Device>,
+    /// `logic` frame the device-loss hook fires on.
+    device_loss_at: Option<u32>,
+    /// `logic` frame the restart hook fires on.
+    restart_at: Option<u32>,
+    /// `logic` passes since boot — the clock both frames are read on.
+    frames: u32,
+}
+
+#[cfg(debug_assertions)]
+impl Injections {
+    /// Read both hooks from the environment, or `None` when neither is set.
+    fn from_env(render_state: Option<&eframe::egui_wgpu::RenderState>) -> Option<Self> {
+        let device_loss_at = sys::inject::frame_at(sys::inject::DEVICE_LOSS);
+        let restart_at = sys::inject::frame_at(sys::inject::RESTART);
+        (device_loss_at.is_some() || restart_at.is_some()).then(|| Self {
+            device: render_state.map(|render_state| render_state.device.clone()),
+            device_loss_at,
+            restart_at,
+            frames: 0,
+        })
+    }
 }
 
 /// What the tray connect item should show this frame: the i18n `&'static
@@ -484,6 +538,7 @@ fn tray_connect_presentation(
 struct TrayMenu {
     show: tray_icon::menu::MenuItem,
     connect: tray_icon::menu::MenuItem,
+    restart: tray_icon::menu::MenuItem,
     quit: tray_icon::menu::MenuItem,
 }
 
@@ -507,6 +562,8 @@ impl TrayEventTarget {
             Some(TrayAction::Show)
         } else if event.id == self.connect_id {
             Some(TrayAction::ToggleConnection)
+        } else if event.id == self.restart_id {
+            Some(TrayAction::Restart)
         } else if event.id == self.quit_id {
             Some(TrayAction::Quit)
         } else {
@@ -568,6 +625,7 @@ fn install_tray_event_target(
         tray_id,
         show_id: menu.show.id().clone(),
         connect_id: menu.connect.id().clone(),
+        restart_id: menu.restart.id().clone(),
         quit_id: menu.quit.id().clone(),
         action_tx,
         ctx: ctx.clone(),
@@ -635,19 +693,20 @@ fn quit_resume_ready(servers: &mut ServersScreen, quitting: bool) -> bool {
 impl BroccoliApp {
     /// Boot the app for a real run: window, tray icon, runtime.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::build(cc, true)
-    }
-
-    /// The headless test boot: exactly [`Self::new`] except the tray icon. The
-    /// tray menu and its action channel still exist, so the tray plumbing
-    /// keeps its types and stays covered, but a test run must not light up the
-    /// notification area (`tests/ui_smoke.rs` and the other kittest suites
-    /// boot the app through this constructor).
-    pub fn new_headless(cc: &eframe::CreationContext<'_>) -> Self {
         Self::build(cc, false)
     }
 
-    fn build(cc: &eframe::CreationContext<'_>, with_tray_icon: bool) -> Self {
+    /// The headless test boot: exactly [`Self::new`] except the tray icon and
+    /// the native dialogs. The tray menu and its action channel still exist, so
+    /// the tray plumbing keeps its types and stays covered, but a test run must
+    /// neither light up the notification area nor raise a modal box
+    /// (`tests/ui_smoke.rs` and the other kittest suites boot the app through
+    /// this constructor).
+    pub fn new_headless(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::build(cc, true)
+    }
+
+    fn build(cc: &eframe::CreationContext<'_>, headless: bool) -> Self {
         init_tracing();
         // Next-launch housekeeping: a crash or kill can strand a
         // scratch `profile-test-*.json` validation config — a full generated
@@ -668,6 +727,36 @@ impl BroccoliApp {
             tracing::warn!("latency probe config cleanup failed: {error}");
         }
         load_cjk_fonts(&cc.egui_ctx);
+        // The surface-status handler wakes this context when it drops a frame,
+        // so a skipped frame is followed by the one that retries it.
+        crate::record_ui_context(&cc.egui_ctx);
+        // The device can die at any moment and only the driver knows why; the
+        // callback below turns that into a state the app acts on, and this
+        // clone of the flag is what `logic` reads. The adapter line is the
+        // first thing a field report needs: the app cannot choose what the
+        // driver does, but the log can name what it did it to.
+        let render_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(render_state) = &cc.wgpu_render_state {
+            let info = render_state.adapter.get_info();
+            tracing::info!(
+                "renderer: adapter {} ({:?}) on the {:?} backend, driver {}",
+                info.name,
+                info.device_type,
+                info.backend,
+                info.driver
+            );
+            let lost = std::sync::Arc::clone(&render_lost);
+            let ctx = cc.egui_ctx.clone();
+            render_state
+                .device
+                .set_device_lost_callback(move |reason, message| {
+                    // Any thread can report the loss: the flag and the wake
+                    // hand it to the frame that hides the window.
+                    lost.store(true, std::sync::atomic::Ordering::Release);
+                    tracing::error!("graphics device lost ({reason:?}): {message}");
+                    ctx.request_repaint();
+                });
+        }
         // A locked or undetectable profile directory breaks every later save
         // and download; surface the failure up front instead of letting it
         // appear later as confusing secondary errors.
@@ -774,7 +863,7 @@ impl BroccoliApp {
             native_theme::apply(dark, &hwnds[..count]);
             (dark, main_hwnd)
         };
-        let (tray, tray_menu) = build_tray(&icon_assets, settings.language, with_tray_icon);
+        let (tray, tray_menu) = build_tray(&icon_assets, settings.language, !headless);
         let (tray_registration_id, tray_action_rx) =
             install_tray_event_handlers(&cc.egui_ctx, tray.as_ref(), &tray_menu);
         let (core_version, core_setup) = core_facts(sys::core_dl::cached_core_presence(
@@ -850,6 +939,12 @@ impl BroccoliApp {
             icon_assets,
             last_icon_presentation: None,
             last_tray_connect: None,
+            last_tray_render_lost: None,
+            render_lost_entered: false,
+            render_lost,
+            native_notices: !headless,
+            #[cfg(debug_assertions)]
+            injections: Injections::from_env(cc.wgpu_render_state.as_ref()),
             tray,
             tray_registration_id,
             tray_action_rx,
@@ -1194,6 +1289,7 @@ impl BroccoliApp {
                         }
                     }
                 },
+                TrayAction::Restart => self.restart(ctx),
                 TrayAction::Quit => self.quit(ctx),
             }
         }
@@ -1221,13 +1317,33 @@ impl BroccoliApp {
         self.tray_menu.connect.set_enabled(presentation.enabled);
     }
 
-    fn sync_icons(&mut self, frame: &eframe::Frame) {
-        let presentation = classify(&self.phase, self.active_transport);
-        if self.last_icon_presentation == Some(presentation) {
+    /// Point the tray items at the render-lost state: the restart is the way
+    /// back to a window, and Show cannot reopen one that has no renderer. Both
+    /// follow from the same flag, so one gate covers them.
+    fn sync_tray_render_lost(&mut self) {
+        let render_lost = self.render_lost_entered;
+        if self.last_tray_render_lost == Some(render_lost) {
             return;
         }
-        self.last_icon_presentation = Some(presentation);
-        let tooltip = presentation.tooltip(self.settings.language);
+        self.last_tray_render_lost = Some(render_lost);
+        self.tray_menu.show.set_enabled(!render_lost);
+        self.tray_menu.restart.set_enabled(render_lost);
+    }
+
+    fn sync_icons(&mut self, frame: &eframe::Frame) {
+        let presentation = classify(&self.phase, self.active_transport);
+        // The tooltip names a lost renderer while that state holds: the window
+        // it would otherwise describe is gone.
+        let render_lost = self.render_lost_entered;
+        if self.last_icon_presentation == Some((presentation, render_lost)) {
+            return;
+        }
+        self.last_icon_presentation = Some((presentation, render_lost));
+        let tooltip = if render_lost {
+            t(self.settings.language, Key::TrayTooltipRenderLost).to_string()
+        } else {
+            presentation.tooltip(self.settings.language)
+        };
 
         #[cfg(windows)]
         {
@@ -1313,6 +1429,16 @@ impl BroccoliApp {
     fn sync_native_theme(&mut self, _ctx: &egui::Context, _frame: &eframe::Frame) {}
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        if self.render_lost_entered {
+            // Nothing can draw any more, so bringing the viewport up would put
+            // a window on screen that never repaints. The tray's own Show item
+            // is disabled in this state; this arm covers the tray-icon click,
+            // which no menu item gates, and answers it with the same notice the
+            // loss raised.
+            tracing::warn!("show requested while rendering is lost: the restart is the way back");
+            self.raise_render_lost_notice();
+            return;
+        }
         // Every path back from close-to-tray goes through here, so it is
         // the single place the visibility gate reopens.
         self.viewport_hidden = false;
@@ -1325,7 +1451,121 @@ impl BroccoliApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
+    /// Enter the render-lost state: wgpu reported the graphics device dead, so
+    /// no frame the app prepares can reach the screen. The window is hidden
+    /// instead of left frozen (a hidden viewport also stops eframe's painting),
+    /// the tray keeps the app reachable — with the restart that gets the window
+    /// back enabled — and the core and the tunnel keep running.
+    fn enter_render_lost(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        self.render_lost_entered = true;
+        // The surface-status handler stops scheduling retries from here: a
+        // lost device clears only on a restart, so no frame this app asks for
+        // could succeed.
+        crate::note_render_lost();
+        // The line that makes a field report self-explanatory: what happened
+        // to the window, and what brings it back.
+        tracing::error!("render lost: the window is hidden until the app restarts");
+        self.viewport_hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Hiding alone does not stop the paint path: egui treats a window as
+        // visible for rendering unless it is minimized or occluded, so a
+        // wake would still run a full pass into the dead device (each attempt
+        // logging a staging error and a dropped frame). Minimizing puts eframe
+        // on its logic-only path — the same path close-to-tray's hidden window
+        // takes once it is minimized — and the window stays hidden.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        // `sync_icons` reads the flag set above, so the tooltip lands now
+        // rather than on the next icon state change.
+        self.sync_icons(frame);
+        self.raise_render_lost_notice();
+    }
+
+    /// Tell the user what happened to the window: a native box, because the
+    /// app's own renderer is what is gone. Raised again when a request to show
+    /// the window arrives while the state holds.
+    fn raise_render_lost_notice(&self) {
+        if !self.native_notices {
+            return;
+        }
+        let body = t_fmt(
+            self.settings.language,
+            Key::NoticeDeviceLostText,
+            &[&sys::paths::app_log().display().to_string()],
+        );
+        sys::notice::show(
+            t(self.settings.language, Key::NoticeDeviceLostTitle).to_string(),
+            body,
+        );
+    }
+
+    /// Restart the app — the tray action the render-lost state exists for.
+    ///
+    /// `main` starts the replacement once this process has stopped and
+    /// released the single-instance mutex.
+    fn restart(&mut self, ctx: &egui::Context) {
+        sys::restart::request();
+        self.quit_unrenderable(ctx);
+    }
+
+    /// Quit while the window cannot draw: the leave modal that protects an
+    /// unsaved draft needs a renderer, so the edits are recorded in the log
+    /// and the quit goes ahead.
+    fn quit_unrenderable(&mut self, ctx: &egui::Context) {
+        if self.servers_ui.unsaved_changes() {
+            tracing::warn!(
+                "closing the window with unsaved server edits: the leave prompt needs a window that can draw"
+            );
+        }
+        self.quit_impl(ctx, None);
+    }
+
+    /// Run the debug-only injections the environment ordered (see
+    /// [`crate::sys::inject`]).
+    #[cfg(debug_assertions)]
+    fn run_injections(&mut self, ctx: &egui::Context) {
+        let Some(injections) = self.injections.as_mut() else {
+            return;
+        };
+        injections.frames = injections.frames.saturating_add(1);
+        let frame = injections.frames;
+        let loss_due = injections.device_loss_at == Some(frame);
+        let restart_due = injections.restart_at == Some(frame);
+        // An idle app repaints only on events, so a pending injection must ask
+        // for the frames its number counts — otherwise the run could sit below
+        // the ordered frame forever.
+        let pending = injections.device_loss_at.is_some_and(|at| at > frame)
+            || injections.restart_at.is_some_and(|at| at > frame);
+        if pending {
+            ctx.request_repaint();
+        }
+        if loss_due && let Some(device) = injections.device.as_ref() {
+            // Destroying the device leaves the same invalid-device state a
+            // driver loss does: the surface acquire reports a validation error
+            // and every later staging write fails. A driver loss reports the
+            // callback synchronously, an explicit destroy only once the queue
+            // drains, so the poll drives that completion — the injection must
+            // reach the same callback the app listens for.
+            tracing::warn!("injecting a device loss at frame {frame}");
+            device.destroy();
+            if let Err(error) = device.poll(eframe::wgpu::PollType::wait_indefinitely()) {
+                tracing::warn!("injected loss: the poll that reports it failed: {error}");
+            }
+        }
+        if restart_due {
+            tracing::warn!("injecting a restart at frame {frame}");
+            self.restart(ctx);
+        }
+    }
+
     fn quit(&mut self, ctx: &egui::Context) {
+        if self.render_lost_entered {
+            // The leave modal a dirty draft stages needs a window that can
+            // draw, and this state is exactly the one where none can: the quit
+            // goes ahead with the edits recorded, the same rule the restart
+            // follows.
+            self.quit_unrenderable(ctx);
+            return;
+        }
         // Unsaved-changes indicator: a dirty server draft defers the quit —
         // the leave action is staged, and the modal resolved on later frames
         // resumes the quit through the ui() tail. `quit_with_cleanup` /
@@ -1950,6 +2190,8 @@ impl Drop for BroccoliApp {
 
 impl eframe::App for BroccoliApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(debug_assertions)]
+        self.run_injections(ctx);
         self.frame_drain = self.drain_events();
         if self.frame_drain == DrainOutcome::Full {
             // A full drain batch means more events are queued:
@@ -1969,6 +2211,17 @@ impl eframe::App for BroccoliApp {
             self.viewport_hidden = true;
         }
         self.drain_tray(ctx);
+        // The device-lost callback may have fired since the last pass: nothing
+        // the app draws can reach the screen any more, so the window goes away
+        // and the app keeps running for the tray, the core and the tunnel. A
+        // quit already in flight is left alone — the window is closing, and a
+        // notice for a run that is ending would only race the teardown.
+        if !self.quitting
+            && !self.render_lost_entered
+            && self.render_lost.load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.enter_render_lost(ctx, frame);
+        }
         // The Connect block reason is refreshed once per pass after the
         // event drain and shared by the tray sync, the top-bar Connect
         // button, and the screen contexts: the text
@@ -1976,6 +2229,7 @@ impl eframe::App for BroccoliApp {
         // repaint frames.
         self.refresh_connect_block_cache();
         self.sync_tray_action();
+        self.sync_tray_render_lost();
         self.sync_icons(frame);
         self.sync_native_theme(ctx, frame);
     }
@@ -2819,6 +3073,7 @@ mod safety_tests {
         let menu = super::TrayMenu {
             show: MenuItem::with_id("broccoli-test-show", "Show", true, None),
             connect: MenuItem::with_id("broccoli-test-connect", "Connect", true, None),
+            restart: MenuItem::with_id("broccoli-test-restart", "Restart", true, None),
             quit: MenuItem::with_id("broccoli-test-quit", "Quit", true, None),
         };
         let tray_id = TrayIconId::new("broccoli-test-tray");
@@ -2863,6 +3118,16 @@ mod safety_tests {
                 })
             },
             Some(super::TrayAction::ToggleConnection),
+        );
+        assert_tray_event(
+            &menu,
+            Some(tray_id.clone()),
+            || {
+                super::dispatch_menu_event(MenuEvent {
+                    id: menu.restart.id().clone(),
+                })
+            },
+            Some(super::TrayAction::Restart),
         );
         assert_tray_event(
             &menu,
@@ -2921,6 +3186,78 @@ mod safety_tests {
             },
             None,
         );
+    }
+
+    /// A reported device loss takes the window away and leaves the app running:
+    /// the viewport hides, the tray restart becomes the way back, and the
+    /// headless boot raises no dialog.
+    #[test]
+    fn device_loss_hides_the_window_and_enables_the_tray_restart() {
+        crate::sys::appdata::with_appdata(|| {
+            let mut harness = egui_kittest::Harness::builder()
+                .build_eframe(|cc| crate::app::BroccoliApp::new_headless(cc));
+            harness.run();
+            assert!(
+                !harness.state().tray_menu.restart.is_enabled(),
+                "a restart is not offered while the window can draw"
+            );
+
+            // A real loss sets this flag from wgpu's device-lost callback; the
+            // flag is all `logic` reads.
+            harness
+                .state()
+                .render_lost
+                .store(true, std::sync::atomic::Ordering::Release);
+            harness.run();
+
+            let app = harness.state();
+            assert!(app.render_lost_entered, "the loss must be taken once");
+            assert!(
+                app.viewport_hidden,
+                "the window must be hidden, not left frozen"
+            );
+            assert!(
+                app.tray_menu.restart.is_enabled(),
+                "the tray restart must become the way back to a window"
+            );
+            assert!(
+                !app.tray_menu.show.is_enabled(),
+                "Show cannot reopen a window that has no renderer"
+            );
+            assert!(
+                !app.native_notices,
+                "the headless boot must not raise a dialog"
+            );
+        });
+    }
+
+    /// The tray restart records the hand-off `main` reads, exactly once per
+    /// run.
+    #[test]
+    fn tray_restart_records_the_handoff_for_main() {
+        // The flag is process-global; leave the test's own take drained.
+        let _ = crate::sys::restart::take_requested();
+        crate::sys::appdata::with_appdata(|| {
+            let mut harness = egui_kittest::Harness::builder()
+                .build_eframe(|cc| crate::app::BroccoliApp::new_headless(cc));
+            harness.run();
+            let restart_id = harness.state().tray_menu.restart.id().clone();
+            super::dispatch_menu_event(tray_icon::menu::MenuEvent { id: restart_id });
+            harness.run();
+
+            assert!(
+                crate::sys::restart::take_requested(),
+                "the tray restart must record the hand-off for main"
+            );
+            assert!(
+                !crate::sys::restart::take_requested(),
+                "one run starts at most one replacement"
+            );
+            assert!(
+                harness.state().quitting,
+                "the restart must close the window it cannot draw"
+            );
+        });
     }
 
     #[test]
@@ -3700,11 +4037,15 @@ fn build_tray(
 
     let show = MenuItem::new(t(lang, Key::TrayShow), true, None);
     let connect = MenuItem::new(t(lang, Key::TrayConnectDisconnect), true, None);
+    // The restart exists for the state where the window cannot draw: it starts
+    // disabled, and `sync_tray_restart` enables it while rendering is lost.
+    let restart = MenuItem::new(t(lang, Key::TrayRestart), false, None);
     let quit = MenuItem::new(t(lang, Key::TrayQuit), true, None);
     let menu = Menu::new();
     let _ = menu.append(&show);
     let _ = menu.append(&connect);
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&restart);
     let _ = menu.append(&quit);
 
     #[cfg(windows)]
@@ -3737,6 +4078,7 @@ fn build_tray(
         TrayMenu {
             show,
             connect,
+            restart,
             quit,
         },
     )
@@ -3943,33 +4285,30 @@ fn init_tracing() {
     if let Err(error) = paths::ensure_dirs() {
         eprintln!("broccoli: failed to create profile directories: {error:#}");
     }
-    let writer: tracing_subscriber::fmt::writer::BoxMakeWriter = match RotatingLogWriter::open(
-        paths::logs_dir().join("app.log"),
-        APP_LOG_MAX_BYTES,
-        APP_LOG_KEEP,
-    ) {
-        Ok(rotating) => {
-            // Runtime events can arrive faster than disk writes. A bounded
-            // worker keeps the egui thread and core output pumps independent
-            // of filesystem latency; retain its guard for process lifetime so
-            // a clean exit flushes accepted records. Rotation happens inside
-            // the rotating writer on that worker thread, never on the pumps.
-            let (writer, guard) = tracing_appender::non_blocking(rotating);
-            // Keep only the first guard: a later app construction in the
-            // same process (tests) must not shut the live worker down.
-            let mut guard_slot = LOG_GUARD
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard_slot.is_none() {
-                *guard_slot = Some(guard);
+    let writer: tracing_subscriber::fmt::writer::BoxMakeWriter =
+        match RotatingLogWriter::open(paths::app_log(), APP_LOG_MAX_BYTES, APP_LOG_KEEP) {
+            Ok(rotating) => {
+                // Runtime events can arrive faster than disk writes. A bounded
+                // worker keeps the egui thread and core output pumps independent
+                // of filesystem latency; retain its guard for process lifetime so
+                // a clean exit flushes accepted records. Rotation happens inside
+                // the rotating writer on that worker thread, never on the pumps.
+                let (writer, guard) = tracing_appender::non_blocking(rotating);
+                // Keep only the first guard: a later app construction in the
+                // same process (tests) must not shut the live worker down.
+                let mut guard_slot = LOG_GUARD
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard_slot.is_none() {
+                    *guard_slot = Some(guard);
+                }
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(writer)
             }
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(writer)
-        }
-        Err(error) => {
-            eprintln!("broccoli: cannot open app.log, tracing to stdout: {error}");
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
-        }
-    };
+            Err(error) => {
+                eprintln!("broccoli: cannot open app.log, tracing to stdout: {error}");
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+            }
+        };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,wgpu=warn,naga=warn".into());
     tracing_subscriber::fmt()

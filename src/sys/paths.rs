@@ -56,6 +56,12 @@ pub fn logs_dir() -> PathBuf {
     broccoli_root().join("logs")
 }
 
+/// `%APPDATA%\broccoli\logs\app.log` — the file the GUI's own records go to
+/// (rotated beside it as `app.log.N`).
+pub fn app_log() -> PathBuf {
+    logs_dir().join("app.log")
+}
+
 /// Create every directory above — each carrying the user-only, inheritable,
 /// protected DACL before any file can be written into it — and
 /// re-harden pre-existing roots on every run. Idempotent: re-application

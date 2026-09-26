@@ -69,6 +69,13 @@ struct WgpuWinitRunning<'app> {
     shared: Rc<RefCell<SharedState>>,
 
     pending_deltas: TexturesDelta,
+
+    /// Set when the paint path panicked. The panic is caught at the paint call
+    /// instead of unwinding out of `winit`'s window procedure, where it would
+    /// abort the process, and every later frame skips painting: the renderer's
+    /// state after a panic is not trustworthy, while the app's logic keeps
+    /// running.
+    render_panicked: bool,
 }
 
 impl Drop for WgpuWinitRunning<'_> {
@@ -76,6 +83,17 @@ impl Drop for WgpuWinitRunning<'_> {
         // Avoid debug panic when dropping unapplied deltas on teardown
         self.pending_deltas.clear();
     }
+}
+
+/// The message inside a caught panic payload, for the log line that records
+/// why painting was disabled. A payload that carries no string — a `panic_any`
+/// value — has no message to show.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<panic payload is not a string>")
 }
 
 /// Everything needed by the immediate viewport renderer.\
@@ -381,6 +399,7 @@ impl<'app> WgpuWinitApp<'app> {
             app,
             shared,
             pending_deltas: Default::default(),
+            render_panicked: false,
         }))
     }
 }
@@ -620,6 +639,7 @@ impl WgpuWinitRunning<'_> {
             integration,
             shared,
             pending_deltas,
+            render_panicked,
         } = self;
 
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
@@ -796,7 +816,7 @@ impl WgpuWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
-        let vsync_secs = if is_visible {
+        let vsync_secs = if is_visible && !*render_panicked {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
             let mut screenshot_commands = vec![];
@@ -808,15 +828,35 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
-            let vsync_secs = painter.paint_and_update_textures(
-                viewport_id,
-                pixels_per_point,
-                app.clear_color(&egui_ctx.global_style().visuals),
-                &clipped_primitives,
-                pending_deltas,
-                screenshot_commands,
-                window,
-            );
+            // The paint call is caught rather than propagated: it runs inside
+            // `winit`'s window procedure, where a panic cannot unwind and would
+            // abort the process — a renderer defect must not be fatal. The
+            // first caught panic disables painting for the rest of the session
+            // (the renderer's state after a panic is not trustworthy) while the
+            // app's logic keeps running; `AssertUnwindSafe` is deliberate, and
+            // no paint is attempted again on the state this frame left behind.
+            let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                painter.paint_and_update_textures(
+                    viewport_id,
+                    pixels_per_point,
+                    app.clear_color(&egui_ctx.global_style().visuals),
+                    &clipped_primitives,
+                    pending_deltas,
+                    screenshot_commands,
+                    window,
+                )
+            }));
+            let vsync_secs = match painted {
+                Ok(vsync_secs) => vsync_secs,
+                Err(payload) => {
+                    *render_panicked = true;
+                    log::error!(
+                        "The render path panicked. Painting is disabled for the rest of this session: {}",
+                        panic_payload_message(payload.as_ref())
+                    );
+                    0.0
+                }
+            };
 
             for action in viewport.actions_requested.drain(..) {
                 match action {

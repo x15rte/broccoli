@@ -154,7 +154,7 @@ fn main() {
     // reported and ends startup with a non-zero exit, never mistaken for a
     // quiet second launch (no tracing subscriber exists this early, so the
     // diagnostic goes to stderr).
-    let _guard = match broccoli::sys::single_instance::acquire() {
+    let instance_guard = match broccoli::sys::single_instance::acquire() {
         SingleInstance::Acquired(guard) => guard,
         SingleInstance::AlreadyRunning => return,
         SingleInstance::Unavailable(reason) => {
@@ -192,6 +192,17 @@ fn main() {
     if let Err(e) = run_result {
         eprintln!("broccoli GUI failed: {e:?}");
         std::process::exit(1);
+    }
+
+    // A restart hands the run to a fresh process. The mutex is released before
+    // the replacement starts, because the replacement acquires it at startup
+    // and would otherwise be turned away as a second launch.
+    if broccoli::sys::restart::take_requested() {
+        drop(instance_guard);
+        if let Err(error) = broccoli::sys::restart::spawn_replacement() {
+            eprintln!("broccoli restart: the replacement could not start: {error}");
+        }
+        std::process::exit(0);
     }
 
     // The process's own teardown is done: state flushed, core and helper

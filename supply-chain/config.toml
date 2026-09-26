@@ -13,6 +13,9 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 [policy.eframe]
 audit-as-crates-io = false
 
+[policy.egui-wgpu]
+audit-as-crates-io = false
+
 [policy.egui-winit]
 audit-as-crates-io = false
 

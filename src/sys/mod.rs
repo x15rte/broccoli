@@ -6,9 +6,15 @@ pub mod core_dl;
 pub mod elevation;
 pub mod exit_bound;
 pub mod geodata;
+// Debug-only fault injection (see the module doc): a release build carries no
+// way to order a device loss or a restart.
+#[cfg(debug_assertions)]
+pub(crate) mod inject;
 pub mod net_table;
 pub mod netif;
+pub(crate) mod notice;
 pub mod paths;
+pub mod restart;
 pub mod security;
 pub mod selfupd;
 pub mod single_instance;
