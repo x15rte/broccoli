@@ -2776,11 +2776,13 @@ fn bootstrap_scope_follows_a_transitive_chain_to_its_far_end() {
 }
 
 #[test]
-fn standalone_profiles_keep_the_bootstrap_scope_when_not_active() {
-    // Every profile whose dial is not proxied through another keeps the
-    // marking: trial rules, balancers and the observatory can dial any
-    // profile tag at runtime, so such a dial must still resolve through the
-    // bootstrap resolver.
+fn standby_profiles_keep_no_bootstrap_marking_outside_the_documents_dials() {
+    // Only the outbounds the document dials take the marking. A standby the
+    // user has not activated is not one of them: nothing in the configuration
+    // reaches it (no rule, balancer, or health engine), and activating it
+    // regenerates the document with it as the default route. Marking it would
+    // route its domain — and any system query for it — to a direct resolver
+    // outside the tunnel for a dial that never happens.
     let active = ServerProfile {
         id: ID.into(),
         ..ServerProfile::new("active", vless_server("active.example.com", 443))
@@ -2800,15 +2802,183 @@ fn standalone_profiles_keep_the_bootstrap_scope_when_not_active() {
 
     assert_eq!(
         cfg["dns"]["servers"][2]["domains"],
-        json!(["domain:active.example.com", "domain:standby.example.com"])
+        json!(["domain:active.example.com"])
     );
-    for index in 0..2 {
+    assert_eq!(
+        cfg["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
+        json!("useip")
+    );
+    assert!(
+        cfg["outbounds"][1].get("streamSettings").is_none(),
+        "a standby the document never dials carries no injection: {}",
+        cfg["outbounds"][1]
+    );
+}
+
+#[test]
+fn rule_targets_and_balancer_members_keep_the_bootstrap_marking() {
+    // The document's own dials keep the marking: a routing rule's target is
+    // dialed whenever the rule matches, and a balancer selects among its
+    // members at runtime — a trial rule may name any balancer of the
+    // committed document, so its members stay resolvable too.
+    let active = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("active", vless_server("active.example.com", 443))
+    };
+    let ruled = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("ruled", vless_server("ruled.example.com", 443))
+    };
+    let balanced = ServerProfile {
+        id: "1111222233334444".into(),
+        ..ServerProfile::new("balanced", vless_server("balanced.example.com", 443))
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(active.id.clone()),
+        profiles: vec![active, ruled.clone(), balanced.clone()],
+        extra: Map::new(),
+    };
+    let mut settings = base_settings();
+    settings.routing.rules.push(crate::model::Rule {
+        outbound_tag: ruled.tag(),
+        ..Default::default()
+    });
+    settings.routing.balancers.push(crate::model::Balancer {
+        tag: "bal".into(),
+        selector: vec![balanced.tag()],
+        ..Default::default()
+    });
+
+    let cfg = generate_deterministic(&servers, &settings).expect("generate config");
+
+    assert_eq!(
+        cfg["dns"]["servers"][2]["domains"],
+        json!([
+            "domain:active.example.com",
+            "domain:balanced.example.com",
+            "domain:ruled.example.com"
+        ])
+    );
+    for index in 0..3 {
         assert_eq!(
             cfg["outbounds"][index]["streamSettings"]["sockopt"]["domainStrategy"],
             json!("useip"),
-            "profile outbound {index} must take useip"
+            "outbound {index} is dialed by the document and must take useip"
         );
     }
+}
+
+#[test]
+fn health_engine_subjects_keep_the_bootstrap_marking() {
+    // The emitted observatory probes its subjects continuously, so those
+    // dials resolve through the bootstrap resolver like any other. The
+    // dependency-forced form (a balancer that reads live health) observes
+    // every profile, which is what keeps `leastping`/`leastload` balancers
+    // working over the whole list.
+    let active = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("active", vless_server("active.example.com", 443))
+    };
+    let probed = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("probed", vless_server("probed.example.com", 443))
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(active.id.clone()),
+        profiles: vec![active, probed],
+        extra: Map::new(),
+    };
+    let mut settings = base_settings();
+    settings.routing.observatory.enabled = true;
+    settings.routing.observatory.subject_selector = vec!["srv-".into()];
+
+    let cfg = generate_deterministic(&servers, &settings).expect("generate config");
+    assert_eq!(
+        cfg["dns"]["servers"][2]["domains"],
+        json!(["domain:active.example.com", "domain:probed.example.com"]),
+        "a user-enabled observatory marks exactly its subjects"
+    );
+
+    // The forced form ignores the stored selector and observes every profile.
+    settings.routing.observatory.enabled = false;
+    settings.routing.balancers.push(crate::model::Balancer {
+        tag: "healthy".into(),
+        selector: vec!["srv-".into()],
+        strategy: crate::model::StrategyCfg {
+            r#type: "leastping".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cfg = generate_deterministic(&servers, &settings).expect("generate config");
+    assert_eq!(
+        cfg["dns"]["servers"][2]["domains"],
+        json!(["domain:active.example.com", "domain:probed.example.com"])
+    );
+
+    // Both engines wired: the core starts every app, so the burst's own
+    // subjects are dialed beside the ordinary observatory's.
+    settings.routing.balancers.clear();
+    settings.routing.observatory.enabled = true;
+    settings.routing.observatory.subject_selector = vec!["srv-01234567".into()];
+    settings.routing.burst_observatory.enabled = true;
+    settings.routing.burst_observatory.subject_selector = vec!["srv-fedcba98".into()];
+    let cfg = generate_deterministic(&servers, &settings).expect("generate config");
+    assert_eq!(
+        cfg["dns"]["servers"][2]["domains"],
+        json!(["domain:active.example.com", "domain:probed.example.com"]),
+        "each engine's subjects keep their marking"
+    );
+}
+
+#[test]
+fn rule_target_chain_terminal_is_the_marked_outbound() {
+    // A rule may name a chained profile; the dial it triggers ends on that
+    // profile's chain terminal, so the terminal — not the rule's own target —
+    // takes the scope entry and the injection.
+    let active = ServerProfile {
+        id: ID.into(),
+        ..ServerProfile::new("active", vless_server("active.example.com", 443))
+    };
+    let exit = ServerProfile {
+        id: "fedcba9876543210".into(),
+        ..ServerProfile::new("exit", vless_server("exit.example.com", 443))
+    };
+    let mut hop_outbound = vless_server("hop.example.com", 443);
+    hop_outbound.chain_via(exit.tag());
+    let hop = ServerProfile {
+        id: "1111222233334444".into(),
+        ..ServerProfile::new("hop", hop_outbound)
+    };
+    let servers = ServersFile {
+        version: 1,
+        active: Some(active.id.clone()),
+        profiles: vec![active.clone(), hop.clone(), exit],
+        extra: Map::new(),
+    };
+    let mut settings = base_settings();
+    settings.routing.rules.push(crate::model::Rule {
+        outbound_tag: hop.tag(),
+        ..Default::default()
+    });
+
+    let cfg = generate_deterministic(&servers, &settings).expect("generate config");
+
+    assert_eq!(
+        cfg["dns"]["servers"][2]["domains"],
+        json!(["domain:active.example.com", "domain:exit.example.com"])
+    );
+    assert_eq!(
+        cfg["outbounds"][1]["streamSettings"]["sockopt"],
+        json!({ "dialerProxy": servers.profiles[2].tag() }),
+        "the rule's own target carries the chain and nothing else"
+    );
+    assert_eq!(
+        cfg["outbounds"][2]["streamSettings"]["sockopt"]["domainStrategy"],
+        json!("useip")
+    );
 }
 
 #[test]

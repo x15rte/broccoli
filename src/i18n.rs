@@ -3016,7 +3016,7 @@ mod en {
             Key::DnsClientIpHint => "203.0.113.1 — the address upstream servers see",
             Key::DnsBootstrapLabel => "Proxy-server resolver (local DNS)",
             Key::DnsBootstrapHint => {
-                "The app resolves the server domains of the direct-dial outbounds with this \
+                "The app resolves the domains of the servers the configuration dials with this \
                  endpoint. The app dials this endpoint directly, outside the tunnel. Enter an \
                  endpoint with an IP address, for example https://223.5.5.5/dns-query or \
                  223.5.5.5, or 'localhost' for the OS resolver. Leave it empty to derive the \

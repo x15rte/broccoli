@@ -200,18 +200,23 @@ pub fn generate_with_api_port(
 
     // Proxy-server bootstrap: a direct-dial outbound's domain resolves
     // through a scoped `+local` DNS server (direct dial) instead of the OS
-    // resolver, so the tunnel chain can bootstrap itself. A chained hop's
-    // domain stays out of the scope: that server is reached through the
-    // chain and resolves on the far side. Both halves are load-bearing:
+    // resolver, so the tunnel chain can bootstrap itself. Only the outbounds
+    // the emitted document actually dials take the marking: the default route
+    // and the profiles its rules, balancers and health engines reach. A
+    // profile the document never dials — a standby server the user has not
+    // activated — carries neither the scope entry nor the injection until a
+    // commit makes it the default route or a rule's target. A chained hop's
+    // domain stays out of the scope: that server is reached through the chain
+    // and resolves on the far side. Both halves are load-bearing:
     // `useip` routes the server dial into the DNS module, and the scoped
     // server answers it without the tunnel; emitting one without the other
     // would leave the dial on the OS resolver or deadlock it inside the
     // module (the DoH dial needs the very chain the query is for).
-    let direct_dial = direct_dial_outbound_tags(servers);
+    let dialed = dialed_outbound_tags(servers, settings);
     let mut server_domains: Vec<String> = servers
         .profiles
         .iter()
-        .filter(|profile| direct_dial.contains(&profile.tag()))
+        .filter(|profile| dialed.contains(&profile.tag()))
         .filter_map(profile_server_domain)
         .collect();
     server_domains.sort();
@@ -241,7 +246,7 @@ pub fn generate_with_api_port(
     // value instead of receiving positional facts it could swap for one
     // another.
     let emission = Emission {
-        direct_dial,
+        dialed,
         bootstrap: bootstrap.is_some(),
         dns_on: dns_wire.is_some(),
         dns_intercept,
@@ -532,15 +537,16 @@ fn invalid_model_error(verdict: Verdict) -> Option<GenerateError> {
         .map(|issue| GenerateError::InvalidFinding(Box::new(issue)))
 }
 
-/// Tags of the direct-dial outbounds: every profile whose server address the
-/// local machine dials directly. The walk over dial-through references ends
-/// on such a profile itself — either it names no target, or the target is a
-/// builtin (`direct`/`block`), which has no server to reach. A reference
-/// naming another profile excludes it: that hop's server is reached through
-/// the chain and resolves on the far side.
-fn direct_dial_outbound_tags(servers: &ServersFile) -> BTreeSet<String> {
+/// Tags of the outbounds the emitted document dials, each mapped to its chain
+/// terminal: every profile whose server address this machine dials while this
+/// document runs. The walk over dial-through references ends on the profile
+/// itself when it names no target, or a builtin (`direct`/`block`), which has
+/// no server to reach. A reference naming another profile excludes the
+/// referencing outbound: that hop's server is reached through the chain and
+/// resolves on the far side.
+fn dialed_outbound_tags(servers: &ServersFile, settings: &Settings) -> BTreeSet<String> {
     let tags = crate::model::emit::profile_outbound_tags(&servers.profiles);
-    crate::model::dial::DialGraph::new(&servers.profiles, &tags).direct_dial_tags()
+    crate::model::dial::DialGraph::new(&servers.profiles, &tags).dialed_outbound_tags(settings)
 }
 
 /// The proxy-server host of a profile when it is a domain (not an IP
@@ -757,8 +763,8 @@ struct OutboundWirePolicy<'a> {
     interface: Option<&'a str>,
     /// Resolve domain-addressed server dials through the DNS module
     /// (`sockopt.domainStrategy: "useip"`). Only the main config passes
-    /// `true`, and only for a direct-dial outbound, only when the config
-    /// emits a bootstrap resolver.
+    /// `true`, and only for an outbound the document dials, only when the
+    /// config emits a bootstrap resolver.
     bootstrap: bool,
 }
 
@@ -798,12 +804,14 @@ fn append_builtin_outbounds(out: &mut Vec<Value>) {
 /// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
 /// the compiler noticing.
 struct Emission<'a> {
-    /// The direct-dial outbound tags: the only profiles whose server address
-    /// this machine dials directly, so the only ones whose domain the
-    /// bootstrap resolver may answer.
-    direct_dial: BTreeSet<String>,
+    /// The outbound tags this document dials: the default route and the
+    /// profiles its rules, balancers and health engines reach, each mapped to
+    /// its chain terminal. These are the only profiles whose server address
+    /// this machine dials, so the only ones whose domain the bootstrap
+    /// resolver may answer.
+    dialed: BTreeSet<String>,
     /// Whether a scoped bootstrap resolver was emitted at all: a DNS module
-    /// exists and a direct-dial server domain needs one.
+    /// exists and a dialed outbound's server domain needs one.
     bootstrap: bool,
     /// Whether the DNS module reaches the wire at all.
     dns_on: bool,
@@ -824,11 +832,12 @@ struct Emission<'a> {
 
 impl Emission<'_> {
     /// Whether this profile's own dial goes through the scoped bootstrap DNS
-    /// server: only a direct-dial outbound's domain is in its scope (a chained
-    /// hop's server is reached through the chain and resolves on the far
-    /// side — see [`crate::model::dial`]).
+    /// server: only an outbound the document dials has its domain in the
+    /// scope (a chained hop's server is reached through the chain and resolves
+    /// on the far side, and a standby the document never dials resolves
+    /// nothing before the tunnel — see [`crate::model::dial`]).
     fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
-        self.bootstrap && self.direct_dial.contains(&profile.tag())
+        self.bootstrap && self.dialed.contains(&profile.tag())
     }
 }
 
@@ -910,8 +919,9 @@ fn outbounds(servers: &ServersFile, emission: &Emission<'_>) -> Value {
         let policy = OutboundWirePolicy {
             // The main config must not bind dials to an interface.
             interface: None,
-            // A chained hop never dials its server from here: only a
-            // direct-dial outbound resolves through the bootstrap.
+            // A chained hop never dials its server from here, and a standby
+            // stays unmarked: only an outbound this document dials resolves
+            // through the bootstrap.
             bootstrap: emission.bootstrap_reaches(profile),
         };
         out.push(profile_wire_outbound(profile, policy));

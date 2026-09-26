@@ -3,7 +3,7 @@
 //! How profiles point at each other is one graph, but every question over it
 //! used to be a private walk: the validation pass rebuilt the chain map to
 //! report a dangling hop or a cycle, the generator rebuilt the tag set to
-//! decide which profiles dial out directly (the bootstrap DNS scope), the
+//! decide which outbounds the document dials (the bootstrap DNS scope), the
 //! latency probe walked the chain transitively to stage the probes a profile
 //! needs, the delete dialog scanned rules, balancers and every other profile
 //! for references, and the chain-target picker listed the hops a profile may
@@ -12,8 +12,8 @@
 //!
 //! This module answers all of them from one graph built over the profile set
 //! and the outbound tags the generated document carries — so "is this hop a
-//! profile", "which outbound is direct-dial" and "who references this tag"
-//! have one definition each.
+//! profile", "which outbounds does the document dial" and "who references this
+//! tag" have one definition each.
 
 use super::ServerProfile;
 use super::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
@@ -48,24 +48,96 @@ impl<'a> DialGraph<'a> {
         self.profiles.iter().find(|profile| profile.tag() == tag)
     }
 
-    /// Whether this profile dials its server itself: no chain hop, or a hop
-    /// that names a built-in outbound rather than another profile (that hop's
-    /// server is reached on the far side of the built-in, not through a
-    /// profile the document carries).
-    pub fn dials_directly(&self, profile: &ServerProfile) -> bool {
-        match profile.chain_target() {
-            None => true,
-            Some(target) => self.profile(target).is_none(),
+    /// The far end of `profile`'s dial-through chain: the profile whose server
+    /// address this machine dials. A hop that names a builtin (`direct`,
+    /// `block`) or no profile at all ends the walk at the profile itself. The
+    /// walk is bounded by the profile count, so a cycle (which validation
+    /// refuses) cannot hang it.
+    fn terminal(&self, profile: &'a ServerProfile) -> &'a ServerProfile {
+        let mut current = profile;
+        for _ in 0..self.profiles.len() {
+            let Some(next) = current.chain_target().and_then(|tag| self.profile(tag)) else {
+                break;
+            };
+            current = next;
         }
+        current
     }
 
-    /// The outbound tags of every profile that dials out directly.
-    pub fn direct_dial_tags(&self) -> BTreeSet<String> {
-        self.profiles
-            .iter()
-            .filter(|profile| self.dials_directly(profile))
-            .map(ServerProfile::tag)
-            .collect()
+    /// The outbound tags the emitted document can dial: the chain terminals of
+    /// the default route (the list's first profile — Xray's default route is
+    /// the first outbound) and of every profile the settings reach — a routing
+    /// rule's target, a balancer's selector matches and its `fallbackTag`, and
+    /// the subjects of the emitted health engines. These are the only
+    /// outbounds whose server address this machine resolves before the tunnel
+    /// exists; a profile the document never dials (a standby the user has not
+    /// activated) stays unmarked until a commit makes it the default route or
+    /// a rule's target.
+    ///
+    /// Balancer selectors and observatory subject selectors match outbound
+    /// tags by prefix, the way the core resolves them
+    /// (`app/proxyman/outbound.Manager.Select`). A balancer that reads live
+    /// health data forces the observatory over every profile, which is why it
+    /// marks every terminal.
+    pub fn dialed_outbound_tags(&self, settings: &Settings) -> BTreeSet<String> {
+        let routing = &settings.routing;
+        let mut dialed = BTreeSet::new();
+        if let Some(default_route) = self.profiles.first() {
+            // Xray's default route is the first outbound, and the profile list
+            // keeps the active one first.
+            dialed.insert(self.terminal(default_route).tag());
+        }
+        for rule in &routing.rules {
+            for profile in self
+                .profiles
+                .iter()
+                .filter(|profile| profile.tag() == rule.outbound_tag)
+            {
+                dialed.insert(self.terminal(profile).tag());
+            }
+        }
+        for balancer in &routing.balancers {
+            for profile in self.profiles.iter().filter(|profile| {
+                balancer
+                    .selector
+                    .iter()
+                    .any(|pattern| profile.tag().starts_with(pattern))
+                    || profile.tag() == balancer.fallback_tag
+            }) {
+                dialed.insert(self.terminal(profile).tag());
+            }
+        }
+        // The emitted health engines probe their subjects, so those dials
+        // resolve like any other. The core starts every wired app, so a
+        // document carrying both engines dials both subject sets; the
+        // registration order (`infra/conf/xray.go` appends `observatory`
+        // before `burstObservatory`) decides only which one answers the status
+        // read. A dependency-forced observatory observes every profile, and a
+        // user-enabled one keeps its own subject selector, exactly as the
+        // generator emits them.
+        let forced_observatory = routing.observatory_emitted() && !routing.observatory.enabled;
+        let observatory_patterns: &[String] = if routing.observatory_emitted() {
+            &routing.observatory.subject_selector
+        } else {
+            &[]
+        };
+        let burst_patterns: &[String] = if routing.burst_observatory_emitted() {
+            &routing.burst_observatory.subject_selector
+        } else {
+            &[]
+        };
+        for profile in self.profiles.iter().filter(|profile| {
+            forced_observatory
+                || observatory_patterns
+                    .iter()
+                    .any(|pattern| profile.tag().starts_with(pattern))
+                || burst_patterns
+                    .iter()
+                    .any(|pattern| profile.tag().starts_with(pattern))
+        }) {
+            dialed.insert(self.terminal(profile).tag());
+        }
+        dialed
     }
 
     /// The profiles `tag` reaches through its chain, transitively and
@@ -231,9 +303,10 @@ mod tests {
 
     /// A profile with no hop, one with a hop to a profile, and one whose hop
     /// names the built-in `direct` are the three dial shapes: only the middle
-    /// one reaches its server through the chain.
+    /// one reaches its server through the chain, so the document dials the
+    /// hop's server rather than its own.
     #[test]
-    fn direct_dial_follows_the_profile_set_not_the_target_shape() {
+    fn dialed_terminals_follow_the_chain_not_the_target_shape() {
         let mut direct = profile("direct");
         chain(&mut direct, DIRECT_OUTBOUND_TAG);
         let mut chained = profile("chained");
@@ -243,13 +316,25 @@ mod tests {
         let profiles = vec![direct.clone(), chained.clone(), hop.clone(), plain.clone()];
         let tags = tags_of(&profiles);
         let graph = DialGraph::new(&profiles, &tags);
+        // The list's first profile is the default route; every other profile
+        // is a standby the settings never reference.
+        let settings = Settings::default();
 
-        assert!(graph.dials_directly(&direct), "a builtin hop is direct");
-        assert!(!graph.dials_directly(&chained), "a profile hop is not");
-        assert!(graph.dials_directly(&plain));
         assert_eq!(
-            graph.direct_dial_tags(),
-            BTreeSet::from([direct.tag(), hop.tag(), plain.tag()])
+            graph.terminal(&direct).tag(),
+            direct.tag(),
+            "a builtin hop leaves the outbound dialing its own server"
+        );
+        assert_eq!(
+            graph.terminal(&chained).tag(),
+            hop.tag(),
+            "a profile hop defers to the hop's own dial"
+        );
+        assert_eq!(graph.terminal(&plain).tag(), plain.tag());
+        assert_eq!(
+            graph.dialed_outbound_tags(&settings),
+            BTreeSet::from([direct.tag()]),
+            "only the default route is dialed"
         );
     }
 
