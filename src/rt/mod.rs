@@ -13,6 +13,7 @@ pub mod jobs;
 mod latency;
 mod policy;
 mod profiles;
+mod readiness;
 mod seat;
 mod state;
 pub mod supervisor;
@@ -22,12 +23,12 @@ use policy::{
     CANDIDATE_RETRY_DELAY, CoreExitFacts, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure,
     READY_TIMEOUT, READY_TIMEOUT_APPLIED, ReadinessTimeout, TUN_BIND_RACE_RETRIES,
     candidate_retry_budget, classify_core_exit, classify_pre_readiness_exit,
-    helper_state_arms_readiness, readiness_deadline_reached, readiness_timeout,
     readiness_timeout_verdict, spend_retry_attempt, update_retries_bind_race,
 };
 use state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
 
 use self::events::{AppLogSink, EventStream};
+use self::readiness::{Poll, Readiness};
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
@@ -898,6 +899,26 @@ fn ticker(period: Duration) -> tokio::time::Interval {
     tick
 }
 
+/// The reason a core ended before it was ready: `headline` carries the exit
+/// code (or `?` when the platform reported none), and the captured output
+/// fills the trailing slot — or the keyed "no core output" fragment does when
+/// nothing was captured, so the value renders in the display language like
+/// the frame around it.
+fn pre_readiness_reason(headline: Key, code: Option<i32>, captured: &str) -> Diag {
+    let reason = Diag::new(headline).arg(exit_code_text(code));
+    if captured.is_empty() {
+        reason.arg_message(Diag::new(Key::RtFrameNoCoreOutput))
+    } else {
+        reason.arg(captured)
+    }
+}
+
+/// An exit code as display text; a code the platform did not report reads `?`.
+fn exit_code_text(code: Option<i32>) -> String {
+    code.map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// Fire counts for the control-plane poll arms of [`Runtime::run`], owned by
 /// the runtime and shared with the module's phase-gating tests — those tests
 /// spawn `run`, which consumes the runtime, so the counts must outlive it.
@@ -995,12 +1016,10 @@ struct Runtime {
     /// Add attempts spent for `dns_in_listener`, capped through the shared
     /// [`spend_retry_attempt`] rule ([`DNS_IN_ADD_ATTEMPTS`]).
     dns_in_attempts: u8,
-    /// Readiness clock: `Some(deadline)` = armed, `None` = unarmed (TUN
-    /// staging or nothing started). Direct starts arm immediately after
-    /// `supervisor::spawn`; TUN starts arm only once the elevated helper
-    /// reports the xray child spawned, so helper staging and validation never
-    /// count against the deadline.
-    readiness_deadline: Option<Instant>,
+    /// The readiness clock of this start: armed after the child is
+    /// confirmed alive, disarmed while a TUN start is still staging in the
+    /// elevated helper.
+    readiness: Readiness,
 
     prev_traffic: HashMap<String, (u64, u64)>,
     /// Cumulative inbound (listener traffic) counters, one baseline per tag,
@@ -1104,7 +1123,7 @@ impl Runtime {
             pending_restart: None,
             dns_in_listener: None,
             dns_in_attempts: 0,
-            readiness_deadline: None,
+            readiness: Readiness::new(),
             prev_traffic: HashMap::new(),
             prev_inbound_traffic: HashMap::new(),
             // xorshift64* state must be non-zero.
@@ -2121,7 +2140,7 @@ impl Runtime {
                 // The TUN adapter is up; drop stale resolver answers cached
                 // before it existed.
                 self.flush_dns_cache();
-                self.defer_readiness_deadline();
+                self.readiness.defer();
                 self.emit_active_config();
                 self.set_phase(CorePhase::Starting);
                 self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
@@ -2556,7 +2575,10 @@ impl Runtime {
                     sink.core_line(line);
                 }));
                 self.backend.spawn_direct(Box::new(child));
-                self.arm_readiness_deadline();
+                self.readiness.arm(
+                    self.pending_transition.is_candidate_pending(),
+                    self.backend.is_tun_owned(),
+                );
                 self.emit_active_config();
                 self.set_phase(CorePhase::Starting);
                 self.app_log(Diag::new(Key::RtLogCoreStartedDirect).arg(pid));
@@ -2622,7 +2644,7 @@ impl Runtime {
                     // The TUN adapter is up; drop stale resolver answers
                     // cached before it existed.
                     self.flush_dns_cache();
-                    self.defer_readiness_deadline();
+                    self.readiness.defer();
                     self.emit_active_config();
                     self.set_phase(CorePhase::Starting);
                     self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
@@ -2688,30 +2710,6 @@ impl Runtime {
         self.app_log(Diag::new(Key::RtLogHelperLaunchWait));
     }
 
-    fn arm_readiness_deadline(&mut self) {
-        // The clock choice carries the TUN restart rule: a TUN start never
-        // takes the short applied-candidate clock, because its wintun adapter
-        // create legitimately waits out the previous session's teardown and
-        // killing a core stuck mid-create wedges PnP device creation for
-        // every wintun user.
-        self.readiness_deadline = Some(
-            Instant::now()
-                + readiness_timeout(
-                    self.pending_transition.is_candidate_pending(),
-                    self.backend.is_tun_owned(),
-                ),
-        );
-    }
-
-    /// A TUN start must not start the readiness clock at `pipe.start()` write
-    /// time: the elevated helper may still be staging, validating (up to
-    /// `CONFIG_TEST_TIMEOUT`) and copying payloads before the xray child
-    /// exists. Disarm the clock so `ready_poll` ignores any stale deadline
-    /// until the helper confirms the spawn.
-    fn defer_readiness_deadline(&mut self) {
-        self.readiness_deadline = None;
-    }
-
     /// The elevated helper reports `starting` immediately after the xray child
     /// was spawned and attached to its kill-on-close job. That is the spawn
     /// confirmation the readiness clock may start from; other states are
@@ -2722,9 +2720,11 @@ impl Runtime {
         if state == "starting" || state == "running" {
             self.backend.set_child_pid(pid);
         }
-        if helper_state_arms_readiness(state, self.readiness_deadline.is_some()) {
-            self.arm_readiness_deadline();
-        }
+        self.readiness.on_helper_state(
+            state,
+            self.pending_transition.is_candidate_pending(),
+            self.backend.is_tun_owned(),
+        );
     }
 
     /// Returns whether the graceful close succeeded (or was not applicable:
@@ -2976,28 +2976,11 @@ impl Runtime {
                 }
             }
             ExitBranch::CandidatePreReadiness => {
-                // An empty capture fills its slot with the keyed "no core
-                // output" fragment, so the value renders in the display
-                // language like the frame around it.
-                let no_output = tail.is_empty();
-                let captured = if no_output {
-                    String::new()
-                } else {
-                    tail.clone()
-                };
-                let reason = Diag::new(Key::RtFrameCandidateExited).arg(
-                    code.map(|value| value.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
-                );
-                let reason = if no_output {
-                    reason.arg_message(Diag::new(Key::RtFrameNoCoreOutput))
-                } else {
-                    reason.arg(&captured)
-                };
+                let reason = pre_readiness_reason(Key::RtFrameCandidateExited, code, &tail);
                 // Two transient TUN signatures earn an automatic retry (the
                 // dns-in bind race and the adapter teardown window of a fresh
                 // apply); the budget rule lives in `policy`.
-                let failure = classify_pre_readiness_exit(was_tun, &captured);
+                let failure = classify_pre_readiness_exit(was_tun, &tail);
                 let budget = candidate_retry_budget(failure);
                 if let Some(attempt) = spend_retry_attempt(&mut self.candidate_boot_retries, budget)
                 {
@@ -3015,22 +2998,8 @@ impl Runtime {
                 }
             }
             ExitBranch::UpdatePreReadiness => {
-                let no_output = tail.is_empty();
-                let captured = if no_output {
-                    String::new()
-                } else {
-                    tail.clone()
-                };
-                let reason = Diag::new(Key::RtFrameUpdatedCoreExited).arg(
-                    code.map(|value| value.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
-                );
-                let reason = if no_output {
-                    reason.arg_message(Diag::new(Key::RtFrameNoCoreOutput))
-                } else {
-                    reason.arg(&captured)
-                };
-                if update_retries_bind_race(was_tun, &captured)
+                let reason = pre_readiness_reason(Key::RtFrameUpdatedCoreExited, code, &tail);
+                if update_retries_bind_race(was_tun, &tail)
                     && let Some(attempt) = self.core_update.spend_bind_race_retry()
                 {
                     self.app_log(
@@ -3076,10 +3045,7 @@ impl Runtime {
                 let (attempt, delay_ms) = self.backoff.next(Instant::now(), jitter_ms);
                 self.app_log(
                     Diag::new(Key::RtLogCoreExitBackoff)
-                        .arg(
-                            code.map(|value| value.to_string())
-                                .unwrap_or_else(|| "?".to_string()),
-                        )
+                        .arg(exit_code_text(code))
                         .arg(attempt + 1)
                         .arg(delay_ms),
                 );
@@ -3188,43 +3154,44 @@ impl Runtime {
         if !self.backend.is_alive() || self.exit_policy.stopping() {
             return;
         }
-        let Some(deadline) = self.readiness_deadline else {
-            return;
-        };
-        if readiness_deadline_reached(deadline, Instant::now()) {
-            match readiness_timeout_verdict(
-                self.pending_transition.is_candidate_pending(),
-                self.core_update.is_candidate_pending(),
-                self.core_update.rollback_pending().is_some(),
-            ) {
-                ReadinessTimeout::AppliedCandidate => {
-                    let _ = self.pending_transition.arm_rollback(
-                        Diag::new(Key::RtFrameCandidateReadyTimeout)
-                            .arg(READY_TIMEOUT_APPLIED.as_secs()),
-                    );
-                    self.exit_policy.begin_stop(Instant::now());
-                    self.kill_backend().await;
-                }
-                ReadinessTimeout::UpdatedCore => {
-                    // The last readiness miss is its own keyed sentence,
-                    // nested so it renders in the same language.
-                    let reason = match self.core_update.last_readiness_error() {
-                        Some(miss) => Diag::new(Key::RtFrameUpdatedCoreReadyTimeoutApi)
-                            .arg(READY_TIMEOUT.as_secs())
-                            .arg_message(miss.clone()),
-                        None => Diag::new(Key::RtFrameUpdatedCoreReadyTimeout)
-                            .arg(READY_TIMEOUT.as_secs()),
-                    };
-                    if self.core_update.arm_rollback(reason) {
+        match self.readiness.poll(Instant::now()) {
+            Poll::Unarmed => return,
+            Poll::Pending => {}
+            Poll::Fired => {
+                match readiness_timeout_verdict(
+                    self.pending_transition.is_candidate_pending(),
+                    self.core_update.is_candidate_pending(),
+                    self.core_update.rollback_pending().is_some(),
+                ) {
+                    ReadinessTimeout::AppliedCandidate => {
+                        let _ = self.pending_transition.arm_rollback(
+                            Diag::new(Key::RtFrameCandidateReadyTimeout)
+                                .arg(READY_TIMEOUT_APPLIED.as_secs()),
+                        );
                         self.exit_policy.begin_stop(Instant::now());
                         self.kill_backend().await;
-                    } else {
-                        self.silence_readiness_timeout().await;
                     }
+                    ReadinessTimeout::UpdatedCore => {
+                        // The last readiness miss is its own keyed sentence,
+                        // nested so it renders in the same language.
+                        let reason = match self.core_update.last_readiness_error() {
+                            Some(miss) => Diag::new(Key::RtFrameUpdatedCoreReadyTimeoutApi)
+                                .arg(READY_TIMEOUT.as_secs())
+                                .arg_message(miss.clone()),
+                            None => Diag::new(Key::RtFrameUpdatedCoreReadyTimeout)
+                                .arg(READY_TIMEOUT.as_secs()),
+                        };
+                        if self.core_update.arm_rollback(reason) {
+                            self.exit_policy.begin_stop(Instant::now());
+                            self.kill_backend().await;
+                        } else {
+                            self.silence_readiness_timeout().await;
+                        }
+                    }
+                    ReadinessTimeout::Unclaimed => self.silence_readiness_timeout().await,
                 }
-                ReadinessTimeout::Unclaimed => self.silence_readiness_timeout().await,
+                return;
             }
-            return;
         }
         match self.grpc.get_sys_stats().await {
             Ok(_) => {
@@ -3289,19 +3256,15 @@ impl Runtime {
         ));
     }
 
-    /// Trust the readiness probe only when the loopback listener on
-    /// the active API port is owned by the spawned core child. A same-user
-    /// process could answer `get_sys_stats` on an enumerated port; only the
-    /// verified responder may clear the rollback gate or ACK the core-update
-    /// backup. Mismatch or unverifiable → `false` (never trust).
+    /// Whether the loopback listener on the active API port is owned by the
+    /// spawned core child. A same-user process could answer `get_sys_stats`
+    /// on an enumerated port; only the verified responder may clear the
+    /// rollback gate or ACK the core-update backup. Mismatch or
+    /// unverifiable → `false` (never trust).
     fn api_listener_owned_by_child(&self) -> bool {
-        let Some(pid) = self.backend.child_pid() else {
-            return false;
-        };
-        let Some(rows) = crate::sys::net_table::tcp_table() else {
-            return false;
-        };
-        crate::sys::net_table::loopback_api_listener_owned_by(&rows, self.api_port, pid)
+        self.backend
+            .child_pid()
+            .is_some_and(|pid| readiness::api_listener_owned_by(self.api_port, pid))
     }
 
     /// Success branch of the readiness probe, gated on the owning-PID verdict.
@@ -4365,9 +4328,9 @@ mod tests {
         // `pipe.start()` has been accepted, but the elevated helper is still
         // staging/validating (up to CONFIG_TEST_TIMEOUT plus the payload copy)
         // — the xray child does not exist yet, so no deadline may be armed.
-        runtime.defer_readiness_deadline();
+        runtime.readiness.defer();
         assert!(
-            runtime.readiness_deadline.is_none(),
+            !runtime.readiness.armed(),
             "TUN staging must not arm the readiness clock before spawn confirmation"
         );
 
@@ -4375,9 +4338,10 @@ mod tests {
         // earlier than the confirmation instant.
         let confirmation = Instant::now();
         runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness_deadline.is_some());
+        assert!(runtime.readiness.armed());
         let ahead = runtime
-            .readiness_deadline
+            .readiness
+            .deadline()
             .expect("armed deadline")
             .saturating_duration_since(confirmation);
         assert!(
@@ -4393,9 +4357,9 @@ mod tests {
         );
 
         // A later informational state must not re-arm (or extend) the clock.
-        let armed = runtime.readiness_deadline;
+        let armed = runtime.readiness.deadline();
         runtime.on_helper_state("running", 4242);
-        assert_eq!(runtime.readiness_deadline, armed);
+        assert_eq!(runtime.readiness.deadline(), armed);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4404,12 +4368,13 @@ mod tests {
         runtime.requested_tun_mode = true;
         runtime.backend = BackendState::for_test(true, false);
 
-        runtime.defer_readiness_deadline();
+        runtime.readiness.defer();
         let confirmation = Instant::now();
         runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness_deadline.is_some());
+        assert!(runtime.readiness.armed());
         let ahead = runtime
-            .readiness_deadline
+            .readiness
+            .deadline()
             .expect("armed deadline")
             .saturating_duration_since(confirmation);
         assert!(
@@ -4425,7 +4390,7 @@ mod tests {
         runtime.pending_transition.commit_candidate();
         runtime.requested_tun_mode = true;
         runtime.backend = BackendState::for_test(true, false);
-        runtime.defer_readiness_deadline();
+        runtime.readiness.defer();
 
         // While the readiness clock is unarmed (helper still staging), ready_poll
         // must no-op: no rollback, the candidate stays pending, no stop begun.
@@ -4444,8 +4409,10 @@ mod tests {
         // The helper finally confirms the spawn: the clock starts now, and a
         // genuine post-confirmation timeout still queues exactly one rollback.
         runtime.on_helper_state("starting", 4242);
-        assert!(runtime.readiness_deadline.is_some());
-        runtime.readiness_deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert!(runtime.readiness.armed());
+        runtime
+            .readiness
+            .arm_at(Instant::now() - Duration::from_millis(1));
         runtime.ready_poll().await;
         assert!(
             runtime.pending_transition.rollback_pending().is_some(),
@@ -4461,10 +4428,14 @@ mod tests {
         runtime.pending_transition.commit_candidate();
         // The direct path arms right after `supervisor::spawn` succeeds; the
         // clock must be live immediately, before any ready poll.
-        runtime.arm_readiness_deadline();
-        assert!(runtime.readiness_deadline.is_some());
+        runtime.readiness.arm(
+            runtime.pending_transition.is_candidate_pending(),
+            runtime.backend.is_tun_owned(),
+        );
+        assert!(runtime.readiness.armed());
         let remaining = runtime
-            .readiness_deadline
+            .readiness
+            .deadline()
             .expect("armed deadline")
             .saturating_duration_since(Instant::now());
         assert!(
@@ -6327,7 +6298,9 @@ mod tests {
         let (mut runtime, events) = runtime_with_events();
         runtime.backend = BackendState::for_test(true, false);
         runtime.phase = super::CorePhase::Starting;
-        runtime.readiness_deadline = Some(Instant::now() - Duration::from_millis(1));
+        runtime
+            .readiness
+            .arm_at(Instant::now() - Duration::from_millis(1));
 
         runtime.ready_poll().await;
 
