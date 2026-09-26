@@ -2803,12 +2803,12 @@ mod tests {
     /// parse → export → reparse must be stable, and the canonical form must
     /// be a fixpoint.
     fn round_trip(s: &str) -> (ServerProfile, String) {
-        let p1 = parse_link(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
-        let s2 = to_link(&p1).unwrap_or_else(|e| panic!("export {s:?}: {e}"));
-        let p2 = parse_link(&s2).unwrap_or_else(|e| panic!("reparse {s2:?}: {e}"));
+        let p1 = parse_link(s).unwrap_or_else(|e| panic!("parse {}: {e}", redact(s)));
+        let s2 = to_link(&p1).unwrap_or_else(|e| panic!("export {}: {e}", redact(s)));
+        let p2 = parse_link(&s2).unwrap_or_else(|e| panic!("reparse {}: {e}", redact(&s2)));
         assert_profile_eq(&p1, &p2);
         let s3 = to_link(&p2).unwrap();
-        assert_eq!(s2, s3, "canonical form not stable for {s:?}");
+        assert_eq!(s2, s3, "canonical form not stable for {}", redact(s));
         (p2, s3)
     }
 
@@ -3025,7 +3025,10 @@ mod tests {
                     "message must name masterKeyLog: {message:?}"
                 );
             }
-            other => panic!("expected Malformed for nested TLS masterKeyLog, got {other:?}"),
+            other => panic!(
+                "expected Malformed for nested TLS masterKeyLog, got {}",
+                outcome_shape(&other)
+            ),
         }
 
         // Reality variant of the same attack.
@@ -3043,7 +3046,10 @@ mod tests {
                     "message must name masterKeyLog: {message:?}"
                 );
             }
-            other => panic!("expected Malformed for nested REALITY masterKeyLog, got {other:?}"),
+            other => panic!(
+                "expected Malformed for nested REALITY masterKeyLog, got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3097,7 +3103,10 @@ mod tests {
                     "message must name allowInsecure: {message:?}"
                 );
             }
-            other => panic!("expected Malformed for nested TLS allowInsecure, got {other:?}"),
+            other => panic!(
+                "expected Malformed for nested TLS allowInsecure, got {}",
+                outcome_shape(&other)
+            ),
         }
 
         // `allowInsecure: false` is the Go zero value — Xray runs it fine, so
@@ -3154,7 +3163,10 @@ mod tests {
                     "{message:?}"
                 );
             }
-            other => panic!("expected malformed xhttp extra, got {other:?}"),
+            other => panic!(
+                "expected malformed xhttp extra, got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3182,7 +3194,10 @@ mod tests {
                     "{message:?}"
                 );
             }
-            other => panic!("expected malformed vmess JSON, got {other:?}"),
+            other => panic!(
+                "expected malformed vmess JSON, got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3215,7 +3230,10 @@ mod tests {
                     "must not echo the name into the error: {message:?}"
                 );
             }
-            other => panic!("expected over-long ps rejection, got {other:?}"),
+            other => panic!(
+                "expected over-long ps rejection, got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3265,7 +3283,10 @@ mod tests {
                 assert!(message.contains("finalmask.udp[0]"), "{message:?}");
                 assert!(message.contains("future-udp"), "{message:?}");
             }
-            other => panic!("expected unknown finalmask rejection, got {other:?}"),
+            other => panic!(
+                "expected unknown finalmask rejection, got {}",
+                outcome_shape(&other)
+            ),
         }
 
         let invalid =
@@ -3278,7 +3299,10 @@ mod tests {
                 assert!(message.contains("finalmask.tcp[0]"), "{message:?}");
                 assert!(message.contains("packet number cannot be 0"), "{message:?}");
             }
-            other => panic!("expected invalid finalmask rejection, got {other:?}"),
+            other => panic!(
+                "expected invalid finalmask rejection, got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3309,9 +3333,13 @@ mod tests {
             match parse_link(&link) {
                 Err(LinkError::InvalidModel { issue, .. }) => {
                     let message = validation_issue_message(&issue, Language::En);
-                    assert_eq!(message, expected, "{link:?}");
+                    assert_eq!(message, expected, "{}", redact(&link));
                 }
-                other => panic!("expected public plaintext rejection for {link:?}, got {other:?}"),
+                other => panic!(
+                    "expected public plaintext rejection for {}, got {}",
+                    redact(&link),
+                    outcome_shape(&other)
+                ),
             }
         }
     }
@@ -3504,7 +3532,7 @@ mod tests {
         }));
         match parse_link(&link) {
             Err(LinkError::Unsupported(m)) => assert!(m.text(Language::En).contains("alterId")),
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected Unsupported, got {}", outcome_shape(&other)),
         }
     }
 
@@ -3519,7 +3547,7 @@ mod tests {
                 let message = message.text(Language::En);
                 assert!(message.contains("packetEncoding"));
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected Unsupported, got {}", outcome_shape(&other)),
         }
     }
 
@@ -3886,12 +3914,12 @@ mod tests {
                 let msg = msg.text(Language::En);
                 assert!(msg.contains("profile name exceeds"));
             }
-            other => panic!("expected Malformed, got {other:?}"),
+            other => panic!("expected Malformed, got {}", outcome_shape(&other)),
         }
         let ui = URL_SAFE_NO_PAD.encode("aes-128-gcm:pw");
         match parse_link(&format!("ss://{ui}@long2.example.com:8388#{long}")) {
             Err(LinkError::Malformed(_)) => {}
-            other => panic!("expected Malformed, got {other:?}"),
+            other => panic!("expected Malformed, got {}", outcome_shape(&other)),
         }
         // Exactly at the cap is still accepted.
         let ok = "y".repeat(MAX_PROFILE_NAME_LEN);
@@ -3928,14 +3956,22 @@ mod tests {
     fn expect_malformed(s: &str) {
         match parse_link(s) {
             Err(LinkError::Malformed(_)) => {}
-            other => panic!("expected Malformed for {s:?}, got {other:?}"),
+            other => panic!(
+                "expected Malformed for {}, got {}",
+                redact(s),
+                outcome_shape(&other)
+            ),
         }
     }
 
     fn expect_unsupported(s: &str) {
         match parse_link(s) {
             Err(LinkError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported for {s:?}, got {other:?}"),
+            other => panic!(
+                "expected Unsupported for {}, got {}",
+                redact(s),
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3948,7 +3984,11 @@ mod tests {
                     "{message:?} did not name {field:?}"
                 );
             }
-            other => panic!("expected Lossy({field}) for {profile:?}, got {other:?}"),
+            other => panic!(
+                "expected Lossy({field}) for {}, got {}",
+                profile.name,
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3963,7 +4003,10 @@ mod tests {
                     t_fmt(Language::En, key, &[&field])
                 );
             }
-            other => panic!("expected Lossy({key:?}, {field:?}), got {other:?}"),
+            other => panic!(
+                "expected Lossy({key:?}, {field:?}), got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -3972,8 +4015,75 @@ mod tests {
     fn expect_invalid_model(s: &str, code: crate::model::validation::ValidationCode) {
         match parse_link(s) {
             Err(LinkError::InvalidModel { issue, .. }) if issue.code == code => {}
-            other => panic!("expected InvalidModel({code:?}) for {s:?}, got {other:?}"),
+            other => panic!(
+                "expected InvalidModel({code:?}) for {}, got {}",
+                redact(s),
+                outcome_shape(&other)
+            ),
         }
+    }
+
+    /// A link with its credential elided: for the URL-shaped engines
+    /// everything between the scheme and the first `@` is the account's id or
+    /// password, and for the base64-shaped ones the whole body is, so a
+    /// diagnostic names the scheme and host without the secret it carries.
+    fn redact(link: &str) -> String {
+        let Some((scheme, rest)) = link.split_once("://") else {
+            return "<link>".to_owned();
+        };
+        match rest.split_once('@') {
+            Some((_, host)) => format!("{scheme}://<id>@{host}"),
+            None => format!("{scheme}://<body>"),
+        }
+    }
+
+    /// The failure's shape without its payload: a `Diag`'s args can quote the
+    /// link text, so a panic message names the variant and its key instead of
+    /// dumping a value that may carry the credential.
+    /// The same shape for a parse outcome: a test that matched the error's
+    /// variant by pattern still holds the whole `Result`, and its message must
+    /// name what came back without dumping a profile or a link either.
+    fn outcome_shape<T>(outcome: &Result<T, LinkError>) -> String {
+        match outcome {
+            Ok(_) => "Ok(_)".to_owned(),
+            Err(error) => error_shape(error),
+        }
+    }
+
+    fn error_shape(error: &LinkError) -> String {
+        match error {
+            LinkError::Unsupported(message) => format!("Unsupported({:?})", message.key()),
+            LinkError::Malformed(message) => format!("Malformed({:?})", message.key()),
+            LinkError::Lossy(message) => format!("Lossy({:?})", message.key()),
+            LinkError::InvalidModel { issue, .. } => format!("InvalidModel({:?})", issue.code),
+        }
+    }
+
+    #[test]
+    fn diagnostics_never_echo_the_credential() {
+        // A panic message is a CI log line: the account's id must not travel
+        // into it, and the reader still needs to know which link and which
+        // failure the case reached.
+        assert_eq!(
+            redact("vless://7f0a9c4e-0000-0000-0000-000000000000@h.example.com:443?type=ws"),
+            "vless://<id>@h.example.com:443?type=ws"
+        );
+        assert_eq!(redact("vmess://eyJ2IjoiMiJ9"), "vmess://<body>");
+        assert_eq!(redact("no scheme here"), "<link>");
+        assert_eq!(
+            outcome_shape(&parse_link(
+                "vless://7f0a9c4e-0000-0000-0000-000000000000@h.example.com:443?security=tls"
+            )),
+            "Ok(_)"
+        );
+        let malformed =
+            parse_link("vless://7f0a9c4e-0000-0000-0000-000000000000@h.example.com").unwrap_err();
+        let shape = error_shape(&malformed);
+        assert!(shape.starts_with("Malformed("), "{shape}");
+        assert!(
+            !shape.contains("7f0a9c4e"),
+            "the shape must not carry the payload: {shape}"
+        );
     }
 
     #[test]
@@ -4100,7 +4210,10 @@ mod tests {
                 let message = validation_issue_message(&issue, Language::En);
                 assert!(message.contains("TLS or REALITY"), "{message:?}");
             }
-            other => panic!("expected Vision security rejection, got {other:?}"),
+            other => panic!(
+                "expected Vision security rejection, got {}",
+                outcome_shape(&other)
+            ),
         }
 
         let tls = format!(
@@ -4386,7 +4499,7 @@ mod tests {
         let link = to_link(&profile).expect("inactive WebSocket draft is not wire state");
         assert!(link.contains("type=grpc"));
         assert!(link.contains("serviceName=active-svc"));
-        assert!(!link.contains("stale"), "{link:?}");
+        assert!(!link.contains("stale"), "{}", redact(&link));
         assert!(
             profile.outbound.stream.ws_settings.is_some(),
             "export must canonicalize a clone, not destroy the editor draft"
@@ -4414,7 +4527,7 @@ mod tests {
                 .unwrap();
 
         let link = to_link(&profile).expect("inactive REALITY draft is not wire state");
-        assert!(!link.contains("inactive-reality"), "{link:?}");
+        assert!(!link.contains("inactive-reality"), "{}", redact(&link));
 
         let reparsed = parse_link(&link).unwrap();
         assert_eq!(reparsed.outbound.stream.security, Security::Tls);
@@ -4499,7 +4612,7 @@ mod tests {
         let p = ServerProfile::new("x", OutboundModel::new(Protocol::Wireguard));
         match to_link(&p) {
             Err(LinkError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected Unsupported, got {}", outcome_shape(&other)),
         }
     }
 
@@ -4522,7 +4635,10 @@ mod tests {
                 message.text(Language::En),
                 t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[])
             ),
-            other => panic!("expected Unsupported(Hysteria), got {other:?}"),
+            other => panic!(
+                "expected Unsupported(Hysteria), got {}",
+                outcome_shape(&other)
+            ),
         }
     }
 
@@ -4647,7 +4763,7 @@ mod tests {
                     "error must not echo the raw input: {message:?}"
                 );
             }
-            other => panic!("expected too-long rejection, got {other:?}"),
+            other => panic!("expected too-long rejection, got {}", outcome_shape(&other)),
         }
     }
 
@@ -4671,7 +4787,7 @@ mod tests {
                 );
                 assert!(!message.contains(&long), "error must not echo the line");
             }
-            other => panic!("expected too-long rejection, got {other:?}"),
+            other => panic!("expected too-long rejection, got {}", outcome_shape(other)),
         }
         assert!(parsed[2].is_ok(), "short line after the long one");
     }
@@ -4690,7 +4806,7 @@ mod tests {
                 );
                 assert!(!message.contains(&text), "error must not echo the blob");
             }
-            other => panic!("expected too-large rejection, got {other:?}"),
+            other => panic!("expected too-large rejection, got {}", outcome_shape(other)),
         }
     }
 
@@ -4859,7 +4975,7 @@ mod tests {
                     )
                 );
             }
-            other => panic!("expected bounded Malformed, got {other:?}"),
+            other => panic!("expected bounded Malformed, got {}", outcome_shape(&other)),
         }
 
         // Invalid port-list text item — the Debug-quoted embed path.
@@ -4884,7 +5000,7 @@ mod tests {
                     )
                 );
             }
-            other => panic!("expected bounded Malformed, got {other:?}"),
+            other => panic!("expected bounded Malformed, got {}", outcome_shape(&other)),
         }
     }
 

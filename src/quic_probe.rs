@@ -529,7 +529,14 @@ mod tests {
         let transcript = render_capture("n.example.com", 443, "n.example.com", &chain);
         assert!(
             transcript.contains(&format!("Cert's CA <#1> SHA256:\t{pin}\n")),
-            "{transcript}"
+            // The labels alone: a transcript row carries a certificate hash,
+            // and the capture that reaches this code in the field is a real
+            // server's chain.
+            "the capture must carry the CA pin row; labels rendered: {:?}",
+            transcript
+                .lines()
+                .map(|line| line.split('\t').next().unwrap_or_default())
+                .collect::<Vec<_>>()
         );
     }
 
