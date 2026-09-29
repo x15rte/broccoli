@@ -269,11 +269,13 @@ impl FakeDnsCfg {
                      an i64, and a string-keyed Value map only",
             ));
         }
-        Some(if pools.len() == 1 {
-            pools.pop().unwrap()
-        } else {
-            Value::Array(pools)
-        })
+        // A single pool collapses to the bare pool object; the array form is
+        // used for any other length. `try_from` moves the element out without
+        // an index or pop that would need a length check to stay total.
+        match <[Value; 1]>::try_from(pools) {
+            Ok([only]) => Some(only),
+            Err(pools) => Some(Value::Array(pools)),
+        }
     }
 }
 

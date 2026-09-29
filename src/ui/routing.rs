@@ -5220,7 +5220,7 @@ mod balancer_runtime_consume_tests {
             edge.feedback,
             Some((
                 true,
-                t_fmt(Language::En, Key::RoutingOverrideApplied, &[&"direct"]).to_string()
+                t_fmt(Language::En, Key::RoutingOverrideApplied, &[&"direct"])
             ))
         );
     }

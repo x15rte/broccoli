@@ -65,6 +65,10 @@ fn may_foreground(window_pid: u32, holder_pid: u32) -> bool {
 /// `OpenProcess` must open that PID, and `GetProcessId` on the returned
 /// handle must re-derive the same PID. `None` fails the verification closed.
 fn verified_window_pid(hwnd: HWND) -> Option<u32> {
+    // SAFETY: the block only wraps the Win32 verification sequence below, whose
+    // calls each carry their own SAFETY comment; it adds no requirement of its
+    // own — the caller passes a valid window handle, and the handle this block
+    // opens is closed here exactly once on every path.
     unsafe {
         let mut pid = 0u32;
         // SAFETY: `hwnd` is the valid HWND returned by `FindWindowW` (checked

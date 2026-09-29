@@ -944,10 +944,11 @@ fn assert_user_only_dacl(dir: &std::path::Path) {
         "{} DACL must be present and protected from inheritance",
         dir.display()
     );
-    // SAFETY: `dacl` is the valid, non-null DACL returned by `read_dacl`
-    // (checked above); its header (AceCount at offset 2) is initialized
-    // because the descriptor was fully loaded.
     assert_eq!(
+        // SAFETY: `dacl` is the valid, non-null DACL returned by `read_dacl`
+        // (checked above); its header (AceCount at offset 2) is initialized
+        // because the descriptor was fully loaded. The storage is `read_dacl`'s
+        // word buffer, so the descriptor base is 8-byte aligned.
         unsafe { (*dacl).AceCount },
         1,
         "{} DACL must grant exactly one principal",
@@ -979,10 +980,10 @@ fn assert_user_only_dacl(dir: &std::path::Path) {
     let user_sid = current_user_sid();
     let user_sid = user_sid.psid();
     let sid = PSID((std::ptr::addr_of!(ace.SidStart) as *mut u32).cast::<core::ffi::c_void>());
-    // SAFETY: `sid` points at the embedded SID in the live DACL buffer (its
-    // length fits the ACE's `AceSize`); `user_sid` is the SID owned by the
-    // `current_user_sid` value bound above. EqualSid only reads both.
     assert!(
+        // SAFETY: `sid` points at the embedded SID in the live DACL buffer (its
+        // length fits the ACE's `AceSize`); `user_sid` is the SID owned by the
+        // `current_user_sid` value bound above. EqualSid only reads both.
         unsafe { EqualSid(sid, user_sid) }.is_ok(),
         "{} DACL must grant access only to the current user",
         dir.display()
@@ -1037,11 +1038,13 @@ fn assert_state_file_user_only(path: &std::path::Path) {
         let sid = PSID((std::ptr::addr_of!(ace.SidStart) as *mut u32).cast::<core::ffi::c_void>());
         // SAFETY: `sid` is the embedded SID in the live DACL buffer (its
         // length fits the ACE's `AceSize`); `world` is the well-known Everyone
-        // SID built above; `user_sid` is the current user SID. EqualSid only
-        // reads both.
+        // SID built above. EqualSid only reads both.
         if unsafe { EqualSid(sid, world) }.is_ok() {
             panic!("state file {} grants Everyone access", path.display());
         }
+        // SAFETY: `sid` is still the embedded SID in the live DACL buffer and
+        // `user_sid` is the current user SID bound above; EqualSid only reads
+        // both.
         if unsafe { EqualSid(sid, user_sid) }.is_ok() && ace.Mask == FILE_ALL_ACCESS.0 {
             saw_user_full = true;
         }

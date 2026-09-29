@@ -169,7 +169,7 @@ mod tests {
         });
         assert_eq!(listener_for_config(&tun), None, "no module, no listener");
 
-        let mut null_module = tun.clone();
+        let mut null_module = tun;
         null_module["dns"] = Value::Null;
         assert_eq!(
             listener_for_config(&null_module),

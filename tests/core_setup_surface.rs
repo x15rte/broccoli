@@ -44,12 +44,13 @@ fn boot(
                 return;
             }
             let core = root.join("broccoli").join("core");
-            std::fs::create_dir_all(&core).unwrap();
+            std::fs::create_dir_all(&core).expect("create the stale core tree");
             // Every field of the release metadata must be present for it to parse;
             // the version is what makes this tree a stale install, and the pin
             // compares fail on the metadata before any payload is hashed.
             for payload in ["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"] {
-                std::fs::write(core.join(payload), b"another build's payload").unwrap();
+                std::fs::write(core.join(payload), b"another build's payload")
+                    .expect("write a stale core payload");
             }
             let metadata = serde_json::json!({
                 "schema": 0,
@@ -61,11 +62,10 @@ fn boot(
                 "geosite_sha256": "0".repeat(64),
                 "version": STALE_VERSION,
             });
-            std::fs::write(
-                core.join(RELEASE_METADATA),
-                serde_json::to_vec(&metadata).unwrap(),
-            )
-            .unwrap();
+            let encoded =
+                serde_json::to_vec(&metadata).expect("serialize the stale release metadata");
+            std::fs::write(core.join(RELEASE_METADATA), encoded)
+                .expect("write the stale release metadata");
         },
         None,
     );

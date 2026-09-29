@@ -8253,7 +8253,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
-        rig.servers.profiles.push(osaka.clone());
+        rig.servers.profiles.push(osaka);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness
             .get_all_by_label("⚡")
@@ -10852,7 +10852,7 @@ Authentication: ML-KEM-768, Post-Quantum
             extra: Default::default(),
         });
         rig.servers.profiles.push(tokyo.clone());
-        rig.servers.active = Some(tokyo.id.clone());
+        rig.servers.active = Some(tokyo.id);
         let mut harness = wide_servers_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -11012,7 +11012,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let state = harness.state();
         assert_eq!(
             state.0.leave_pending,
-            Some(LeaveAction::Select(osaka.id.clone())),
+            Some(LeaveAction::Select(osaka.id)),
             "a selection switch with unsaved changes must stage the leave modal"
         );
         assert_eq!(
@@ -11060,7 +11060,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        rig.servers.active = Some(tokyo.id.clone());
+        rig.servers.active = Some(tokyo.id);
         let mut harness = unsaved_harness(rig);
         harness.run();
         edit_existing_draft(&mut harness.state_mut().0);
@@ -11104,13 +11104,13 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        screen.selected = Some(tokyo.id.clone());
+        screen.selected = Some(tokyo.id);
         // Only the add draft is dirty: the add window is a plain window, so
         // the list stays clickable behind it — a row click staged a Select
         // while the modal's Save must target the add draft.
         let added = ServerProfile::new("Added", OutboundModel::new(Protocol::Vless));
         screen.add_draft = Some(rendered_add_draft(&added, true));
-        screen.leave_pending = Some(LeaveAction::Select(osaka.id.clone()));
+        screen.leave_pending = Some(LeaveAction::Select(osaka.id));
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
         screen.profile_validation_origin = Some(ProfileValidationOrigin::Draft);
@@ -11316,7 +11316,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 text: "{".into(),
                 error: Some("unterminated".into()),
                 dirty: true,
-                profile: tokyo.id.clone(),
+                profile: tokyo.id,
             },
         );
         assert!(
@@ -11353,7 +11353,7 @@ Authentication: ML-KEM-768, Post-Quantum
             rejected: vec![("Tokyo".into(), "xray said no".into())],
             import_source: None,
             draft_target: Some(ToolTarget::ExistingDraft {
-                profile_id: tokyo.id.clone(),
+                profile_id: tokyo.id,
                 generation: 7,
             }),
         }))
@@ -11398,11 +11398,11 @@ Authentication: ML-KEM-768, Post-Quantum
         screen.profile_validation_origin = Some(ProfileValidationOrigin::Draft);
         tx.send(Ok(ProfileValidationResult {
             origin: ProfileValidationOrigin::Draft,
-            accepted: vec![edited.clone()],
+            accepted: vec![edited],
             rejected: Vec::new(),
             import_source: None,
             draft_target: Some(ToolTarget::ExistingDraft {
-                profile_id: tokyo.id.clone(),
+                profile_id: tokyo.id,
                 generation: 3,
             }),
         }))
@@ -11621,7 +11621,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.state_mut().0.seeded_buffers.clear();
 
         // The edit plus a blocking finding: Discard stays, Save goes dark.
-        let mut blocked = edited.clone();
+        let mut blocked = edited;
         blocked.outbound.stream.finalmask = Some(bad_finalmask_model());
         install(
             &mut harness.state_mut().0,
@@ -11762,7 +11762,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut rig = UiTestRig::default();
         let tokyo = profile_with_bad_finalmask();
         rig.servers.profiles.push(tokyo.clone());
-        rig.servers.active = Some(tokyo.id.clone());
+        rig.servers.active = Some(tokyo.id);
         let mut harness = unsaved_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -12024,7 +12024,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Osaka",
             OutboundModel::new(Protocol::Freedom),
         ));
-        rig.servers.active = Some(tokyo.id.clone());
+        rig.servers.active = Some(tokyo.id);
         let mut harness = unsaved_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -12113,7 +12113,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "beta",
             OutboundModel::new(Protocol::Freedom),
         ));
-        rig.servers.active = Some(alpha.id.clone());
+        rig.servers.active = Some(alpha.id);
         let mut harness = unsaved_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -12318,7 +12318,7 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(profile.clone());
-        rig.servers.active = Some(profile.id.clone());
+        rig.servers.active = Some(profile.id);
         rig
     }
 
@@ -12576,7 +12576,7 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(profile.clone());
-        rig.servers.active = Some(profile.id.clone());
+        rig.servers.active = Some(profile.id);
         let mut harness = wide_servers_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -12698,7 +12698,7 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(profile.clone());
-        rig.servers.active = Some(profile.id.clone());
+        rig.servers.active = Some(profile.id);
         let mut harness = wide_servers_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -12806,7 +12806,7 @@ Authentication: ML-KEM-768, Post-Quantum
             extra: Default::default(),
         });
         rig.servers.profiles.push(tokyo.clone());
-        rig.servers.active = Some(tokyo.id.clone());
+        rig.servers.active = Some(tokyo.id);
         let mut harness = wide_servers_harness(rig);
         harness.run();
         harness.get_by_label("Advanced").click();
@@ -13144,7 +13144,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(profile.clone());
-        rig.servers.active = Some(profile.id.clone());
+        rig.servers.active = Some(profile.id);
         rig
     }
 

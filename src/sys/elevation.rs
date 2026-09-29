@@ -137,6 +137,10 @@ const PROGRAM_DATA_FALLBACK: &str = r"C:\ProgramData";
 /// elevated helper (which may run under a different admin account) resolve
 /// the same directory.
 fn program_data() -> PathBuf {
+    // SAFETY: `FOLDERID_ProgramData` is a static known-folder id and
+    // `KF_FLAG_DEFAULT` asks for the user-invariant path, so no other argument
+    // needs to be valid; on success the call returns a `CoTaskMemAlloc` buffer
+    // the `Ok` arm decodes and frees exactly once.
     match unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None) } {
         Ok(pointer) => {
             // SAFETY: `pointer` is the non-null, NUL-terminated UTF-16 path

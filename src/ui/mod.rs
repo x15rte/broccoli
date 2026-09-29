@@ -1357,7 +1357,7 @@ mod tests {
         let profile = ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom));
         let tag = profile.tag();
         let result = single_probe_result(
-            tag.clone(),
+            tag,
             Ok(vec![OutboundStatusView {
                 health_ping: None,
                 tag: profile.tag(),
@@ -1473,7 +1473,7 @@ mod tests {
                 },
                 OutboundStatusView {
                     health_ping: None,
-                    tag: tag.clone(),
+                    tag,
                     alive: true,
                     delay_ms: 23,
                     last_error: None,
@@ -1505,7 +1505,7 @@ mod tests {
                 },
                 OutboundStatusView {
                     health_ping: None,
-                    tag: tag.clone(),
+                    tag,
                     alive: false,
                     delay_ms: 0,
                     last_error: None,

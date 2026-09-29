@@ -132,13 +132,15 @@ fn pristine_from_managed(core: &Path) {
 /// Assert no `.restore-*` temp file survives anywhere in `core`.
 fn assert_no_restore_temps(core: &Path) {
     assert!(
-        fs::read_dir(core).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".restore-")
-        }),
+        fs::read_dir(core)
+            .expect("list the core directory")
+            .all(|entry| {
+                !entry
+                    .expect("read a core directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".restore-")
+            }),
         "a heal must not leave temp files behind"
     );
 }

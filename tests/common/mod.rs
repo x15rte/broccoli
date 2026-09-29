@@ -112,7 +112,9 @@ pub fn boot(
     Harness<'static, BroccoliApp>,
 ) {
     let lock = APPDATA_LOCK.lock();
-    let env = TempEnvironment::redirect(tempfile::tempdir().unwrap());
+    let env = TempEnvironment::redirect(
+        tempfile::tempdir().expect("create a temp dir for the test environment"),
+    );
     seed(env.path());
     let mut builder = Harness::builder();
     if let Some(frame_step) = frame_step {

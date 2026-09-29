@@ -39,6 +39,23 @@ eframe = { path = "vendor/eframe" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
 
+[lints.clippy]
+# Mechanical form of the repo's Rust code-quality rules. The repo carries no lint
+# suppressions (tests/no_lint_suppressions.rs), so a lint enters this list only
+# when the tree can satisfy it without one. `unwrap_used` is on while
+# `expect_used` and `let_underscore_must_use` stay off: an invariant-backed
+# expect and a best-effort discard have no suppression-free spelling.
+undocumented_unsafe_blocks = "warn"
+redundant_clone = "warn"
+unwrap_used = "warn"
+mem_forget = "warn"
+large_futures = "warn"
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+rc_mutex = "warn"
+rc_buffer = "warn"
+mutex_atomic = "warn"
+
 [features]
 # Release builds require the vendored-protoc feature or a PROTOC env var verified
 # as a known-good protoc (libprotoc 27.1, see build.rs); debug builds fall back to

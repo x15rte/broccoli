@@ -798,7 +798,7 @@ fn settings_appearance_accent_reapplied_at_startup_and_reset() {
         ..Default::default()
     };
     let (_lock, _tmp, mut h) = screen::boot_state(screen::BootState {
-        settings: settings.clone(),
+        settings,
         servers: ServersFile::default(),
     });
 

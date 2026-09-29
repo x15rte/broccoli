@@ -3456,7 +3456,7 @@ mod safety_tests {
                 "quicParams": {"udpHop": {"ports": "443", "interval": "5-10"}}
             }}}
         ]);
-        let mut overridden = settings.clone();
+        let mut overridden = settings;
         overridden.raw_override = Some(config.to_string());
         assert!(
             generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En).is_err(),

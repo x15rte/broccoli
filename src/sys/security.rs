@@ -648,8 +648,11 @@ mod tests {
         let system_again = Sid::well_known(WinLocalSystemSid).expect("rebuild SYSTEM SID");
         let administrators =
             Sid::well_known(WinBuiltinAdministratorsSid).expect("build Administrators SID");
-        // SAFETY: both `psid()` results point at valid, alive SID storage.
+        // SAFETY: `system.psid()` points at valid, alive SID storage: the SID
+        // was copied out of the well-known-SID builder's owned buffer.
         assert!(unsafe { IsValidSid(system.psid()) }.as_bool());
+        // SAFETY: `administrators.psid()` points at the storage owned by the
+        // `administrators` value above, alive for the call.
         assert!(unsafe { IsValidSid(administrators.psid()) }.as_bool());
         assert!(same_sid(system.psid(), system_again.psid()));
         assert!(!same_sid(system.psid(), administrators.psid()));

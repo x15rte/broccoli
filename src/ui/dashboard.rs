@@ -1173,10 +1173,9 @@ mod tests {
             ],
             ..Default::default()
         });
-        let rig_handle = rig.clone();
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
-                let mut rig = rig_handle.borrow_mut();
+                let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx())
             },
             DashboardScreen::default(),
@@ -1390,10 +1389,9 @@ mod tests {
             num_gc: 7,
             ..Default::default()
         });
-        let rig_handle = rig.clone();
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
-                let mut rig = rig_handle.borrow_mut();
+                let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx())
             },
             DashboardScreen::default(),
@@ -1425,14 +1423,13 @@ mod tests {
             num_gc: 91,
             ..Default::default()
         });
-        let rig_handle = rig.clone();
         let width = 340.0;
         let height = 700.0;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(width, height))
             .build_ui_state(
                 move |ui, screen: &mut DashboardScreen| {
-                    let mut rig = rig_handle.borrow_mut();
+                    let mut rig = rig.borrow_mut();
                     screen.show(ui, &mut rig.ctx())
                 },
                 DashboardScreen::default(),
@@ -2196,10 +2193,9 @@ mod tests {
             });
             rig.settings.local_inbounds[1].enabled = false;
         }
-        let rig_handle = rig.clone();
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
-                let mut rig = rig_handle.borrow_mut();
+                let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx())
             },
             DashboardScreen::default(),

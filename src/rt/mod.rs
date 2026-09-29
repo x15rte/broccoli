@@ -4046,14 +4046,13 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
-        let full_sender = sender.clone();
         let blocker = std::thread::spawn(move || {
             queue_event(
                 CoreEvt::State {
                     phase: super::CorePhase::Running,
                     transport: None,
                 },
-                &full_sender,
+                &sender,
             );
         });
         // Free the slot; the waiting lifecycle event arrives next.
@@ -4077,18 +4076,21 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(CoreEvt::Operation(None)).expect("fill slot");
-        let full_sender = sender.clone();
         let started = Instant::now();
-        let blocker = std::thread::spawn(move || {
-            queue_event(
-                CoreEvt::State {
-                    phase: super::CorePhase::Running,
-                    transport: None,
-                },
-                &full_sender,
-            );
+        // The thread borrows the sender rather than taking a clone: the test
+        // keeps it alive for the rest of the run, so draining the filler
+        // leaves a connected, empty channel (`Empty`, not `Disconnected`).
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                queue_event(
+                    CoreEvt::State {
+                        phase: super::CorePhase::Running,
+                        transport: None,
+                    },
+                    &sender,
+                );
+            });
         });
-        blocker.join().expect("bounded fallback must return");
         let waited = started.elapsed();
         assert!(
             waited >= super::events::EVENT_SEND_BOUND / 2,

@@ -43,20 +43,23 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// the last handle terminates every process in the job, so dropping this is a
 /// guaranteed kill even if tokio's own kill_on_drop path is bypassed.
 ///
-/// SAFETY: the wrapped `HANDLE` is an opaque kernel-object reference with value
-/// semantics — no process memory is dereferenced through it, and every Win32
-/// call used on it (`SetInformationJobObject`, `AssignProcessToJobObject`,
-/// `CloseHandle`) carries no thread affinity; the kernel serializes access.
-/// Ownership is exclusive: the handle is created by `CreateJobObjectW` and
-/// closed exactly once in `Drop`, on whatever thread drops the value, so
-/// moving the handle (Send) or sharing it by reference (Sync) across threads
-/// cannot race a close or alias a second owner.
-///
 /// Shared by the apply-gate's `xray run -test` child: every
 /// managed-core spawn in the crate — main core, latency probe, validation —
 /// pins its child to a kill-on-close job through this one wrapper.
 pub(crate) struct Job(HANDLE);
+
+// SAFETY: the wrapped `HANDLE` is an opaque kernel-object reference with value
+// semantics — no process memory is dereferenced through it, and the Win32 calls
+// used on it (`SetInformationJobObject`, `AssignProcessToJobObject`,
+// `CloseHandle`) carry no thread affinity, so moving the handle to another
+// thread is sound. Ownership is exclusive: the handle is created by
+// `CreateJobObjectW` and closed exactly once in `Drop`, on whatever thread
+// drops the value, so no second owner is left holding the same handle.
 unsafe impl Send for Job {}
+// SAFETY: as for `Send`: the handle is an opaque kernel-object reference with
+// no thread affinity and nothing is reached through it but kernel objects; the
+// calls made on it are serialized by the kernel, and the exclusive `Drop` close
+// means a shared `&Job` cannot race that close or take over the handle.
 unsafe impl Sync for Job {}
 
 impl Job {

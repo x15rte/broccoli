@@ -118,12 +118,21 @@ fn process_alive(pid: u32) -> bool {
     use windows::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    // SAFETY: `pid` is the value the runtime announced for its own core start
+    // and the call asks for query-only rights, so no pointer argument is
+    // involved. On success the returned handle is owned by this function and
+    // closed exactly once below; a dead or inaccessible process yields `Err`,
+    // reported as not running.
     let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
         return false;
     };
     let mut code = 0;
+    // SAFETY: `handle` is the valid process handle opened above and still open;
+    // `&mut code` is a valid, live out-parameter the kernel writes on success.
     let alive =
         unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32;
+    // SAFETY: `handle` is the handle opened above and is not used afterwards, so
+    // this is its single close.
     unsafe { CloseHandle(handle) }.ok();
     alive
 }
@@ -827,7 +836,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     wait_stopped(&evt_rx, Instant::now() + Duration::from_secs(10));
     wait_process_exit(first_pid, Instant::now() + Duration::from_secs(10));
     rt.cmd
-        .send(apply_and_start(config.clone()))
+        .send(apply_and_start(config))
         .expect("restart the core");
     let (second_pid, second_start_logs, ready_error) =
         wait_ready(&evt_rx, Instant::now() + Duration::from_secs(60));

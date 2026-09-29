@@ -774,7 +774,7 @@ mod tests {
         let existing = import_profile("existing", "0123456789abcdef");
         let mut staged = ServersFile {
             profiles: vec![existing.clone()],
-            active: Some(existing.id.clone()),
+            active: Some(existing.id),
             ..ServersFile::default()
         };
 

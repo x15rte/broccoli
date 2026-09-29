@@ -16,7 +16,7 @@
 //! certificate.
 
 use std::fmt::Write as _;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,7 +79,14 @@ impl ServerCertVerifier for AcceptAllVerifier {
         let mut chain = Vec::with_capacity(1 + intermediates.len());
         chain.push(end_entity.as_ref().to_vec());
         chain.extend(intermediates.iter().map(|cert| cert.as_ref().to_vec()));
-        *self.captured.lock().unwrap() = Some(chain);
+        // A poisoned lock means some other thread panicked while holding it;
+        // the slot only ever holds the captured chain, so the guard is
+        // recovered rather than propagating an unrelated panic.
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *captured = Some(chain);
         Ok(ServerCertVerified::assertion())
     }
 
@@ -219,13 +226,13 @@ async fn capture(addrs: &[SocketAddr], sni: &str) -> Result<Vec<Vec<u8>>, String
 
     let mut last_error = String::from("no usable addresses");
     for &addr in addrs {
-        let bind: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0"
+        // An ephemeral port on the wildcard address of the target's family:
+        // the endpoint only needs to reach one address.
+        let bind = if addr.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
         } else {
-            "[::]:0"
-        }
-        .parse()
-        .unwrap();
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
         let mut endpoint = match quinn::Endpoint::client(bind) {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -245,7 +252,13 @@ async fn capture(addrs: &[SocketAddr], sni: &str) -> Result<Vec<Vec<u8>>, String
             last_error = format!("handshake: {error}");
             continue;
         }
-        let chain = captured.lock().unwrap().take().unwrap_or_default();
+        // As in the verifier: a poisoned lock says another thread panicked, and
+        // a missing chain (no certificate recorded) is handled as an empty one.
+        let chain = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
         // Dropping the endpoint releases the UDP socket; the server needs no
         // graceful goodbye for a probe.
         return Ok(chain);

@@ -294,10 +294,11 @@ fn wait_for_message(
     parent: Option<HANDLE>,
 ) -> Result<bool, DiagError> {
     loop {
-        // SAFETY: `parent` is a valid open handle to the launching GUI process
-        // (from `OpenProcess` in `serve`), still open; timeout 0 polls without
-        // blocking and the result is checked against `WAIT_OBJECT_0`.
         if let Some(parent) = parent
+            // SAFETY: `parent` is a valid open handle to the launching GUI
+            // process (from `OpenProcess` in `serve`), still open; timeout 0
+            // polls without blocking and the result is checked against
+            // `WAIT_OBJECT_0`.
             && unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0
         {
             return Ok(false);
@@ -434,6 +435,13 @@ fn create_helper_pipe(wide_name: &[u16], parent_user: &Sid) -> Result<HANDLE, Di
         with_protected_attributes(
             owner,
             &[(parent_user, GENERIC_READ.0 | GENERIC_WRITE.0)],
+            // SAFETY: `wide_name` is the caller's NUL-terminated wide pipe
+            // name, valid for the call; `attributes` is the fully initialized
+            // `SECURITY_ATTRIBUTES` built by `with_protected_attributes`
+            // (`nLength` set, `lpSecurityDescriptor` pointing at a live
+            // descriptor, `bInheritHandle` false) and the SID/ACL buffers it
+            // references stay alive for the synchronous call. The returned
+            // handle is checked against `INVALID_HANDLE_VALUE` below.
             |attributes| unsafe {
                 CreateNamedPipeW(
                     PCWSTR(wide_name.as_ptr()),
@@ -863,19 +871,24 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
             continue;
         }
         // SAFETY: `ace.sid` is the embedded SID in the live DACL buffer and
-        // the well-known SIDs are alive above; EqualSid only reads them.
+        // `system` is the well-known SID built above; EqualSid only reads both.
         if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
             if saw_system {
                 return false;
             }
             saw_system = true;
-        } else if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
-            if saw_administrators {
+        } else {
+            // SAFETY: `ace.sid` is still the embedded SID in the live DACL
+            // buffer and `administrators` is the other well-known SID built
+            // above; EqualSid only reads both.
+            if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
+                if saw_administrators {
+                    return false;
+                }
+                saw_administrators = true;
+            } else {
                 return false;
             }
-            saw_administrators = true;
-        } else {
-            return false;
         }
     }
     saw_system && saw_administrators && extra_aces == 1
@@ -930,18 +943,20 @@ fn create_protected_directory(path: &Path, allow_existing: bool) -> Result<(), D
     let administrators =
         Sid::well_known(WinBuiltinAdministratorsSid).diag(Key::HelperWellKnownSidFailed)?;
     let create = |owner: Option<&Sid>| {
-        with_protected_attributes(owner, &[], |attributes| unsafe {
-            CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(attributes))
-        })
+        with_protected_attributes(
+            owner,
+            &[],
+            // SAFETY: `wide` is a NUL-terminated wide path valid for the call;
+            // `attributes` is the fully initialized `SECURITY_ATTRIBUTES` built
+            // by `with_protected_attributes` (`nLength` set,
+            // `lpSecurityDescriptor` pointing at the live descriptor,
+            // `bInheritHandle` false) and stays alive for the synchronous call,
+            // as do the SID/ACL buffers the descriptor references. The BOOLEAN
+            // result is checked by the caller (`Ok(())` vs error).
+            |attributes| unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(attributes)) },
+        )
         .diag(Key::HelperDirectoryAttributesFailed)
     };
-    // SAFETY: `wide` is a NUL-terminated wide path valid for the call;
-    // `attributes` is the fully initialized `SECURITY_ATTRIBUTES` built by
-    // `with_protected_attributes` (`nLength` set, `lpSecurityDescriptor`
-    // pointing at the live descriptor, `bInheritHandle` false) and stays
-    // alive for the synchronous call, as do the SID/ACL buffers the
-    // descriptor references. The BOOLEAN result is checked by the caller
-    // (`Ok(())` vs error).
     let mut created = create(Some(&administrators))?;
     if let Err(error) = &created
         && is_invalid_owner_error(error)
@@ -2757,10 +2772,11 @@ impl HelperPipe {
             return Err(DiagError::new(Diag::new(Key::HelperConnectCancelled)));
         }
         let mode: NAMED_PIPE_MODE = PIPE_READMODE_MESSAGE;
-        // SAFETY: `handle` is the valid open pipe handle; `&mode` is a fully
-        // initialized `NAMED_PIPE_MODE` on the stack, alive for the call. The
-        // return is checked and the handle is closed on the error path.
         if let Err(error) =
+            // SAFETY: `handle` is the valid open pipe handle; `&mode` is a
+            // fully initialized `NAMED_PIPE_MODE` on the stack, alive for the
+            // call. The return is checked and the handle is closed on the
+            // error path.
             unsafe { SetNamedPipeHandleState(handle, Some(&mode as *const _), None, None) }
         {
             // SAFETY: `handle` is still the valid, open handle from
@@ -2790,8 +2806,7 @@ impl HelperPipe {
             let mut auth = serde_json::to_string(&HelperCommand::Auth {
                 token: token.to_string(),
             })
-            .expect("the auth command is a plain struct of strings")
-            .to_string();
+            .expect("the auth command is a plain struct of strings");
             auth.push('\n');
             writer_guard
                 .write_all(auth.as_bytes())
@@ -3434,6 +3449,11 @@ mod tests {
             SetSecurityDescriptorControl(descriptor_pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED)?;
         }
         let wide = path_to_wide(dir);
+        // SAFETY: `descriptor_pointer` refers to the live, initialized
+        // `descriptor` above (its DACL just written by
+        // `SetSecurityDescriptorDacl`); `wide` is a NUL-terminated wide path
+        // valid for the call. The kernel reads the descriptor and copies the
+        // DACL out before returning; the BOOLEAN result is checked below.
         let applied = unsafe {
             SetFileSecurityW(
                 PCWSTR(wide.as_ptr()),
@@ -3969,6 +3989,10 @@ mod tests {
         .expect("connect test pipe");
         // The client may connect before the server accepts; the kernel then
         // reports ERROR_PIPE_CONNECTED, which means the connection is up.
+        // SAFETY: `server` is the valid pipe handle created by
+        // `CreateNamedPipeW` above (the invalid-handle case was rejected by the
+        // assert); `None` asks for no overlapped structure, so the call is
+        // synchronous, and its error is inspected for `ERROR_PIPE_CONNECTED`.
         if let Err(error) = unsafe { ConnectNamedPipe(server, None) } {
             assert_eq!(
                 error.code(),
@@ -4224,10 +4248,8 @@ mod tests {
         sender
             .try_send(HelperEvent::Log(HelperLog::Raw("filler".to_string())))
             .expect("fill the hop");
-        let full_sender = sender.clone();
-        let blocker = std::thread::spawn(move || {
-            send_helper_lifecycle_event(HelperEvent::Exit(23), &full_sender)
-        });
+        let blocker =
+            std::thread::spawn(move || send_helper_lifecycle_event(HelperEvent::Exit(23), &sender));
         // Free the slot; the waiting exit event arrives next.
         assert!(matches!(
             receiver.blocking_recv(),
@@ -4255,12 +4277,13 @@ mod tests {
         sender
             .try_send(HelperEvent::Log(HelperLog::Raw("filler".to_string())))
             .expect("fill the hop");
-        let full_sender = sender.clone();
         let started = Instant::now();
-        let blocker = std::thread::spawn(move || {
-            send_helper_lifecycle_event(HelperEvent::Exit(23), &full_sender)
+        // The thread borrows the sender instead of taking a clone: the test
+        // keeps it alive for the rest of the run, so draining the filler
+        // leaves a connected, empty channel (`Empty`, not `Disconnected`).
+        std::thread::scope(|scope| {
+            scope.spawn(|| send_helper_lifecycle_event(HelperEvent::Exit(23), &sender));
         });
-        blocker.join().expect("bounded fallback must return");
         let waited = started.elapsed();
         assert!(
             waited >= LIFECYCLE_SEND_WINDOW / 2,
@@ -4302,11 +4325,9 @@ mod tests {
         sender
             .try_send(HelperEvent::Log(HelperLog::Raw("filler".to_string())))
             .expect("fill the hop");
-        let full_sender = sender.clone();
         let started = Instant::now();
-        let blocker = std::thread::spawn(move || {
-            send_helper_lifecycle_event(HelperEvent::Exit(23), &full_sender)
-        });
+        let blocker =
+            std::thread::spawn(move || send_helper_lifecycle_event(HelperEvent::Exit(23), &sender));
         // Runtime stalled (hop full, undrained) past the old bound...
         std::thread::sleep(stall);
         // ...and draining now: the waiting exit event must arrive instead

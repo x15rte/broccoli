@@ -2955,7 +2955,7 @@ fn rule_target_chain_terminal_is_the_marked_outbound() {
     let servers = ServersFile {
         version: 1,
         active: Some(active.id.clone()),
-        profiles: vec![active.clone(), hop.clone(), exit],
+        profiles: vec![active, hop.clone(), exit],
         extra: Map::new(),
     };
     let mut settings = base_settings();
@@ -3084,7 +3084,7 @@ fn a_chain_profile_emits_the_dialer_proxy_spelling_only() {
 
     // A profile that still carries the retired key gates generation outright:
     // the core never sees the key, and the message names the replacement.
-    let mut marked = servers.clone();
+    let mut marked = servers;
     marked.profiles[0].outbound.retired_proxy_settings = Some(json!({"tag": "srv-exit"}));
     let error = generate_deterministic(&marked, &base_settings())
         .expect_err("an unresolved retired key must gate generation");

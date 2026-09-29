@@ -252,24 +252,31 @@ impl ObservatoryCfg {
     /// GUI-only; `forced_subjects` (dependency-forced observatory only)
     /// replaces subjectSelector with the given outbound tags.
     pub fn to_wire(&self, forced_subjects: Option<&[String]>) -> Value {
-        let mut v = serde_json::to_value(self).expect(
+        let v = serde_json::to_value(self).expect(
             "model serialization is infallible: ObservatoryCfg fields are u64/bool/string \
              values and string-keyed Value maps only",
         );
-        let o = v.as_object_mut().unwrap();
-        o.remove("enabled"); // GUI-only toggle, not an Xray key
-        if let Some(subjects) = forced_subjects {
-            o.insert(
-                "subjectSelector".into(),
-                Value::Array(
-                    subjects
-                        .iter()
-                        .map(|tag| Value::String(tag.clone()))
-                        .collect(),
-                ),
-            );
+        // The struct always serializes to an object (its fields are scalars and
+        // string-keyed maps); any other shape is passed through unchanged
+        // rather than assumed away.
+        match v {
+            Value::Object(mut o) => {
+                o.remove("enabled"); // GUI-only toggle, not an Xray key
+                if let Some(subjects) = forced_subjects {
+                    o.insert(
+                        "subjectSelector".into(),
+                        Value::Array(
+                            subjects
+                                .iter()
+                                .map(|tag| Value::String(tag.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(o)
+            }
+            other => other,
         }
-        v
     }
 }
 
@@ -715,7 +722,7 @@ mod integrity_tests {
             },
             RouteTestRequest {
                 vless_route: u16::MAX as u32 + 1,
-                ..valid.clone()
+                ..valid
             },
         ] {
             assert!(request.validate().is_err());

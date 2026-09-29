@@ -1000,15 +1000,16 @@ impl TunCfg {
                 o.remove("autoSystemRoutingTable");
             }
         }
-        let mut ib = json!({
-            "tag": TUN_INBOUND_TAG,
-            "protocol": "tun",
-            "settings": set,
-        });
+        // Built as a map directly: the envelope is an object by construction,
+        // so adding the optional `sniffing` key needs no shape check.
+        let mut ib = Map::new();
+        ib.insert("tag".into(), Value::String(TUN_INBOUND_TAG.into()));
+        ib.insert("protocol".into(), Value::String("tun".into()));
+        ib.insert("settings".into(), set);
         if let Some(sn) = self.sniffing.to_wire(fakedns) {
-            ib.as_object_mut().unwrap().insert("sniffing".into(), sn);
+            ib.insert("sniffing".into(), sn);
         }
-        ib
+        Value::Object(ib)
     }
 }
 #[cfg(test)]

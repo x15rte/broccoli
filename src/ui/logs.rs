@@ -1540,12 +1540,11 @@ mod tests {
                 r.push_log(false, format!("line {i:04}"));
             }
         }
-        let rig_handle = rig.clone();
         let mut harness = Harness::builder()
             .with_size(egui::vec2(700.0, 400.0))
             .build_ui_state(
                 move |ui, screen: &mut LogsScreen| {
-                    let mut rig = rig_handle.borrow_mut();
+                    let mut rig = rig.borrow_mut();
                     screen.show(ui, &mut rig.ctx())
                 },
                 LogsScreen::default(),

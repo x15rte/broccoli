@@ -207,7 +207,7 @@ impl InboundsScreen {
                         |listen| {
                             validate_listen_address(listen)
                                 .err()
-                                .map(|code| validation_message(&code, lang).to_string())
+                                .map(|code| validation_message(&code, lang))
                         },
                         validation.local_warnings[i].as_deref(),
                     );
@@ -378,7 +378,7 @@ impl InboundsScreen {
                                 |listen| {
                                     validate_listen_address(listen)
                                         .err()
-                                        .map(|code| validation_message(&code, lang).to_string())
+                                        .map(|code| validation_message(&code, lang))
                                 },
                                 validation.doko_warnings[i].as_deref(),
                             );
@@ -825,7 +825,7 @@ fn sniffing_row_error(
     validate_sniffing(sniffing, prefix)
         .into_iter()
         .next()
-        .map(|issue| validation_message(&issue.code, lang).to_string())
+        .map(|issue| validation_message(&issue.code, lang))
 }
 
 fn inline_error(ui: &mut egui::Ui, error: Option<&str>) {
@@ -1176,12 +1176,11 @@ mod listener_validation_tests {
     /// AccessKit tree without scrolling (the screen has no ScrollArea of its
     /// own in this unit-harness context).
     fn harness_for(rig: Rc<RefCell<UiTestRig>>) -> Harness<'static, InboundsScreen> {
-        let rig_handle = rig.clone();
         Harness::builder()
             .with_size(egui::vec2(900.0, 2400.0))
             .build_ui_state(
                 move |ui, screen: &mut InboundsScreen| {
-                    let mut rig = rig_handle.borrow_mut();
+                    let mut rig = rig.borrow_mut();
                     screen.show(ui, &mut rig.ctx())
                 },
                 InboundsScreen::default(),

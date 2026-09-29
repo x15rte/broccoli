@@ -9237,7 +9237,7 @@ mod tests {
         );
         assert_eq!(
             found[0].code,
-            ValidationCode::InboundTagDuplicated(seeded_tag.clone())
+            ValidationCode::InboundTagDuplicated(seeded_tag)
         );
         assert_eq!(found[0].path, None, "a tag collision carries no path");
 
