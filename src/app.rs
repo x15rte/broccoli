@@ -4836,12 +4836,10 @@ mod tests {
     use crate::model::settings::Mode;
     use crate::rt::supervisor::MAX_LINE_BYTES;
 
+    /// A fixture adapter for the commit-guard tests — the guard keys on the
+    /// name and up flag only, so any nonzero index serves.
     fn iface(name: &str, up: bool) -> crate::sys::netif::NetIf {
-        crate::sys::netif::NetIf {
-            name: name.into(),
-            ips: Vec::new(),
-            up,
-        }
+        crate::sys::netif::test_iface(name, 1, false, up, &[])
     }
 
     #[test]

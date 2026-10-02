@@ -1,36 +1,50 @@
-//! Network interface enumeration via `GetAdaptersAddresses`.
-//! Used to pick a physical outbound interface for TUN routing rules.
+//! Network interface enumeration via `GetAdaptersAddresses`, plus the
+//! forward table and per-interface metrics the `auto` outbound heuristic
+//! reads. Used to pick a physical outbound interface for TUN traffic.
 //!
 //! The TUN uplink rule lives here too — [`fixed_name_verdict`],
-//! [`resolve_probe_uplink`], and [`tun_adapter_name`] are pure functions
-//! over an enumeration view the caller supplies. The view and the mode gate
-//! differ by caller, deliberately: the commit guard and the TUN screen pass
-//! the physical-only [`list`] view, while the probe passes the
-//! tunnel-inclusive [`list_all`] view with the TUN's own adapter excluded;
-//! and while the commit guard only judges a bound TUN (mode on), the TUN
-//! screen surfaces a broken pinned pick regardless of mode — it would
-//! become the outage the moment TUN switches on. Both splits are
+//! [`resolve_probe_uplink`], and [`tun_adapter_name`] judge an enumeration
+//! view the caller supplies. The view and the mode gate differ by caller,
+//! deliberately: the commit guard and the TUN screen pass the
+//! physical-only [`list`] view, while the probe passes the
+//! tunnel-inclusive [`list_all`] view with the TUN's own adapter excluded
+//! by index; and while the commit guard only judges a bound TUN (mode on),
+//! the TUN screen surfaces a broken pinned pick regardless of mode — it
+//! would become the outage the moment TUN switches on. Both splits are
 //! behavior-visible: a tunnel-type adapter reads as missing to the guard
-//! yet may resolve a probe.
+//! yet may resolve a probe. The `auto` branch itself reads live OS state
+//! (see `xray_outbound_heuristic`), so only the fixed-name branches are
+//! pure over the enumeration.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::mem::align_of;
-use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
-    IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH,
+    FreeMibTable, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    GetAdaptersAddresses, GetIpForwardTable2, GetIpInterfaceEntry, IF_TYPE_IEEE80211,
+    IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6};
+use windows::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+};
 
 /// One network interface and its unicast addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetIf {
     pub name: String,
-    pub ips: Vec<String>,
+    /// The adapter's interface index (`Ipv6IfIndex`, else `IfIndex`, as
+    /// reported by `GetAdaptersAddresses`).
+    pub index: u32,
+    /// Whether the adapter's `IfType` is IEEE 802.11 wireless — the
+    /// property Xray's outbound heuristic reads (`windows.IF_TYPE_IEEE80211`
+    /// via `winipcfg`).
+    pub wireless: bool,
     /// Whether the adapter's operational status is up (`OperStatus ==
     /// IfOperStatusUp` as reported by `GetAdaptersAddresses`).
     pub up: bool,
+    pub ips: Vec<String>,
 }
 
 /// Owns the `GetAdaptersAddresses` output buffer. The buffer is allocated
@@ -168,10 +182,26 @@ fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
                     }
                     uni = addr.Next;
                 }
+                // `Anonymous1` is a union of `Alignment` (padding) and the
+                // `{ Length, IfIndex }` pair the API always writes, so
+                // reading `IfIndex` reads the variant in force; the union
+                // member access is covered by this function's enclosing
+                // unsafe block. Go's `net.Interface.Index` — the value
+                // upstream's route-row skip and `InterfaceByIndex` use — is
+                // `IfIndex`, with `Ipv6IfIndex` only as the fallback for an
+                // adapter without one.
+                let if_index = adapter.Anonymous1.Anonymous.IfIndex;
+                let index = if if_index != 0 {
+                    if_index
+                } else {
+                    adapter.Ipv6IfIndex
+                };
                 out.push(NetIf {
                     name,
-                    ips,
+                    index,
+                    wireless: adapter.IfType == IF_TYPE_IEEE80211,
                     up: adapter.OperStatus == IfOperStatusUp,
+                    ips,
                 });
             }
             cur = adapter.Next;
@@ -180,62 +210,143 @@ fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
     }
 }
 
-/// Pick the best physical outbound interface for TUN traffic, replicating
-/// Xray-core's `findOutboundInterface`/`scoreWindowsInterface`
-/// (proxy/tun/tun_windows.go) on the `list_all` view. Candidates are the
-/// up interfaces with at least one IP whose name does not contain
-/// "vEthernet" (case-sensitive, as in Go) and whose name is not
-/// `excluded_name` — the main core's own TUN adapter, mirroring Go's
-/// `iface.Index == tunIndex` skip (the adapter's friendly name is its wire
-/// `name`); loopback never appears in the input (both enumerations exclude
-/// it), matching Go's flag check. Scoring mirrors Xray: +2 when the
-/// lowercased name contains "wlan" or "wi-fi", +1 when any IP starts with
-/// "192.168.". The highest score wins; ties go to the lexicographically
-/// smaller name. Returns the winner's name, or `None` when no interface
-/// qualifies.
-pub fn xray_outbound_heuristic<'a>(
-    ifaces: &'a [NetIf],
-    excluded_name: Option<&str>,
-) -> Option<&'a str> {
-    let mut best: Option<(&NetIf, i32)> = None;
-    for iface in ifaces {
-        if Some(iface.name.as_str()) == excluded_name {
-            continue;
-        }
-        if iface.name.contains("vEthernet") {
-            continue;
-        }
-        if !iface.up {
-            continue;
-        }
-        if iface.ips.is_empty() {
-            continue;
-        }
-        let score = score_xray_interface(iface);
-        match best {
-            None => best = Some((iface, score)),
-            Some((best_iface, best_score)) => {
-                if score > best_score || (score == best_score && iface.name < best_iface.name) {
-                    best = Some((iface, score));
-                }
-            }
-        }
-    }
-    best.map(|(iface, _)| iface.name.as_str())
+/// One prefix-length-0 row of the OS forward table: the interface it
+/// belongs to and its route metric.
+struct DefaultRouteRow {
+    index: u32,
+    metric: u32,
 }
 
-/// Xray-core's `scoreWindowsInterface`: +2 for a "wlan"/"wi-fi" name (after
-/// lowercasing), +1 when any unicast IP starts with "192.168.".
-fn score_xray_interface(iface: &NetIf) -> i32 {
-    let mut score = 0;
-    let name = iface.name.to_lowercase();
-    if name.contains("wlan") || name.contains("wi-fi") {
-        score += 2;
+/// Every default-route (prefix-length 0) row of the OS forward table, in
+/// table order — the exact row set Xray's `findOutboundInterface` iterates
+/// (proxy/tun/tun_windows.go:360). `None` when the table cannot be read
+/// (the caller's fail-soft branch, mirroring Go's error path).
+fn default_route_rows() -> Option<Vec<DefaultRouteRow>> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: `table` starts null and the API either fails (table stays
+    // null) or writes a pointer to a `MIB_IPFORWARD_TABLE2` it owns, freed
+    // below by `FreeMibTable` on every path.
+    let rc = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
+    if rc != ERROR_SUCCESS || table.is_null() {
+        return None;
     }
-    if iface.ips.iter().any(|ip| ip.starts_with("192.168.")) {
-        score += 1;
+    // SAFETY: `table` is a live, API-owned allocation aligned for
+    // `MIB_IPFORWARD_TABLE2` (the API returns it fully formed), so `Table`
+    // heads `NumEntries` contiguous, properly aligned `MIB_IPFORWARD_ROW2`s.
+    // The rows are copied out before `FreeMibTable` releases the
+    // allocation, so no read outlives it.
+    let rows = unsafe {
+        let num = (*table).NumEntries as usize;
+        let first = std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+        let slice = std::slice::from_raw_parts(first, num);
+        let out = slice
+            .iter()
+            .filter(|row| row.DestinationPrefix.PrefixLength == 0)
+            .map(|row| DefaultRouteRow {
+                index: row.InterfaceIndex,
+                metric: row.Metric,
+            })
+            .collect::<Vec<_>>();
+        FreeMibTable(table.cast());
+        out
+    };
+    Some(rows)
+}
+
+/// The per-interface metric Xray's heuristic adds to the route metric
+/// (`iface.Metric` via `winipcfg`'s `IPInterface`): `GetIpInterfaceEntry`
+/// for the interface's IPv4 row, falling back to IPv6 (the Go code tries
+/// `AF_INET` first, then `AF_INET6`). `None` when neither family resolves —
+/// the Go code skips the candidate entirely in that case.
+fn interface_metric(index: u32) -> Option<u32> {
+    for family in [AF_INET, AF_INET6] {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceIndex: index,
+            ..MIB_IPINTERFACE_ROW::default()
+        };
+        // SAFETY: `row` is a fully initialized stack struct; the API
+        // rewrites the fields it reports on success and leaves the rest
+        // untouched.
+        let rc = unsafe { GetIpInterfaceEntry(&mut row) };
+        if rc == ERROR_SUCCESS {
+            return Some(row.Metric);
+        }
     }
-    score
+    None
+}
+
+/// One scored candidate for the outbound heuristic: the interface plus its
+/// combined route+interface metric.
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    iface: &'a NetIf,
+    metric: u32,
+}
+
+/// The pure half of Xray's Windows `findOutboundInterface`
+/// (proxy/tun/tun_windows.go:347-392): over the default-route candidates,
+/// the lowest combined metric wins and any wireless winner overrides every
+/// non-wireless one regardless of metric. Candidates come pre-filtered to
+/// up interfaces and are named by interface, carrying the adapter's index
+/// so the TUN's own row can be skipped — Go's
+/// `r[i].InterfaceIndex == uint32(tunIndex)` skip. The I/O half
+/// (`xray_outbound_heuristic`) owns the enumeration, route read and metric
+/// lookups. `None` when no candidate qualifies.
+fn pick_outbound_interface<'a>(
+    candidates: impl IntoIterator<Item = Candidate<'a>>,
+    tun_self_index: Option<u32>,
+) -> Option<&'a str> {
+    let mut wired: Option<Candidate> = None;
+    let mut wireless: Option<Candidate> = None;
+    for candidate in candidates {
+        if Some(candidate.iface.index) == tun_self_index {
+            continue;
+        }
+        // Strict `<`: Go's loop keeps the first row seen on a metric tie
+        // (table order), so a later equal-metric row must not displace it.
+        let slot = if candidate.iface.wireless {
+            &mut wireless
+        } else {
+            &mut wired
+        };
+        if slot
+            .as_ref()
+            .is_none_or(|best| candidate.metric < best.metric)
+        {
+            *slot = Some(candidate);
+        }
+    }
+    // Go: `if indexWifi != 0 { index = indexWifi }` — a wireless winner
+    // overrides the wired pick unconditionally.
+    wireless
+        .or(wired)
+        .map(|candidate| candidate.iface.name.as_str())
+}
+
+/// Pick the interface Xray-core's Windows `findOutboundInterface` binds
+/// for an `auto` TUN outbound. Reads the live forward table and per-
+/// interface metrics (the OS facts the Go implementation reads through
+/// winipcfg), keeps the up interfaces other than the TUN's own, and scores
+/// them with [`pick_outbound_interface`].
+///
+/// Returns `None` when the route table cannot be read or no candidate
+/// qualifies — the probe then dials unbound, mirroring Go's nil-interface
+/// fallback.
+fn xray_outbound_heuristic(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Option<&str> {
+    let rows = default_route_rows()?;
+    let candidates = rows.into_iter().filter_map(|row| {
+        let iface = ifaces.iter().find(|iface| iface.index == row.index)?;
+        if !iface.up {
+            return None;
+        }
+        let metric = interface_metric(row.index)?;
+        Some(Candidate {
+            iface,
+            metric: row.metric.saturating_add(metric),
+        })
+    });
+    pick_outbound_interface(candidates, tun_self_index)
 }
 
 /// Xray's wire default for the TUN adapter name: a TUN inbound whose
@@ -316,27 +427,29 @@ pub enum ProbeUplink<'a> {
 /// Resolve the interface the probe child binds its dials to while the main
 /// core is up with TUN: the TUN `autoOutboundsInterface` setting, resolved
 /// at probe time against a fresh adapter enumeration so a rename or newly
-/// enabled adapter is picked up. Pure — the enumeration is passed in.
+/// enabled adapter is picked up.
 ///
 /// - TUN not active: no capture to bypass — [`ProbeUplink::Unbound`].
 /// - Setting `None`: no interface configured — unbound; the dial rides the
 ///   TUN, the pollution the binding is meant to prevent.
-/// - Setting `""` or `"auto"`: replicate Xray's `findOutboundInterface`
-///   heuristic; unbound when no candidate qualifies (proceed unbound, like
-///   Xray's nil interface).
+/// - Setting `""` or `"auto"`: replicate Xray's `findOutboundInterface`;
+///   this branch reads the live route table and per-interface metrics (see
+///   `xray_outbound_heuristic`), so it performs I/O. Unbound when no
+///   candidate qualifies (proceed unbound, like Xray's nil interface).
 /// - Fixed name: must exist in the enumeration and be up, else the verdict
 ///   names the failure — a silent fallback would re-introduce the polluted
-///   measurement while looking valid.
+///   measurement while looking valid. This branch reads no OS state.
 ///
-/// `tun_self_name` is the main core's own TUN adapter (its wire name, per
-/// [`tun_adapter_name`]): it is excluded from the heuristic and rejected as
-/// a fixed target, mirroring Go's `iface.Index == tunIndex` skip — binding
-/// to the TUN's own interface would send the dial back into the tunnel,
-/// re-introducing the exact pollution this resolution removes.
+/// `tun_self_index` is the main core's own TUN adapter index (the caller
+/// resolves [`tun_adapter_name`] against the enumeration): it is excluded
+/// from the heuristic and a fixed name resolving to it is rejected,
+/// mirroring Go's `iface.Index == tunIndex` skip — binding to the TUN's own
+/// interface would send the dial back into the tunnel, re-introducing the
+/// exact pollution this resolution removes.
 pub fn resolve_probe_uplink<'a>(
     setting: Option<&'a str>,
     tun_active: bool,
-    tun_self_name: Option<&'a str>,
+    tun_self_index: Option<u32>,
     ifaces: &'a [NetIf],
 ) -> ProbeUplink<'a> {
     if !tun_active {
@@ -346,15 +459,16 @@ pub fn resolve_probe_uplink<'a>(
         return ProbeUplink::Unbound;
     };
     if setting.is_empty() || setting == "auto" {
-        return match xray_outbound_heuristic(ifaces, tun_self_name) {
+        return match xray_outbound_heuristic(ifaces, tun_self_index) {
             Some(name) => ProbeUplink::Interface(name),
             None => ProbeUplink::Unbound,
         };
     }
-    if Some(setting) == tun_self_name {
+    let fixed = ifaces.iter().find(|iface| iface.name == setting);
+    if fixed.is_some_and(|iface| Some(iface.index) == tun_self_index) {
         return ProbeUplink::TunSelf { name: setting };
     }
-    match ifaces.iter().find(|iface| iface.name == setting) {
+    match fixed {
         Some(iface) if iface.up => ProbeUplink::Interface(setting),
         Some(_) => ProbeUplink::Down { name: setting },
         None => ProbeUplink::Missing { name: setting },
@@ -396,6 +510,21 @@ unsafe fn format_sockaddr(sa: *const SOCKADDR) -> Option<String> {
     }
 }
 
+/// A fixture adapter view for unit tests across the crate: the enumeration
+/// is a live OS call, so tests build the view by hand. `index` must be
+/// nonzero (real adapters always report one); callers that never key on
+/// the value pass any nonzero index.
+#[cfg(test)]
+pub(crate) fn test_iface(name: &str, index: u32, wireless: bool, up: bool, ips: &[&str]) -> NetIf {
+    NetIf {
+        name: name.to_string(),
+        index,
+        wireless,
+        up,
+        ips: ips.iter().map(|ip| (*ip).to_string()).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,156 +533,109 @@ mod tests {
     fn adapter_enumeration_is_live() {
         // Smoke test for the aligned-buffer walk: it must complete without
         // panicking and yield at least the physical adapters on this
-        // networked Windows host (loopback and tunnel are skipped).
+        // networked Windows host (loopback and tunnel are skipped). The
+        // index must be populated — the heuristic keys on it.
         let adapters = list();
         assert!(
             !adapters.is_empty(),
             "expected at least one non-loopback adapter on a networked Windows host"
         );
+        assert!(
+            adapters.iter().all(|adapter| adapter.index != 0),
+            "every enumerated adapter must carry its interface index"
+        );
     }
 
-    fn iface(name: &str, up: bool, ips: &[&str]) -> NetIf {
-        NetIf {
-            name: name.to_string(),
-            up,
-            ips: ips.iter().map(|s| s.to_string()).collect(),
+    #[test]
+    fn heuristic_picks_the_live_default_route_owner() {
+        // Live oracle for the I/O half: whatever this machine's route table
+        // holds, the winner must be an up enumerated interface that owns a
+        // prefix-length-0 row and is not the TUN's own adapter. The scoring
+        // policy itself is pinned deterministically in the picker tests
+        // below.
+        let all = list_all();
+        let tun_index = all
+            .iter()
+            .find(|iface| iface.name == "broccoli0")
+            .map(|iface| iface.index);
+        let winner = xray_outbound_heuristic(&all, tun_index)
+            .expect("a networked host has a default-route owning interface");
+        let winning = all
+            .iter()
+            .find(|iface| iface.name == winner)
+            .expect("the winner must come from the enumeration");
+        assert!(winning.up, "the heuristic must never pick a down adapter");
+        if let Some(tun_index) = tun_index {
+            assert_ne!(
+                winning.index, tun_index,
+                "the TUN adapter itself must never win"
+            );
         }
+        let rows = default_route_rows().expect("the table read that just succeeded");
+        assert!(
+            rows.iter().any(|row| row.index == winning.index),
+            "the winner must own a default route"
+        );
+    }
+
+    fn candidate(iface: &NetIf, metric: u32) -> Candidate<'_> {
+        Candidate { iface, metric }
     }
 
     #[test]
-    fn heuristic_prefers_wlan_name() {
-        // Score 2 ("wlan" name) beats score 0 ("Ethernet" name).
-        let ifaces = vec![
-            iface("Ethernet", true, &["10.0.0.5"]),
-            iface("wlan", true, &["10.0.0.6"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("wlan"));
+    fn picker_takes_the_lowest_metric_in_any_row_order() {
+        let wired = test_iface("wired", 26, false, true, &["192.168.1.2"]);
+        let backup = test_iface("backup", 27, false, true, &["10.0.0.2"]);
+        let rows = [candidate(&wired, 25), candidate(&backup, 60)];
+        assert_eq!(pick_outbound_interface(rows, None), Some("wired"));
+        let rows = [candidate(&backup, 60), candidate(&wired, 25)];
+        assert_eq!(pick_outbound_interface(rows, None), Some("wired"));
     }
 
     #[test]
-    fn heuristic_192_168_bonus_is_decisive() {
-        // Equal name scores (0 vs 0): the 192.168.x prefix adds +1 and wins.
-        let ifaces = vec![
-            iface("Ethernet 2", true, &["10.0.0.5"]),
-            iface("Ethernet", true, &["192.168.1.2"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("Ethernet"));
+    fn picker_keeps_the_first_row_on_a_metric_tie() {
+        // Go's strict `<` never replaces on equality, so the earlier table
+        // row wins.
+        let first = test_iface("first", 26, false, true, &["192.168.1.2"]);
+        let second = test_iface("second", 27, false, true, &["10.0.0.2"]);
+        let rows = [candidate(&first, 25), candidate(&second, 25)];
+        assert_eq!(pick_outbound_interface(rows, None), Some("first"));
     }
 
     #[test]
-    fn heuristic_wi_fi_matches_case_insensitively() {
-        // "Wi-Fi" matches the "wi-fi" substring after lowercasing.
-        let ifaces = vec![
-            iface("Ethernet", true, &["10.0.0.5"]),
-            iface("Wi-Fi", true, &["10.0.0.6"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("Wi-Fi"));
+    fn picker_prefers_any_wireless_over_a_better_wired_metric() {
+        // Go overrides the pick with the best wireless row unconditionally
+        // (`if indexWifi != 0 { index = indexWifi }`), so a wireless
+        // candidate wins even at a much higher metric.
+        let wired = test_iface("wired", 26, false, true, &["192.168.1.2"]);
+        let wifi = test_iface("Wi-Fi", 17, true, true, &["10.0.0.5"]);
+        let rows = [candidate(&wired, 5), candidate(&wifi, 400)];
+        assert_eq!(pick_outbound_interface(rows, None), Some("Wi-Fi"));
     }
 
     #[test]
-    fn heuristic_skips_vethernet() {
-        // "vEthernet" would score 3 but is skipped; the skip is
-        // case-sensitive, so "VEthernet" is not skipped and wins.
-        let ifaces = vec![
-            iface("vEthernet (WSL)", true, &["192.168.1.1"]),
-            iface("Ethernet", true, &["10.0.0.1"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("Ethernet"));
-
-        let ifaces = vec![
-            iface("VEthernet", true, &["192.168.1.1"]),
-            iface("Ethernet", true, &["10.0.0.1"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("VEthernet"));
-    }
-
-    #[test]
-    fn heuristic_skips_down_interfaces() {
-        // Down "Wi-Fi" with a 192.168.x address (would score 3) is skipped.
-        let ifaces = vec![
-            iface("Wi-Fi", false, &["192.168.1.2"]),
-            iface("Ethernet", true, &["10.0.0.1"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("Ethernet"));
-    }
-
-    #[test]
-    fn heuristic_skips_interfaces_without_ips() {
-        let ifaces = vec![
-            iface("Wi-Fi", true, &[]),
-            iface("Ethernet", true, &["10.0.0.1"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("Ethernet"));
-    }
-
-    #[test]
-    fn heuristic_tie_breaks_lexicographically() {
-        // Equal scores (2 vs 2): the lexicographically smaller name wins.
-        let ifaces = vec![
-            iface("wlan-b", true, &["10.0.0.6"]),
-            iface("wlan-a", true, &["10.0.0.7"]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), Some("wlan-a"));
-    }
-
-    #[test]
-    fn heuristic_all_skipped_returns_none() {
-        let ifaces = vec![
-            iface("vEthernet (WSL)", true, &["192.168.1.1"]),
-            iface("Wi-Fi", false, &["192.168.1.2"]),
-            iface("Ethernet", true, &[]),
-        ];
-        assert_eq!(xray_outbound_heuristic(&ifaces, None), None);
-        assert_eq!(xray_outbound_heuristic(&[], None), None);
-    }
-
-    #[test]
-    fn heuristic_excludes_the_tun_adapter_itself() {
-        // Go's findOutboundInterface skips iface.Index == tunIndex; the TUN
-        // adapter ("broccoli0", up, one IP, score 0) must never win a tie
-        // against a physical adapter or be selected on its own.
-        let ifaces = vec![
-            iface("broccoli0", true, &["10.255.0.1"]),
-            iface("ethernet", true, &["10.0.0.1"]),
-        ];
-        // Without exclusion the score-0 tie goes to "broccoli0" (byte-wise
-        // name order: "broccoli0" < "ethernet").
+    fn picker_skips_the_tun_adapters_own_index() {
+        // A user-configured `0.0.0.0/0` in autoSystemRoutingTable puts a
+        // prefix-length-0 row on the TUN adapter (beyond the /1 split
+        // routes the app emits itself); Go skips that row by interface
+        // index, and so must the pick.
+        let tun = test_iface("broccoli0", 9, false, true, &["10.255.0.1"]);
+        let wired = test_iface("wired", 26, false, true, &["192.168.1.2"]);
+        let rows = [candidate(&tun, 0), candidate(&wired, 25)];
         assert_eq!(
-            xray_outbound_heuristic(&ifaces, None),
+            pick_outbound_interface(rows, None),
             Some("broccoli0"),
-            "precondition: without exclusion the TUN adapter would win"
+            "precondition: without the exclusion the TUN row would win"
         );
-        assert_eq!(
-            xray_outbound_heuristic(&ifaces, Some("broccoli0")),
-            Some("ethernet"),
-            "the TUN adapter must be excluded by name"
-        );
-        // Excluding the only candidate leaves nothing.
-        let only_tun = vec![iface("broccoli0", true, &["10.255.0.1"])];
-        assert_eq!(xray_outbound_heuristic(&only_tun, Some("broccoli0")), None);
-        // A non-matching exclusion name changes nothing.
-        assert_eq!(
-            xray_outbound_heuristic(&ifaces, Some("vEthernet (Default Switch)")),
-            Some("broccoli0")
-        );
+        assert_eq!(pick_outbound_interface(rows, Some(9)), Some("wired"));
+        // The TUN row alone leaves nothing to bind.
+        let only_tun = [candidate(&tun, 0)];
+        assert_eq!(pick_outbound_interface(only_tun, Some(9)), None);
     }
 
     #[test]
-    fn heuristic_is_deterministic() {
-        let ifaces = vec![
-            iface("Wi-Fi", true, &["10.0.0.6"]),
-            iface("Ethernet", true, &["192.168.1.2"]),
-            iface("wlan", false, &["10.0.0.9"]),
-        ];
-        let first = xray_outbound_heuristic(&ifaces, None);
-        let second = xray_outbound_heuristic(&ifaces, None);
-        assert_eq!(first, second);
-
-        // The winner is chosen by score/name, not input order: a reversed
-        // input yields the same result.
-        let mut reversed = ifaces.clone();
-        reversed.reverse();
-        assert_eq!(xray_outbound_heuristic(&reversed, None), first);
+    fn picker_without_candidates_returns_none() {
+        assert_eq!(pick_outbound_interface(Vec::new(), None), None);
     }
 
     #[test]
@@ -569,7 +651,7 @@ mod tests {
 
     #[test]
     fn fixed_verdict_unpins_empty_and_auto_settings() {
-        let ifaces = vec![iface("wired", false, &[])];
+        let ifaces = vec![test_iface("wired", 2, false, false, &[])];
         for setting in ["", "  ", "auto", " auto "] {
             assert_eq!(
                 fixed_name_verdict(setting, &ifaces),
@@ -587,8 +669,8 @@ mod tests {
     #[test]
     fn fixed_verdict_reports_up_down_and_missing_names() {
         let ifaces = vec![
-            iface("Ethernet", true, &["10.0.0.1"]),
-            iface("wired", false, &[]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.1"]),
+            test_iface("wired", 3, false, false, &[]),
         ];
         assert_eq!(
             fixed_name_verdict("Ethernet", &ifaces),
@@ -613,7 +695,7 @@ mod tests {
     fn probe_inactive_tun_stays_unbound_for_every_setting() {
         // Mode off: no capture to bypass, so no setting resolves — not even
         // a fixed name that is down, missing, or the TUN's own adapter.
-        let ifaces = vec![iface("broccoli0", true, &["10.255.0.1"])];
+        let ifaces = vec![test_iface("broccoli0", 9, false, true, &["10.255.0.1"])];
         for setting in [
             None,
             Some(""),
@@ -622,7 +704,7 @@ mod tests {
             Some("broccoli0"),
         ] {
             assert_eq!(
-                resolve_probe_uplink(setting, false, Some("broccoli0"), &ifaces),
+                resolve_probe_uplink(setting, false, Some(9), &ifaces),
                 ProbeUplink::Unbound,
                 "{setting:?} must stay unbound while TUN is inactive"
             );
@@ -630,32 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn probe_unpinned_settings_resolve_the_heuristic_winner() {
-        // Score 2 ("Wi-Fi" name) beats score 1 ("Ethernet" with 192.168.x).
-        let ifaces = vec![
-            iface("Ethernet", true, &["192.168.1.5"]),
-            iface("Wi-Fi", true, &["10.0.0.5"]),
-        ];
-        for setting in [Some(""), Some("auto")] {
-            assert_eq!(
-                resolve_probe_uplink(setting, true, None, &ifaces),
-                ProbeUplink::Interface("Wi-Fi"),
-                "{setting:?} resolves like auto"
-            );
-        }
-        assert_eq!(
-            resolve_probe_uplink(Some("auto"), true, None, &[]),
-            ProbeUplink::Unbound,
-            "no candidate is not an error"
-        );
-    }
-
-    #[test]
     fn probe_none_setting_stays_unbound_even_when_tun_is_active() {
         // An unconfigured interface must leave the probe unbound, so its
         // dial rides the TUN instead of silently binding whatever the
         // heuristic would pick.
-        let ifaces = vec![iface("Wi-Fi", true, &["10.0.0.5"])];
+        let ifaces = vec![test_iface("Wi-Fi", 5, true, true, &["10.0.0.5"])];
         assert_eq!(
             resolve_probe_uplink(None, true, None, &ifaces),
             ProbeUplink::Unbound
@@ -665,9 +726,9 @@ mod tests {
     #[test]
     fn probe_fixed_name_covers_interface_down_and_missing() {
         let ifaces = vec![
-            iface("Ethernet", true, &["10.0.0.1"]),
-            iface("wired", false, &[]),
-            iface("Wi-Fi", true, &["10.0.0.5"]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.1"]),
+            test_iface("wired", 3, false, false, &[]),
+            test_iface("Wi-Fi", 5, true, true, &["10.0.0.5"]),
         ];
         assert_eq!(
             resolve_probe_uplink(Some("Ethernet"), true, None, &ifaces),
@@ -684,37 +745,26 @@ mod tests {
     }
 
     #[test]
-    fn probe_auto_excludes_the_tun_adapter_itself() {
-        // The TUN adapter ("broccoli0", up, one IP, score 0) ties with a
-        // plain "ethernet" and wins by byte-wise name order — exactly the
-        // case Go's `iface.Index == tunIndex` skip prevents.
-        let ifaces = vec![
-            iface("broccoli0", true, &["10.255.0.1"]),
-            iface("ethernet", true, &["10.0.0.1"]),
-        ];
-        assert_eq!(
-            resolve_probe_uplink(Some("auto"), true, None, &ifaces),
-            ProbeUplink::Interface("broccoli0"),
-            "precondition: without the exclusion the TUN adapter would win"
-        );
-        assert_eq!(
-            resolve_probe_uplink(Some("auto"), true, Some("broccoli0"), &ifaces),
-            ProbeUplink::Interface("ethernet"),
-            "the TUN adapter must be excluded by name"
-        );
-    }
-
-    #[test]
     fn probe_fixed_name_equal_to_the_tun_adapter_is_rejected() {
         // Present and up, yet rejected: binding to the TUN's own interface
         // would send the dial back into the tunnel.
         let ifaces = vec![
-            iface("broccoli0", true, &["10.255.0.1"]),
-            iface("Ethernet", true, &["10.0.0.1"]),
+            test_iface("broccoli0", 9, false, true, &["10.255.0.1"]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.1"]),
         ];
         assert_eq!(
-            resolve_probe_uplink(Some("broccoli0"), true, Some("broccoli0"), &ifaces),
+            resolve_probe_uplink(Some("broccoli0"), true, Some(9), &ifaces),
             ProbeUplink::TunSelf { name: "broccoli0" }
+        );
+    }
+
+    #[test]
+    fn probe_auto_with_no_enumerated_interface_is_unbound() {
+        // No route row can match an empty enumeration, so the auto branch
+        // resolves to nothing regardless of the host's real route table.
+        assert_eq!(
+            resolve_probe_uplink(Some("auto"), true, None, &[]),
+            ProbeUplink::Unbound
         );
     }
 }

@@ -144,14 +144,20 @@ async fn stop_child(child: &mut supervisor::Child) -> bool {
 
 /// Resolve the interface the probe child binds its dials to: the shared TUN
 /// uplink rule ([`sys::netif::resolve_probe_uplink`]) rendered as the probe's
-/// binding or a loud failure. Pure — the enumeration is passed in.
+/// binding or a loud failure. The TUN adapter's index comes from matching
+/// its configured wire name against the enumeration — the match must stay
+/// live, since a rename that breaks it silently disables the exclusion. The
+/// auto branch reads live OS state.
 pub(crate) fn resolve_probe_interface(
     setting: Option<&str>,
     tun_active: bool,
     tun_adapter_name: Option<&str>,
     ifaces: &[sys::netif::NetIf],
 ) -> Result<Option<String>, ProbeFailure> {
-    match sys::netif::resolve_probe_uplink(setting, tun_active, tun_adapter_name, ifaces) {
+    let tun_self_index = tun_adapter_name
+        .and_then(|name| ifaces.iter().find(|iface| iface.name == name))
+        .map(|iface| iface.index);
+    match sys::netif::resolve_probe_uplink(setting, tun_active, tun_self_index, ifaces) {
         ProbeUplink::Unbound => Ok(None),
         ProbeUplink::Interface(name) => Ok(Some(name.to_owned())),
         ProbeUplink::TunSelf { name } => Err(ProbeFailure::plain(
@@ -603,16 +609,23 @@ mod tests {
         );
     }
 
+    /// A fixture adapter with a stable, nonzero index per name: real
+    /// adapters always report one, and the TUN-adapter identification keys
+    /// on it.
     fn iface(name: &str, ips: &[&str], up: bool) -> NetIf {
-        NetIf {
-            name: name.into(),
-            ips: ips.iter().map(|ip| (*ip).into()).collect(),
-            up,
-        }
+        let index = match name {
+            "Ethernet" => 2,
+            "Wi-Fi" => 17,
+            "wired" => 26,
+            "broccoli0" => 9,
+            other => panic!("fixture adapter {other:?} needs an index"),
+        };
+        crate::sys::netif::test_iface(name, index, name == "Wi-Fi", up, ips)
     }
 
-    /// Xray-heuristic fixture: "Wi-Fi" outscores "Ethernet" (+2 name bonus
-    /// beats +1 for the 192.168.x address).
+    /// Adapter fixture for the fixed-name branches. The auto branch reads
+    /// the live route table and then intersects it with the view it is
+    /// given, so a fixture can only ever narrow that reading.
     fn candidates() -> Vec<NetIf> {
         vec![
             iface("Ethernet", &["192.168.1.5"], true),

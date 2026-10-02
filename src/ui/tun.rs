@@ -388,12 +388,10 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable as _;
 
+    /// A fixture adapter for the TUN screen tests — the verdict keys on the
+    /// name and up flag only, so any nonzero index serves.
     fn iface(name: &str, up: bool) -> NetIf {
-        NetIf {
-            name: name.to_string(),
-            ips: Vec::new(),
-            up,
-        }
+        crate::sys::netif::test_iface(name, 1, false, up, &[])
     }
 
     /// Render the screen over fixture adapters for one fixed uplink setting
