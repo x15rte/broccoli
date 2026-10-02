@@ -1,5 +1,4 @@
 # broccoli 🥦
-> I think TUN isn't working after the latest Windows update.  I'll fix it once I have the money to pay for the LLM 😭
 
 xray-core gui for windows 🦀  
   
