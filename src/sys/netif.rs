@@ -486,6 +486,23 @@ pub fn resolve_probe_uplink<'a>(
 /// the same 2-byte family member — and it must stay valid for the call.
 unsafe fn format_sockaddr(sa: *const SOCKADDR) -> Option<String> {
     // SAFETY: the caller guarantees `sa` is null or points at a complete,
+    // live `SOCKADDR` whose family member describes it (see `# Safety`).
+    unsafe { sockaddr_ip(sa).map(|ip| ip.to_string()) }
+}
+
+/// The address a live `SOCKADDR` names, in either family this app reads
+/// (`SOCKADDR_IN`, `SOCKADDR_IN6`), or `None` for the null pointer and for
+/// any other family. One decoding site for every caller that needs the
+/// address rather than its text.
+///
+/// # Safety
+///
+/// `sa` must be null or point at a complete `SOCKADDR` whose `sa_family`
+/// member accurately describes the object — the two families read here are
+/// `SOCKADDR_IN` (16 bytes) and `SOCKADDR_IN6` (28 bytes), each starting with
+/// the same 2-byte family member — and it must stay valid for the call.
+pub(crate) unsafe fn sockaddr_ip(sa: *const SOCKADDR) -> Option<std::net::IpAddr> {
+    // SAFETY: the caller guarantees `sa` is null or points at a complete,
     // live `SOCKADDR` whose family member describes it (see `# Safety`). The
     // null check runs before any dereference, and the casts only re-interpret
     // that same object as the concrete struct named by `sa_family`, both of
@@ -499,11 +516,13 @@ unsafe fn format_sockaddr(sa: *const SOCKADDR) -> Option<String> {
         if family == AF_INET {
             let sin = &*(sa as *const SOCKADDR_IN);
             let b = sin.sin_addr.S_un.S_un_b;
-            Some(format!("{}.{}.{}.{}", b.s_b1, b.s_b2, b.s_b3, b.s_b4))
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                b.s_b1, b.s_b2, b.s_b3, b.s_b4,
+            )))
         } else if family == AF_INET6 {
             let sin6 = &*(sa as *const SOCKADDR_IN6);
             let bytes = sin6.sin6_addr.u.Byte;
-            Some(std::net::Ipv6Addr::from(bytes).to_string())
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)))
         } else {
             None
         }

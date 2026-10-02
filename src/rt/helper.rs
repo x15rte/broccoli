@@ -105,6 +105,10 @@ const LIFECYCLE_SEND_WINDOW: Duration = Duration::from_millis(4000);
 /// spawning the replacement core (see `clean_leftover_tun_adapter`).
 const TUN_CLEAN_TIMEOUT: Duration = Duration::from_secs(10);
 const STAGE_BASE: &str = ".broccoli-secure-runtime";
+/// Record file of the system-DNS takeover (`sys::dns_takeover`), inside
+/// [`STAGE_BASE`] so it lives beside the stage directories and under the same
+/// protected DACL.
+const DNS_TAKEOVER_RECORD: &str = "dns-takeover.json";
 const STAGE_PREFIX: &str = "stage-";
 const STAGE_MARKER: &str = ".broccoli-secure-stage";
 const STAGE_MARKER_CONTENT: &[u8] = b"broccoli-secure-stage-v1";
@@ -986,6 +990,13 @@ fn secure_stage_base() -> Result<PathBuf, DiagError> {
     Ok(base)
 }
 
+/// The record file of the system-DNS takeover, beside the stage directories
+/// it must outlive: a helper that dies hard leaves the record behind, and the
+/// next helper restores the captured DNS servers from it.
+fn dns_takeover_record_path() -> Result<PathBuf, DiagError> {
+    Ok(secure_stage_base()?.join(DNS_TAKEOVER_RECORD))
+}
+
 fn stage_entry_allowed(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| STAGE_ENTRIES.contains(&name))
@@ -1554,6 +1565,22 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
         return Err(DiagError::new(Diag::new(Key::HelperAuthRejected)));
     }
     let current: Arc<Mutex<Option<HelperChild>>> = Arc::new(Mutex::new(None));
+    // A helper that died hard can leave the captured DNS servers of a dead
+    // session on disk and the adapters pointed at a tunnel address that no
+    // longer exists. The record is that session's repair instruction, and
+    // this is the first moment a repair may run: authenticated, before any
+    // command stages a core. Best-effort, like the shield.
+    match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
+        Ok(Some(0)) | Ok(None) => {}
+        Ok(Some(adapters)) => send_log(
+            &writer,
+            Diag::new(Key::HelperDnsTakeoverRepaired).arg(adapters),
+        ),
+        Err(error) => send_log_record(
+            &writer,
+            &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
+        ),
+    }
     loop {
         match wait_for_message(handle, None, Some(parent.0)) {
             Ok(true) => {}
@@ -1652,6 +1679,12 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     {
         child.kill();
     }
+    // The reaper that would restore the DNS servers with the shield cannot
+    // win a race against this process exiting (it polls the killed child),
+    // and the child's job object dies with this process, so the session is
+    // over now: hand the captured servers back before returning. A failure
+    // keeps the record for the next helper's startup repair.
+    release_dns_takeover(&writer);
     Ok(())
 }
 
@@ -2009,11 +2042,47 @@ fn helper_start(
                             Some(&stage_path.join("xray.exe")),
                             Some(ifindex),
                         ) {
-                            Ok(()) if child_is_live_current(current, pid) => None,
+                            Ok(()) if child_is_live_current(current, pid) => {
+                                // The shield and the takeover guard the same
+                                // resolver: with the shield up, a DNS server
+                                // another adapter still lists never answers,
+                                // and the resolver waits out its whole retry
+                                // schedule before it accepts a negative
+                                // answer. The takeover writes its capture
+                                // before it changes anything, so a failure
+                                // here still leaves a repair behind.
+                                let outcome = (|| -> Result<usize, DiagError> {
+                                    let path = dns_takeover_record_path()?;
+                                    let in_tun =
+                                        crate::rt::dns_in::listener_for_bytes(config_bytes)
+                                            .ok_or_else(|| {
+                                                DiagError::new(Diag::new(
+                                                    Key::HelperConfigNoTunAdapter,
+                                                ))
+                                            })?;
+                                    crate::sys::dns_takeover::engage(&path, ifindex, in_tun.address)
+                                })();
+                                match outcome {
+                                    Ok(adapters) => {
+                                        send_log(
+                                            writer,
+                                            Diag::new(Key::HelperDnsTakeoverApplied).arg(adapters),
+                                        );
+                                        None
+                                    }
+                                    Err(error) => Some(
+                                        DiagError::new(Diag::new(Key::HelperDnsTakeoverNotEngaged))
+                                            .caused_by(error),
+                                    ),
+                                }
+                            }
                             Ok(()) => match crate::rt::wfp::set_dns_shield(false, None, None) {
-                                Ok(()) => Some(DiagError::new(
-                                    Diag::new(Key::HelperShieldRemovedAfterExit).arg(pid),
-                                )),
+                                Ok(()) => {
+                                    release_dns_takeover(writer);
+                                    Some(DiagError::new(
+                                        Diag::new(Key::HelperShieldRemovedAfterExit).arg(pid),
+                                    ))
+                                }
                                 Err(error) => {
                                     send_log_record(
                                         writer,
@@ -2125,12 +2194,15 @@ fn helper_start(
             if let Ok(slot) = current.lock()
                 && finished.is_some()
                 && slot.is_none()
-                && let Err(error) = crate::rt::wfp::set_dns_shield(false, None, None)
             {
-                send_log_record(
-                    &writer,
-                    &DiagError::new(Diag::new(Key::HelperDnsShieldTeardownFailed)).caused_by(error),
-                );
+                match crate::rt::wfp::set_dns_shield(false, None, None) {
+                    Ok(()) => release_dns_takeover(&writer),
+                    Err(error) => send_log_record(
+                        &writer,
+                        &DiagError::new(Diag::new(Key::HelperDnsShieldTeardownFailed))
+                            .caused_by(error),
+                    ),
+                }
             }
             // Dropping the exact exited child removes only the allowlisted
             // non-reparse secure-stage entries (payload locks were released
@@ -2142,6 +2214,24 @@ fn helper_start(
                 &serde_json::json!({"event":"state","state":"stopped","pid":pid}),
             );
         });
+    }
+}
+
+/// Undo this session's system-DNS takeover and delete its record. Runs
+/// wherever the DNS shield is removed: the two halves guard the same
+/// resolver, so they start and stop together. Best-effort — a failure keeps
+/// the record, and the next helper start repairs from it.
+fn release_dns_takeover(writer: &Arc<Mutex<File>>) {
+    match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
+        Ok(Some(0)) | Ok(None) => {}
+        Ok(Some(adapters)) => send_log(
+            writer,
+            Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
+        ),
+        Err(error) => send_log_record(
+            writer,
+            &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
+        ),
     }
 }
 

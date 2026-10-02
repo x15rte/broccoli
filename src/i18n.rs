@@ -1994,6 +1994,15 @@ keys! {
     HelperShieldNotInstalledAfterExit 1,
     HelperDnsShieldTeardownFailed 0,
     HelperDnsShieldNotEngaged 0,
+    HelperDnsTakeoverApplied 1,
+    HelperDnsTakeoverNotEngaged 0,
+    HelperDnsTakeoverRestored 1,
+    HelperDnsTakeoverRestoreFailed 0,
+    HelperDnsTakeoverRepaired 1,
+    DnsTakeoverEnumerateFailed 0,
+    DnsTakeoverRegisterFailed 1,
+    DnsTakeoverWin32Code 1,
+    DnsTakeoverRecordFailed 0,
     HelperTunAdapterMissing 1,
     HelperConfigNoTunAdapter 0,
     HelperTunCleanupConfigReadFailed 0,
@@ -5611,6 +5620,32 @@ mod en {
             }
             Key::HelperDnsShieldNotEngaged => {
                 "The elevated helper could not install the DNS shield"
+            }
+            Key::HelperDnsTakeoverApplied => {
+                "The elevated helper pointed the DNS servers of {} adapters at the tunnel DNS."
+            }
+            Key::HelperDnsTakeoverNotEngaged => {
+                "The elevated helper could not take the system DNS over"
+            }
+            Key::HelperDnsTakeoverRestored => {
+                "The elevated helper restored the DNS servers of {} adapters."
+            }
+            Key::HelperDnsTakeoverRestoreFailed => {
+                "The elevated helper could not restore the system DNS servers"
+            }
+            Key::HelperDnsTakeoverRepaired => {
+                "The elevated helper restored the DNS servers of {} adapters from a previous \
+                 session."
+            }
+            Key::DnsTakeoverEnumerateFailed => {
+                "The elevated helper could not read the adapter list for the DNS takeover"
+            }
+            Key::DnsTakeoverRegisterFailed => {
+                "The elevated helper could not change the DNS servers of adapter {}"
+            }
+            Key::DnsTakeoverWin32Code => "Windows reports error code {}.",
+            Key::DnsTakeoverRecordFailed => {
+                "The elevated helper could not read or write the DNS takeover record file"
             }
             Key::HelperTunAdapterMissing => {
                 "TUN adapter {} never appeared, so the elevated helper could not resolve its \
