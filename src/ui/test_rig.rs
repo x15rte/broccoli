@@ -20,6 +20,7 @@ use crate::rt::{
     CoreCmd, CorePhase, DownloadState, JobKind, LatencyProbeResult, OutboundStatusView, StatsTick,
 };
 use crate::sys::selfupd::UpdateCheckState;
+use crate::ui::logs::LogLine;
 use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
 use egui_kittest::Harness;
 use std::collections::VecDeque;
@@ -59,7 +60,7 @@ pub(crate) struct UiTestRig {
     pub(crate) stats: Option<StatsTick>,
     pub(crate) stats_history: VecDeque<StatsTick>,
     pub(crate) observatory: Vec<OutboundStatusView>,
-    pub(crate) logs: VecDeque<(bool, String)>,
+    pub(crate) logs: VecDeque<LogLine>,
     /// Monotonic push count mirroring the app's `LogBuffer::generation`
     /// [`UiTestRig::push_log`] keeps it in step with the ring.
     /// Tests that push lines while a Logs screen is live must route the
@@ -233,7 +234,11 @@ impl UiTestRig {
     /// stale.
     pub(crate) fn push_log(&mut self, from_core: bool, line: String) {
         self.logs_generation += 1;
-        self.logs.push_back((from_core, line));
+        self.logs.push_back(LogLine {
+            text: line,
+            from_core,
+            level: None,
+        });
     }
 
     /// Record a model edit between frames through the shell's own mutation

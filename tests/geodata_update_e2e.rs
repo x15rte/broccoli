@@ -97,8 +97,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// return the pid. The needle is built from the runtime's own message key (its
 /// text up to the `{}` placeholder), so a wording change cannot silently make
 /// every start look missing while this wait keeps timing out. `CoreEvt::AppLog`
-/// carries the rendered sentence itself; the log view's `[broccoli] ` prefix is
-/// added by the GUI, not here.
+/// carries the rendered sentence itself; the severity gutter is added by the
+/// Logs screen, not here.
 fn parse_started_pid(line: &str) -> Option<u32> {
     let sentence = broccoli::i18n::t(
         broccoli::model::settings::Language::En,

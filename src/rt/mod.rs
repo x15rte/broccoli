@@ -459,8 +459,8 @@ pub enum CoreEvt {
         line: String,
         from_core: bool,
     },
-    /// One runtime-authored message: the app renders it with the active
-    /// language and adds the `[broccoli] ` log prefix at drain time.
+    /// One runtime-authored message: the app renders it in the active
+    /// language and shows it under the gutter its key's level declares.
     AppLog(AppMessage),
     Stats(StatsTick),
     Observatory(Vec<OutboundStatusView>),
@@ -1431,18 +1431,19 @@ impl Runtime {
         self.release_exclusive();
     }
 
-    /// Queue one raw passthrough log line: complete text, `[broccoli] `
-    /// prefixed here. Runtime-authored prose goes through [`Runtime::app_log`]
-    /// instead, so it renders in the display language.
+    /// Queue one raw passthrough log line: complete text. Runtime-authored
+    /// prose goes through [`Runtime::app_log`] instead, so it renders in the
+    /// display language and its key supplies the level; a line with no key
+    /// carries no severity, and the Logs screen shows it verbatim.
     fn log(&mut self, msg: &str) {
         self.emit(CoreEvt::Log {
-            line: format!("[broccoli] {msg}"),
+            line: msg.to_string(),
             from_core: false,
         });
     }
 
     /// Queue one runtime-authored message: the app renders it in the active
-    /// language and adds the `[broccoli] ` log prefix at drain time.
+    /// language and shows it under the gutter its key's level declares.
     fn app_log(&mut self, message: impl Into<AppMessage>) {
         self.drain_pending_bookends();
         self.events.app_log(message);
@@ -7156,10 +7157,8 @@ mod tests {
         let emitted: Vec<_> = events.try_iter().collect();
         let lines = log_lines(&emitted);
         assert!(
-            lines
-                .iter()
-                .any(|line| *line == format!("[broccoli] {expected}")),
-            "the failure must reach the log through the [broccoli] path with its tail, got: {lines:?}"
+            lines.iter().any(|line| *line == expected),
+            "the failure must reach the log with its tail, got: {lines:?}"
         );
         assert!(
             lines.iter().any(|line| line.contains("[stderr] boom")),
@@ -7191,10 +7190,10 @@ mod tests {
 
         flush_bookends(&mut runtime);
         let emitted: Vec<_> = events.try_iter().collect();
-        let expected = format!("[broccoli] {}", t(Language::En, Key::ProbeNoProfiles));
+        let expected = t(Language::En, Key::ProbeNoProfiles);
         assert!(
-            log_lines(&emitted).iter().any(|line| *line == expected),
-            "the no-profiles rejection must reach the log through the [broccoli] path, got: {emitted:?}"
+            log_lines(&emitted).contains(&expected),
+            "the no-profiles rejection must reach the log, got: {emitted:?}"
         );
         assert!(
             emitted.iter().any(|event| matches!(
@@ -7247,9 +7246,7 @@ mod tests {
         let emitted: Vec<_> = events.try_iter().collect();
         let lines = log_lines(&emitted);
         assert!(
-            lines
-                .iter()
-                .any(|line| *line == format!("[broccoli] {expected}")),
+            lines.contains(&expected.as_str()),
             "the warn line must name the dead server's verdict, got: {lines:?}"
         );
     }
@@ -7306,9 +7303,7 @@ mod tests {
             "premise: the summary appends the wall exactly once, got: {expected}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|line| *line == format!("[broccoli] {expected}")),
+            lines.contains(&expected.as_str()),
             "the warn line must append the run's diagnostics wall once, got: {lines:?}"
         );
     }
@@ -7343,9 +7338,7 @@ mod tests {
         let emitted: Vec<_> = events.try_iter().collect();
         let lines = log_lines(&emitted);
         assert!(
-            lines
-                .iter()
-                .any(|line| *line == format!("[broccoli] {expected}")),
+            lines.contains(&expected.as_str()),
             "the warn line must name the dead server's verdict, got: {lines:?}"
         );
         assert!(
@@ -7384,9 +7377,7 @@ mod tests {
         let emitted: Vec<_> = events.try_iter().collect();
         let lines = log_lines(&emitted);
         assert!(
-            lines
-                .iter()
-                .any(|line| *line == format!("[broccoli] {expected}")),
+            lines.contains(&expected.as_str()),
             "a single-probe dead verdict must log the same warn line shape, got: {lines:?}"
         );
     }

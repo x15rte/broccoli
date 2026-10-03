@@ -50,16 +50,59 @@
 //! runs it: a lint in the frame loop would cost frames for a verdict no user
 //! reads.
 //!
+//! # Log lines
+//!
+//! A key whose text is one line of the Logs screen is declared
+//! `(Log, Level, count)` in `keys!` — `RtLogConfigApplied (Log, Info, 0)` —
+//! and follows the rules below instead of the prose rules above. A log line is
+//! scanned down a column while the session runs, not read once like a dialog,
+//! so every rule serves that scan:
+//!
+//! - One event per line. The event comes first, in lowercase (`connect
+//!   rejected: …`), and a colon introduces its detail. A semicolon joins the
+//!   consequence of the event (`TUN core alive; stopping it now`), where the
+//!   prose rules would have written a second sentence.
+//! - No period, exclamation mark, or question mark. The line is an entry, not
+//!   a sentence. A period inside an address literal (`127.0.0.1`) is not
+//!   punctuation, and neither is one inside a `{}` placeholder.
+//! - No actor. The reader of the app's log knows the app is the actor, so "the
+//!   app" is padding; the core and the helper are other actors and keep their
+//!   names.
+//! - The first word is lowercase unless it is a technical name (`TUN`, `Xray`,
+//!   `DNS`).
+//! - At most 100 characters; the lint reports an advisory past 80.
+//! - Every value the emitter holds. A line that says only that something
+//!   failed while the error text is in hand is a defect, not brevity: a
+//!   failure line carries its cause through the message chain, which renders
+//!   as `headline: cause`, or through a placeholder.
+//! - No contractions, no marketing adjectives, no soft two-word verbs, no
+//!   action nouns: the same bans as the prose rules.
+//!
+//! The rules read the key's own text, so a value substituted into the line
+//! keeps its own punctuation — captured core output is passthrough wherever it
+//! lands.
+//!
+//! The level is part of the declaration, never a per-call choice:
+//! [`LogLevel::Info`] for a normal step of the session, [`LogLevel::Warn`] for
+//! a degraded condition the app worked around, [`LogLevel::Error`] for a
+//! failure. The Logs screen shows that level and the source as a gutter in
+//! front of the line, and the text copied out of the screen carries the same
+//! token as `app.log` (`ERROR broccoli: connect rejected: …`). A passthrough
+//! line has no declared level and shows verbatim.
+//!
 //! # Adding a string
 //!
 //! 1. Add one [`Key`] variant.
 //! 2. Add its English arm in `mod en`. The match is exhaustive, so a
 //!    forgotten arm is a compile error.
 //! 3. Use `{}` placeholders for the values, in order; [`t_fmt`] fills them.
-//!    Declare their count beside the key in `keys!`: every fill site is
-//!    written against that count, and the corpus lint compares it with the
-//!    English text, so a wording change cannot move it silently.
-//! 4. Never splice one sentence out of two [`t`] results. Every combination
+//!    Declare their count beside the key in `keys!` — `Variant 2` — so every
+//!    fill site is written against that count, and the corpus lint compares it
+//!    with the English text: a wording change cannot move it silently.
+//! 4. For a line the Logs screen shows, declare the row `(Log, Level, count)`
+//!    instead and write it to the log rules above. A key the ring never shows
+//!    stays a bare count and keeps the prose rules.
+//! 5. Never splice one sentence out of two [`t`] results. Every combination
 //!    gets its own key, so a translation never inherits English word order.
 //!
 //! # Terminology
@@ -93,11 +136,92 @@ use crate::model::settings::Language;
 use crate::model::stream::Network;
 use crate::model::validation::{ValidationCode, ValidationIssue};
 
-/// Declares [`Key`], [`ALL`], and [`Key::arity`] from one variant list, where
-/// every row carries the placeholder count of its English text, so the enum,
-/// the list, and the counts cannot drift apart.
+/// The writing-rule profile a key's English text is authored to.
+///
+/// A UI key is read once as prose — a label, a hint, a dialog sentence — and
+/// follows the writing rules of the shipped standard. A log key is one line
+/// of a scanned column and follows the log rules instead. The class is
+/// declared on the key's row in `keys!`, never inferred from its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextClass {
+    /// UI prose: labels, hints, dialogs, diagnostics-wall text.
+    Ui,
+    /// One Logs-screen line.
+    Log,
+}
+
+/// Severity of one log line, in filter order.
+///
+/// A log key declares its level on its `keys!` row. Text the app does not
+/// author — captured core output — carries no declared level, and the Logs
+/// screen reads its severity from the line itself instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    /// Diagnostic detail.
+    Debug,
+    /// A normal step of the session.
+    Info,
+    /// A degraded or unexpected condition the app worked around.
+    Warn,
+    /// A failure.
+    Error,
+}
+
+impl LogLevel {
+    /// The level's fixed-width tag, the one the Logs screen's gutter and the
+    /// `app.log` records carry.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+/// Placeholder count of one `keys!` row: a bare literal for a UI key, or the
+/// count inside the `(Log, Level, count)` spec of a log key.
+macro_rules! key_arity {
+    ($arity:literal) => {
+        $arity
+    };
+    ((Log, $level:ident, $arity:literal)) => {
+        $arity
+    };
+}
+
+/// Text class of one `keys!` row: `(Log, Level, count)` is a log key, a bare
+/// placeholder count is a UI key.
+macro_rules! key_class {
+    ($arity:literal) => {
+        TextClass::Ui
+    };
+    ((Log, $level:ident, $arity:literal)) => {
+        TextClass::Log
+    };
+}
+
+/// Declared level of one `keys!` row: `(Log, Level, count)` names it, a UI key
+/// has none.
+macro_rules! key_level {
+    ($arity:literal) => {
+        None
+    };
+    ((Log, $level:ident, $arity:literal)) => {
+        Some(LogLevel::$level)
+    };
+}
+
+/// Declares [`Key`], [`ALL`], [`Key::arity`], [`Key::class`], and
+/// [`Key::level`] from one variant list, where every row carries the
+/// placeholder count of its English text — and, for a log key, its level —
+/// so the enum, the list, and the counts cannot drift apart.
+///
+/// A row is `Variant 2` for a UI key and `Variant (Log, Info, 2)` for a log
+/// key: one token, so the two shapes match the same pattern.
 macro_rules! keys {
-    ( $( $(#[$meta:meta])* $variant:ident $arity:literal ),* $(,)? ) => {
+    ( $( $(#[$meta:meta])* $variant:ident $spec:tt ),* $(,)? ) => {
         /// Every user-facing string in the UI, listed once here with the
         /// placeholder count of its English text. Removing a key (or adding
         /// one without updating every locale table) fails to compile.
@@ -118,7 +242,24 @@ macro_rules! keys {
             /// count silently.
             pub fn arity(self) -> usize {
                 match self {
-                    $( Key::$variant => $arity, )*
+                    $( Key::$variant => key_arity!($spec), )*
+                }
+            }
+
+            /// The writing-rule profile this key's English text is authored
+            /// to: [`TextClass::Log`] for a row declared `(Log, Level, count)`,
+            /// [`TextClass::Ui`] for every other row.
+            pub fn class(self) -> TextClass {
+                match self {
+                    $( Key::$variant => key_class!($spec), )*
+                }
+            }
+
+            /// The severity this key's log line carries, or `None` for a UI
+            /// key.
+            pub fn level(self) -> Option<LogLevel> {
+                match self {
+                    $( Key::$variant => key_level!($spec), )*
                 }
             }
         }
@@ -271,12 +412,11 @@ keys! {
     TopbarAppVersion 1,
     TopbarStateLoadFailed 0,
     AppOperationInProgress 1,
-    LogCoreError 1,
-    LogConnectBlocked 1,
-    LogDisconnectBlocked 1,
-    LogBroccoliMessage 1,
-    LogOpenStateFolderFailed 1,
-    LogOpenCoreFolderFailed 1,
+    LogCoreError (Log, Error, 1),
+    LogConnectBlocked (Log, Error, 1),
+    LogBroccoliMessage (Log, Error, 1),
+    LogOpenStateFolderFailed (Log, Error, 1),
+    LogOpenCoreFolderFailed (Log, Error, 1),
     CreateProfileDirsFailed 1,
     SaveServersFailed 1,
     SaveSettingsFailed 1,
@@ -1557,30 +1697,30 @@ keys! {
     SettingsGeodataCronInvalid 1,
     // Stray strings routed out of consumer code: runtime log lines and
     // frames, probe sentences, and file-dialog strings.
-    RtLogHelperDisconnected 0,
-    RtLogCleanUpLaunch 0,
-    RtLogCleanUpDone 2,
-    RtLogCleanUpNothing 0,
-    RtLogCleanUpTimeout 0,
-    RtLogCleanUpFailed 0,
-    RtLogConnectRejectedStopping 0,
-    RtLogConnectIgnoredRunning 0,
-    RtLogTransportChangeRestart 0,
-    RtLogTunModeOn 0,
-    RtLogTunModeOff 0,
-    RtLogCoreStartedHelper 0,
-    RtLogConfigApplied 0,
-    RtLogInternalStartRejected 0,
-    RtLogHelperLaunchWait 0,
-    RtLogTunInboundClosed 0,
-    RtLogTunCloseTimeout 0,
-    RtLogTunCoreExited 0,
-    RtLogTunCoreAlive 0,
-    RtLogDnsFlushExit 0,
-    RtLogCoreReady 0,
-    RtLogExitNotReported 0,
-    RtLogSuppressedOne 0,
-    RtLogSuppressedMany 1,
+    RtLogHelperDisconnected (Log, Warn, 0),
+    RtLogCleanUpLaunch (Log, Info, 0),
+    RtLogCleanUpDone (Log, Info, 2),
+    RtLogCleanUpNothing (Log, Info, 0),
+    RtLogCleanUpTimeout (Log, Error, 0),
+    RtLogCleanUpFailed (Log, Error, 0),
+    RtLogConnectRejectedStopping (Log, Warn, 0),
+    RtLogConnectIgnoredRunning (Log, Warn, 0),
+    RtLogTransportChangeRestart (Log, Info, 0),
+    RtLogTunModeOn (Log, Info, 0),
+    RtLogTunModeOff (Log, Info, 0),
+    RtLogCoreStartedHelper (Log, Info, 0),
+    RtLogConfigApplied (Log, Info, 0),
+    RtLogInternalStartRejected (Log, Warn, 0),
+    RtLogHelperLaunchWait (Log, Info, 0),
+    RtLogTunInboundClosed (Log, Info, 0),
+    RtLogTunCloseTimeout (Log, Warn, 0),
+    RtLogTunCoreExited (Log, Info, 0),
+    RtLogTunCoreAlive (Log, Warn, 0),
+    RtLogDnsFlushExit (Log, Warn, 0),
+    RtLogCoreReady (Log, Info, 0),
+    RtLogExitNotReported (Log, Warn, 0),
+    RtLogSuppressedOne (Log, Warn, 0),
+    RtLogSuppressedMany (Log, Warn, 1),
     RtPhaseHelperUnavailable 0,
     RtPhaseHelperConfigLost 0,
     RtPhaseHelperStartFailed 0,
@@ -1598,8 +1738,8 @@ keys! {
     RtFrameNoCoreOutput 0,
     RtFrameCandidateReadyTimeout 1,
     RtFrameUpdatedCoreReadyTimeout 1,
-    RtFrameCommandRejectedBusy 1,
-    RtFrameBackgroundFailed 1,
+    RtFrameCommandRejectedBusy (Log, Warn, 1),
+    RtFrameBackgroundFailed (Log, Error, 1),
     ProbeExitStatus 1,
     ProbeExitNoStatus 0,
     ProbeWaitFailed 1,
@@ -1800,27 +1940,27 @@ keys! {
     IntegrityRouteIp 2,
     IntegrityRouteNetwork 1,
     IntegrityRouteAttributeKey 1,
-    RtLogOperationCancelled 2,
-    RtLogUpdateFinishedAfterStop 0,
-    RtLogApiEndpointCommitted 1,
-    RtLogCoreStartedDirect 1,
-    RtLogTunGracefulCloseFailed 1,
-    RtLogTunCoreStopWindow 0,
-    RtLogHelperStopFailed 0,
-    RtLogDnsFlushFailed 1,
-    RtLogCoreExitBackoff 3,
-    RtLogDnsInListenerAdded 2,
-    RtLogDnsInListenerNotAdded 1,
-    RtLogUpdateCancelRequested 1,
-    RtLogValidationCancelRequested 1,
-    RtLogUpdateAckFailed 0,
-    RtLogPayloadsVerified 1,
-    RtLogSpawnConfigRegenerated 0,
-    RtLogSpawnConfigCommitted 0,
-    RtLogSpawnConfigGate 0,
-    RtLogSpawnConfigReplay 0,
-    RtLogHealthGateCompleted 0,
-    RtLogConfigKeptInstalledCore 1,
+    RtLogOperationCancelled (Log, Warn, 2),
+    RtLogUpdateFinishedAfterStop (Log, Warn, 0),
+    RtLogApiEndpointCommitted (Log, Info, 1),
+    RtLogCoreStartedDirect (Log, Info, 1),
+    RtLogTunGracefulCloseFailed (Log, Warn, 1),
+    RtLogTunCoreStopWindow (Log, Warn, 0),
+    RtLogHelperStopFailed (Log, Error, 0),
+    RtLogDnsFlushFailed (Log, Warn, 1),
+    RtLogCoreExitBackoff (Log, Warn, 3),
+    RtLogDnsInListenerAdded (Log, Info, 2),
+    RtLogDnsInListenerNotAdded (Log, Warn, 1),
+    RtLogUpdateCancelRequested (Log, Warn, 1),
+    RtLogValidationCancelRequested (Log, Warn, 1),
+    RtLogUpdateAckFailed (Log, Warn, 0),
+    RtLogPayloadsVerified (Log, Info, 1),
+    RtLogSpawnConfigRegenerated (Log, Info, 0),
+    RtLogSpawnConfigCommitted (Log, Info, 0),
+    RtLogSpawnConfigGate (Log, Info, 0),
+    RtLogSpawnConfigReplay (Log, Warn, 0),
+    RtLogHealthGateCompleted (Log, Info, 0),
+    RtLogConfigKeptInstalledCore (Log, Error, 1),
     RtFramePreviewReadFailed 0,
     RtPhaseHelperLaunchFailed 0,
     RtFrameApplyRejected 0,
@@ -1830,19 +1970,19 @@ keys! {
     RtFrameUpdatedCoreSpawnRestored 0,
     RtFrameUpdatedCoreSpawnNoLastGood 0,
     RtFrameUpdatedCoreSpawnRollbackFailed 1,
-    RtFrameRolledBackLastGood 1,
-    RtFrameRollbackFailed 1,
-    RtFrameCoreRestored 1,
-    RtFrameCoreNoLastGood 1,
-    RtFrameCoreRollbackFailed 1,
+    RtFrameRolledBackLastGood (Log, Error, 1),
+    RtFrameRollbackFailed (Log, Error, 1),
+    RtFrameCoreRestored (Log, Error, 1),
+    RtFrameCoreNoLastGood (Log, Error, 1),
+    RtFrameCoreRollbackFailed (Log, Error, 1),
     RtFrameApplyCancelled 1,
     RtFrameConfigTestCancelled 1,
     RtFrameProfileValidationCancelled 1,
-    RtFrameConfigRollbackCancelled 1,
-    RtFrameCoreRollbackCancelled 1,
-    RtFrameCandidateRetryBindRace 3,
-    RtFrameCandidateRetryTeardownRace 3,
-    RtFrameUpdateRetryBindRace 3,
+    RtFrameConfigRollbackCancelled (Log, Error, 1),
+    RtFrameCoreRollbackCancelled (Log, Error, 1),
+    RtFrameCandidateRetryBindRace (Log, Warn, 3),
+    RtFrameCandidateRetryTeardownRace (Log, Warn, 3),
+    RtFrameUpdateRetryBindRace (Log, Warn, 3),
     RtFrameUpdateStopCoreFirst 0,
     RtFrameUpdateHealthCheckPending 0,
     RtFrameUpdatedCoreReadyTimeoutApi 2,
@@ -1997,28 +2137,28 @@ keys! {
     HelperWireConfigEncodingInvalid 0,
     HelperWirePortInvalid 0,
     HelperConfigTooLarge 2,
-    HelperMalformedStartCommand 0,
-    HelperStageValidated 1,
-    HelperStageRefused 0,
-    HelperCoreSpawnFailed 0,
-    HelperJobSetupFailed 0,
-    HelperShieldRemovedAfterExit 1,
-    HelperShieldNotInstalledAfterExit 1,
-    HelperDnsShieldTeardownFailed 0,
-    HelperDnsShieldNotEngaged 0,
-    HelperDnsTakeoverApplied 1,
-    HelperDnsTakeoverNotEngaged 0,
-    HelperDnsTakeoverRestored 1,
-    HelperDnsTakeoverRestoreFailed 0,
-    HelperDnsTakeoverRepaired 1,
+    HelperMalformedStartCommand (Log, Error, 0),
+    HelperStageValidated (Log, Info, 1),
+    HelperStageRefused (Log, Error, 0),
+    HelperCoreSpawnFailed (Log, Error, 0),
+    HelperJobSetupFailed (Log, Error, 0),
+    HelperShieldRemovedAfterExit (Log, Warn, 1),
+    HelperShieldNotInstalledAfterExit (Log, Warn, 1),
+    HelperDnsShieldTeardownFailed (Log, Error, 0),
+    HelperDnsShieldNotEngaged (Log, Error, 0),
+    HelperDnsTakeoverApplied (Log, Info, 1),
+    HelperDnsTakeoverNotEngaged (Log, Error, 0),
+    HelperDnsTakeoverRestored (Log, Info, 1),
+    HelperDnsTakeoverRestoreFailed (Log, Error, 0),
+    HelperDnsTakeoverRepaired (Log, Warn, 1),
     DnsTakeoverEnumerateFailed 0,
     DnsTakeoverRegisterFailed 1,
     DnsTakeoverWin32Code 1,
     DnsTakeoverRecordFailed 0,
-    HelperTunAdapterMissing 1,
-    HelperConfigNoTunAdapter 0,
-    HelperTunCleanupConfigReadFailed 0,
-    HelperTunCleanupTimeout 1,
+    HelperTunAdapterMissing (Log, Error, 1),
+    HelperConfigNoTunAdapter (Log, Error, 0),
+    HelperTunCleanupConfigReadFailed (Log, Error, 0),
+    HelperTunCleanupTimeout (Log, Warn, 1),
     HelperStagedValidationSpawnFailed 0,
     HelperStagedValidationIsolateFailed 0,
     HelperStagedConfigRejected 1,
@@ -2809,12 +2949,11 @@ mod en {
             Key::TopbarAppVersion => "app {}",
             Key::TopbarStateLoadFailed => "the app could not load the state file",
             Key::AppOperationInProgress => "{} operation in progress",
-            Key::LogCoreError => "[broccoli] core error: {}",
-            Key::LogConnectBlocked => "[broccoli] connect blocked: {}",
-            Key::LogDisconnectBlocked => "[broccoli] disconnect blocked: {}",
-            Key::LogBroccoliMessage => "[broccoli] {}",
-            Key::LogOpenStateFolderFailed => "[broccoli] failed to open state folder: {}",
-            Key::LogOpenCoreFolderFailed => "[broccoli] failed to open core folder: {}",
+            Key::LogCoreError => "core error: {}",
+            Key::LogConnectBlocked => "connect blocked: {}",
+            Key::LogBroccoliMessage => "{}",
+            Key::LogOpenStateFolderFailed => "failed to open state folder: {}",
+            Key::LogOpenCoreFolderFailed => "failed to open core folder: {}",
             Key::CreateProfileDirsFailed => "failed to create profile directories: {}",
             Key::SaveServersFailed => "failed to save servers.json: {}",
             Key::SaveSettingsFailed => "failed to save settings.json: {}",
@@ -4769,57 +4908,44 @@ mod en {
             Key::SettingsGeodataUrlInvalid => "geodata {}: {}",
             Key::SettingsGeodataCronInvalid => "geodata: {}",
             // Runtime diagnostics and file dialogs, rendered at the display boundary.
-            Key::RtLogHelperDisconnected => "The elevated helper disconnected.",
+            Key::RtLogHelperDisconnected => "elevated helper disconnected",
             Key::RtLogCleanUpLaunch => {
-                "The app cleans up the network state. Approve the administrator prompt."
+                "network state cleanup starting; approve the administrator prompt"
             }
             Key::RtLogCleanUpDone => {
-                "The app cleaned up the network state and restored the DNS servers of {} adapters. \
-                 It removed {} leftover adapters."
+                "network state cleaned up: DNS of {} adapters restored, {} adapters removed"
             }
-            Key::RtLogCleanUpNothing => "The network state needs no cleanup.",
+            Key::RtLogCleanUpNothing => "network state needs no cleanup",
             Key::RtLogCleanUpTimeout => {
-                "The network state cleanup timed out. The helper did not report back."
+                "network state cleanup timed out; the helper did not report back"
             }
-            Key::RtLogCleanUpFailed => "The app could not clean up the network state.",
-            Key::RtLogConnectRejectedStopping => {
-                "The app rejected the connect because a core stop is still in progress."
-            }
-            Key::RtLogConnectIgnoredRunning => {
-                "The app ignored the connect because the core is already running."
-            }
-            Key::RtLogTransportChangeRestart => "The transport changed. The app restarts the core.",
-            Key::RtLogTunModeOn => "The app enabled TUN. The core will run elevated.",
-            Key::RtLogTunModeOff => "The app disabled TUN. The core will run as a direct child.",
-            Key::RtLogCoreStartedHelper => "The elevated helper started the core.",
-            Key::RtLogConfigApplied => "The app applied the config.",
+            Key::RtLogCleanUpFailed => "network state cleanup failed",
+            Key::RtLogConnectRejectedStopping => "connect rejected: a core stop is in progress",
+            Key::RtLogConnectIgnoredRunning => "connect ignored: the core is already running",
+            Key::RtLogTransportChangeRestart => "transport changed; restarting the core",
+            Key::RtLogTunModeOn => "TUN enabled; the core runs elevated",
+            Key::RtLogTunModeOff => "TUN disabled; the core runs as a direct child",
+            Key::RtLogCoreStartedHelper => "elevated helper started the core",
+            Key::RtLogConfigApplied => "config applied",
             Key::RtLogInternalStartRejected => {
-                "The app rejected an internal start because the previous core process is still \
-                 alive."
+                "internal start rejected: the previous core process is still alive"
             }
             Key::RtLogHelperLaunchWait => {
-                "The app starts the elevated helper and waits for the authenticated pipe."
+                "starting the elevated helper; waiting for the authenticated pipe"
             }
-            Key::RtLogTunInboundClosed => "The TUN inbound closed cleanly.",
-            Key::RtLogTunCloseTimeout => {
-                "The TUN graceful close timed out. The app uses the process fallback."
-            }
-            Key::RtLogTunCoreExited => {
-                "The TUN core exited on its own during the wintun create window."
-            }
+            Key::RtLogTunInboundClosed => "TUN inbound closed cleanly",
+            Key::RtLogTunCloseTimeout => "TUN graceful close timed out; using the process fallback",
+            Key::RtLogTunCoreExited => "TUN core exited on its own during the wintun create window",
             Key::RtLogTunCoreAlive => {
-                "The TUN core is still alive after the wintun create window. The app stops the \
-                 core now."
+                "TUN core alive after the wintun create window; stopping it now"
             }
-            Key::RtLogDnsFlushExit => {
-                "ipconfig exited with a non-zero status during the DNS cache flush."
-            }
-            Key::RtLogCoreReady => "The core is ready.",
+            Key::RtLogDnsFlushExit => "ipconfig exited non-zero during the DNS cache flush",
+            Key::RtLogCoreReady => "core ready",
             Key::RtLogExitNotReported => {
-                "The core did not report its exit in time. The app forces the final termination."
+                "core did not report its exit in time; forcing the final termination"
             }
-            Key::RtLogSuppressedOne => "The app suppressed 1 log line.",
-            Key::RtLogSuppressedMany => "The app suppressed {} log lines.",
+            Key::RtLogSuppressedOne => "1 log line suppressed",
+            Key::RtLogSuppressedMany => "{} log lines suppressed",
             Key::RtPhaseHelperUnavailable => "The elevated helper is unavailable",
             Key::RtPhaseHelperConfigLost => {
                 "The app cannot start the helper because the validated config bytes are gone."
@@ -4858,9 +4984,9 @@ mod en {
                 "The updated core did not become ready within {} s."
             }
             Key::RtFrameCommandRejectedBusy => {
-                "The app rejected the command because a {} operation is already in progress."
+                "command rejected: a {} operation is already in progress"
             }
-            Key::RtFrameBackgroundFailed => "A background operation failed: {}",
+            Key::RtFrameBackgroundFailed => "background operation failed: {}",
             Key::ProbeExitStatus => "The probe core exited with status {}",
             Key::ProbeExitNoStatus => "The probe core exited without a status code.",
             Key::ProbeWaitFailed => "The app could not wait for the probe core: {}",
@@ -5217,66 +5343,54 @@ mod en {
             Key::IntegrityRouteIp => "The {} IP address {} is not valid.",
             Key::IntegrityRouteNetwork => "The route test does not support the network {}.",
             Key::IntegrityRouteAttributeKey => "The attribute key {} is empty.",
-            Key::RtLogOperationCancelled => "The app cancelled the {} operation: {}",
+            Key::RtLogOperationCancelled => "{} operation cancelled: {}",
             Key::RtLogUpdateFinishedAfterStop => {
-                "The core update finished after the stop request. The updated core is on disk and \
-                 the app health-checks it on the next start."
+                "core update finished after the stop request; health-checked on the next start"
             }
-            Key::RtLogApiEndpointCommitted => "The app committed the API endpoint as 127.0.0.1:{}.",
-            Key::RtLogCoreStartedDirect => "The app started the core as a direct child (pid {}).",
+            Key::RtLogApiEndpointCommitted => "control plane endpoint committed: 127.0.0.1:{}",
+            Key::RtLogCoreStartedDirect => "core started as a direct child (pid {})",
             Key::RtLogTunGracefulCloseFailed => {
-                "The TUN graceful close failed. The app uses the process fallback: {}"
+                "TUN graceful close failed; using the process fallback: {}"
             }
             Key::RtLogTunCoreStopWindow => {
-                "The TUN core did not answer the graceful close. The app waits out the wintun create \
-                 window before the stop to prevent a PnP wedge."
+                "TUN close unanswered; waiting out the wintun create window to avoid a PnP wedge"
             }
-            Key::RtLogHelperStopFailed => "The app could not stop the elevated helper",
-            Key::RtLogDnsFlushFailed => "The app could not flush the DNS cache: {}",
+            Key::RtLogHelperStopFailed => "elevated helper stop failed",
+            Key::RtLogDnsFlushFailed => "DNS cache flush failed: {}",
             Key::RtLogCoreExitBackoff => {
-                "The core exited unexpectedly (code {}). The app restarts the core as attempt {} in \
-                 {} ms."
+                "core exited unexpectedly (code {}); restarting as attempt {} in {} ms"
             }
-            Key::RtLogDnsInListenerAdded => "The app added the in-tun DNS listener on {}:{}.",
+            Key::RtLogDnsInListenerAdded => "in-tun DNS listener added on {}:{}",
             Key::RtLogDnsInListenerNotAdded => {
-                "The app did not add the in-tun DNS listener: {}. The listener is best-effort."
+                "in-tun DNS listener not added: {}; the listener is best-effort"
             }
             Key::RtLogUpdateCancelRequested => {
-                "The app requested the cancellation of the core update: {}. The in-flight install \
-                 finishes before the app releases the update slot."
+                "core update cancel requested: {}; the update slot frees after the install"
             }
             Key::RtLogValidationCancelRequested => {
-                "The app requested the cancellation of the profile validation: {}. The in-flight \
-                 validation finishes before the app releases the busy window."
+                "profile validation cancel requested: {}; the busy window frees when it ends"
             }
-            Key::RtLogUpdateAckFailed => {
-                "The core is ready. The app could not acknowledge the core update"
-            }
+            Key::RtLogUpdateAckFailed => "core ready; the update acknowledgement failed",
             Key::RtLogPayloadsVerified => {
-                "The app verified the core payloads against the compiled release pins: {}."
+                "core payloads verified against the compiled release pins: {}"
             }
             Key::RtLogSpawnConfigRegenerated => {
-                "The app starts the core with a configuration regenerated from the saved settings \
-                 and servers."
+                "starting the core with a configuration regenerated from the saved settings"
             }
             Key::RtLogSpawnConfigCommitted => {
-                "The app starts the core with the configuration this session applied and \
-                 validated."
+                "starting the core with the configuration this session applied and validated"
             }
             Key::RtLogSpawnConfigGate => {
-                "The app starts the core with the app-owned health-check configuration."
+                "starting the core with an app-owned health-check configuration"
             }
             Key::RtLogSpawnConfigReplay => {
-                "The app starts the core with the stamp-checked configuration that the rollback \
-                 restored."
+                "starting the core with the stamp-checked configuration the rollback restored"
             }
             Key::RtLogHealthGateCompleted => {
-                "The installed core answered. The app acknowledges the update and stops the \
-                 health-check core."
+                "installed core answered; acknowledging the update and stopping it"
             }
             Key::RtLogConfigKeptInstalledCore => {
-                "The app keeps the installed core. The failure is the configuration, not the \
-                 payload: {}"
+                "installed core kept; the failure is the config, not the payload: {}"
             }
             Key::RtFramePreviewReadFailed => {
                 "The app could not read the active config for the preview"
@@ -5302,36 +5416,30 @@ mod en {
             Key::RtFrameUpdatedCoreSpawnRollbackFailed => {
                 "The core rollback failed after the updated core did not start: {}"
             }
-            Key::RtFrameRolledBackLastGood => {
-                "{} The app rolled back to the last known-good config."
-            }
-            Key::RtFrameRollbackFailed => "{} The rollback failed",
-            Key::RtFrameCoreRestored => "{} The app restored the retained last-good core.",
-            Key::RtFrameCoreNoLastGood => "{} No retained last-good core was available.",
-            Key::RtFrameCoreRollbackFailed => "{} The core rollback failed",
+            Key::RtFrameRolledBackLastGood => "{} rolled back to the last known-good config",
+            Key::RtFrameRollbackFailed => "{} rollback failed",
+            Key::RtFrameCoreRestored => "{} restored the retained last-good core",
+            Key::RtFrameCoreNoLastGood => "{} no retained last-good core was available",
+            Key::RtFrameCoreRollbackFailed => "{} core rollback failed",
             Key::RtFrameApplyCancelled => "The app cancelled the apply: {}",
             Key::RtFrameConfigTestCancelled => "The app cancelled the config test: {}",
             Key::RtFrameProfileValidationCancelled => {
                 "The app cancelled the profile validation: {}"
             }
             Key::RtFrameConfigRollbackCancelled => {
-                "{} The app cancelled the rollback because the old backend exit was not confirmed."
+                "{} config rollback cancelled: the old backend exit was not confirmed"
             }
             Key::RtFrameCoreRollbackCancelled => {
-                "{} The app cancelled the core rollback because the old backend exit was not \
-                 confirmed."
+                "{} core rollback cancelled: the old backend exit was not confirmed"
             }
             Key::RtFrameCandidateRetryBindRace => {
-                "{} The app retries the candidate because of the dns-in bind race. This is attempt \
-                 {} of {}."
+                "{} candidate retry: dns-in bind race, attempt {} of {}"
             }
             Key::RtFrameCandidateRetryTeardownRace => {
-                "{} The app retries the candidate because of the adapter teardown race. This is \
-                 attempt {} of {}."
+                "{} candidate retry: adapter teardown race, attempt {} of {}"
             }
             Key::RtFrameUpdateRetryBindRace => {
-                "{} The app retries the core update because of the dns-in bind race. This is attempt \
-                 {} of {}."
+                "{} core update retry: dns-in bind race, attempt {} of {}"
             }
             Key::RtFrameUpdateStopCoreFirst => "Stop the core first.",
             Key::RtFrameUpdateHealthCheckPending => {
@@ -5632,47 +5740,40 @@ mod en {
                  cap, so the app refuses to start."
             }
             Key::HelperMalformedStartCommand => {
-                "The elevated helper rejected a malformed start command"
+                "elevated helper rejected a malformed start command"
             }
             Key::HelperStageValidated => {
-                "The elevated helper staged and validated the pinned Xray core {}."
+                "elevated helper staged and validated the pinned Xray core {}"
             }
             Key::HelperStageRefused => {
-                "The elevated helper refused to start the core before secure staging"
+                "elevated helper refused to start the core before secure staging"
             }
-            Key::HelperCoreSpawnFailed => "The elevated helper could not start the staged core",
+            Key::HelperCoreSpawnFailed => "elevated helper could not start the staged core",
             Key::HelperJobSetupFailed => {
-                "The elevated helper could not isolate the staged core in a job object"
+                "elevated helper could not isolate the staged core in a job object"
             }
             Key::HelperShieldRemovedAfterExit => {
-                "Core {} exited during the adapter index poll, so the elevated helper removed the \
-                 DNS shield again."
+                "core {} exited during the adapter index poll; the DNS shield was removed again"
             }
             Key::HelperShieldNotInstalledAfterExit => {
-                "Core {} exited during the adapter index poll, so the elevated helper did not \
-                 install the DNS shield."
+                "core {} exited during the adapter index poll; the DNS shield was not installed"
             }
-            Key::HelperDnsShieldTeardownFailed => {
-                "The elevated helper could not remove the DNS shield"
-            }
-            Key::HelperDnsShieldNotEngaged => {
-                "The elevated helper could not install the DNS shield"
-            }
+            Key::HelperDnsShieldTeardownFailed => "elevated helper could not remove the DNS shield",
+            Key::HelperDnsShieldNotEngaged => "elevated helper could not install the DNS shield",
             Key::HelperDnsTakeoverApplied => {
-                "The elevated helper pointed the DNS servers of {} adapters at the tunnel DNS."
+                "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
             }
             Key::HelperDnsTakeoverNotEngaged => {
-                "The elevated helper could not take the system DNS over"
+                "elevated helper could not take the system DNS over"
             }
             Key::HelperDnsTakeoverRestored => {
-                "The elevated helper restored the DNS servers of {} adapters."
+                "elevated helper restored the DNS servers of {} adapters"
             }
             Key::HelperDnsTakeoverRestoreFailed => {
-                "The elevated helper could not restore the system DNS servers"
+                "elevated helper could not restore the system DNS servers"
             }
             Key::HelperDnsTakeoverRepaired => {
-                "The elevated helper restored the DNS servers of {} adapters from a previous \
-                 session."
+                "elevated helper restored the DNS servers of {} adapters from a previous session"
             }
             Key::DnsTakeoverEnumerateFailed => {
                 "The elevated helper could not read the adapter list for the DNS takeover"
@@ -5685,16 +5786,14 @@ mod en {
                 "The elevated helper could not read or write the DNS takeover record file"
             }
             Key::HelperTunAdapterMissing => {
-                "TUN adapter {} never appeared, so the elevated helper could not resolve its \
-                 interface index."
+                "TUN adapter {} never appeared; the helper could not resolve its index"
             }
-            Key::HelperConfigNoTunAdapter => "The staged configuration has no TUN adapter name.",
+            Key::HelperConfigNoTunAdapter => "staged configuration has no TUN adapter name",
             Key::HelperTunCleanupConfigReadFailed => {
-                "The elevated helper could not read the staged configuration for the TUN cleanup"
+                "elevated helper could not read the staged configuration for the TUN cleanup"
             }
             Key::HelperTunCleanupTimeout => {
-                "TUN adapter {} did not finish its cleanup in time. The elevated helper starts the \
-                 core now."
+                "TUN adapter {} cleanup timed out; the helper starts the core now"
             }
             Key::HelperStagedValidationSpawnFailed => {
                 "The elevated helper could not start the staged Xray validation"

@@ -17,11 +17,12 @@
 use broccoli::i18n::{ALL, Key, t};
 use broccoli::model::settings::Language;
 use standard::{
-    EXCEPTIONS, INSTRUCTION_WORD_CAP, RULE_ARITY, RULE_AVOIDED_TERM, RULE_BANNED_TERM,
-    RULE_COMPOUND_TENSE, RULE_CONTRACTION, RULE_IDS, RULE_INSTRUCTION_LENGTH, RULE_NOMINALIZATION,
-    RULE_NOUN_CLUSTER, RULE_PASSIVE, RULE_PLACEHOLDER, RULE_POSSESSIVE, RULE_SEMICOLON,
-    RULE_SENTENCE_LENGTH, SENTENCE_WORD_CAP, advisory_findings, arity_findings, exempt,
-    hard_findings, key_findings,
+    EXCEPTIONS, INSTRUCTION_WORD_CAP, LOG_LINE_ADVISORY_CHARS, LOG_LINE_CHAR_CAP, RULE_ARITY,
+    RULE_AVOIDED_TERM, RULE_BANNED_TERM, RULE_COMPOUND_TENSE, RULE_CONTRACTION, RULE_IDS,
+    RULE_INSTRUCTION_LENGTH, RULE_LOG_ACTOR, RULE_LOG_CAPITALIZATION, RULE_LOG_LENGTH,
+    RULE_LOG_TERMINATOR, RULE_NOMINALIZATION, RULE_NOUN_CLUSTER, RULE_PASSIVE, RULE_PLACEHOLDER,
+    RULE_POSSESSIVE, RULE_SEMICOLON, RULE_SENTENCE_LENGTH, SENTENCE_WORD_CAP, advisory_findings,
+    arity_findings, exempt, hard_findings, key_findings, log_advisory_findings, log_hard_findings,
 };
 
 #[path = "common/standard.rs"]
@@ -96,6 +97,102 @@ fn advisory_rules(text: &str) -> Vec<&'static str> {
         .iter()
         .map(|finding| finding.rule)
         .collect()
+}
+
+/// The rule ids the log hard checks report for one string.
+fn log_hard_rules(text: &str) -> Vec<&'static str> {
+    log_hard_findings(text)
+        .iter()
+        .map(|finding| finding.rule)
+        .collect()
+}
+
+/// The rule ids the log advisory checks report for one string.
+fn log_advisory_rules(text: &str) -> Vec<&'static str> {
+    log_advisory_findings(text)
+        .iter()
+        .map(|finding| finding.rule)
+        .collect()
+}
+
+#[test]
+fn a_log_line_holds_no_sentence_terminator() {
+    assert_eq!(log_hard_rules("core ready."), vec![RULE_LOG_TERMINATOR]);
+    assert_eq!(
+        log_hard_rules("core ready! again"),
+        vec![RULE_LOG_TERMINATOR]
+    );
+    assert!(log_hard_rules("core ready").is_empty());
+    // A value keeps its own punctuation: only the template is checked, and a
+    // placeholder's inner text is not the line's punctuation.
+    assert!(log_hard_rules("probe failed: {}").is_empty());
+    assert!(log_hard_rules("probe failed: {server:?}").is_empty());
+    // An address literal is not a sentence split.
+    assert!(log_hard_rules("endpoint committed: 127.0.0.1:{}").is_empty());
+}
+
+#[test]
+fn a_log_line_names_no_actor() {
+    assert_eq!(
+        log_hard_rules("the app applied the config"),
+        vec![RULE_LOG_ACTOR]
+    );
+    assert_eq!(
+        log_hard_rules("The app stops the core"),
+        vec![RULE_LOG_ACTOR, RULE_LOG_CAPITALIZATION]
+    );
+    // The core and the helper are other actors and stay nameable.
+    assert!(log_hard_rules("the core exited: code 23").is_empty());
+}
+
+#[test]
+fn a_log_line_starts_lowercase_unless_it_is_a_technical_name() {
+    assert_eq!(log_hard_rules("Core ready"), vec![RULE_LOG_CAPITALIZATION]);
+    assert!(log_hard_rules("core ready").is_empty());
+    assert!(log_hard_rules("TUN inbound closed").is_empty());
+    assert!(log_hard_rules("Xray logger restarted").is_empty());
+}
+
+#[test]
+fn a_log_line_is_capped_in_characters() {
+    assert!(log_hard_rules(&"x".repeat(LOG_LINE_CHAR_CAP)).is_empty());
+    assert_eq!(
+        log_hard_rules(&"x".repeat(LOG_LINE_CHAR_CAP + 1)),
+        vec![RULE_LOG_LENGTH]
+    );
+    let advisory = "x".repeat(LOG_LINE_ADVISORY_CHARS + 1);
+    assert!(log_hard_rules(&advisory).is_empty());
+    assert_eq!(log_advisory_rules(&advisory), vec![RULE_LOG_LENGTH]);
+}
+
+#[test]
+fn a_log_line_allows_a_semicolon_and_reads_no_passive_voice() {
+    assert!(log_hard_rules("TUN core alive; stopping it now").is_empty());
+    assert!(log_hard_findings("the file was written by the helper").is_empty());
+    assert!(log_advisory_findings("connect rejected by the core").is_empty());
+}
+
+#[test]
+fn a_log_line_keeps_the_shared_hard_rules() {
+    assert!(log_hard_rules("connect didn't start").contains(&RULE_CONTRACTION));
+    assert!(log_hard_rules("a seamless start").contains(&RULE_BANNED_TERM));
+    assert!(log_hard_rules("{unclosed").contains(&RULE_PLACEHOLDER));
+    assert!(log_hard_rules(" trailing ").contains(&RULE_PLACEHOLDER));
+}
+
+#[test]
+fn the_prose_profile_still_applies_to_a_ui_key() {
+    assert_eq!(Key::Close.class(), broccoli::i18n::TextClass::Ui);
+    assert!(Key::Close.level().is_none());
+}
+
+#[test]
+fn a_log_key_declares_its_level() {
+    assert_eq!(Key::RtLogCoreReady.class(), broccoli::i18n::TextClass::Log);
+    assert_eq!(
+        Key::RtLogCoreReady.level(),
+        Some(broccoli::i18n::LogLevel::Info)
+    );
 }
 
 #[test]

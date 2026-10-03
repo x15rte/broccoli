@@ -3,7 +3,7 @@
 
 use crate::diag::Diag;
 use crate::r#gen::{self, keys};
-use crate::i18n::{Key, t, t_fmt};
+use crate::i18n::{Key, LogLevel, t, t_fmt};
 use crate::icon::{IconAssets, IconPresentation, classify};
 use crate::links::excerpt;
 use crate::model::inbound::API_INBOUND_TAG;
@@ -17,6 +17,7 @@ use crate::rt::{
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::sys::{self, paths};
+use crate::ui::logs::LogLine;
 use crate::ui::servers::{LeaveAction, ServersScreen};
 use crate::ui::{self, PhaseAction, Screen, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
 use std::collections::{HashMap, VecDeque};
@@ -83,14 +84,43 @@ enum TrayAction {
     Quit,
 }
 
-/// In-app log ring: newest last, `(from_core, line)` entries, capped by both
-/// line count (`LOG_CAP`) and resident bytes (`LOG_BYTE_CAP`) so a verbose
-/// core cannot grow the buffer toward the ~20 MiB worst case of 5000 x 4 KiB
-/// lines. The UI reads this as the plain
-/// `VecDeque<(bool, String)>` it always was, via `Deref`; only `push`
-/// mutates the ring, so the byte total cannot drift.
+/// Write one ring line into `app.log` at `level` under `target`. A macro
+/// because `tracing` requires the target to be a constant expression.
+macro_rules! mirror_record {
+    ($target:literal, $level:expr, $line:expr) => {
+        match $level {
+            Some($crate::i18n::LogLevel::Debug) => tracing::debug!(target: $target, "{}", $line),
+            Some($crate::i18n::LogLevel::Warn) => tracing::warn!(target: $target, "{}", $line),
+            Some($crate::i18n::LogLevel::Error) => tracing::error!(target: $target, "{}", $line),
+            Some($crate::i18n::LogLevel::Info) | None => {
+                tracing::info!(target: $target, "{}", $line)
+            }
+        }
+    };
+}
+
+/// Mirror one ring line into `app.log` at its own level and target. Only the
+/// disk copy is sanitized: a crafted core line must not inject ANSI sequences,
+/// carriage returns, or fake log records (CWE-117). The in-memory view keeps
+/// the raw line — egui renders it as literal text.
+fn mirror_line(from_core: bool, level: Option<LogLevel>, line: &str) {
+    let escaped = escape_control_chars(line);
+    // `tracing` demands a constant target, so the level match is written
+    // once per target rather than around a target variable.
+    if from_core {
+        mirror_record!("xray", level, escaped);
+    } else {
+        mirror_record!("broccoli", level, escaped);
+    }
+}
+
+/// In-app log ring: newest last, [`LogLine`] entries, capped by both line
+/// count (`LOG_CAP`) and resident bytes (`LOG_BYTE_CAP`) so a verbose core
+/// cannot grow the buffer toward the ~20 MiB worst case of 5000 x 4 KiB
+/// lines. The UI reads this as the plain `VecDeque<LogLine>` it is, via
+/// `Deref`; only `push` mutates the ring, so the byte total cannot drift.
 struct LogBuffer {
-    entries: VecDeque<(bool, String)>,
+    entries: VecDeque<LogLine>,
     /// Sum of retained line lengths — the quantity `LOG_BYTE_CAP` bounds.
     /// Actual resident memory is this plus a fixed per-entry overhead.
     bytes: usize,
@@ -118,13 +148,13 @@ impl LogBuffer {
     /// popped at most once, and no entry is ever re-copied. The `bytes` total
     /// it keeps is the resident accounting the tests read — this is
     /// event-driven (core events, button handlers), never per frame.
-    fn push(&mut self, from_core: bool, line: String) {
+    fn push(&mut self, line: LogLine) {
         self.generation += 1;
-        self.bytes += line.len();
-        self.entries.push_back((from_core, line));
+        self.bytes += line.text.len();
+        self.entries.push_back(line);
         while self.entries.len() > LOG_CAP || self.bytes > LOG_BYTE_CAP {
-            if let Some((_, evicted)) = self.entries.pop_front() {
-                self.bytes -= evicted.len();
+            if let Some(evicted) = self.entries.pop_front() {
+                self.bytes -= evicted.text.len();
             } else {
                 // Unreachable: the just-pushed line is in the ring, so an
                 // over-cap byte total implies a non-empty ring.
@@ -145,7 +175,7 @@ impl LogBuffer {
 }
 
 impl Deref for LogBuffer {
-    type Target = VecDeque<(bool, String)>;
+    type Target = VecDeque<LogLine>;
 
     fn deref(&self) -> &Self::Target {
         &self.entries
@@ -975,19 +1005,29 @@ impl BroccoliApp {
         app
     }
 
-    /// Append a line to the in-app log ring (rendered by the Logs screen).
-    /// GUI-originated lines pass `from_core: false`, core output `true`.
+    /// Append a passthrough line to the in-app log ring (rendered by the Logs
+    /// screen): core output (`from_core: true`) or app text with no key of its
+    /// own. No key declares a severity for such a line, so the screen shows it
+    /// verbatim and reads its severity from the text to filter on.
     pub fn push_log(&mut self, from_core: bool, line: String) {
-        // Only the disk copy is sanitized: a crafted core line must not inject
-        // ANSI sequences, carriage returns, or fake log records into app.log
-        // (CWE-117). The in-memory view keeps the raw line — egui
-        // renders it as literal text, so the viewer is unchanged.
-        if from_core {
-            tracing::info!(target: "xray", "{}", escape_control_chars(&line));
-        } else {
-            tracing::info!(target: "broccoli", "{}", escape_control_chars(&line));
-        }
-        self.logs.push(from_core, line);
+        self.push_entry(from_core, None, line);
+    }
+
+    /// Append one app-authored line whose severity its key declares: the
+    /// level `keys!` fixes for `key`, never a per-call choice.
+    fn push_keyed_log(&mut self, key: Key, line: String) {
+        self.push_entry(false, key.level(), line);
+    }
+
+    /// Mirror one line into `app.log` and append it to the ring, at the level
+    /// the caller resolved.
+    fn push_entry(&mut self, from_core: bool, level: Option<LogLevel>, line: String) {
+        mirror_line(from_core, level, &line);
+        self.logs.push(LogLine {
+            text: line,
+            from_core,
+            level,
+        });
     }
 
     fn apply_observatory_statuses(servers: &mut ServersFile, statuses: &[OutboundStatusView]) {
@@ -1083,8 +1123,8 @@ impl BroccoliApp {
 
                     if let CorePhase::Error(error) = &phase {
                         let lang = self.settings.language;
-                        self.push_log(
-                            false,
+                        self.push_keyed_log(
+                            Key::LogCoreError,
                             t_fmt(lang, Key::LogCoreError, &[&error.record(lang)]),
                         );
                     }
@@ -1094,10 +1134,10 @@ impl BroccoliApp {
                 }
                 CoreEvt::Log { line, from_core } => self.push_log(from_core, line),
                 CoreEvt::AppLog(message) => {
-                    // Runtime-authored text: render it in the active language
-                    // and add the log prefix the runtime's raw lines carry.
+                    // Runtime-authored text: rendered in the active language,
+                    // and its level comes from the key the runtime chose.
                     let lang = self.settings.language;
-                    self.push_log(false, format!("[broccoli] {}", message.text(lang)));
+                    self.push_keyed_log(message.headline().key(), message.text(lang));
                 }
                 CoreEvt::Stats(tick) => {
                     self.stats_generation += 1;
@@ -1747,7 +1787,10 @@ impl BroccoliApp {
         self.config_dirty = true;
         self.apply_result = Some((false, message.clone()));
         let lang = self.settings.language;
-        self.push_log(false, t_fmt(lang, Key::LogBroccoliMessage, &[&message]));
+        self.push_keyed_log(
+            Key::LogBroccoliMessage,
+            t_fmt(lang, Key::LogBroccoliMessage, &[&message]),
+        );
     }
 
     /// The terminal message a Connect or Apply attempt fails with while the
@@ -1782,7 +1825,10 @@ impl BroccoliApp {
         // The content-area block reads the message from the UI-context
         // snapshot, which rebuilds only when an input moved.
         self.ui_ctx_dirty = true;
-        self.push_log(false, t_fmt(lang, Key::LogConnectBlocked, &[&reason]));
+        self.push_keyed_log(
+            Key::LogConnectBlocked,
+            t_fmt(lang, Key::LogConnectBlocked, &[&reason]),
+        );
         reason
     }
 
@@ -1823,7 +1869,10 @@ impl BroccoliApp {
             .and_then(|cache| cache.reason.clone())
         {
             self.apply_result = Some((false, reason.clone()));
-            self.push_log(false, t_fmt(lang, Key::LogConnectBlocked, &[&reason]));
+            self.push_keyed_log(
+                Key::LogConnectBlocked,
+                t_fmt(lang, Key::LogConnectBlocked, &[&reason]),
+            );
             return Err(reason);
         }
         // The managed core cannot run yet: fail here, visibly, instead of
@@ -1998,8 +2047,8 @@ impl BroccoliApp {
             if !self.state_error_save_logged {
                 self.state_error_save_logged = true;
                 let lang = self.settings.language;
-                self.push_log(
-                    false,
+                self.push_keyed_log(
+                    Key::LogBroccoliMessage,
                     t_fmt(
                         lang,
                         Key::LogBroccoliMessage,
@@ -2015,12 +2064,18 @@ impl BroccoliApp {
         let mut save_errors = Vec::new();
         if let Err(error) = self.servers.save() {
             let message = t_fmt(lang, Key::SaveServersFailed, &[&format!("{error:#}")]);
-            self.push_log(false, t_fmt(lang, Key::LogBroccoliMessage, &[&message]));
+            self.push_keyed_log(
+                Key::LogBroccoliMessage,
+                t_fmt(lang, Key::LogBroccoliMessage, &[&message]),
+            );
             save_errors.push(message);
         }
         if let Err(error) = self.settings.save() {
             let message = t_fmt(lang, Key::SaveSettingsFailed, &[&format!("{error:#}")]);
-            self.push_log(false, t_fmt(lang, Key::LogBroccoliMessage, &[&message]));
+            self.push_keyed_log(
+                Key::LogBroccoliMessage,
+                t_fmt(lang, Key::LogBroccoliMessage, &[&message]),
+            );
             save_errors.push(message);
         }
         self.persistence_error = if save_errors.is_empty() {
@@ -2331,8 +2386,8 @@ impl eframe::App for BroccoliApp {
                 .arg(paths::state_dir())
                 .spawn()
         {
-            self.push_log(
-                false,
+            self.push_keyed_log(
+                Key::LogOpenStateFolderFailed,
                 t_fmt(lang, Key::LogOpenStateFolderFailed, &[&open_error]),
             );
         }
@@ -2506,8 +2561,8 @@ impl eframe::App for BroccoliApp {
                 .spawn()
         {
             let lang = self.settings.language;
-            self.push_log(
-                false,
+            self.push_keyed_log(
+                Key::LogOpenCoreFolderFailed,
                 t_fmt(lang, Key::LogOpenCoreFolderFailed, &[&open_error]),
             );
         }
@@ -4829,7 +4884,7 @@ mod apply_verdict_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, TerminalError};
+    use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, LogLine, TerminalError};
     use super::{Language, native_dark_for, tun_outbound_interface_block_reason};
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
@@ -4975,7 +5030,11 @@ mod tests {
         for i in 0..count {
             // Exactly MAX_LINE_BYTES ASCII bytes per line, distinguishable
             // by the zero-padded index.
-            buf.push(true, format!("{:0width$}", i, width = MAX_LINE_BYTES));
+            buf.push(LogLine {
+                text: format!("{:0width$}", i, width = MAX_LINE_BYTES),
+                from_core: true,
+                level: None,
+            });
             assert!(buf.bytes <= LOG_BYTE_CAP, "push {i} left the byte cap");
         }
         // Steady state: exactly the byte cap, filled with max-size lines.
@@ -4985,8 +5044,8 @@ mod tests {
         // survivor is the first line that fits within the byte cap.
         let newest = format!("{:0width$}", count - 1, width = MAX_LINE_BYTES);
         let oldest = format!("{:0width$}", count - max_lines, width = MAX_LINE_BYTES);
-        assert_eq!(buf.back().unwrap().1.as_str(), newest.as_str());
-        assert_eq!(buf.front().unwrap().1.as_str(), oldest.as_str());
+        assert_eq!(buf.back().unwrap().text.as_str(), newest.as_str());
+        assert_eq!(buf.front().unwrap().text.as_str(), oldest.as_str());
     }
 
     /// At normal line volumes the byte cap is dormant — the count
@@ -4997,7 +5056,11 @@ mod tests {
         let short = "status ok";
         let count = 3 * LOG_CAP;
         for i in 0..count {
-            buf.push(i % 2 == 0, format!("{short} {i}"));
+            buf.push(LogLine {
+                text: format!("{short} {i}"),
+                from_core: i % 2 == 0,
+                level: None,
+            });
         }
         assert_eq!(buf.len(), LOG_CAP);
         // This volume never reaches the byte cap, so the count cap alone
@@ -5012,7 +5075,10 @@ mod tests {
         let expected: Vec<(bool, String)> = (2 * LOG_CAP..count)
             .map(|i| (i % 2 == 0, format!("{short} {i}")))
             .collect();
-        let actual: Vec<(bool, String)> = buf.iter().cloned().collect();
+        let actual: Vec<(bool, String)> = buf
+            .iter()
+            .map(|line| (line.from_core, line.text.clone()))
+            .collect();
         assert_eq!(actual, expected);
     }
 
@@ -5023,14 +5089,26 @@ mod tests {
     fn byte_accounting_tracks_pushes_and_evictions() {
         let mut buf = LogBuffer::new();
 
-        buf.push(false, "hello".to_string());
-        buf.push(false, "world".to_string());
+        buf.push(LogLine {
+            text: "hello".to_string(),
+            from_core: false,
+            level: None,
+        });
+        buf.push(LogLine {
+            text: "world".to_string(),
+            from_core: false,
+            level: None,
+        });
         assert_eq!(buf.bytes, 10);
 
         // Max-size lines: the byte cap binds and stays bound on every push.
         let max_line = "y".repeat(MAX_LINE_BYTES);
         for _ in 0..(LOG_BYTE_CAP / MAX_LINE_BYTES + 2) {
-            buf.push(true, max_line.clone());
+            buf.push(LogLine {
+                text: max_line.clone(),
+                from_core: true,
+                level: None,
+            });
             assert!(buf.bytes <= LOG_BYTE_CAP);
         }
         // The short lines were evicted; the ring holds exactly the byte cap

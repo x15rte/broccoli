@@ -11,7 +11,7 @@ use egui::{Color32, RichText, ScrollArea, TextEdit, TextStyle, Ui};
 
 use super::UiCtx;
 use crate::diag::DiagError;
-use crate::i18n::{Key, t, t_fmt};
+use crate::i18n::{Key, LogLevel, t, t_fmt};
 use crate::model::settings::Language;
 use crate::rt::{CoreCmd, CorePhase, JobKind};
 use crate::sys;
@@ -47,47 +47,78 @@ impl LevelFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Level {
-    Debug,
-    Info,
-    Warning,
-    Error,
+/// One line in the app's log ring: the text, its author, and its severity.
+///
+/// The app declares the level of a line it authors — the key's own `keys!`
+/// row — and sniffs a passthrough line, which it does not author. The
+/// display form is [`display_line`]: this severity and the source in a
+/// fixed-width gutter, then the text, the same shape `app.log` records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    /// The line text, with no severity or source prefix.
+    pub text: String,
+    /// Whether the core produced the line (passthrough) rather than the app.
+    pub from_core: bool,
+    /// The level the line's key declares. Passthrough text has no key, so it
+    /// carries `None` here and the screen reads its severity from the text.
+    pub level: Option<LogLevel>,
 }
 
-/// Best-effort level sniffing. Core console lines look like
-/// `2026/08/10 12:00:00.123 [Warning] ...`; tracing lines carry a padded
-/// ` WARN`-style token. Anything unrecognized returns `None`.
-fn line_level(line: &str) -> Option<Level> {
+/// The display text of one ring line: a line with a known severity shows that
+/// severity and the source in a fixed-width gutter — the same shape `app.log`
+/// records, so a pasted selection and the file agree. Core output shows
+/// verbatim, because it carries its own timestamp and level and the ring must
+/// not rewrite what the core said, and so does a line whose severity is
+/// unknown: there is nothing to show in the gutter.
+fn display_line(line: &LogLine) -> String {
+    match line.level {
+        Some(level) if !line.from_core => format!("{:<5} broccoli: {}", level.tag(), line.text),
+        _ => line.text.clone(),
+    }
+}
+
+/// The severity the filter reads for one ring entry: the level the entry's key
+/// declares, or — for passthrough text no key authored — the level its own
+/// text carries. `None` when neither is available, which keeps a line with no
+/// recognizable severity visible until the user narrows on purpose.
+fn row_level(entry: &LogLine) -> Option<LogLevel> {
+    entry.level.or_else(|| sniff_level(&entry.text))
+}
+
+/// Best-effort level sniffing for text no key authors. Core console
+/// lines look like `2026/08/10 12:00:00.123 [Warning] ...`; tracing lines
+/// carry a padded ` WARN`-style token. Anything unrecognized returns `None`,
+/// which the level filters keep visible until the user narrows on purpose.
+fn sniff_level(line: &str) -> Option<LogLevel> {
     if line.contains("[Error]") || line.contains(" ERROR") {
-        Some(Level::Error)
+        Some(LogLevel::Error)
     } else if line.contains("[Warning]") || line.contains("[Warn]") || line.contains(" WARN") {
-        Some(Level::Warning)
+        Some(LogLevel::Warn)
     } else if line.contains("[Info]") || line.contains(" INFO") {
-        Some(Level::Info)
+        Some(LogLevel::Info)
     } else if line.contains("[Debug]") || line.contains(" DEBUG") || line.contains(" TRACE") {
-        Some(Level::Debug)
+        Some(LogLevel::Debug)
     } else {
         None
     }
 }
 
-fn passes(filter: LevelFilter, level: Option<Level>) -> bool {
+fn passes(filter: LevelFilter, level: Option<LogLevel>) -> bool {
     match filter {
         LevelFilter::All => true,
         // Unparseable lines (core banner, continuation output) stay visible
         // until the user narrows to warnings/errors on purpose.
-        LevelFilter::InfoPlus => level.is_none_or(|l| l >= Level::Info),
-        LevelFilter::WarningPlus => level.is_some_and(|l| l >= Level::Warning),
-        LevelFilter::ErrorPlus => level == Some(Level::Error),
+        LevelFilter::InfoPlus => level.is_none_or(|l| l >= LogLevel::Info),
+        LevelFilter::WarningPlus => level.is_some_and(|l| l >= LogLevel::Warn),
+        LevelFilter::ErrorPlus => level == Some(LogLevel::Error),
     }
 }
 
-fn line_color(from_core: bool, level: Option<Level>, dark: bool) -> Color32 {
+fn line_color(from_core: bool, level: Option<LogLevel>, dark: bool) -> Color32 {
     let status = status_colors(dark);
     match level {
-        Some(Level::Error) => status.err,
-        Some(Level::Warning) => status.warn,
+        Some(LogLevel::Error) => status.err,
+        Some(LogLevel::Warn) => status.warn,
         // Origin tint: core stdout/stderr greenish, app (tracing) bluish.
         // Darker on the Light theme so the tint stays legible on white.
         _ if from_core => {
@@ -127,7 +158,7 @@ struct RingId {
 }
 
 impl RingId {
-    fn of(logs: &VecDeque<(bool, String)>, generation: u64) -> Self {
+    fn of(logs: &VecDeque<LogLine>, generation: u64) -> Self {
         Self {
             len: logs.len(),
             generation,
@@ -183,8 +214,9 @@ struct FilteredRow {
     /// whole view whenever a cap evicts.
     seq: u64,
     from_core: bool,
-    /// Sniffed level, computed once at rebuild instead of per painted row.
-    level: Option<Level>,
+    /// Severity of this row, taken from the ring entry: the level an
+    /// app-authored key declares, or the level sniffed from passthrough text.
+    level: Option<LogLevel>,
     line: String,
 }
 
@@ -293,7 +325,7 @@ impl FilteredView {
     /// rows", plus whether the index-keyed selection survived.
     fn refresh(
         &mut self,
-        logs: &VecDeque<(bool, String)>,
+        logs: &VecDeque<LogLine>,
         logs_generation: u64,
         level: LevelFilter,
         needle: &str,
@@ -333,19 +365,19 @@ impl FilteredView {
             // lines are gone, so the walk starts at the oldest survivor.
             let from = previous.generation.max(front);
             let mut admitted = 0;
-            for (offset, (from_core, line)) in logs.iter().enumerate().skip((from - front) as usize)
-            {
+            for (offset, entry) in logs.iter().enumerate().skip((from - front) as usize) {
                 let seq = front + offset as u64;
                 if seq >= ring.generation {
                     break;
                 }
-                let row_level = line_level(line);
-                if passes(level, row_level) && contains_ascii_case_insensitive(line, needle) {
+                let row_level = row_level(entry);
+                if passes(level, row_level) && contains_ascii_case_insensitive(&entry.text, needle)
+                {
                     self.rows.push(FilteredRow {
                         seq,
-                        from_core: *from_core,
+                        from_core: entry.from_core,
                         level: row_level,
-                        line: line.clone(),
+                        line: display_line(entry),
                     });
                     admitted += 1;
                 }
@@ -374,14 +406,14 @@ impl FilteredView {
             start = start.max(logs.len().saturating_sub(pushed));
         }
         let mut rows = Vec::new();
-        for (offset, (from_core, line)) in logs.iter().enumerate().skip(start) {
-            let row_level = line_level(line);
-            if passes(level, row_level) && contains_ascii_case_insensitive(line, needle) {
+        for (offset, entry) in logs.iter().enumerate().skip(start) {
+            let row_level = row_level(entry);
+            if passes(level, row_level) && contains_ascii_case_insensitive(&entry.text, needle) {
                 rows.push(FilteredRow {
                     seq: ring.front() + offset as u64,
-                    from_core: *from_core,
+                    from_core: entry.from_core,
                     level: row_level,
-                    line: line.clone(),
+                    line: display_line(entry),
                 });
             }
         }
@@ -785,7 +817,7 @@ impl LogsScreen {
             // before the sender drops.
             Some(Terminal::Exited) | None => {}
         }
-        let logs: &VecDeque<(bool, String)> = ctx.logs;
+        let logs: &VecDeque<LogLine> = ctx.logs;
         let logger_gate = verdict(
             matches!(ctx.phase, CorePhase::Running),
             // The window rung is the logger restart kind's declared rule: the
@@ -934,11 +966,7 @@ impl LogsScreen {
     ///
     /// The returned decision is the observable the tests assert; the render
     /// path paints whatever the view holds either way.
-    fn refresh_view(
-        &mut self,
-        logs: &VecDeque<(bool, String)>,
-        logs_generation: u64,
-    ) -> RefreshOutcome {
+    fn refresh_view(&mut self, logs: &VecDeque<LogLine>, logs_generation: u64) -> RefreshOutcome {
         let outcome = self.view.refresh(
             logs,
             logs_generation,
@@ -1367,14 +1395,31 @@ mod tests {
     /// the memoized view is keyed on. Direct-ring tests below must route
     /// their pushes through this helper, or the view's `refresh` would see
     /// an unchanged ring and keep a stale view.
-    fn push_line(
-        logs: &mut VecDeque<(bool, String)>,
+    fn push_line(logs: &mut VecDeque<LogLine>, generation: &mut u64, from_core: bool, line: &str) {
+        *generation += 1;
+        logs.push_back(LogLine {
+            text: line.to_string(),
+            from_core,
+            level: None,
+        });
+    }
+
+    /// Push one line with the level stated, the way the app pushes a keyed
+    /// line: the ring stores the key's declared severity rather than sniffing
+    /// the text for it.
+    fn push_line_with_level(
+        logs: &mut VecDeque<LogLine>,
         generation: &mut u64,
         from_core: bool,
+        level: Option<LogLevel>,
         line: &str,
     ) {
         *generation += 1;
-        logs.push_back((from_core, line.to_string()));
+        logs.push_back(LogLine {
+            text: line.to_string(),
+            from_core,
+            level,
+        });
     }
 
     /// A warmed headless font set: laying a galley out needs a completed
@@ -1505,9 +1550,9 @@ mod tests {
     fn clear_view_hides_old_and_keeps_new_lines_when_text_recurs_on_both_sides() {
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
-        push_line(&mut logs, &mut generation, false, "[Info] status ok");
-        push_line(&mut logs, &mut generation, false, "[Info] connect");
-        push_line(&mut logs, &mut generation, false, "[Info] status ok");
+        push_line(&mut logs, &mut generation, true, "[Info] status ok");
+        push_line(&mut logs, &mut generation, true, "[Info] connect");
+        push_line(&mut logs, &mut generation, true, "[Info] status ok");
         let mut screen = LogsScreen::default();
         assert!(screen.refresh_view(&logs, generation).changed());
         // Clear pressed now, generation 3.
@@ -1516,9 +1561,9 @@ mod tests {
         assert!(screen.plan().rows().is_empty());
         // New lines arrive, including another textually identical
         // "status ok".
-        push_line(&mut logs, &mut generation, false, "[Info] fresh A");
-        push_line(&mut logs, &mut generation, false, "[Info] status ok");
-        push_line(&mut logs, &mut generation, false, "[Info] fresh B");
+        push_line(&mut logs, &mut generation, true, "[Info] fresh A");
+        push_line(&mut logs, &mut generation, true, "[Info] status ok");
+        push_line(&mut logs, &mut generation, true, "[Info] fresh B");
         assert!(screen.refresh_view(&logs, generation).changed());
         let rows = screen.plan().rows();
         assert_eq!(
@@ -1796,13 +1841,8 @@ mod tests {
     /// Push one line into a ring that evicts at `cap`, the shape
     /// `LogBuffer::push` gives the screen once either cap binds: the counter
     /// advances by one and the oldest entry drops.
-    fn push_capped(
-        logs: &mut VecDeque<(bool, String)>,
-        generation: &mut u64,
-        cap: usize,
-        line: &str,
-    ) {
-        push_line(logs, generation, false, line);
+    fn push_capped(logs: &mut VecDeque<LogLine>, generation: &mut u64, cap: usize, line: &str) {
+        push_line(logs, generation, true, line);
         while logs.len() > cap {
             logs.pop_front();
         }
@@ -2248,7 +2288,7 @@ mod tests {
     /// either cap binds.
     fn push_capped_rig(rig: &mut UiTestRig, cap: usize, index: usize) {
         rig.push_log(
-            false,
+            true,
             format!("2026/08/10 12:00:{index:02}.000 [Info] line {index}"),
         );
         while rig.logs.len() > cap {
@@ -2359,15 +2399,18 @@ mod tests {
         assert_eq!(plan.staleness(60.0, 2.0), Staleness::Current);
     }
 
-    /// Build one filtered row the way the view does, so the copy-text
-    /// helper is exercised against the row shape the render path hands it.
-    /// The sequence is irrelevant here: the copy helpers address rows by
+    /// Build one filtered row the way the view does, so the copy-text helper
+    /// is exercised against the row shape the render path hands it. The row
+    /// is a passthrough line, whose display text is its own text verbatim, so
+    /// these tests pin the copy math and not the gutter an app-authored row
+    /// carries (that shape is pinned by the filter-semantics test). The
+    /// sequence is irrelevant here: the copy helpers address rows by
     /// index, never by the ring position a row came from.
     fn filtered_row(line: &str) -> FilteredRow {
         FilteredRow {
             seq: 0,
-            from_core: false,
-            level: line_level(line),
+            from_core: true,
+            level: sniff_level(line),
             line: line.to_string(),
         }
     }
@@ -2538,8 +2581,9 @@ mod tests {
 
         // A selection whose active cursor sits on the boundary past the
         // first "charlie" character (cursors are character boundaries, so
-        // index 8 means "[Info] c"): the middle row copies in full, the
-        // last one up to the active cursor.
+        // index 8 means "[Info] c"): the middle row copies in full, the last
+        // one up to the active cursor. These rows carry no declared level, so
+        // they display verbatim.
         screen.rows_selection = RowSelection {
             anchor: Some(row_cursor(1, 0)),
             active: Some(row_cursor(2, 8)),
@@ -2557,23 +2601,76 @@ mod tests {
         );
     }
 
-    /// Behavior pin: the memoized view keeps the exact
-    /// filtering semantics of the previous per-frame pass — unparseable
-    /// lines stay visible at All, level thresholds, ASCII-case-insensitive
-    /// trimmed text filter, clear marker, display cap.
+    /// The display form of a row: an app-authored line whose key declares a
+    /// level carries that level and the source in a fixed-width gutter — the
+    /// same shape `app.log` records and that the copy actions hand to the
+    /// clipboard — while passthrough core output shows verbatim, because the
+    /// core wrote its own timestamp and level and the ring must not rewrite
+    /// it.
+    #[test]
+    fn app_lines_show_their_level_and_source_in_a_fixed_gutter() {
+        let app = LogLine {
+            text: "connect rejected: a core stop is in progress".to_string(),
+            from_core: false,
+            level: Some(LogLevel::Warn),
+        };
+        assert_eq!(
+            display_line(&app),
+            "WARN  broccoli: connect rejected: a core stop is in progress"
+        );
+        // A line with no declared level has no severity to show.
+        assert_eq!(
+            display_line(&LogLine {
+                level: None,
+                ..app.clone()
+            }),
+            "connect rejected: a core stop is in progress"
+        );
+        assert_eq!(
+            display_line(&LogLine {
+                from_core: true,
+                ..app
+            }),
+            "connect rejected: a core stop is in progress"
+        );
+    }
+
+    /// Behavior pin: the memoized view keeps the filtering semantics of the
+    /// previous per-frame pass — unparseable lines stay visible at All, level
+    /// thresholds, ASCII-case-insensitive trimmed text filter, clear marker,
+    /// display cap — and the row text is the display form: an app-authored
+    /// row carries the level and the source in its gutter, while passthrough
+    /// core output stays verbatim.
     #[test]
     fn filtered_view_preserves_level_text_and_clear_marker_semantics() {
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
-        for (from_core, line) in [
-            (true, "core banner (unparseable)"),
-            (false, "2026/08/10 12:00:00.000 [Debug] trace detail"),
-            (false, "2026/08/10 12:00:01.000 [Info] connected"),
-            (false, "2026/08/10 12:00:02.000 [Warning] retrying"),
-            (true, "2026/08/10 12:00:03.000 [Error] dns failed"),
-            (false, "app WARN token line"),
+        for (from_core, level, line) in [
+            (true, None, "core banner (unparseable)"),
+            (
+                true,
+                Some(LogLevel::Debug),
+                "2026/08/10 12:00:00.000 [Debug] trace detail",
+            ),
+            (false, Some(LogLevel::Info), "core ready"),
+            (
+                false,
+                Some(LogLevel::Warn),
+                "connect ignored: the core is already running",
+            ),
+            (
+                false,
+                Some(LogLevel::Error),
+                "connect blocked: install the managed Xray core",
+            ),
+            (
+                true,
+                Some(LogLevel::Error),
+                "2026/08/10 12:00:03.000 [Error] dns failed",
+            ),
+            (false, None, "app line without a level"),
         ] {
-            push_line(&mut logs, &mut generation, from_core, line);
+            push_line_with_level(&mut logs, &mut generation, from_core, level, line);
         }
         let mut screen = LogsScreen::default();
         fn rows(screen: &LogsScreen) -> &[FilteredRow] {
@@ -2582,41 +2679,47 @@ mod tests {
 
         // All: every line, including the unparseable ones.
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(rows(&screen).len(), 6);
+        assert_eq!(rows(&screen).len(), 7);
 
-        // InfoPlus: unparseable + Info + Warning + Error + WARN-token line.
+        // InfoPlus: unparseable + Info + Warn + Error lines, the Debug line
+        // hidden and level-less lines kept visible.
         screen.level = LevelFilter::InfoPlus;
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(rows(&screen).len(), 5);
+        assert_eq!(rows(&screen).len(), 6);
 
-        // WarningPlus: the two warning-or-above lines plus the WARN-token
-        // line; unparseable and below-threshold lines are hidden.
+        // WarningPlus: the warning-or-above lines; unparseable and
+        // below-threshold lines are hidden. An app-authored row shows its
+        // level and source in the gutter, a core row its own words.
         screen.level = LevelFilter::WarningPlus;
         assert!(screen.refresh_view(&logs, generation).changed());
         let warning_plus = rows(&screen);
         assert_eq!(warning_plus.len(), 3);
         assert_eq!(
             warning_plus[0].line,
-            "2026/08/10 12:00:02.000 [Warning] retrying"
+            "WARN  broccoli: connect ignored: the core is already running"
         );
         assert_eq!(
             warning_plus[1].line,
+            "ERROR broccoli: connect blocked: install the managed Xray core"
+        );
+        assert_eq!(
+            warning_plus[2].line,
             "2026/08/10 12:00:03.000 [Error] dns failed"
         );
-        assert_eq!(warning_plus[2].line, "app WARN token line");
         assert!(
             warning_plus
                 .iter()
-                .all(|row| row.level == Some(Level::Warning) || row.level == Some(Level::Error))
+                .all(|row| row.level == Some(LogLevel::Warn) || row.level == Some(LogLevel::Error))
         );
 
-        // ErrorPlus: only the Error line, from_core preserved.
+        // ErrorPlus: the two Error lines, from_core preserved.
         screen.level = LevelFilter::ErrorPlus;
         assert!(screen.refresh_view(&logs, generation).changed());
-        assert_eq!(rows(&screen).len(), 1);
-        assert!(rows(&screen)[0].from_core);
+        assert_eq!(rows(&screen).len(), 2);
+        assert!(!rows(&screen)[0].from_core && rows(&screen)[1].from_core);
 
-        // Text filter: ASCII-case-insensitive, whitespace trimmed.
+        // Text filter: ASCII-case-insensitive, whitespace trimmed. It reads
+        // the line text, not the gutter.
         screen.level = LevelFilter::All;
         screen.text = "  DNS ".to_string();
         assert!(screen.refresh_view(&logs, generation).changed());
@@ -2633,10 +2736,10 @@ mod tests {
         screen.clear_after_generation = Some(3);
         assert!(screen.refresh_view(&logs, generation).changed());
         let after_marker = rows(&screen);
-        assert_eq!(after_marker.len(), 3);
+        assert_eq!(after_marker.len(), 4);
         assert_eq!(
             after_marker[0].line,
-            "2026/08/10 12:00:02.000 [Warning] retrying"
+            "WARN  broccoli: connect ignored: the core is already running"
         );
     }
 
@@ -2649,7 +2752,7 @@ mod tests {
         let mut logs = VecDeque::new();
         let mut generation = 0u64;
         for i in 0..2500 {
-            push_line(&mut logs, &mut generation, false, &format!("line {i:04}"));
+            push_line(&mut logs, &mut generation, true, &format!("line {i:04}"));
         }
         let mut screen = LogsScreen::default();
         assert!(screen.refresh_view(&logs, generation).changed());
@@ -2750,7 +2853,7 @@ mod tests {
         let mut rig = UiTestRig::default();
         for i in 0..4 {
             rig.push_log(
-                false,
+                true,
                 format!("2026/08/10 12:00:{i:02}.000 [Info] keep line {i}"),
             );
         }
@@ -2782,13 +2885,13 @@ mod tests {
         // measures exactly the two admitted rows — the retained vectors
         // grow, nothing is re-measured from scratch. Each push advances the
         // ring's generation.
-        rig.push_log(false, "2026/08/10 12:01:00.000 [Info] noise".to_string());
+        rig.push_log(true, "2026/08/10 12:01:00.000 [Info] noise".to_string());
         rig.push_log(
-            false,
+            true,
             "2026/08/10 12:01:01.000 [Info] keep line 4".to_string(),
         );
         rig.push_log(
-            false,
+            true,
             "2026/08/10 12:01:02.000 [Info] keep line 5".to_string(),
         );
         run_frame(&ctx, &mut screen, &mut rig);
@@ -2865,13 +2968,13 @@ mod tests {
         push_line(
             &mut logs,
             &mut generation,
-            false,
+            true,
             "2026/08/10 12:00:00.000 [Info] line A",
         );
         push_line(
             &mut logs,
             &mut generation,
-            false,
+            true,
             "2026/08/10 12:00:01.000 [Info] line B",
         );
         let mut view = FilteredView::default();
@@ -2932,7 +3035,7 @@ mod tests {
         push_line(
             &mut logs,
             &mut generation,
-            false,
+            true,
             "2026/08/10 12:00:03.000 [Error] fatal boom",
         );
         assert!(
@@ -3016,9 +3119,13 @@ mod tests {
         // Small stand-in for the app's ring with `LogBuffer`'s eviction
         // rule: push, then drop the front once the cap is exceeded.
         const CAP: usize = 3;
-        let push = |logs: &mut VecDeque<(bool, String)>, generation: &mut u64| {
+        let push = |logs: &mut VecDeque<LogLine>, generation: &mut u64| {
             *generation += 1;
-            logs.push_back((false, String::new()));
+            logs.push_back(LogLine {
+                text: String::new(),
+                from_core: false,
+                level: None,
+            });
             if logs.len() > CAP {
                 logs.pop_front();
             }

@@ -30,6 +30,7 @@ use crate::rt::{
 };
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
+use crate::ui::logs::LogLine;
 use egui::RichText;
 use std::collections::VecDeque;
 
@@ -139,8 +140,8 @@ pub struct UiCtx<'a> {
     pub stats: &'a Option<StatsTick>,
     pub stats_history: &'a VecDeque<StatsTick>,
     pub observatory: &'a [OutboundStatusView],
-    /// (from_core, line), newest last, capped by the app.
-    pub logs: &'a VecDeque<(bool, String)>,
+    /// The app's log ring: `LogLine` entries, newest last, capped by the app.
+    pub logs: &'a VecDeque<LogLine>,
     /// Monotonic push count of the app's log ring: the Logs
     /// screen keys its memoized filtered view on this plus the ring length,
     /// so the identity changes exactly when the ring's content changes —
@@ -219,7 +220,7 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) settings: &'a mut Settings,
     pub(crate) cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
     pub(crate) stats_history: &'a VecDeque<StatsTick>,
-    pub(crate) logs: &'a VecDeque<(bool, String)>,
+    pub(crate) logs: &'a VecDeque<LogLine>,
     /// Monotonic push count of the app's log ring: the Logs
     /// screen keys its memoized filtered view on `(len, logs_generation)`,
     /// so the identity changes exactly when the ring's content changes.

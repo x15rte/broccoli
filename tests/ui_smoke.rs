@@ -1179,9 +1179,10 @@ fn idle_frames_keep_the_app_rendering() {
 }
 
 /// Runtime-authored log lines travel as `CoreEvt::AppLog` and are rendered by
-/// the app in the active language with the log prefix raw lines carry.
+/// the app in the active language, in the severity-and-source gutter the row
+/// carries.
 #[test]
-fn app_log_events_render_in_the_active_language_with_the_prefix() {
+fn app_log_events_render_in_the_active_language_with_the_gutter() {
     let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.run();
     common::dismiss_wizard(&mut h);
@@ -1192,10 +1193,21 @@ fn app_log_events_render_in_the_active_language_with_the_prefix() {
         .click();
     h.run_steps(2);
 
-    let expected = format!("[broccoli] {}", t(Language::En, Key::RtLogCoreReady));
+    let level = Key::RtLogCoreReady
+        .level()
+        .expect("a log-class key declares its level");
+    let text = t(Language::En, Key::RtLogCoreReady);
+    let rendered = h
+        .query_all_by(|node| {
+            node.value().is_some_and(|value| {
+                value.contains(text) && value.contains("broccoli:") && value.contains(level.tag())
+            })
+        })
+        .next();
     assert!(
-        h.query_all_by_label(expected.as_str()).next().is_some(),
+        rendered.is_some(),
         "the Logs screen must render the runtime line in the active language \
-         with its prefix: {expected}"
+         under its level and source: {} {text}",
+        level.tag()
     );
 }

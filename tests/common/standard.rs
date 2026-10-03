@@ -48,6 +48,25 @@
 //! prefer "the X of Y"), and the synonyms the terminology table rules out
 //! (`AVOIDED_TERMS`).
 //!
+//! # Log profile
+//!
+//! A key declared `(Log, Level, count)` is one scanned line, so it is checked
+//! against [`log_hard_findings`] and [`log_advisory_findings`] instead of the
+//! prose rules: no sentence terminator (`.`/`!`/`?`) in the text, at most
+//! [`LOG_LINE_CHAR_CAP`] characters, a lowercase first word unless it is a
+//! technical name ([`PROPER_FIRST_WORDS`]), and no "the app" — the actor is
+//! always the app, so naming it is padding. Semicolons are allowed there (a
+//! semicolon joins a consequence to its event, which is what the prose rule's
+//! "write two sentences" would split apart). The passive-voice and
+//! compound-tense advisories do not apply to a line: "connect rejected" is the
+//! shape of the class. The banned-term, contraction, placeholder, and arity
+//! rules apply unchanged, and the character cap is advisory past
+//! [`LOG_LINE_ADVISORY_CHARS`].
+//!
+//! The terminator rule reads the key's *template*, so a value the app does not
+//! author — captured core output, an error string — keeps its own punctuation
+//! at the point of substitution.
+//!
 //! # Exceptions
 //!
 //! [`EXCEPTIONS`] lists the strings that knowingly keep a violation: the key,
@@ -56,7 +75,7 @@
 //! table itself and fails the corpus check. [`key_findings`] applies the rows,
 //! so a caller reads one verdict per key.
 
-use broccoli::i18n::{Key, t};
+use broccoli::i18n::{Key, TextClass, t};
 use broccoli::model::settings::Language;
 
 /// Sentence word cap for a sentence that does not start with an imperative
@@ -101,6 +120,21 @@ pub const RULE_NOUN_CLUSTER: &str = "noun-cluster";
 pub const RULE_AVOIDED_TERM: &str = "avoided-term";
 /// Rule id: advisory possessive `'s` on a noun.
 pub const RULE_POSSESSIVE: &str = "possessive";
+/// Rule id: a sentence terminator in a log line's template.
+pub const RULE_LOG_TERMINATOR: &str = "log-terminator";
+/// Rule id: a log line longer than its character cap.
+pub const RULE_LOG_LENGTH: &str = "log-length";
+/// Rule id: a log line that names the app as the actor.
+pub const RULE_LOG_ACTOR: &str = "log-actor";
+/// Rule id: a log line whose first word is capitalized without being a
+/// technical name.
+pub const RULE_LOG_CAPITALIZATION: &str = "log-capitalization";
+
+/// Character cap for one log line.
+pub const LOG_LINE_CHAR_CAP: usize = 100;
+
+/// Length past which a log line draws an advisory finding.
+pub const LOG_LINE_ADVISORY_CHARS: usize = 80;
 
 /// Every rule id, so an exception row that misspells one cannot silently
 /// exempt nothing.
@@ -118,6 +152,10 @@ pub const RULE_IDS: &[&str] = &[
     RULE_NOUN_CLUSTER,
     RULE_AVOIDED_TERM,
     RULE_POSSESSIVE,
+    RULE_LOG_TERMINATOR,
+    RULE_LOG_LENGTH,
+    RULE_LOG_ACTOR,
+    RULE_LOG_CAPITALIZATION,
 ];
 
 /// A sentence that starts with one of these verbs is an instruction.
@@ -186,6 +224,12 @@ const BANNED_TERMS: &[&str] = &[
     "reach out",
     "dive into",
     "fire up",
+];
+
+/// Names a log line may start with, spelled as the terminology table fixes
+/// them; every other line starts with a lowercase word.
+const PROPER_FIRST_WORDS: &[&str] = &[
+    "DNS", "HTTP", "QUIC", "SOCKS", "TLS", "TUN", "UDP", "Windows", "Xray",
 ];
 
 /// Synonyms the terminology table rules out. The table also lists `node`,
@@ -424,6 +468,135 @@ pub fn advisory_findings(text: &str) -> Vec<Finding> {
     findings
 }
 
+/// Hard-rule findings for one log line's template.
+///
+/// The prose rules do not run here: a log line is scanned, not read, so it
+/// takes no sentence terminator, names no actor, and may join a consequence
+/// with a semicolon — the character cap bounds it instead of a word cap.
+pub fn log_hard_findings(text: &str) -> Vec<Finding> {
+    let mut findings = structural_findings(text);
+    if !has_ascii_letter(text) {
+        return findings;
+    }
+    findings.extend(log_length_hard(text));
+    findings.extend(term_findings(
+        text,
+        BANNED_TERMS,
+        RULE_BANNED_TERM,
+        "banned term",
+    ));
+    findings.extend(term_findings(text, &["the app"], RULE_LOG_ACTOR, "actor"));
+    if let Some(terminator) = log_terminator(text) {
+        findings.push(Finding::new(
+            RULE_LOG_TERMINATOR,
+            format!("{terminator:?} ends or splits the line"),
+        ));
+    }
+    if let Some(word) = capitalized_first_word(text) {
+        findings.push(Finding::new(RULE_LOG_CAPITALIZATION, word));
+    }
+    if let Some(token) = contraction(text) {
+        findings.push(Finding::new(RULE_CONTRACTION, token));
+    }
+    findings
+}
+
+/// Advisory findings for one log line's template: the noun-cluster,
+/// nominalization, avoided-term, and possessive advisories apply, while
+/// passive voice and compound tenses do not ("connect rejected" is the shape
+/// of the class). The character cap is advisory between the two caps.
+pub fn log_advisory_findings(text: &str) -> Vec<Finding> {
+    if !has_ascii_letter(text) {
+        return Vec::new();
+    }
+    let mut findings = term_findings(text, AVOIDED_TERMS, RULE_AVOIDED_TERM, "avoided term");
+    findings.extend(log_length_advisory(text));
+    for line in sentences(text) {
+        let words = tokens(line);
+        findings.extend(nominalization_findings(&words));
+        findings.extend(noun_cluster_findings(&words));
+    }
+    if let Some(token) = possessive(text) {
+        findings.push(Finding::new(
+            RULE_POSSESSIVE,
+            format!("{token} (prefer the X of Y form)"),
+        ));
+    }
+    findings
+}
+
+/// A line past the character cap: [`LOG_LINE_CHAR_CAP`] hard, with the
+/// advisory band reported by [`log_length_advisory`] instead.
+fn log_length_hard(text: &str) -> Vec<Finding> {
+    let length = text.chars().count();
+    (length > LOG_LINE_CHAR_CAP)
+        .then(|| {
+            Finding::new(
+                RULE_LOG_LENGTH,
+                format!("{length} characters, cap is {LOG_LINE_CHAR_CAP}"),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// A line past the advisory length, below the hard cap.
+fn log_length_advisory(text: &str) -> Vec<Finding> {
+    let length = text.chars().count();
+    (length > LOG_LINE_ADVISORY_CHARS && length <= LOG_LINE_CHAR_CAP)
+        .then(|| {
+            Finding::new(
+                RULE_LOG_LENGTH,
+                format!("{length} characters (advisory past {LOG_LINE_ADVISORY_CHARS})"),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The first sentence terminator in the template, if any. Values keep their
+/// own punctuation: this reads the template alone.
+///
+/// A period counts only when whitespace or the end of the text follows, so an
+/// address literal (`127.0.0.1`) is not read as punctuation. An exclamation
+/// mark or question mark always counts. A `{...}` placeholder is skipped
+/// whole, so the `?` of a `{:?}` form is not read as one either.
+fn log_terminator(text: &str) -> Option<char> {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                for next in chars.by_ref() {
+                    if next == '}' {
+                        break;
+                    }
+                }
+            }
+            '!' | '?' => return Some(c),
+            '.' if chars.peek().is_none_or(|next| next.is_whitespace()) => return Some(c),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The first word when it starts with an uppercase ASCII letter and is not a
+/// technical name that keeps its capitals. A line starts lowercase unless the
+/// word is a name the terminology table fixes.
+fn capitalized_first_word(text: &str) -> Option<String> {
+    let first = text.split_whitespace().next()?;
+    let word = first.trim_start_matches(|c: char| !c.is_alphabetic());
+    let initial = word.chars().next()?;
+    if !initial.is_ascii_uppercase() {
+        return None;
+    }
+    let bare = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+    PROPER_FIRST_WORDS
+        .iter()
+        .all(|name| !bare.starts_with(name))
+        .then(|| format!("{word:?} starts uppercase"))
+}
+
 /// Findings for one catalogue key, with the exception rows applied.
 pub struct KeyFindings {
     /// Violations of the hard rules: a non-empty list fails the corpus check.
@@ -436,19 +609,26 @@ pub struct KeyFindings {
 /// the hard rules and the placeholder-arity check, run the advisory rules, and
 /// drop the findings an [`EXCEPTIONS`] row covers.
 ///
+/// The profile follows the key's declared [`TextClass`]: a log key is checked
+/// against the log rules, every other key against the prose rules.
+///
 /// The catalogue read happens here, so no caller can check a key against text
 /// that is not the key's own, and a caller cannot forget the arity check or
 /// the exemption rows. A translation is checked the same way: swap the locale
 /// in the read below.
 pub fn key_findings(key: Key) -> KeyFindings {
     let text = t(Language::En, key);
+    let (hard, advisory) = match key.class() {
+        TextClass::Ui => (hard_findings(text), advisory_findings(text)),
+        TextClass::Log => (log_hard_findings(text), log_advisory_findings(text)),
+    };
     KeyFindings {
-        hard: hard_findings(text)
+        hard: hard
             .into_iter()
             .chain(arity_findings(key, text))
             .filter(|finding| !is_exempt(key, finding.rule))
             .collect(),
-        advisory: advisory_findings(text)
+        advisory: advisory
             .into_iter()
             .filter(|finding| !is_exempt(key, finding.rule))
             .collect(),
