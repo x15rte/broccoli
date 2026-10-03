@@ -869,8 +869,7 @@ impl SettingsScreen {
             // The runtime decides whether anything needs cleaning; the adapter
             // name is the effective one the TUN settings derive, because a
             // cleanup has no staged config to read it from.
-            let adapter_name =
-                crate::sys::netif::tun_adapter_name(&ctx.settings.tun.name).to_owned();
+            let adapter_name = ctx.settings.tun.effective_name().to_owned();
             ctx.send(CoreCmd::CleanUp { adapter_name });
         }
         if self.reset_modal {

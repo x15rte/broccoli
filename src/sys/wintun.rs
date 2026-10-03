@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use crate::r#gen::keys;
 
-use super::netif::{DEFAULT_TUN_ADAPTER_NAME, tun_adapter_name};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DI_REMOVEDEVICE_GLOBAL, DIF_REMOVE, GUID_DEVCLASS_NET, HDEVINFO, SP_CLASSINSTALL_HEADER,
     SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS, SetupDiCallClassInstaller,
@@ -356,10 +355,13 @@ pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, usize, Vec<String>)
     }
 }
 
-/// The tun adapter name a generated config will create, if it contains a TUN
-/// inbound: the shared wire-name derivation
-/// ([`super::netif::tun_adapter_name`]), whose fallback covers the absent or
-/// cleared name the wire form drops.
+/// The tun adapter name a staged config creates, when it contains a TUN
+/// inbound that names its adapter. Every config this app generates names it
+/// ([`crate::model::inbound::TunCfg::effective_name`]); a config that does
+/// not (a whole-config raw override carrying its own TUN inbound) is
+/// answered with `None`, because the core fills a name-less inbound with a
+/// random free `utun10`-`utun1024` name (infra/conf/tun.go) that this side
+/// cannot map back to a devnode.
 pub fn staged_tun_adapter_name(config_json: &str) -> Option<String> {
     let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
     let inbounds = config.get(keys::INBOUNDS)?.as_array()?;
@@ -375,8 +377,8 @@ pub fn staged_tun_adapter_name(config_json: &str) -> Option<String> {
             .get(keys::SETTINGS)
             .and_then(|settings| settings.get("name"))
             .and_then(serde_json::Value::as_str)
-            .map(tun_adapter_name)
-            .unwrap_or(DEFAULT_TUN_ADAPTER_NAME);
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?;
         return Some(name.to_string());
     }
     None
@@ -448,14 +450,13 @@ mod tests {
         let no_tun = r#"{"inbounds": [{"protocol": "socks"}]}"#;
         assert_eq!(staged_tun_adapter_name(no_tun), None);
 
+        // A TUN inbound that names no adapter is one this side cannot map
+        // back: the core fills the name itself.
         let empty_name = r#"{"inbounds": [{"protocol": "tun", "settings": {}}]}"#;
-        assert_eq!(staged_tun_adapter_name(empty_name).as_deref(), Some("tun0"));
+        assert_eq!(staged_tun_adapter_name(empty_name), None);
 
         let whitespace_name = r#"{"inbounds": [{"protocol": "tun", "settings": {"name": "  "}}]}"#;
-        assert_eq!(
-            staged_tun_adapter_name(whitespace_name).as_deref(),
-            Some("tun0")
-        );
+        assert_eq!(staged_tun_adapter_name(whitespace_name), None);
 
         assert_eq!(staged_tun_adapter_name("not json"), None);
     }

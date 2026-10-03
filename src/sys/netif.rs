@@ -2,8 +2,8 @@
 //! forward table and per-interface metrics the `auto` outbound heuristic
 //! reads. Used to pick a physical outbound interface for TUN traffic.
 //!
-//! The TUN uplink rule lives here too — [`fixed_name_verdict`],
-//! [`resolve_probe_uplink`], and [`tun_adapter_name`] judge an enumeration
+//! The TUN uplink rule lives here too — [`fixed_name_verdict`] and
+//! [`resolve_probe_uplink`] judge an enumeration
 //! view the caller supplies. The view and the mode gate differ by caller,
 //! deliberately: the commit guard and the TUN screen pass the
 //! physical-only [`list`] view, while the probe passes the
@@ -349,25 +349,6 @@ fn xray_outbound_heuristic(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Opt
     pick_outbound_interface(candidates, tun_self_index)
 }
 
-/// Xray's wire default for the TUN adapter name: a TUN inbound whose
-/// settings carry no `name` makes the core create a `tun0` adapter. A
-/// cleared app setting produces exactly such a name-less inbound (the wire
-/// form drops the empty string), so this is the effective name wherever one
-/// is derived from the setting.
-pub const DEFAULT_TUN_ADAPTER_NAME: &str = "tun0";
-
-/// Derive the TUN adapter's effective wire name from a configured
-/// (settings) name: the trimmed name, or [`DEFAULT_TUN_ADAPTER_NAME`] when
-/// nothing but whitespace is configured.
-pub fn tun_adapter_name(configured_name: &str) -> &str {
-    let trimmed = configured_name.trim();
-    if trimmed.is_empty() {
-        DEFAULT_TUN_ADAPTER_NAME
-    } else {
-        trimmed
-    }
-}
-
 /// The verdict for a configured fixed TUN uplink name, checked against an
 /// enumeration view (production passes the physical-only [`list`] view).
 /// A pinned name makes a TUN-mode core bind every dial — the outbound chain
@@ -441,7 +422,8 @@ pub enum ProbeUplink<'a> {
 ///   measurement while looking valid. This branch reads no OS state.
 ///
 /// `tun_self_index` is the main core's own TUN adapter index (the caller
-/// resolves [`tun_adapter_name`] against the enumeration): it is excluded
+/// resolves the TUN inbound's effective name against the enumeration): it
+/// is excluded
 /// from the heuristic and a fixed name resolving to it is rejected,
 /// mirroring Go's `iface.Index == tunIndex` skip — binding to the TUN's own
 /// interface would send the dial back into the tunnel, re-introducing the
@@ -655,17 +637,6 @@ mod tests {
     #[test]
     fn picker_without_candidates_returns_none() {
         assert_eq!(pick_outbound_interface(Vec::new(), None), None);
-    }
-
-    #[test]
-    fn tun_adapter_name_trims_and_falls_back_to_the_wire_default() {
-        // The constant is the wire contract: a name-less TUN inbound makes
-        // the core create `tun0`.
-        assert_eq!(DEFAULT_TUN_ADAPTER_NAME, "tun0");
-        assert_eq!(tun_adapter_name("broccoli0"), "broccoli0");
-        assert_eq!(tun_adapter_name("  broccoli0  "), "broccoli0");
-        assert_eq!(tun_adapter_name(""), DEFAULT_TUN_ADAPTER_NAME);
-        assert_eq!(tun_adapter_name(" \t "), DEFAULT_TUN_ADAPTER_NAME);
     }
 
     #[test]

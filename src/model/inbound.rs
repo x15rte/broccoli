@@ -899,8 +899,9 @@ mod stable_tag_tests {
 pub struct TunCfg {
     /// Always serialized (storage): a cleared name must survive the load
     /// round-trip — with the seeded "broccoli0" default, a missing key
-    /// would resurrect it after the user cleared it. `to_wire` strips the
-    /// empty string so the wire form stays clean.
+    /// would resurrect it after the user cleared it. The wire form never
+    /// carries the blank string: [`Self::effective_name`] names the adapter
+    /// even then, so the core always creates the adapter this app tracks.
     pub name: String,
     /// Always serialized (storage): a cleared desc must survive the load
     /// round-trip — with the seeded "Wintun" default, a missing key
@@ -937,10 +938,14 @@ pub struct TunCfg {
     pub extra: Map<String, Value>,
 }
 
+/// The seeded TUN adapter name. The emitted inbound always names its
+/// adapter, so a blank setting ([`TunCfg::effective_name`]) resolves here.
+pub const DEFAULT_TUN_NAME: &str = "broccoli0";
+
 impl Default for TunCfg {
     fn default() -> Self {
         Self {
-            name: "broccoli0".into(),
+            name: DEFAULT_TUN_NAME.into(),
             desc: "Wintun".into(),
             mtu: 1500,
             gateway: vec!["10.255.0.1/30".into(), "fd00::1/64".into()],
@@ -963,6 +968,22 @@ impl Default for TunCfg {
 }
 
 impl TunCfg {
+    /// The adapter name the emitted TUN inbound carries: the trimmed
+    /// setting, or [`DEFAULT_TUN_NAME`] when the setting is blank. The core
+    /// fills a name-less TUN inbound with a random free `utun10`-`utun1024`
+    /// name (infra/conf/tun.go), which nothing on this side can map back to
+    /// the devnode to clean up, the interface to shield, or the adapter to
+    /// exclude from the latency probe's uplink pick — so the inbound always
+    /// names its adapter.
+    pub fn effective_name(&self) -> &str {
+        let trimmed = self.name.trim();
+        if trimmed.is_empty() {
+            DEFAULT_TUN_NAME
+        } else {
+            trimmed
+        }
+    }
+
     /// Wire form of the TUN inbound; `sniffing` lives in the inbound
     /// envelope, not the TUN protocol settings.
     pub fn to_wire(&self, fakedns: bool) -> Value {
@@ -981,9 +1002,13 @@ impl TunCfg {
             // so a user-cleared value survives the load round-trip; strip
             // them here so the wire form stays byte-identical to the
             // skip-based one.
-            if self.name.is_empty() {
-                o.remove("name");
-            }
+            // The name is never blank on the wire, whatever the setting
+            // holds (see `effective_name`); the other storage-only fields
+            // still strip their cleared values.
+            o.insert(
+                "name".into(),
+                Value::String(self.effective_name().to_string()),
+            );
             if self.desc.is_empty() {
                 o.remove("desc");
             }
@@ -1014,7 +1039,7 @@ impl TunCfg {
 }
 #[cfg(test)]
 mod tun_tests {
-    use super::TunCfg;
+    use super::{DEFAULT_TUN_NAME, TunCfg};
 
     #[test]
     fn fresh_install_default_routing_table_covers_v4_and_v6() {
@@ -1027,6 +1052,37 @@ mod tun_tests {
                 "8000::/1".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn wire_form_always_names_the_adapter() {
+        // A name-less TUN inbound would let the core create a random
+        // `utun10`-`utun1024` adapter (infra/conf/tun.go) that nothing on
+        // this side maps back to the devnode to clean up, the interface to
+        // shield, or the adapter to exclude from the probe's uplink pick, so
+        // the emitted settings always carry a name.
+        let blank = TunCfg {
+            name: " \t ".into(),
+            ..Default::default()
+        };
+        assert_eq!(blank.effective_name(), DEFAULT_TUN_NAME);
+        assert_eq!(
+            blank.to_wire(false)["settings"]["name"],
+            serde_json::json!(DEFAULT_TUN_NAME)
+        );
+
+        let named = TunCfg {
+            name: "  my-tun  ".into(),
+            ..Default::default()
+        };
+        assert_eq!(named.effective_name(), "my-tun");
+        assert_eq!(
+            named.to_wire(false)["settings"]["name"],
+            serde_json::json!("my-tun")
+        );
+        // Storage keeps the setting exactly as typed, blank or padded: only
+        // the wire form normalizes (see the cleared-state test).
+        assert_eq!(named.name, "  my-tun  ");
     }
 
     #[test]

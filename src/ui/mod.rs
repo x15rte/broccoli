@@ -477,8 +477,7 @@ impl<'a> UiCtx<'a> {
         // request does not re-derive it from the mode setting: one decision,
         // taken where the live backend is known.
         let tun_outbound_interface = Some(self.settings.tun.auto_outbounds_interface.clone());
-        let tun_adapter_name =
-            Some(sys::netif::tun_adapter_name(&self.settings.tun.name).to_owned());
+        let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
         self.cmd
             .send(CoreCmd::ProbeLatency {
                 profiles,
