@@ -14,6 +14,8 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use broccoli::i18n::{Key, t_fmt};
+use broccoli::model::settings::Language;
 use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 use broccoli::rt::{ApplyIntent, CoreCmd, CoreEvt, CorePhase, GrpcClient, LatencyProbeResult};
 
@@ -139,6 +141,7 @@ fn wait_for_latency_result(
     main_grpc: &GrpcClient,
     io: &tokio::runtime::Runtime,
     initial_uptime: u32,
+    app_logs: &mut Vec<String>,
 ) -> LatencyProbeResult {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut operation_released = false;
@@ -156,6 +159,12 @@ fn wait_for_latency_result(
             Some(CoreEvt::Operation(None)) if result.is_some() => {
                 operation_released = true;
                 return ControlFlow::Break(());
+            }
+            // Collect every app-authored line this window renders: the main
+            // core is not restarted here, so none of them can be the payload
+            // verification of a traffic-carrying spawn.
+            Some(CoreEvt::AppLog(message)) => {
+                app_logs.push(message.text(Language::En));
             }
             _ => {}
         }
@@ -289,6 +298,12 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
         .expect("main API stats")
         .uptime;
 
+    // Every app-authored line the two probe windows below render. The main
+    // core is not restarted in either window (asserted by
+    // `assert_no_main_failure_event`), so its payload-verification line cannot
+    // legitimately appear here; only a probe narrating its own verify could.
+    let mut probe_app_logs = Vec::new();
+
     runtime
         .cmd
         .send(CoreCmd::ProbeLatency {
@@ -298,7 +313,13 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
             tun_adapter_name: None,
         })
         .expect("send successful isolated probe");
-    let success = wait_for_latency_result(&evt_rx, &main_grpc, &io, initial_uptime);
+    let success = wait_for_latency_result(
+        &evt_rx,
+        &main_grpc,
+        &io,
+        initial_uptime,
+        &mut probe_app_logs,
+    );
     let statuses = success.result.expect("successful probe runner result");
     let status = statuses
         .iter()
@@ -333,7 +354,13 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
             tun_adapter_name: None,
         })
         .expect("send dead-target isolated probe");
-    let dead = wait_for_latency_result(&evt_rx, &main_grpc, &io, initial_uptime);
+    let dead = wait_for_latency_result(
+        &evt_rx,
+        &main_grpc,
+        &io,
+        initial_uptime,
+        &mut probe_app_logs,
+    );
     let dead_status = dead
         .result
         .expect("dead target should still return an observation row")
@@ -358,6 +385,17 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
         &active_config,
     );
     assert_no_probe_temp_dirs(&probe_temp);
+
+    // A probe spawn verifies its scope but must not narrate it: the ring
+    // record of a release verify belongs to the traffic-carrying core start,
+    // and the probe window has no such start (the main core is never
+    // restarted here). The probe whose scope is `XrayExeOnly` would render
+    // exactly this line.
+    let probe_verify_line = t_fmt(Language::En, Key::RtLogPayloadsVerified, &[&"xray.exe"]);
+    assert!(
+        !probe_app_logs.contains(&probe_verify_line),
+        "an isolated probe spawn must not narrate its release verify, got: {probe_app_logs:?}"
+    );
 
     runtime.cmd.send(CoreCmd::Stop).expect("stop main runtime");
     let stop_deadline = Instant::now() + Duration::from_secs(10);

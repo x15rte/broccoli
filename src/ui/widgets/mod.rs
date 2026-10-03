@@ -894,6 +894,36 @@ pub fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) 
         });
 }
 
+/// Draw one control row whose explanation rides its hover: `add` renders the
+/// control, and the row's rect carries `note` as a tooltip, so a note the
+/// user does not need for the decision at hand costs no permanent line. The
+/// scope keeps the caller's layout; the hover widget is created after the
+/// row, because a child `Ui`'s own rect is registered at creation — before
+/// its contents — and egui only hovers a non-interactive widget that sits
+/// above the interactive one it covers. A control in the row keeps its own
+/// tooltip: egui stacks the two while both are hovered. A row inside disabled
+/// UI keeps its tooltip through the disabled channel.
+pub fn noted<'a, R>(
+    ui: &mut egui::Ui,
+    note: impl Into<Option<&'a str>>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let row = ui.scope(|ui| add(ui));
+    if let Some(note) = note.into() {
+        let hover = ui.interact(
+            row.response.rect,
+            row.response.id.with("note"),
+            egui::Sense::hover(),
+        );
+        if hover.enabled() {
+            hover.on_hover_text(note);
+        } else {
+            hover.on_disabled_hover_text(note);
+        }
+    }
+    row.inner
+}
+
 /// Parse a Go-duration interval that must be greater than zero — the
 /// observatory probe interval. Returns the inline message for an invalid
 /// draft instead of a committed value.
@@ -945,6 +975,35 @@ mod tests {
                 Err(expected.clone())
             );
         }
+    }
+
+    #[test]
+    fn a_noted_row_carries_its_note_on_hover_and_no_line() {
+        // The note rides the row's hover instead of a permanent line: the
+        // text is absent from the tree until the pointer is over the row,
+        // and present once it is.
+        let note = "The core downloads on first use.";
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 200.0))
+            .build_ui_state(
+                |ui, value: &mut String| {
+                    let _ = noted(ui, note, |ui| text_field(ui, "core", value, ""));
+                },
+                String::new(),
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "a noted row must render no permanent line for its note"
+        );
+
+        harness.get_by_label("core").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the row's hover must carry the note"
+        );
     }
 
     #[test]

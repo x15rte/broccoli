@@ -286,12 +286,7 @@ fn finalmask_transform_editor(
                         changed |= widgets::text_field(ui, "reuse", &mut arg.reuse, "_var");
                     }
                     "metadata" => {
-                        changed |= widgets::text_field(
-                            ui,
-                            "metadata",
-                            &mut arg.metadata,
-                            t(lang, Key::SrvMetadataSelectorHint),
-                        );
+                        changed |= widgets::text_field(ui, "metadata", &mut arg.metadata, "");
                     }
                     "transform" => {
                         if let Some(nested) = arg.transform.as_mut() {
@@ -895,19 +890,13 @@ fn finalmask_realm_tls_editor(
         &mut tls.ech_server_keys,
         t(lang, Key::SrvRealmTlsEchServerKeysHint),
     );
-    changed |= widgets::text_field(
-        ui,
-        "echConfigList",
-        &mut tls.ech_config_list,
-        t(lang, Key::SrvRealmTlsEchConfigListHint),
-    );
+    changed |= widgets::text_field(ui, "echConfigList", &mut tls.ech_config_list, "");
     // The realm TLS ECH sockopt's findings already ride the memoized
     // finalmask sweep (`validate_finalmask` validates this exact field under
     // its mask-scoped path), so the inline re-check here would be a second
     // message channel for the same value; the memoized finalmask verdict
     // list below the mask list is the one that renders it.
     changed |= ech_sockopt_editor(ui, lang, &mut tls.ech_sockopt, &[]);
-    ui.weak(t(lang, Key::SrvRealmTlsWireNote));
     let mut remove = None;
     for (index, certificate) in tls.certificates.iter_mut().enumerate() {
         ui.push_id(("realm-cert", index), |ui| {
@@ -1152,17 +1141,22 @@ pub(super) fn finalmask_udp_settings_editor(
                 &mut settings.stun_servers,
                 "stun.example.com:3478",
             );
-            changed |= widgets::combo_str_labeled(
-                ui,
-                "ipMode",
-                &mut settings.ip_mode,
-                &["dual", "v4", "v6"],
-                t(lang, Key::SrvDefault),
-                true,
-            );
-            ui.weak(t(lang, Key::SrvRealmIpModeNote));
+            changed |= widgets::noted(ui, t(lang, Key::SrvRealmIpModeNote), |ui| {
+                widgets::combo_str_labeled(
+                    ui,
+                    "ipMode",
+                    &mut settings.ip_mode,
+                    &["dual", "v4", "v6"],
+                    t(lang, Key::SrvDefault),
+                    true,
+                )
+            });
             let mut has_mapping = settings.port_mapping.is_some();
-            if ui.checkbox(&mut has_mapping, "portMapping").changed() {
+            if ui
+                .checkbox(&mut has_mapping, "portMapping")
+                .on_hover_text(t(lang, Key::SrvRealmPortMappingNote))
+                .changed()
+            {
                 settings.port_mapping = has_mapping.then(FinalmaskRealmPortMapping::default);
                 changed = true;
             }
@@ -1180,10 +1174,13 @@ pub(super) fn finalmask_udp_settings_editor(
                     &mut mapping.lifetime,
                     0..=i64::MAX,
                 );
-                ui.weak(t(lang, Key::SrvRealmPortMappingNote));
             }
             let mut has_tls = settings.tls_config.is_some();
-            if ui.checkbox(&mut has_tls, "tlsConfig").changed() {
+            if ui
+                .checkbox(&mut has_tls, "tlsConfig")
+                .on_hover_text(t(lang, Key::SrvRealmTlsWireNote))
+                .changed()
+            {
                 settings.tls_config = has_tls.then(FinalmaskRealmTls::default);
                 changed = true;
             }

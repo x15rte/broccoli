@@ -202,11 +202,24 @@ impl SpawnFlavor {
             SpawnFlavor::LatencyProbe => crate::sys::core_dl::VerifyScope::XrayExeOnly,
         }
     }
+
+    /// Whether this flavor narrates its verify in the ring. The traffic-
+    /// carrying main core keeps the one line per start that records what the
+    /// app did; the one-shot probe child still verifies but stays silent, so
+    /// a sweep over many profiles does not fill the ring with identical
+    /// lines.
+    fn narrates_verify(self) -> bool {
+        match self {
+            SpawnFlavor::MainCore => true,
+            SpawnFlavor::LatencyProbe => false,
+        }
+    }
 }
 
-/// The one app-authored line a spawn writes once release verification
-/// passed: the payload names of the verify scope, which is what makes this
-/// spawn trusted. Pure, so the scope-to-names mapping is unit-testable.
+/// The one app-authored line a main-core spawn writes once release
+/// verification passed: the payload names of the verify scope, which is what
+/// makes this spawn trusted. Pure, so the scope-to-names mapping is
+/// unit-testable.
 pub(crate) fn verified_payloads_notice(scope: VerifyScope) -> Diag {
     let names = scope
         .payload_pins()
@@ -299,8 +312,11 @@ async fn spawn_for(
     };
     // The verification result is consumed here, before CreateProcess: these
     // are the payloads that passed release verification for this spawn, so
-    // this line is what makes the start below trusted. One line per spawn.
-    log.log(verified_payloads_notice(scope));
+    // this line is what makes the start below trusted. One line per
+    // narrating spawn; the probe child verifies but stays silent.
+    if flavor.narrates_verify() {
+        log.log(verified_payloads_notice(scope));
+    }
     let mut cmd = Command::new(core.join("xray.exe"));
     cmd.arg("run")
         .arg("-config")

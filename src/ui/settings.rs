@@ -21,7 +21,7 @@ use crate::ui::request::{Request, Terminal};
 const LOG_LEVELS: [&str; 5] = ["debug", "info", "warning", "error", "none"];
 
 /// Parse the raw override edit buffer: an empty/whitespace-only buffer is
-/// `Err("")` (rendered as the paste hint), anything else is the JSON result.
+/// `Err("")` (the empty draft), anything else is the JSON result.
 fn parse_raw_override(buf: &str) -> Result<serde_json::Value, String> {
     if buf.trim().is_empty() {
         Err(String::new())
@@ -607,6 +607,7 @@ impl SettingsScreen {
                     &mut color,
                     egui::color_picker::Alpha::Opaque,
                 )
+                .on_hover_text(t(ctx.settings.language, Key::AccentColorNote))
                 .changed()
                 {
                     let rgba = accent_rgba(color);
@@ -617,11 +618,6 @@ impl SettingsScreen {
                     }
                 }
             });
-            ui.label(
-                RichText::new(t(ctx.settings.language, Key::AccentColorHint))
-                    .weak()
-                    .small(),
-            );
         });
     }
 
@@ -892,9 +888,10 @@ impl SettingsScreen {
             ui.heading(t(lang, Key::SettingsCleanUpNetworkTitle));
             ui.add_space(4.0);
             ui.add(
-                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanUpNetworkBody)).weak())
+                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanUpNetworkNote)).weak())
                     .wrap(),
-            );
+            )
+            .on_hover_text(t(lang, Key::SettingsCleanUpNetworkDetail));
             ui.add_space(10.0);
             if ui
                 .button(t(lang, Key::SettingsCleanUpNetworkConfirm))
@@ -923,8 +920,9 @@ impl SettingsScreen {
             ui.heading(t(lang, Key::SettingsCleanupTitle));
             ui.add_space(4.0);
             ui.add(
-                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanupBody)).weak()).wrap(),
-            );
+                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanupNote)).weak()).wrap(),
+            )
+            .on_hover_text(t(lang, Key::SettingsCleanupDetail));
             ui.add_space(10.0);
             if ui
                 .button(t(lang, Key::SettingsCleanupFull))
@@ -952,7 +950,8 @@ impl SettingsScreen {
             ui.set_max_width(520.0);
             ui.heading(t(lang, Key::SettingsResetTitle));
             ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(t(lang, Key::SettingsResetBody)).weak()).wrap());
+            ui.add(egui::Label::new(RichText::new(t(lang, Key::SettingsResetNote)).weak()).wrap())
+                .on_hover_text(t(lang, Key::SettingsResetDetail));
             ui.add_space(10.0);
             if ui.button(t(lang, Key::SettingsResetConfirm)).clicked() {
                 self.reset_request = true;
@@ -1004,13 +1003,15 @@ impl SettingsScreen {
             // Commit + mark dirty only when the value validates (probe_interval
             // pattern): an invalid draft stays in the edit buffer with its
             // inline error and can never block later generation.
-            let changed = widgets::validated_field(
-                ui,
-                "geoip.dat",
-                geoip_url,
-                t(lang, Key::UrlHint),
-                |value| geodata_url_error(value, lang),
-            );
+            let changed = widgets::noted(ui, t(lang, Key::SettingsGeodataEmptyNote), |ui| {
+                widgets::validated_field(
+                    ui,
+                    "geoip.dat",
+                    geoip_url,
+                    t(lang, Key::UrlHint),
+                    |value| geodata_url_error(value, lang),
+                )
+            });
             if changed
                 && self.geoip_url_buf.commit_if(
                     |value| geodata_url_error(value, lang).is_none(),
@@ -1025,13 +1026,15 @@ impl SettingsScreen {
             let geosite_url = self
                 .geosite_url_buf
                 .begin(|| ctx.settings.geodata.geosite_url.clone().unwrap_or_default());
-            let changed = widgets::validated_field(
-                ui,
-                "geosite.dat",
-                geosite_url,
-                t(lang, Key::UrlHint),
-                |value| geodata_url_error(value, lang),
-            );
+            let changed = widgets::noted(ui, t(lang, Key::SettingsGeodataEmptyNote), |ui| {
+                widgets::validated_field(
+                    ui,
+                    "geosite.dat",
+                    geosite_url,
+                    t(lang, Key::UrlHint),
+                    |value| geodata_url_error(value, lang),
+                )
+            });
             if changed
                 && self.geosite_url_buf.commit_if(
                     |value| geodata_url_error(value, lang).is_none(),
@@ -1046,13 +1049,15 @@ impl SettingsScreen {
             let cron = self
                 .geodata_cron_buf
                 .begin(|| ctx.settings.geodata.cron.clone().unwrap_or_default());
-            let changed = widgets::validated_field(
-                ui,
-                t(lang, Key::SettingsGeodataCronLabel),
-                cron,
-                crate::model::settings::DEFAULT_GEODATA_CRON,
-                |value| geodata_cron_error(value, lang),
-            );
+            let changed = widgets::noted(ui, t(lang, Key::SettingsGeodataCronNote), |ui| {
+                widgets::validated_field(
+                    ui,
+                    t(lang, Key::SettingsGeodataCronLabel),
+                    cron,
+                    crate::model::settings::DEFAULT_GEODATA_CRON,
+                    |value| geodata_cron_error(value, lang),
+                )
+            });
             if changed
                 && self.geodata_cron_buf.commit_if(
                     |value| geodata_cron_error(value, lang).is_none(),
@@ -1063,28 +1068,12 @@ impl SettingsScreen {
             {
                 ctx.mark_dirty();
             }
-            ui.label(
-                RichText::new(t(lang, Key::SettingsGeodataCronHint))
-                    .weak()
-                    .small(),
-            );
-            ui.label(
-                RichText::new(t(lang, Key::SettingsGeodataEmptyHint))
-                    .weak()
-                    .small(),
-            );
-            ui.label(
-                RichText::new(t(lang, Key::SettingsGeodataScheduleHint))
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(6.0);
             self.geodata_provenance_ui(ui, lang);
         });
     }
 
     /// The geo data provenance status line and the Restore action,
-    /// under the section's fields and hints. Rendered from the
+    /// under the section's fields. Rendered from the
     /// memoized hash result — nothing here hashes; the caption is rebuilt
     /// only when the result or the language changed.
     ///
@@ -1168,19 +1157,16 @@ impl SettingsScreen {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsAdvanced), |ui| {
             widgets::section(ui, t(lang, Key::SettingsPingTest), |ui| {
-                if widgets::text_field(
-                    ui,
-                    t(lang, Key::ProbeUrl),
-                    &mut ctx.settings.probe_url,
-                    "https://www.google.com/generate_204",
-                ) {
+                if widgets::noted(ui, t(lang, Key::SettingsPingTestNote), |ui| {
+                    widgets::text_field(
+                        ui,
+                        t(lang, Key::ProbeUrl),
+                        &mut ctx.settings.probe_url,
+                        "https://www.google.com/generate_204",
+                    )
+                }) {
                     ctx.mark_dirty();
                 }
-                ui.label(
-                    RichText::new(t(lang, Key::SettingsPingTestHint))
-                        .weak()
-                        .small(),
-                );
             });
             if ctx.settings.raw_override.is_some() {
                 ui.label(
@@ -1193,12 +1179,7 @@ impl SettingsScreen {
             egui::CollapsingHeader::new(t(lang, Key::SettingsRawOverrideHeader))
                 .id_salt("settings_raw_override")
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(t(lang, Key::SettingsRawOverrideExplain))
-                            .weak()
-                            .small(),
-                    );
-                    let raw_changed = {
+                    let raw_response = {
                         // Seeded on first open; afterwards the draft is the
                         // buffer on screen until Enable override commits it.
                         let raw = self
@@ -1210,8 +1191,8 @@ impl SettingsScreen {
                                 .desired_rows(14)
                                 .desired_width(f32::INFINITY),
                         )
-                        .changed()
                     };
+                    let raw_changed = raw_response.changed();
                     // The seeding frame is the first open; every edit drives
                     // a fresh parse too, so the verdict always describes the
                     // buffer on screen.
@@ -1229,11 +1210,7 @@ impl SettingsScreen {
                             });
                         }
                         Some(RawParseState::Empty) => {
-                            ui.label(
-                                RichText::new(t(lang, Key::SettingsRawOverridePasteHint))
-                                    .weak()
-                                    .small(),
-                            );
+                            raw_response.on_hover_text(t(lang, Key::SettingsRawOverridePasteNote));
                         }
                         Some(RawParseState::TooLarge(len, limit)) => {
                             ui.label(
@@ -1340,7 +1317,9 @@ impl SettingsScreen {
                             ui.label(RichText::new(output.as_str()).monospace().small());
                         }
                     }
-                });
+                })
+                .header_response
+                .on_hover_text(t(lang, Key::SettingsRawOverrideExplain));
         });
     }
 }

@@ -232,12 +232,9 @@ impl DnsScreen {
                 &mut dns.client_ip,
                 t(lang, Key::DnsClientIpHint),
             );
-            *changed |= widgets::text_field(
-                ui,
-                t(lang, Key::DnsBootstrapLabel),
-                &mut dns.bootstrap,
-                t(lang, Key::DnsBootstrapHint),
-            );
+            *changed |= widgets::noted(ui, t(lang, Key::DnsBootstrapNote), |ui| {
+                widgets::text_field(ui, t(lang, Key::DnsBootstrapLabel), &mut dns.bootstrap, "")
+            });
             *changed |= widgets::combo_str(
                 ui,
                 t(lang, Key::DnsQueryStrategy),
@@ -324,11 +321,6 @@ impl DnsScreen {
                 }
                 *changed = true;
             }
-            ui.label(
-                RichText::new(t(lang, Key::DnsFakednsExplain))
-                    .small()
-                    .weak(),
-            );
             if fd.enabled {
                 let mut delete = None;
                 for (index, pool) in fd.pools.iter_mut().enumerate() {

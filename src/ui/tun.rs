@@ -151,23 +151,14 @@ impl TunScreen {
             .fill(ui.visuals().extreme_bg_color)
             .inner_margin(8.0)
             .show(ui, |ui| {
-                ui.label(t(lang, Key::TunExplain));
-                // The in-tun DNS listener answers on the adapter's gateway
-                // address and is added to the running core once the adapter
-                // exists (it never appears in the generated config the
-                // preview shows), so the page states that lifecycle where
-                // the settings driving it live: TUN on, a DNS module, and an
-                // IPv4 gateway to bind.
-                if ctx.settings.mode == Mode::Tun
-                    && !ctx.settings.dns.is_effectively_empty()
-                    && tun_ipv4_gateway(&ctx.settings.tun).is_some()
-                {
-                    ui.label(
-                        egui::RichText::new(t(lang, Key::TunDnsListenerNote))
-                            .weak()
-                            .small(),
-                    );
-                }
+                // The in-tun DNS listener note rides the screen header: the
+                // listener answers on the adapter's gateway address and is
+                // added to the running core once the adapter exists (it never
+                // appears in the generated config the preview shows), so the
+                // note states that lifecycle on hover instead of as a
+                // permanent line.
+                ui.label(t(lang, Key::TunExplain))
+                    .on_hover_text(t(lang, Key::TunDnsListenerNote));
                 ui.label(badge);
             });
         ui.add_space(6.0);
@@ -182,9 +173,6 @@ impl TunScreen {
             {
                 let requested_mode = if enabled { Mode::Tun } else { Mode::Off };
                 changed |= ctx.settings.set_mode(requested_mode);
-            }
-            if ctx.settings.mode == Mode::Tun {
-                ui.weak(t(lang, Key::TunRestartHint));
             }
         });
         // The banner sits between the enable toggle and the sections: it is
@@ -268,7 +256,7 @@ impl TunScreen {
             // still binds, then every socket fails unreachable-host).
             ui.horizontal(|ui| {
                 ui.label(t(lang, Key::TunAutoOutboundsLabel));
-                egui::ComboBox::from_id_salt("auto-iface")
+                let combo_button = egui::ComboBox::from_id_salt("auto-iface")
                     .selected_text(if tun.auto_outbounds_interface.is_empty() {
                         "auto"
                     } else {
@@ -306,7 +294,9 @@ impl TunScreen {
                                 );
                             }
                         }
-                    });
+                    })
+                    .response;
+                combo_button.on_hover_text(t(lang, Key::TunAutoOutboundsNote));
                 // A persisted fixed pick whose adapter is currently down or
                 // missing is the outage trap above: surface it here (the
                 // shared name verdict), and Apply/Connect rejects it
@@ -328,13 +318,6 @@ impl TunScreen {
                     );
                 }
             });
-            if tun.auto_outbounds_interface.is_empty() || tun.auto_outbounds_interface == "auto" {
-                ui.label(
-                    egui::RichText::new(t(lang, Key::TunAutoOutboundsHint))
-                        .weak()
-                        .small(),
-                );
-            }
         });
 
         if changed {
@@ -424,29 +407,6 @@ mod tests {
         }
     }
 
-    /// Render the screen once for a settings shape and assert whether the
-    /// in-tun DNS listener note appears: `true` requires the exact note
-    /// label, `false` forbids it.
-    fn assert_rendered_listener_note(
-        case: &str,
-        configure: impl FnOnce(&mut UiTestRig),
-        expected: bool,
-    ) {
-        let mut rig = UiTestRig::default();
-        configure(&mut rig);
-        let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.show(ui, &mut rig.ctx()),
-            TunScreen::default(),
-        );
-        harness.run();
-        let note = t(Language::En, Key::TunDnsListenerNote);
-        assert_eq!(
-            harness.query_by_label(note).is_some(),
-            expected,
-            "{case}: the listener note must follow the settings that drive the listener"
-        );
-    }
-
     /// Render the screen once for a mode/phase with the shell un-elevated
     /// (what `UiTestRig` models, and what the app always is) and assert the
     /// elevation badge: exactly `expected` of the three badge labels is on
@@ -482,37 +442,29 @@ mod tests {
     }
 
     #[test]
-    fn dns_listener_note_follows_the_tun_and_module_settings() {
-        // TUN on with the seeded module and gateway: the note states where
-        // the listener binds and when it appears.
-        assert_rendered_listener_note(
-            "TUN on, module and gateway set",
-            |rig| rig.settings.mode = Mode::Tun,
-            true,
+    fn dns_listener_note_rides_the_tun_header_hover() {
+        // The note is no permanent line: it stays out of the tree until the
+        // pointer is over the TUN screen header that carries it, and is
+        // present once it is.
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, screen| screen.show(ui, &mut rig.ctx()),
+            TunScreen::default(),
         );
-        // TUN off: no adapter, nothing binds the gateway.
-        assert_rendered_listener_note("TUN off", |_| {}, false);
-        // No DNS module: the listener is never added. Clearing the server
-        // list alone still leaves the parallel-query flag on the wire — a
-        // module as far as the generator and the runtime are concerned — so
-        // the no-module state clears both.
-        assert_rendered_listener_note(
-            "no module",
-            |rig| {
-                rig.settings.mode = Mode::Tun;
-                rig.settings.dns.servers.clear();
-                rig.settings.dns.enable_parallel_query = false;
-            },
-            false,
+        harness.run();
+        let note = t(Language::En, Key::TunDnsListenerNote);
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the listener note must render no permanent line"
         );
-        // No IPv4 gateway: generation is blocked and nothing binds.
-        assert_rendered_listener_note(
-            "no IPv4 gateway",
-            |rig| {
-                rig.settings.mode = Mode::Tun;
-                rig.settings.tun.gateway.clear();
-            },
-            false,
+
+        let header = t(Language::En, Key::TunExplain);
+        harness.get_by_label(header).hover();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the TUN header hover must carry the listener note"
         );
     }
 

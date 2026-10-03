@@ -359,7 +359,7 @@ impl InboundsScreen {
                                 r"C:\path\to\xray.sock",
                             );
                             ui.label(
-                                egui::RichText::new(t(lang, Key::InboundsUnixHint))
+                                egui::RichText::new(t(lang, Key::InboundsUnixNote))
                                     .small()
                                     .weak(),
                             );
@@ -385,7 +385,7 @@ impl InboundsScreen {
                         }
                         Err(_) => {
                             ui.label(
-                                egui::RichText::new(t(lang, Key::InboundsImportedHint))
+                                egui::RichText::new(t(lang, Key::InboundsImportedNote))
                                     .small()
                                     .weak(),
                             );

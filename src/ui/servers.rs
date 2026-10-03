@@ -919,13 +919,6 @@ fn sockopt_editor(
             &mut settings.max_concurrent_try,
             0..=u32::MAX,
         );
-        if !settings.extra.is_empty() {
-            ui.weak(t_fmt(
-                lang,
-                Key::SrvUnknownFutureFieldsCustom,
-                &[&settings.extra.len()],
-            ));
-        }
     }
 
     match usage {
@@ -996,13 +989,6 @@ fn sockopt_editor(
                 changed |=
                     widgets::text_field(ui, "opt", &mut custom.opt, t(lang, Key::SrvCustomOptHint));
                 changed |= widgets::text_field(ui, "value", &mut custom.value, "");
-                if !custom.extra.is_empty() {
-                    ui.weak(t_fmt(
-                        lang,
-                        Key::SrvUnknownFutureFields,
-                        &[&custom.extra.len()],
-                    ));
-                }
             });
         });
     }
@@ -1016,13 +1002,6 @@ fn sockopt_editor(
     // on idle repaint frames.
     for error in errors {
         ui.colored_label(status_colors_of(ui).err, error.as_str());
-    }
-    if !sockopt.extra.is_empty() {
-        ui.weak(t_fmt(
-            lang,
-            Key::SrvUnknownFutureFieldsSockopt,
-            &[&sockopt.extra.len()],
-        ));
     }
     changed
 }
@@ -1043,6 +1022,7 @@ fn ech_sockopt_editor(
     let mut enabled = sockopt.is_some();
     if ui
         .checkbox(&mut enabled, t(lang, Key::SrvEchDnsQuerySockopt))
+        .on_hover_text(t(lang, Key::SrvEchSockoptNote))
         .changed()
     {
         *sockopt = if enabled {
@@ -1054,7 +1034,6 @@ fn ech_sockopt_editor(
     }
     if let Some(sockopt) = sockopt.as_mut() {
         ui.indent("ech-dns-query-sockopt", |ui| {
-            ui.weak(t(lang, Key::SrvEchSockoptNote));
             changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::EchDnsQuery, None, errors);
         });
     }
@@ -1072,13 +1051,16 @@ fn mask_sockopt_editor(
 ) -> bool {
     let mut changed = false;
     let mut enabled = sockopt.is_some();
-    if ui.checkbox(&mut enabled, "sockopt").changed() {
+    if ui
+        .checkbox(&mut enabled, "sockopt")
+        .on_hover_text(t(lang, Key::SrvMaskSockoptNote))
+        .changed()
+    {
         *sockopt = enabled.then(SockoptModel::default);
         changed = true;
     }
     if let Some(sockopt) = sockopt.as_mut() {
         ui.indent("mask-sockopt", |ui| {
-            ui.weak(t(lang, Key::SrvMaskSockoptNote));
             changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::Mask, None, &[]);
         });
     }
@@ -1704,24 +1686,6 @@ fn retired_udp_hop_present(profile: &ServerProfile) -> bool {
         .as_ref()
         .and_then(|finalmask| finalmask.quic_params.as_ref())
         .is_some_and(|quic| quic.retired_udp_hop.is_some())
-}
-
-/// True when the profile's UDP mask list carries a `udphop` entry. The
-/// cheap repaint-path form of the hop state: [`udphop_masks`] serializes the
-/// entries for the mutation-time comparison, which is too much work for an
-/// idle frame of the finding row.
-fn profile_has_udphop_mask(profile: &ServerProfile) -> bool {
-    profile
-        .outbound
-        .stream
-        .finalmask
-        .as_ref()
-        .is_some_and(|finalmask| {
-            finalmask
-                .udp
-                .iter()
-                .any(|mask| matches!(mask, FinalmaskUdpMask::Udphop { .. }))
-        })
 }
 
 /// The `udphop` masks a profile carries, serialized the way the settings
@@ -3490,11 +3454,6 @@ impl ServersScreen {
             egui::Modal::new(egui::Id::new("broccoli-unsaved-leave")).show(egui_ctx, |ui| {
                 ui.set_max_width(520.0);
                 ui.heading(t(lang, Key::SrvUnsavedChanges));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(RichText::new(t(lang, Key::SrvUnsavedLeaveBody)).weak())
-                        .wrap(),
-                );
                 ui.add_space(10.0);
                 if validating {
                     ui.horizontal(|ui| {
@@ -4007,14 +3966,10 @@ impl ServersScreen {
                 });
             // The retired `proxySettings` finding's other way out: a user who
             // wants no chain at all drops the key here instead of setting a
-            // target. The note states what that costs, so it renders only
-            // when the profile will keep no chain; the control is the finding
-            // row's own and never appears for any other rule.
+            // target; the control is the finding row's own and never appears
+            // for any other rule.
             if draft.profile.outbound.retired_proxy_settings.is_some() {
                 ui.horizontal(|ui| {
-                    if draft.profile.chain_target().is_none() {
-                        ui.weak(t(lang, Key::SrvRemoveProxySettingsKeyNote));
-                    }
                     if ui.button(t(lang, Key::SrvRemoveProxySettingsKey)).clicked() {
                         dismissed_retired_key = true;
                     }
@@ -4022,14 +3977,10 @@ impl ServersScreen {
             }
             // The retired `quicParams.udpHop` finding's other way out: a user
             // who wants no hop at all drops the key here instead of building
-            // the mask. The note states what that costs, so it renders only
-            // when the profile keeps no `udphop` mask; the control is the
-            // finding row's own and never appears for any other rule.
+            // the mask; the control is the finding row's own and never appears
+            // for any other rule.
             if retired_udp_hop_present(&draft.profile) {
                 ui.horizontal(|ui| {
-                    if !profile_has_udphop_mask(&draft.profile) {
-                        ui.weak(t(lang, Key::SrvRemoveUdpHopKeyNote));
-                    }
                     if ui.button(t(lang, Key::SrvRemoveUdpHopKey)).clicked() {
                         dismissed_retired_hop = true;
                     }
@@ -4162,7 +4113,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvIdUuid),
                     &mut settings.id,
-                    "uuid",
+                    "",
                     |v| v_uuid_required(lang, v),
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -4173,14 +4124,16 @@ impl ServersScreen {
                 if generate {
                     self.request_tool(ui, lang, target, XrayToolKind::Uuid, vec!["uuid".into()]);
                 }
-                changed |= widgets::combo_str_labeled(
-                    ui,
-                    "flow",
-                    &mut settings.flow,
-                    &VLESS_FLOW,
-                    t(lang, Key::SrvDefault),
-                    false,
-                );
+                changed |= widgets::noted(ui, t(lang, Key::SrvVisionUdp443Note), |ui| {
+                    widgets::combo_str_labeled(
+                        ui,
+                        "flow",
+                        &mut settings.flow,
+                        &VLESS_FLOW,
+                        t(lang, Key::SrvDefault),
+                        false,
+                    )
+                });
                 // Warn inline at the flow
                 // trigger when the profile's mux would carry TCP under a
                 // vision flow. The predicate is the model's own, so this
@@ -4197,9 +4150,6 @@ impl ServersScreen {
                         validation_message(&ValidationCode::MuxWithVisionFlow, lang),
                     );
                 }
-                // Informational copy: what the two vision variants do
-                // with UDP/443 (no validation, no gating).
-                ui.weak(t(lang, Key::SrvVisionUdp443Hint));
                 let (field_changed, generate) = keygen_field(
                     ui,
                     "encryption",
@@ -4257,7 +4207,7 @@ impl ServersScreen {
                     ui,
                     t(lang, Key::SrvIdUuid),
                     &mut settings.id,
-                    "uuid",
+                    "",
                     |v| v_uuid_required(lang, v),
                     &KeygenButton {
                         label: t(lang, Key::Generate),
@@ -4374,15 +4324,16 @@ impl ServersScreen {
                 );
                 // The widget hands each row the list length, so the sentinel
                 // verdict follows the list as rows come and go.
-                changed |= widgets::validated_string_list(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvWgRemoteDns),
-                    &mut settings.remote_dns,
-                    t(lang, Key::SrvWgRemoteDnsHint),
-                    |entry, list_len| v_wg_remote_dns_entry(lang, entry, list_len),
-                );
-                ui.small(t(lang, Key::SrvWgRemoteDnsNote));
+                changed |= widgets::noted(ui, t(lang, Key::SrvWgRemoteDnsNote), |ui| {
+                    widgets::validated_string_list(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvWgRemoteDns),
+                        &mut settings.remote_dns,
+                        t(lang, Key::SrvWgRemoteDnsHint),
+                        |entry, list_len| v_wg_remote_dns_entry(lang, entry, list_len),
+                    )
+                });
                 let mut mtu = (settings.mtu != 0).then_some(settings.mtu);
                 if widgets::opt_num(ui, "mtu", &mut mtu, 576..=1500) {
                     settings.mtu = mtu.unwrap_or_default();
@@ -4696,7 +4647,6 @@ impl ServersScreen {
             }
             ProtocolSettings::Hysteria(settings) => {
                 changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
-                ui.weak(t(lang, Key::SrvHysteriaNote));
             }
         }
         // The public-endpoint TLS rules render from the memoized validation
@@ -4813,6 +4763,16 @@ impl ServersScreen {
                     response.on_hover_text(t(lang, Key::SrvHysteriaSelectsTls))
                 } else {
                     response
+                };
+                let response = match n {
+                    Network::Grpc => response
+                        .on_hover_text(t(lang, Key::SrvGrpcMuxNote))
+                        .on_hover_text(t(lang, Key::SrvGrpcDeprecated)),
+                    Network::Ws => response.on_hover_text(t(lang, Key::SrvWsDeprecated)),
+                    Network::Httpupgrade => {
+                        response.on_hover_text(t(lang, Key::SrvHttpupgradeDeprecated))
+                    }
+                    _ => response,
                 };
                 if response.clicked() && st.network != n && st.select_network(n).is_ok() {
                     changed = true;
@@ -5294,11 +5254,9 @@ impl ServersScreen {
                 let mut s = st.grpc_settings.take().unwrap_or_default();
                 changed |= widgets::text_field(ui, "serviceName", &mut s.service_name, "grpc");
                 changed |= widgets::text_field(ui, "authority", &mut s.authority, "example.com");
-                changed |=
-                    widgets::opt_bool(ui, "multiMode", &mut s.multi_mode, t(lang, Key::SrvUnset));
-                // Informational copy (docs grpc.md: multiMode is
-                // experimental/BETA — no stability promise).
-                ui.weak(t(lang, Key::SrvGrpcMultiModeHint));
+                changed |= widgets::noted(ui, t(lang, Key::SrvGrpcMultiModeNote), |ui| {
+                    widgets::opt_bool(ui, "multiMode", &mut s.multi_mode, t(lang, Key::SrvUnset))
+                });
                 changed |= widgets::opt_num(
                     ui,
                     t(lang, Key::SrvIdleTimeoutS),
@@ -5324,10 +5282,6 @@ impl ServersScreen {
                     0..=16_777_215,
                 );
                 changed |= opt_string(ui, "user_agent", &mut s.user_agent, "");
-                // Informational copy (docs grpc.md: gRPC/HTTP-2
-                // already multiplexes — mux.cool on top is not recommended).
-                ui.weak(t(lang, Key::SrvGrpcMuxHint));
-                ui.weak(t(lang, Key::SrvGrpcDeprecated));
                 if had_settings || changed {
                     st.grpc_settings = Some(s);
                 }
@@ -5345,7 +5299,6 @@ impl ServersScreen {
                     &mut s.heartbeat_period,
                     0..=600,
                 );
-                ui.weak(t(lang, Key::SrvWsDeprecated));
                 if had_settings || changed {
                     st.ws_settings = Some(s);
                 }
@@ -5356,7 +5309,6 @@ impl ServersScreen {
                 changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
                 changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
-                ui.weak(t(lang, Key::SrvHttpupgradeDeprecated));
                 if had_settings || changed {
                     st.httpupgrade_settings = Some(s);
                 }
@@ -5411,7 +5363,6 @@ impl ServersScreen {
                             changed |= ui
                                 .checkbox(&mut m.x_forwarded, t(lang, Key::SrvXForwarded))
                                 .changed();
-                            ui.weak(t(lang, Key::SrvXForwardedNote));
                             changed |= ui
                                 .checkbox(&mut m.insecure, t(lang, Key::SrvSkipTlsVerify))
                                 .changed();
@@ -5436,7 +5387,6 @@ impl ServersScreen {
                         _ => {}
                     }
                 }
-                ui.weak(t(lang, Key::SrvCongestionNote));
                 if had_settings || changed {
                     st.hysteria_settings = Some(s);
                 }
@@ -5529,12 +5479,14 @@ impl ServersScreen {
                 let had_settings = st.tls_settings.is_some();
                 let mut s = st.tls_settings.take().unwrap_or_default();
                 let tool_working = self.tool_job.is_some();
-                changed |= widgets::text_field(
-                    ui,
-                    t(lang, Key::SrvServerNameSni),
-                    &mut s.server_name,
-                    "example.com",
-                );
+                changed |= widgets::noted(ui, t(lang, Key::SrvTlsServerNameEmptyNote), |ui| {
+                    widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvServerNameSni),
+                        &mut s.server_name,
+                        "example.com",
+                    )
+                });
                 // Warn inline at the field when
                 // the value cannot plausibly be a hostname — the model's own
                 // predicate, so the inline hint can never drift from the
@@ -5545,10 +5497,6 @@ impl ServersScreen {
                         validation_message(&ValidationCode::ServerNameImplausible, lang),
                     );
                 }
-                // Informational copy: empty falls back to the dial
-                // address as the SNI (Xray tls WithDestination; diagnostics
-                // note, not a rule).
-                ui.weak(t(lang, Key::SrvTlsServerNameEmptyHint));
                 changed |= widgets::string_list(
                     ui,
                     lang,
@@ -5556,15 +5504,14 @@ impl ServersScreen {
                     &mut s.alpn,
                     t(lang, Key::SrvAlpnHint),
                 );
-                changed |= fingerprint_editor(
-                    ui,
-                    lang,
-                    &mut s.fingerprint,
-                    ValidationCode::TlsFingerprintUnsupported,
-                );
-                // Informational copy: fingerprint option semantics
-                // (empty ≠ no imitation).
-                ui.weak(t(lang, Key::SrvTlsFingerprintHint));
+                changed |= widgets::noted(ui, t(lang, Key::SrvTlsFingerprintNote), |ui| {
+                    fingerprint_editor(
+                        ui,
+                        lang,
+                        &mut s.fingerprint,
+                        ValidationCode::TlsFingerprintUnsupported,
+                    )
+                });
                 changed |= widgets::combo_str_labeled(
                     ui,
                     t(lang, Key::SrvMinVersion),
@@ -5964,12 +5911,14 @@ impl ServersScreen {
             Security::Reality => {
                 let had_settings = st.reality_settings.is_some();
                 let mut s = st.reality_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(
-                    ui,
-                    t(lang, Key::SrvServerNameTarget),
-                    &mut s.server_name,
-                    "example.com",
-                );
+                changed |= widgets::noted(ui, t(lang, Key::SrvRealityServerNameEmptyNote), |ui| {
+                    widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvServerNameTarget),
+                        &mut s.server_name,
+                        "example.com",
+                    )
+                });
                 // Warn inline at the field when
                 // the value cannot plausibly be a hostname (mirrors the TLS
                 // block above). Empty stays untouched (out of scope).
@@ -5979,19 +5928,14 @@ impl ServersScreen {
                         validation_message(&ValidationCode::ServerNameImplausible, lang),
                     );
                 }
-                // Informational copy: empty falls back to the dial
-                // address as the SNI, which must then be in the server's
-                // serverNames (diagnostics-class note, not a rule).
-                ui.weak(t(lang, Key::SrvRealityServerNameEmptyHint));
-                changed |= fingerprint_editor(
-                    ui,
-                    lang,
-                    &mut s.fingerprint,
-                    ValidationCode::RealityFingerprintUnsupported,
-                );
-                // Informational copy: fingerprint option semantics
-                // for REALITY (excluded names are rejected by Xray's Build).
-                ui.weak(t(lang, Key::SrvRealityFingerprintHint));
+                changed |= widgets::noted(ui, t(lang, Key::SrvRealityFingerprintNote), |ui| {
+                    fingerprint_editor(
+                        ui,
+                        lang,
+                        &mut s.fingerprint,
+                        ValidationCode::RealityFingerprintUnsupported,
+                    )
+                });
                 // These fields keep their keygen rows but
                 // drop the per-keystroke validator closures — format
                 // findings on the same values now fire from the model pass
@@ -6076,9 +6020,7 @@ impl ServersScreen {
                     st.reality_settings = Some(s);
                 }
             }
-            Security::None => {
-                ui.weak(t(lang, Key::SrvPlaintextNote));
-            }
+            Security::None => {}
         }
         changed
     }
@@ -6158,7 +6100,7 @@ impl ServersScreen {
             let mut fm = o.stream.finalmask.take().unwrap_or_default();
 
             ui.heading(t(lang, Key::SrvTcpMasks));
-            ui.weak(t(lang, Key::SrvTcpMaskOrderCaption));
+            ui.weak(t(lang, Key::SrvTcpMaskOrderNote));
             let tcp_len = fm.tcp.len();
             let mut tcp_remove = None;
             let mut tcp_move = None;
@@ -6246,7 +6188,7 @@ impl ServersScreen {
 
             ui.separator();
             ui.heading(t(lang, Key::SrvUdpMasks));
-            ui.weak(t(lang, Key::SrvUdpMaskOrderCaption));
+            ui.weak(t(lang, Key::SrvUdpMaskOrderNote));
             let udp_len = fm.udp.len();
             let mut udp_remove = None;
             let mut udp_move = None;
@@ -6695,6 +6637,7 @@ impl ServersScreen {
                                 .desired_width(f32::INFINITY)
                                 .hint_text(t(lang, Key::SrvImportPasteHint)),
                         )
+                        .on_hover_text(t(lang, Key::SrvPasteCtrlV))
                         .changed();
                     if source_changed {
                         self.invalidate_import_preview();
@@ -6702,18 +6645,15 @@ impl ServersScreen {
                         self.import_parse_error = None;
                         self.cancel_import_parse();
                     }
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !self.import_parse_job.is_pending() && !self.import_text.is_empty(),
-                                egui::Button::new(t(lang, Key::SrvParse)),
-                            )
-                            .clicked()
-                        {
-                            self.start_import_parse(lang, ui.ctx().clone());
-                        }
-                        ui.weak(t(lang, Key::SrvPasteCtrlV));
-                    });
+                    if ui
+                        .add_enabled(
+                            !self.import_parse_job.is_pending() && !self.import_text.is_empty(),
+                            egui::Button::new(t(lang, Key::SrvParse)),
+                        )
+                        .clicked()
+                    {
+                        self.start_import_parse(lang, ui.ctx().clone());
+                    }
                     if self.import_parse_job.is_pending() {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -7075,6 +7015,7 @@ fn mux_tab(ui: &mut egui::Ui, lang: Language, m: &mut MuxModel, flow: Option<&st
     let mut changed = false;
     changed |= ui
         .checkbox(&mut m.enabled, t(lang, Key::SrvEnableXmux))
+        .on_hover_text(t(lang, Key::SrvMuxDeprecatedNote))
         .changed();
     // Warn inline at the mux trigger when a
     // vision flow would ride TCP over smux — same shared predicate as the
@@ -7092,17 +7033,15 @@ fn mux_tab(ui: &mut egui::Ui, lang: Language, m: &mut MuxModel, flow: Option<&st
         -1..=1024,
     );
     changed |= widgets::opt_num(ui, "xudpConcurrency", &mut m.xudp_concurrency, -1..=1024);
-    changed |= opt_combo_str(
-        ui,
-        lang,
-        "xudpProxyUDP443",
-        &mut m.xudp_proxy_udp443,
-        XUDP_PROXY_UDP443_MODES,
-    );
-    // Informational copy: the (unset)/empty default means reject
-    // (Xray's MuxConfig.Build normalizes "" to reject).
-    ui.weak(t(lang, Key::SrvXudpProxyUdp443Hint));
-    ui.weak(t(lang, Key::SrvMuxDeprecatedHint));
+    changed |= widgets::noted(ui, t(lang, Key::SrvXudpProxyUdp443Note), |ui| {
+        opt_combo_str(
+            ui,
+            lang,
+            "xudpProxyUDP443",
+            &mut m.xudp_proxy_udp443,
+            XUDP_PROXY_UDP443_MODES,
+        )
+    });
     changed
 }
 
@@ -9499,99 +9438,6 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn info_hints_render_under_security_tab_rows() {
-        // Static informational copy (no validation, no gating): the
-        // TLS and REALITY serverName fields explain their empty fallback, and
-        // each fingerprint combo explains its option semantics.
-        for security in [Security::Tls, Security::Reality] {
-            let mut stream = StreamModel {
-                security,
-                ..Default::default()
-            };
-            let mut screen = ServersScreen::default();
-            let mut harness = Harness::new_ui(|ui| {
-                let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
-            });
-            harness.run();
-            let (server_name_hint, fingerprint_hint) = match security {
-                Security::Tls => (
-                    t(Language::En, Key::SrvTlsServerNameEmptyHint),
-                    t(Language::En, Key::SrvTlsFingerprintHint),
-                ),
-                Security::Reality => (
-                    t(Language::En, Key::SrvRealityServerNameEmptyHint),
-                    t(Language::En, Key::SrvRealityFingerprintHint),
-                ),
-                Security::None => unreachable!(),
-            };
-            assert!(
-                harness.query_by_label(server_name_hint).is_some(),
-                "{security:?} serverName row must render its empty-fallback hint"
-            );
-            assert!(
-                harness.query_by_label(fingerprint_hint).is_some(),
-                "{security:?} fingerprint row must render its option-semantics hint"
-            );
-            drop(harness);
-        }
-    }
-
-    #[test]
-    fn info_hints_render_at_flow_xudp_and_grpc_rows() {
-        // Basic tab → flow combo: the vision UDP/443 semantics.
-        let mut profile = ServerProfile::new("flow-hints", OutboundModel::new(Protocol::Vless));
-        let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
-        });
-        harness.run();
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvVisionUdp443Hint))
-                .is_some(),
-            "the flow combo must render the vision UDP/443 semantics hint"
-        );
-        drop(harness);
-
-        // Mux tab → the xudpProxyUDP443 combo's reject-default note.
-        let mut mux = Default::default();
-        let mut harness = Harness::new_ui(|ui| {
-            mux_tab(ui, Language::En, &mut mux, None);
-        });
-        harness.run();
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvXudpProxyUdp443Hint))
-                .is_some(),
-            "the xudpProxyUDP443 combo must render its reject-default hint"
-        );
-        drop(harness);
-
-        // Transport tab → gRPC section: multiMode row + mux guidance.
-        let mut stream = StreamModel {
-            network: Network::Grpc,
-            ..Default::default()
-        };
-        let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.transport_tab(ui, Language::En, &mut stream, 0, None);
-        });
-        harness.run();
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvGrpcMultiModeHint))
-                .is_some(),
-            "the gRPC multiMode row must render its experimental hint"
-        );
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvGrpcMuxHint))
-                .is_some(),
-            "the gRPC section must render the mux guidance hint"
-        );
-    }
-
-    #[test]
     fn every_basic_protocol_renders_without_mutating_the_profile() {
         for protocol in Protocol::ALL {
             let mut profile = ServerProfile::new(protocol.as_str(), OutboundModel::new(protocol));
@@ -10747,14 +10593,14 @@ Authentication: ML-KEM-768, Post-Quantum
                 );
             });
         harness.run();
-        for key in [Key::SrvTcpMaskOrderCaption, Key::SrvUdpMaskOrderCaption] {
+        for key in [Key::SrvTcpMaskOrderNote, Key::SrvUdpMaskOrderNote] {
             let caption = t(Language::En, key);
             assert!(
                 harness.query_by_label(caption).is_some(),
                 "the mask lists must render {key:?}: {caption:?}"
             );
         }
-        let udp = t(Language::En, Key::SrvUdpMaskOrderCaption);
+        let udp = t(Language::En, Key::SrvUdpMaskOrderNote);
         for name in ["udphop", "realm", "xicmp", "sudoku"] {
             assert!(udp.contains(name), "{udp:?} must name {name}");
         }
@@ -12229,8 +12075,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness
                 .query_by_label("The app removes the retired key. The server dials directly.")
-                .is_some(),
-            "the note must state the dropped chain when none is set"
+                .is_none(),
+            "the removal is the control's job; no note line states it"
         );
 
         harness
@@ -12492,8 +12338,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness
                 .query_by_label("The app removes the retired key. The hop stops working.")
-                .is_some(),
-            "the note must state what the dismissed hop costs"
+                .is_none(),
+            "the removal is the control's job; no note line states it"
         );
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Remove the udpHop key")
@@ -13379,12 +13225,6 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsNote))
-                .is_some(),
-            "the sentinel semantics note must render under the list"
-        );
-        assert!(
-            harness
                 .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
                 .is_none(),
             "the sentinel alone must not report"
@@ -13542,8 +13382,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness
                 .query_by_label(t(Language::En, Key::SrvRealmIpModeNote))
-                .is_some(),
-            "the ipMode note must render"
+                .is_none(),
+            "the ipMode note is the combo's hover, never a rendered line"
         );
 
         // The combo shows the core default and offers the three wire values.
@@ -13612,12 +13452,6 @@ Authentication: ML-KEM-768, Post-Quantum
             );
         });
         harness.run();
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvXForwardedNote))
-                .is_some(),
-            "the xForwarded switch must render its note"
-        );
         // Unset emits nothing; the switch writes the camelCase key.
         assert_eq!(
             serde_json::to_value(stream.borrow().hysteria_settings.as_ref().unwrap()).unwrap()["masquerade"],

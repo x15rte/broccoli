@@ -572,8 +572,8 @@ pub(crate) struct TerminalErrorView {
 
 /// Which mount renders the shared core-setup surface. The component is one,
 /// mounted twice: the startup dialog adds the first-run footer, and the
-/// Settings section carries the standing explanation of what the state, the
-/// install, and the failure attribution mean.
+/// Settings section carries the standing note that rides the state row's
+/// hover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoreSetupMount {
     /// The first-run dialog: "Set up later" and a "Continue" once the install
@@ -595,9 +595,8 @@ pub(crate) struct CoreSetupOutcome {
 /// Render the one shared pinned-core setup surface.
 ///
 /// Mirrors the Settings screen idiom: a state row in the top-bar "colored
-/// dot + text" style, option rows as `label + control`, `weak().small()`
-/// hint lines below their control, stock buttons, and `colored_label`
-/// status lines.
+/// dot + text" style, option rows as `label + control`, stock buttons, and
+/// `colored_label` status lines.
 ///
 /// Both mounts render the same facts in every core state: the installed and
 /// the required version, the verification state with the failure's own
@@ -605,8 +604,8 @@ pub(crate) struct CoreSetupOutcome {
 ///
 /// [`CoreSetupMount::Dialog`] adds the first-run footer (a "Set up later"
 /// button and a "Continue" button once install finished);
-/// [`CoreSetupMount::Settings`] adds the note that explains the state, the
-/// install flow, and the failure attribution in place.
+/// [`CoreSetupMount::Settings`] adds the standing note on the state row that
+/// explains how the installed version is read and accepted.
 pub(crate) fn show_core_setup(
     ui: &mut egui::Ui,
     ctx: &mut UiCtx<'_>,
@@ -633,7 +632,7 @@ pub(crate) fn show_core_setup(
         .or(ctx.core_version.as_deref());
     let verification_error = ctx.core_setup.verification_error.as_ref();
     // A managed tree exists in any verified or unverified state; only the
-    // missing state has nothing to verify and shows the first-use hint.
+    // missing state has nothing to verify.
     let tree_present = verified || verification_error.is_some();
 
     // Core state row, same idiom as the top bar: colored dot + state text.
@@ -647,30 +646,20 @@ pub(crate) fn show_core_setup(
         _ if installed.is_some() => (colors.warn, t(lang, Key::CoreSetupUpdateRequired)),
         _ => (egui::Color32::GRAY, t(lang, Key::CoreSetupNotInstalled)),
     };
-    ui.horizontal(|ui| {
-        ui.colored_label(state_color, "●");
-        ui.label(RichText::new(t(lang, Key::CoreSetupXrayCore)).strong());
-        ui.separator();
-        ui.colored_label(state_color, state_text);
-    });
-
-    // The standing explanation of what this state, an install, and a failure
-    // mean: the Settings mount carries it in place, right under the state
-    // row; the first-run dialog keeps its own shorter wording.
-    if matches!(mount, CoreSetupMount::Settings) {
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(RichText::new(t(lang, Key::CoreSetupNote)).weak().small()).wrap());
-    }
-
-    // First-run hint: the core is not bundled, it downloads on first use.
-    if !tree_present {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(t(lang, Key::CoreSetupFirstUseHint))
-                .weak()
-                .small(),
-        );
-    }
+    // The standing explanation of what the core state means rides the state
+    // row's hover in Settings; the first-run dialog carries no note.
+    widgets::noted(
+        ui,
+        matches!(mount, CoreSetupMount::Settings).then(|| t(lang, Key::CoreSetupNote)),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(state_color, "●");
+                ui.label(RichText::new(t(lang, Key::CoreSetupXrayCore)).strong());
+                ui.separator();
+                ui.colored_label(state_color, state_text);
+            });
+        },
+    );
 
     // Versions row: what is installed and what this build needs, in every
     // state — a stale core names both, a missing one names only the pin.
@@ -685,8 +674,8 @@ pub(crate) fn show_core_setup(
         ui.label(RichText::new(t_fmt(lang, Key::CoreSetupRequiredVersionRow, &[&required])).weak());
     });
 
-    // Verification state with its reason: the verification error's own text,
-    // wrapped because a failed pin compare names the payload and its hashes.
+    // The verification failure's own text, wrapped because a failed pin
+    // compare names the payload and its hashes.
     if let Some(error) = verification_error {
         ui.add_space(4.0);
         ui.add(
@@ -700,13 +689,6 @@ pub(crate) fn show_core_setup(
                 .small(),
             )
             .wrap(),
-        );
-    } else if verified {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(t(lang, Key::CoreSetupVerifiedHint))
-                .weak()
-                .small(),
         );
     }
 
@@ -754,44 +736,46 @@ pub(crate) fn show_core_setup(
     };
 
     ui.add_space(10.0);
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(can_verify, egui::Button::new(t(lang, Key::CoreSetupVerify)))
-            .on_disabled_hover_text(verify_disabled_reason)
-            .clicked()
-        {
-            ctx.request_core_verify();
-        }
-        if ui
-            .add_enabled(
-                can_install,
-                egui::Button::new(t(lang, Key::CoreSetupDownloadButton)),
-            )
-            .on_disabled_hover_text(install_disabled_reason)
-            .clicked()
-        {
-            ctx.send(CoreCmd::UpdateCore);
-        }
-        if ui
-            .add_enabled(
-                can_install,
-                egui::Button::new(t(lang, Key::CoreSetupImportArchive)),
-            )
-            .on_disabled_hover_text(install_disabled_reason)
-            .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter(t(lang, Key::ShellXrayArchiveFilter), &["zip"])
-                .pick_file()
-        {
-            ctx.send(CoreCmd::ImportCoreArchive(path));
-        }
-        if ui
-            .button(t(lang, Key::CoreSetupOpenFolder))
-            .on_hover_text(sys::paths::core_dir().display().to_string())
-            .clicked()
-        {
-            ctx.request_open_core_folder();
-        }
+    widgets::noted(ui, t(lang, Key::CoreSetupOfflineNote), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(can_verify, egui::Button::new(t(lang, Key::CoreSetupVerify)))
+                .on_disabled_hover_text(verify_disabled_reason)
+                .clicked()
+            {
+                ctx.request_core_verify();
+            }
+            if ui
+                .add_enabled(
+                    can_install,
+                    egui::Button::new(t(lang, Key::CoreSetupDownloadButton)),
+                )
+                .on_disabled_hover_text(install_disabled_reason)
+                .clicked()
+            {
+                ctx.send(CoreCmd::UpdateCore);
+            }
+            if ui
+                .add_enabled(
+                    can_install,
+                    egui::Button::new(t(lang, Key::CoreSetupImportArchive)),
+                )
+                .on_disabled_hover_text(install_disabled_reason)
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter(t(lang, Key::ShellXrayArchiveFilter), &["zip"])
+                    .pick_file()
+            {
+                ctx.send(CoreCmd::ImportCoreArchive(path));
+            }
+            if ui
+                .button(t(lang, Key::CoreSetupOpenFolder))
+                .on_hover_text(sys::paths::core_dir().display().to_string())
+                .clicked()
+            {
+                ctx.request_open_core_folder();
+            }
+        });
     });
 
     // A closed control channel means the runtime thread is gone: the
@@ -806,10 +790,6 @@ pub(crate) fn show_core_setup(
             RichText::new(t(lang, Key::RuntimeChannelClosed)).small(),
         );
     }
-
-    // Hint under its control, settings style.
-    ui.add_space(6.0);
-    ui.add(egui::Label::new(RichText::new(t(lang, Key::CoreSetupHint)).weak().small()).wrap());
 
     // Live status: stock progress bar or colored status lines.
     match &ctx.download {
@@ -1026,45 +1006,6 @@ mod tests {
     use crate::ui::test_rig::UiTestRig;
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
 
-    #[test]
-    fn core_setup_not_installed_renders_first_use_hint() {
-        let rig = UiTestRig::default();
-        let harness = Harness::new_ui_state(
-            |ui, rig: &mut UiTestRig| {
-                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
-            },
-            rig,
-        );
-
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::CoreSetupFirstUseHint))
-                .is_some(),
-            "not-installed state must hint that the core downloads on first use"
-        );
-    }
-
-    #[test]
-    fn core_setup_installed_state_omits_first_use_hint() {
-        let rig = UiTestRig {
-            core_version: Some("v1.8.24".to_string()),
-            ..Default::default()
-        };
-        let harness = Harness::new_ui_state(
-            |ui, rig: &mut UiTestRig| {
-                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
-            },
-            rig,
-        );
-
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::CoreSetupFirstUseHint))
-                .is_none(),
-            "installed state must not render the first-use hint"
-        );
-    }
-
     /// Render the shared surface over one rig state and hand back the
     /// harness, so each test states only the state it is about.
     fn core_setup_harness(rig: UiTestRig) -> Harness<'static, UiTestRig> {
@@ -1180,12 +1121,6 @@ mod tests {
         assert!(
             harness.query_by_label_contains(reason).is_some(),
             "the verification failure's own text must render"
-        );
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::CoreSetupFirstUseHint))
-                .is_none(),
-            "a present tree is not a first install"
         );
     }
 

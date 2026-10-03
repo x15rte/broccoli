@@ -279,7 +279,7 @@ keys! {
     AccentColor 0,
     AccentColorReset 0,
     AccentColorResetHint 0,
-    AccentColorHint 0,
+    AccentColorNote 0,
     // Shared copy used by several screens.
     Servers 0,
     Preview 0,
@@ -341,12 +341,10 @@ keys! {
     CoreSetupInstalledVersionRow 1,
     CoreSetupRequiredVersionRow 1,
     CoreSetupNoInstalledVersion 0,
-    CoreSetupVerifiedHint 0,
     CoreSetupVerificationFailed 1,
     CoreSetupVerify 0,
     CoreSetupVerifyNoCore 0,
     CoreSetupOpenFolder 0,
-    CoreSetupFirstUseHint 0,
     CoreSetupNote 0,
     CoreSetupXrayCore 0,
     CoreSetupPinnedRelease 0,
@@ -357,7 +355,7 @@ keys! {
     CoreSetupBusy 0,
     CoreSetupDownloadButton 0,
     CoreSetupImportArchive 0,
-    CoreSetupHint 0,
+    CoreSetupOfflineNote 0,
     CoreSetupProgress 3,
     CoreSetupInstalledVersion 1,
     CoreSetupHealthCheck 0,
@@ -445,8 +443,6 @@ keys! {
     IconTooltipTun 0,
     // First-run wizard.
     WizardWelcome 0,
-    WizardCoreMissing 0,
-    WizardCoreUpdateRequired 2,
     // About screen.
     AboutBroccoliVersion 1,
     AboutTagline 0,
@@ -466,7 +462,6 @@ keys! {
     TunExplain 0,
     TunDnsListenerNote 0,
     TunEnableCheckbox 0,
-    TunRestartHint 0,
     TunSectionIdentity 0,
     TunIfaceNameLabel 0,
     TunDescLabel 0,
@@ -476,7 +471,7 @@ keys! {
     TunSectionAutoRoutes 0,
     TunAutoRoutingTableLabel 0,
     TunAutoOutboundsLabel 0,
-    TunAutoOutboundsHint 0,
+    TunAutoOutboundsNote 0,
     TunAutoOutboundsDown 1,
     TunAutoOutboundsMissing 1,
     TunSectionIfaces 0,
@@ -572,7 +567,7 @@ keys! {
     DnsClientIp 0,
     DnsClientIpHint 0,
     DnsBootstrapLabel 0,
-    DnsBootstrapHint 0,
+    DnsBootstrapNote 0,
     DnsTag 0,
     DnsTagHint 0,
     DnsQueryStrategy 0,
@@ -587,7 +582,6 @@ keys! {
     DnsServeExpiredTtl 0,
     DnsSectionFakedns 0,
     DnsEnableFakedns 0,
-    DnsFakednsExplain 0,
     DnsPoolTitle 1,
     DnsIpPool 0,
     DnsPoolCidrRequired 0,
@@ -637,9 +631,9 @@ keys! {
     InboundsUsedByRules 1,
     InboundsDeleteBlocked 1,
     InboundsUnixPath 0,
-    InboundsUnixHint 0,
+    InboundsUnixNote 0,
     InboundsListenPort 0,
-    InboundsImportedHint 0,
+    InboundsImportedNote 0,
     InboundsTargetAddress 0,
     InboundsTargetAddressHint 0,
     InboundsTargetPort 0,
@@ -767,7 +761,7 @@ keys! {
     RuntimeStateRefreshed 0,
     RuntimeOverrideTitle 0,
     RuntimeOverrideEphemeral 0,
-    RuntimeOverrideScopeHint 0,
+    RuntimeOverrideScopeNote 0,
     CurrentOverride 1,
     CurrentOverrideNone 0,
     PrincipleTargets 1,
@@ -918,27 +912,30 @@ keys! {
     SettingsCleanUpNetwork 0,
     SettingsCleanUpNetworkHint 0,
     SettingsCleanUpNetworkTitle 0,
-    SettingsCleanUpNetworkBody 0,
+    SettingsCleanUpNetworkNote 0,
+    SettingsCleanUpNetworkDetail 0,
     SettingsCleanUpNetworkConfirm 0,
     SettingsCleanUpAndExit 0,
     SettingsCleanUpAndExitHint 0,
     SettingsCleanupTitle 0,
-    SettingsCleanupBody 0,
+    SettingsCleanupNote 0,
+    SettingsCleanupDetail 0,
     SettingsCleanupFull 0,
     SettingsCleanupFullHint 0,
     // Settings → Reset to default.
     SettingsResetToDefault 0,
     SettingsResetToDefaultHint 0,
     SettingsResetTitle 0,
-    SettingsResetBody 0,
+    SettingsResetNote 0,
+    SettingsResetDetail 0,
     SettingsResetConfirm 0,
     SettingsAdvanced 0,
     SettingsPingTest 0,
-    SettingsPingTestHint 0,
+    SettingsPingTestNote 0,
     SettingsRawOverrideActive 0,
     SettingsRawOverrideHeader 0,
     SettingsRawOverrideExplain 0,
-    SettingsRawOverridePasteHint 0,
+    SettingsRawOverridePasteNote 0,
     SettingsRawOverrideParsing 0,
     SettingsRawOverrideTooLarge 2,
     SettingsRawOverrideWorkerFailed 1,
@@ -962,9 +959,8 @@ keys! {
     // Settings → Geodata: core-native `geodata` key.
     SettingsGeodata 0,
     SettingsGeodataCronLabel 0,
-    SettingsGeodataCronHint 0,
-    SettingsGeodataEmptyHint 0,
-    SettingsGeodataScheduleHint 0,
+    SettingsGeodataCronNote 0,
+    SettingsGeodataEmptyNote 0,
     // Settings → Geodata provenance + Restore.
     SettingsGeodataProvenanceRelease 0,
     SettingsGeodataProvenanceUserOn 1,
@@ -1070,7 +1066,6 @@ keys! {
     SrvValidateAndSaveHint 0,
     SrvDiscardChanges 0,
     SrvUnsavedChanges 0,
-    SrvUnsavedLeaveBody 0,
     SrvUnsavedLeaveSave 0,
     SrvValidatingXrayTest 0,
     SrvValidationFailedColon 0,
@@ -1120,7 +1115,6 @@ keys! {
     SrvDnsRuleActionRequired 0,
     SrvAddDnsRule 0,
     SrvSniffing 0,
-    SrvHysteriaNote 0,
     SrvReverseProxy 0,
     SrvReverseSniffing 0,
     SrvReservedBytes 0,
@@ -1151,7 +1145,6 @@ keys! {
     SrvUseVersion2 0,
     SrvRewriteHost 0,
     SrvSkipTlsVerify 0,
-    SrvCongestionNote 0,
     SrvGrpcDeprecated 0,
     SrvWsDeprecated 0,
     SrvHttpupgradeDeprecated 0,
@@ -1187,7 +1180,6 @@ keys! {
     SrvCertificateN 1,
     SrvCertificateFileRequired 0,
     SrvAddCertificate 0,
-    SrvPlaintextNote 0,
     SrvPublicKeyDerivationDraftOnly 0,
     SrvEnvelope 0,
     SrvFinalmask 0,
@@ -1199,8 +1191,8 @@ keys! {
     SrvUdpN 1,
     SrvAddTcpMask 0,
     SrvAddUdpMask 0,
-    SrvTcpMaskOrderCaption 0,
-    SrvUdpMaskOrderCaption 0,
+    SrvTcpMaskOrderNote 0,
+    SrvUdpMaskOrderNote 0,
     SrvSockopt 0,
     SrvAddServerWindow 0,
     SrvProtocol 0,
@@ -1235,9 +1227,6 @@ keys! {
     SrvUp 0,
     SrvDown 0,
     SrvCustomSockoptN 1,
-    SrvUnknownFutureFields 1,
-    SrvUnknownFutureFieldsSockopt 1,
-    SrvUnknownFutureFieldsCustom 1,
     SrvPenetrateNote 0,
     SrvPenetrateEchNote 0,
     SrvEchDnsQuerySockopt 0,
@@ -1307,9 +1296,7 @@ keys! {
     SrvMasterKeyLogNotSupported 0,
     SrvProxySettingsRemoved 0,
     SrvRemoveProxySettingsKey 0,
-    SrvRemoveProxySettingsKeyNote 0,
     SrvRemoveUdpHopKey 0,
-    SrvRemoveUdpHopKeyNote 0,
     SrvMaskSockoptNote 0,
     SrvPenetrateMaskNote 0,
     SrvFromMitmOnlyAlpnShort 0,
@@ -1332,7 +1319,7 @@ keys! {
     SrvUseAuto 0,
     SrvCookieHeaderNeedsPacketUp 0,
     SrvSendThroughInvalid 0,
-    SrvMuxDeprecatedHint 0,
+    SrvMuxDeprecatedNote 0,
     SrvRulesColon 0,
     SrvNoisesUdpObfuscation 0,
     SrvNoiseInvalid 0,
@@ -1417,14 +1404,14 @@ keys! {
     SrvTlsProbeIpOverride 0,
     // Informational hint copy (option semantics — UI copy only, no
     // validation codes).
-    SrvTlsServerNameEmptyHint 0,
-    SrvRealityServerNameEmptyHint 0,
-    SrvTlsFingerprintHint 0,
-    SrvRealityFingerprintHint 0,
-    SrvVisionUdp443Hint 0,
-    SrvXudpProxyUdp443Hint 0,
-    SrvGrpcMuxHint 0,
-    SrvGrpcMultiModeHint 0,
+    SrvTlsServerNameEmptyNote 0,
+    SrvRealityServerNameEmptyNote 0,
+    SrvTlsFingerprintNote 0,
+    SrvRealityFingerprintNote 0,
+    SrvVisionUdp443Note 0,
+    SrvXudpProxyUdp443Note 0,
+    SrvGrpcMuxNote 0,
+    SrvGrpcMultiModeNote 0,
     SrvDialerProxyHint 0,
     SrvCustomLevelHint 0,
     SrvCustomOptHint 0,
@@ -1446,14 +1433,12 @@ keys! {
     SrvMldsa65VerifyHint 0,
     SrvSendThroughHint 0,
     SrvNoisePacketHint 0,
-    SrvMetadataSelectorHint 0,
     SrvXmcPasswordHint 0,
     SrvXmcTexturesValueHint 0,
     SrvXmcTexturesSignatureHint 0,
     SrvRealmTlsPinnedPeerCertSha256Hint 0,
     SrvRealmTlsVerifyPeerCertByNameHint 0,
     SrvRealmTlsEchServerKeysHint 0,
-    SrvRealmTlsEchConfigListHint 0,
     SrvMkcpHeaderValueHint 0,
     ErrorBullet 1,
     // Model-layer validation errors, translated at the source.
@@ -1611,15 +1596,13 @@ keys! {
     TrialRulesAdd 0,
     TrialRulesWindow 0,
     TrialRuleTag 0,
-    TrialRuleTagHint 0,
     TrialRuleTarget 0,
     TrialRulesOutbound 0,
     TrialRulesBalancer 0,
-    TrialRulesOrderHint 0,
     TrialRuleDomains 0,
-    TrialRuleDomainsHint 0,
+    TrialRuleDomainsNote 0,
     TrialRuleIps 0,
-    TrialRuleIpsHint 0,
+    TrialRuleIpsNote 0,
     TrialRuleProcesses 0,
     TrialRulesInject 0,
     TrialRulesRemove 0,
@@ -2293,7 +2276,6 @@ keys! {
     SrvTimeoutS 0,
     SrvLifetimeS 0,
     SrvXForwarded 0,
-    SrvXForwardedNote 0,
     SrvCustomResponseData 0,
 }
 
@@ -2805,7 +2787,7 @@ mod en {
             Key::AccentColor => "Accent color",
             Key::AccentColorReset => "Reset",
             Key::AccentColorResetHint => "Restore egui's stock accent for both themes",
-            Key::AccentColorHint => "Applies to both dark and light themes, including System mode.",
+            Key::AccentColorNote => "Applies to both dark and light themes, including System mode.",
             // Shared copy used by several screens.
             Key::Servers => "Servers",
             Key::Preview => "Preview",
@@ -2867,12 +2849,10 @@ mod en {
             Key::CoreSetupInstalledVersionRow => "Installed: {}",
             Key::CoreSetupRequiredVersionRow => "Required: {}",
             Key::CoreSetupNoInstalledVersion => "Installed: none",
-            Key::CoreSetupVerifiedHint => "The installed core matches the compiled release pins.",
             Key::CoreSetupVerificationFailed => "Verification failed: {}",
             Key::CoreSetupVerify => "Verify",
             Key::CoreSetupVerifyNoCore => "No installed core to verify",
             Key::CoreSetupOpenFolder => "Open core folder",
-            Key::CoreSetupFirstUseHint => "The Xray core downloads on first use.",
             Key::CoreSetupNote => {
                 "The app reads the installed version from the release metadata of the core and \
                  accepts it only when every payload matches the compiled pins. An install \
@@ -2894,7 +2874,7 @@ mod en {
             Key::CoreSetupBusy => "Another lifecycle or core operation is already running.",
             Key::CoreSetupDownloadButton => "Download pinned release",
             Key::CoreSetupImportArchive => "Import archive…",
-            Key::CoreSetupHint => {
+            Key::CoreSetupOfflineNote => {
                 "Download the exact pinned release above, or import the ZIP from another \
                  device when GitHub is unreachable."
             }
@@ -3009,10 +2989,6 @@ mod en {
             Key::IconTooltipTun => "broccoli — TUN active",
             // First-run wizard.
             Key::WizardWelcome => "Welcome to broccoli",
-            Key::WizardCoreMissing => "The Xray core (xray.exe) is not installed yet.",
-            Key::WizardCoreUpdateRequired => {
-                "Core update required: installed {}, this build needs {}."
-            }
             // About screen.
             Key::AboutBroccoliVersion => "broccoli {}",
             Key::AboutTagline => "A Windows GUI client for Xray core.",
@@ -3052,7 +3028,6 @@ mod en {
                  not part of the generated configuration."
             }
             Key::TunEnableCheckbox => "enable TUN inbound",
-            Key::TunRestartHint => "the core restarts through the elevated helper when you apply",
             Key::TunSectionIdentity => "Identity",
             Key::TunIfaceNameLabel => "interface name",
             Key::TunDescLabel => "description",
@@ -3062,7 +3037,7 @@ mod en {
             Key::TunSectionAutoRoutes => "Auto routes",
             Key::TunAutoRoutingTableLabel => "auto system routing table",
             Key::TunAutoOutboundsLabel => "auto outbounds interface",
-            Key::TunAutoOutboundsHint => {
+            Key::TunAutoOutboundsNote => {
                 "Not recommended on machines with multiple network adapters: 'auto' may pick an \
                  adapter without internet access. Prefer the adapter your network actually uses."
             }
@@ -3185,7 +3160,7 @@ mod en {
             Key::DnsClientIp => "Client IP (EDNS)",
             Key::DnsClientIpHint => "203.0.113.1 — the address upstream servers see",
             Key::DnsBootstrapLabel => "Proxy-server resolver (local DNS)",
-            Key::DnsBootstrapHint => {
+            Key::DnsBootstrapNote => {
                 "The app resolves the domains of the servers the configuration dials with this \
                  endpoint. The app dials this endpoint directly, outside the tunnel. Enter an \
                  endpoint with an IP address, for example https://223.5.5.5/dns-query or \
@@ -3206,10 +3181,6 @@ mod en {
             Key::DnsServeExpiredTtl => "Serve expired TTL (s)",
             Key::DnsSectionFakedns => "FakeDNS",
             Key::DnsEnableFakedns => "Enable fakeDNS",
-            Key::DnsFakednsExplain => {
-                "When enabled, the generator adds the fakeDNS pool(s), a fakedns DNS server entry, \
-                 and 'fakedns' in every sniffing destOverride to the generated config."
-            }
             Key::DnsPoolTitle => "Pool {}",
             Key::DnsIpPool => "IP pool",
             Key::DnsPoolCidrRequired => "pool CIDR is required",
@@ -3273,15 +3244,9 @@ mod en {
                 "Remove blocked: {reference_count} routing rule(s) use the stable tag."
             }
             Key::InboundsUnixPath => "UNIX socket path",
-            Key::InboundsUnixHint => {
-                "Xray's receiver accepts either one UNIX path or an IP/port envelope, so you cannot \
-                 mix UNIX with TCP or UDP in one inbound."
-            }
+            Key::InboundsUnixNote => "UNIX sockets cannot share an inbound with TCP or UDP.",
             Key::InboundsListenPort => "listen port",
-            Key::InboundsImportedHint => {
-                "The app preserves the imported mode. Both endpoint values remain editable until you \
-                 select a supported listener mode."
-            }
+            Key::InboundsImportedNote => "Imported mode keeps both endpoint values editable.",
             Key::InboundsTargetAddress => "target address",
             Key::InboundsTargetAddressHint => "8.8.8.8 or example.com",
             Key::InboundsTargetPort => "target port",
@@ -3440,7 +3405,7 @@ mod en {
             Key::RuntimeOverrideEphemeral => {
                 "Ephemeral Xray state: any core or configuration restart resets this override."
             }
-            Key::RuntimeOverrideScopeHint => {
+            Key::RuntimeOverrideScopeNote => {
                 "The core knows only the balancers of the configuration it runs. Apply the \
                  configuration after you change a balancer."
             }
@@ -3642,7 +3607,10 @@ mod en {
                  leftover tunnel adapters. Use this when a session ended unexpectedly."
             }
             Key::SettingsCleanUpNetworkTitle => "Clean Up Network State",
-            Key::SettingsCleanUpNetworkBody => {
+            Key::SettingsCleanUpNetworkNote => {
+                "Stops the tunnel and restores the network settings it changed."
+            }
+            Key::SettingsCleanUpNetworkDetail => {
                 "The app stops the tunnel and removes what a session left behind. It restores the \
                  DNS servers the tunnel took over and removes the leftover tunnel adapters. \
                  Windows asks for administrator approval."
@@ -3654,7 +3622,10 @@ mod en {
                  fresh install."
             }
             Key::SettingsCleanupTitle => "Clean Up and Exit",
-            Key::SettingsCleanupBody => {
+            Key::SettingsCleanupNote => {
+                "Removes everything: configuration, servers, the core, and logs."
+            }
+            Key::SettingsCleanupDetail => {
                 "The app removes everything: configuration, servers, core, and logs. First, the app \
                  exits normally and stops the core."
             }
@@ -3670,7 +3641,8 @@ mod en {
                  finish the reset."
             }
             Key::SettingsResetTitle => "Reset to default",
-            Key::SettingsResetBody => {
+            Key::SettingsResetNote => "Resets all settings to defaults and keeps your server list.",
+            Key::SettingsResetDetail => {
                 "All settings return to a fresh install's defaults: mode, local endpoints, DNS, \
                  latency, theme. The app exits to finish the reset and clears the generated \
                  configurations and logs. The app keeps your server list. The next launch starts as \
@@ -3679,7 +3651,7 @@ mod en {
             Key::SettingsResetConfirm => "Reset to default",
             Key::SettingsAdvanced => "Advanced",
             Key::SettingsPingTest => "Ping test",
-            Key::SettingsPingTestHint => {
+            Key::SettingsPingTestNote => {
                 "URL that the isolated Test latency one-shot probe fetches. An empty value falls \
                  back to the Observatory probe URL, then to the built-in default."
             }
@@ -3691,7 +3663,7 @@ mod en {
                 "The app hands a complete config.json to the core verbatim. It replaces the \
                  generated configuration."
             }
-            Key::SettingsRawOverridePasteHint => {
+            Key::SettingsRawOverridePasteNote => {
                 "Paste a full config.json to enable the buttons below."
             }
             Key::SettingsRawOverrideParsing => "Parsing the raw override…",
@@ -3721,17 +3693,14 @@ mod en {
             Key::ProbeIntervalPositive => "probe interval must be greater than 0",
             Key::SettingsGeodata => "Geodata",
             Key::SettingsGeodataCronLabel => "Update schedule (cron):",
-            Key::SettingsGeodataCronHint => {
+            Key::SettingsGeodataCronNote => {
                 "5-field cron: minute hour day-of-month month day-of-week. Leave empty for the \
-                 default 0 4 * * *"
+                 default 0 4 * * *. The core downloads and reloads the configured files on this \
+                 schedule without a restart."
             }
-            Key::SettingsGeodataEmptyHint => {
+            Key::SettingsGeodataEmptyNote => {
                 "Leave a file URL empty to keep the built-in dat file shipped with \
                  the pinned core."
-            }
-            Key::SettingsGeodataScheduleHint => {
-                "The core downloads and reloads the configured files on this schedule \
-                 without a restart."
             }
             Key::SettingsGeodataProvenanceRelease => {
                 "Release-managed: the geo data matches the pinned release."
@@ -3881,7 +3850,6 @@ mod en {
             }
             Key::SrvDiscardChanges => "Discard changes",
             Key::SrvUnsavedChanges => "Unsaved changes",
-            Key::SrvUnsavedLeaveBody => "You have unsaved changes. Save, discard, or keep editing.",
             Key::SrvUnsavedLeaveSave => "Save",
             Key::SrvValidatingXrayTest => "Validating with xray run -test…",
             Key::SrvValidationFailedColon => "Xray validation failed:",
@@ -3937,7 +3905,7 @@ mod en {
             Key::SrvShadowsocksLevelRange => "Shadowsocks level must be between 0 and 255.",
             Key::SrvAtLeastOneWgPeer => "At least one WireGuard peer is required.",
             Key::SrvWgPeerPublicKeyNote => {
-                "The remote peer provides it. It must not be derived from this client's secret key."
+                "The remote peer provides it, never this client's secret key."
             }
             Key::SrvReservedBytesFound => "Xray requires exactly 3 reserved bytes. Found {}.",
             Key::SrvResetThreeZeroBytes => "Reset to three zero bytes",
@@ -3953,9 +3921,6 @@ mod en {
             Key::SrvDnsRuleActionRequired => "A valid DNS rule action is required.",
             Key::SrvAddDnsRule => "+ DNS rule",
             Key::SrvSniffing => "sniffing",
-            Key::SrvHysteriaNote => {
-                "auth and congestion live under Transport (hysteriaSettings / finalmask.quicParams)"
-            }
             Key::SrvReverseProxy => "reverse proxy (VLESS reverse)",
             Key::SrvReverseSniffing => "reverse sniffing",
             Key::SrvReservedBytes => "reserved bytes (exactly 3)",
@@ -3991,9 +3956,6 @@ mod en {
             Key::SrvUseVersion2 => "Use version 2",
             Key::SrvRewriteHost => "rewrite Host",
             Key::SrvSkipTlsVerify => "skip TLS verify",
-            Key::SrvCongestionNote => {
-                "congestion/brutal rates live under Advanced → finalmask.quicParams"
-            }
             Key::SrvGrpcDeprecated => "gRPC is deprecated upstream. Prefer XHTTP stream-up.",
             Key::SrvWsDeprecated => "WebSocket is deprecated upstream. Prefer XHTTP H2 and H3.",
             Key::SrvHttpupgradeDeprecated => "HTTPUpgrade is deprecated upstream. Prefer XHTTP.",
@@ -4041,9 +4003,6 @@ mod en {
                 "certificate file or inline certificate is required."
             }
             Key::SrvAddCertificate => "+ certificate",
-            Key::SrvPlaintextNote => {
-                "plaintext: the core accepts only private-IP/domain servers for vless/trojan"
-            }
             Key::SrvPublicKeyDerivationDraftOnly => {
                 "Public-key derivation is available only for an unsaved server draft."
             }
@@ -4057,12 +4016,8 @@ mod en {
             Key::SrvUdpN => "UDP {}",
             Key::SrvAddTcpMask => "+ TCP mask",
             Key::SrvAddUdpMask => "+ UDP mask",
-            Key::SrvTcpMaskOrderCaption => {
-                "No TCP mask type has a fixed position. The core accepts any TCP mask order"
-            }
-            Key::SrvUdpMaskOrderCaption => {
-                "udphop, realm, and xicmp must be the last entries. sudoku must be the first entry"
-            }
+            Key::SrvTcpMaskOrderNote => "The core accepts any TCP mask order.",
+            Key::SrvUdpMaskOrderNote => "Put udphop, realm, and xicmp last and sudoku first.",
             Key::SrvSockopt => "sockopt",
             Key::SrvAddServerWindow => "Add server",
             Key::SrvProtocol => "protocol",
@@ -4105,20 +4060,8 @@ mod en {
             Key::SrvUp => "up",
             Key::SrvDown => "down",
             Key::SrvCustomSockoptN => "custom sockopt {}",
-            Key::SrvUnknownFutureFields => {
-                "{} unknown future customSockopt field(s) are preserved unchanged."
-            }
-            Key::SrvUnknownFutureFieldsSockopt => {
-                "{} unknown future SocketConfig field(s) are preserved unchanged."
-            }
-            Key::SrvUnknownFutureFieldsCustom => {
-                "{} unknown future happyEyeballs field(s) are preserved unchanged."
-            }
-            Key::SrvPenetrateNote => "penetrate is consulted only when XHTTP has downloadSettings.",
-            Key::SrvPenetrateEchNote => {
-                "penetrate only copies stream sockopt into XHTTP downloadSettings. The ECH DNS query \
-                 calls DialSystem directly."
-            }
+            Key::SrvPenetrateNote => "Penetrate applies only with XHTTP downloadSettings.",
+            Key::SrvPenetrateEchNote => "Penetrate does not affect the ECH DNS query.",
             Key::SrvEchDnsQuerySockopt => "ECH DNS-query socket options",
             Key::SrvEchSockoptNote => {
                 "Used only when echConfigList requests DNS (https://, h2c://, or udp://). \
@@ -4211,20 +4154,11 @@ mod en {
                  streamSettings.sockopt.dialerProxy to the outbound tag this server dials through."
             }
             Key::SrvRemoveProxySettingsKey => "Remove the proxySettings key",
-            Key::SrvRemoveProxySettingsKeyNote => {
-                "The app removes the retired key. The server dials directly."
-            }
             Key::SrvRemoveUdpHopKey => "Remove the udpHop key",
-            Key::SrvRemoveUdpHopKeyNote => {
-                "The app removes the retired key. The hop stops working."
-            }
             Key::SrvMaskSockoptNote => {
                 "The hop socket takes these values. TCP-only fields do not affect it"
             }
-            Key::SrvPenetrateMaskNote => {
-                "penetrate only copies the stream sockopt into XHTTP downloadSettings. The hop \
-                 socket calls DialSystem directly"
-            }
+            Key::SrvPenetrateMaskNote => "Penetrate does not affect the hop socket.",
             Key::SrvFromMitmOnlyAlpnShort => "fromMitm must be the only ALPN value",
             Key::SrvTlsCertFileOrPem => "every TLS certificate needs a file or inline PEM",
             Key::SrvRealitySettingsMissing => "REALITY settings are missing",
@@ -4251,7 +4185,7 @@ mod en {
             Key::SrvSendThroughInvalid => {
                 "sendThrough must be an IP address, CIDR, origin, or srcip."
             }
-            Key::SrvMuxDeprecatedHint => {
+            Key::SrvMuxDeprecatedNote => {
                 "Mux is deprecated for XHTTP. Use xmux instead. Keep concurrency 8 for TCP-era \
                  configs."
             }
@@ -4342,33 +4276,33 @@ mod en {
             Key::SrvTlsProbeIpOverride => "IP override",
             // Informational hint copy (option semantics — UI copy only,
             // no validation codes).
-            Key::SrvTlsServerNameEmptyHint => "empty = the server address is sent as the SNI",
-            Key::SrvRealityServerNameEmptyHint => {
+            Key::SrvTlsServerNameEmptyNote => "empty = the server address is sent as the SNI",
+            Key::SrvRealityServerNameEmptyNote => {
                 "empty = the server address is sent as the SNI. The handshake succeeds only when \
                  that SNI is one of the server's serverNames"
             }
-            Key::SrvTlsFingerprintHint => {
+            Key::SrvTlsFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. unsafe = native Go TLS, no imitation"
             }
-            Key::SrvRealityFingerprintHint => {
+            Key::SrvRealityFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. The list offers only the browser names the Xray project tests: chrome, \
                  firefox, safari. A saved server keeps any other fingerprint Xray accepts"
             }
-            Key::SrvVisionUdp443Hint => {
+            Key::SrvVisionUdp443Note => {
                 "xtls-rprx-vision alone intercepts UDP/443 (QUIC) client-side. Xray then logs \"XTLS \
                  rejected UDP/443 traffic\". The -udp443 variant lifts that interception. Otherwise \
                  the two variants write identical bytes on the wire"
             }
-            Key::SrvXudpProxyUdp443Hint => {
+            Key::SrvXudpProxyUdp443Note => {
                 "(unset) or empty = reject, Xray's default: UDP/443 (QUIC) through mux is refused. \
                  QUIC clients then fall back to TCP (HTTP/2)"
             }
-            Key::SrvGrpcMuxHint => {
+            Key::SrvGrpcMuxNote => {
                 "gRPC (HTTP/2) has built-in multiplexing. Combining it with mux is not recommended"
             }
-            Key::SrvGrpcMultiModeHint => {
+            Key::SrvGrpcMultiModeNote => {
                 "multiMode is experimental (BETA): Xray may drop it or change it across \
                  versions"
             }
@@ -4395,14 +4329,12 @@ mod en {
             Key::SrvMldsa65VerifyHint => "base64url ML-DSA-65 seed→verify",
             Key::SrvSendThroughHint => "local IP, CIDR, origin, or srcip",
             Key::SrvNoisePacketHint => "payload or range",
-            Key::SrvMetadataSelectorHint => "metadata selector",
             Key::SrvXmcPasswordHint => "RSA derivation password",
             Key::SrvXmcTexturesValueHint => "signed Mojang textures value",
             Key::SrvXmcTexturesSignatureHint => "signed Mojang textures signature",
             Key::SrvRealmTlsPinnedPeerCertSha256Hint => "comma-separated SHA-256 hex",
             Key::SrvRealmTlsVerifyPeerCertByNameHint => "comma-separated names",
             Key::SrvRealmTlsEchServerKeysHint => "standard base64 ECH server keys",
-            Key::SrvRealmTlsEchConfigListHint => "ECH config list",
             Key::SrvMkcpHeaderValueHint => "DNS domain or AES-128-GCM password",
             Key::ErrorBullet => "• {}",
             // Model-layer validation errors, translated at the source.
@@ -4758,20 +4690,15 @@ mod en {
             Key::TrialRulesAdd => "New trial rule…",
             Key::TrialRulesWindow => "New trial rule",
             Key::TrialRuleTag => "Rule tag",
-            Key::TrialRuleTagHint => "required, and must be unique among the live rules",
             Key::TrialRuleTarget => "Target",
             Key::TrialRulesOutbound => "Outbound",
             Key::TrialRulesBalancer => "Balancer",
-            Key::TrialRulesOrderHint => {
-                "The core checks a trial rule after every configured rule. A configured rule \
-                 that matches first wins."
-            }
             Key::TrialRuleDomains => "Domains (one per line)",
-            Key::TrialRuleDomainsHint => {
+            Key::TrialRuleDomainsNote => {
                 "plain (substring), domain:, full:, regexp:, keyword:, geosite:CODE"
             }
             Key::TrialRuleIps => "IPs / CIDR (one per line)",
-            Key::TrialRuleIpsHint => "IPv4/IPv6, CIDR ranges, geoip:CODE. A leading ! negates",
+            Key::TrialRuleIpsNote => "IPv4/IPv6, CIDR ranges, geoip:CODE. A leading ! negates",
             Key::TrialRuleProcesses => "Processes (one per line)",
             Key::TrialRulesInject => "Inject",
             Key::TrialRulesRemove => "Remove",
@@ -6083,10 +6010,6 @@ mod en {
             Key::SrvTimeoutS => "timeout (s)",
             Key::SrvLifetimeS => "lifetime (s)",
             Key::SrvXForwarded => "set X-Forwarded-* headers",
-            Key::SrvXForwardedNote => {
-                "The core adds X-Forwarded-For, X-Forwarded-Host, and X-Forwarded-Proto to the \
-                 proxied request."
-            }
         }
     }
 }
@@ -6608,7 +6531,7 @@ mod tests {
             ),
             (Key::SettingsResetTitle, "Reset to default"),
             (
-                Key::SettingsResetBody,
+                Key::SettingsResetDetail,
                 "All settings return to a fresh install's defaults: mode, local endpoints, DNS, latency, theme. The app exits to finish the reset and clears the generated configurations and logs. The app keeps your server list. The next launch starts as a fresh install with your servers.",
             ),
             (Key::SettingsResetConfirm, "Reset to default"),
@@ -6662,8 +6585,8 @@ mod tests {
     #[test]
     fn t_fmt_placeholder_at_start_and_end() {
         assert_eq!(
-            t_fmt(Language::En, Key::SrvUnknownFutureFields, &[&3]),
-            "3 unknown future customSockopt field(s) are preserved unchanged."
+            t_fmt(Language::En, Key::AppOperationInProgress, &[&"apply"]),
+            "apply operation in progress"
         );
         assert_eq!(
             t_fmt(Language::En, Key::SrvCustomSockoptN, &[&1]),

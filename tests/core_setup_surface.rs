@@ -81,19 +81,10 @@ fn boot(
 fn stale_core_dialog_names_both_versions_and_the_reason() {
     let (_lock, _tmp, h) = boot(true);
 
-    let intro = t_fmt(
-        Language::En,
-        Key::WizardCoreUpdateRequired,
-        &[&STALE_VERSION, &core_dl::pinned_core_version()],
-    );
     assert!(
-        h.query_all_by_label(intro.as_str()).next().is_some(),
-        "the dialog must name the installed and the required version: {intro:?}"
-    );
-    assert!(
-        h.query_all_by_label(t(Language::En, Key::WizardCoreMissing))
+        h.query_all_by_label(t(Language::En, Key::CoreSetupUpdateRequired))
             .next()
-            .is_none(),
+            .is_some(),
         "a core that is present but stale is an update, not a first install"
     );
     for label in [
@@ -455,16 +446,16 @@ fn a_rollback_leaves_the_gate_reading_the_restored_tree() {
 }
 
 /// The Settings section documents what the state, an install, and a failure
-/// mean: the note renders under the state row there and never in the startup
-/// dialog, which keeps its own shorter wording.
+/// mean: the note rides the section header's hover there and never renders as
+/// a line, in the dialog or in Settings.
 #[test]
-fn core_setup_note_renders_in_the_settings_section() {
+fn core_setup_note_never_renders_as_a_line_in_settings() {
     let (_lock, _tmp, mut h) = boot(true);
 
     let note = t(Language::En, Key::CoreSetupNote);
     assert!(
         h.query_all_by_label(note).next().is_none(),
-        "the note belongs to the Settings section, not to the dialog"
+        "the note is the section's hover, never a rendered line"
     );
 
     common::dismiss_wizard(&mut h);
@@ -475,14 +466,14 @@ fn core_setup_note_renders_in_the_settings_section() {
     .click();
     h.run();
     assert!(
-        h.query_all_by_label(note).next().is_some(),
-        "the Settings section must carry the explanation it documents: {note:?}"
+        h.query_all_by_label(note).next().is_none(),
+        "the Settings section must not render the note as a line: {note:?}"
     );
 }
 
 /// Verify re-checks the installed tree on demand: with the tree gone since
 /// boot, the fresh pass reports the state that exists now instead of the
-/// memoized one, and the dialog's wording follows it.
+/// memoized one, and the rendered state row follows it.
 #[test]
 fn verify_rechecks_the_installed_tree_on_demand() {
     let (_lock, tmp, mut h) = boot(true);
@@ -512,12 +503,6 @@ fn verify_rechecks_the_installed_tree_on_demand() {
     assert!(
         h.query_all_by_label(stale_state).next().is_none(),
         "the memoized verdict must not survive a fresh pass"
-    );
-    assert!(
-        h.query_all_by_label(t(Language::En, Key::WizardCoreMissing))
-            .next()
-            .is_some(),
-        "the dialog's wording must follow the re-checked state"
     );
 }
 

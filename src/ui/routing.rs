@@ -1026,7 +1026,6 @@ impl RoutingScreen {
                 }
                 ui.label(t(lang, Key::TrialRuleTag));
                 ui.add(egui::TextEdit::singleline(&mut draft.rule_tag).desired_width(220.0));
-                ui.label(RichText::new(t(lang, Key::TrialRuleTagHint)).weak());
                 ui.separator();
                 ui.label(t(lang, Key::TrialRuleTarget));
                 ui.horizontal(|ui| {
@@ -1071,26 +1070,21 @@ impl RoutingScreen {
                             }
                         });
                 }
-                ui.label(
-                    RichText::new(t(lang, Key::TrialRulesOrderHint))
-                        .small()
-                        .weak(),
-                );
                 ui.separator();
                 ui.label(t(lang, Key::TrialRuleDomains));
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.domains)
                         .desired_width(260.0)
                         .desired_rows(3),
-                );
-                ui.label(RichText::new(t(lang, Key::TrialRuleDomainsHint)).weak());
+                )
+                .on_hover_text(t(lang, Key::TrialRuleDomainsNote));
                 ui.label(t(lang, Key::TrialRuleIps));
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.ips)
                         .desired_width(260.0)
                         .desired_rows(3),
-                );
-                ui.label(RichText::new(t(lang, Key::TrialRuleIpsHint)).weak());
+                )
+                .on_hover_text(t(lang, Key::TrialRuleIpsNote));
                 ui.label(t(lang, Key::TrialRuleProcesses));
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.processes)
@@ -2122,19 +2116,13 @@ impl RoutingScreen {
         tag: &str,
     ) {
         ui.separator();
-        ui.label(RichText::new(t(lang, Key::RuntimeOverrideTitle)).strong());
-        ui.label(
-            RichText::new(t(lang, Key::RuntimeOverrideEphemeral))
-                .small()
-                .weak(),
-        );
-        // Why the core can reject a balancer tag: it only knows the balancers
-        // of the configuration it is running.
-        ui.label(
-            RichText::new(t(lang, Key::RuntimeOverrideScopeHint))
-                .small()
-                .weak(),
-        );
+        // Both override notes ride the section header: the override resets
+        // on any core or configuration restart, and the core only knows the
+        // balancers of the configuration it is running (which is why it can
+        // reject a balancer tag until the configuration is applied).
+        ui.label(RichText::new(t(lang, Key::RuntimeOverrideTitle)).strong())
+            .on_hover_text(t(lang, Key::RuntimeOverrideEphemeral))
+            .on_hover_text(t(lang, Key::RuntimeOverrideScopeNote));
 
         let action = {
             let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag);
@@ -6050,10 +6038,11 @@ mod routing_control_render_tests {
         );
     }
 
-    /// The override block says why the core can reject a balancer tag: the
-    /// scope hint renders directly under the ephemeral note.
+    /// Both override notes ride the 'Runtime override' header's hover: the
+    /// block renders no permanent note line, and the header carries both
+    /// texts once the pointer is over it.
     #[test]
-    fn the_override_block_renders_the_scope_hint_under_the_ephemeral_note() {
+    fn the_override_block_carries_its_notes_on_the_header_hover() {
         let mut rig = UiTestRig::default();
         rig.settings.routing.balancers.push(Balancer {
             tag: "edge".into(),
@@ -6066,15 +6055,23 @@ mod routing_control_render_tests {
             .click();
         harness.run();
 
-        let ephemeral = harness
-            .get_by_label(t(Language::En, Key::RuntimeOverrideEphemeral))
-            .rect();
-        let scope = harness
-            .get_by_label(t(Language::En, Key::RuntimeOverrideScopeHint))
-            .rect();
+        let ephemeral = t(Language::En, Key::RuntimeOverrideEphemeral);
+        let scope = t(Language::En, Key::RuntimeOverrideScopeNote);
         assert!(
-            scope.min.y >= ephemeral.max.y,
-            "the scope hint must render under the ephemeral note: {ephemeral:?} vs {scope:?}"
+            harness.query_by_label(ephemeral).is_none() && harness.query_by_label(scope).is_none(),
+            "the override block must render no permanent note line"
+        );
+
+        let title = t(Language::En, Key::RuntimeOverrideTitle);
+        harness.get_by_label(title).hover();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(ephemeral).next().is_some(),
+            "the header hover must carry the ephemeral note"
+        );
+        assert!(
+            harness.query_all_by_label(scope).next().is_some(),
+            "the header hover must carry the scope note"
         );
     }
 
