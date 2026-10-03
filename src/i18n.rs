@@ -413,6 +413,7 @@ keys! {
     TopbarStateLoadFailed 0,
     AppOperationInProgress 1,
     LogCoreError (Log, Error, 1),
+    LogConfigWarning (Log, Warn, 1),
     LogConnectBlocked (Log, Error, 1),
     LogBroccoliMessage (Log, Error, 1),
     LogOpenStateFolderFailed (Log, Error, 1),
@@ -1654,6 +1655,8 @@ keys! {
     OutboundVlessSeedIgnored 0,
     OutboundFreedomNoiseRemoved 0,
     OutboundFreedomDomainStrategyUnsupported 0,
+    OutboundFreedomAddressPortStrategyUnsupported 0,
+    OutboundFreedomFinalRulesIgnored 0,
     OutboundRealityServerFormKeysInert 0,
     HysteriaQuicKnobsMoved 0,
     // Settings-level verdict messages (`validate_settings` /
@@ -1690,6 +1693,7 @@ keys! {
     SettingsRoutingRuleBalancerMissing 2,
     SettingsRoutingRuleInboundMissing 2,
     SettingsDnsServerAddressMissing 1,
+    SettingsDnsBootstrapNotResolvable 0,
     SettingsFakeDnsPoolCidrInvalid 1,
     SettingsFakeDnsPoolSizeInvalid 1,
     SettingsFakeDnsPoolCapacityExceeded 3,
@@ -2461,6 +2465,10 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         VlessSeedIgnored => t(lang, Key::OutboundVlessSeedIgnored),
         FreedomNoiseRemoved => t(lang, Key::OutboundFreedomNoiseRemoved),
         FreedomDomainStrategyUnsupported => t(lang, Key::OutboundFreedomDomainStrategyUnsupported),
+        FreedomAddressPortStrategyUnsupported => {
+            t(lang, Key::OutboundFreedomAddressPortStrategyUnsupported)
+        }
+        FreedomFinalRulesIgnored => t(lang, Key::OutboundFreedomFinalRulesIgnored),
         RealityServerFormKeysInert => t(lang, Key::OutboundRealityServerFormKeysInert),
         HysteriaQuicKnobsMoved => t(lang, Key::HysteriaQuicKnobsMoved),
         SockoptDomainStrategyInvalid => t(lang, Key::SockoptDomainStrategyInvalid),
@@ -2577,6 +2585,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         RoutingRuleBalancerMissing(_, _) => t(lang, Key::SettingsRoutingRuleBalancerMissing),
         RoutingRuleInboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleInboundMissing),
         DnsServerAddressMissing(_) => t(lang, Key::SettingsDnsServerAddressMissing),
+        DnsBootstrapNotResolvable => t(lang, Key::SettingsDnsBootstrapNotResolvable),
         FakeDnsPoolCidrInvalid(_) => t(lang, Key::SettingsFakeDnsPoolCidrInvalid),
         FakeDnsPoolSizeInvalid(_) => t(lang, Key::SettingsFakeDnsPoolSizeInvalid),
         FakeDnsPoolCapacityExceeded(_, _, _) => t(lang, Key::SettingsFakeDnsPoolCapacityExceeded),
@@ -2950,6 +2959,7 @@ mod en {
             Key::TopbarStateLoadFailed => "the app could not load the state file",
             Key::AppOperationInProgress => "{} operation in progress",
             Key::LogCoreError => "core error: {}",
+            Key::LogConfigWarning => "config warning: {}",
             Key::LogConnectBlocked => "connect blocked: {}",
             Key::LogBroccoliMessage => "{}",
             Key::LogOpenStateFolderFailed => "failed to open state folder: {}",
@@ -4825,6 +4835,14 @@ mod en {
                  useipv6v4, forceip, forceipv4, forceipv6, forceipv4v6, forceipv6v4 \
                  (case-insensitive). Xray refuses the outbound at load"
             }
+            Key::OutboundFreedomAddressPortStrategyUnsupported => {
+                "a freedom outbound never dials through addressPortStrategy. Clear the field or set \
+                 it to none. Xray refuses the outbound at load"
+            }
+            Key::OutboundFreedomFinalRulesIgnored => {
+                "finalRules are ignored while sockopt.dialerProxy is set, since freedom is not the \
+                 final outbound. Remove the rules, or remove the dialerProxy and let freedom dial"
+            }
             Key::OutboundRealityServerFormKeysInert => {
                 "dest, target, privateKey, serverNames, shortIds, and mldsa65Seed are REALITY \
                  server-form keys. A client outbound carries them verbatim and never uses them. dest \
@@ -4833,8 +4851,8 @@ mod en {
             }
             Key::HysteriaQuicKnobsMoved => {
                 "congestion, up, down, and udphop were moved from hysteriaSettings to \
-                 finalmask.quicParams (congestion, brutalUp, brutalDown, udpHop). Xray accepts them \
-                 only to log a warning and drop them. Move the values"
+                 finalmask.quicParams (congestion, brutalUp, brutalDown, udpHop). Xray ignores \
+                 them in hysteriaSettings. Move the values"
             }
             // Settings-level verdict templates. Parameterized entries keep
             // the `{}`/`{:?}` placeholders that `validation_issue_message`
@@ -4898,6 +4916,10 @@ mod en {
                 "routing rule {} references missing inbound {}"
             }
             Key::SettingsDnsServerAddressMissing => "DNS server {} has no address",
+            Key::SettingsDnsBootstrapNotResolvable => {
+                "bootstrap resolver: must be an IP literal or localhost, since a domain host \
+                 needs the resolution this entry provides"
+            }
             Key::SettingsFakeDnsPoolCidrInvalid => {
                 "fakeDNS pool {}: ipPool must be an IP CIDR range"
             }

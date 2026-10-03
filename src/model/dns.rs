@@ -453,6 +453,92 @@ pub(crate) fn is_valid_cidr(s: &str) -> bool {
     parse_pool_cidr(s).is_some()
 }
 
+/// One bootstrap endpoint the generator emits as a scoped `+local` DNS
+/// server: the scheme the emitted address carries and the endpoint text that
+/// follows it, with the host already checked to be an IP literal.
+pub(crate) struct ScopedBootstrap {
+    pub scheme: &'static str,
+    pub endpoint: String,
+}
+
+/// Host part of a `scheme://host[:port][/path]` endpoint.
+pub(crate) fn scheme_host(rest: &str) -> &str {
+    // Bracketed IPv6 literals contain colons; unbracket first.
+    if let Some(host) = rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        return host.0;
+    }
+    // Unbracketed IPv6 literal without a port is a bare host.
+    if rest.parse::<std::net::IpAddr>().is_ok() {
+        return rest;
+    }
+    rest.split([':', '/']).next().unwrap_or(rest)
+}
+
+/// The scoped `+local` bootstrap DNS server a proxy-server resolver address
+/// yields, or `None` when the generator cannot emit one. The grammar is a
+/// [`DnsServer`] address minus its protocol forms: `https://`, `h2c://`,
+/// `quic://` or `tcp://` followed by `host[:port][/path]`, or a bare
+/// `host[:port]` (plain UDP DNS, bootstrapped over TCP on the same port).
+/// The host must be an IP literal — a domain would need the very resolution
+/// the entry provides — so a domain host yields no entry at all. `localhost`
+/// (the OS resolver) and the empty string (derive from the first configured
+/// server) are the caller's own cases, never this function's.
+///
+/// `fallback_port` is the configured port a bare address without one uses.
+pub(crate) fn scoped_bootstrap_endpoint(
+    address: &str,
+    fallback_port: Option<u16>,
+) -> Option<ScopedBootstrap> {
+    let (scheme, endpoint, host) = match address.split_once("://") {
+        Some(("https", rest)) => (
+            "https+local",
+            rest.to_string(),
+            scheme_host(rest).to_string(),
+        ),
+        Some(("h2c", rest)) => ("h2c+local", rest.to_string(), scheme_host(rest).to_string()),
+        Some(("quic", rest)) => (
+            "quic+local",
+            rest.to_string(),
+            scheme_host(rest).to_string(),
+        ),
+        Some(("tcp", rest)) => ("tcp+local", rest.to_string(), scheme_host(rest).to_string()),
+        None => {
+            // A bare address is UDP DNS on `fallback_port` (53 when none is
+            // configured), bootstrapped over TCP on that port. A whole
+            // address that parses as an IP literal wins over the port split:
+            // an IPv6 literal's colons would otherwise read as a port. The
+            // endpoint text brackets such a host, as the core's address
+            // grammar does.
+            let (host, port) = if address.parse::<std::net::IpAddr>().is_ok() {
+                (address, fallback_port.unwrap_or(53).to_string())
+            } else {
+                match address.rsplit_once(':') {
+                    Some((host, port))
+                        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        (host, port.to_string())
+                    }
+                    _ => (address, fallback_port.unwrap_or(53).to_string()),
+                }
+            };
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            let endpoint = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            ("tcp+local", endpoint, host.to_string())
+        }
+        // localhost / fakedns / unknown schemes: no bootstrap possible.
+        _ => return None,
+    };
+    host.parse::<std::net::IpAddr>().ok()?;
+    Some(ScopedBootstrap { scheme, endpoint })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +724,75 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("DNS server address string or configuration object"));
+    }
+
+    #[test]
+    fn scoped_bootstrap_endpoint_grammar() {
+        let scoped = |address: &str, port: Option<u16>| {
+            let endpoint = scoped_bootstrap_endpoint(address, port)
+                .unwrap_or_else(|| panic!("{address:?} must yield an endpoint"));
+            (endpoint.scheme, endpoint.endpoint)
+        };
+        // The scheme forms keep the text after `://` verbatim, so a path, a
+        // port, and a bracketed IPv6 host all survive.
+        for (address, scheme, endpoint) in [
+            (
+                "https://223.5.5.5/dns-query",
+                "https+local",
+                "223.5.5.5/dns-query",
+            ),
+            ("h2c://1.1.1.1", "h2c+local", "1.1.1.1"),
+            ("quic://1.1.1.1:853", "quic+local", "1.1.1.1:853"),
+            ("tcp://1.1.1.1", "tcp+local", "1.1.1.1"),
+            (
+                "https://[2606:4700:4700::1111]/dns-query",
+                "https+local",
+                "[2606:4700:4700::1111]/dns-query",
+            ),
+        ] {
+            assert_eq!(
+                scoped(address, None),
+                (scheme, endpoint.into()),
+                "{address}"
+            );
+        }
+        // A bare address is UDP DNS on the configured port (53 when none),
+        // bootstrapped over TCP; an IPv6 literal is bracketed in the endpoint.
+        assert_eq!(
+            scoped("223.5.5.5", None),
+            ("tcp+local", "223.5.5.5:53".into())
+        );
+        assert_eq!(
+            scoped("8.8.8.8", Some(5353)),
+            ("tcp+local", "8.8.8.8:5353".into())
+        );
+        assert_eq!(
+            scoped("8.8.8.8:5353", None),
+            ("tcp+local", "8.8.8.8:5353".into())
+        );
+        assert_eq!(scoped("::1", None), ("tcp+local", "[::1]:53".into()));
+        assert_eq!(
+            scoped("[::1]:5353", None),
+            ("tcp+local", "[::1]:5353".into())
+        );
+        // The host gate: a domain host would need the very resolution the
+        // entry provides, and an unknown scheme has no `+local` form.
+        for refused in [
+            "https://dns.google/dns-query",
+            "dns.google",
+            "dns.google:53",
+            "udp://1.1.1.1",
+            "http://1.1.1.1",
+            "fakedns",
+            "localhost",
+            "",
+            "://",
+        ] {
+            assert!(
+                scoped_bootstrap_endpoint(refused, None).is_none(),
+                "{refused:?} must not yield a bootstrap endpoint"
+            );
+        }
     }
 
     #[test]

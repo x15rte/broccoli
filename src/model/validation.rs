@@ -454,6 +454,14 @@ pub enum ValidationCode {
     RoutingRuleInboundMissing(usize, String),
     /// A configured DNS server without an address (1-based index).
     DnsServerAddressMissing(usize),
+    /// The GUI bootstrap override is an endpoint the generator cannot turn
+    /// into the scoped `+local` server that resolves proxy-server domains: a
+    /// domain host would need the very resolution the entry provides, and an
+    /// unknown scheme has no `+local` form at all. The typed override then
+    /// has no effect and the emitted document shows nothing — a configuration
+    /// warning (Severity::Warning), never a gate; Xray loads and runs the
+    /// document with the entry absent.
+    DnsBootstrapNotResolvable,
     /// A fakeDNS pool whose `ipPool` is not an IP CIDR range (1-based index).
     FakeDnsPoolCidrInvalid(usize),
     /// A fakeDNS pool with a non-positive `poolSize` (1-based index).
@@ -489,6 +497,15 @@ pub enum ValidationCode {
     /// config silently never behaves as written on either side of the
     /// contradiction, so it warns (Severity::Warning), never blocks.
     TlsMinExceedsMax,
+    /// Freedom `settings.finalRules` beside a `sockopt.dialerProxy`: freedom
+    /// is not the final outbound then, so its handler returns before it
+    /// builds any final rule — the whole set is inert, which it reports once
+    /// as `The "finalRules" setting is ignored when "sockopt.dialerProxy" is
+    /// set, since freedom is not the final outbound.`
+    /// (proxy/freedom/freedom.go:193-197). The document loads and runs
+    /// without the rules, and the dialerProxy value itself is legal, so this
+    /// is a configuration warning (Severity::Warning), never a gate.
+    FreedomFinalRulesIgnored,
     // ---- stream/sockopt/strategy enum surfaces (validate_stream /
     //      validate_sockopt / validate_outbound / validate_sniffing) ----
     //
@@ -663,6 +680,16 @@ pub enum ValidationCode {
     /// `string` unmarshal fails) refuses the outbound at load. The field
     /// is unmodeled, so this extra scan is its only seam.
     FreedomDomainStrategyUnsupported,
+    /// A freedom outbound whose effective `sockopt.addressPortStrategy` is
+    /// neither the empty spelling nor `none`: `infra/conf/xray.go` builds the
+    /// freedom handler from the whole document and refuses the outbound with
+    /// `freedom outbound does not support "sockopt.addressPortStrategy"`
+    /// because freedom's own dialer never reads the field
+    /// (infra/conf/xray.go:343-346). Both of those spellings map to
+    /// `AddressPortStrategy_None` (infra/conf/transport_sockopt.go:137-155)
+    /// and stay silent; an out-of-vocabulary value is
+    /// [`Self::SockoptAddressPortStrategyInvalid`]'s finding instead.
+    FreedomAddressPortStrategyUnsupported,
     /// REALITY server-form keys (`dest`, `target`, `privateKey`,
     /// `serverNames`, `shortIds`, `mldsa65Seed`) carried on a client
     /// profile: a client REALITY build never reads them, and a set
@@ -674,12 +701,13 @@ pub enum ValidationCode {
     /// material).
     RealityServerFormKeysInert,
     /// Hysteria2 `stream.hysteriaSettings.congestion` / `.up` / `.down` /
-    /// `.udphop` (accepted then dropped): HysteriaConfig still parses the
-    /// legacy QUIC knobs, logs an upstream warning and discards them — the
-    /// values moved to `finalmask.quicParams` (`congestion`, `brutalUp` /
-    /// `brutalDown`, `udpHop`) — so the config loads and runs without the
-    /// knobs — advisory (Severity::Warning). JSON `null` is the
-    /// Go zero shape and stays silent.
+    /// `.udphop`: the pinned core's `HysteriaConfig` declares none of them
+    /// (infra/conf/transport_method.go), so Go's JSON unmarshal ignores the
+    /// keys and nothing is logged — the values live in
+    /// `finalmask.quicParams` (`congestion`, `brutalUp` / `brutalDown`,
+    /// `udpHop`). The config loads and runs without the knobs, so the model
+    /// warns — advisory (Severity::Warning). JSON `null` is the Go zero shape
+    /// and stays silent.
     HysteriaQuicKnobsMoved,
     /// XHTTP `xhttpSettings.extra` holds a key that names a modeled xhttp
     /// setting: the extra value overrides it.
@@ -1827,6 +1855,39 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                 issues.push(issue(
                     ValidationCode::FreedomDomainStrategyUnsupported,
                     Some("settings.domainStrategy".into()),
+                ));
+            }
+            // Freedom is built from the whole document, and
+            // `infra/conf/xray.go` refuses the outbound whenever the effective
+            // `sockopt.addressPortStrategy` is not `AddressPortStrategy_None`:
+            // freedom's dialer reads no such field. The empty spelling and
+            // `none` are that variant, so only the six SRV/TXT strategies
+            // gate; an out-of-vocabulary value is the sockopt rule's own
+            // finding.
+            if let Some(sockopt) = o.stream.sockopt.as_ref()
+                && sockopt_address_port_strategy_supported(&sockopt.address_port_strategy)
+                && !sockopt.address_port_strategy.is_empty()
+                && !sockopt.address_port_strategy.eq_ignore_ascii_case("none")
+            {
+                issues.push(issue(
+                    ValidationCode::FreedomAddressPortStrategyUnsupported,
+                    Some("stream.sockopt.addressPortStrategy".into()),
+                ));
+            }
+            // A `sockopt.dialerProxy` makes freedom a non-final outbound, and
+            // its handler then drops the whole final-rule set and logs that
+            // the setting is ignored (proxy/freedom/freedom.go:193-197). The
+            // document still loads and runs, just without the rules, so this
+            // warns; the dialerProxy value itself stays legal.
+            if !settings.final_rules.is_empty()
+                && o.stream
+                    .sockopt
+                    .as_ref()
+                    .is_some_and(|sockopt| !sockopt.dialer_proxy.is_empty())
+            {
+                issues.push(warning(
+                    ValidationCode::FreedomFinalRulesIgnored,
+                    Some("settings.finalRules".into()),
                 ));
             }
         }
@@ -4307,6 +4368,23 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
         }
     }
 
+    // The GUI bootstrap override replaces the auto-derived first server as
+    // the resolver for proxy-server domains, so it must be an endpoint the
+    // generator can emit as the scoped `+local` entry: an IP-literal host
+    // (behind `https://`, `h2c://`, `quic://`, `tcp://` or bare) or the
+    // literal `localhost`. A domain host would need that very resolution, so
+    // the generator emits nothing and the override silently has no effect.
+    // The auto-derived path is not judged here: its input is the server list.
+    let bootstrap = settings.dns.bootstrap.trim();
+    if !bootstrap.is_empty()
+        && bootstrap != "localhost"
+        && crate::model::dns::scoped_bootstrap_endpoint(bootstrap, None).is_none()
+    {
+        issues.push(warning(
+            ValidationCode::DnsBootstrapNotResolvable,
+            Some("dns.bootstrap".into()),
+        ));
+    }
     for (index, server) in settings.dns.servers.iter().enumerate() {
         if server.address.trim().is_empty() {
             issues.push(issue(
@@ -6797,6 +6875,115 @@ mod tests {
     }
 
     #[test]
+    fn freedom_refuses_every_effective_address_port_strategy_but_none() {
+        // The freedom handler is built from the whole document, and
+        // infra/conf/xray.go refuses the outbound whenever the effective
+        // `sockopt.addressPortStrategy` is not `AddressPortStrategy_None`:
+        // freedom's own dialer reads no such field. The empty spelling and
+        // `none` are that variant, so those stay silent, and the gate covers
+        // the SRV/TXT orders in any case.
+        for strategy in ["srvportonly", "SRVPortOnly", "txtportandaddress"] {
+            let mut outbound = freedom_canonical();
+            outbound.stream.sockopt = Some(SockoptModel {
+                address_port_strategy: strategy.into(),
+                ..Default::default()
+            });
+            let issues = validate_outbound(&outbound);
+            assert_eq!(
+                issues,
+                vec![issue(
+                    ValidationCode::FreedomAddressPortStrategyUnsupported,
+                    Some("stream.sockopt.addressPortStrategy".into()),
+                )],
+                "strategy {strategy:?} must gate the freedom outbound"
+            );
+        }
+        for strategy in ["", "none", "NONE"] {
+            let mut outbound = freedom_canonical();
+            outbound.stream.sockopt = Some(SockoptModel {
+                address_port_strategy: strategy.into(),
+                ..Default::default()
+            });
+            assert!(
+                validate_outbound(&outbound).is_empty(),
+                "strategy {strategy:?} maps to AddressPortStrategy_None upstream"
+            );
+        }
+        // A dialer that reads the field keeps it: the finding is freedom's.
+        let mut vless = vless_canonical();
+        vless.stream.sockopt = Some(SockoptModel {
+            address_port_strategy: "srvportonly".into(),
+            ..Default::default()
+        });
+        assert!(
+            !codes(&validate_outbound(&vless))
+                .contains(&ValidationCode::FreedomAddressPortStrategyUnsupported),
+            "the SRV strategy is a VLESS dialer's own setting"
+        );
+        // An out-of-vocabulary value stays the sockopt rule's finding alone:
+        // one field must not report two causes.
+        let mut outbound = freedom_canonical();
+        outbound.stream.sockopt = Some(SockoptModel {
+            address_port_strategy: "bogus".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            codes(&validate_outbound(&outbound)),
+            vec![ValidationCode::SockoptAddressPortStrategyInvalid],
+            "the freedom gate must defer to the vocabulary rule"
+        );
+    }
+
+    #[test]
+    fn freedom_final_rules_warn_inert_beside_a_dialer_proxy() {
+        // A `sockopt.dialerProxy` makes freedom a non-final outbound, and its
+        // handler then returns before building any final rule, logging that
+        // the whole setting is ignored (proxy/freedom/freedom.go:193-197).
+        // The document loads and runs without the rules, so the model warns.
+        let with_rules = |rules: bool, dialer_proxy: &str| {
+            let mut outbound = freedom_canonical();
+            let ProtocolSettings::Freedom(settings) = &mut outbound.settings else {
+                unreachable!()
+            };
+            if rules {
+                settings
+                    .final_rules
+                    .push(crate::model::outbound::FreedomFinalRule {
+                        action: "block".into(),
+                        ..Default::default()
+                    });
+            }
+            if !dialer_proxy.is_empty() {
+                outbound.stream.sockopt = Some(SockoptModel {
+                    dialer_proxy: dialer_proxy.into(),
+                    ..Default::default()
+                });
+            }
+            outbound
+        };
+        // Freedom stays final without a dialerProxy: the rules are live.
+        assert!(validate_outbound(&with_rules(true, "")).is_empty());
+        // Nothing to ignore without rules, whatever the dialerProxy says.
+        assert!(validate_outbound(&with_rules(false, "srv-bbbbbbbb")).is_empty());
+        assert_eq!(
+            validate_outbound(&with_rules(true, "srv-bbbbbbbb")),
+            vec![warning(
+                ValidationCode::FreedomFinalRulesIgnored,
+                Some("settings.finalRules".into()),
+            )]
+        );
+        // Upstream reads the proxy tag's length, so a whitespace value still
+        // counts as set and the rules are still inert.
+        assert_eq!(
+            validate_outbound(&with_rules(true, " ")),
+            vec![warning(
+                ValidationCode::FreedomFinalRulesIgnored,
+                Some("settings.finalRules".into()),
+            )]
+        );
+    }
+
+    #[test]
     fn reality_server_form_extra_keys_warn_on_client_profiles() {
         // Server-form keys carried on a client REALITY block are
         // never read by the client build, and a set dest/target flips
@@ -6885,10 +7072,11 @@ mod tests {
 
     #[test]
     fn hysteria_legacy_quic_knob_extras_warn_moved_to_finalmask() {
-        // HysteriaConfig parses congestion/up/down/udphop, logs an
-        // upstream warning ("…move to finalmask/quicParams") and drops them
-        // (conf/transport_method.go) — the config loads and runs without
-        // the knobs, so the model warns (advisory, never gating).
+        // The pinned core's HysteriaConfig declares none of
+        // congestion/up/down/udphop (infra/conf/transport_method.go), so Go's
+        // JSON unmarshal ignores them and nothing is logged — the config
+        // loads and runs without the knobs, so the model warns (advisory,
+        // never gating).
         for (key, path) in [
             ("congestion", "stream.hysteriaSettings.congestion"),
             ("CONGESTION", "stream.hysteriaSettings.congestion"),
@@ -9178,6 +9366,61 @@ mod tests {
                 "finding must stay bounded, got {} chars: {message}",
                 message.len()
             );
+        }
+    }
+
+    #[test]
+    fn dns_bootstrap_override_must_be_an_ip_literal_or_localhost() {
+        let verdict = |bootstrap: &str| {
+            let mut settings = Settings::default();
+            settings.dns.bootstrap = bootstrap.into();
+            validate_settings(&settings, &ServersFile::default(), 10853)
+                .into_iter()
+                .filter(|issue| issue.code == ValidationCode::DnsBootstrapNotResolvable)
+                .collect::<Vec<_>>()
+        };
+        // Honored overrides stay silent: an IP-literal host behind any of the
+        // generator's schemes, a bare host[:port] (IPv6 included), and the OS
+        // resolver. The empty string is the auto-derive from the first
+        // server, whose grammar the server list owns.
+        for accepted in [
+            "localhost",
+            "1.1.1.1",
+            "1.1.1.1:5353",
+            "https://223.5.5.5/dns-query",
+            "h2c://1.1.1.1",
+            "quic://[2606:4700:4700::1111]",
+            "2606:4700:4700::1111",
+            "",
+        ] {
+            assert!(
+                verdict(accepted).is_empty(),
+                "{accepted:?} must stay silent: {:#?}",
+                verdict(accepted)
+            );
+        }
+        // A domain host needs the very resolution the entry provides, and an
+        // unknown scheme has no `+local` form: the generator emits nothing,
+        // so the typed override silently does nothing at all. `localhost` is
+        // matched as spelled (the generator compares the trimmed text
+        // verbatim), so another case of it is refused too.
+        for refused in [
+            "https://dns.google/dns-query",
+            "dns.google",
+            "dns.google:53",
+            "udp://1.1.1.1",
+            "http://223.5.5.5/dns-query",
+            "fakedns",
+            "LOCALHOST",
+        ] {
+            let issues = verdict(refused);
+            assert_eq!(
+                issues.len(),
+                1,
+                "{refused:?} must warn exactly once: {issues:#?}"
+            );
+            assert_eq!(issues[0].severity, Severity::Warning, "{refused:?}");
+            assert_eq!(issues[0].path.as_deref(), Some("dns.bootstrap"));
         }
     }
 

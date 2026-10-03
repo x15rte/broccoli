@@ -2371,6 +2371,32 @@ fn explicit_bootstrap_bare_host_uses_tcp_local() {
 }
 
 #[test]
+fn explicit_bootstrap_bare_ipv6_host_uses_tcp_local_bracketed() {
+    // A bare IPv6 literal carries the colons a naive port split reads as a
+    // port, so the whole address must win over the split and the endpoint
+    // must bracket the host the way the core's own address grammar does —
+    // `tcp+local://:::53` would be an address the core refuses.
+    let mut settings = base_settings();
+    settings.dns.servers.push(DnsServer {
+        address: "https://1.1.1.1/dns-query".into(),
+        ..Default::default()
+    });
+    settings.dns.bootstrap = "2606:4700:4700::1111".into();
+    let ob = vless_server("srv.example.com", 443);
+    let cfg = generate_deterministic(&single_server(ob), &settings).expect("generate config");
+
+    let servers = cfg["dns"]["servers"].as_array().unwrap();
+    assert_eq!(
+        servers[3],
+        json!({
+            "address": "tcp+local://[2606:4700:4700::1111]:53",
+            "domains": ["domain:srv.example.com"],
+            "skipFallback": true,
+        })
+    );
+}
+
+#[test]
 fn explicit_bootstrap_domain_host_skips_bootstrap() {
     // A domain host would re-enter the DNS module to resolve itself —
     // deadlock — so the bootstrap is skipped entirely (and with it useip).
@@ -3836,6 +3862,38 @@ fn golden_hysteria2_ordered_mask_chain() {
     golden!(
         "goldens/hysteria2_ordered_mask_chain.json",
         generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// The reporting entry returns the advisory half of the settings verdict
+/// beside the document: the document itself is unchanged (the warning never
+/// gates) and the blocking half still refuses with no advisory returned.
+#[test]
+fn the_reporting_entry_returns_the_advisory_findings() {
+    let mut warned = base_settings();
+    warned.dns.bootstrap = "https://dns.google/dns-query".into();
+    let (config, advisories) = generate_with_advisories(&ServersFile::default(), &warned)
+        .expect("a warning-only model must still generate");
+    assert!(
+        config.get("outbounds").is_some(),
+        "the document must be the emitted configuration"
+    );
+    assert_eq!(
+        advisories
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<Vec<_>>(),
+        vec![ValidationCode::DnsBootstrapNotResolvable],
+        "{advisories:#?}"
+    );
+
+    let mut blocked = base_settings();
+    blocked.dns.servers = vec![DnsServer::default()];
+    let error = generate_with_advisories(&ServersFile::default(), &blocked)
+        .expect_err("an address-less DNS server must refuse the model");
+    assert!(
+        matches!(error, GenerateError::InvalidFinding(_)),
+        "the refusal must be the blocking finding: {error:?}"
     );
 }
 

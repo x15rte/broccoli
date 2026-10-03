@@ -7,7 +7,7 @@ pub mod keys;
 
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
-use crate::model::dns::DEFAULT_PLAINTEXT_RESOLVERS;
+use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scheme_host, scoped_bootstrap_endpoint};
 use crate::model::emit;
 use crate::model::inbound::{API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG};
 use crate::model::settings::Language;
@@ -126,6 +126,34 @@ pub fn generate_with_api_port(
     settings: &Settings,
     api_port: u16,
 ) -> Result<Value, GenerateError> {
+    generate_reporting(servers, settings, api_port, &mut Vec::new())
+}
+
+/// [`generate`] with the model's advisory findings: the document is emitted
+/// exactly as [`generate`] emits it, and every finding the model pass
+/// produced that does not gate it — an xray-legal configuration that cannot
+/// behave as written — is returned beside it, in pass order. The apply path
+/// logs them, because a user who never opens the offending editor would
+/// otherwise never learn that the emitted document drops what they set.
+pub fn generate_with_advisories(
+    servers: &ServersFile,
+    settings: &Settings,
+) -> Result<(Value, Vec<ValidationIssue>), GenerateError> {
+    let api_port = pick_ephemeral_api_port()?;
+    let mut advisories = Vec::new();
+    let value = generate_reporting(servers, settings, api_port, &mut advisories)?;
+    Ok((value, advisories))
+}
+
+/// The generation itself, with the advisory half of the settings verdict
+/// collected into `advisories` instead of dropped: one pass, so a caller that
+/// wants the findings pays no second walk.
+fn generate_reporting(
+    servers: &ServersFile,
+    settings: &Settings,
+    api_port: u16,
+    advisories: &mut Vec<ValidationIssue>,
+) -> Result<Value, GenerateError> {
     if api_port == 0 {
         return Err(GenerateError::InvalidModel(Diag::new(
             Key::GenApiListenerPortZero,
@@ -137,7 +165,9 @@ pub fn generate_with_api_port(
 
     let fakedns = settings.dns.fakedns.enabled;
     let tun_on = emit::tun_inbound_emitted(settings);
-    if let Some(error) = invalid_model_error(validate_settings(settings, servers, api_port)) {
+    let verdict = validate_settings(settings, servers, api_port);
+    advisories.extend(verdict.advisory().cloned());
+    if let Some(error) = invalid_model_error(verdict) {
         return Err(error);
     }
     let active = servers.active_profile();
@@ -588,18 +618,6 @@ fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
         && !host.starts_with('.'))
     .then_some(host)
 }
-/// Host part of a `scheme://host[:port][/path]` endpoint.
-fn scheme_host(rest: &str) -> &str {
-    // Bracketed IPv6 literals contain colons; unbracket first.
-    if let Some(host) = rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
-        return host.0;
-    }
-    // Unbracketed IPv6 literal without a port is a bare host.
-    if rest.parse::<std::net::IpAddr>().is_ok() {
-        return rest;
-    }
-    rest.split([':', '/']).next().unwrap_or(rest)
-}
 /// IP-literal upstream endpoints of scheme-based DNS servers, as (ip, port)
 /// pairs for routing pinning. Only servers whose dials go out as TCP
 /// (https/h2c/quic/tcp) qualify; bare hosts are UDP DNS, already pinned by
@@ -660,38 +678,15 @@ fn bootstrap_dns_server(settings: &Settings, domains: &[String]) -> Option<Value
             "skipFallback": true,
         }));
     }
-    let (address, port) = if override_address.is_empty() {
+    let (address, fallback_port) = if override_address.is_empty() {
         let first = settings.dns.servers.first()?;
         (first.address.trim(), first.port)
     } else {
         (override_address, None)
     };
-    let (local_scheme, endpoint, host) = match address.split_once("://") {
-        Some(("https", rest)) => ("https+local", rest.to_string(), scheme_host(rest)),
-        Some(("h2c", rest)) => ("h2c+local", rest.to_string(), scheme_host(rest)),
-        Some(("quic", rest)) => ("quic+local", rest.to_string(), scheme_host(rest)),
-        Some(("tcp", rest)) => ("tcp+local", rest.to_string(), scheme_host(rest)),
-        None => {
-            // Bare host (UDP DNS default) bootstraps over TCP on the same
-            // port; a bare host cannot carry a path.
-            let (host, port) = match address.rsplit_once(':') {
-                Some((host, port))
-                    if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-                {
-                    (host, port.to_string())
-                }
-                _ => (address, port.unwrap_or(53).to_string()),
-            };
-            ("tcp+local", format!("{host}:{port}"), host)
-        }
-        // localhost / fakedns / unknown schemes: no bootstrap possible.
-        _ => return None,
-    };
-    if host.parse::<std::net::IpAddr>().is_err() {
-        return None;
-    }
+    let scoped = scoped_bootstrap_endpoint(address, fallback_port)?;
     Some(json!({
-        "address": format!("{local_scheme}://{endpoint}"),
+        "address": format!("{}://{}", scoped.scheme, scoped.endpoint),
         "domains": domains,
         // Without this, Xray's DNS sortClients fallback appends EVERY
         // server to the query list — scoped ones included — so every
