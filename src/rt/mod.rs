@@ -37,6 +37,7 @@ use crate::model::inbound::TUN_INBOUND_TAG;
 use crate::model::settings::Language;
 use crate::sys::selfupd::UpdateCheckState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -866,7 +867,7 @@ const OUTPUT_RING: usize = 200;
 const START_FAILURE_EXCERPT_LINES: usize = 6;
 /// Readiness poll cadence while Starting.
 const READY_POLL: Duration = Duration::from_millis(250);
-/// Retry cadence for adding the in-tun DNS listener to a running core
+/// Retry cadence for adding the in-tun DNS listeners to a running core
 /// ([`dns_in`]). The first attempt lands at readiness; the cadence only
 /// spaces the retries that race a still-coming-up wintun adapter, and the
 /// spin is bounded by [`DNS_IN_ADD_ATTEMPTS`].
@@ -1647,7 +1648,7 @@ impl Runtime {
                     self.ready_poll().await;
                     self.poll_fires.ready.fetch_add(1, Ordering::Relaxed);
                 }
-                _ = dns_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) && self.lifecycle.dns_in_listener.is_some() => {
+                _ = dns_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) && !self.lifecycle.dns_in_pending.is_empty() => {
                     self.dns_in_poll().await;
                 }
                 _ = stats_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Running) => {
@@ -2568,11 +2569,11 @@ impl Runtime {
         self.lifecycle.core_update.clear_last_error();
         self.prev_traffic.clear();
         self.prev_inbound_traffic.clear();
-        // The previous core's listener died with it: a start never inherits a
-        // pending add. Only the TUN branch below arms one, from the config
+        // The previous core's listeners died with it: a start never inherits a
+        // pending add. Only the TUN branch below arms any, from the config
         // that core will run — a direct child never owns the adapter whose
-        // gateway the listener binds.
-        self.lifecycle.dns_in_listener = None;
+        // gateways the listeners bind.
+        self.lifecycle.dns_in_pending.clear();
         self.lifecycle.dns_in_attempts = 0;
 
         // TUN always runs behind the authenticated helper, even when the GUI
@@ -2604,14 +2605,16 @@ impl Runtime {
                         }
                     });
             }
-            // Arm the in-tun DNS listener from the exact bytes the helper
-            // stages: the listener binds the address this config pins as the
-            // tun adapter's DNS, so the two can never drift.
-            self.lifecycle.dns_in_listener = self
+            // Arm the in-tun DNS listeners from the exact bytes the helper
+            // stages: each listener binds an address this config assigns to
+            // the tun adapter, so the two can never drift.
+            self.lifecycle.dns_in_pending = self
                 .lifecycle
                 .helper_config_bytes
                 .as_deref()
-                .and_then(dns_in::listener_for_bytes);
+                .and_then(dns_in::listener_for_bytes)
+                .map(|listener| listener.addresses())
+                .unwrap_or_default();
             self.start_via_helper();
             return;
         }
@@ -2962,9 +2965,9 @@ impl Runtime {
     }
 
     async fn kill_backend(&mut self) {
-        // The in-tun DNS listener dies with the core it was added to; the
+        // The in-tun DNS listeners die with the core they were added to; the
         // next start arms its own from the config that core runs.
-        self.lifecycle.dns_in_listener = None;
+        self.lifecycle.dns_in_pending.clear();
         // Ownership, not the requested next mode, controls cleanup. This call
         // always precedes Direct::start_kill, helper Stop, or backend drop.
         let tun = self.lifecycle.backend.is_tun_owned();
@@ -3391,34 +3394,39 @@ impl Runtime {
         }
     }
 
-    /// One attempt at adding this start's in-tun DNS listener
-    /// ([`dns_in`]) to the running core. Attempts are capped through the
-    /// shared [`spend_retry_attempt`] rule; a success, or a spent budget,
-    /// clears the pending listener so the retry arm stops firing.
+    /// One attempt at adding this start's in-tun DNS listeners ([`dns_in`])
+    /// to the running core: one per gateway address family the config
+    /// carries. Attempts are capped through the shared
+    /// [`spend_retry_attempt`] rule; a success, or a spent budget, drops the
+    /// address from the pending set so the retry arm stops firing for it.
     /// Best-effort, like the helper's DNS shield: a core that is serving
     /// traffic is never torn down because a listener could not be added.
     async fn dns_in_poll(&mut self) {
-        let Some(listener) = self.lifecycle.dns_in_listener else {
+        if self.lifecycle.dns_in_pending.is_empty() {
             return;
-        };
-        match self.grpc.add_dns_in_listener(&listener).await {
-            Ok(()) => {
-                self.lifecycle.dns_in_listener = None;
-                self.app_log(
+        }
+        let mut failed = Vec::new();
+        for address in std::mem::take(&mut self.lifecycle.dns_in_pending) {
+            match self.grpc.add_dns_in_listener(address).await {
+                Ok(()) => self.app_log(
                     Diag::new(Key::RtLogDnsInListenerAdded)
-                        .arg(listener.address)
-                        .arg(dns_in::PORT),
-                );
-            }
-            Err(error) => {
-                if spend_retry_attempt(&mut self.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS)
-                    .is_none()
-                {
-                    self.lifecycle.dns_in_listener = None;
-                    self.app_log(Diag::new(Key::RtLogDnsInListenerNotAdded).arg(error));
-                }
+                        .arg(SocketAddr::new(address, dns_in::PORT).to_string()),
+                ),
+                Err(error) => failed.push((address, error)),
             }
         }
+        if failed.is_empty() {
+            return;
+        }
+        if spend_retry_attempt(&mut self.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS).is_none() {
+            for (_, error) in failed {
+                self.app_log(Diag::new(Key::RtLogDnsInListenerNotAdded).arg(error));
+            }
+            return;
+        }
+        // The addresses that did land stay off the list: the retry only
+        // covers the family that is still racing its adapter address.
+        self.lifecycle.dns_in_pending = failed.into_iter().map(|(address, _)| address).collect();
     }
 
     /// Silence the exit path of a readiness timeout no candidate owns: the
@@ -6942,7 +6950,7 @@ mod tests {
         // Every attempt fails against a dead API port — the same failure
         // shape a still-coming-up wintun adapter produces — so this drives
         // the retry budget, the quiet in-budget attempts, and the give-up
-        // record.
+        // record. Both families are pending, so the give-up reports each.
         let dead_port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
             listener.local_addr().expect("local addr").port()
@@ -6950,9 +6958,10 @@ mod tests {
         let (mut runtime, events) = runtime_with_events();
         runtime.grpc = crate::rt::grpc::GrpcClient::new(dead_port);
         runtime.lifecycle.phase = super::CorePhase::Running;
-        runtime.lifecycle.dns_in_listener = Some(super::dns_in::Listener {
-            address: std::net::Ipv4Addr::new(10, 255, 0, 1),
-        });
+        runtime.lifecycle.dns_in_pending = vec![
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 255, 0, 1)),
+            std::net::IpAddr::V6("fd00::1".parse().expect("gateway literal")),
+        ];
 
         for _ in 0..DNS_IN_ADD_ATTEMPTS {
             runtime.dns_in_poll().await;
@@ -6962,8 +6971,8 @@ mod tests {
             "every attempt inside the budget must be spent"
         );
         assert!(
-            runtime.lifecycle.dns_in_listener.is_some(),
-            "inside the budget the listener stays pending for the retry arm"
+            !runtime.lifecycle.dns_in_pending.is_empty(),
+            "inside the budget the listeners stay pending for the retry arm"
         );
         assert!(
             !app_log_texts(&events.try_iter().collect::<Vec<_>>())
@@ -6974,15 +6983,17 @@ mod tests {
 
         runtime.dns_in_poll().await;
         assert!(
-            runtime.lifecycle.dns_in_listener.is_none(),
-            "a spent budget clears the pending listener"
+            runtime.lifecycle.dns_in_pending.is_empty(),
+            "a spent budget clears the pending listeners"
         );
         let emitted: Vec<_> = events.try_iter().collect();
-        assert!(
+        assert_eq!(
             app_log_texts(&emitted)
                 .iter()
-                .any(|text| text.contains(frame_prefix(Key::RtLogDnsInListenerNotAdded))),
-            "the give-up must leave one record"
+                .filter(|text| text.contains(frame_prefix(Key::RtLogDnsInListenerNotAdded)))
+                .count(),
+            2,
+            "the give-up must leave one record per family"
         );
 
         runtime.dns_in_poll().await;

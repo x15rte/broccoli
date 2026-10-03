@@ -5,8 +5,8 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
-    API_INBOUND_TAG, DNS_INBOUND_TAG, DokodemoNetwork, TUN_INBOUND_TAG, is_wildcard_listen,
-    listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
+    API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DokodemoNetwork, TUN_INBOUND_TAG,
+    is_wildcard_listen, listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
 };
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
@@ -770,10 +770,12 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
     // Reserved-tag collisions: the tun/dns/api listeners plus every
     // local endpoint tag — the user-managed list replaced the fixed
     // in-socks/in-http builtins, so its tags are builtins now. The DNS
-    // listener is added to the running core rather than emitted, but its
-    // tag is taken all the same.
-    if matches!(tag, API_INBOUND_TAG | DNS_INBOUND_TAG | TUN_INBOUND_TAG)
-        || settings.local_inbounds.iter().any(|entry| entry.tag == tag)
+    // listeners (one per gateway address family) are added to the running
+    // core rather than emitted, but their tags are taken all the same.
+    if matches!(
+        tag,
+        API_INBOUND_TAG | DNS_INBOUND_TAG | DNS_INBOUND_V6_TAG | TUN_INBOUND_TAG
+    ) || settings.local_inbounds.iter().any(|entry| entry.tag == tag)
     {
         return Some(t_fmt(lang, Key::DokodemoTagBuiltin, &[&format!("{tag:?}")]));
     }

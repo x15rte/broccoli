@@ -621,18 +621,18 @@ impl GrpcClient {
         Ok(())
     }
 
-    /// Add the in-tun DNS listener to the running core. The listener binds
-    /// the TUN gateway, an address the core owns only once its tun inbound
+    /// Add one in-tun DNS listener to the running core. The listener binds a
+    /// tunnel gateway address, which the core owns only once its tun inbound
     /// has assigned it, so callers retry this call while the adapter is
     /// still coming up. The add clears the tag first: a previous failed
     /// attempt left it registered in the core's manager, and removing a tag
     /// that was never added is a `NO_CLUE` error that stays ignored.
     pub async fn add_dns_in_listener(
         &self,
-        listener: &dns_in::Listener,
+        address: std::net::IpAddr,
     ) -> Result<(), tonic::Status> {
-        let _ = self.remove_inbound(listener.tag()).await;
-        self.add_inbound(listener.inbound_config()).await
+        let _ = self.remove_inbound(dns_in::tag_of(address)).await;
+        self.add_inbound(dns_in::inbound_config(address)).await
     }
 }
 

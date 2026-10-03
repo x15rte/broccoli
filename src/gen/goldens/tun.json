@@ -119,7 +119,8 @@
     "rules": [
       {
         "inboundTag": [
-          "dns-in"
+          "dns-in",
+          "dns-in6"
         ],
         "network": "udp,tcp",
         "outboundTag": "dns-out",

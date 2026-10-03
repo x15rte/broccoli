@@ -3833,13 +3833,24 @@ pub fn inbound_auth_trap(entry: &LocalInboundCfg) -> bool {
 
 /// The gateway list's IPv4 address: the first entry whose CIDR prefix is an
 /// IPv4 literal. `None` for an empty or IPv6-only list — TUN then has no
-/// adapter address and no in-subnet address for the in-tun DNS listener
+/// adapter address and no in-subnet address for the in-tun DNS listeners
 /// ([`ValidationCode::TunIpv4GatewayRequired`]); the generator derives the
-/// DNS listener address from the same value.
+/// IPv4 listener address from the same value.
 pub fn tun_ipv4_gateway(tun: &TunCfg) -> Option<&str> {
     tun.gateway
         .iter()
         .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains('.')))
+}
+
+/// The gateway list's IPv6 address: the first entry whose CIDR prefix is an
+/// IPv6 literal, without its prefix length. Every gateway entry becomes an
+/// address on the adapter, and the tunnel serves IPv6 DNS on this one, so the
+/// port-53 reservation covers it as it does the IPv4 address; the runtime's
+/// IPv6 listener binds the same value.
+pub fn tun_ipv6_gateway(tun: &TunCfg) -> Option<&str> {
+    tun.gateway
+        .iter()
+        .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains(':')))
 }
 
 /// Canonical form of a Windows socket path (case-folded, `/` → `\`,
@@ -4300,13 +4311,17 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
             ));
         }
     }
-    // The in-tun DNS listener (TUN gateway:53, TCP+UDP) is added to the
-    // running TUN core while a DNS module exists; a user listener on the
-    // same endpoint must be rejected like any other collision.
-    if emit::dns_inbound_emitted(settings)
-        && let Some(address) = tun_gateway
-    {
-        ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
+    // The in-tun DNS listeners (one per gateway address family, port 53,
+    // TCP+UDP) are added to the running TUN core while a DNS module exists; a
+    // user listener on either endpoint must be rejected like any other
+    // collision.
+    if emit::dns_inbound_emitted(settings) {
+        if let Some(address) = tun_gateway {
+            ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
+        }
+        if let Some(address) = tun_ipv6_gateway(&settings.tun) {
+            ip_listeners.push(("DNS-in6".into(), address.to_string(), 53, 3));
+        }
     }
     // The conjunction itself is one definition
     // (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps
@@ -9143,6 +9158,55 @@ mod tests {
             });
             assert_eq!(issue.severity, Severity::Error, "{issue:?}");
         }
+    }
+
+    #[test]
+    fn a_user_listener_on_a_tunnel_gateway_port_53_conflicts_with_the_dns_listeners() {
+        // The runtime adds one in-tun DNS listener per gateway address family
+        // to the running TUN core, all on port 53: a user endpoint on either
+        // gateway address would take a socket the tunnel's own DNS answers
+        // on, so the settings verdict must refuse it before any start.
+        for gateway in ["10.255.0.1", "fd00::1"] {
+            let mut settings = Settings::default();
+            settings.set_mode(crate::model::settings::Mode::Tun);
+            settings.dokodemo.push(crate::model::inbound::DokodemoCfg {
+                tag: "in-dns-clash".into(),
+                enabled: true,
+                listen: gateway.into(),
+                listen_port: 53,
+                ..Default::default()
+            });
+            let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+            assert!(
+                issues.iter().any(|issue| matches!(
+                    &issue.code,
+                    ValidationCode::ListenerConflict(_, _, address, port)
+                        if address == gateway && *port == 53
+                )),
+                "a listener on {gateway}:53 must conflict with the in-tun DNS listener: {issues:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_listener_on_a_tunnel_gateway_port_53_is_fine_without_tun() {
+        // The reservation follows the listeners: with no TUN inbound there is
+        // no in-tun DNS listener, so the same endpoint is the user's.
+        let mut settings = Settings::default();
+        settings.dokodemo.push(crate::model::inbound::DokodemoCfg {
+            tag: "in-dns-clash".into(),
+            enabled: true,
+            listen: "10.255.0.1".into(),
+            listen_port: 53,
+            ..Default::default()
+        });
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::ListenerConflict(..))),
+            "no tunnel, no in-tun DNS listener to conflict with: {issues:#?}"
+        );
     }
 
     #[test]

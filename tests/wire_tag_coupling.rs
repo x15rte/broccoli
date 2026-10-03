@@ -9,8 +9,8 @@
 
 use broccoli::r#gen::{generate_with_api_port, keys};
 use broccoli::model::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
-    TUN_INBOUND_TAG,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
+    DNS_OUTBOUND_TAG, TUN_INBOUND_TAG,
 };
 use broccoli::model::{Mode, ServersFile, Settings};
 use broccoli::rt::config_needs_dns_shield;
@@ -94,21 +94,36 @@ fn tun_adapter_dns(config: &Value) -> Option<&str> {
         .as_str()
 }
 
-/// The inbound tag the DNS module's interception rule names, or `None`.
-fn dns_in_rule_tag(config: &Value) -> Option<&str> {
-    config
-        .get(keys::ROUTING)?
-        .get("rules")?
+/// The first IPv6 gateway the tun inbound assigns, without its prefix length.
+fn tun_gateway_ipv6(config: &Value) -> Option<&str> {
+    inbound(config, "tun")?
+        .get(keys::SETTINGS)?
+        .get(keys::GATEWAY)?
         .as_array()?
         .iter()
-        .find(|rule| {
-            rule.get("outboundTag").and_then(Value::as_str) == Some(DNS_OUTBOUND_TAG)
-                && rule.get("inboundTag").is_some()
-        })?
-        .get("inboundTag")?
-        .as_array()?
-        .first()?
-        .as_str()
+        .filter_map(Value::as_str)
+        .map(|entry| entry.split('/').next().unwrap_or(entry))
+        .find(|entry| entry.contains(':'))
+}
+
+/// The inbound tags the DNS module's interception rule names, or an empty
+/// list when the config carries no such rule.
+fn dns_in_rule_tags(config: &Value) -> Vec<&str> {
+    config
+        .get(keys::ROUTING)
+        .and_then(|routing| routing.get("rules"))
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.get("outboundTag").and_then(Value::as_str) == Some(DNS_OUTBOUND_TAG)
+                    && rule.get("inboundTag").is_some()
+                    && rule.get("port").and_then(Value::as_str) == Some("53")
+            })
+        })
+        .and_then(|rule| rule.get("inboundTag"))
+        .and_then(Value::as_array)
+        .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -125,18 +140,27 @@ fn emitted_tun_inbound_tag_matches_teardown_const() {
 #[test]
 fn emitted_dns_listener_and_outbound_tags_match_consts() {
     let config = emitted_tun_config();
-    // The runtime adds the in-tun DNS listener to the running core under
-    // DNS_INBOUND_TAG (src/rt/dns_in.rs), and derives its bind address from
-    // the emitted adapter-DNS pin; the emitted interception rule must name
-    // that same tag, or the listener's queries would miss the module. The
-    // safety balancer contract (src/model/safety.rs) mirrors the emitted
-    // dns-out by DNS_OUTBOUND_TAG.
-    assert_eq!(dns_in_rule_tag(&config), Some(DNS_INBOUND_TAG));
-    let listener = dns_in::listener_for_config(&config).expect("TUN config needs the listener");
+    // The runtime adds one in-tun DNS listener per gateway family to the
+    // running core (src/rt/dns_in.rs) — under DNS_INBOUND_TAG for the
+    // adapter-DNS pin and DNS_INBOUND_V6_TAG for the tunnel's IPv6 gateway —
+    // and derives their bind addresses from the emitted config; the emitted
+    // interception rule must name both tags, or a listener's queries would
+    // miss the module. The safety balancer contract (src/model/safety.rs)
+    // mirrors the emitted dns-out by DNS_OUTBOUND_TAG.
     assert_eq!(
-        Some(listener.address.to_string()),
+        dns_in_rule_tags(&config),
+        vec![DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG]
+    );
+    let listener = dns_in::listener_for_config(&config).expect("TUN config needs the listeners");
+    assert_eq!(
+        listener.v4.map(|address| address.to_string()),
         tun_adapter_dns(&config).map(str::to_string),
-        "the listener must bind the address the emitted config pins as the adapter DNS"
+        "the IPv4 listener must bind the address the emitted config pins as the adapter DNS"
+    );
+    assert_eq!(
+        listener.v6.map(|address| address.to_string()),
+        tun_gateway_ipv6(&config).map(str::to_string),
+        "the IPv6 listener must bind the tunnel gateway the emitted config assigns"
     );
     assert_eq!(outbound_tag(&config, "dns"), Some(DNS_OUTBOUND_TAG));
 }
@@ -164,11 +188,20 @@ fn golden_tun_tags_match_runtime_consts() {
     let config: Value = serde_json::from_str(include_str!("../src/gen/goldens/tun.json"))
         .expect("golden tun.json must parse");
     assert_eq!(inbound_tag(&config, "tun"), Some(TUN_INBOUND_TAG));
-    assert_eq!(dns_in_rule_tag(&config), Some(DNS_INBOUND_TAG));
     assert_eq!(
+        dns_in_rule_tags(&config),
+        vec![DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG]
+    );
+    let listener = dns_in::listener_for_config(&config).expect("the golden needs the listeners");
+    assert_eq!(
+        listener.v4.map(|address| address.to_string()),
         Some("10.255.0.1".to_string()),
-        dns_in::listener_for_config(&config).map(|listener| listener.address.to_string()),
-        "the golden must hand the runtime the in-tun listener's bind address"
+        "the golden must hand the runtime the IPv4 listener's bind address"
+    );
+    assert_eq!(
+        listener.v6.map(|address| address.to_string()),
+        Some("fd00::1".to_string()),
+        "the golden must hand the runtime the IPv6 listener's bind address"
     );
     assert_eq!(outbound_tag(&config, "dns"), Some(DNS_OUTBOUND_TAG));
     assert_eq!(outbound_tag(&config, "freedom"), Some(DIRECT_OUTBOUND_TAG));

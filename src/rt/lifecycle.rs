@@ -9,10 +9,10 @@
 //! (spawn, attach, confirmed exit, forced release) belongs to
 //! [`BackendState`].
 
+use std::net::IpAddr;
 use std::time::Instant;
 
 use super::CorePhase;
-use super::dns_in;
 use super::policy::CoreExitFacts;
 use super::readiness::Readiness;
 use super::state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
@@ -65,11 +65,12 @@ pub(super) struct Lifecycle {
     /// window and [`TUN_BIND_RACE_RETRIES`] extra for the dns-in bind race.
     pub(super) candidate_boot_retries: u8,
     pub(super) pending_restart: Option<Instant>,
-    /// The in-tun DNS listener this start must add to its running core,
-    /// armed from the config the core runs. `None` means nothing is pending:
-    /// the add was not needed, succeeded, or spent its attempt budget.
-    pub(super) dns_in_listener: Option<dns_in::Listener>,
-    /// Add attempts spent for `dns_in_listener`, capped through the shared
+    /// The in-tun DNS listeners this start must add to its running core,
+    /// armed from the config the core runs: one address per gateway family the
+    /// tunnel carries. Empty means nothing is pending — the add was not
+    /// needed, succeeded, or spent its attempt budget.
+    pub(super) dns_in_pending: Vec<IpAddr>,
+    /// Add attempts spent for `dns_in_pending`, capped through the shared
     /// [`spend_retry_attempt`] rule ([`DNS_IN_ADD_ATTEMPTS`]).
     pub(super) dns_in_attempts: u8,
     /// The readiness clock of this start: armed after the child is
@@ -95,7 +96,7 @@ impl Lifecycle {
             gate_backend_alive: false,
             candidate_boot_retries: 0,
             pending_restart: None,
-            dns_in_listener: None,
+            dns_in_pending: Vec::new(),
             dns_in_attempts: 0,
             readiness: Readiness::new(),
         }

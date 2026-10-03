@@ -125,7 +125,6 @@ struct AdapterView {
     if_index: u32,
     if_type: u32,
     luid: windows::Win32::NetworkManagement::Ndis::NET_LUID_LH,
-    unicast: Vec<IpAddr>,
     dns: Vec<IpAddr>,
 }
 
@@ -167,30 +166,25 @@ fn family_state(adapter: &str, servers: &[IpAddr], ipv6: bool) -> Option<FamilyS
     })
 }
 
-/// The entries to take over from an enumeration, plus the tunnel adapter's
-/// own IPv6 address when it has one. Skips the loopback adapters and the
-/// tunnel adapter itself, and captures an IPv6 family only when the tunnel
-/// carries one: a family the takeover cannot serve is left exactly as it is,
-/// because an empty server list is not expressible through the interface
-/// settings API and a family left out of the record is a family the restore
-/// must not rewrite.
-fn plan(views: &[AdapterView], tun_if_index: u32) -> (Record, Option<Ipv6Addr>) {
-    let tun_v6 = views
-        .iter()
-        .find(|view| view.if_index == tun_if_index)
-        .and_then(|view| {
-            view.unicast.iter().find_map(|ip| match ip {
-                IpAddr::V6(ip) if !ip.is_unicast_link_local() => Some(*ip),
-                _ => None,
-            })
-        });
+/// The entries to take over from an enumeration. Skips the loopback adapters
+/// and the tunnel adapter itself, and captures a family only when `targets`
+/// carries an address for it — the tunnel address that family's queries will
+/// be pointed at. A family the tunnel does not serve is left exactly as it is:
+/// an empty server list is not expressible through the interface settings API,
+/// and a family left out of the record is a family the restore must not
+/// rewrite.
+fn plan(views: &[AdapterView], tun_if_index: u32, targets: Targets) -> Record {
     let mut entries = Vec::new();
     for view in views {
         if view.if_type == IF_TYPE_SOFTWARE_LOOPBACK || view.if_index == tun_if_index {
             continue;
         }
-        let v4 = family_state(&view.adapter, &view.dns, false);
-        let v6 = tun_v6.and_then(|_| family_state(&view.adapter, &view.dns, true));
+        let v4 = targets
+            .v4
+            .and_then(|_| family_state(&view.adapter, &view.dns, false));
+        let v6 = targets
+            .v6
+            .and_then(|_| family_state(&view.adapter, &view.dns, true));
         if v4.is_none() && v6.is_none() {
             continue;
         }
@@ -201,10 +195,20 @@ fn plan(views: &[AdapterView], tun_if_index: u32) -> (Record, Option<Ipv6Addr>) 
             v6,
         });
     }
-    (Record { entries }, tun_v6)
+    Record { entries }
 }
 
-/// Enumerate every adapter with its unicast addresses and DNS servers.
+/// The tunnel addresses the takeover points the taken-over families at: the
+/// addresses the runtime's in-tun DNS listeners bind, derived from the same
+/// config. A family without one is not taken over — its adapters would only
+/// be pointed at a server nothing answers on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Targets {
+    pub(crate) v4: Option<Ipv4Addr>,
+    pub(crate) v6: Option<Ipv6Addr>,
+}
+
+/// Enumerate every adapter with its DNS servers.
 fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
     // SAFETY: See the identical two-call sizing in `netif::enumerate`: the
@@ -236,17 +240,6 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
             // inside the aligned allocation `buffer` owns, so `cur` always
             // points at a valid, properly aligned struct.
             let adapter = &*cur;
-            let mut unicast = Vec::new();
-            let mut uni = adapter.FirstUnicastAddress;
-            while !uni.is_null() {
-                // SAFETY: `FirstUnicastAddress` heads a null-terminated chain
-                // of unicast address structs in the same live allocation.
-                let node = &*uni;
-                if let Some(ip) = sockaddr_ip(node.Address.lpSockaddr) {
-                    unicast.push(ip);
-                }
-                uni = node.Next;
-            }
             let mut dns = Vec::new();
             let mut server = adapter.FirstDnsServerAddress;
             while !server.is_null() {
@@ -277,7 +270,6 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
                 },
                 if_type: adapter.IfType,
                 luid: adapter.Luid,
-                unicast,
                 dns,
             });
             cur = adapter.Next;
@@ -341,9 +333,9 @@ fn find_view<'a>(views: &'a [AdapterView], entry: &Entry) -> Option<&'a AdapterV
         .find(|view| view.adapter.eq_ignore_ascii_case(&entry.adapter))
 }
 
-/// Apply the takeover: point every captured adapter's DNS at the in-tun
-/// address, and clear the families the tunnel does not carry.
-fn apply(record: &Record, tun_v6: Option<Ipv6Addr>, in_tun_v4: Ipv4Addr) -> Result<(), DiagError> {
+/// Apply the takeover: point every captured adapter's DNS at the tunnel
+/// address of its family.
+fn apply(record: &Record, targets: Targets) -> Result<(), DiagError> {
     let views = enumerate()?;
     for entry in &record.entries {
         let Some(view) = find_view(&views, entry) else {
@@ -352,14 +344,12 @@ fn apply(record: &Record, tun_v6: Option<Ipv6Addr>, in_tun_v4: Ipv4Addr) -> Resu
         let Some(guid) = interface_guid(&view.luid) else {
             continue;
         };
-        if let Some(state) = &entry.v4 {
-            let servers = state.takeover_servers(IpAddr::V4(in_tun_v4));
+        if let (Some(state), Some(target)) = (&entry.v4, targets.v4) {
+            let servers = state.takeover_servers(IpAddr::V4(target));
             set_servers(guid, false, Servers::List(&servers), &entry.alias)?;
         }
-        if let Some(state) = &entry.v6
-            && let Some(tun_v6) = tun_v6
-        {
-            let servers = state.takeover_servers(IpAddr::V6(tun_v6));
+        if let (Some(state), Some(target)) = (&entry.v6, targets.v6) {
+            let servers = state.takeover_servers(IpAddr::V6(target));
             set_servers(guid, true, Servers::List(&servers), &entry.alias)?;
         }
     }
@@ -476,15 +466,15 @@ fn merge(existing: Option<Record>, fresh: Record) -> Record {
 pub(crate) fn engage(
     record_path: &Path,
     tun_if_index: u32,
-    in_tun_v4: Ipv4Addr,
+    targets: Targets,
 ) -> Result<usize, DiagError> {
-    let (fresh, tun_v6) = plan(&enumerate()?, tun_if_index);
+    let fresh = plan(&enumerate()?, tun_if_index, targets);
     let record = merge(read_record(record_path)?, fresh);
     if record.entries.is_empty() {
         return Ok(0);
     }
     write_record(record_path, &record)?;
-    apply(&record, tun_v6, in_tun_v4)?;
+    apply(&record, targets)?;
     Ok(record.entries.len())
 }
 
@@ -531,21 +521,22 @@ mod tests {
         }
     }
 
-    fn view(
-        adapter: &str,
-        if_index: u32,
-        if_type: u32,
-        dns: &[&str],
-        unicast: &[&str],
-    ) -> AdapterView {
+    fn view(adapter: &str, if_index: u32, if_type: u32, dns: &[&str]) -> AdapterView {
         AdapterView {
             adapter: adapter.to_string(),
             alias: format!("alias-{adapter}"),
             if_index,
             if_type,
             luid: Default::default(),
-            unicast: unicast.iter().map(|s| s.parse().expect("ip")).collect(),
             dns: dns.iter().map(|s| s.parse().expect("ip")).collect(),
+        }
+    }
+
+    /// Both tunnel addresses, the shape a dual-stack TUN setting produces.
+    fn both_families() -> Targets {
+        Targets {
+            v4: Some(Ipv4Addr::new(10, 255, 0, 1)),
+            v6: Some("fd00::1".parse().expect("ip")),
         }
     }
 
@@ -580,37 +571,39 @@ mod tests {
         // stay out of the takeover *and* out of the record: the restore would
         // otherwise rewrite a family the session never touched.
         let views = [
-            view("{tun}", 9, 53, &["10.255.0.1"], &["10.255.0.1"]),
-            view(
-                "{wired}",
-                4,
-                6,
-                &["192.168.124.1", "fd00::53"],
-                &["192.168.124.7"],
-            ),
+            view("{tun}", 9, 53, &["10.255.0.1"]),
+            view("{wired}", 4, 6, &["192.168.124.1", "fd00::53"]),
         ];
-        let (record, tun_v6) = plan(&views, 9);
-        assert_eq!(tun_v6, None);
+        let record = plan(
+            &views,
+            9,
+            Targets {
+                v4: Some(Ipv4Addr::new(10, 255, 0, 1)),
+                v6: None,
+            },
+        );
         assert_eq!(record.entries.len(), 1);
         assert!(record.entries[0].v4.is_some(), "IPv4 is always carried");
-        assert_eq!(record.entries[0].v6, None);
+        assert_eq!(
+            record.entries[0].v6, None,
+            "an IPv6 family the tunnel cannot serve stays untouched"
+        );
     }
 
     #[test]
     fn the_plan_skips_loopback_and_the_tunnel_and_keeps_only_adapters_with_servers() {
         let views = vec![
-            view("{tun}", 9, 53, &["10.255.0.1"], &["10.255.0.1", "fd00::1"]),
+            view("{tun}", 9, 53, &["10.255.0.1"]),
             view(
                 "{loop}",
                 1,
                 IF_TYPE_SOFTWARE_LOOPBACK,
                 &["fec0:0:0:ffff::1"],
-                &[],
             ),
-            view("{wired}", 4, 6, &["192.168.124.1"], &["192.168.124.7"]),
-            view("{quiet}", 5, 6, &[], &["192.168.9.9"]),
+            view("{wired}", 4, 6, &["192.168.124.1"]),
+            view("{quiet}", 5, 6, &[]),
         ];
-        let (record, tun_v6) = plan(&views, 9);
+        let record = plan(&views, 9, both_families());
         assert_eq!(
             record.entries.len(),
             1,
@@ -625,7 +618,25 @@ mod tests {
             record.entries[0].v6, None,
             "no IPv6 servers, so the family is untouched"
         );
-        assert_eq!(tun_v6, Some("fd00::1".parse().expect("ip")));
+    }
+
+    #[test]
+    fn the_plan_captures_the_ipv6_family_the_tunnel_serves() {
+        // An adapter carries IPv6 servers and the tunnel has an IPv6 gateway,
+        // so the takeover owns that family too — it is the family the resolver
+        // would otherwise send to a shield-blocked server.
+        let views = [
+            view("{tun}", 9, 53, &["10.255.0.1"]),
+            view("{wired}", 4, 6, &["192.168.124.1", "fd00:124::1"]),
+        ];
+        let record = plan(&views, 9, both_families());
+        assert_eq!(
+            record.entries[0]
+                .v6
+                .as_ref()
+                .map(|state| state.servers.clone()),
+            Some(vec!["fd00:124::1".to_string()])
+        );
     }
 
     #[test]
@@ -787,7 +798,6 @@ mod tests {
             4,
             6,
             &["1.1.1.1"],
-            &[],
         )];
         let entry = Entry {
             adapter: "{c21dc854-03f2-aea0-84d2-9c7ac601c070}".to_string(),

@@ -115,6 +115,12 @@ pub const PROTOCOL: &str = "protocol";
 /// listener derivation read it back.
 pub const SETTINGS: &str = "settings";
 
+/// The `gateway` field of the TUN protocol settings (`TunConfig.Gateway`,
+/// infra/conf/tun.go:18): every entry becomes an address on the adapter, so
+/// its IPv6 entry is the address the tunnel serves IPv6 DNS on. The in-tun
+/// listener derivation reads it back.
+pub const GATEWAY: &str = "gateway";
+
 /// The outbound detour's `streamSettings` block
 /// (`OutboundDetourConfig.StreamSetting`, infra/conf/xray.go:219), whose
 /// `sockopt` the generator patches caller-side dial policy into.

@@ -8,7 +8,8 @@ use crate::model::dns::{
     SECOND_FAKEDNS_POOL_SIZE,
 };
 use crate::model::inbound::{
-    DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
+    DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG, LocalInboundCfg, LocalInboundProtocol,
+    TUN_INBOUND_TAG,
 };
 use crate::model::stream::MasqueradeCfg;
 use crate::model::validation::ValidationCode;
@@ -1532,7 +1533,10 @@ fn tun_user_rules_follow_the_dns_interception_rules() {
     // profile), and an unconditional in-tun catch-all would swallow appended
     // trial rules before they are evaluated.
     assert_eq!(rules.len(), 4);
-    assert_eq!(rules[0]["inboundTag"], json!([DNS_INBOUND_TAG]));
+    assert_eq!(
+        rules[0]["inboundTag"],
+        json!([DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG])
+    );
     assert_eq!(rules[1]["inboundTag"], json!([TUN_INBOUND_TAG]));
     assert_eq!(rules[2]["inboundTag"], json!(["in-socks"]));
     assert_eq!(rules[3]["outboundTag"], json!("block"));
@@ -1571,7 +1575,7 @@ fn tun_emits_pins_then_dns_interception_then_user_rules_in_order() {
             },
             // Local DNS interception, in emitter order: dns-in, TUN, SOCKS.
             {
-                "inboundTag": [DNS_INBOUND_TAG],
+                "inboundTag": [DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG],
                 "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
@@ -2100,8 +2104,8 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|ib| ib["tag"] != DNS_INBOUND_TAG),
-        "the in-tun DNS listener must not be emitted into the static config"
+            .all(|ib| { ib["tag"] != DNS_INBOUND_TAG && ib["tag"] != DNS_INBOUND_V6_TAG }),
+        "the in-tun DNS listeners must not be emitted into the static config"
     );
 
     // Interception rules; DoH (TCP:443) never matches them and falls to
@@ -2112,7 +2116,7 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
         cfg["routing"]["rules"],
         json!([
             {
-                "inboundTag": [DNS_INBOUND_TAG],
+                "inboundTag": [DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG],
                 "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
@@ -2299,7 +2303,10 @@ fn doh_pinning_skipped_without_active_profile() {
         rules.iter().all(|rule| rule["port"] != "443"),
         "no DoH pin without an active profile: {rules:?}"
     );
-    assert_eq!(rules[0]["inboundTag"], json!([DNS_INBOUND_TAG]));
+    assert_eq!(
+        rules[0]["inboundTag"],
+        json!([DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG])
+    );
 }
 
 #[test]

@@ -1953,7 +1953,7 @@ keys! {
     RtLogHelperStopFailed (Log, Error, 0),
     RtLogDnsFlushFailed (Log, Warn, 1),
     RtLogCoreExitBackoff (Log, Warn, 3),
-    RtLogDnsInListenerAdded (Log, Info, 2),
+    RtLogDnsInListenerAdded (Log, Info, 1),
     RtLogDnsInListenerNotAdded (Log, Warn, 1),
     RtLogUpdateCancelRequested (Log, Warn, 1),
     RtLogValidationCancelRequested (Log, Warn, 1),
@@ -3047,9 +3047,9 @@ mod en {
             }
             Key::TunDnsListenerNote => {
                 "With a DNS module, the adapter's DNS points at the first IPv4 gateway. The app adds \
-                 the in-tun DNS listener that answers those queries to the running core once the \
-                 adapter is up. That happens a moment after the core starts. It is not part of the \
-                 generated configuration."
+                 an in-tun DNS listener for every gateway address the tunnel carries to the running \
+                 core once the adapter is up. That happens a moment after the core starts. It is \
+                 not part of the generated configuration."
             }
             Key::TunEnableCheckbox => "enable TUN inbound",
             Key::TunRestartHint => "the core restarts through the elevated helper when you apply",
@@ -5382,7 +5382,7 @@ mod en {
             Key::RtLogCoreExitBackoff => {
                 "core exited unexpectedly (code {}); restarting as attempt {} in {} ms"
             }
-            Key::RtLogDnsInListenerAdded => "in-tun DNS listener added on {}:{}",
+            Key::RtLogDnsInListenerAdded => "in-tun DNS listener added on {}",
             Key::RtLogDnsInListenerNotAdded => {
                 "in-tun DNS listener not added: {}; the listener is best-effort"
             }

@@ -9,7 +9,9 @@ use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scheme_host, scoped_bootstrap_endpoint};
 use crate::model::emit;
-use crate::model::inbound::{API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG};
+use crate::model::inbound::{
+    API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG,
+};
 use crate::model::settings::Language;
 use crate::model::validation::{
     ValidationIssue, Verdict, tun_ipv4_gateway, validate_profiles, validate_settings,
@@ -1018,7 +1020,7 @@ fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
     if emission.dns_intercept {
         if emission.dns_on && emission.tun_on {
             rules.push(json!({
-                "inboundTag": [DNS_INBOUND_TAG],
+                "inboundTag": [DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG],
                 "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,

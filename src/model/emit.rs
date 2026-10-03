@@ -16,8 +16,8 @@
 use std::collections::BTreeSet;
 
 use super::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_OUTBOUND_TAG,
-    DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
+    DNS_OUTBOUND_TAG, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
 use super::servers::{ServerProfile, ServersFile};
 use super::settings::{Mode, Settings};
@@ -67,12 +67,13 @@ pub fn dns_intercept(settings: &Settings) -> bool {
         && (tun_inbound_emitted(settings) || dns_capable_socks(settings).next().is_some())
 }
 
-/// True when the running configuration carries the in-tun DNS listener: the DNS
-/// module exists and so does the tun inbound. The generator deliberately does
-/// not emit that listener — Xray starts tagged inbounds in Go map order, and a
-/// listener binding the TUN gateway loses the race against the adapter's own
-/// DNS queries on a fraction of cold starts — so the runtime adds it under
-/// [`DNS_INBOUND_TAG`] while the interception rules hold.
+/// True when the running configuration carries the in-tun DNS listeners: the
+/// DNS module exists and so does the tun inbound. The generator deliberately
+/// does not emit them — Xray starts tagged inbounds in Go map order, and a
+/// listener binding a TUN gateway loses the race against the adapter's own DNS
+/// queries on a fraction of cold starts — so the runtime adds them under
+/// [`DNS_INBOUND_TAG`] and [`super::inbound::DNS_INBOUND_V6_TAG`] while the
+/// interception rules hold.
 pub fn dns_inbound_emitted(settings: &Settings) -> bool {
     tun_inbound_emitted(settings) && dns_module_emitted(settings)
 }
@@ -123,10 +124,12 @@ pub fn dokodemo_emitted(entry: &DokodemoCfg) -> bool {
 /// for tag uniqueness reserves these after its walk, so the insert that fails —
 /// the collision report — names the same arm this module carries.
 pub fn appended_inbound_tags(settings: &Settings) -> impl Iterator<Item = &'static str> {
+    let dns_listeners = dns_inbound_emitted(settings);
     tun_inbound_emitted(settings)
         .then_some(TUN_INBOUND_TAG)
         .into_iter()
-        .chain(dns_inbound_emitted(settings).then_some(DNS_INBOUND_TAG))
+        .chain(dns_listeners.then_some(DNS_INBOUND_TAG))
+        .chain(dns_listeners.then_some(DNS_INBOUND_V6_TAG))
 }
 
 /// The inbound tags the running configuration carries: the control-plane
@@ -272,6 +275,7 @@ mod tests {
         tags.extend(config[keys::API][keys::TAG].as_str().map(str::to_string));
         if dns_inbound_emitted(settings) {
             tags.insert(DNS_INBOUND_TAG.into());
+            tags.insert(DNS_INBOUND_V6_TAG.into());
         }
         tags
     }

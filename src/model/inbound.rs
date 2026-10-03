@@ -22,6 +22,12 @@ pub const TUN_INBOUND_TAG: &str = "in-tun";
 /// whether the system DNS points at this listener.
 pub const DNS_INBOUND_TAG: &str = "dns-in";
 
+/// Wire tag of the tunnel's IPv6 DNS listener: `"dns-in6"`. The runtime adds
+/// one in-tun DNS listener per gateway address family the tunnel carries, and
+/// Xray's inbound manager keys handlers by tag, so the IPv6 one needs its own —
+/// named by the same interception rule that names [`DNS_INBOUND_TAG`].
+pub const DNS_INBOUND_V6_TAG: &str = "dns-in6";
+
 /// Wire tag of the DNS outbound: `"dns-out"`. Referenced in emission of the
 /// DNS module's outbound and in routing rules that forward DNS traffic to it.
 pub const DNS_OUTBOUND_TAG: &str = "dns-out";

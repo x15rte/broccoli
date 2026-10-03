@@ -38,10 +38,10 @@ pub(super) const CANDIDATE_RETRY_DELAY: Duration = Duration::from_millis(2000);
 /// attempts cut the user-visible rate to roughly `(1/8)^4`.
 pub(super) const TUN_BIND_RACE_RETRIES: u8 = 3;
 
-/// Automatic add attempts for the in-tun DNS listener a running TUN core
-/// needs ([`super::dns_in`]): the listener binds the TUN gateway, an address
-/// the core's tun inbound assigns while its start is still in flight, so
-/// early attempts may race the adapter create. At the listener's retry
+/// Automatic add attempts for the in-tun DNS listeners a running TUN core
+/// needs ([`super::dns_in`]): each listener binds a TUN gateway address, an
+/// address the core's tun inbound assigns while its start is still in flight,
+/// so early attempts may race the adapter create. At the listeners' retry
 /// cadence the budget spans roughly ten seconds; the add is best-effort, so
 /// a spent budget logs and leaves the core running.
 pub(super) const DNS_IN_ADD_ATTEMPTS: u8 = 20;

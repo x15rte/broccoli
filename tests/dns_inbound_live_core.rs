@@ -20,12 +20,12 @@
 //! target with the ignore lifted.
 
 use std::io::Write as _;
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use broccoli::model::inbound::DNS_INBOUND_TAG;
-use broccoli::rt::dns_in::{Listener, PORT};
+use broccoli::model::inbound::{DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG};
+use broccoli::rt::dns_in::PORT;
 use broccoli::rt::grpc::GrpcClient;
 
 #[path = "common/live_core.rs"]
@@ -100,11 +100,9 @@ async fn in_tun_dns_listener_adds_to_a_live_core() {
 
     wait_for_api(api_port);
     let client = GrpcClient::new(api_port);
-    let listener = Listener {
-        address: Ipv4Addr::LOCALHOST,
-    };
+    let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-    match client.add_dns_in_listener(&listener).await {
+    match client.add_dns_in_listener(address).await {
         Ok(()) => {}
         // A machine already serving DNS on loopback:53 cannot bind the
         // listener. The retry protocol still has to hold: the failed attempt
@@ -116,7 +114,7 @@ async fn in_tun_dns_listener_adds_to_a_live_core() {
                 "an occupied port must surface the core's bind error, got: {}",
                 error.message()
             );
-            let retry = client.add_dns_in_listener(&listener).await;
+            let retry = client.add_dns_in_listener(address).await;
             let retry = retry.expect_err("the occupied port cannot free itself");
             assert!(
                 retry.message().contains("failed to listen TCP on 53"),
@@ -141,10 +139,28 @@ async fn in_tun_dns_listener_adds_to_a_live_core() {
         "the core must own the loopback listener on port {PORT}"
     );
 
+    // The IPv6 listener: the tunnel's other gateway family, bound under its
+    // own tag. The payload differs only in the address length, so a core that
+    // accepts this add has started the handler on `::1:53`.
+    let address6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    client
+        .add_dns_in_listener(address6)
+        .await
+        .expect("the core must accept the IPv6 listener payload");
+    let inbounds = client.list_inbounds().await.expect("list after IPv6 add");
+    assert!(
+        inbounds.iter().any(|entry| entry.tag == DNS_INBOUND_V6_TAG),
+        "the IPv6 listener must be listed under its own tag, got {inbounds:?}"
+    );
+    assert!(
+        inbounds.iter().any(|entry| entry.tag == DNS_INBOUND_TAG),
+        "adding the IPv6 family must not disturb the IPv4 listener, got {inbounds:?}"
+    );
+
     // Remove-then-add re-entry: a second add replaces the bound listener
     // instead of failing on the already-registered tag.
     client
-        .add_dns_in_listener(&listener)
+        .add_dns_in_listener(address)
         .await
         .expect("re-entry must replace the listener");
     let inbounds = client.list_inbounds().await.expect("list after re-entry");

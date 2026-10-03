@@ -5,7 +5,7 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message, t, t_fmt};
 use crate::model::emit;
 use crate::model::inbound::{
-    API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, TUN_INBOUND_TAG,
+    API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, TUN_INBOUND_TAG,
 };
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::SafetyVerdicts;
@@ -1299,19 +1299,25 @@ impl RoutingScreen {
             })
             .collect();
         // TestRoute dialog inbound options: every local endpoint tag (all
-        // entries, list order) plus the built-in tun/dns/api listeners and
-        // every dokodemo tag. A different question than `emit::inbound_tags`:
-        // a trial rule may name a listener that is switched off right now —
-        // the dialog offers it, and the core answers for the tags it does not
-        // know — so disabled entries stay in this list on purpose.
+        // entries, list order) plus the built-in tun/dns listeners (one per
+        // gateway family) and api, and every dokodemo tag. A different
+        // question than `emit::inbound_tags`: a trial rule may name a listener
+        // that is switched off right now — the dialog offers it, and the core
+        // answers for the tags it does not know — so disabled entries stay in
+        // this list on purpose.
         let known_inbounds: Vec<String> = settings
             .local_inbounds
             .iter()
             .map(|entry| entry.tag.clone())
             .chain(
-                [TUN_INBOUND_TAG, DNS_INBOUND_TAG, API_INBOUND_TAG]
-                    .into_iter()
-                    .map(str::to_string),
+                [
+                    TUN_INBOUND_TAG,
+                    DNS_INBOUND_TAG,
+                    DNS_INBOUND_V6_TAG,
+                    API_INBOUND_TAG,
+                ]
+                .into_iter()
+                .map(str::to_string),
             )
             .chain(settings.dokodemo.iter().map(|entry| entry.tag.clone()))
             .collect();
@@ -3627,7 +3633,7 @@ mod geodata_picker_search_tests {
 #[cfg(test)]
 mod view_cache_tests {
     use super::{Language, RoutingScreen, rule_summary, rule_target_line};
-    use crate::model::inbound::{DNS_INBOUND_TAG, TUN_INBOUND_TAG};
+    use crate::model::inbound::{DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, TUN_INBOUND_TAG};
     use crate::model::{
         Balancer, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, OutboundModel, Rule,
         ServerProfile, ServersFile, Settings,
@@ -4029,6 +4035,7 @@ mod view_cache_tests {
                 "in-http",
                 TUN_INBOUND_TAG,
                 DNS_INBOUND_TAG,
+                DNS_INBOUND_V6_TAG,
                 "api",
                 "in-doko-a",
                 "in-doko-b"
@@ -4045,6 +4052,7 @@ mod view_cache_tests {
                 "in-http",
                 TUN_INBOUND_TAG,
                 DNS_INBOUND_TAG,
+                DNS_INBOUND_V6_TAG,
                 "api",
                 "in-doko-a",
                 "in-doko-c"
@@ -4067,6 +4075,7 @@ mod view_cache_tests {
                 "in-http-1",
                 TUN_INBOUND_TAG,
                 DNS_INBOUND_TAG,
+                DNS_INBOUND_V6_TAG,
                 "api",
                 "in-doko-a",
                 "in-doko-c"

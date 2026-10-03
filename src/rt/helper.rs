@@ -2077,7 +2077,14 @@ fn helper_start(
                                                     Key::HelperConfigNoTunAdapter,
                                                 ))
                                             })?;
-                                    crate::sys::dns_takeover::engage(&path, ifindex, in_tun.address)
+                                    crate::sys::dns_takeover::engage(
+                                        &path,
+                                        ifindex,
+                                        crate::sys::dns_takeover::Targets {
+                                            v4: in_tun.v4,
+                                            v6: in_tun.v6,
+                                        },
+                                    )
                                 })();
                                 match outcome {
                                     Ok(adapters) => {
