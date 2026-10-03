@@ -2882,6 +2882,22 @@ impl ServersScreen {
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
                 .max_height(list_height)
                 .show_rows(ui, row_height, profiles.len(), |ui, rows| {
+                    // egui's floating (overlay) scroll bar paints and
+                    // hit-tests over the band's right edge: a vertical
+                    // ScrollArea shrinks horizontally to its content and the
+                    // bar hugs that edge, reserving no space of its own
+                    // (`ScrollStyle::allocated_width` is the floating
+                    // allocation, zero by default). A row fills the band, so
+                    // its trailing delete button would sit under the track
+                    // and a press on its right part would grab the bar
+                    // instead. Reserve the bar's overlap — computed once per
+                    // frame from the style, since every row shares the band —
+                    // and report the full band width again at the end so the
+                    // bar stays pinned to the edge the rows stop short of.
+                    let scroll = ui.style().spacing.scroll;
+                    let scrollbar_inset = (scroll.bar_width - scroll.allocated_width()).max(0.0);
+                    let band_right = ui.max_rect().right();
+                    ui.set_max_width((ui.available_width() - scrollbar_inset).max(0.0));
                     let colors = status_colors_of(ui);
                     // One frame of drag-reorder state: the pointer (only
                     // while it is inside the list viewport), the proposed
@@ -3034,6 +3050,10 @@ impl ServersScreen {
                             ui.ctx().request_repaint();
                         }
                     }
+                    // The rows stopped short of the band's right edge; report
+                    // the full width so the overlay bar stays there instead of
+                    // following the shrunken content onto the controls.
+                    ui.expand_to_include_x(band_right);
                 });
         }
         // A finished row drag performs its move at the gap the pointer last
@@ -13076,34 +13096,25 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         // The per-row delete button in the same band row stages the
-        // confirmation dialog for that profile. The button's right edge
-        // runs under the ScrollArea's overlay scrollbar track (~x190+), so
-        // press the visible left part like a real pointer would; kittest's
-        // node-center click would land on the track.
-        let del_rect = harness
+        // confirmation dialog for that profile. The reserved strip must hold:
+        // the button stops clear of the overlay scroll bar, and a centre
+        // press must reach it.
+        let bar_rect = harness
+            .get_all_by_role(egui::accesskit::Role::ScrollBar)
+            .next()
+            .expect("the scrolled list must show its overlay scroll bar")
+            .rect();
+        let delete = harness
             .get_all_by_label("🗑")
             .find(|node| (node.rect().center().y - row_y).abs() < 8.0)
-            .expect("the scrolled-to row must render its delete button")
-            .rect();
-        let press = egui::pos2(del_rect.left() + 4.0, del_rect.center().y);
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(press));
-        harness.step();
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: press,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        });
-        harness.step();
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: press,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        });
+            .expect("the scrolled-to row must render its delete button");
+        let delete_rect = delete.rect();
+        assert!(
+            delete_rect.max.x <= bar_rect.min.x,
+            "the delete button must stop clear of the overlay scroll bar: \
+             button {delete_rect:?}, bar {bar_rect:?}"
+        );
+        delete.click();
         harness.run_steps(2);
         assert_eq!(
             harness
