@@ -86,9 +86,8 @@ pub struct DashboardScreen {
     /// rebuilt only when the stats generation, the traffic unit or the
     /// language changes.
     inbound_cache: Option<InboundCache>,
-    /// Header-row labels (phase badge, endpoint rows, API-port line),
-    /// rebuilt only when a phase/endpoint/persist/language/core-start
-    /// change moved them.
+    /// Header-row labels (phase badge, endpoint rows), rebuilt only when a
+    /// phase/endpoint/persist/language/core-start change moved them.
     header_cache: Option<HeaderCache>,
 }
 
@@ -249,7 +248,7 @@ impl DashboardScreen {
     }
 
     /// The header-row labels for this frame (phase badge, per-endpoint
-    /// status rows, API-port line): formatted only when a phase transition,
+    /// status rows): formatted only when a phase transition,
     /// a model edit, a language change or a core start moved them — never on
     /// repaint frames. The status word inside each endpoint caption is
     /// phase-derived, so the phase is part of the key with its own
@@ -919,13 +918,12 @@ enum ListenerStatus {
     Disabled,
 }
 
-/// The dashboard header-row labels: the phase-badge
-/// caption, the per-endpoint status rows (label + the derived status they
-/// were formatted for) and the API-port line — rebuilt only when a phase
-/// transition, a model edit, a language change or a core start moved them,
-/// never on repaint frames. The phase is keyed by clone-at-rebuild and
-/// compared with its own payload-inclusive `PartialEq`, so the per-frame
-/// staleness check never allocates.
+/// The dashboard header-row labels: the phase-badge caption and the
+/// per-endpoint status rows (label + the derived status they were formatted
+/// for) — rebuilt only when a phase transition, a model edit, a language
+/// change or a core start moved them, never on repaint frames. The phase is
+/// keyed by clone-at-rebuild and compared with its own payload-inclusive
+/// `PartialEq`, so the per-frame staleness check never allocates.
 struct HeaderCache {
     phase: CorePhase,
     /// The model generation the endpoint captions were derived from.

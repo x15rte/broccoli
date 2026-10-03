@@ -1222,8 +1222,8 @@ fn managed_geo_data_matches_pins(core: &Path) -> bool {
 ///
 /// Safe to call at any time and idempotent:
 /// - a missing pair — or a pair member that is not an ordinary file — bails
-///   with an error naming the file and saying restore is unavailable (a
-///   future change turns this into a terminal-with-reason path);
+///   with a terminal error carrying the file name and the restore-unavailable
+///   reason;
 /// - a pair member whose bytes do not match its compiled pin bails naming
 ///   the file and both hashes, before any managed file is touched;
 /// - managed DATs that already match the pins are a no-op;
