@@ -321,17 +321,20 @@ pub fn remove_instance(instance_id: &str) -> Result<(), String> {
 
 /// Remove leftover devnodes for the adapter name and wait (bounded) until none
 /// remain. The wait is what serializes the restart against the previous
-/// session's in-flight teardown. Returns `(clean, log_lines)`.
-pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, Vec<String>) {
+/// session's in-flight teardown. Returns `(clean, removed, log_lines)`, where
+/// `removed` counts the devnodes this call actually removed.
+pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, usize, Vec<String>) {
     let deadline = Instant::now() + timeout;
+    let mut removed = 0;
     let mut lines = Vec::new();
     loop {
         match matching_instance_ids(name) {
-            Ok(ids) if ids.is_empty() => return (true, lines),
+            Ok(ids) if ids.is_empty() => return (true, removed, lines),
             Ok(ids) => {
                 for id in ids {
                     match remove_instance(&id) {
                         Ok(()) => {
+                            removed += 1;
                             lines.push(format!("removed leftover wintun devnode {id}"));
                         }
                         Err(error) => {
@@ -347,7 +350,7 @@ pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, Vec<String>) {
                 "wintun devnode cleanup for \"{name}\" timed out after {} ms",
                 timeout.as_millis()
             ));
-            return (false, lines);
+            return (false, removed, lines);
         }
         std::thread::sleep(POLL_INTERVAL);
     }

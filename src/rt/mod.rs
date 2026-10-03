@@ -122,6 +122,16 @@ pub enum CoreCmd {
     Start,
     Stop,
     Restart,
+    /// Clean the machine's TUN leftovers without connecting: stop a running
+    /// core, drop the DNS shield, restore the DNS servers a session took
+    /// over, remove leftover wintun devnodes of `adapter_name`, and flush the
+    /// resolver cache. The manual repair for a session that ended
+    /// unexpectedly; `adapter_name` is the effective adapter name the TUN
+    /// settings derive, because a cleanup has no staged config to read it
+    /// from. The terminal is the operation bookend plus a summary log line.
+    CleanUp {
+        adapter_name: String,
+    },
     /// Validate the candidate with `xray run -test`, and on success commit it
     /// and do what `intent` asks with the result. The revision is the app's
     /// own identifier of the configuration the candidate was generated from:
@@ -800,6 +810,10 @@ fn cancelled_helper_connect() -> ExclusiveOutcome {
     ExclusiveOutcome::HelperConnected(Err(HelperConnectFailure::Cancelled))
 }
 
+fn cancelled_cleanup() -> ExclusiveOutcome {
+    ExclusiveOutcome::CleanUpLaunched(Err(HelperConnectFailure::Cancelled))
+}
+
 /// The UAC prompt cannot be cancelled, but an accepted prompt must not turn
 /// into a pipe connection after Stop/Shutdown has cancelled this launch.
 fn connect_after_helper_launch<T>(cancel: &AtomicBool, connect: impl FnOnce() -> T) -> Option<T> {
@@ -873,6 +887,14 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// parent-death watchdog still kills immediately at app crash — killing then
 /// is unavoidable (nobody is left to wait) and by design.
 const TUN_STOP_WINDOW: Duration = Duration::from_secs(20);
+/// How long a commanded cleanup may take after its helper is connected. Every
+/// step the helper runs is bounded on its own — the TUN close window, the
+/// devnode sweep's ten seconds, the DNS restore — so this only catches a
+/// helper that dies without answering, which must never leave the busy window
+/// held.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cadence of the cleanup deadline check ([`CLEANUP_TIMEOUT`]'s guard).
+const CLEANUP_TICK: Duration = Duration::from_millis(500);
 /// Download UI redraw cadence. HTTP chunks can arrive far faster than egui
 /// frames; coalescing their progress snapshots prevents an unbounded event
 /// backlog from starving lifecycle commands.
@@ -1002,6 +1024,24 @@ struct Runtime {
     /// (an event emitted after a mutation follows that mutation's
     /// bookends; an event emitted before stays before).
     pending_bookends: mpsc::UnboundedReceiver<Option<JobKind>>,
+    /// A cleanup the runtime commanded and has not yet seen finish, if any.
+    cleanup: Option<Cleanup>,
+}
+
+/// A cleanup in flight: the helper it commands, the events that carry that
+/// helper's terminal, and the deadline that keeps a helper dying mid-cleanup
+/// from holding the busy window.
+struct Cleanup {
+    /// The helper this cleanup launched, when the runtime owned none to
+    /// command in place. Held for its `Drop` — releasing it at the terminal
+    /// closes the pipe and ends the process — so nothing reads it; `None`
+    /// leaves the runtime's own helper untouched.
+    _pipe: Option<helper::HelperPipe>,
+    /// The launched helper's events. `None` for an owned helper, whose events
+    /// arrive through the backend's own arm.
+    events: Option<mpsc::Receiver<helper::HelperEvent>>,
+    /// When the wait for the terminal expires.
+    deadline: Instant,
 }
 
 /// Install the aws-lc-rs crypto provider as rustls's process default.
@@ -1064,6 +1104,7 @@ impl Runtime {
             }),
             apply_revision: 0,
             pending_bookends: bookend_rx,
+            cleanup: None,
         }
     }
 
@@ -1270,6 +1311,21 @@ impl Runtime {
     /// await, where an out-of-band emitter (the update-check worker, the
     /// download-progress `try_send`) could overtake it.
     fn release_exclusive(&mut self) {
+        // The window and a cleanup's wait end together: a cleanup is only in
+        // flight while its own record is held, so any release that did not
+        // come from the cleanup's own terminal must end the operation too.
+        // `finish_cleanup` / `fail_cleanup` take the state before calling
+        // this, and `cancel_task_exclusive` clears it, so an armed state here
+        // means the helper that was cleaning went away with this release: the
+        // operation gets the one result it can still have, a reported failure,
+        // instead of ending silently. (The drop also closes a helper this
+        // cleanup launched.)
+        if self.cleanup.take().is_some() {
+            self.app_log(
+                DiagError::new(Diag::new(Key::RtLogCleanUpFailed))
+                    .caused_by(DiagError::new(Diag::new(Key::RtLogHelperDisconnected))),
+            );
+        }
         self.jobs.finish_exclusive();
         self.drain_pending_bookends();
     }
@@ -1321,6 +1377,11 @@ impl Runtime {
     /// terminal of their own — their result already landed or the exit path
     /// owns them.
     fn cancel_task_exclusive(&mut self, kind: JobKind, reason: &Diag) {
+        // A cleanup that is already waiting on its helper's terminal is owned
+        // by the record being cancelled here: drop its state so a late
+        // terminal neither settles a released window nor leaves a helper
+        // launched for that cleanup alive.
+        self.cleanup = None;
         // The worker's terminal state is taken before the cancel: the task
         // is aborted below, so the cancel path is the exactly-one terminal
         // when the outcome can no longer arrive.
@@ -1452,6 +1513,7 @@ impl Runtime {
         let mut stats_tick = ticker(Duration::from_secs(1));
         let mut obs_tick = ticker(Duration::from_secs(5));
         let mut house_tick = ticker(Duration::from_millis(500));
+        let mut cleanup_tick = ticker(CLEANUP_TICK);
 
         loop {
             tokio::select! {
@@ -1529,6 +1591,10 @@ impl Runtime {
                         Some(helper::HelperEvent::State { state, pid }) => {
                             self.lifecycle.on_helper_state(&state, pid);
                         }
+                        Some(helper::HelperEvent::Cleaned {
+                            dns_adapters,
+                            adapters_removed,
+                        }) => self.finish_cleanup(dns_adapters, adapters_removed),
                         None => {
                             // Pipe EOF is watchdog ownership release, but it is
                             // not an Xray Exit acknowledgement. Never launch a
@@ -1536,11 +1602,45 @@ impl Runtime {
                             let active = self.lifecycle.backend.is_alive() || self.lifecycle.exit_policy.stopping();
                             self.lifecycle.backend.force_release();
                             self.app_log(Diag::new(Key::RtLogHelperDisconnected));
+                            // A cleanup waiting on this helper lost its
+                            // terminal with the pipe: report and release,
+                            // never leave the busy window held.
+                            if self.cleanup.is_some() {
+                                self.fail_cleanup(
+                                    DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(
+                                        DiagError::new(Diag::new(Key::RtLogHelperDisconnected)),
+                                    ),
+                                );
+                            }
                             if active {
                                 self.on_unconfirmed_backend_loss();
                             }
                         }
                     }
+                }
+                ev = async {
+                    match self.cleanup.as_mut().and_then(|cleanup| cleanup.events.as_mut()) {
+                        Some(rx) => rx.recv().await,
+                        None => unreachable!(),
+                    }
+                }, if self.cleanup.as_ref().is_some_and(|cleanup| cleanup.events.is_some()) => {
+                    match ev {
+                        Some(helper::HelperEvent::Cleaned {
+                            dns_adapters,
+                            adapters_removed,
+                        }) => self.finish_cleanup(dns_adapters, adapters_removed),
+                        Some(helper::HelperEvent::Log(record)) => self.emit_helper_log(record),
+                        // The helper the cleanup launched ended without its
+                        // terminal.
+                        Some(_) | None => self.fail_cleanup(
+                            DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(
+                                DiagError::new(Diag::new(Key::RtLogHelperDisconnected)),
+                            ),
+                        ),
+                    }
+                }
+                _ = cleanup_tick.tick(), if self.cleanup.as_ref().is_some_and(|cleanup| cleanup.deadline <= Instant::now()) => {
+                    self.fail_cleanup(DiagError::new(Diag::new(Key::RtLogCleanUpTimeout)));
                 }
                 _ = ready_tick.tick(), if matches!(self.lifecycle.phase, CorePhase::Starting) => {
                     self.ready_poll().await;
@@ -1668,6 +1768,22 @@ impl Runtime {
                 } else {
                     self.start_backend().await;
                 }
+            }
+            CoreCmd::CleanUp { adapter_name } => {
+                let Some(_id) = self.begin_exclusive(JobKind::CleanUp, BusyAnswer::Nowhere) else {
+                    return;
+                };
+                // A running core is stopped first, through the teardown the
+                // Stop path runs: the sweep below is only meaningful once
+                // nothing owns the adapter any more, and a misbehaving session
+                // is exactly what a user asks this for.
+                if self.lifecycle.backend.tun_owned_or_alive() {
+                    self.lifecycle.pending_restart = None;
+                    self.lifecycle.pending_transition.clear();
+                    self.lifecycle.exit_policy.begin_stop(Instant::now());
+                    self.kill_backend().await;
+                }
+                self.command_cleanup(adapter_name);
             }
             CoreCmd::Apply {
                 value,
@@ -2034,6 +2150,17 @@ impl Runtime {
     /// core update keep the record through readiness (deferred release).
     async fn complete_exclusive(&mut self, outcome: ExclusiveOutcome) {
         match outcome {
+            ExclusiveOutcome::CleanUpLaunched(result) => match result {
+                Ok((pipe, events)) => self.arm_cleanup(Some(pipe), Some(events)),
+                Err(error) => match error.error() {
+                    // A launch aborted by the shared cancel flag is not a
+                    // failure: Stop/Shutdown already owns terminal state.
+                    None => self.release_exclusive(),
+                    Some(error) => self.fail_cleanup(
+                        DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(error),
+                    ),
+                },
+            },
             ExclusiveOutcome::HelperConnected(result) => {
                 let mut pipe = match result {
                     Ok(pipe) => pipe,
@@ -2646,6 +2773,124 @@ impl Runtime {
         self.app_log(Diag::new(Key::RtLogHelperLaunchWait));
     }
 
+    /// Command the machine cleanup over the helper this runtime already owns,
+    /// or over a helper launched for this request alone. The cleanup needs
+    /// elevation for the devnode removal and the captured DNS servers, and the
+    /// GUI has no path to it besides the helper.
+    fn command_cleanup(&mut self, adapter_name: String) {
+        if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
+            if let Err(error) = pipe.cleanup(&adapter_name) {
+                self.fail_cleanup(
+                    DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(error),
+                );
+            } else {
+                self.arm_cleanup(None, None);
+            }
+            return;
+        }
+        let pipe_id = uuid::Uuid::new_v4().simple().to_string();
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let cancel = match self.jobs.exclusive_cancel_flag() {
+            Some(flag) => flag,
+            None => {
+                self.fail_cleanup(DiagError::new(Diag::new(Key::RtLogCleanUpFailed)));
+                return;
+            }
+        };
+        let task_cancel = Arc::clone(&cancel);
+        let task = tokio::task::spawn_blocking(move || {
+            if task_cancel.load(Ordering::Acquire) {
+                return cancelled_cleanup();
+            }
+            // `_credentials` must stay alive through the connect attempt: the
+            // elevated child reads the ProgramData token file at its startup,
+            // so the GUI deletes it only after the handshake has resolved.
+            let _credentials = match crate::sys::elevation::launch_core_helper(&pipe_id, &token) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return ExclusiveOutcome::CleanUpLaunched(Err(HelperConnectFailure::Failed(
+                        DiagError::new(Diag::new(Key::RtLogCleanUpFailed))
+                            .caused_by(DiagError::new(error.diag()))
+                            .into(),
+                    )));
+                }
+            };
+            match connect_after_helper_launch(&task_cancel, || {
+                helper::HelperPipe::connect_cancellable(&pipe_id, &token, &task_cancel)
+            }) {
+                // A connect that resolved after Stop/Shutdown raised the flag
+                // is cancelled: the pipe (when one was opened) is dropped here,
+                // and the helper sees its watched parent close.
+                Some(Ok(mut pipe)) if !task_cancel.load(Ordering::Acquire) => {
+                    // A command that cannot be written drops the pipe, which
+                    // ends the helper this request launched.
+                    if let Err(error) = pipe.cleanup(&adapter_name) {
+                        return ExclusiveOutcome::CleanUpLaunched(Err(
+                            HelperConnectFailure::Failed(error.into()),
+                        ));
+                    }
+                    let events = pipe.take_events();
+                    ExclusiveOutcome::CleanUpLaunched(Ok((pipe, events)))
+                }
+                Some(Err(error)) if !task_cancel.load(Ordering::Acquire) => {
+                    ExclusiveOutcome::CleanUpLaunched(Err(HelperConnectFailure::Failed(
+                        error.into(),
+                    )))
+                }
+                _ => cancelled_cleanup(),
+            }
+        });
+        self.jobs.attach_exclusive_task(task);
+        self.app_log(Diag::new(Key::RtLogCleanUpLaunch));
+    }
+
+    /// Start waiting for a commanded cleanup's terminal. The deadline begins
+    /// here, after any elevation prompt and the connect: every step the helper
+    /// then runs is bounded, so a longer wait means it died without answering.
+    fn arm_cleanup(
+        &mut self,
+        pipe: Option<helper::HelperPipe>,
+        events: Option<mpsc::Receiver<helper::HelperEvent>>,
+    ) {
+        self.cleanup = Some(Cleanup {
+            _pipe: pipe,
+            events,
+            deadline: Instant::now() + CLEANUP_TIMEOUT,
+        });
+    }
+
+    /// The helper reported its cleanup counts: flush the resolver cache (the
+    /// restored servers must answer at once, not after a stale answer ages
+    /// out), log the summary, drop a helper launched for this request alone
+    /// (its pipe close ends the process) and release the window.
+    fn finish_cleanup(&mut self, dns_adapters: u32, adapters_removed: u32) {
+        if self.cleanup.take().is_none() {
+            return; // no cleanup in flight: an unrelated helper's terminal
+        }
+        self.flush_dns_cache();
+        if dns_adapters == 0 && adapters_removed == 0 {
+            self.app_log(Diag::new(Key::RtLogCleanUpNothing));
+        } else {
+            self.app_log(
+                Diag::new(Key::RtLogCleanUpDone)
+                    .arg(dns_adapters)
+                    .arg(adapters_removed),
+            );
+        }
+        self.release_exclusive();
+    }
+
+    /// The cleanup ended without its terminal (the helper died, or the wait
+    /// ran out): report it and release the window, so a dead helper can never
+    /// leave the GUI busy forever. Dropping a launched helper's pipe ends it.
+    fn fail_cleanup(&mut self, error: DiagError) {
+        if self.cleanup.take().is_none() {
+            return;
+        }
+        self.app_log(error);
+        self.release_exclusive();
+    }
+
     /// Returns whether the graceful close succeeded (or was not applicable:
     /// the backend does not own a TUN).
     async fn cleanup_tun(&mut self) -> bool {
@@ -2887,9 +3132,18 @@ impl Runtime {
             ExitBranch::StopSettled => {
                 self.lifecycle.exit_policy.finish();
                 if !self.lifecycle.shutting_down {
-                    self.lifecycle.backend.force_release();
-                    self.set_phase(CorePhase::Stopped);
-                    self.release_exclusive();
+                    if self.jobs.busy_kind() == Some(JobKind::CleanUp) {
+                        // A cleanup owns this window, and the core's exit is
+                        // the stop it asked for: settle the phase here and
+                        // leave the record — and, over the runtime's own
+                        // helper, the pipe its terminal arrives on — to the
+                        // cleanup, whose own terminal releases both.
+                        self.set_phase(CorePhase::Stopped);
+                    } else {
+                        self.lifecycle.backend.force_release();
+                        self.set_phase(CorePhase::Stopped);
+                        self.release_exclusive();
+                    }
                 }
             }
             ExitBranch::CandidatePreReadiness => {
@@ -6835,6 +7089,7 @@ mod tests {
         let occupying = [
             JobKind::Start,
             JobKind::Stop,
+            JobKind::CleanUp,
             JobKind::Restart,
             JobKind::ApplyConfig,
             JobKind::TestConfig,

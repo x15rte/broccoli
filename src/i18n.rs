@@ -770,9 +770,15 @@ keys! {
     SettingsUpdateUpToDate 1,
     SettingsUpdateFailed 0,
     SettingsUpdateReleasesLink 0,
-    // Settings → Cleanup: exit-time footprint removal.
+    // Settings → Cleanup: runtime network-state repair and exit-time
+    // footprint removal.
     SettingsCleanup 0,
     SettingsCleanupHint 0,
+    SettingsCleanUpNetwork 0,
+    SettingsCleanUpNetworkHint 0,
+    SettingsCleanUpNetworkTitle 0,
+    SettingsCleanUpNetworkBody 0,
+    SettingsCleanUpNetworkConfirm 0,
     SettingsCleanUpAndExit 0,
     SettingsCleanUpAndExitHint 0,
     SettingsCleanupTitle 0,
@@ -1552,6 +1558,11 @@ keys! {
     // Stray strings routed out of consumer code: runtime log lines and
     // frames, probe sentences, and file-dialog strings.
     RtLogHelperDisconnected 0,
+    RtLogCleanUpLaunch 0,
+    RtLogCleanUpDone 2,
+    RtLogCleanUpNothing 0,
+    RtLogCleanUpTimeout 0,
+    RtLogCleanUpFailed 0,
     RtLogConnectRejectedStopping 0,
     RtLogConnectIgnoredRunning 0,
     RtLogTransportChangeRestart 0,
@@ -1849,6 +1860,7 @@ keys! {
     RtReasonHelperDisconnected 0,
     OperationConnect 0,
     OperationDisconnect 0,
+    OperationCleanUp 0,
     OperationRestart 0,
     OperationApplyConfig 0,
     OperationTestConfig 0,
@@ -3472,9 +3484,21 @@ mod en {
             // Settings → Cleanup: exit-time footprint removal.
             Key::SettingsCleanup => "Cleanup",
             Key::SettingsCleanupHint => {
-                "Maintenance: reset to a fresh install's defaults, or remove broccoli \
-                 from this PC entirely."
+                "Maintenance: clean up the network state, reset to a fresh install's defaults, or \
+                 remove broccoli from this PC entirely."
             }
+            Key::SettingsCleanUpNetwork => "Clean Up Network State…",
+            Key::SettingsCleanUpNetworkHint => {
+                "Stop the tunnel, restore the DNS servers the tunnel took over, and remove the \
+                 leftover tunnel adapters. Use this when a session ended unexpectedly."
+            }
+            Key::SettingsCleanUpNetworkTitle => "Clean Up Network State",
+            Key::SettingsCleanUpNetworkBody => {
+                "The app stops the tunnel and removes what a session left behind. It restores the \
+                 DNS servers the tunnel took over and removes the leftover tunnel adapters. \
+                 Windows asks for administrator approval."
+            }
+            Key::SettingsCleanUpNetworkConfirm => "Clean up",
             Key::SettingsCleanUpAndExit => "Clean Up and Exit…",
             Key::SettingsCleanUpAndExitHint => {
                 "The app deletes the entire app-data folder and exits. The next launch starts as a \
@@ -4746,6 +4770,18 @@ mod en {
             Key::SettingsGeodataCronInvalid => "geodata: {}",
             // Runtime diagnostics and file dialogs, rendered at the display boundary.
             Key::RtLogHelperDisconnected => "The elevated helper disconnected.",
+            Key::RtLogCleanUpLaunch => {
+                "The app cleans up the network state. Approve the administrator prompt."
+            }
+            Key::RtLogCleanUpDone => {
+                "The app cleaned up the network state and restored the DNS servers of {} adapters. \
+                 It removed {} leftover adapters."
+            }
+            Key::RtLogCleanUpNothing => "The network state needs no cleanup.",
+            Key::RtLogCleanUpTimeout => {
+                "The network state cleanup timed out. The helper did not report back."
+            }
+            Key::RtLogCleanUpFailed => "The app could not clean up the network state.",
             Key::RtLogConnectRejectedStopping => {
                 "The app rejected the connect because a core stop is still in progress."
             }
@@ -5324,6 +5360,7 @@ mod en {
             Key::RtReasonHelperDisconnected => "the elevated helper disconnected unexpectedly",
             Key::OperationConnect => "connect",
             Key::OperationDisconnect => "disconnect",
+            Key::OperationCleanUp => "network cleanup",
             Key::OperationRestart => "restart",
             Key::OperationApplyConfig => "config apply",
             Key::OperationTestConfig => "config test",
@@ -6454,6 +6491,8 @@ mod tests {
                 "All settings return to a fresh install's defaults: mode, local endpoints, DNS, latency, theme. The app exits to finish the reset and clears the generated configurations and logs. The app keeps your server list. The next launch starts as a fresh install with your servers.",
             ),
             (Key::SettingsResetConfirm, "Reset to default"),
+            (Key::SettingsCleanUpNetwork, "Clean Up Network State…"),
+            (Key::SettingsCleanUpNetworkConfirm, "Clean up"),
             (
                 Key::SettingsGeodataProvenanceRelease,
                 "Release-managed: the geo data matches the pinned release.",

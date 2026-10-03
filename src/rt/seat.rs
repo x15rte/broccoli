@@ -47,6 +47,7 @@ pub(crate) fn operation_name(kind: JobKind) -> Option<Diag> {
     let key = match kind {
         JobKind::Start => Key::OperationConnect,
         JobKind::Stop => Key::OperationDisconnect,
+        JobKind::CleanUp => Key::OperationCleanUp,
         JobKind::Restart => Key::OperationRestart,
         JobKind::ApplyConfig => Key::OperationApplyConfig,
         JobKind::TestConfig => Key::OperationTestConfig,
@@ -203,6 +204,9 @@ pub(crate) fn rule(kind: JobKind) -> KindRule {
         // Exclusive kinds.
         JobKind::Start => OCCUPYING,
         JobKind::Stop => PREEMPTIVE_KIND,
+        // A cleanup stops a running core on its way through, so it must not
+        // preempt an operation the user already has in flight.
+        JobKind::CleanUp => OCCUPYING,
         JobKind::Restart => OCCUPYING,
         JobKind::ApplyConfig => OCCUPYING,
         JobKind::TestConfig => OCCUPYING,
@@ -224,6 +228,9 @@ pub(crate) fn exclusive_reject(kind: JobKind) -> ExclusiveReject {
     match kind {
         // Lifecycle spans: no terminal of their own to answer with.
         JobKind::Start | JobKind::Restart => ExclusiveReject::Logged,
+        // The cleanup's outcome is the summary log line, so a reject settles
+        // the optimistic view the same way.
+        JobKind::CleanUp => ExclusiveReject::Logged,
         JobKind::Stop => ExclusiveReject::Preempting,
         // The two request/reply kinds answer their requester directly.
         JobKind::TestConfig | JobKind::ValidateProfiles => ExclusiveReject::Reply,
@@ -410,7 +417,7 @@ pub(crate) fn deliver_cancel_terminal(
         ),
         // Lifecycle spans cancel to log + release only: their terminal would
         // have ridden the worker's outcome, which the cancel owns.
-        JobKind::Start | JobKind::Restart | JobKind::Stop => {}
+        JobKind::Start | JobKind::Restart | JobKind::Stop | JobKind::CleanUp => {}
         // A keep-slot core-update install is never aborted by a cancel path
         // (the flag-only path returns before this point).
         JobKind::UpdateCore => unreachable!(
@@ -443,7 +450,7 @@ pub(crate) fn deliver_join_error_terminal(
         JobKind::Start | JobKind::Restart => {
             runtime.set_phase(CorePhase::Error(PhaseError::new(message)))
         }
-        JobKind::Stop => {}
+        JobKind::Stop | JobKind::CleanUp => {}
         kind => unreachable!("query kinds never reach the exclusive task branch: {kind:?}"),
     }
 }

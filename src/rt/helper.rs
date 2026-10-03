@@ -19,7 +19,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,15 @@ const LIFECYCLE_SEND_WINDOW: Duration = Duration::from_millis(4000);
 /// spawning the replacement core (see `clean_leftover_tun_adapter`).
 const TUN_CLEAN_TIMEOUT: Duration = Duration::from_secs(10);
 const STAGE_BASE: &str = ".broccoli-secure-runtime";
+/// Captured DNS servers this helper process restored, wherever the restore ran:
+/// the startup repair, a session teardown, or a cleanup command. A cleanup's
+/// terminal reports the count since the last report and resets it, because the
+/// helper the GUI launched for a cleanup restores the captured servers *before*
+/// it reads that command — a report that counted only the command's own step
+/// would tell the user nothing needed cleaning right after the helper restored
+/// them, while an unreset total would overstate a cleanup served by a helper
+/// that already ran sessions.
+static DNS_SERVERS_RESTORED: AtomicUsize = AtomicUsize::new(0);
 /// Record file of the system-DNS takeover (`sys::dns_takeover`), inside
 /// [`STAGE_BASE`] so it lives beside the stage directories and under the same
 /// protected DACL.
@@ -1197,6 +1206,14 @@ enum HelperCommand {
     },
     Stop,
     Status,
+    /// Clean the machine's TUN leftovers without starting anything: stop a
+    /// core this helper still holds, drop the DNS shield, restore the DNS
+    /// servers a session took over, and remove leftover wintun devnodes of
+    /// `adapter_name`. The terminal is the `cleaned` event; a helper the GUI
+    /// launched for this request alone exits when that pipe closes.
+    CleanUp {
+        adapter_name: String,
+    },
     /// Authenticate with the one-shot token before anything else.
     Auth {
         token: String,
@@ -1665,6 +1682,9 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     &writer,
                     &serde_json::json!({"event":"state","state":state,"pid":pid}),
                 );
+            }
+            HelperCommand::CleanUp { adapter_name } => {
+                helper_cleanup(&current, &writer, &adapter_name);
             }
             // The auth handshake is decoded before this loop (it precedes
             // every command); a late one is not a command this loop serves.
@@ -2196,7 +2216,9 @@ fn helper_start(
                 && slot.is_none()
             {
                 match crate::rt::wfp::set_dns_shield(false, None, None) {
-                    Ok(()) => release_dns_takeover(&writer),
+                    Ok(()) => {
+                        release_dns_takeover(&writer);
+                    }
                     Err(error) => send_log_record(
                         &writer,
                         &DiagError::new(Diag::new(Key::HelperDnsShieldTeardownFailed))
@@ -2220,25 +2242,51 @@ fn helper_start(
 /// Undo this session's system-DNS takeover and delete its record. Runs
 /// wherever the DNS shield is removed: the two halves guard the same
 /// resolver, so they start and stop together. Best-effort — a failure keeps
-/// the record, and the next helper start repairs from it.
-fn release_dns_takeover(writer: &Arc<Mutex<File>>) {
+/// the record, and the next helper start repairs from it. Returns the number
+/// of adapters whose captured servers were restored.
+fn release_dns_takeover(writer: &Arc<Mutex<File>>) -> usize {
     match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
-        Ok(Some(0)) | Ok(None) => {}
-        Ok(Some(adapters)) => send_log(
-            writer,
-            Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
-        ),
-        Err(error) => send_log_record(
-            writer,
-            &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
-        ),
+        Ok(Some(0)) | Ok(None) => 0,
+        Ok(Some(adapters)) => {
+            DNS_SERVERS_RESTORED.fetch_add(adapters, Ordering::Relaxed);
+            send_log(
+                writer,
+                Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
+            );
+            adapters
+        }
+        Err(error) => {
+            send_log_record(
+                writer,
+                &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
+            );
+            0
+        }
     }
 }
 
-/// Remove leftover wintun devnodes for the staged config's TUN adapter name
-/// and wait (bounded) until the previous session's teardown has fully
-/// settled. Runs elevated before every core spawn; a no-op when the staged
-/// config has no TUN inbound.
+/// Remove leftover wintun devnodes for `name` and wait (bounded) until the
+/// previous session's teardown has fully settled; a timeout is logged here.
+/// Returns whether the adapter set is clean and how many devnodes this call
+/// removed. Every devnode line is forwarded to the GUI log, which is where a
+/// user reads what the cleanup removed.
+fn clean_leftover_adapters(name: &str, writer: &Arc<Mutex<File>>) -> (bool, usize) {
+    let (clean, removed, lines) = crate::sys::wintun::ensure_clean(name, TUN_CLEAN_TIMEOUT);
+    for line in lines {
+        send_event(
+            writer,
+            &serde_json::json!({"event":"log","line":format!("{HELPER_LINE_PREFIX}{line}")}),
+        );
+    }
+    if !clean {
+        send_log(writer, Diag::new(Key::HelperTunCleanupTimeout).arg(name));
+    }
+    (clean, removed)
+}
+
+/// Remove leftover devnodes for the staged config's TUN adapter name. Runs
+/// elevated before every core spawn; a no-op when the staged config has no
+/// TUN inbound.
 fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) {
     let config = match fs::read_to_string(stage.join(STAGED_CONFIG)) {
         Ok(config) => config,
@@ -2253,16 +2301,47 @@ fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) {
     let Some(name) = crate::sys::wintun::staged_tun_adapter_name(&config) else {
         return; // no TUN inbound — nothing to clean
     };
-    let (clean, lines) = crate::sys::wintun::ensure_clean(&name, TUN_CLEAN_TIMEOUT);
-    for line in lines {
-        send_event(
+    clean_leftover_adapters(&name, writer);
+}
+
+/// The manual cleanup (`HelperCommand::CleanUp`): stop a core this helper
+/// still holds, drop the DNS shield, restore the captured DNS servers, and
+/// remove leftover devnodes of `adapter_name`, then report the counts as the
+/// `cleaned` terminal. Every step is best-effort and logs its own failure, so
+/// one failing step never hides the others; the caller is the GUI's manual
+/// repair, which runs this when a session ended unexpectedly and left the
+/// machine pointed at a tunnel that is gone.
+fn helper_cleanup(
+    slot: &Arc<Mutex<Option<HelperChild>>>,
+    writer: &Arc<Mutex<File>>,
+    adapter_name: &str,
+) {
+    if let Ok(mut slot) = slot.lock()
+        && let Some(child) = slot.as_mut()
+    {
+        child.kill();
+    }
+    if let Err(error) = crate::rt::wfp::set_dns_shield(false, None, None) {
+        send_log_record(
             writer,
-            &serde_json::json!({"event":"log","line":format!("{HELPER_LINE_PREFIX}{line}")}),
+            &DiagError::new(Diag::new(Key::HelperDnsShieldTeardownFailed)).caused_by(error),
         );
     }
-    if !clean {
-        send_log(writer, Diag::new(Key::HelperTunCleanupTimeout).arg(name));
-    }
+    // The startup repair restores captured servers before this command is
+    // read, so the report is everything restored since the last report —
+    // never a zero that would tell the user nothing needed cleaning, and
+    // never a helper-lifetime total a second cleanup would overstate.
+    release_dns_takeover(writer);
+    let dns_adapters = DNS_SERVERS_RESTORED.swap(0, Ordering::Relaxed);
+    let (_, adapters_removed) = clean_leftover_adapters(adapter_name, writer);
+    send_event(
+        writer,
+        &serde_json::json!({
+            "event": "cleaned",
+            "dns_adapters": dns_adapters,
+            "adapters_removed": adapters_removed,
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2429,6 +2508,11 @@ wire_keys!(
     HelperDirectoryNotOrdinary,
     HelperDnsShieldNotEngaged,
     HelperDnsShieldTeardownFailed,
+    HelperDnsTakeoverApplied,
+    HelperDnsTakeoverNotEngaged,
+    HelperDnsTakeoverRepaired,
+    HelperDnsTakeoverRestoreFailed,
+    HelperDnsTakeoverRestored,
     HelperHashReadFailed,
     HelperHashRewindFailed,
     HelperJobSetupFailed,
@@ -2594,9 +2678,55 @@ pub enum HelperLog {
 
 #[derive(Debug)]
 pub enum HelperEvent {
-    State { state: String, pid: u32 },
+    State {
+        state: String,
+        pid: u32,
+    },
     Log(HelperLog),
     Exit(i32),
+    /// Terminal of `HelperCommand::CleanUp`: the number of adapters whose
+    /// captured DNS servers were restored and the number of leftover wintun
+    /// devnodes removed.
+    Cleaned {
+        dns_adapters: u32,
+        adapters_removed: u32,
+    },
+}
+
+/// Decode one `{"event":...}` record from the helper. `None` means the record
+/// names no event this build knows, which the reader skips — a helper from
+/// the same build only ever sends the events above.
+fn decode_helper_event(value: &serde_json::Value) -> Option<HelperEvent> {
+    let decode = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as u32
+    };
+    Some(
+        match value.get("event").and_then(serde_json::Value::as_str)? {
+            "state" => HelperEvent::State {
+                state: value
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                pid: decode("pid"),
+            },
+            "log" => HelperEvent::Log(decode_helper_log(value)),
+            "exit" => HelperEvent::Exit(
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1) as i32,
+            ),
+            "cleaned" => HelperEvent::Cleaned {
+                dns_adapters: decode("dns_adapters"),
+                adapters_removed: decode("adapters_removed"),
+            },
+            _ => return None,
+        },
+    )
 }
 
 /// Decode one `{"event":"log"}` record from the helper: a keyed message
@@ -2925,28 +3055,8 @@ impl HelperPipe {
                             else {
                                 continue;
                             };
-                            let event = match value.get("event").and_then(serde_json::Value::as_str)
-                            {
-                                Some("state") => HelperEvent::State {
-                                    state: value
-                                        .get("state")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    pid: value
-                                        .get("pid")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or_default()
-                                        as u32,
-                                },
-                                Some("log") => HelperEvent::Log(decode_helper_log(&value)),
-                                Some("exit") => HelperEvent::Exit(
-                                    value
-                                        .get("code")
-                                        .and_then(serde_json::Value::as_i64)
-                                        .unwrap_or(-1) as i32,
-                                ),
-                                _ => continue,
+                            let Some(event) = decode_helper_event(&value) else {
+                                continue;
                             };
                             // The hop is bounded: log lines are
                             // drop-coalesced by `log_gate` when the runtime
@@ -3024,6 +3134,17 @@ impl HelperPipe {
         self.send(&HelperCommand::Status)
     }
 
+    /// Ask the helper to clean this machine's TUN leftovers
+    /// ([`HelperCommand::CleanUp`]): its own core, the DNS shield, the
+    /// captured DNS servers, and leftover devnodes of `adapter_name`. The
+    /// terminal is [`HelperEvent::Cleaned`], which arrives on the pipe's own
+    /// event stream like every other helper event.
+    pub fn cleanup(&self, adapter_name: &str) -> Result<(), DiagError> {
+        self.send(&HelperCommand::CleanUp {
+            adapter_name: adapter_name.to_string(),
+        })
+    }
+
     fn send(&self, command: &HelperCommand) -> Result<(), DiagError> {
         let mut message = serde_json::to_string(command)
             .expect("the wire command is a plain struct of numbers, strings and a u16 list");
@@ -3069,13 +3190,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        HelperCommand, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES, ParentIdentity,
+        HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES, ParentIdentity,
         STAGED_CONFIG, SecureRuntimeStage, config_from_wire, current_process_user_sid,
-        dacl_deviation_is_benign, decode_helper_log, ensure_protected_directory,
-        parent_identity_accepts, parse_helper_parent_arg, path_from_units, path_to_wide,
-        process_creation_time_of, read_pipe_message, stage_config_bytes_at, stage_entry_allowed,
-        start_wire_message, to_wide, token_matches, validated_ace, validated_pipe_name,
-        verify_protected_directory,
+        dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
+        ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
+        path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
+        stage_config_bytes_at, stage_entry_allowed, start_wire_message, to_wide, token_matches,
+        validated_ace, validated_pipe_name, verify_protected_directory,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -3350,6 +3471,72 @@ mod tests {
             "an embedded NUL is refused"
         );
         assert!(path_from_units(&[]).is_err(), "an empty path is refused");
+    }
+
+    #[test]
+    fn cleanup_messages_name_keys_the_pipe_carries() {
+        // Every key a cleanup can log must resolve in the pipe vocabulary: an
+        // unlisted key degrades its line to the English fallback instead of
+        // the language the user reads.
+        for key in [
+            Key::HelperDnsTakeoverApplied,
+            Key::HelperDnsTakeoverNotEngaged,
+            Key::HelperDnsTakeoverRepaired,
+            Key::HelperDnsTakeoverRestored,
+            Key::HelperDnsTakeoverRestoreFailed,
+            Key::HelperDnsShieldNotEngaged,
+            Key::HelperDnsShieldTeardownFailed,
+            Key::HelperTunCleanupConfigReadFailed,
+            Key::HelperTunCleanupTimeout,
+        ] {
+            assert!(
+                key_name(key).is_some(),
+                "{key:?} must be in the helper pipe vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_up_command_carries_the_adapter_name() {
+        // A cleanup has no staged config to derive the adapter name from, so
+        // the name travels on the command; the round trip proves both ends of
+        // the pipe agree on its shape.
+        let command = HelperCommand::CleanUp {
+            adapter_name: "broccoli0".to_string(),
+        };
+        let wire = serde_json::to_string(&command).expect("the command serializes");
+        let decoded: HelperCommand =
+            serde_json::from_str(&wire).expect("the helper decodes its own wire form");
+        match decoded {
+            HelperCommand::CleanUp { adapter_name } => assert_eq!(adapter_name, "broccoli0"),
+            _ => panic!("the cleanup command must decode to its own variant"),
+        }
+    }
+
+    #[test]
+    fn cleaned_event_decodes_its_counts() {
+        let value = serde_json::json!({
+            "event": "cleaned",
+            "dns_adapters": 3,
+            "adapters_removed": 1,
+        });
+        let Some(HelperEvent::Cleaned {
+            dns_adapters,
+            adapters_removed,
+        }) = decode_helper_event(&value)
+        else {
+            panic!("a cleaned record must decode to the cleanup terminal");
+        };
+        assert_eq!((dns_adapters, adapters_removed), (3, 1));
+    }
+
+    #[test]
+    fn an_unknown_event_decodes_to_nothing() {
+        // A record naming no event this build knows is skipped, never read as
+        // a terminal: an `exit` is what ends a session, and guessing one from
+        // an unknown shape would tear a live core down.
+        assert!(decode_helper_event(&serde_json::json!({"event": "future"})).is_none());
+        assert!(decode_helper_event(&serde_json::json!({})).is_none());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::i18n::{Key, t, t_fmt};
 use crate::links::excerpt;
 use crate::model::PolicyLevelCfg;
 use crate::model::settings::{Language, geodata_cron_error, geodata_url_error};
-use crate::rt::{CoreCmd, TestConfigReply};
+use crate::rt::{CoreCmd, JobKind, TestConfigReply};
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
 use crate::ui::request::{Request, Terminal};
@@ -353,6 +353,10 @@ pub struct SettingsScreen {
     geodata_provenance: GeoDataProvenanceState,
     /// Whether the Cleanup modal is open.
     cleanup_modal: bool,
+    /// Whether the Clean Up Network State modal is open. Confirming it sends
+    /// `CoreCmd::CleanUp`; unlike the two exit actions below, this one keeps
+    /// the app running.
+    network_cleanup_modal: bool,
     /// Whether full cleanup was confirmed; consumed by the shell
     /// ([`Self::take_cleanup_request`]) so the app can stash it for `main`
     /// and quit through the normal shutdown path.
@@ -817,11 +821,13 @@ impl SettingsScreen {
         });
     }
 
-    /// Exit-time maintenance: the section offers two
-    /// actions — "Reset to default…" (the safer one, listed first) and
-    /// "Clean Up and Exit". Reset opens a modal that confirms restoring a
+    /// Exit-time maintenance: the section offers three
+    /// actions — "Clean Up Network State…" (the runtime repair, which keeps
+    /// the app running), "Reset to default…" (the safer of the two exit
+    /// actions, listed before the full cleanup) and "Clean Up and Exit…".
+    /// Reset opens a modal that confirms restoring a
     /// fresh install's defaults while keeping the server list; cleanup opens
-    /// the full-cleanup modal. Confirmed requests are exposed via
+    /// the full-cleanup modal. Confirmed exit requests are exposed via
     /// [`Self::take_reset_request`] / [`Self::take_cleanup_request`]; the
     /// shell stashes them for `main` and quits through the normal shutdown
     /// path, so the filesystem actions run only after the app has fully
@@ -832,6 +838,17 @@ impl SettingsScreen {
             ui.set_max_width(680.0);
             ui.label(t(lang, Key::SettingsCleanupHint));
             ui.add_space(4.0);
+            let cleanup_ready = !ctx.busy.blocks(JobKind::CleanUp);
+            if ui
+                .add_enabled(
+                    cleanup_ready,
+                    egui::Button::new(t(lang, Key::SettingsCleanUpNetwork)),
+                )
+                .on_hover_text(t(lang, Key::SettingsCleanUpNetworkHint))
+                .clicked()
+            {
+                self.network_cleanup_modal = true;
+            }
             if ui
                 .button(t(lang, Key::SettingsResetToDefault))
                 .on_hover_text(t(lang, Key::SettingsResetToDefaultHint))
@@ -847,12 +864,55 @@ impl SettingsScreen {
                 self.cleanup_modal = true;
             }
         });
+        if self.network_cleanup_modal && self.show_network_cleanup_modal(ui.ctx(), lang) {
+            self.network_cleanup_modal = false;
+            // The runtime decides whether anything needs cleaning; the adapter
+            // name is the effective one the TUN settings derive, because a
+            // cleanup has no staged config to read it from.
+            let adapter_name =
+                crate::sys::netif::tun_adapter_name(&ctx.settings.tun.name).to_owned();
+            ctx.send(CoreCmd::CleanUp { adapter_name });
+        }
         if self.reset_modal {
             self.show_reset_modal(ui.ctx(), lang);
         }
         if self.cleanup_modal {
             self.show_cleanup_modal(ui.ctx(), lang);
         }
+    }
+
+    /// The network-state cleanup confirmation: one action, because the repair
+    /// itself is reversible — it restores what a session took over and
+    /// removes only what that session left behind. Returns whether the user
+    /// confirmed; Cancel closes the modal without a command.
+    fn show_network_cleanup_modal(&mut self, ctx: &egui::Context, lang: Language) -> bool {
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Modal::new(egui::Id::new("broccoli-network-cleanup-modal")).show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            ui.heading(t(lang, Key::SettingsCleanUpNetworkTitle));
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanUpNetworkBody)).weak())
+                    .wrap(),
+            );
+            ui.add_space(10.0);
+            if ui
+                .button(t(lang, Key::SettingsCleanUpNetworkConfirm))
+                .clicked()
+            {
+                confirmed = true;
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            if ui.button(t(lang, Key::Cancel)).clicked() {
+                cancelled = true;
+            }
+        });
+        if cancelled {
+            self.network_cleanup_modal = false;
+        }
+        confirmed
     }
 
     /// The cleanup confirmation modal — the `egui::Modal` pattern of the
@@ -1874,6 +1934,88 @@ mod tests {
             harness.query_by_label("Reset to default").is_none(),
             "the reset modal must be closed until its button is clicked"
         );
+    }
+
+    #[test]
+    fn cleanup_section_renders_the_network_cleanup_button() {
+        let mut rig = UiTestRig::default();
+        let harness = Harness::builder().build_ui_state(
+            |ui, screen| screen.cleanup_section(ui, &mut rig.ctx()),
+            SettingsScreen::default(),
+        );
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Network State…")
+                .is_some(),
+            "the Cleanup section must render the network cleanup button"
+        );
+        assert!(
+            harness.query_by_label("Clean Up Network State").is_none(),
+            "the network cleanup modal must be closed until the button is clicked"
+        );
+    }
+
+    #[test]
+    fn network_cleanup_modal_confirm_sends_one_clean_up_command() {
+        let mut rig = UiTestRig::default();
+        let mut screen = SettingsScreen::default();
+        let mut harness = Harness::builder()
+            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Network State…")
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Clean Up Network State").is_some(),
+            "the button must open the confirmation"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Clean up")
+            .click();
+        harness.run();
+        drop(harness);
+
+        match rig._cmd_rx.try_recv() {
+            Ok(CoreCmd::CleanUp { adapter_name }) => assert_eq!(
+                adapter_name, "broccoli0",
+                "the command carries the settings' default adapter name"
+            ),
+            other => panic!("confirming must send exactly one CleanUp command: {other:?}"),
+        }
+        assert!(
+            rig._cmd_rx.try_recv().is_err(),
+            "one confirmation must send exactly one command"
+        );
+        assert!(
+            !screen.network_cleanup_modal,
+            "confirming must close the modal"
+        );
+    }
+
+    #[test]
+    fn network_cleanup_modal_cancel_sends_nothing() {
+        let mut rig = UiTestRig::default();
+        let mut screen = SettingsScreen::default();
+        let mut harness = Harness::builder()
+            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Network State…")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Cancel")
+            .click();
+        harness.run();
+        drop(harness);
+
+        assert!(
+            rig._cmd_rx.try_recv().is_err(),
+            "Cancel must not command a cleanup"
+        );
+        assert!(!screen.network_cleanup_modal, "Cancel must close the modal");
     }
 
     #[test]

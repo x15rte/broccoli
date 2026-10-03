@@ -502,7 +502,14 @@ pub(crate) fn release(record_path: &Path) -> Result<Option<usize>, DiagError> {
     };
     let (restored, residual) = restore(&record)?;
     if residual.is_empty() {
-        std::fs::remove_file(record_path).map_err(|_| record_error())?;
+        // A record already gone is success: the restore ran, and a concurrent
+        // release (the helper's own teardown paths can overlap) must not
+        // report a failure for finishing second.
+        match std::fs::remove_file(record_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(record_error()),
+        }
     } else {
         write_record(record_path, &Record { entries: residual })?;
     }

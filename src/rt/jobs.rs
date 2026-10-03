@@ -64,6 +64,8 @@ pub enum JobKind {
     Start,
     /// `CoreCmd::Stop`.
     Stop,
+    /// `CoreCmd::CleanUp`.
+    CleanUp,
     /// `CoreCmd::Restart`; `SetTunMode` occupies as this kind when it acts.
     Restart,
     /// `CoreCmd::Apply`.
@@ -162,6 +164,7 @@ impl super::CoreCmd {
         Some(match self {
             Self::Start => JobKind::Start,
             Self::Stop => JobKind::Stop,
+            Self::CleanUp { .. } => JobKind::CleanUp,
             Self::Restart => JobKind::Restart,
             Self::Apply { .. } => JobKind::ApplyConfig,
             Self::TestConfig { .. } => JobKind::TestConfig,
@@ -194,6 +197,19 @@ impl super::CoreCmd {
 pub enum ExclusiveOutcome {
     /// A TUN helper-connect worker (lifecycle Start/Restart span).
     HelperConnected(Result<super::helper::HelperPipe, super::HelperConnectFailure>),
+    /// A cleanup-launch worker (`CoreCmd::CleanUp`): the transient helper it
+    /// launched, already commanded to clean, with the events that carry that
+    /// helper's terminal — or the connect failure (or cancellation) that ended
+    /// the launch before it commanded anything.
+    CleanUpLaunched(
+        Result<
+            (
+                super::helper::HelperPipe,
+                tokio::sync::mpsc::Receiver<super::helper::HelperEvent>,
+            ),
+            super::HelperConnectFailure,
+        >,
+    ),
     /// An apply validation worker (`CoreCmd::Apply`).
     ApplyValidated {
         ok: bool,
@@ -763,8 +779,9 @@ mod tests {
     }
 
     /// Every kind that occupies the busy window.
-    const OCCUPYING: [JobKind; 7] = [
+    const OCCUPYING: [JobKind; 8] = [
         JobKind::Start,
+        JobKind::CleanUp,
         JobKind::Restart,
         JobKind::ApplyConfig,
         JobKind::TestConfig,
@@ -782,9 +799,10 @@ mod tests {
     ];
 
     /// Every kind, for whole-table invariants.
-    const ALL_KINDS: [JobKind; 13] = [
+    const ALL_KINDS: [JobKind; 14] = [
         JobKind::Start,
         JobKind::Stop,
+        JobKind::CleanUp,
         JobKind::Restart,
         JobKind::ApplyConfig,
         JobKind::TestConfig,
@@ -810,6 +828,7 @@ mod tests {
         };
         assert_eq!(JobKind::Start.rule(), expect(true, false, true));
         assert_eq!(JobKind::Stop.rule(), expect(true, true, true));
+        assert_eq!(JobKind::CleanUp.rule(), expect(true, false, true));
         assert_eq!(JobKind::Restart.rule(), expect(true, false, true));
         assert_eq!(JobKind::ApplyConfig.rule(), expect(true, false, true));
         assert_eq!(JobKind::TestConfig.rule(), expect(true, false, true));
