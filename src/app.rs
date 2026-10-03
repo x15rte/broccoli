@@ -9,6 +9,7 @@ use crate::links::excerpt;
 use crate::model::inbound::API_INBOUND_TAG;
 use crate::model::safety::SafetyFinding;
 use crate::model::settings::{Language, Mode};
+use crate::model::validation::ValidationIssue;
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
     AppMessage, ApplyIntent, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState,
@@ -861,7 +862,7 @@ impl BroccoliApp {
         let config_error = generated_candidate.as_ref().err().cloned();
         let applied_candidate = generated_candidate
             .ok()
-            .map(normalize_candidate_for_compare);
+            .map(|(candidate, _)| normalize_candidate_for_compare(candidate));
 
         let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(EVT_CHANNEL_CAPACITY);
         let rt = spawn_runtime(evt_tx.clone(), cc.egui_ctx.clone());
@@ -1184,7 +1185,9 @@ impl BroccoliApp {
                             self.applied_candidate =
                                 generate_runtime_candidate(&self.servers, &self.settings, lang)
                                     .ok()
-                                    .map(normalize_candidate_for_compare);
+                                    .map(|(candidate, _)| {
+                                        normalize_candidate_for_compare(candidate)
+                                    });
                         }
                         self.config_dirty = !settles_current;
                         // A success for an older revision is not a failure of
@@ -1935,14 +1938,16 @@ impl BroccoliApp {
             self.record_generation_failure(reason.clone());
             return Err(reason);
         }
-        let config = match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-            Ok(config) => config,
-            Err(message) => {
-                self.record_generation_failure(message.clone());
-                return Err(message);
-            }
-        };
+        let (config, advisories) =
+            match generate_runtime_candidate(&self.servers, &self.settings, lang) {
+                Ok(generated) => generated,
+                Err(message) => {
+                    self.record_generation_failure(message.clone());
+                    return Err(message);
+                }
+            };
         self.config_error = None;
+        self.log_config_advisories(&advisories, lang);
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
@@ -2088,7 +2093,7 @@ impl BroccoliApp {
             self.config_revision = self.config_revision.wrapping_add(1);
             self.apply_result = None;
             match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-                Ok(config) => {
+                Ok((config, _)) => {
                     self.config_error = None;
                     // The gate is derived, not sticky: an edit reverted to the
                     // applied state (or the startup baseline) drops "changes
@@ -2161,14 +2166,16 @@ impl BroccoliApp {
             self.record_generation_failure(reason);
             return;
         }
-        let config = match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-            Ok(config) => config,
-            Err(message) => {
-                self.record_generation_failure(message);
-                return;
-            }
-        };
+        let (config, advisories) =
+            match generate_runtime_candidate(&self.servers, &self.settings, lang) {
+                Ok(generated) => generated,
+                Err(message) => {
+                    self.record_generation_failure(message);
+                    return;
+                }
+            };
         self.config_error = None;
+        self.log_config_advisories(&advisories, lang);
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
@@ -2179,6 +2186,17 @@ impl BroccoliApp {
         } else {
             self.apply_result = Some((false, t(lang, Key::CoreRuntimeUnavailable).into()));
             self.config_dirty = true;
+        }
+    }
+
+    /// Log the advisory findings a generation carried: one line per finding,
+    /// so a commit that proceeds anyway still tells the user what the emitted
+    /// document drops. The apply paths call this at the user's own action;
+    /// the edit-time recompute does not, because the same finding on every
+    /// keystroke-throttled frame would bury the log.
+    fn log_config_advisories(&mut self, advisories: &[ValidationIssue], lang: Language) {
+        for line in config_advisory_lines(advisories, lang) {
+            self.push_keyed_log(Key::LogConfigWarning, line);
         }
     }
 }
@@ -2705,19 +2723,36 @@ fn generate_runtime_candidate(
     servers: &ServersFile,
     settings: &Settings,
     lang: Language,
-) -> Result<serde_json::Value, String> {
-    let config = r#gen::generate(servers, settings).map_err(|error| {
-        // Generation errors can echo user-editable content
-        // (raw-override text, model fields) into every surface that shows
-        // this message — the startup baseline and edit-time config chips,
-        // `record_generation_failure` (apply result + log), and the
-        // raw-override verdict — so the error text is excerpted at the
-        // shared 48-char bound here, before it can reach a UI label or the
-        // rotating log.
-        t_fmt(lang, Key::GenerationFailed, &[&excerpt(&error.text(lang))])
-    })?;
+) -> Result<(serde_json::Value, Vec<ValidationIssue>), String> {
+    let (config, advisories) =
+        r#gen::generate_with_advisories(servers, settings).map_err(|error| {
+            // Generation errors can echo user-editable content
+            // (raw-override text, model fields) into every surface that shows
+            // this message — the startup baseline and edit-time config chips,
+            // `record_generation_failure` (apply result + log), and the
+            // raw-override verdict — so the error text is excerpted at the
+            // shared 48-char bound here, before it can reach a UI label or the
+            // rotating log.
+            t_fmt(lang, Key::GenerationFailed, &[&excerpt(&error.text(lang))])
+        })?;
     validate_raw_override_candidate(settings, &config, lang)?;
-    Ok(config)
+    Ok((config, advisories))
+}
+
+/// The log lines a generation's advisory findings produce: one per finding,
+/// each rendering the finding's own text through the log key. A free function
+/// so the rendering is testable without an `eframe` context.
+fn config_advisory_lines(advisories: &[ValidationIssue], lang: Language) -> Vec<String> {
+    advisories
+        .iter()
+        .map(|issue| {
+            t_fmt(
+                lang,
+                Key::LogConfigWarning,
+                &[&crate::i18n::validation_issue_message(issue, lang)],
+            )
+        })
+        .collect()
 }
 
 /// Which commit path a pending hazard acknowledgment belongs to; the
@@ -4797,6 +4832,60 @@ mod unsaved_changes_tests {
     }
 }
 
+/// The advisory log lines (contract): one line per finding, at the log key's
+/// own level, naming the finding the emitted document drops.
+#[cfg(test)]
+mod config_advisory_tests {
+    use super::config_advisory_lines;
+    use crate::i18n::{Key, t};
+    use crate::model::settings::Language;
+    use crate::model::validation::{Severity, ValidationCode, ValidationIssue};
+
+    fn issue(code: ValidationCode, path: &str) -> ValidationIssue {
+        ValidationIssue {
+            code,
+            path: Some(path.into()),
+            severity: Severity::Warning,
+        }
+    }
+
+    #[test]
+    fn every_advisory_finding_renders_one_line_in_pass_order() {
+        let advisories = vec![
+            issue(ValidationCode::DnsBootstrapNotResolvable, "dns.bootstrap"),
+            issue(ValidationCode::VmessAlterIdIgnored, "settings.alterId"),
+        ];
+        let lines = config_advisory_lines(&advisories, Language::En);
+        assert_eq!(lines.len(), advisories.len(), "one line per finding");
+        // The line is the log key's own template wrapped around the rendered
+        // finding, which carries its field path: both halves are derived, so a
+        // copy change cannot red this test while the seam stays untested.
+        let template = t(Language::En, Key::LogConfigWarning);
+        let prefix = template
+            .split_once("{}")
+            .expect("the log key carries the finding it reports")
+            .0;
+        assert_eq!(
+            lines[0],
+            format!(
+                "{prefix}dns.bootstrap: {}",
+                t(Language::En, Key::SettingsDnsBootstrapNotResolvable)
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "{prefix}settings.alterId: {}",
+                t(Language::En, Key::OutboundVmessAlterIdIgnored)
+            )
+        );
+    }
+
+    #[test]
+    fn a_generation_without_findings_logs_nothing() {
+        assert!(config_advisory_lines(&[], Language::En).is_empty());
+    }
+}
 /// The derived config-apply gate (contract): the chip is up exactly while the
 /// current candidate differs from the config the running core accepted (or
 /// the startup baseline), or while the state cannot be saved.

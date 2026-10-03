@@ -2090,8 +2090,11 @@ impl Runtime {
             .jobs
             .exclusive_cancel_flag()
             .expect("the record begun by the dispatch arm still occupies");
+        // The worker runs off the loop, so it logs through its own sink: an
+        // import reports the advisory findings it accepts there.
+        let log = self.log_sink();
         let task = tokio::spawn(async move {
-            ExclusiveOutcome::ProfileValidation(profiles::validate(request, &cancel).await)
+            ExclusiveOutcome::ProfileValidation(profiles::validate(request, &cancel, &log).await)
         });
         self.jobs.attach_exclusive_task(task);
     }
@@ -3502,9 +3505,16 @@ impl Runtime {
     /// the totals are the core's cumulative counters summed as-is — never
     /// accumulated client-side — so a dropped tick cannot skew them.
     fn aggregate_totals(rows: &[(String, u64, u64)]) -> (u64, u64) {
+        // The counters arrive from the core and are summed as-is; their sum
+        // can exceed u64 (a hand-built or buggy core, or counters close to
+        // the type's ceiling). Saturate rather than overflow: a plain `sum`
+        // panics in debug and wraps in release, and a wrapped total silently
+        // under-reports traffic.
         (
-            rows.iter().map(|(_, up, _)| up).sum(),
-            rows.iter().map(|(_, _, down)| down).sum(),
+            rows.iter()
+                .fold(0u64, |total, (_, up, _)| total.saturating_add(*up)),
+            rows.iter()
+                .fold(0u64, |total, (_, _, down)| total.saturating_add(*down)),
         )
     }
 
@@ -4193,6 +4203,23 @@ mod tests {
         assert_eq!((total_up, total_down), (4040, 6050));
         let (again_up, again_down) = Runtime::aggregate_totals(&rows);
         assert_eq!((again_up, again_down), (total_up, total_down));
+    }
+
+    /// Summing the core's counters must never panic or wrap: a row already
+    /// near `u64::MAX` saturates, while an ordinary sum is unchanged.
+    #[test]
+    fn aggregate_totals_saturate_instead_of_wrapping() {
+        let near_max = vec![
+            ("a".to_string(), u64::MAX - 1, u64::MAX - 1),
+            ("b".to_string(), 10, 10),
+        ];
+        assert_eq!(
+            Runtime::aggregate_totals(&near_max),
+            (u64::MAX, u64::MAX),
+            "a sum past the ceiling must saturate, not wrap"
+        );
+        let ordinary = vec![("a".to_string(), 1010, 2020), ("b".to_string(), 3030, 4030)];
+        assert_eq!(Runtime::aggregate_totals(&ordinary), (4040, 6050));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -62,6 +62,7 @@ use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use crate::model::inbound::TUN_INBOUND_TAG;
 use crate::rt::supervisor::CREATE_NO_WINDOW;
+use crate::sys::elevation::is_hex_secret;
 use crate::sys::security::{
     Sid, TokenHandle, is_invalid_owner_error, with_protected_attributes, with_protected_descriptor,
 };
@@ -145,10 +146,6 @@ unsafe extern "system" {
 
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn is_hex_secret(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validated_pipe_name(pipe_id: &str) -> Result<String, DiagError> {

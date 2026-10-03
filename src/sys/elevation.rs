@@ -121,12 +121,28 @@ impl std::error::Error for HelperLaunchError {}
 /// token file (`helper_token_path`) is the fallback channel.
 pub const HELPER_TOKEN_ENV: &str = "BROCCOLI_CORE_HELPER_TOKEN";
 
+/// The fixed-width hex credential shape the GUI generates for a launch
+/// (`uuid::Uuid::new_v4().simple()`): exactly 32 ASCII hex digits. Both the
+/// pipe id and the auth token have it, and it is the single gate for
+/// anything built out of either — the pipe id names a ProgramData token file
+/// and a pipe, so an id outside this shape must never reach either.
+pub(crate) fn is_hex_secret(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// The ProgramData token file for `pipe_id`. The path derives from the
 /// immutable `--helper-pipe` argument, which already travels on the UAC
 /// command line, so no secret crosses argv; the GUI (writer) and the elevated
 /// helper (reader) derive the same location.
 fn helper_token_path(pipe_id: &str) -> PathBuf {
-    program_data().join(format!("broccoli-core-helper-token-{pipe_id}"))
+    helper_token_path_in(&program_data(), pipe_id)
+}
+
+/// [`helper_token_path`] under an explicit root: the reader's tests pass a
+/// temp directory, so the guard's no-filesystem-access property is observable
+/// instead of resting on the real ProgramData staying empty.
+fn helper_token_path_in(root: &Path, pipe_id: &str) -> PathBuf {
+    root.join(format!("broccoli-core-helper-token-{pipe_id}"))
 }
 
 /// Well-known ProgramData literal used when the shell API fails or returns a
@@ -235,9 +251,25 @@ fn write_token_file(path: &Path, token: &str) -> Result<(), HelperLaunchError> {
 /// (`helper_token_path`). The file is deleted on a successful read so the
 /// credential cannot linger or be replayed by a later process. The caller
 /// (`main.rs --core-helper`) consumes the file only when the environment
-/// channel is absent (cross-user UAC elevation).
+/// channel is absent (cross-user UAC elevation). An id outside the
+/// fixed-width hex credential shape yields `None` without touching the
+/// filesystem: the token file name embeds the id, so it must never name an
+/// arbitrary path.
 pub fn read_helper_token_file(pipe_id: &str) -> Option<String> {
-    let path = helper_token_path(pipe_id);
+    read_helper_token_file_at(&program_data(), pipe_id)
+}
+
+/// [`read_helper_token_file`] under an explicit root, with the credential
+/// guard in front of every path it builds.
+fn read_helper_token_file_at(root: &Path, pipe_id: &str) -> Option<String> {
+    // `pipe_id` is a raw `--helper-pipe` argv value, and the token file name
+    // embeds it: an id outside the fixed-width hex credential shape would
+    // name an arbitrary path (and this function deletes what it reads).
+    // Reject before building a path or touching the filesystem.
+    if !is_hex_secret(pipe_id) {
+        return None;
+    }
+    let path = helper_token_path_in(root, pipe_id);
     let token = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     let token = token.trim();
@@ -471,8 +503,8 @@ pub(crate) fn launch_core_helper(
 mod tests {
     use super::{
         HELPER_TOKEN_ENV, HelperLaunchError, HelperTokenGuard, helper_command_line,
-        helper_token_path, lock_helper_token_env, program_data, program_data_from,
-        read_helper_token_file,
+        helper_token_path, is_hex_secret, lock_helper_token_env, program_data, program_data_from,
+        read_helper_token_file, read_helper_token_file_at,
     };
     use std::path::PathBuf;
 
@@ -481,6 +513,71 @@ mod tests {
     /// expectations are independent of the code under test.
     const PIPE_ID: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+    /// The credential shape is exactly 32 ASCII hex digits — the pipe id and
+    /// the auth token both come from `Uuid::new_v4().simple()`. Anything else
+    /// must be rejected, because the pipe id is embedded in a token file name
+    /// and in a pipe name.
+    #[test]
+    fn hex_secret_is_fixed_width_ascii_hex() {
+        assert!(is_hex_secret(PIPE_ID));
+        assert!(is_hex_secret(TOKEN));
+        assert!(is_hex_secret("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_hex_secret(""));
+        assert!(!is_hex_secret("0123456789abcdef0123456789abcde"));
+        assert!(!is_hex_secret("0123456789abcdef0123456789abcdef0"));
+        assert!(!is_hex_secret("0123456789abcdef0123456789abcdeg"));
+        assert!(!is_hex_secret("0123456789abcdef0123456789abcde-"));
+    }
+
+    /// A raw `--helper-pipe` value outside the credential shape must yield no
+    /// token without any filesystem access: the token file name embeds the
+    /// id, so an unvalidated id would name an arbitrary path — and the read
+    /// deletes what it finds. The file an unguarded call would target is
+    /// planted, so this test fails if the guard is dropped: the id
+    /// `..\..\evil` resolves through the embedded name to `<root>/evil`.
+    #[test]
+    fn helper_token_file_read_rejects_a_non_credential_pipe_id() {
+        let root = std::env::temp_dir().join(format!(
+            "broccoli-token-guard-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // The embedded name's first component must exist for the OS to walk
+        // through it to the planted file.
+        std::fs::create_dir_all(root.join("broccoli-core-helper-token-..")).unwrap();
+        let target = root.join("evil");
+        std::fs::write(&target, TOKEN).unwrap();
+
+        for id in [
+            "",
+            "../shared",
+            "..\\..\\evil",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcde",
+        ] {
+            assert!(
+                read_helper_token_file_at(&root, id).is_none(),
+                "{id:?} must be rejected"
+            );
+        }
+        assert!(
+            target.exists(),
+            "an out-of-shape id must not read or delete anything"
+        );
+
+        // The positive half, through the same seam: a shaped id reads its own
+        // file and removes it, so a broken reader — not the guard — would be
+        // what the assertions above caught.
+        let own = root.join(format!("broccoli-core-helper-token-{PIPE_ID}"));
+        std::fs::write(&own, TOKEN).unwrap();
+        assert_eq!(
+            read_helper_token_file_at(&root, PIPE_ID).as_deref(),
+            Some(TOKEN)
+        );
+        assert!(!own.exists(), "the read removes the file it consumed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The elevated child's argv must never carry the auth token —
     /// any same-user process can read a child's command line for its lifetime.

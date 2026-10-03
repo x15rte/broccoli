@@ -1281,6 +1281,63 @@ fn unreadable_state_load_fails_and_missing_state_loads_defaults() {
     });
 }
 
+/// A hand-edited oversized state file must fail the load instead of being
+/// read whole. An explicit tiny cap keeps the fixture small; the production
+/// cap only differs in size. The cap is inclusive (exactly at the cap
+/// loads), one byte past it is `Oversized`, and the oversized file is left
+/// in place so the user can trim it instead of losing it to a defaults
+/// overwrite.
+#[test]
+fn oversized_state_load_fails_without_touching_the_file() {
+    with_appdata(|| {
+        crate::sys::paths::ensure_dirs().expect("create dirs");
+        let path = state_file("servers.json");
+        let cap: u64 = 256;
+
+        // Valid JSON padded with trailing whitespace (legal between JSON
+        // tokens), so size alone decides the outcome.
+        let mut document = serde_json::to_vec(&ServersFile::default()).expect("serialize state");
+        assert!(document.len() <= cap as usize, "the fixture must fit");
+        document.resize(cap as usize, b' ');
+        std::fs::write(&path, &document).expect("write at-cap fixture");
+        let loaded: ServersFile = load_state_with_cap("servers.json", cap)
+            .expect("a file exactly at the cap must still load");
+        assert!(loaded.profiles.is_empty() && loaded.active.is_none());
+
+        // One byte over: the error names the variant, the path, the bytes
+        // read and the limit, and the file survives untouched.
+        document.push(b' ');
+        std::fs::write(&path, &document).expect("write over-cap fixture");
+        let error = load_state_with_cap::<ServersFile>("servers.json", cap)
+            .expect_err("a file past the cap must fail the load");
+        assert!(matches!(error, StateLoadError::Oversized(_)), "{error:?}");
+        let message = format!("{error}");
+        assert!(
+            message.contains("servers.json"),
+            "names the file: {message}"
+        );
+        assert!(
+            message.contains(&(cap + 1).to_string()),
+            "names the observed size: {message}"
+        );
+        assert!(
+            message.contains(&cap.to_string()),
+            "names the limit: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back").len(),
+            cap as usize + 1,
+            "the oversized file must be left untouched"
+        );
+
+        // The missing-file path is unaffected by the cap.
+        std::fs::remove_file(&path).expect("remove the fixture");
+        let loaded: ServersFile = load_state_with_cap("servers.json", cap)
+            .expect("a missing state file is a fresh install, not a failure");
+        assert!(loaded.profiles.is_empty() && loaded.active.is_none());
+    });
+}
+
 #[test]
 fn corrupt_state_load_wipes_the_quarantine() {
     with_appdata(|| {

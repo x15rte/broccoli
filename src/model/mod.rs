@@ -59,7 +59,7 @@ use crate::links::excerpt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 // Test-only imports: `SECURITY_ATTRIBUTES`/`BOOL` back the `#[cfg(test)]`
@@ -122,42 +122,91 @@ pub enum StateLoadError {
     /// error text is truncated at the 48-char excerpt bound before it can be
     /// logged or rendered).
     Semantic(String),
+    /// The state file exceeded the read cap (`STATE_FILE_MAX_BYTES` in
+    /// production, or the explicit cap `load_state_with_cap` was given) and
+    /// was not read past it. The file was NOT touched and `Default` was NOT
+    /// substituted: an oversized document is still the user's state, and
+    /// reporting it as a fresh install would let the next save overwrite it
+    /// with defaults. The message names the path, the number of bytes read
+    /// through the cap, and the cap itself.
+    Oversized(String),
 }
 
 impl std::fmt::Display for StateLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StateLoadError::Io(message) | StateLoadError::Semantic(message) => f.write_str(message),
+            StateLoadError::Io(message)
+            | StateLoadError::Semantic(message)
+            | StateLoadError::Oversized(message) => f.write_str(message),
         }
     }
 }
 
-/// Load a GUI state file.
+/// Load a GUI state file, bounding the read at [`STATE_FILE_MAX_BYTES`].
+///
+/// [`load_state_with_cap`] carries the full failure and quarantine
+/// semantics.
+pub(crate) fn load_state<T>(name: &str) -> Result<T, StateLoadError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    load_state_with_cap(name, STATE_FILE_MAX_BYTES)
+}
+
+/// Upper bound on the state file a production load reads into memory.
+///
+/// A GUI state file is a small JSON document — even a long server list with
+/// every optional field set stays well under a megabyte — so 16 MiB leaves
+/// more than an order of magnitude of headroom while stopping a hand-edited
+/// or corrupted multi-gigabyte file from being read whole: serde_json would
+/// only reject it after the process had already allocated its full size.
+const STATE_FILE_MAX_BYTES: u64 = 16 << 20;
+
+/// [`load_state`] with an explicit read cap; tests pass a small cap so they
+/// need no large fixture.
 ///
 /// Missing → `Default`. UNREADABLE (any read failure other than a missing
 /// file) → `Err` naming the path and the OS error, file untouched: a
 /// transient failure must not be reported as a fresh install, because the
 /// defaults that would then be in memory get written over the intact file on
-/// the next save. STRUCTURAL corruption (serde_json cannot parse the
-/// document: syntax/EOF errors) → renamed to `<file>.broken-<unix ts>`, wiped
-/// and deleted, and `Default` returned (no plaintext quarantine copy
-/// remains). SEMANTIC failure (valid JSON whose content does not fit the
+/// the next save. OVERSIZED (more than `cap` bytes) → `Err(Oversized)`
+/// naming the path, the bytes read and the cap; the file is NOT touched (see
+/// [`StateLoadError::Oversized`]). STRUCTURAL corruption (serde_json cannot
+/// parse the document: syntax/EOF errors) → renamed to `<file>.broken-<unix
+/// ts>`, wiped and deleted, and `Default` returned (no plaintext quarantine
+/// copy remains). SEMANTIC failure (valid JSON whose content does not fit the
 /// type — unknown `security`/`network` values, wrong field types) → `Err`
 /// naming the offending field path and a bounded excerpt of the value; the
 /// file is NOT renamed or touched, so the user can fix it and an older
 /// broccoli reading a newer broccoli's state cannot destroy it.
-pub(crate) fn load_state<T>(name: &str) -> Result<T, StateLoadError>
+pub(crate) fn load_state_with_cap<T>(name: &str, cap: u64) -> Result<T, StateLoadError>
 where
     T: serde::de::DeserializeOwned + Default,
 {
     let path = state_file(name);
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
+    let file = match File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
         Err(error) => {
             return Err(StateLoadError::Io(format!("{}: {error}", path.display())));
         }
     };
+    // Read through `take(cap + 1)`, never a full read: the extra byte is what
+    // distinguishes "exactly at the cap" from "over it", and `Take` bounds the
+    // bytes this file can contribute even if it grows after the open — the
+    // bound is on the reader, not on a size sampled beforehand that a race
+    // could invalidate.
+    let mut data = Vec::new();
+    if let Err(error) = file.take(cap.saturating_add(1)).read_to_end(&mut data) {
+        return Err(StateLoadError::Io(format!("{}: {error}", path.display())));
+    }
+    if data.len() as u64 > cap {
+        return Err(StateLoadError::Oversized(format!(
+            "{}: {} bytes read, limit {cap}",
+            path.display(),
+            data.len()
+        )));
+    }
     // `serde_json::Deserializer` implements `serde::Deserializer` only through
     // `&mut`, so the path-aware wrapper borrows it.
     let mut de = serde_json::Deserializer::from_slice(&data);

@@ -32,13 +32,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diag::{Diag, DiagError};
-use crate::i18n::{Key, t, t_fmt};
+use crate::i18n::{Key, t, t_fmt, validation_issue_message};
 use crate::links;
 use crate::model::settings::Language;
 use crate::model::validation::validate_outbound;
 use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 
 use super::apply;
+use super::events::AppLogSink;
 
 /// Where an accepted draft validation commits: which editor draft the request
 /// was staged from, echoed back on the verdict so the screen applies the
@@ -145,9 +146,15 @@ fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
 /// accumulate the verdict. `cancel` is observed before the first profile and
 /// between profiles — never inside a validation child, whose open file the
 /// guard must be allowed to remove.
+///
+/// An import logs each accepted profile's advisory findings through `log`:
+/// the profile imports (they never gate), but the emitted document drops what
+/// they name, and the user who pasted a link may never open the editors that
+/// would show them amber.
 pub(crate) async fn validate(
     request: ProfileValidationRequest,
     cancel: &AtomicBool,
+    log: &AppLogSink,
 ) -> ProfileValidationReply {
     let ProfileValidationRequest {
         origin,
@@ -174,11 +181,24 @@ pub(crate) async fn validate(
         } else {
             profile.name.clone()
         };
-        if origin == ProfileValidationOrigin::Import
-            && let Err(error) = links::validate_profile(&profile)
-        {
-            rejected.push((label, error.text(lang)));
-            continue;
+        if origin == ProfileValidationOrigin::Import {
+            // The advisory findings never refuse the import — they are the
+            // profile that is xray-legal and cannot behave as written — so
+            // they are logged, one line each, and the import proceeds.
+            match links::profile_advisories(&profile) {
+                Ok(advisories) => {
+                    for issue in &advisories {
+                        log.log(
+                            Diag::new(Key::LogConfigWarning)
+                                .arg(validation_issue_message(issue, lang)),
+                        );
+                    }
+                }
+                Err(error) => {
+                    rejected.push((label, error.text(lang)));
+                    continue;
+                }
+            }
         }
         if origin == ProfileValidationOrigin::Import
             && accepted
@@ -490,6 +510,17 @@ mod tests {
             servers: crate::model::ServersFile::default(),
             settings: crate::model::Settings::default(),
         }
+    }
+
+    /// A worker log sink plus the receiver its lines land on, so a test can
+    /// assert exactly what an import reported to the Logs screen.
+    fn log_sink() -> (
+        super::AppLogSink,
+        std::sync::mpsc::Receiver<super::super::CoreEvt>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let sink = super::super::events::EventStream::new(tx, egui::Context::default()).sink();
+        (sink, rx)
     }
 
     #[test]
@@ -961,7 +992,7 @@ mod tests {
             active: Some("0123456789abcdef".to_string()),
             ..ServersFile::default()
         };
-        let verdict = validate(request, &AtomicBool::new(false))
+        let verdict = validate(request, &AtomicBool::new(false), &log_sink().0)
             .await
             .expect("the worker walks the profile list");
         assert!(verdict.accepted.is_empty(), "{:?}", verdict.accepted);
@@ -1051,7 +1082,7 @@ mod tests {
             active: Some(sibling.id.clone()),
             ..ServersFile::default()
         };
-        let verdict = validate(request, &AtomicBool::new(false))
+        let verdict = validate(request, &AtomicBool::new(false), &log_sink().0)
             .await
             .expect("the worker walks the profile list");
         assert!(
@@ -1063,6 +1094,49 @@ mod tests {
         assert_eq!(verdict.accepted[0].id, candidate.id);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_import_logs_every_advisory_finding_it_accepts() {
+        // The finding never gates the import, but the emitted document drops
+        // what it names, and a user who pasted a link never opens the editor
+        // that would show it amber. The line must reach the log whatever the
+        // core test then reports about the profile.
+        let mut outbound = OutboundModel::new(Protocol::Vmess);
+        let crate::model::ProtocolSettings::Vmess(settings) = &mut outbound.settings else {
+            unreachable!()
+        };
+        settings.address = "1.2.3.4".into();
+        settings.port = 443;
+        settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+        settings
+            .extra
+            .insert("alterId".into(), serde_json::json!(1));
+        let profile = ServerProfile::new("advisory", outbound);
+
+        let (log, rx) = log_sink();
+        let _ = validate(request(vec![profile]), &AtomicBool::new(false), &log).await;
+
+        let lines: Vec<String> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                super::super::CoreEvt::AppLog(message) => Some(message.text(Language::En)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "one line per finding: {lines:#?}");
+        // Both halves come from the locale table: the log key's template and
+        // the finding's own message.
+        let template = t(Language::En, Key::LogConfigWarning);
+        let prefix = template
+            .split_once("{}")
+            .expect("the log key carries the finding it reports")
+            .0;
+        assert!(lines[0].starts_with(prefix), "{lines:#?}");
+        assert!(
+            lines[0].contains(t(Language::En, Key::OutboundVmessAlterIdIgnored)),
+            "the line must name the finding it reports: {lines:#?}"
+        );
+    }
+
     // ---------- cooperative cancellation ----------
 
     #[tokio::test(flavor = "current_thread")]
@@ -1071,7 +1145,13 @@ mod tests {
         // so a request cancelled that early writes no scratch config and
         // reports no partial verdict.
         let profile = ServerProfile::new("cancelled", OutboundModel::new(Protocol::Freedom));
-        match validate(request(vec![profile]), &AtomicBool::new(true)).await {
+        match validate(
+            request(vec![profile]),
+            &AtomicBool::new(true),
+            &log_sink().0,
+        )
+        .await
+        {
             Ok(_) => panic!("a cancelled request must not report a verdict"),
             Err(error) => assert_eq!(error.diag().key(), Key::SeatValidationCancelled),
         }

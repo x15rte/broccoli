@@ -2351,6 +2351,20 @@ fn validate_2022_key(method: &str, password: &str) -> bool {
 /// cross-field invariants. Callers that persist an imported profile should
 /// additionally run the generated scratch config through `xray run -test`.
 pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
+    validate_profile_inner(profile).map(|_| ())
+}
+
+/// The advisory half of [`validate_profile`]'s model pass: the findings a
+/// profile carries that are xray-legal and never refuse it. The import path
+/// logs them, so a profile the editors flag amber is not accepted in silence.
+pub fn profile_advisories(profile: &ServerProfile) -> Result<Vec<ValidationIssue>, LinkError> {
+    validate_profile_inner(profile)
+}
+
+/// One walk, two seams: the refusal [`validate_profile`] reports and the
+/// advisory findings [`profile_advisories`] returns come from the same pass,
+/// so the import grammar and the logged warnings cannot drift apart.
+fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue>, LinkError> {
     let settings_protocol = profile.outbound.settings.protocol();
     if profile.outbound.protocol != settings_protocol {
         return Err(malformed(
@@ -2417,16 +2431,19 @@ pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
     // Model validation pass: protocol, stream, and transport-security
     // invariants in one sweep (no short-circuit). The verdict's first
     // blocking finding blocks the import/export; its advisory findings are
-    // the profile that is xray-legal and imports fine. Remaining #716
-    // grammar checks run below.
-    if let Some(issue) = validate_outbound(&profile.outbound).into_first_blocking() {
+    // the profile that is xray-legal and imports fine, returned to the
+    // caller instead of dropped. Remaining #716 grammar checks run below.
+    let verdict = validate_outbound(&profile.outbound);
+    let advisories: Vec<ValidationIssue> = verdict.advisory().cloned().collect();
+    if let Some(issue) = verdict.into_first_blocking() {
         return Err(LinkError::InvalidModel {
             prefix: None,
             issue: Box::new(issue),
         });
     }
 
-    validate_stream_core(&profile.outbound.stream)
+    validate_stream_core(&profile.outbound.stream)?;
+    Ok(advisories)
 }
 
 fn option_has_fields<T: Serialize>(value: &Option<T>) -> bool {
@@ -2957,14 +2974,17 @@ mod tests {
         let profile = parse_link(&link).expect("an implausible serverName may only warn");
         let reality = profile.outbound.stream.reality_settings.as_ref().unwrap();
         assert_eq!(reality.server_name, "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d");
-        // The import must surface the advisory finding through the model pass.
-        let issues = crate::model::validation::validate_outbound(&profile.outbound);
+        // The import must surface the advisory finding through the model pass
+        // — and through the seam the import logs it with, which must hand the
+        // finding over without refusing the profile.
+        let advisories =
+            profile_advisories(&profile).expect("an advisory finding must not refuse the import");
         assert!(
-            issues.iter().any(|issue| {
+            advisories.iter().any(|issue| {
                 issue.code == crate::model::validation::ValidationCode::ServerNameImplausible
                     && issue.severity == crate::model::validation::Severity::Warning
             }),
-            "{issues:#?}"
+            "{advisories:#?}"
         );
     }
 
