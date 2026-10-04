@@ -19,7 +19,7 @@ use crate::links;
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
     WireguardPeer, blackhole_custom_response_data_decodes, blackhole_response_is_custom,
-    blackhole_response_type_supported, is_valid_wireguard_key,
+    blackhole_response_type_supported,
 };
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
@@ -447,51 +447,11 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
         ProtocolSettings::Http(settings) => {
             require_remote(&mut blocking, &settings.address, settings.port);
         }
-        ProtocolSettings::Wireguard(settings) => {
-            if !is_valid_wireguard_key(&settings.secret_key) {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardSecretKeyInvalid,
-                ));
-            }
-            if settings
-                .reserved
-                .as_ref()
-                .is_some_and(|reserved| reserved.len() != 3)
-            {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardReservedKeyBytes,
-                ));
-            }
-            if settings.peers.is_empty() {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardPeersRequired,
-                ));
-            }
-            if settings
-                .peers
-                .iter()
-                .any(|peer| !is_valid_wireguard_key(&peer.public_key))
-            {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardPeerPublicKeyRequired,
-                ));
-            }
-            if settings
-                .peers
-                .iter()
-                .any(|peer| peer.endpoint.trim().is_empty())
-            {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardPeerEndpointRequired,
-                ));
-            }
-            if settings.peers.iter().any(|peer| {
-                !peer.pre_shared_key.is_empty() && !is_valid_wireguard_key(&peer.pre_shared_key)
-            }) {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::WireguardPresharedKeyInvalid,
-                ));
-            }
+        ProtocolSettings::Wireguard(_) => {
+            // Key material, the reserved bytes, and the peer essentials
+            // (public key, endpoint, pre-shared key) are model rules below —
+            // the editor pushes were the same predicates on the same values,
+            // from a verdict this list already merges.
         }
         ProtocolSettings::Freedom(settings) => {
             if settings

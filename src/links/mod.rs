@@ -3560,38 +3560,12 @@ fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue
             }
         }
         ProtocolSettings::Wireguard(settings) => {
-            // The editor checks key material with `is_valid_wireguard_key`
-            // directly, but the model pass raises no WireGuard key rule (its
-            // `WireguardSecretKeyInvalid` / `WireguardPeerPublicKeyRequired`
-            // variants are declared and never emitted), so an imported link
-            // would otherwise reach the core and fail at config load — after
-            // the preview called it fine.
+            // The key material, the peer essentials, and the reserved length
+            // are model rules: the `validate_outbound` pass below refuses
+            // them as the keyed `InvalidModel`, for the editor, generation,
+            // and this importer alike.
             if settings.address.is_empty() {
                 return Err(malformed(Diag::new(Key::LinkWgAddress)));
-            }
-            if !crate::model::outbound::is_valid_wireguard_key(&settings.secret_key) {
-                return Err(malformed(Diag::new(Key::LinkWgSecretKey)));
-            }
-            let Some(peer) = settings.peers.first() else {
-                return Err(malformed(Diag::new(Key::LinkWgPeer)));
-            };
-            if peer.endpoint.is_empty() {
-                return Err(malformed(Diag::new(Key::LinkWgPeer)));
-            }
-            if !crate::model::outbound::is_valid_wireguard_key(&peer.public_key) {
-                return Err(malformed(Diag::new(Key::LinkWgPublicKey)));
-            }
-            if !peer.pre_shared_key.is_empty()
-                && !crate::model::outbound::is_valid_wireguard_key(&peer.pre_shared_key)
-            {
-                return Err(malformed(Diag::new(Key::LinkWgPresharedKey)));
-            }
-            if settings
-                .reserved
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() != 3)
-            {
-                return Err(malformed(Diag::new(Key::LinkWgReserved)));
             }
         }
         ProtocolSettings::Hysteria(settings) => {
@@ -5419,20 +5393,28 @@ mod tests {
 
     #[test]
     fn wireguard_refuses_material_the_core_cannot_use() {
-        // The model pass raises no WireGuard key rule, so the import grammar
-        // checks the material itself; otherwise the profile would only fail at
-        // core config load, after the preview called it importable.
+        // The model pass owns the key material, so an import reports the
+        // same keyed finding the editor and generation gate on — never a
+        // profile that only fails at core config load after a clean preview.
+        use crate::model::validation::ValidationCode;
         let secret = URL_SAFE_NO_PAD.encode([1_u8; 32]);
         let public = URL_SAFE_NO_PAD.encode([2_u8; 32]);
-        expect_malformed(
+        expect_invalid_model(
             "wg://h.example.com:51820?private_key=not-a-key&public_key=also-not&local_address=10.0.0.2%2F32",
+            ValidationCode::WireguardSecretKeyInvalid,
         );
-        expect_malformed(&format!(
-            "wg://h.example.com:51820?private_key={secret}&public_key=not-a-key&local_address=10.0.0.2%2F32"
-        ));
-        expect_malformed(&format!(
-            "wg://h.example.com:51820?private_key={secret}&public_key={public}&local_address=10.0.0.2%2F32&reserved=1-2"
-        ));
+        expect_invalid_model(
+            &format!(
+                "wg://h.example.com:51820?private_key={secret}&public_key=not-a-key&local_address=10.0.0.2%2F32"
+            ),
+            ValidationCode::WireguardPeerPublicKeyRequired,
+        );
+        expect_invalid_model(
+            &format!(
+                "wg://h.example.com:51820?private_key={secret}&public_key={public}&local_address=10.0.0.2%2F32&reserved=1-2"
+            ),
+            ValidationCode::WireguardReservedKeyBytes,
+        );
     }
 
     #[test]

@@ -1276,6 +1276,7 @@ keys! {
     SrvWgPeerEndpointRequired 0,
     SrvWgPresharedInvalid 0,
     SrvWgRemoteDnsInvalid 0,
+    SrvWgDomainStrategyInvalid 0,
     SrvWgRemoteDnsEntryInvalid 0,
     SrvWgRemoteDnsLocalOnly 0,
     SrvFreedomFragmentInvalid 0,
@@ -1881,14 +1882,12 @@ keys! {
     LinkWgSecretKey 0,
     LinkWgPublicKey 0,
     LinkWgAddress 0,
-    LinkWgPeer 0,
     LinkWgReserved 0,
     LinkHysteriaPin 0,
     LinkHysteriaObfsPassword 0,
     LinkHysteriaPacketSize 0,
     LinkHysteriaHopInterval 0,
     LinkHysteriaBrutal 0,
-    LinkWgPresharedKey 0,
     LinkHttpTlsConflict 0,
     LinkLossyPolicyLevel 1,
     LinkLossyEmail 1,
@@ -2550,6 +2549,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FreedomFinalRuleInvalid => t(lang, Key::SrvFreedomFinalRuleInvalid),
         DnsRuleActionInvalid => t(lang, Key::SrvDnsRuleActionInvalidShort),
         WireguardRemoteDnsInvalid => t(lang, Key::SrvWgRemoteDnsInvalid),
+        WireguardDomainStrategyInvalid => t(lang, Key::SrvWgDomainStrategyInvalid),
         // Settings-level verdict rules (validate_settings /
         // validate_profiles). Parameterized rules return the template that
         // validation_issue_message fills with the code-carried values.
@@ -4139,6 +4139,9 @@ mod en {
                  be the only entry."
             }
             Key::SrvWgRemoteDnsEntryInvalid => "Enter an IP address or the word local.",
+            Key::SrvWgDomainStrategyInvalid => {
+                "domainStrategy is not supported by Xray WireGuardConfig"
+            }
             Key::SrvWgRemoteDnsLocalOnly => "The local entry must be the only entry.",
             Key::SrvFreedomFragmentInvalid => {
                 "Freedom fragmentation requires valid packets, length, and interval"
@@ -5202,7 +5205,6 @@ mod en {
             Key::LinkWgSecretKey => "The wireguard link is missing its private key.",
             Key::LinkWgPublicKey => "The wireguard link is missing the peer public key.",
             Key::LinkWgAddress => "The wireguard link is missing its interface address.",
-            Key::LinkWgPeer => "The wireguard link has no peer.",
             Key::LinkWgReserved => "The wireguard reserved value must be decimal bytes 0-255.",
             Key::LinkHysteriaPin => "The hysteria2 pinSHA256 must be a single certificate pin.",
             Key::LinkHysteriaObfsPassword => "The hysteria2 obfs needs an obfs-password.",
@@ -5213,7 +5215,6 @@ mod en {
             Key::LinkHysteriaBrutal => {
                 "The hysteria2 upmbps and downmbps must be set together as whole numbers."
             }
-            Key::LinkWgPresharedKey => "The wireguard preshared key is not the base64 of 32 bytes.",
             Key::LinkHttpTlsConflict => "An https link cannot also set security=none.",
             Key::LinkLossyPolicyLevel => "The share-link grammar has no policy level for {}.",
             Key::LinkLossyEmail => "The share-link grammar has no email field for {}.",

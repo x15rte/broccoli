@@ -370,12 +370,40 @@ pub fn wireguard_remote_dns_supported(entries: &[String]) -> bool {
 }
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key
 /// size: 64 hexadecimal digits, or raw standard/URL-safe base64 with zero or
-/// one trailing padding character.
+/// one trailing padding character. Go trims one `=` and ignores CR and LF
+/// before decoding, and its decoder is not strict, so the bundled engine's
+/// trailing-bit check is relaxed here — the core runs a key whose last symbol
+/// carries non-zero trailing bits, and it runs the same key with CR/LF in it.
 pub(crate) fn is_valid_wireguard_key(value: &str) -> bool {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
+    // The raw alphabets the core's `ParseWireGuardKey` picks between (`+`/`/`
+    // in the value select the standard one), with the trailing-bit check the
+    // bundled engines enforce by default turned off.
+    const GO_STANDARD: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    const GO_URL: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+
     if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return true;
     }
 
+    let stripped;
+    let value = if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        stripped = value.replace(['\r', '\n'], "");
+        stripped.as_str()
+    } else {
+        value
+    };
     let encoded = match value.strip_suffix('=') {
         Some(raw) if !raw.ends_with('=') => raw,
         Some(_) => return false,
@@ -387,9 +415,9 @@ pub(crate) fn is_valid_wireguard_key(value: &str) -> bool {
 
     let mut decoded = [0_u8; 33];
     let result = if encoded.bytes().any(|byte| matches!(byte, b'+' | b'/')) {
-        base64::engine::general_purpose::STANDARD_NO_PAD.decode_slice(encoded, &mut decoded)
+        GO_STANDARD.decode_slice(encoded, &mut decoded)
     } else {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode_slice(encoded, &mut decoded)
+        GO_URL.decode_slice(encoded, &mut decoded)
     };
     matches!(result, Ok(32))
 }
@@ -1191,6 +1219,19 @@ mod tests {
         for value in [hex, std_padded, std_raw, url_padded, url_raw] {
             assert!(is_valid_wireguard_key(&value), "{value}");
         }
+
+        // Two spellings Go's decoder reads but a strict Rust engine does not:
+        // the same 32 bytes of `0x01` with non-zero trailing bits in the last
+        // symbol, and with a CR/LF pair the decoder ignores. Both keys below
+        // passed `xray run -test` on the pinned v26.9.9 binary, so refusing
+        // them would gate a profile the core runs.
+        for value in [
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQF",
+            "AQEBAQEBAQEBAQEBAQEB\nAQEBAQEBAQEBAQEBAQEBAQE",
+        ] {
+            assert!(is_valid_wireguard_key(value), "{value:?}");
+        }
     }
 
     #[test]
@@ -1940,6 +1981,152 @@ mod tests {
                 .unwrap_or_else(|| panic!("{unbuildable:?} must be refused: {issues:?}"));
             assert_eq!(issue.severity, Severity::Error, "{unbuildable:?}");
             assert_eq!(issue.path.as_deref(), Some("settings.remoteDNS"));
+        }
+    }
+
+    /// Every WireGuard material value the pinned core refuses while it builds
+    /// the configuration or constructs the outbound, at the model pass: the
+    /// six rules gate with their own code, wire path, and error tier, and the
+    /// material both key spellings the core builds stays silent. The
+    /// endpoint-resolution vocabulary has its own test below.
+    #[test]
+    fn wireguard_material_the_core_cannot_build_gates_with_its_field_path() {
+        use crate::model::validation::{Severity, ValidationCode, validate_outbound};
+
+        /// The one finding `mutate` adds to an otherwise valid WireGuard
+        /// profile: `code` at `path`, error tier.
+        fn finding(mutate: impl FnOnce(&mut WireguardSettings), code: ValidationCode, path: &str) {
+            let mut outbound = wireguard_with_remote_dns(None);
+            let ProtocolSettings::Wireguard(settings) = &mut outbound.settings else {
+                panic!("the helper builds a WireGuard outbound");
+            };
+            mutate(settings);
+            let issues = validate_outbound(&outbound);
+            let issue = issues
+                .iter()
+                .find(|issue| issue.code == code)
+                .unwrap_or_else(|| panic!("{code:?} must be reported: {issues:?}"));
+            assert_eq!(issue.severity, Severity::Error, "{code:?}");
+            assert_eq!(issue.path.as_deref(), Some(path), "{code:?}");
+        }
+
+        // The helper's key pair is the base64 spelling (43 raw symbols and
+        // one `=`), which `ParseWireGuardKey` builds, so the base profile has
+        // no blocking finding at all.
+        assert!(
+            !validate_outbound(&wireguard_with_remote_dns(None)).has_blocking(),
+            "the valid base profile must gate nothing"
+        );
+        let mut hex = wireguard_with_remote_dns(None);
+        let ProtocolSettings::Wireguard(settings) = &mut hex.settings else {
+            panic!("the helper builds a WireGuard outbound");
+        };
+        settings.secret_key = "01".repeat(32);
+        settings.peers[0].public_key = "02".repeat(32);
+        assert!(
+            !validate_outbound(&hex).has_blocking(),
+            "the 64-hex key spelling must stay buildable"
+        );
+
+        // The two shapes the core's decoder tolerates: an empty `reserved` is
+        // its zero value, and the key above with a newline inside is the same
+        // 32 bytes (`xray run -test` accepts both on the pinned binary).
+        let mut tolerated = wireguard_with_remote_dns(None);
+        let ProtocolSettings::Wireguard(settings) = &mut tolerated.settings else {
+            panic!("the helper builds a WireGuard outbound");
+        };
+        settings.reserved = Some(Vec::new());
+        settings.secret_key = "AQEBAQEBAQEBAQEBAQEB\nAQEBAQEBAQEBAQEBAQEBAQE".into();
+        assert!(
+            !validate_outbound(&tolerated).has_blocking(),
+            "an empty reserved and a CR/LF key must stay buildable"
+        );
+
+        finding(
+            |settings| settings.secret_key.clear(),
+            ValidationCode::WireguardSecretKeyInvalid,
+            "settings.secretKey",
+        );
+        finding(
+            |settings| settings.reserved = Some(vec![1, 2]),
+            ValidationCode::WireguardReservedKeyBytes,
+            "settings.reserved",
+        );
+        finding(
+            |settings| settings.peers.clear(),
+            ValidationCode::WireguardPeersRequired,
+            "settings.peers",
+        );
+        finding(
+            |settings| settings.peers[0].public_key.clear(),
+            ValidationCode::WireguardPeerPublicKeyRequired,
+            "settings.peers[].publicKey",
+        );
+        finding(
+            |settings| settings.peers[0].endpoint.clear(),
+            ValidationCode::WireguardPeerEndpointRequired,
+            "settings.peers[].endpoint",
+        );
+        finding(
+            |settings| settings.peers[0].endpoint = " ".into(),
+            ValidationCode::WireguardPeerEndpointRequired,
+            "settings.peers[].endpoint",
+        );
+        finding(
+            |settings| settings.peers[0].pre_shared_key = "not-a-key".into(),
+            ValidationCode::WireguardPresharedKeyInvalid,
+            "settings.peers[].preSharedKey",
+        );
+    }
+
+    /// The WireGuard endpoint-resolution vocabulary at the model pass: every
+    /// spelling the pinned core reads (it lowercases before matching) and the
+    /// empty zero value stay silent, and anything else gates with its wire
+    /// path. `xray run -test` on the pinned v26.9.9 binary accepts each
+    /// accepted value below and exits 23 on each refused one.
+    #[test]
+    fn wireguard_domain_strategy_gates_only_spellings_the_core_refuses() {
+        use crate::model::validation::{Severity, ValidationCode, validate_outbound};
+
+        fn with_strategy(strategy: &str) -> OutboundModel {
+            let mut outbound = wireguard_with_remote_dns(None);
+            let ProtocolSettings::Wireguard(settings) = &mut outbound.settings else {
+                panic!("the helper builds a WireGuard outbound");
+            };
+            settings.domain_strategy = strategy.to_owned();
+            outbound
+        }
+
+        for accepted in [
+            "",
+            "forceip",
+            "ForceIP",
+            "FORCEIPv4",
+            "forceipv6",
+            "forceipv4v6",
+            "forceipv6v4",
+        ] {
+            assert!(
+                !validate_outbound(&with_strategy(accepted)).has_blocking(),
+                "{accepted:?} must stay buildable"
+            );
+        }
+
+        // `forceip4` is the near-miss the core refuses (the spelling it reads
+        // is `forceipv4`), and `AsIs` is the strategy spelling of the other
+        // blocks. Neither Go nor the rule trims.
+        for refused in ["bogus", "AsIs", "forceip4", " ForceIP", "ForceIPv4v6 "] {
+            let issues = validate_outbound(&with_strategy(refused));
+            let issue = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::WireguardDomainStrategyInvalid)
+                .unwrap_or_else(|| panic!("{refused:?} must be refused: {issues:?}"));
+            assert_eq!(issue.severity, Severity::Error, "{refused:?}");
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("settings.domainStrategy"),
+                "{refused:?}"
+            );
         }
     }
 }

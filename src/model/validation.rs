@@ -36,7 +36,7 @@ use super::inbound::{
 use super::outbound::{
     MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
     blackhole_response_is_custom, blackhole_response_type_supported,
-    endpoint_requires_transport_security, vless_encryption_supported,
+    endpoint_requires_transport_security, is_valid_wireguard_key, vless_encryption_supported,
     wireguard_remote_dns_supported,
 };
 use super::stream::{
@@ -364,6 +364,46 @@ pub enum ValidationCode {
     /// whole process during config load — the config can never start. Error
     /// tier: the profile gates until the list is fixed.
     WireguardRemoteDnsInvalid,
+    /// WireGuard `settings.domainStrategy` is outside the vocabulary the
+    /// pinned core reads: `WireGuardConfig.Build` lowercases the value and
+    /// refuses the outbound at config load for anything but `forceip` (what
+    /// the empty value selects), `forceipv4`, `forceipv6`, `forceipv4v6`,
+    /// and `forceipv6v4` (infra/conf/wireguard.go:128-141). Error tier: the
+    /// profile gates until the value is fixed.
+    WireguardDomainStrategyInvalid,
+    /// WireGuard `settings.secretKey` is empty or is not a key the pinned
+    /// core builds: `WireGuardConfig.Build` runs it through
+    /// `ParseWireGuardKey` (infra/conf/wireguard.go), which refuses the
+    /// empty string and anything that is neither 64 hexadecimal digits nor
+    /// the raw base64 of the same 32 bytes, so the whole config fails to
+    /// load. Error tier: the profile gates until the key is fixed.
+    WireguardSecretKeyInvalid,
+    /// WireGuard `settings.reserved` is set and is not exactly three bytes:
+    /// `WireGuardConfig.Build` refuses a non-empty value of any other length
+    /// at config load (infra/conf/wireguard.go), and the value is spliced
+    /// into the header ahead of the handshake (proxy/wireguard/bind.go), so
+    /// no other length can run. An empty list is the core's zero shape and
+    /// stays silent. Error tier.
+    WireguardReservedKeyBytes,
+    /// WireGuard `settings.peers` is empty: the pinned core refuses the
+    /// outbound while it constructs the handler at config load — `NewClient`
+    /// returns "empty peers" (proxy/wireguard/client.go). Error tier.
+    WireguardPeersRequired,
+    /// A WireGuard peer's `publicKey` is empty or is not a key the pinned
+    /// core builds: an empty key fails `NewClient` ("peer without
+    /// publickey") and a non-empty one fails `ParseWireGuardKey` in the
+    /// peer's `Build` (infra/conf/wireguard.go) — both at config load.
+    /// Error tier.
+    WireguardPeerPublicKeyRequired,
+    /// A WireGuard peer's `endpoint` is empty or blank: `NewClient` refuses
+    /// the outbound at config load when it is empty ("peer without
+    /// endpoint"), and a blank one leaves the dial no target either. Error
+    /// tier: the field must name a target.
+    WireguardPeerEndpointRequired,
+    /// A set WireGuard peer `preSharedKey` is not a key the pinned core
+    /// builds: the peer's `Build` runs it through `ParseWireGuardKey`
+    /// (infra/conf/wireguard.go) and the config fails to load. Error tier.
+    WireguardPresharedKeyInvalid,
     // ---- settings-wide verdict rules (validate_settings /
     //      validate_profiles) ----
     //
@@ -729,12 +769,11 @@ pub enum ValidationCode {
     // The rules below judge a *server draft*: the empty field a fresh draft
     // starts from, the value a widget can only judge while the user types it.
     // Every one of them is a value the wire accepts — Xray builds a config
-    // with an empty id or an empty WireGuard peer list as readily as it
-    // builds an empty string — so no model sweep emits them and no stored
-    // profile is refused for carrying them. The editor's own sweep emits them
-    // so a draft rule has an identity (code + tier) instead of a rendered
-    // sentence. Their messages name the field the user is looking at, so none
-    // carries a wire path.
+    // with an empty VLESS id as readily as it builds an empty string — so no
+    // model sweep emits them and no stored profile is refused for carrying
+    // them. The editor's own sweep emits them so a draft rule has an identity
+    // (code + tier) instead of a rendered sentence. Their messages name the
+    // field the user is looking at, so none carries a wire path.
     /// The profile's protocol tag and its `settings` block name different
     /// protocols: serde binds the two independently, so a hand-edited state
     /// file can disagree, and every model rule reads one of them.
@@ -762,23 +801,6 @@ pub enum ValidationCode {
     /// `proxy/vmess/outbound` reads, so the core refuses connection attempts
     /// with an unknown cipher instead of falling back to `auto`.
     VmessSecurityUnsupported,
-    /// WireGuard `settings.secretKey` is not the base64 of 32 bytes the
-    /// Noise handshake needs (`proxy/wireguard/device` key parsing).
-    WireguardSecretKeyInvalid,
-    /// WireGuard `settings.reserved` is set but not exactly three bytes: the
-    /// value is spliced into the header ahead of the handshake
-    /// (`proxy/wireguard/client.go`), so any other length corrupts it.
-    WireguardReservedKeyBytes,
-    /// WireGuard `settings.peers` is empty: a peer-less tunnel has nothing to
-    /// hand a packet to.
-    WireguardPeersRequired,
-    /// A WireGuard peer's `publicKey` is not the base64 of 32 bytes.
-    WireguardPeerPublicKeyRequired,
-    /// A WireGuard peer's `endpoint` is empty: the dial has no target.
-    WireguardPeerEndpointRequired,
-    /// A set WireGuard peer `preSharedKey` is not the base64 of 32 bytes the
-    /// handshake mixes in.
-    WireguardPresharedKeyInvalid,
     /// Freedom `settings.fragment` cannot run: Xray's fragment manager
     /// requires a positive length range and a non-decreasing interval range.
     FreedomFragmentInvalid,
@@ -1501,9 +1523,9 @@ fn freedom_domain_strategy_supported(strategy: &str) -> bool {
 
 /// The `settings.domainStrategy` vocabulary the WireGuard editor offers —
 /// the resolution strategies the core's WireGuard endpoint dial runs a peer
-/// host through, plus the empty zero value that leaves the core's own
-/// `forceip` default in place. The combo offers the list verbatim, and the
-/// dial keeps its own default for an unknown value, so no rule judges one.
+/// host through, plus the empty zero value that selects the core's own
+/// `forceip` default. The combo offers the list verbatim, and
+/// [`wireguard_domain_strategy_supported`] is its predicate.
 pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "",
     "ForceIP",
@@ -1512,6 +1534,18 @@ pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "ForceIPv4v6",
     "ForceIPv6v4",
 ];
+
+/// True when a WireGuard `domainStrategy` is one of
+/// [`WG_TARGET_STRATEGY_OPTIONS`], case-insensitively: `WireGuardConfig.Build`
+/// lowercases the value before matching and refuses the outbound at config
+/// load outside the five strategies and the empty zero value
+/// (infra/conf/wireguard.go:128-141). Nothing is trimmed — Go lowercases the
+/// stored bytes as they are.
+fn wireguard_domain_strategy_supported(strategy: &str) -> bool {
+    WG_TARGET_STRATEGY_OPTIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+}
 
 // ---------- outbound envelope / DNS-rule vocabularies ----------
 //
@@ -1654,20 +1688,93 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             Some("settings.version".into()),
         ));
     }
-    // WireGuard's in-network resolver list: the pinned core parses each entry
-    // with `netip.MustParseAddr` while it creates the outbound client and
-    // reads `local` as the sentinel only when the list length is one, so a
+    // WireGuard settings the core cannot build — the in-network resolver
+    // list, the endpoint-resolution strategy, and the key/peer material. The
+    // resolver list: the pinned core parses each entry with
+    // `netip.MustParseAddr` while it creates the outbound client and reads
+    // `local` as the sentinel only when the list length is one, so a
     // non-address entry or a mixed list panics the whole process during
     // config load (proxy/wireguard/client.go:117-124; verified against the
-    // pinned binary, which exits with that panic under `run -test`). Error
-    // tier, like every other WireGuard value the core cannot build.
-    if let ProtocolSettings::Wireguard(settings) = &o.settings
-        && !wireguard_remote_dns_supported(&settings.remote_dns)
-    {
-        issues.push(issue(
-            ValidationCode::WireguardRemoteDnsInvalid,
-            Some("settings.remoteDNS".into()),
-        ));
+    // pinned binary, which exits with that panic under `run -test`). The
+    // strategy: `WireGuardConfig.Build` lowercases the value and refuses the
+    // outbound outside the five spellings it reads
+    // (infra/conf/wireguard.go:128-141; the pinned binary exits 23 on the
+    // near-miss `forceip4` and accepts the mixed-case spellings). The
+    // material: `WireGuardConfig.Build` refuses a non-buildable `secretKey`
+    // (infra/conf/wireguard.go:76) and a `reserved` that is set but not three
+    // bytes (infra/conf/wireguard.go:123), and each peer's non-empty
+    // `publicKey`/`preSharedKey` is parsed in the peer's own `Build`
+    // (infra/conf/wireguard.go:33,40); `NewClient` refuses an empty peer
+    // list, a peer without a public key and a peer without an endpoint while
+    // it constructs the handler (proxy/wireguard/client.go:86-93) — all at
+    // config load, all reached by `run -test`. Error tier: the profile gates
+    // until the field is fixed.
+    //
+    // The predicates are the editor's old draft requirements, moved here so
+    // one verdict covers the editor, generation, and the importer.
+    if let ProtocolSettings::Wireguard(settings) = &o.settings {
+        if !wireguard_remote_dns_supported(&settings.remote_dns) {
+            issues.push(issue(
+                ValidationCode::WireguardRemoteDnsInvalid,
+                Some("settings.remoteDNS".into()),
+            ));
+        }
+        if !wireguard_domain_strategy_supported(&settings.domain_strategy) {
+            issues.push(issue(
+                ValidationCode::WireguardDomainStrategyInvalid,
+                Some("settings.domainStrategy".into()),
+            ));
+        }
+        if !is_valid_wireguard_key(&settings.secret_key) {
+            issues.push(issue(
+                ValidationCode::WireguardSecretKeyInvalid,
+                Some("settings.secretKey".into()),
+            ));
+        }
+        if settings
+            .reserved
+            .as_ref()
+            .is_some_and(|reserved| !reserved.is_empty() && reserved.len() != 3)
+        {
+            issues.push(issue(
+                ValidationCode::WireguardReservedKeyBytes,
+                Some("settings.reserved".into()),
+            ));
+        }
+        if settings.peers.is_empty() {
+            issues.push(issue(
+                ValidationCode::WireguardPeersRequired,
+                Some("settings.peers".into()),
+            ));
+        }
+        if settings
+            .peers
+            .iter()
+            .any(|peer| !is_valid_wireguard_key(&peer.public_key))
+        {
+            issues.push(issue(
+                ValidationCode::WireguardPeerPublicKeyRequired,
+                Some("settings.peers[].publicKey".into()),
+            ));
+        }
+        if settings
+            .peers
+            .iter()
+            .any(|peer| peer.endpoint.trim().is_empty())
+        {
+            issues.push(issue(
+                ValidationCode::WireguardPeerEndpointRequired,
+                Some("settings.peers[].endpoint".into()),
+            ));
+        }
+        if settings.peers.iter().any(|peer| {
+            !peer.pre_shared_key.is_empty() && !is_valid_wireguard_key(&peer.pre_shared_key)
+        }) {
+            issues.push(issue(
+                ValidationCode::WireguardPresharedKeyInvalid,
+                Some("settings.peers[].preSharedKey".into()),
+            ));
+        }
     }
 
     // Protocol-`settings` vocabulary / required values: the out-of-vocab
@@ -4487,9 +4594,7 @@ mod tests {
     /// near-misses the list does not hold (a case variant of a case-sensitive
     /// vocabulary, a spelling with stray whitespace, a value one step past
     /// the set). A combo that offers a value its own rule refuses, or a rule
-    /// that drifts off its list, reds here. `WG_TARGET_STRATEGY_OPTIONS` is
-    /// the one published list without a pair: the dial keeps its own default
-    /// for an unknown value, so nothing judges it.
+    /// that drifts off its list, reds here.
     #[test]
     fn field_vocabularies_and_their_predicates_agree() {
         fn couples(options: &[&str], accepts: impl Fn(&str) -> bool, refused: &[&str]) {
@@ -4520,6 +4625,11 @@ mod tests {
             SOCKOPT_DOMAIN_STRATEGY_OPTIONS,
             sockopt_domain_strategy_supported,
             &["asis+", "bogus"],
+        );
+        couples(
+            WG_TARGET_STRATEGY_OPTIONS,
+            wireguard_domain_strategy_supported,
+            &["forceip4", "asis", "ForceIPv6v4 ", "bogus"],
         );
         couples(
             SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,

@@ -863,8 +863,9 @@ fn latency_probe_interface_binding_skips_wireguard_outbounds() {
     // an inert interface binding that looks bound but isn't.
     let mut wg = OutboundModel::new(Protocol::Wireguard);
     wg.settings = ProtocolSettings::Wireguard(WireguardSettings {
+        secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
         peers: vec![WireguardPeer {
-            public_key: "A".repeat(44),
+            public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
             endpoint: "wg.example.com:51820".into(),
             ..Default::default()
         }],
@@ -2680,8 +2681,9 @@ fn wireguard_domain_endpoint_joins_bootstrap_without_sockopt() {
     // injected into its wire form.
     let mut ob = OutboundModel::new(Protocol::Wireguard);
     ob.settings = ProtocolSettings::Wireguard(WireguardSettings {
+        secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
         peers: vec![WireguardPeer {
-            public_key: "A".repeat(44),
+            public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
             endpoint: "wg.example.com:51820".into(),
             ..Default::default()
         }],
