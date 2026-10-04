@@ -83,11 +83,13 @@ pub use grpc::{
     BalancerInfoView, GrpcClient, HealthPingView, OutboundStatusView, RuntimeEntryView, StatsTick,
 };
 
-/// WFP DNS-shield predicate (see [`wfp`]): true when the config runs a TUN
-/// inbound alongside the DNS module's loopback listener. Re-exported from
-/// the runtime root so the wire-tag coupling tests can pin the
-/// shield against the emitted config without widening the `wfp` module.
-pub use wfp::config_needs_dns_shield;
+/// WFP shield predicates (see [`wfp`]): [`config_needs_dns_shield`] is true
+/// when the config runs a TUN inbound alongside the DNS module's loopback
+/// listener, and [`config_carries_ipv6`] is true when the tunnel assigns an
+/// IPv6 gateway. Re-exported from the runtime root so the wire-tag coupling
+/// tests can pin them against the emitted config without widening the `wfp`
+/// module.
+pub use wfp::{config_carries_ipv6, config_needs_dns_shield};
 
 /// Terminal verdict of one accepted `CoreCmd::TestConfig`: `Ok((accepted,
 /// output))` when the core ran the validation, `Err` when it never did
@@ -3033,7 +3035,8 @@ impl Runtime {
     /// Best-effort OS resolver-cache flush on TUN up/down transitions
     /// (`ipconfig /flushdns` — DnsFlushResolverCache). The Windows cache
     /// keeps pre-TUN ISP answers alive; after a route change they would be
-    /// served stale (sing-box flushes on Start/Close; Xray does not).
+    /// served stale (Xray does not flush the cache when its tunnel comes up
+    /// or goes down).
     /// Failure is non-fatal: the cache ages out on its own, so errors are
     /// logged, not surfaced.
     fn flush_dns_cache(&mut self) {

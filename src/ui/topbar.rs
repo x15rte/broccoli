@@ -170,6 +170,10 @@ pub(crate) struct TopbarRowState<'a> {
     pub(crate) config_error: Option<&'a str>,
     pub(crate) state_error: Option<&'a str>,
     pub(crate) persistence_error: Option<&'a str>,
+    /// The helper reported that it could not install the WFP egress shield
+    /// for the running session: the chip zone warns until a later install
+    /// succeeds or the session ends.
+    pub(crate) dns_shield_inactive: bool,
     // ---- right cluster ----
     pub(crate) stats_generation: u64,
     pub(crate) unit: TrafficUnit,
@@ -315,6 +319,7 @@ pub(crate) fn show_row(
             config_error: state.config_error,
             state_error: state.state_error,
             persistence_error: state.persistence_error,
+            dns_shield_inactive: state.dns_shield_inactive,
         };
         let zone_start_x = ui.cursor().min.x;
         let zone_w =
@@ -421,6 +426,10 @@ struct TopbarStatus<'a> {
     pub(crate) config_error: Option<&'a str>,
     pub(crate) state_error: Option<&'a str>,
     pub(crate) persistence_error: Option<&'a str>,
+    /// The WFP egress shield the helper installs for a TUN session could not
+    /// be installed: the machine's DNS queries are not confined to the
+    /// tunnel.
+    pub(crate) dns_shield_inactive: bool,
 }
 
 /// The click outcomes of one chip-zone frame.
@@ -544,6 +553,10 @@ fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -> TopbarCli
         ui.separator();
         chip(ui, colors.warn, t(lang, Key::TopbarCoreNotInstalled));
     }
+    if status.dns_shield_inactive {
+        ui.separator();
+        chip(ui, colors.warn, t(lang, Key::TopbarDnsShieldInactive));
+    }
     if let Some((ok, output)) = status.apply_result {
         ui.separator();
         let summary = output
@@ -620,6 +633,7 @@ mod tests {
             config_error: Some("generation failure detail"),
             state_error: Some("load failure detail"),
             persistence_error: Some("save failure detail"),
+            dns_shield_inactive: true,
         }
     }
 
@@ -712,6 +726,7 @@ mod tests {
                             state_error: heavy.then_some("load failure detail"),
                             persistence_error: (fixture.case == RowCase::PersistenceOnly)
                                 .then_some("save failure detail"),
+                            dns_shield_inactive: heavy,
                             stats_generation: 1,
                             unit: TrafficUnit::Auto,
                             stats: fixture.stats.as_ref(),
@@ -791,6 +806,7 @@ mod tests {
             "Server edits not saved",
             "trial rules: 2 active",
             "Xray core not installed",
+            "DNS leak protection inactive",
             "changes pending",
             "Apply now",
             "Configuration applied",
@@ -1025,6 +1041,7 @@ mod tests {
             "Server edits not saved",
             "trial rules: 2 active",
             "Xray core not installed",
+            "DNS leak protection inactive",
             "changes pending",
             "Apply now",
             "Configuration applied",

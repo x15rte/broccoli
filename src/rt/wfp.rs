@@ -1,17 +1,25 @@
-//! WFP DNS shield (best-effort): while a TUN core with a DNS module runs,
+//! WFP egress shield (best-effort): while a TUN core with a DNS module runs,
 //! block direct outbound connections to remote port 53 unless they egress
 //! the TUN interface (the in-tun DNS listener at the gateway address) or
 //! originate from the xray process itself (its own upstream dials). This
 //! kills the physical-adapter on-link gateway DNS vector that never enters
 //! the TUN (Windows multi-homed resolution would otherwise leak queries
-//! outside the tunnel). The filter shape mirrors sing-tun's StrictRoute
-//! DNSModeHijack (tun_windows.go): app-id permit (12) > tun-interface
-//! permit (11) > port-53 block (10) — no address exemptions, so the
-//! resolver's DNS path works exactly when it routes into the tunnel and
-//! nothing else. Filters live in a dynamic WFP session
-//! (`FWPM_SESSION_FLAG_DYNAMIC`) so the kernel removes them when the helper
-//! process exits (crash-safe). Best-effort: the caller logs failures, never
-//! fatal.
+//! outside the tunnel). An address family the tunnel does not carry gets
+//! blocked whole, so its traffic cannot escape through the physical
+//! adapters either; neighbor discovery stays permitted so the link keeps
+//! working.
+//!
+//! Weight order in the broccoli sublayer, highest first: the core's app-id
+//! permit (13) > un-carried-family block (12) > TUN-interface permit (11) >
+//! port-53 block (10). No address exemptions, so the resolver's DNS path
+//! works exactly when it routes into the tunnel, and nothing else.
+//!
+//! The block half needs no adapter, so the helper installs it before the
+//! TUN interface index is known (fail closed across startup) and adds the
+//! TUN-interface permits in a second install once the adapter exists.
+//! Filters live in a dynamic WFP session (`FWPM_SESSION_FLAG_DYNAMIC`) so
+//! the kernel removes them when the helper process exits (crash-safe).
+//! Best-effort: the caller logs failures, never fatal.
 
 use crate::diag::{Diag, DiagError};
 use crate::r#gen::keys;
@@ -23,11 +31,13 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::GetAdaptersAddresses;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_UINT32, FWP_VALUE0,
-    FWP_VALUE0_0, FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_INTERFACE_INDEX,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
+    FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_DATA_TYPE,
+    FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0,
+    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_INTERFACE_INDEX, FWPM_CONDITION_IP_LOCAL_PORT,
+    FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+    FWPM_FILTER_FLAGS, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
     FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0,
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
     FwpmSubLayerAdd0,
@@ -35,16 +45,298 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
 use windows::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows::core::{GUID, PCWSTR, PWSTR};
 
-/// Broccoli-owned WFP sublayer (fixed GUID; filters live here, not in the
-/// default sublayer, so nothing else can be confused by them).
-const SUBLAYER_KEY: GUID = GUID::from_u128(0xb90f44c1_6b2d_4e7a_8c93_5a1d2e3f4a5b);
+/// The sublayer one install's filters live in — never the default sublayer,
+/// so nothing else can be confused by them. WFP keys sublayers system-wide
+/// rather than per session, so every install needs its own key: the
+/// fail-closed install's session is still alive when the full install
+/// replaces it, and reusing the key would fail the second sublayer add
+/// (`FWP_E_ALREADY_EXISTS`), which would tear the whole shield down. The
+/// previous session is closed as soon as the new one is stored, so the two
+/// sublayers overlap only for that replace.
+fn sublayer_key() -> GUID {
+    GUID::from_u128(uuid::Uuid::new_v4().as_u128())
+}
+
 const DNS_PORT: u16 = 53;
-/// Permit weight for xray's own dials (any interface) — above the block.
-const WEIGHT_PERMIT: u8 = 12;
+
+/// Permit weight for the core's own dials (any interface) — above every
+/// block.
+const WEIGHT_PERMIT_XRAY: u8 = 13;
+/// Permit weight for neighbor discovery on an IPv6 family the tunnel does
+/// not carry — above that family's block, so the physical link stays alive.
+const WEIGHT_PERMIT_NDP: u8 = 13;
+/// Block weight for the whole address family the tunnel does not carry:
+/// below the permits, above the TUN-interface permit.
+const WEIGHT_BLOCK_UNSUPPORTED: u8 = 12;
 /// Permit weight for traffic egressing the TUN interface (the in-tun DNS
-/// listener) — between the xray permit and the block, mirroring sing-tun.
-const WEIGHT_TUN_INTERFACE: u8 = 11;
+/// listener) — between the family block and the port-53 block.
+const WEIGHT_PERMIT_TUN: u8 = 11;
 const WEIGHT_BLOCK_DNS: u8 = 10;
+
+/// The IPv6 protocol number (RFC 8200) the neighbor-discovery permits match.
+const IPPROTO_ICMPV6: u8 = 58;
+/// Router solicitation (RFC 4861) is sent to the all-routers link-local
+/// multicast address, so its permit is narrowed to that destination.
+const NDP_ROUTER_SOLICITATION: u16 = 133;
+/// ICMPv6 neighbor-discovery types (RFC 4861) that must survive the
+/// un-carried-family block: without them the machine's IPv6 link loses its
+/// routers and neighbors even though the family is otherwise unreachable.
+const NDP_TYPES: [u16; 3] = [NDP_ROUTER_SOLICITATION, 135, 136];
+const ALL_ROUTERS_V6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
+
+/// At the ALE connect layers an ICMPv6 message's type and code travel in the
+/// local and remote port fields, so the neighbor-discovery permits match
+/// them through the port condition keys (the ALE layers carry no condition
+/// of their own for an ICMP field).
+const CONDITION_ICMPV6_TYPE: GUID = FWPM_CONDITION_IP_LOCAL_PORT;
+const CONDITION_ICMPV6_CODE: GUID = FWPM_CONDITION_IP_REMOTE_PORT;
+
+/// The address family one filter belongs to: every filter exists in both ALE
+/// connect layers, one instance per family the shield has an opinion about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    const BOTH: [Family; 2] = [Family::V4, Family::V6];
+
+    fn layer(self) -> GUID {
+        match self {
+            Family::V4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            Family::V6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        }
+    }
+
+    /// The word the filter's display name carries, so a `wf.msc` reader can
+    /// tell the two families' filters apart.
+    fn suffix(self) -> &'static str {
+        match self {
+            Family::V4 => "ipv4",
+            Family::V6 => "ipv6",
+        }
+    }
+}
+
+/// What one filter does. Its weight and WFP action follow from the kind, so
+/// the ordering that decides which traffic survives has one home.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// Permit the staged core's own dials, on either family and any
+    /// interface: the core's transport leaves through the physical adapters
+    /// whatever the tunnel carries.
+    AppIdPermit,
+    /// Permit one neighbor-discovery message (the payload is the ICMPv6
+    /// type) so an un-carried IPv6 family keeps its link.
+    NdpPermit(u16),
+    /// Block the whole address family the tunnel does not carry.
+    UnsupportedFamilyBlock,
+    /// Permit traffic egressing the TUN interface (the in-tun DNS listener).
+    TunInterfacePermit,
+    /// Block direct DNS (remote port 53) outside the tunnel.
+    DnsBlock,
+}
+
+impl Kind {
+    fn weight(self) -> u8 {
+        match self {
+            Kind::AppIdPermit => WEIGHT_PERMIT_XRAY,
+            Kind::NdpPermit(_) => WEIGHT_PERMIT_NDP,
+            Kind::UnsupportedFamilyBlock => WEIGHT_BLOCK_UNSUPPORTED,
+            Kind::TunInterfacePermit => WEIGHT_PERMIT_TUN,
+            Kind::DnsBlock => WEIGHT_BLOCK_DNS,
+        }
+    }
+
+    fn action(self) -> FWP_ACTION_TYPE {
+        match self {
+            Kind::AppIdPermit | Kind::NdpPermit(_) | Kind::TunInterfacePermit => FWP_ACTION_PERMIT,
+            Kind::UnsupportedFamilyBlock | Kind::DnsBlock => FWP_ACTION_BLOCK,
+        }
+    }
+
+    /// Whether the filter is a hard permit: it carries
+    /// `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`, so no later sublayer's block
+    /// can soften it. Only the core's own dials need that strength.
+    fn clear_action_right(self) -> bool {
+        matches!(self, Kind::AppIdPermit)
+    }
+
+    /// The filter's display name and description, so a `wf.msc` or audit
+    /// reader sees what each filter is for.
+    fn display(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::AppIdPermit => ("broccoli permit xray", "permit the staged core's own dials"),
+            Kind::NdpPermit(NDP_ROUTER_SOLICITATION) => (
+                "broccoli permit router solicitation",
+                "permit IPv6 router solicitation on a family the tunnel does not carry",
+            ),
+            Kind::NdpPermit(_) => (
+                "broccoli permit neighbor discovery",
+                "permit IPv6 neighbor discovery on a family the tunnel does not carry",
+            ),
+            Kind::UnsupportedFamilyBlock => (
+                "broccoli block unsupported family",
+                "block the address family the tunnel does not carry",
+            ),
+            Kind::TunInterfacePermit => (
+                "broccoli permit tun",
+                "permit traffic egressing the TUN interface",
+            ),
+            Kind::DnsBlock => ("broccoli block dns", "block direct DNS outside the tunnel"),
+        }
+    }
+}
+
+/// One filter the shield installs: the pure shape, so the ordering that
+/// decides which traffic survives is testable without a WFP engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FilterSpec {
+    family: Family,
+    kind: Kind,
+}
+
+/// The filters one install adds. `carries_ipv6` is whether the emitted TUN
+/// config assigns an IPv6 gateway; the model requires an IPv4 gateway
+/// whenever TUN mode is on, so IPv4 is always carried and only the IPv6
+/// family can be un-carried. `tun_ifindex` is whether the adapter index is
+/// known yet: the fail-closed first install runs without it and adds no
+/// TUN-interface permits.
+///
+/// A carried family gets the core's app-id permit, the TUN-interface permit
+/// (once the index is known) and the port-53 block. An un-carried family
+/// gets the app-id permit, a catch-all block and its neighbor-discovery
+/// permits — never the port-53 block, which the catch-all subsumes.
+fn plan(carries_ipv6: bool, tun_ifindex: bool) -> Vec<FilterSpec> {
+    let mut specs = Vec::new();
+    for family in Family::BOTH {
+        let carried = family == Family::V4 || carries_ipv6;
+        specs.push(FilterSpec {
+            family,
+            kind: Kind::AppIdPermit,
+        });
+        if carried {
+            if tun_ifindex {
+                specs.push(FilterSpec {
+                    family,
+                    kind: Kind::TunInterfacePermit,
+                });
+            }
+            specs.push(FilterSpec {
+                family,
+                kind: Kind::DnsBlock,
+            });
+        } else {
+            specs.push(FilterSpec {
+                family,
+                kind: Kind::UnsupportedFamilyBlock,
+            });
+            specs.extend(NDP_TYPES.map(|icmp_type| FilterSpec {
+                family,
+                kind: Kind::NdpPermit(icmp_type),
+            }));
+        }
+    }
+    specs
+}
+
+/// One filter's materialized pieces, owned for the whole add loop: the
+/// [`FWPM_FILTER0`] built from an entry borrows its display strings and its
+/// condition array, so both must outlive the `FwpmFilterAdd0` that uses them.
+struct FilterEntry {
+    spec: FilterSpec,
+    name: Vec<u16>,
+    description: Vec<u16>,
+    conditions: Vec<FWPM_FILTER_CONDITION0>,
+}
+
+/// The values an install's conditions point at. `app_id` is freed by the
+/// caller after every add; `all_routers` is a local of the same call, so its
+/// address is stable for the whole add loop.
+struct ConditionValues {
+    app_id: *mut FWP_BYTE_BLOB,
+    tun_ifindex: u32,
+    all_routers: FWP_BYTE_ARRAY16,
+}
+
+/// One equality condition on a WFP field.
+fn condition(
+    field_key: GUID,
+    value_type: FWP_DATA_TYPE,
+    value: FWP_CONDITION_VALUE0_0,
+) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: field_key,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: value_type,
+            Anonymous: value,
+        },
+    }
+}
+
+/// The conditions one filter matches, pointing at `values` (which must
+/// outlive every add that uses the result).
+fn conditions_for(spec: FilterSpec, values: &ConditionValues) -> Vec<FWPM_FILTER_CONDITION0> {
+    match spec.kind {
+        Kind::AppIdPermit => vec![condition(
+            FWPM_CONDITION_ALE_APP_ID,
+            FWP_BYTE_BLOB_TYPE,
+            FWP_CONDITION_VALUE0_0 {
+                byteBlob: values.app_id,
+            },
+        )],
+        Kind::TunInterfacePermit => vec![condition(
+            // The index of the interface the connection is sent on. The Win32
+            // name for this GUID is `FWPM_CONDITION_LOCAL_INTERFACE_INDEX`;
+            // `fwpmu.h` aliases it to `FWPM_CONDITION_INTERFACE_INDEX`, the
+            // name the windows crate exports.
+            FWPM_CONDITION_INTERFACE_INDEX,
+            FWP_UINT32,
+            FWP_CONDITION_VALUE0_0 {
+                uint32: values.tun_ifindex,
+            },
+        )],
+        Kind::DnsBlock => vec![condition(
+            FWPM_CONDITION_IP_REMOTE_PORT,
+            FWP_UINT16,
+            FWP_CONDITION_VALUE0_0 { uint16: DNS_PORT },
+        )],
+        Kind::UnsupportedFamilyBlock => Vec::new(),
+        Kind::NdpPermit(icmp_type) => {
+            let mut conditions = vec![
+                condition(
+                    FWPM_CONDITION_IP_PROTOCOL,
+                    FWP_UINT8,
+                    FWP_CONDITION_VALUE0_0 {
+                        uint8: IPPROTO_ICMPV6,
+                    },
+                ),
+                condition(
+                    CONDITION_ICMPV6_TYPE,
+                    FWP_UINT16,
+                    FWP_CONDITION_VALUE0_0 { uint16: icmp_type },
+                ),
+                condition(
+                    CONDITION_ICMPV6_CODE,
+                    FWP_UINT16,
+                    FWP_CONDITION_VALUE0_0 { uint16: 0 },
+                ),
+            ];
+            if icmp_type == NDP_ROUTER_SOLICITATION {
+                conditions.push(condition(
+                    FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    FWP_BYTE_ARRAY16_TYPE,
+                    FWP_CONDITION_VALUE0_0 {
+                        byteArray16: &values.all_routers as *const _ as *mut _,
+                    },
+                ));
+            }
+            conditions
+        }
+    }
+}
 
 /// NUL-terminated UTF-16 copy of `value`. WFP objects reject null display
 /// names (FWP_E_NULL_DISPLAY_NAME), so every sublayer and filter gets one.
@@ -63,10 +355,14 @@ fn display_data(name: &[u16], description: &[u16]) -> FWPM_DISPLAY_DATA0 {
 
 /// Human-readable name for a Fwpm* status, so the helper log shows the
 /// failing condition instead of an opaque number. Codes from the official
-/// WFP error table (FWP facility 0x32).
+/// WFP error table (FWP facility 0x32), plus the plain Win32 codes the
+/// `Fwpm*` calls return directly for a denied caller.
 fn wfp_status_name(status: u32) -> &'static str {
     match status {
         0 => "ERROR_SUCCESS",
+        // The unelevated sublayer add: opening the engine can succeed, the
+        // write is what the token denies.
+        5 => "ERROR_ACCESS_DENIED",
         0x8007_0005 => "E_ACCESSDENIED",
         0x8032_0008 => "FWP_E_NOT_FOUND",
         0x8032_0009 => "FWP_E_ALREADY_EXISTS",
@@ -112,41 +408,91 @@ unsafe impl Send for DnsShield {}
 /// dropped on process exit — the dynamic session handles that.
 static SHIELD: Mutex<Option<DnsShield>> = Mutex::new(None);
 
+/// Whether the config runs a TUN inbound.
+fn has_tun_inbound(config: &serde_json::Value) -> bool {
+    config
+        .get(keys::INBOUNDS)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|inbounds| {
+            inbounds.iter().any(|inbound| {
+                inbound
+                    .get(keys::PROTOCOL)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|protocol| protocol == "tun")
+            })
+        })
+}
+
 /// Whether a config runs a TUN core with the DNS module on: the tun inbound
 /// owns the adapter DNS, and the module (the top-level `dns` object) is what
 /// answers it — the runtime adds the module's in-tun listener to the running
 /// core (src/rt/dns_in.rs). Either half without the other has no tunnel DNS
 /// to protect.
 pub fn config_needs_dns_shield(config: &serde_json::Value) -> bool {
-    let Some(inbounds) = config
-        .get(keys::INBOUNDS)
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    let has_tun = inbounds.iter().any(|inbound| {
-        inbound
-            .get(keys::PROTOCOL)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|protocol| protocol == "tun")
-    });
-    has_tun && config.get(keys::DNS).is_some()
+    has_tun_inbound(config) && config.get(keys::DNS).is_some()
 }
 
-pub fn set_dns_shield(
-    enabled: bool,
-    xray_exe: Option<&Path>,
-    tun_ifindex: Option<u32>,
-) -> Result<(), DiagError> {
+/// Whether the emitted TUN config assigns an IPv6 gateway. Every gateway
+/// entry becomes an adapter address and the in-tun IPv6 DNS listener exists
+/// only for a carried family; the shield blocks the IPv6 family whole when
+/// this is false, so IPv6 traffic cannot leave through the physical
+/// adapters. A config with no TUN inbound, no `settings`, or a gateway list
+/// without an IPv6 entry answers false.
+pub fn config_carries_ipv6(config: &serde_json::Value) -> bool {
+    config
+        .get(keys::INBOUNDS)
+        .and_then(serde_json::Value::as_array)
+        .and_then(|inbounds| {
+            inbounds.iter().find(|inbound| {
+                inbound
+                    .get(keys::PROTOCOL)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|protocol| protocol == "tun")
+            })
+        })
+        .and_then(|inbound| inbound.get(keys::SETTINGS))
+        .and_then(|settings| settings.get(keys::GATEWAY))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|gateways| {
+            gateways
+                .iter()
+                .any(|gateway| gateway.as_str().is_some_and(|entry| entry.contains(':')))
+        })
+}
+
+/// What a caller asks the shield to do. The install half carries everything
+/// the filters need; removal needs nothing, so it cannot be asked to invent
+/// values for parameters it never reads.
+pub enum ShieldCommand<'a> {
+    /// Install the shield, or reinstall it for the next phase: `tun_ifindex`
+    /// is `None` for the fail-closed first install (the block half needs no
+    /// adapter) and `Some` once the adapter exists (which adds the
+    /// TUN-interface permits); `carries_ipv6` selects whether the IPv6 family
+    /// is permitted with its DNS blocked, or blocked whole.
+    Install {
+        xray_exe: &'a Path,
+        tun_ifindex: Option<u32>,
+        carries_ipv6: bool,
+    },
+    /// Remove the installed shield, if any.
+    Remove,
+}
+
+/// Apply one shield command.
+pub fn set_dns_shield(command: ShieldCommand<'_>) -> Result<(), DiagError> {
     let mut guard = SHIELD
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if enabled {
-        let exe = xray_exe.ok_or_else(|| DiagError::new(Diag::new(Key::WfpMissingXrayPath)))?;
-        let ifindex =
-            tun_ifindex.ok_or_else(|| DiagError::new(Diag::new(Key::WfpMissingTunIfindex)))?;
-        match DnsShield::install(exe, ifindex) {
-            Ok(shield) => *guard = Some(shield),
+    match command {
+        ShieldCommand::Install {
+            xray_exe,
+            tun_ifindex,
+            carries_ipv6,
+        } => match DnsShield::install(xray_exe, tun_ifindex, carries_ipv6) {
+            Ok(shield) => {
+                *guard = Some(shield);
+                Ok(())
+            }
             Err(error) => {
                 // A failed (re)install must not leave the previous shield in
                 // place: every start stages xray.exe under a fresh uuid
@@ -156,13 +502,14 @@ pub fn set_dns_shield(
                 // failure degrades to no shield (leak tolerated), never to a
                 // broken core.
                 *guard = None;
-                return Err(error);
+                Err(error)
             }
+        },
+        ShieldCommand::Remove => {
+            *guard = None;
+            Ok(())
         }
-    } else {
-        *guard = None;
     }
-    Ok(())
 }
 
 /// Resolve a network adapter's interface index by its friendly name via
@@ -226,7 +573,14 @@ pub fn interface_index_by_name(name: &str) -> Option<u32> {
 }
 
 impl DnsShield {
-    fn install(xray_exe: &Path, tun_ifindex: u32) -> Result<Self, DiagError> {
+    /// Install the shield for one phase: `tun_ifindex` is `None` for the
+    /// fail-closed first install (the block half needs no adapter), `Some`
+    /// once the adapter exists (which adds the TUN-interface permits).
+    fn install(
+        xray_exe: &Path,
+        tun_ifindex: Option<u32>,
+        carries_ipv6: bool,
+    ) -> Result<Self, DiagError> {
         // Step 1 — dynamic session + engine: the session's filters disappear
         // with the engine handle, so a crash or normal exit cleans up.
         let session = FWPM_SESSION0 {
@@ -262,8 +616,9 @@ impl DnsShield {
         // mandatory (FWP_E_NULL_DISPLAY_NAME otherwise).
         let sublayer_name = wide_str("broccoli");
         let sublayer_desc = wide_str("Broccoli DNS shield sublayer");
+        let sublayer_key = sublayer_key();
         let sublayer = FWPM_SUBLAYER0 {
-            subLayerKey: SUBLAYER_KEY,
+            subLayerKey: sublayer_key,
             displayData: display_data(&sublayer_name, &sublayer_desc),
             weight: u16::MAX,
             ..Default::default()
@@ -303,195 +658,64 @@ impl DnsShield {
             ));
         }
 
-        // Step 4 — four filters as locals that stay alive for the whole add
-        // loop (the kernel copies the values during each FwpmFilterAdd0).
-        // Permit conditions: hard permits (CLEAR_ACTION_RIGHT) for xray's own
-        // dials on both address families.
-        let app_id_condition = FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_ALE_APP_ID,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_BYTE_BLOB_TYPE,
-                Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+        // Step 4 — the filter plan. Every value a condition points at lives
+        // here and outlives the whole add loop (the kernel copies the values
+        // during each FwpmFilterAdd0).
+        let values = ConditionValues {
+            app_id,
+            // Only a `Some` index reaches a TUN-interface permit, so the
+            // sentinel below is never read.
+            tun_ifindex: tun_ifindex.unwrap_or(0),
+            all_routers: FWP_BYTE_ARRAY16 {
+                byteArray16: ALL_ROUTERS_V6,
             },
         };
-        // Block conditions: remote port 53. No address exemptions — the
-        // permitted paths are exactly the xray app-id and the TUN interface
-        // permits above; everything else on 53 is the leak vector
-        // (physical-adapter on-link gateway DNS) and is blocked.
-        let port_condition = FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_UINT16,
-                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: DNS_PORT },
-            },
-        };
-        // Traffic egressing the TUN interface (the in-tun DNS listener at
-        // the gateway address) is permitted: the resolver's queries to the
-        // adapter DNS route on-link into the TUN and must not match the
-        // block. This is the interface-index permit from sing-tun's
-        // StrictRoute DNSModeHijack — no address exemptions needed.
-        let tun_interface_condition = FWPM_FILTER_CONDITION0 {
-            // FWPM_CONDITION_INTERFACE_INDEX: the index of the interface
-            // the connection is sent on (the crate's name for the GUID
-            // sing-box binds as LOCAL_INTERFACE_INDEX).
-            fieldKey: FWPM_CONDITION_INTERFACE_INDEX,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_UINT32,
-                Anonymous: FWP_CONDITION_VALUE0_0 {
-                    uint32: tun_ifindex,
-                },
-            },
-        };
-
-        let mut permit_conditions_v4 = [app_id_condition];
-        let mut permit_conditions_v6 = [app_id_condition];
-        let mut tun_conditions_v4 = [tun_interface_condition];
-        let mut tun_conditions_v6 = [tun_interface_condition];
-        let mut block_conditions_v4 = [port_condition];
-        let mut block_conditions_v6 = [port_condition];
-
         // Every filter carries a display name (FWP_E_NULL_DISPLAY_NAME
-        // otherwise); the buffers stay alive through the add loop below.
-        let permit_v4_name = wide_str("broccoli permit xray ipv4");
-        let permit_v4_desc = wide_str("permit staged xray.exe dials (IPv4)");
-        let permit_v6_name = wide_str("broccoli permit xray ipv6");
-        let permit_v6_desc = wide_str("permit staged xray.exe dials (IPv6)");
-        let tun_v4_name = wide_str("broccoli permit tun ipv4");
-        let tun_v4_desc = wide_str("permit DNS egressing the TUN interface (IPv4)");
-        let tun_v6_name = wide_str("broccoli permit tun ipv6");
-        let tun_v6_desc = wide_str("permit DNS egressing the TUN interface (IPv6)");
-        let block_v4_name = wide_str("broccoli block dns ipv4");
-        let block_v4_desc = wide_str("block direct DNS outside the tunnel (IPv4)");
-        let block_v6_name = wide_str("broccoli block dns ipv6");
-        let block_v6_desc = wide_str("block direct DNS outside the tunnel (IPv6)");
+        // otherwise); these buffers stay alive through the add loop below.
+        let mut entries: Vec<FilterEntry> = Vec::new();
+        for spec in plan(carries_ipv6, tun_ifindex.is_some()) {
+            let (name, description) = spec.kind.display();
+            entries.push(FilterEntry {
+                spec,
+                name: wide_str(&format!("{} {}", name, spec.family.suffix())),
+                description: wide_str(description),
+                conditions: conditions_for(spec, &values),
+            });
+        }
 
-        let permit_v4 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&permit_v4_name, &permit_v4_desc),
-            flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_PERMIT,
-                },
-            },
-            numFilterConditions: permit_conditions_v4.len() as u32,
-            filterCondition: permit_conditions_v4.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_PERMIT,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let permit_v6 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&permit_v6_name, &permit_v6_desc),
-            flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_PERMIT,
-                },
-            },
-            numFilterConditions: permit_conditions_v6.len() as u32,
-            filterCondition: permit_conditions_v6.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_PERMIT,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // The TUN-interface permits: DNS egressing the TUN is the in-tun
-        // listener path and must win over the port-53 block (11 > 10).
-        let tun_v4 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&tun_v4_name, &tun_v4_desc),
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_TUN_INTERFACE,
-                },
-            },
-            numFilterConditions: tun_conditions_v4.len() as u32,
-            filterCondition: tun_conditions_v4.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_PERMIT,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let tun_v6 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&tun_v6_name, &tun_v6_desc),
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_TUN_INTERFACE,
-                },
-            },
-            numFilterConditions: tun_conditions_v6.len() as u32,
-            filterCondition: tun_conditions_v6.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_PERMIT,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let block_v4 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&block_v4_name, &block_v4_desc),
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_BLOCK_DNS,
-                },
-            },
-            numFilterConditions: block_conditions_v4.len() as u32,
-            filterCondition: block_conditions_v4.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_BLOCK,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let block_v6 = FWPM_FILTER0 {
-            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            subLayerKey: SUBLAYER_KEY,
-            displayData: display_data(&block_v6_name, &block_v6_desc),
-            weight: FWP_VALUE0 {
-                r#type: FWP_UINT8,
-                Anonymous: FWP_VALUE0_0 {
-                    uint8: WEIGHT_BLOCK_DNS,
-                },
-            },
-            numFilterConditions: block_conditions_v6.len() as u32,
-            filterCondition: block_conditions_v6.as_mut_ptr(),
-            action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_BLOCK,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        // Add permit xray v4/v6, permit tun v4/v6, block v4/v6.
         let result = (|| -> Result<(), DiagError> {
-            for filter in [
-                &permit_v4, &permit_v6, &tun_v4, &tun_v6, &block_v4, &block_v6,
-            ] {
+            for entry in &mut entries {
+                let conditions = entry.conditions.as_mut_ptr();
+                let filter = FWPM_FILTER0 {
+                    layerKey: entry.spec.family.layer(),
+                    subLayerKey: sublayer_key,
+                    displayData: display_data(&entry.name, &entry.description),
+                    flags: if entry.spec.kind.clear_action_right() {
+                        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+                    } else {
+                        FWPM_FILTER_FLAGS::default()
+                    },
+                    weight: FWP_VALUE0 {
+                        r#type: FWP_UINT8,
+                        Anonymous: FWP_VALUE0_0 {
+                            uint8: entry.spec.kind.weight(),
+                        },
+                    },
+                    numFilterConditions: entry.conditions.len() as u32,
+                    filterCondition: conditions,
+                    action: FWPM_ACTION0 {
+                        r#type: entry.spec.kind.action(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
                 let mut id: u64 = 0;
-                // SAFETY: `filter` and its condition arrays are live locals
-                // of this install for the whole call (the kernel copies the
-                // values); `id` is a valid out-pointer; `engine` is the
-                // valid handle from above.
-                let status = unsafe { FwpmFilterAdd0(engine, filter, None, Some(&mut id)) };
+                // SAFETY: `filter` borrows this entry's display strings and
+                // condition array, which live in `entries` for the whole
+                // loop; every pointer inside those conditions points at
+                // `values`, a live local of this call. `id` is a valid
+                // out-pointer and `engine` the valid handle from above.
+                let status = unsafe { FwpmFilterAdd0(engine, &filter, None, Some(&mut id)) };
                 if status != 0 {
                     return Err(DiagError::new(
                         Diag::new(Key::WfpFilterAddFailed)
@@ -518,31 +742,141 @@ impl DnsShield {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{Key, t};
     use crate::model::inbound::DNS_INBOUND_TAG;
-    use crate::model::settings::Language;
     use serde_json::json;
 
-    /// The converted shield guards render their keyed sentence before any
-    /// WFP call, so the check needs no elevation.
+    /// A full install on a dual-stack tunnel: each carried family gets the
+    /// app-id permit, the TUN-interface permit and the port-53 block, and
+    /// nothing else — no family block, no neighbor-discovery permits.
     #[test]
-    fn missing_shield_inputs_render_their_keys() {
-        let missing_xray =
-            set_dns_shield(true, None, None).expect_err("a shield without an exe must fail");
-        assert_eq!(missing_xray.diag().key(), Key::WfpMissingXrayPath);
-        assert_eq!(
-            missing_xray.text(Language::En),
-            t(Language::En, Key::WfpMissingXrayPath)
+    fn a_carried_family_gets_the_dns_pair_and_no_family_block() {
+        let specs = plan(true, true);
+        assert_eq!(specs.len(), 6, "{specs:#?}");
+        for family in Family::BOTH {
+            for kind in [Kind::AppIdPermit, Kind::TunInterfacePermit, Kind::DnsBlock] {
+                assert!(
+                    specs.contains(&FilterSpec { family, kind }),
+                    "{family:?} must carry {kind:?}: {specs:#?}"
+                );
+            }
+        }
+        assert!(
+            specs.iter().all(|spec| !matches!(
+                spec.kind,
+                Kind::UnsupportedFamilyBlock | Kind::NdpPermit(_)
+            ))
         );
+    }
 
-        let xray = std::path::Path::new("xray.exe");
-        let missing_index = set_dns_shield(true, Some(xray), None)
-            .expect_err("a shield without an interface index must fail");
-        assert_eq!(missing_index.diag().key(), Key::WfpMissingTunIfindex);
-        assert_eq!(
-            missing_index.text(Language::En),
-            t(Language::En, Key::WfpMissingTunIfindex)
+    /// An IPv6 family the tunnel does not carry is blocked whole, with only
+    /// the core's own dials and neighbor discovery above the block. IPv4 is
+    /// unaffected: the model requires an IPv4 gateway.
+    #[test]
+    fn an_un_carried_family_is_blocked_whole() {
+        let specs = plan(false, true);
+        let v6: Vec<Kind> = specs
+            .iter()
+            .filter(|spec| spec.family == Family::V6)
+            .map(|spec| spec.kind)
+            .collect();
+        assert!(v6.contains(&Kind::AppIdPermit), "{v6:#?}");
+        assert!(v6.contains(&Kind::UnsupportedFamilyBlock), "{v6:#?}");
+        for icmp_type in NDP_TYPES {
+            assert!(v6.contains(&Kind::NdpPermit(icmp_type)), "{v6:#?}");
+        }
+        assert!(
+            !v6.contains(&Kind::DnsBlock),
+            "the family block subsumes the port-53 block: {v6:#?}"
         );
+        assert!(!v6.contains(&Kind::TunInterfacePermit), "{v6:#?}");
+
+        // The IPv4 half is untouched: a carried family still gets its pair.
+        assert!(specs.contains(&FilterSpec {
+            family: Family::V4,
+            kind: Kind::DnsBlock
+        }));
+        assert!(specs.contains(&FilterSpec {
+            family: Family::V4,
+            kind: Kind::TunInterfacePermit
+        }));
+    }
+
+    /// The fail-closed first install runs before the adapter exists, so it
+    /// must produce the block half and no TUN-interface permits.
+    #[test]
+    fn the_fail_closed_install_omits_the_tun_permits() {
+        let specs = plan(true, false);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.kind != Kind::TunInterfacePermit),
+            "{specs:#?}"
+        );
+        // The block half is whole: both families keep their app-id permit
+        // and their port-53 block.
+        for family in Family::BOTH {
+            assert!(specs.contains(&FilterSpec {
+                family,
+                kind: Kind::AppIdPermit
+            }));
+            assert!(specs.contains(&FilterSpec {
+                family,
+                kind: Kind::DnsBlock
+            }));
+        }
+    }
+
+    /// The weight order is the behavior: the core's dials outrank every
+    /// block, neighbor discovery outranks the family block, and the
+    /// TUN-interface permit outranks the port-53 block. A weight swap here
+    /// would kill the resolver or the core's own transport.
+    #[test]
+    fn permit_weights_outrank_the_blocks_they_must_survive() {
+        assert!(Kind::AppIdPermit.weight() > Kind::UnsupportedFamilyBlock.weight());
+        assert!(Kind::AppIdPermit.weight() > Kind::DnsBlock.weight());
+        assert!(Kind::AppIdPermit.weight() > Kind::TunInterfacePermit.weight());
+        assert!(
+            Kind::NdpPermit(NDP_ROUTER_SOLICITATION).weight()
+                > Kind::UnsupportedFamilyBlock.weight()
+        );
+        assert!(
+            Kind::UnsupportedFamilyBlock.weight() > Kind::TunInterfacePermit.weight(),
+            "the family block must refuse traffic that does not egress the TUN"
+        );
+        assert!(
+            Kind::TunInterfacePermit.weight() > Kind::DnsBlock.weight(),
+            "a port-53 query egressing the TUN must survive the port-53 block"
+        );
+    }
+
+    /// The family question reads the emitted gateway list: an IPv6 entry
+    /// anywhere in it means carried; a v4-only list, a missing settings
+    /// block and a config without a tunnel all mean not carried.
+    #[test]
+    fn carries_ipv6_follows_the_emitted_gateway_list() {
+        assert!(config_carries_ipv6(&json!({
+            "inbounds": [{"protocol": "tun", "settings": {
+                "gateway": ["10.255.0.1/30", "fd00::1/64"]
+            }}]
+        })));
+        assert!(!config_carries_ipv6(&json!({
+            "inbounds": [{"protocol": "tun", "settings": {
+                "gateway": ["10.255.0.1/30"]
+            }}]
+        })));
+        assert!(!config_carries_ipv6(&json!({
+            "inbounds": [{"protocol": "tun"}]
+        })));
+        assert!(!config_carries_ipv6(&json!({
+            "inbounds": [{"protocol": "socks", "settings": {
+                "gateway": ["fd00::1/64"]
+            }}]
+        })));
+        // `settings` must be an object: a non-object read answers "not
+        // carried", which fails closed toward the family block.
+        assert!(!config_carries_ipv6(&json!({
+            "inbounds": [{"protocol": "tun", "settings": "gateway"}]
+        })));
     }
 
     #[test]
@@ -590,10 +924,11 @@ mod tests {
     }
 
     #[test]
-    fn disable_is_idempotent_unprivileged() {
-        // Real WFP install needs elevation; the off path is testable anywhere.
-        set_dns_shield(false, None, None).unwrap();
-        set_dns_shield(false, None, None).unwrap();
+    fn remove_is_idempotent_unprivileged() {
+        // Real WFP install needs elevation; the removal path is testable
+        // anywhere.
+        set_dns_shield(ShieldCommand::Remove).unwrap();
+        set_dns_shield(ShieldCommand::Remove).unwrap();
     }
 
     /// Ground-truth check of the installed shield: with the shield active
@@ -621,20 +956,25 @@ mod tests {
 
         // ifindex 0: the TUN-interface permit matches nothing, so only the
         // xray app-id permit (this test process is not xray) could pass.
-        set_dns_shield(true, Some(xray), Some(0)).expect("install shield (requires elevation)");
+        set_dns_shield(ShieldCommand::Install {
+            xray_exe: xray,
+            tun_ifindex: Some(0),
+            carries_ipv6: true,
+        })
+        .expect("install shield (requires elevation)");
         // The shield is dynamic-session: it disappears when this process's
         // engine handle closes, i.e. on process exit even without the call.
         // Remove it explicitly so later probes in this run are unaffected.
         struct Guard;
         impl Drop for Guard {
             fn drop(&mut self) {
-                let _ = set_dns_shield(false, None, None);
+                let _ = set_dns_shield(ShieldCommand::Remove);
             }
         }
         let _guard = Guard;
 
-        // Loopback listener: a query to 127.0.0.1:53 must NOT arrive (no
-        // loopback exemption under the sing-box-shaped shield).
+        // Loopback listener: a query to 127.0.0.1:53 must NOT arrive (the
+        // shield has no loopback exemption).
         let loopback_listener = UdpSocket::bind("127.0.0.1:53").expect("bind 127.0.0.1:53");
         loopback_listener
             .set_read_timeout(Some(Duration::from_secs(2)))

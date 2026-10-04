@@ -272,3 +272,42 @@ fn wfp_shield_fires_on_exactly_the_emitted_dns_module() {
         &serde_json::json!({ keys::INBOUNDS: [] })
     ));
 }
+
+#[test]
+fn wfp_shield_reads_the_emitted_gateway_families() {
+    // The shield's IPv6 question must address the emitted gateway list
+    // through the field names the generator writes: the default tunnel is
+    // dual-stack, so the shield blocks only the DNS path, and the same
+    // config with the IPv6 entry removed reads as a family the tunnel does
+    // not carry — the shield then blocks IPv6 whole. A drifted field name
+    // would answer false for the dual-stack config and block IPv6 on every
+    // tunnel.
+    let config = emitted_tun_config();
+    assert!(
+        broccoli::rt::config_carries_ipv6(&config),
+        "the default emitted tunnel carries IPv6"
+    );
+
+    let mut v4_only = config;
+    let gateways = v4_only
+        .get_mut(keys::INBOUNDS)
+        .and_then(Value::as_array_mut)
+        .and_then(|inbounds| {
+            inbounds
+                .iter_mut()
+                .find(|inbound| inbound.get(keys::PROTOCOL).and_then(Value::as_str) == Some("tun"))
+        })
+        .and_then(|tun| tun.get_mut(keys::SETTINGS))
+        .and_then(|settings| settings.get_mut(keys::GATEWAY))
+        .and_then(Value::as_array_mut)
+        .expect("the emitted tun inbound carries a gateway list");
+    gateways.retain(|entry| entry.as_str().is_some_and(|cidr| !cidr.contains(':')));
+    assert!(
+        tun_gateway_ipv6(&v4_only).is_none(),
+        "the fixture must actually drop the IPv6 gateway"
+    );
+    assert!(
+        !broccoli::rt::config_carries_ipv6(&v4_only),
+        "an IPv4-only gateway list means the tunnel does not carry IPv6"
+    );
+}

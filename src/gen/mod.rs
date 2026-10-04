@@ -421,8 +421,8 @@ fn classify_latency_probe_ipv4(ip: Ipv4Addr) -> Option<&'static str> {
 /// The in-tun DNS address: the TUN gateway's IPv4 address (the model
 /// predicate [`tun_ipv4_gateway`] is the shared fact). The WFP DNS shield
 /// permits port-53 only when it egresses the TUN interface, so the adapter
-/// DNS must live inside the TUN subnet — queries then route into the tunnel
-/// (sing-box's in-tun DNS shape). The gateway's own address is the only
+/// DNS must live inside the TUN subnet — queries then route into the tunnel,
+/// where the in-tun listener answers them. The gateway's own address is the only
 /// in-subnet address Xray's stack treats as local and the OS lets a
 /// dokodemo bind; deriving it from the user-editable gateway keeps the two
 /// coupled. Callers only reach this after [`validate_settings`] has

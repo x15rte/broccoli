@@ -405,6 +405,7 @@ keys! {
     TopbarRetrySave 0,
     TopbarOpenStateFolder 0,
     TopbarErrorChip 0,
+    TopbarDnsShieldInactive 0,
     // Topbar right edge: xray core + broccoli app versions.
     TopbarXrayAppVersions 2,
     TopbarAppVersion 1,
@@ -2132,6 +2133,7 @@ keys! {
     HelperShieldRemovedAfterExit (Log, Warn, 1),
     HelperShieldNotInstalledAfterExit (Log, Warn, 1),
     HelperDnsShieldTeardownFailed (Log, Error, 0),
+    HelperDnsShieldEngaged (Log, Info, 0),
     HelperDnsShieldNotEngaged (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
@@ -2183,8 +2185,6 @@ keys! {
     SupervisorChildExited 0,
     SupervisorJobCreateFailed 0,
     SupervisorJobAssignFailed 0,
-    WfpMissingXrayPath 0,
-    WfpMissingTunIfindex 0,
     WfpEngineOpenFailed 2,
     WfpSubLayerAddFailed 2,
     WfpAppIdReadFailed 2,
@@ -2933,6 +2933,7 @@ mod en {
             Key::TopbarRetrySave => "Retry save",
             Key::TopbarOpenStateFolder => "Open state folder",
             Key::TopbarErrorChip => "View error",
+            Key::TopbarDnsShieldInactive => "DNS leak protection inactive",
             // Topbar right edge: xray core + broccoli app versions.
             Key::TopbarXrayAppVersions => "Xray core {} · app {}",
             Key::TopbarAppVersion => "app {}",
@@ -5708,6 +5709,7 @@ mod en {
                 "core {} exited during the adapter index poll; the DNS shield was not installed"
             }
             Key::HelperDnsShieldTeardownFailed => "elevated helper could not remove the DNS shield",
+            Key::HelperDnsShieldEngaged => "elevated helper installed the DNS shield",
             Key::HelperDnsShieldNotEngaged => "elevated helper could not install the DNS shield",
             Key::HelperDnsTakeoverApplied => {
                 "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
@@ -5819,12 +5821,6 @@ mod en {
                 "The app could not create the job object for the core"
             }
             Key::SupervisorJobAssignFailed => "The app could not assign the core to its job",
-            Key::WfpMissingXrayPath => {
-                "The elevated helper cannot install the DNS shield without a staged xray path."
-            }
-            Key::WfpMissingTunIfindex => {
-                "The elevated helper cannot install the DNS shield without a TUN interface index."
-            }
             Key::WfpEngineOpenFailed => {
                 "The elevated helper could not open the Windows filter engine. The status is {} \
                  ({})."
