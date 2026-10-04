@@ -1099,6 +1099,7 @@ keys! {
     SrvRejectedProfileDetails 0,
     SrvWaitCoreOperationImports 0,
     SrvImportOkMark 2,
+    SrvImportIgnoredMark 3,
     SrvImportErrMark 1,
     SrvInvalidJson 1,
     // Servers screen: editor sub-forms + finalmask + transports.
@@ -1853,7 +1854,6 @@ keys! {
     LinkUnsupportedFlow 0,
     LinkUnsupportedGrpcGuna 0,
     LinkUnsupportedTransportMode 1,
-    LinkUnsupportedAllowInsecure 0,
     LinkUnsupportedField 1,
     LinkUnsupportedVmessAlterId 0,
     LinkUnsupportedQueryField 1,
@@ -1874,6 +1874,22 @@ keys! {
     LinkUnsupportedVmessEncryption 1,
     LinkUnsupportedProtocol 1,
     LinkUnsupportedScheme 1,
+    LinkUnsupportedSocks4 0,
+    LinkUnsupportedHysteria1 0,
+    LinkUnsupportedHysteriaObfs 1,
+    LinkHttpHeaders 0,
+    LinkWgSecretKey 0,
+    LinkWgPublicKey 0,
+    LinkWgAddress 0,
+    LinkWgPeer 0,
+    LinkWgReserved 0,
+    LinkHysteriaPin 0,
+    LinkHysteriaObfsPassword 0,
+    LinkHysteriaPacketSize 0,
+    LinkHysteriaHopInterval 0,
+    LinkHysteriaBrutal 0,
+    LinkWgPresharedKey 0,
+    LinkHttpTlsConflict 0,
     LinkLossyPolicyLevel 1,
     LinkLossyEmail 1,
     LinkLossyVlessReverse 1,
@@ -3878,9 +3894,10 @@ mod en {
             Key::SrvQrTooLong => "link too long for QR. Clipboard copy still works",
             Key::SrvImportShareLinks => "Import share links",
             Key::SrvImportHint => {
-                "One link per line (vless:// vmess:// trojan:// ss://). # comments ignored."
+                "One link per line (vless:// vmess:// trojan:// ss:// socks5:// http:// wg:// \
+                 hysteria2://). # comments ignored."
             }
-            Key::SrvImportPasteHint => "vless://…\nvmess://…",
+            Key::SrvImportPasteHint => "vless://…\nvmess://…\nsocks5://… wg://… hysteria2://…",
             Key::SrvParse => "Parse",
             Key::SrvPasteCtrlV => "(paste with Ctrl+V)",
             Key::SrvOkTotal => "{} ok / {} total",
@@ -3899,6 +3916,7 @@ mod en {
                 "Wait for the current core operation before validating imports."
             }
             Key::SrvImportOkMark => "✓ {} — {}",
+            Key::SrvImportIgnoredMark => "✓ {} — {} (ignored: {})",
             Key::SrvImportErrMark => "✗ {}",
             Key::SrvInvalidJson => "invalid JSON: {}",
             // Servers screen: editor sub-forms + finalmask + transports.
@@ -5121,9 +5139,6 @@ mod en {
             Key::LinkUnsupportedTransportMode => {
                 "The mode parameter is not defined for the transport type {}."
             }
-            Key::LinkUnsupportedAllowInsecure => {
-                "Xray core removed allowInsecure. Use certificate pinning."
-            }
             Key::LinkUnsupportedField => {
                 "The field {} is not part of the current #716 grammar. Xray core removed it."
             }
@@ -5173,6 +5188,33 @@ mod en {
             }
             Key::LinkUnsupportedProtocol => "The {} protocol has no share-link format.",
             Key::LinkUnsupportedScheme => "The share link uses the unsupported scheme {}.",
+            Key::LinkUnsupportedSocks4 => {
+                "The SOCKS4 link is not supported. Xray's SOCKS outbound speaks SOCKS5."
+            }
+            Key::LinkUnsupportedHysteria1 => {
+                "Hysteria 1 links are not supported. Xray runs Hysteria 2."
+            }
+            Key::LinkUnsupportedHysteriaObfs => "The hysteria2 obfuscation {} is not supported.",
+            Key::LinkHttpHeaders => {
+                "The http link's headers must be an even-length name,value list with no repeated \
+                 name."
+            }
+            Key::LinkWgSecretKey => "The wireguard link is missing its private key.",
+            Key::LinkWgPublicKey => "The wireguard link is missing the peer public key.",
+            Key::LinkWgAddress => "The wireguard link is missing its interface address.",
+            Key::LinkWgPeer => "The wireguard link has no peer.",
+            Key::LinkWgReserved => "The wireguard reserved value must be decimal bytes 0-255.",
+            Key::LinkHysteriaPin => "The hysteria2 pinSHA256 must be a single certificate pin.",
+            Key::LinkHysteriaObfsPassword => "The hysteria2 obfs needs an obfs-password.",
+            Key::LinkHysteriaPacketSize => "The hysteria2 packet-size range is invalid.",
+            Key::LinkHysteriaHopInterval => {
+                "The hysteria2 hop_interval must be a whole number of seconds."
+            }
+            Key::LinkHysteriaBrutal => {
+                "The hysteria2 upmbps and downmbps must be set together as whole numbers."
+            }
+            Key::LinkWgPresharedKey => "The wireguard preshared key is not the base64 of 32 bytes.",
+            Key::LinkHttpTlsConflict => "An https link cannot also set security=none.",
             Key::LinkLossyPolicyLevel => "The share-link grammar has no policy level for {}.",
             Key::LinkLossyEmail => "The share-link grammar has no email field for {}.",
             Key::LinkLossyVlessReverse => "The VLESS reverse setting {} has no share-link field.",

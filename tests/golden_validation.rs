@@ -34,6 +34,17 @@ fn goldens_dir() -> PathBuf {
         .join("goldens")
 }
 
+/// Run the real core's config validator on `config`, from the core's own
+/// directory so its geo data lookup resolves.
+fn run_xray_test(xray: &Path, config: &Path) -> std::process::Output {
+    Command::new(xray)
+        .args(["run", "-test", "-config"])
+        .arg(config)
+        .current_dir(xray.parent().expect("the core path has a parent directory"))
+        .output()
+        .expect("spawn xray")
+}
+
 #[test]
 #[ignore = "needs a real xray.exe core"]
 fn goldens_pass_xray_test() {
@@ -53,12 +64,7 @@ fn goldens_pass_xray_test() {
 
     let mut failures = Vec::new();
     for path in &entries {
-        let out = Command::new(&xray)
-            .args(["run", "-test", "-config"])
-            .arg(path)
-            .current_dir(xray.parent().unwrap()) // geoip.dat/geosite.dat lookup
-            .output()
-            .expect("spawn xray");
+        let out = run_xray_test(&xray, path);
         if !out.status.success() {
             failures.push(format!(
                 "== {} (exit {:?})\n{}",
@@ -77,6 +83,65 @@ fn goldens_pass_xray_test() {
     eprintln!(
         "validated {} goldens against {}",
         entries.len(),
+        xray.display()
+    );
+}
+
+/// The import-only schemes must generate a configuration the real core
+/// accepts: the link grammar, the model mapping, and the generator are one
+/// contract, and only the core judges the last of them. Also covers a #716
+/// link whose out-of-grammar parameters are compatibility drops — the drops
+/// must not change the accepted configuration.
+#[test]
+#[ignore = "needs a real xray.exe core"]
+fn imported_links_pass_xray_test() {
+    let Some(xray) = xray() else {
+        eprintln!("SKIP: no xray.exe (set XRAY_EXE or download the core)");
+        return;
+    };
+    // A 32-byte key pair in the hex spelling the model accepts, so the
+    // wireguard link needs no encoder here.
+    let secret = "01".repeat(32);
+    let public = "02".repeat(32);
+    let links = [
+        "socks5://alice:s3cr3t@127.0.0.1:1080#Socks".to_string(),
+        "http://127.0.0.1:8080#Http".to_string(),
+        "hysteria2://letmein@example.com:8443?sni=example.com&alpn=h3&obfs=salamander&obfs-password=obfspw&mport=20000-30000&hop_interval=30&upmbps=10&downmbps=50#Hy2"
+            .to_string(),
+        // The hop range rides the authority in a provider link; no single port
+        // names it.
+        "hysteria2://letmein@hop.example.com:20000-30000?security=tls&sni=hop.example.com&allowInsecure=true#Hy2Hop"
+            .to_string(),
+        format!(
+            "wg://198.51.100.9:51820?private_key={secret}&public_key={public}&local_address=10.0.0.2%2F32#WG"
+        ),
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&security=tls&sni=example.com&mux=true&packetEncoding=xudp#Compat"
+            .to_string(),
+    ];
+    let mut servers = broccoli::model::ServersFile::default();
+    for link in &links {
+        let parsed = broccoli::links::parse_link(link)
+            .unwrap_or_else(|error| panic!("parse failed: {error}"));
+        servers.profiles.push(parsed.profile);
+    }
+    let config = broccoli::r#gen::generate(&servers, &broccoli::model::Settings::default())
+        .expect("generate config");
+    let path = std::env::temp_dir().join(format!(
+        "broccoli-imported-links-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, config.to_string()).expect("write config");
+    let out = run_xray_test(&xray, &path);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.status.success(),
+        "xray run -test rejected the imported-link config (exit {:?}):\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!(
+        "validated {} imported links against {}",
+        links.len(),
         xray.display()
     );
 }

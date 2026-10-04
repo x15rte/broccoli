@@ -1895,11 +1895,20 @@ enum LeaveDecision {
     Cancel,
 }
 
-/// One formatted import-preview row: the text the list paints, and whether it
-/// reports a failed link (which only decides its color and its tooltip).
+/// What one import-preview row reports: a clean link, a link whose
+/// compatibility parameters were dropped, or a failed link. The kind only
+/// decides the row's color and tooltip.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportPreviewKind {
+    Ok,
+    Warn,
+    Err,
+}
+
+/// One formatted import-preview row: the text the list paints and its kind.
 struct ImportPreviewRow {
     text: String,
-    error: bool,
+    kind: ImportPreviewKind,
 }
 
 /// Memoized pretty print of one preserved over-limit `downloadSettings`
@@ -1960,7 +1969,7 @@ pub struct ServersScreen {
     add_dialer_proxy_options: Option<DialerProxyOptions>,
     import_open: bool,
     import_text: String,
-    import_parsed: Vec<Result<ServerProfile, links::LinkError>>,
+    import_parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
     import_parsed_source: Option<String>,
     /// Formatted preview of `import_parsed` (see [`ImportPreview`]), built on
     /// the first frame that shows it and reused until the parse result or the
@@ -2049,7 +2058,7 @@ pub struct ServersScreen {
 /// `parsed` for the paste it read.
 struct ImportParseResult {
     source: String,
-    parsed: Vec<Result<ServerProfile, links::LinkError>>,
+    parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
 }
 
 impl ServersScreen {
@@ -2077,20 +2086,28 @@ impl ServersScreen {
             .import_parsed
             .iter()
             .map(|result| match result {
-                Ok(profile) => {
+                Ok(parsed) => {
                     ok += 1;
-                    ImportPreviewRow {
-                        text: t_fmt(
-                            lang,
-                            Key::SrvImportOkMark,
-                            &[&profile.name, &profile.outbound.protocol.as_str()],
-                        ),
-                        error: false,
+                    let protocol = parsed.outbound.protocol.as_str();
+                    if parsed.ignored.is_empty() {
+                        ImportPreviewRow {
+                            text: t_fmt(lang, Key::SrvImportOkMark, &[&parsed.name, &protocol]),
+                            kind: ImportPreviewKind::Ok,
+                        }
+                    } else {
+                        ImportPreviewRow {
+                            text: t_fmt(
+                                lang,
+                                Key::SrvImportIgnoredMark,
+                                &[&parsed.name, &protocol, &parsed.ignored.join(", ")],
+                            ),
+                            kind: ImportPreviewKind::Warn,
+                        }
                     }
                 }
                 Err(error) => ImportPreviewRow {
                     text: t_fmt(lang, Key::SrvImportErrMark, &[&error.text(lang)]),
-                    error: true,
+                    kind: ImportPreviewKind::Err,
                 },
             })
             .collect();
@@ -6685,15 +6702,19 @@ impl ServersScreen {
                             row_height,
                             preview.rows.len(),
                             |ui, rows| {
-                                let error_color = status_colors_of(ui).err;
+                                let colors = status_colors_of(ui);
                                 for row in &preview.rows[rows] {
-                                    let text = if row.error {
-                                        RichText::new(row.text.as_str()).color(error_color)
-                                    } else {
-                                        RichText::new(row.text.as_str())
+                                    let text = match row.kind {
+                                        ImportPreviewKind::Ok => RichText::new(row.text.as_str()),
+                                        ImportPreviewKind::Warn => {
+                                            RichText::new(row.text.as_str()).color(colors.warn)
+                                        }
+                                        ImportPreviewKind::Err => {
+                                            RichText::new(row.text.as_str()).color(colors.err)
+                                        }
                                     };
                                     let response = ui.add(egui::Label::new(text).truncate());
-                                    if row.error {
+                                    if row.kind != ImportPreviewKind::Ok {
                                         response.on_hover_text(row.text.as_str());
                                     }
                                 }
@@ -6720,7 +6741,9 @@ impl ServersScreen {
                             validate_profiles = Some(
                                 self.import_parsed
                                     .iter()
-                                    .filter_map(|result| result.as_ref().ok().cloned())
+                                    .filter_map(|result| {
+                                        result.as_ref().ok().map(|parsed| parsed.profile.clone())
+                                    })
                                     .collect(),
                             );
                         }
@@ -8668,7 +8691,10 @@ Authentication: ML-KEM-768, Post-Quantum
     fn changing_import_source_invalidates_the_parsed_snapshot() {
         let mut screen = ServersScreen {
             import_text: "vless://first".into(),
-            import_parsed: vec![Ok(ServerProfile::default())],
+            import_parsed: vec![Ok(links::ParsedLink {
+                profile: ServerProfile::default(),
+                ignored: Vec::new(),
+            })],
             import_parsed_source: Some("vless://first".into()),
             ..Default::default()
         };

@@ -14,14 +14,31 @@
 //!   whole-URI-base64 form are accepted on import. Export always uses the
 //!   base64url userinfo form.
 //!
+//! Beyond #716, import accepts four schemes for protocols Xray supports but
+//! the discussion never spells — `socks5://` / `socks://`, `http://` /
+//! `https://`, `wg://` / `wireguard://`, `hysteria2://` / `hy2://` — one row
+//! each in [`IMPORT_ONLY`]. Export never renders them: a protocol outside
+//! [`SHAREABLE`] is refused by [`to_link`]. Their link grammars follow the
+//! clients that emit them, which have no external spec, so import is
+//! deliberately tolerant and export stays out of scope.
+//!
 //! Inputs that name removed or unrepresentable behavior are rejected, never
 //! dropped or normalized:
-//! - `allowInsecure`, mKCP `seed` / `headerType`, Trojan `flow`, SIP002
-//!   `plugin=`, VMess `aid > 0`, `security=xtls`, and removed transports.
+//! - mKCP `seed` / non-`none` `headerType`, SIP002 `plugin=`, VMess `aid > 0`,
+//!   `security=xtls`, SOCKS4/4a, Hysteria 1, `obfs=gecko`, and removed
+//!   transports.
 //! - gRPC `mode=guna`, which Xray's boolean `multiMode` cannot express.
-//! - URL fields that are unknown, duplicated after percent-decoding, empty
-//!   when #716 forbids emptiness, or valid only for a different transport or
-//!   security mode.
+//! - URL fields that are duplicated after percent-decoding, empty when #716
+//!   forbids emptiness, or valid only for a different transport or security
+//!   mode.
+//!
+//! Query parameters other clients emit that have no effective Xray field
+//! (`allowInsecure`, `mux=…`, the QUIC / TLS-fragment knobs, …) are listed in
+//! [`IGNORED_PARAMS`]: import drops them, keeps the model default, and reports
+//! each through [`ParsedLink::ignored`] so the import can warn. A parameter
+//! whose value spells a switch turned off (`0`, `false`, `no`) is already the
+//! model default and is dropped silently. A parameter that is neither part of
+//! the selected scheme's grammar nor on that list still refuses the link.
 //!
 //! Export also returns [`LinkError::Lossy`] for local-only mux/proxy/binding,
 //! sockopt, rich headers, and advanced settings not carried by the target
@@ -51,20 +68,24 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
+use crate::model::Int32Range;
 use crate::model::outbound::{
-    OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings, TrojanSettings, VlessSettings,
-    VmessSettings, vless_encryption_supported,
+    HttpSettings, HysteriaSettings, OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings,
+    SocksSettings, TrojanSettings, VlessSettings, VmessSettings, WireguardPeer, WireguardSettings,
+    vless_encryption_supported,
 };
 use crate::model::servers::ServerProfile;
 use crate::model::settings::Language;
 use crate::model::stream::{
-    FinalmaskModel, GrpcSettings, HttpCamouflageRequest, HttpupgradeSettings, KcpSettings, Network,
-    RawHeader, RawSettings, RealityModel, Security, StreamModel, TlsModel, WsSettings,
-    XhttpSettings,
+    FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskSalamander, FinalmaskUdpHop,
+    FinalmaskUdpMask, GrpcSettings, HttpCamouflageRequest, HttpupgradeSettings, HysteriaTransport,
+    KcpSettings, Network, RawHeader, RawSettings, RealityModel, Security, StreamModel, TlsModel,
+    WsSettings, XhttpSettings,
 };
 use crate::model::validation::{
     ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
@@ -114,6 +135,164 @@ impl fmt::Display for LinkError {
 }
 
 impl Error for LinkError {}
+
+/// A share link parsed into a profile plus the compatibility parameters the
+/// grammar recognized but dropped.
+///
+/// Derefs to the profile, so a call site that does not care about the report
+/// reads exactly like a plain profile.
+#[derive(Debug, Clone)]
+pub struct ParsedLink {
+    pub profile: ServerProfile,
+    /// The query parameters (and legacy-vmess JSON keys) other clients emit
+    /// that have no effective Xray field, in link order. The profile already
+    /// carries every model default they would have overridden; see
+    /// [`IGNORED_PARAMS`].
+    pub ignored: Vec<String>,
+}
+
+impl Deref for ParsedLink {
+    type Target = ServerProfile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.profile
+    }
+}
+
+impl DerefMut for ParsedLink {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.profile
+    }
+}
+
+/// Only a value that spells a switch turned off is the model default already;
+/// every other presentation — including a bare flag with no value — is a
+/// setting the link carries, so the report names it.
+fn ignored_value_is_reported(value: &str) -> bool {
+    !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no")
+}
+
+/// Record `key` once, in link order.
+fn record_ignored(ignored: &mut Vec<String>, key: &str) {
+    if !ignored.iter().any(|seen| seen == key) {
+        ignored.push(key.to_string());
+    }
+}
+
+/// Query parameters and legacy-vmess JSON keys other clients emit that have no
+/// effective Xray field. Import drops each present one, keeps the model
+/// default, and reports it through [`ParsedLink::ignored`]; export never
+/// writes one, and a key that is neither here nor part of the selected
+/// scheme's grammar still refuses the link.
+const IGNORED_PARAMS: &[&str] = &[
+    // Multiplex and its brutal congestion rates.
+    "mux",
+    "mux_protocol",
+    "mux_max_connections",
+    "mux_min_streams",
+    "mux_max_streams",
+    "mux_padding",
+    "brutal_enabled",
+    "brutal_up_mbps",
+    "brutal_down_mbps",
+    // XUDP packet encoding.
+    "packetEncoding",
+    // Dial (socket) fields.
+    "reuse_addr",
+    "connect_timeout",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "udp_fragment",
+    "bind_interface",
+    "inet4_bind_address",
+    "inet6_bind_address",
+    // TLS knobs the share grammar does not spell.
+    "disable_sni",
+    "tls_min_version",
+    "tls_max_version",
+    "tls_cipher_suites",
+    "tls_curve_preferences",
+    "tls_certificate",
+    "tls_certificate_path",
+    "tls_certificate_public_key_sha256",
+    "tls_client_certificate",
+    "tls_client_certificate_path",
+    "tls_client_key",
+    "tls_client_key_path",
+    "tls_fragment",
+    "tls_fragment_fallback_delay",
+    "tls_record_fragment",
+    "tls_spoof_enabled",
+    "tls_spoof",
+    "tls_spoof_method",
+    "tls_tricks",
+    "ech_enabled",
+    "ech_config_path",
+    "ech_server_name",
+    // QUIC transport knobs.
+    "quic_idle_timeout",
+    "quic_keep_alive_period",
+    "quic_stream_receive_window",
+    "quic_connection_receive_window",
+    "quic_max_concurrent_streams",
+    "quic_initial_packet_size",
+    "quic_disable_path_mtu_discovery",
+    // Certificate-verification switches: Xray replaced them with the pin
+    // (`streamSettings.tlsSettings.pinnedPeerCertSha256`).
+    "allowInsecure",
+    "insecure",
+    "allow_insecure",
+    // SOCKS over-UDP: Xray's SOCKS outbound has no such switch.
+    "uot",
+    // WireGuard keys with no Xray field, including the AmneziaWG set.
+    "use_system_interface",
+    "workers",
+    "udp_timeout",
+    "enable_amnezia",
+    "jc",
+    "jmin",
+    "jmax",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "i1",
+    "i2",
+    "i3",
+    "i4",
+    "i5",
+    "header_protection_key",
+    "content_padding_addition",
+    "rekey_after_time",
+    "rekey_timeout",
+    "reject_after_time",
+    "keepalive_timeout",
+    "max_handshake_attempts",
+    "random_trailers",
+    "disable_cookies",
+];
+
+/// Whether `key` is a recognized compatibility parameter.
+fn is_ignored_param(key: &str) -> bool {
+    IGNORED_PARAMS.contains(&key)
+}
+
+/// Drop `key` when it is a compatibility parameter with a reporting value,
+/// returning whether it was consumed.
+fn drop_ignored_param(ignored: &mut Vec<String>, key: &str, value: &str) -> bool {
+    if is_ignored_param(key) {
+        if ignored_value_is_reported(value) {
+            record_ignored(ignored, key);
+        }
+        true
+    } else {
+        false
+    }
+}
 
 /// A malformed-link failure whose message carries its key and values.
 fn malformed(message: Diag) -> LinkError {
@@ -452,9 +631,30 @@ fn validate_host(host: &str, scheme: &str) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// Parse `host:port` / `[v6]:port`. Returns host without brackets.
-fn parse_host_port(hp: &str, scheme: &str) -> Result<(String, u16), LinkError> {
-    let (host, port_s) = if let Some(rest) = hp.strip_prefix('[') {
+/// Split `userinfo@host`. `required` decides whether a body without `@` is
+/// malformed (the #716 URL grammar requires the userinfo) or carries none
+/// (the import-only schemes keep credentials in query fields).
+fn split_authority<'a>(
+    auth: &'a str,
+    scheme: &str,
+    required: bool,
+) -> Result<(&'a str, &'a str), LinkError> {
+    match auth.split_once('@') {
+        Some((userinfo, host)) => {
+            if host.contains('@') {
+                return Err(malformed(Diag::new(Key::LinkUserinfoAt).arg(scheme)));
+            }
+            Ok((userinfo, host))
+        }
+        None if required => Err(malformed(Diag::new(Key::LinkUserinfoMissing).arg(scheme))),
+        None => Ok(("", auth)),
+    }
+}
+
+/// Split `host[:port]` / `[v6][:port]`. Returns the host without brackets and
+/// the port text when the link carries one.
+fn split_host_port<'a>(hp: &'a str, scheme: &str) -> Result<(String, Option<&'a str>), LinkError> {
+    if let Some(rest) = hp.strip_prefix('[') {
         let end = rest.find(']').ok_or_else(|| {
             malformed(
                 Diag::new(Key::LinkHostIpv6)
@@ -466,24 +666,34 @@ fn parse_host_port(hp: &str, scheme: &str) -> Result<(String, u16), LinkError> {
         if host.parse::<std::net::Ipv6Addr>().is_err() {
             return Err(malformed(Diag::new(Key::LinkHostIpv6Brackets).arg(scheme)));
         }
-        let port_s = rest[end + 1..]
-            .strip_prefix(':')
-            .ok_or_else(|| malformed(Diag::new(Key::LinkPortMissing).arg(scheme)))?;
-        (host.to_string(), port_s)
+        let tail = &rest[end + 1..];
+        if tail.is_empty() {
+            return Ok((host.to_string(), None));
+        }
+        match tail.strip_prefix(':') {
+            Some(port) => Ok((host.to_string(), Some(port))),
+            None => Err(malformed(Diag::new(Key::LinkHostBracketed).arg(scheme))),
+        }
     } else {
         if hp.contains('[') || hp.contains(']') {
             return Err(malformed(Diag::new(Key::LinkHostBracketed).arg(scheme)));
         }
-        let (h, p) = hp
-            .rsplit_once(':')
-            .ok_or_else(|| malformed(Diag::new(Key::LinkPortMissing).arg(scheme)))?;
-        if h.contains(':') {
-            return Err(malformed(
-                Diag::new(Key::LinkHostIpv6Unbracketed).arg(scheme),
-            ));
+        match hp.rsplit_once(':') {
+            Some((h, p)) => {
+                if h.contains(':') {
+                    return Err(malformed(
+                        Diag::new(Key::LinkHostIpv6Unbracketed).arg(scheme),
+                    ));
+                }
+                Ok((h.to_string(), Some(p)))
+            }
+            None => Ok((hp.to_string(), None)),
         }
-        (h.to_string(), p)
-    };
+    }
+}
+
+/// The host and port both finite, with the grammar's shared checks.
+fn finish_host_port(host: String, port_s: &str, scheme: &str) -> Result<(String, u16), LinkError> {
     validate_host(&host, scheme)?;
     let port: u16 = port_s.parse().map_err(|_| {
         malformed(
@@ -496,6 +706,30 @@ fn parse_host_port(hp: &str, scheme: &str) -> Result<(String, u16), LinkError> {
         return Err(malformed(Diag::new(Key::LinkPortZero).arg(scheme)));
     }
     Ok((host, port))
+}
+
+/// Parse `host:port` / `[v6]:port`. Returns host without brackets.
+fn parse_host_port(hp: &str, scheme: &str) -> Result<(String, u16), LinkError> {
+    let (host, port_s) = split_host_port(hp, scheme)?;
+    let port_s = port_s.ok_or_else(|| malformed(Diag::new(Key::LinkPortMissing).arg(scheme)))?;
+    finish_host_port(host, port_s, scheme)
+}
+
+/// Parse `host[:port]` / `[v6][:port]`, using `default_port` when the link
+/// omits one (the grammars of the import-only schemes allow the omission).
+fn parse_host_port_default(
+    hp: &str,
+    scheme: &str,
+    default_port: u16,
+) -> Result<(String, u16), LinkError> {
+    let (host, port_s) = split_host_port(hp, scheme)?;
+    match port_s {
+        Some(port_s) => finish_host_port(host, port_s, scheme),
+        None => {
+            validate_host(&host, scheme)?;
+            Ok((host, default_port))
+        }
+    }
 }
 
 /// `host:port`, re-bracketing IPv6.
@@ -531,7 +765,11 @@ fn split_alpn(v: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
+fn validate_url_query(
+    q: &Query,
+    proto: Protocol,
+    ignored: &mut Vec<String>,
+) -> Result<(), LinkError> {
     let transport = match q.get("type") {
         Some("") => return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("type"))),
         Some(value) => value,
@@ -600,15 +838,32 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
             "sni" | "fp" => matches!(security, "tls" | "reality"),
             "alpn" | "ech" | "pcs" | "vcn" => security == "tls",
             "pbk" | "sid" | "pqv" | "mldsa65Verify" | "spx" => security == "reality",
-            "allowInsecure" => {
-                return Err(LinkError::Unsupported(Diag::new(
-                    Key::LinkUnsupportedAllowInsecure,
-                )));
-            }
-            "seed" | "headerType" => {
+            "seed" => {
+                // The pinned core parses the key and ignores it
+                // (`infra/conf/transport_method.go` KCPConfig.Build reads
+                // neither `seed` nor `header`), so only the absence of a value
+                // is tolerated: a seed names obfuscation the core cannot run.
+                if value.is_empty() {
+                    continue;
+                }
                 return Err(LinkError::Unsupported(
                     Diag::new(Key::LinkUnsupportedField).arg(key),
                 ));
+            }
+            "headerType" => {
+                // RAW carries it as an import-only field (the HTTP camouflage
+                // Xray still builds); every other transport's header
+                // obfuscation was removed, so only `none` — the absence of
+                // one — is tolerated there.
+                if spec.network == Network::Raw {
+                    true
+                } else if matches!(value.as_str(), "" | "none") {
+                    continue;
+                } else {
+                    return Err(LinkError::Unsupported(
+                        Diag::new(Key::LinkUnsupportedField).arg(key),
+                    ));
+                }
             }
             "aid" | "alterId" => {
                 return Err(LinkError::Unsupported(Diag::new(
@@ -621,6 +876,9 @@ fn validate_url_query(q: &Query, proto: Protocol) -> Result<(), LinkError> {
             other => spec.field(other).is_some(),
         };
         if !allowed {
+            if drop_ignored_param(ignored, key, value) {
+                continue;
+            }
             return Err(LinkError::Unsupported(
                 Diag::new(Key::LinkUnsupportedQueryField).arg(excerpt_debug(key)),
             ));
@@ -905,12 +1163,124 @@ fn raw_settings_present(stream: &StreamModel) -> bool {
     option_has_fields(&stream.raw_settings)
 }
 
+/// Refuse the three raw camouflage getters before export renders them: the
+/// refusal on [`RAW`]'s `refused` list fires first, so reaching one means a
+/// camouflage block would be silently dropped.
+fn raw_camouflage_get(stream: &StreamModel) -> Result<Option<String>, LinkError> {
+    if raw_settings_present(stream) {
+        Err(lossy(
+            "streamSettings.rawSettings",
+            Key::LinkLossyRawCamouflage,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The request block the raw camouflage fields write into. The link must name
+/// `headerType=http` first — the same rule the legacy VMess JSON path
+/// enforces (`LinkRawCamouflage`).
+fn raw_camouflage_request(
+    stream: &mut StreamModel,
+) -> Result<&mut HttpCamouflageRequest, LinkError> {
+    let settings = stream.raw_settings.get_or_insert_default();
+    let header = settings.header.get_or_insert_default();
+    if header.r#type != "http" {
+        return Err(malformed(Diag::new(Key::LinkRawCamouflage)));
+    }
+    Ok(header.request.get_or_insert_default())
+}
+
+/// `headerType` for the raw transport (import-only): Xray still builds the
+/// HTTP request and response camouflage (`infra/conf/transport_method.go`
+/// `tcpHeaderLoader` carries `none` and `http`), so `http` imports the
+/// settings block the legacy VMess JSON path builds. `none` and an omitted
+/// value are the model default and set nothing.
+fn raw_header_type(stream: &mut StreamModel, value: &str) -> Result<(), LinkError> {
+    match value {
+        "" | "none" => Ok(()),
+        "http" => {
+            let settings = stream.raw_settings.get_or_insert_default();
+            settings.header.get_or_insert_default().r#type = "http".into();
+            Ok(())
+        }
+        other => Err(malformed(
+            Diag::new(Key::LinkRawHeaderType).arg(excerpt_debug(other)),
+        )),
+    }
+}
+
+/// The raw camouflage `Host` header (import-only), mirroring the legacy VMess
+/// mapping: a comma list becomes an array.
+fn raw_host(stream: &mut StreamModel, value: &str) -> Result<(), LinkError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let hosts: Vec<Value> = value
+        .split(',')
+        .filter(|host| !host.is_empty())
+        .map(|host| Value::String(host.to_string()))
+        .collect();
+    let request = raw_camouflage_request(stream)?;
+    let entry = if hosts.len() == 1 {
+        hosts
+            .into_iter()
+            .next()
+            .unwrap_or(Value::String(String::new()))
+    } else {
+        Value::Array(hosts)
+    };
+    request.headers.insert("Host".into(), entry);
+    Ok(())
+}
+
+/// The raw camouflage request path list (import-only).
+fn raw_path(stream: &mut StreamModel, value: &str) -> Result<(), LinkError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let request = raw_camouflage_request(stream)?;
+    request.path = value
+        .split(',')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(())
+}
+
+const RAW_HEADER_TYPE: Field = Field {
+    key: "headerType",
+    default: "",
+    require_value: false,
+    validate: None,
+    get: raw_camouflage_get,
+    set: raw_header_type,
+};
+
+const RAW_HOST: Field = Field {
+    key: "host",
+    default: "",
+    require_value: false,
+    validate: None,
+    get: raw_camouflage_get,
+    set: raw_host,
+};
+
+const RAW_PATH_FIELD: Field = Field {
+    key: "path",
+    default: "",
+    require_value: false,
+    validate: None,
+    get: raw_camouflage_get,
+    set: raw_path,
+};
+
 const RAW: TransportSpec = TransportSpec {
     network: Network::Raw,
     path: "streamSettings.rawSettings",
     type_string: Some(DEFAULT_TYPE),
     type_aliases: &["raw"],
-    fields: &[],
+    fields: &[RAW_HEADER_TYPE, RAW_HOST, RAW_PATH_FIELD],
     refused: &[Refused {
         key: Key::LinkLossyRawCamouflage,
         is_set: raw_settings_present,
@@ -1432,7 +1802,7 @@ fn apply_finalmask(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError>
 struct Shareable {
     scheme: &'static str,
     protocol: Protocol,
-    parse: fn(&str) -> Result<ServerProfile, LinkError>,
+    parse: fn(&str, &mut Vec<String>) -> Result<ServerProfile, LinkError>,
 }
 
 /// The share grammar's supported set, one row per shareable protocol: the
@@ -1442,7 +1812,7 @@ const SHAREABLE: &[Shareable] = &[
     Shareable {
         scheme: "vless",
         protocol: Protocol::Vless,
-        parse: |body| parse_url_style(body, Protocol::Vless),
+        parse: |body, ignored| parse_url_style(body, Protocol::Vless, ignored),
     },
     Shareable {
         scheme: "vmess",
@@ -1452,7 +1822,7 @@ const SHAREABLE: &[Shareable] = &[
     Shareable {
         scheme: "trojan",
         protocol: Protocol::Trojan,
-        parse: |body| parse_url_style(body, Protocol::Trojan),
+        parse: |body, ignored| parse_url_style(body, Protocol::Trojan, ignored),
     },
     Shareable {
         scheme: "ss",
@@ -1461,13 +1831,90 @@ const SHAREABLE: &[Shareable] = &[
     },
 ];
 
+/// The import-only set: schemes for protocols Xray supports but #716 never
+/// spells. Their link grammars follow the clients that emit them, which have
+/// no external spec, so import is deliberately tolerant
+/// (see [`IGNORED_PARAMS`]) while `to_link` never renders one. The removed
+/// spellings (`socks4`/`socks4a`, Hysteria 1) sit here too, so the scheme
+/// table stays the single registry and each gets its own diagnostic instead
+/// of the generic unknown-scheme message.
+const IMPORT_ONLY: &[Shareable] = &[
+    Shareable {
+        scheme: "socks5",
+        protocol: Protocol::Socks,
+        parse: parse_socks,
+    },
+    Shareable {
+        scheme: "socks",
+        protocol: Protocol::Socks,
+        parse: parse_socks,
+    },
+    Shareable {
+        scheme: "socks4",
+        protocol: Protocol::Socks,
+        parse: |_, _| {
+            Err(LinkError::Unsupported(Diag::new(
+                Key::LinkUnsupportedSocks4,
+            )))
+        },
+    },
+    Shareable {
+        scheme: "socks4a",
+        protocol: Protocol::Socks,
+        parse: |_, _| {
+            Err(LinkError::Unsupported(Diag::new(
+                Key::LinkUnsupportedSocks4,
+            )))
+        },
+    },
+    Shareable {
+        scheme: "http",
+        protocol: Protocol::Http,
+        parse: |body, ignored| parse_http(body, false, ignored),
+    },
+    Shareable {
+        scheme: "https",
+        protocol: Protocol::Http,
+        parse: |body, ignored| parse_http(body, true, ignored),
+    },
+    Shareable {
+        scheme: "wg",
+        protocol: Protocol::Wireguard,
+        parse: parse_wireguard,
+    },
+    Shareable {
+        scheme: "wireguard",
+        protocol: Protocol::Wireguard,
+        parse: parse_wireguard,
+    },
+    Shareable {
+        scheme: "hysteria2",
+        protocol: Protocol::Hysteria,
+        parse: parse_hysteria2,
+    },
+    Shareable {
+        scheme: "hy2",
+        protocol: Protocol::Hysteria,
+        parse: parse_hysteria2,
+    },
+    Shareable {
+        scheme: "hysteria",
+        protocol: Protocol::Hysteria,
+        parse: |_, _| {
+            Err(LinkError::Unsupported(Diag::new(
+                Key::LinkUnsupportedHysteria1,
+            )))
+        },
+    },
+];
+
 /// #716 names the VMess URL form when the body carries a userinfo, and the
 /// obsolete whole-body Base64-JSON form otherwise.
-fn parse_vmess_body(body: &str) -> Result<ServerProfile, LinkError> {
+fn parse_vmess_body(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
     if body.contains('@') {
-        parse_url_style(body, Protocol::Vmess)
+        parse_url_style(body, Protocol::Vmess, ignored)
     } else {
-        parse_legacy_vmess(body)
+        parse_legacy_vmess(body, ignored)
     }
 }
 
@@ -1483,19 +1930,18 @@ fn unsupported_protocol(protocol: Protocol) -> LinkError {
 
 // ---------- URL-style links (VLESS / VMess / Trojan) ----------
 
-fn parse_url_style(body: &str, proto: Protocol) -> Result<ServerProfile, LinkError> {
+fn parse_url_style(
+    body: &str,
+    proto: Protocol,
+    ignored: &mut Vec<String>,
+) -> Result<ServerProfile, LinkError> {
     let scheme = proto.as_str();
     let (auth, query, frag) = split_link(body);
-    let (userinfo, hp) = auth
-        .split_once('@')
-        .ok_or_else(|| malformed(Diag::new(Key::LinkUserinfoMissing).arg(scheme)))?;
-    if hp.contains('@') {
-        return Err(malformed(Diag::new(Key::LinkUserinfoAt).arg(scheme)));
-    }
+    let (userinfo, hp) = split_authority(auth, scheme, true)?;
     let user = pct_decode(userinfo)?;
     let (host, port) = parse_host_port(hp, scheme)?;
     let q = parse_query(query)?;
-    validate_url_query(&q, proto)?;
+    validate_url_query(&q, proto, ignored)?;
     let mut stream = StreamModel::default();
     apply_security(&q, &mut stream, proto == Protocol::Trojan)?;
     apply_transport_query(&q, &mut stream)?;
@@ -1635,7 +2081,7 @@ fn trojan_link(p: &ServerProfile, s: &TrojanSettings) -> Result<String, LinkErro
 
 // ---------- VMess legacy Base64-JSON import ----------
 
-fn parse_legacy_vmess(body: &str) -> Result<ServerProfile, LinkError> {
+fn parse_legacy_vmess(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
     let raw = b64_decode_any(body).ok_or_else(|| malformed(Diag::new(Key::LinkVmessBase64)))?;
     let v: Value = serde_json::from_slice(&raw)
         .map_err(|e| malformed(Diag::new(Key::LinkVmessJson).arg(excerpt(&e.to_string()))))?;
@@ -1644,7 +2090,7 @@ fn parse_legacy_vmess(body: &str) -> Result<ServerProfile, LinkError> {
         .ok_or_else(|| malformed(Diag::new(Key::LinkVmessObject)))?;
     const LEGACY_FIELDS: &[&str] = &[
         "v", "ps", "add", "port", "id", "aid", "scy", "net", "type", "host", "path", "tls", "sni",
-        "alpn", "fp",
+        "alpn", "fp", "vcn", "pcs", "insecure",
     ];
     if let Some(field) = o
         .keys()
@@ -1735,6 +2181,32 @@ fn parse_legacy_vmess(body: &str) -> Result<ServerProfile, LinkError> {
                 Diag::new(Key::LinkUnsupportedVmessTls).arg(excerpt_debug(other)),
             ));
         }
+    }
+
+    // Client exports write `vcn` / `pcs` on every legacy vmess body (empty
+    // when unset) and `insecure` unconditionally. The TLS fields map onto the
+    // model when TLS is on; without TLS they name nothing, so they join the
+    // compatibility report. `insecure` has no Xray field at all — the
+    // certificate pin replaces it.
+    let vcn = get("vcn");
+    let pcs = get("pcs");
+    if stream.security == Security::Tls {
+        if let Some(tls) = stream.tls_settings.as_mut() {
+            tls.verify_peer_cert_by_name = vcn;
+            tls.pinned_peer_cert_sha256 = pcs;
+        }
+    } else {
+        if !vcn.is_empty() {
+            record_ignored(ignored, "vcn");
+        }
+        if !pcs.is_empty() {
+            record_ignored(ignored, "pcs");
+        }
+    }
+    if let Some(insecure) = o.get("insecure").and_then(Value::as_str)
+        && ignored_value_is_reported(insecure)
+    {
+        record_ignored(ignored, "insecure");
     }
 
     let net = get("net");
@@ -1941,7 +2413,7 @@ fn vmess_link(profile: &ServerProfile, settings: &VmessSettings) -> Result<Strin
 
 // ---------- ss (SIP002) ----------
 
-fn parse_ss(body: &str) -> Result<ServerProfile, LinkError> {
+fn parse_ss(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
     let (rest, frag0) = match body.find('#') {
         Some(i) => (&body[..i], &body[i + 1..]),
         None => (body, ""),
@@ -1951,13 +2423,18 @@ fn parse_ss(body: &str) -> Result<ServerProfile, LinkError> {
         None => (rest, ""),
     };
     let query = parse_query(raw_query)?;
-    // Any query field makes the link unsupported; the first key decides the
-    // message (SIP002 plugins have their own diagnostic).
-    if let Some((key, _)) = query.0.first() {
-        if key == "plugin" {
-            return Err(LinkError::Unsupported(Diag::new(
-                Key::LinkUnsupportedSsPlugin,
-            )));
+    // SIP002 `plugin=` names a transport the model cannot carry (its own
+    // diagnostic); a recognized compatibility parameter is dropped; any other
+    // query field makes the link unsupported, the first key deciding the
+    // message.
+    if query.0.iter().any(|(key, _)| key == "plugin") {
+        return Err(LinkError::Unsupported(Diag::new(
+            Key::LinkUnsupportedSsPlugin,
+        )));
+    }
+    for (key, value) in &query.0 {
+        if drop_ignored_param(ignored, key, value) {
+            continue;
         }
         return Err(LinkError::Unsupported(
             Diag::new(Key::LinkUnsupportedSsQueryField).arg(excerpt_debug(key)),
@@ -2038,6 +2515,651 @@ fn ss_link(p: &ServerProfile, s: &ShadowsocksSettings) -> Result<String, LinkErr
         host_port(&s.address, s.port),
         fragment_suffix(&p.name),
     ))
+}
+
+// ---------- import-only schemes (SOCKS5 / HTTP / WireGuard / Hysteria 2) ----------
+
+/// Validate an import-only scheme's query against its own key list: a key the
+/// scheme defines passes, a recognized compatibility parameter is dropped and
+/// reported, and anything else refuses the link.
+fn validate_scheme_query(
+    q: &Query,
+    own: &[&str],
+    ignored: &mut Vec<String>,
+) -> Result<(), LinkError> {
+    for (key, value) in &q.0 {
+        if own.contains(&key.as_str()) {
+            continue;
+        }
+        if drop_ignored_param(ignored, key, value) {
+            continue;
+        }
+        return Err(LinkError::Unsupported(
+            Diag::new(Key::LinkUnsupportedQueryField).arg(excerpt_debug(key)),
+        ));
+    }
+    Ok(())
+}
+
+/// The first of `keys` present in `q`; two spellings of the same field are
+/// refused rather than silently preferred.
+fn one_of<'a>(q: &'a Query, keys: &[&str]) -> Result<Option<&'a str>, LinkError> {
+    let mut found: Option<&str> = None;
+    for key in keys {
+        if q.get(key).is_some() {
+            if let Some(seen) = found {
+                return Err(malformed(Diag::new(Key::LinkQueryDuplicate).arg(seen)));
+            }
+            found = Some(key);
+        }
+    }
+    Ok(found.and_then(|key| q.get(key)))
+}
+
+/// Apply the TLS parameters the import-only schemes share with #716 (`sni`,
+/// `fp`, `alpn`, `ech`, `pcs`, `vcn`) onto a stream, with `host` as the
+/// default `serverName`. The caller has already decided TLS is on.
+fn apply_tls_params(q: &Query, stream: &mut StreamModel, host: &str) {
+    stream.security = Security::Tls;
+    stream.tls_settings = Some(TlsModel {
+        server_name: q.get_ne("sni").unwrap_or(host).to_string(),
+        fingerprint: q.get_ne("fp").unwrap_or("chrome").to_string(),
+        alpn: split_alpn(q.get("alpn")),
+        ech_config_list: q.get("ech").unwrap_or_default().to_string(),
+        pinned_peer_cert_sha256: q.get("pcs").unwrap_or_default().to_string(),
+        verify_peer_cert_by_name: q.get("vcn").unwrap_or_default().to_string(),
+        ..Default::default()
+    });
+}
+
+/// Split a link userinfo into `user` / `pass`, accepting the plain
+/// (percent-encoded `user:pass`) spelling and the base64(`user:pass`) spelling
+/// other clients emit. A bare value that is not base64 credentials is the
+/// user name.
+fn link_credentials(userinfo: &str) -> Result<(String, String), LinkError> {
+    if userinfo.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    let literal = pct_decode(userinfo)?;
+    if let Some((user, pass)) = literal.split_once(':') {
+        return Ok((user.to_string(), pass.to_string()));
+    }
+    if let Some(decoded) = b64_decode_any(userinfo)
+        && let Ok(text) = String::from_utf8(decoded)
+        && let Some((user, pass)) = text.split_once(':')
+    {
+        return Ok((user.to_string(), pass.to_string()));
+    }
+    Ok((literal, String::new()))
+}
+
+/// `socks5://` / `socks://` — the two client userinfo spellings: a base64
+/// `user:pass` with no query, or a plain `user:pass`. Xray's SOCKS outbound
+/// speaks SOCKS5 only, so `socks4`/`socks4a` are refused by their own rows.
+fn parse_socks(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+    const SCHEME: &str = "socks";
+    let (auth, query, frag) = split_link(body);
+    let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
+    let (host, port) = parse_host_port_default(hp, SCHEME, 1080)?;
+    let q = parse_query(query)?;
+    validate_scheme_query(&q, &["version"], ignored)?;
+    if let Some(version) = q.get_ne("version")
+        && version != "5"
+    {
+        return Err(LinkError::Unsupported(Diag::new(
+            Key::LinkUnsupportedSocks4,
+        )));
+    }
+    let (user, pass) = link_credentials(userinfo)?;
+    let name = match fragment_name(frag)? {
+        Some(name) => name,
+        None => host.clone(),
+    };
+    let mut outbound = OutboundModel::new(Protocol::Socks);
+    outbound.settings = ProtocolSettings::Socks(SocksSettings {
+        address: host,
+        port,
+        user,
+        pass,
+        ..Default::default()
+    });
+    Ok(ServerProfile::new(name, outbound))
+}
+
+/// Fold a client-emitted `headers` value into the model's map. The wire form
+/// is a flat alternating `name,value` list joined by `,`; an odd element count
+/// or a repeated name has no single meaning and is refused.
+fn http_headers(raw: &str) -> Result<Map<String, Value>, LinkError> {
+    let items: Vec<&str> = raw.split(',').collect();
+    let mut headers = Map::new();
+    if !items.len().is_multiple_of(2) {
+        return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
+    }
+    for pair in items.chunks(2) {
+        if pair[0].is_empty()
+            || headers
+                .insert(pair[0].to_string(), Value::String(pair[1].to_string()))
+                .is_some()
+        {
+            return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
+        }
+    }
+    Ok(headers)
+}
+
+/// `http://` / `https://` — the link a client exports for an HTTP CONNECT
+/// outbound. `https` (or `security=tls`) turns TLS on; the default port is 443
+/// with TLS and 80 without.
+fn parse_http(
+    body: &str,
+    scheme_tls: bool,
+    ignored: &mut Vec<String>,
+) -> Result<ServerProfile, LinkError> {
+    const SCHEME: &str = "http";
+    let (auth, query, frag) = split_link(body);
+    let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
+    let q = parse_query(query)?;
+    const OWN: &[&str] = &[
+        "security", "sni", "fp", "alpn", "ech", "pcs", "vcn", "path", "headers",
+    ];
+    validate_scheme_query(&q, OWN, ignored)?;
+    // `security` may agree with the scheme or turn TLS on for `http`; `none`
+    // against an `https` scheme contradicts the scheme rather than naming a
+    // setting, so it refuses the link instead of being silently overridden.
+    let tls = match (scheme_tls, q.get("security")) {
+        (_, Some("")) => return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("security"))),
+        (_, Some("tls")) => true,
+        (true, Some("none")) => return Err(malformed(Diag::new(Key::LinkHttpTlsConflict))),
+        (_, Some("none")) | (false, None) => false,
+        (true, None) => true,
+        (_, Some(other)) => {
+            return Err(malformed(
+                Diag::new(Key::LinkSecurityUnknown).arg(excerpt_debug(other)),
+            ));
+        }
+    };
+    let (host, port) = parse_host_port_default(hp, SCHEME, if tls { 443 } else { 80 })?;
+    let (user, pass) = link_credentials(userinfo)?;
+    // A password-only userinfo (`:token@host`) is the emitting client's bare
+    // token spelling: its own import reads the token as the user name.
+    let (user, pass) = if user.is_empty() && !pass.is_empty() {
+        (pass, String::new())
+    } else {
+        (user, pass)
+    };
+    let mut stream = StreamModel::default();
+    if tls {
+        apply_tls_params(&q, &mut stream, &host);
+    } else {
+        for key in ["sni", "fp", "alpn", "ech", "pcs", "vcn"] {
+            if q.get(key).is_some() {
+                return Err(LinkError::Unsupported(
+                    Diag::new(Key::LinkUnsupportedQueryField).arg(key),
+                ));
+            }
+        }
+    }
+    if q.get_ne("path").is_some() {
+        // Xray's HTTP outbound has no request path.
+        record_ignored(ignored, "path");
+    }
+    let headers = match q.get_ne("headers") {
+        Some(raw) => http_headers(raw)?,
+        None => Map::new(),
+    };
+    let name = match fragment_name(frag)? {
+        Some(name) => name,
+        None => host.clone(),
+    };
+    let mut outbound = OutboundModel::new(Protocol::Http);
+    outbound.settings = ProtocolSettings::Http(HttpSettings {
+        address: host,
+        port,
+        user,
+        pass,
+        headers,
+        ..Default::default()
+    });
+    outbound.stream = stream;
+    Ok(ServerProfile::new(name, outbound))
+}
+
+/// Append the host prefix an address omits, as the emitting clients do before
+/// they hand the value to the core.
+fn fix_address(value: &str) -> String {
+    if value.contains('/') {
+        return value.to_string();
+    }
+    match value.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => format!("{value}/32"),
+        Ok(std::net::IpAddr::V6(_)) => format!("{value}/128"),
+        Err(_) => value.to_string(),
+    }
+}
+
+/// `wg://` / `wireguard://` — the two client spellings: the private key in a
+/// `private_key` parameter with `-`-joined `local_address` values, or the
+/// private key in the userinfo with comma-joined `address` / `ip` values.
+/// Exactly one peer is modeled.
+fn parse_wireguard(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+    const SCHEME: &str = "wireguard";
+    let (auth, query, frag) = split_link(body);
+    let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
+    let userinfo = (!userinfo.is_empty()).then_some(userinfo);
+    let q = parse_query(query)?;
+    const OWN: &[&str] = &[
+        "private_key",
+        "privatekey",
+        "public_key",
+        "publickey",
+        "peer_public_key",
+        "pre_shared_key",
+        "preshared_key",
+        "presharedkey",
+        "psk",
+        "reserved",
+        "address",
+        "ip",
+        "local_address",
+        "mtu",
+        "dns",
+        "fm",
+        "persistent_keepalive_interval",
+        "persistent_keepalive",
+        "keepalive",
+    ];
+    validate_scheme_query(&q, OWN, ignored)?;
+    let (host, port) = parse_host_port_default(hp, SCHEME, 51820)?;
+    // Query values arrive percent-decoded (`parse_query`); only the userinfo
+    // is still raw.
+    let secret_key = match one_of(&q, &["private_key", "privatekey"])? {
+        Some(value) => value.to_string(),
+        None => match userinfo {
+            Some(userinfo) => pct_decode(userinfo)?,
+            None => String::new(),
+        },
+    };
+    if secret_key.is_empty() {
+        return Err(malformed(Diag::new(Key::LinkWgSecretKey)));
+    }
+    let public_key = one_of(&q, &["public_key", "publickey", "peer_public_key"])?
+        .unwrap_or_default()
+        .to_string();
+    if public_key.is_empty() {
+        return Err(malformed(Diag::new(Key::LinkWgPublicKey)));
+    }
+    let pre_shared_key = one_of(
+        &q,
+        &["pre_shared_key", "preshared_key", "presharedkey", "psk"],
+    )?
+    .unwrap_or_default()
+    .to_string();
+    let keep_alive = match one_of(
+        &q,
+        &[
+            "persistent_keepalive_interval",
+            "persistent_keepalive",
+            "keepalive",
+        ],
+    )? {
+        Some(value) => Some(numeric_param("keepalive", value)?),
+        None => None,
+    };
+    let address_text = one_of(&q, &["local_address", "address", "ip"])?.unwrap_or_default();
+    let address: Vec<String> = address_text
+        .split(['-', ','])
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(fix_address)
+        .collect();
+    if address.is_empty() {
+        return Err(malformed(Diag::new(Key::LinkWgAddress)));
+    }
+    let reserved = match q.get_ne("reserved") {
+        Some(raw) => {
+            let bytes = raw
+                .split(['-', ','])
+                .map(str::trim)
+                .filter(|byte| !byte.is_empty())
+                .map(|byte| byte.parse::<u8>())
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| malformed(Diag::new(Key::LinkWgReserved)))?;
+            Some(bytes)
+        }
+        None => None,
+    };
+    let mtu = match q.get_ne("mtu") {
+        Some(value) => u16::try_from(numeric_param("mtu", value)?).map_err(|_| {
+            malformed(
+                Diag::new(Key::LinkNumericParam)
+                    .arg("mtu")
+                    .arg(excerpt_debug(value)),
+            )
+        })?,
+        None => 1420,
+    };
+    let remote_dns: Vec<String> = q
+        .get_ne("dns")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut stream = StreamModel::default();
+    apply_finalmask(&q, &mut stream)?;
+    let name = match fragment_name(frag)? {
+        Some(name) => name,
+        None => host.clone(),
+    };
+    let mut outbound = OutboundModel::new(Protocol::Wireguard);
+    outbound.settings = ProtocolSettings::Wireguard(WireguardSettings {
+        secret_key,
+        address,
+        peers: vec![WireguardPeer {
+            public_key,
+            pre_shared_key,
+            endpoint: host_port(&host, port),
+            keep_alive,
+            ..Default::default()
+        }],
+        mtu,
+        reserved,
+        remote_dns,
+        ..Default::default()
+    });
+    outbound.stream = stream;
+    Ok(ServerProfile::new(name, outbound))
+}
+
+/// A single numeric port, or `None` when the text is a list or range.
+fn parse_single_port(text: &str, scheme: &str) -> Result<Option<u16>, LinkError> {
+    match text.parse::<u16>() {
+        Ok(0) => Err(malformed(Diag::new(Key::LinkPortZero).arg(scheme))),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parse the comma-separated port list a Hysteria 2 authority or `mport`
+/// carries (`20000-30000`, `20000-30000,443`): every item is a single port or an
+/// ascending range, all 1..=65535, and the text reaches Xray's `PortList`
+/// verbatim (`infra/conf/common.go:247-268`). Returns the list's first port,
+/// which becomes the outbound's initial destination.
+fn parse_hop_port_list(text: &str, scheme: &str) -> Result<u16, LinkError> {
+    let invalid = |item: &str| {
+        malformed(
+            Diag::new(Key::LinkPortInvalid)
+                .arg(excerpt_debug(item))
+                .arg(scheme),
+        )
+    };
+    let mut first = None;
+    for item in text.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (from, to) = match item.split_once('-') {
+            Some((from, to)) => (from.trim(), to.trim()),
+            None => (item, item),
+        };
+        let from: u16 = from.parse().map_err(|_| invalid(item))?;
+        let to: u16 = to.parse().map_err(|_| invalid(item))?;
+        if from == 0 || from > to {
+            return Err(invalid(item));
+        }
+        first.get_or_insert(from);
+    }
+    first.ok_or_else(|| invalid(text))
+}
+
+/// The Hysteria 2 authority: `host`, `host:port`, or `host:portList`. A port
+/// list is the hopping set the service advertises, and no single port names
+/// it, so the list's first port becomes the outbound's destination while the
+/// whole list rides the hop mask.
+fn parse_hysteria_authority(
+    hp: &str,
+    scheme: &str,
+) -> Result<(String, u16, Option<String>), LinkError> {
+    let (host, port_text) = split_host_port(hp, scheme)?;
+    validate_host(&host, scheme)?;
+    let Some(port_text) = port_text else {
+        return Ok((host, 443, None));
+    };
+    if let Some(port) = parse_single_port(port_text, scheme)? {
+        return Ok((host, port, None));
+    }
+    let first = parse_hop_port_list(port_text, scheme)?;
+    Ok((host, first, Some(port_text.to_string())))
+}
+
+/// The salamander packet-size range a Hysteria 2 link carries.
+fn hysteria_packet_size(q: &Query) -> Result<Int32Range, LinkError> {
+    let parse = |value: &str| {
+        value
+            .parse::<i32>()
+            .map_err(|_| malformed(Diag::new(Key::LinkHysteriaPacketSize)))
+    };
+    match (q.get_ne("minPacketSize"), q.get_ne("maxPacketSize")) {
+        (None, None) => Ok(Int32Range::single(0)),
+        (Some(min), None) => Ok(Int32Range::single(parse(min)?)),
+        (None, Some(max)) => Ok(Int32Range::single(parse(max)?)),
+        (Some(min), Some(max)) => {
+            let (min, max) = (parse(min)?, parse(max)?);
+            if min > max {
+                return Err(malformed(Diag::new(Key::LinkHysteriaPacketSize)));
+            }
+            Ok(Int32Range::new(min, max))
+        }
+    }
+}
+
+/// The QUIC parameters a Hysteria 2 link carries: `upmbps`/`downmbps` select
+/// the brutal congestion controller, so a one-sided rate is refused.
+fn hysteria_quic_params(q: &Query) -> Result<Option<FinalmaskQuicParams>, LinkError> {
+    let up = q.get_ne("upmbps");
+    let down = q.get_ne("downmbps");
+    let bbr = q.get_ne("bbr_profile");
+    let parrot = q.get_ne("disable_chrome_parrot");
+    if up.is_none() && down.is_none() && bbr.is_none() && parrot.is_none() {
+        return Ok(None);
+    }
+    if up.is_some() != down.is_some() {
+        return Err(malformed(Diag::new(Key::LinkHysteriaBrutal)));
+    }
+    let mut quic = FinalmaskQuicParams::default();
+    if let (Some(up), Some(down)) = (up, down) {
+        quic.congestion = "force-brutal".into();
+        quic.brutal_up = format!("{} mbps", numeric_param("upmbps", up)?);
+        quic.brutal_down = format!("{} mbps", numeric_param("downmbps", down)?);
+    }
+    if let Some(bbr) = bbr {
+        quic.bbr_profile = bbr.to_string();
+    }
+    if let Some(value) = parrot {
+        quic.disable_chrome_parrot = Some(!matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no"
+        ));
+    }
+    Ok(Some(quic))
+}
+
+/// The `finalmask` a Hysteria 2 link carries: salamander obfuscation,
+/// destination hopping (from the authority's port list or `mport`), and the
+/// QUIC congestion parameters. Returns `None` when the link names none of
+/// them.
+fn hysteria_finalmask(
+    q: &Query,
+    authority_ports: Option<&str>,
+) -> Result<Option<FinalmaskModel>, LinkError> {
+    let mut udp: Vec<FinalmaskUdpMask> = Vec::new();
+    let obfs = q.get_ne("obfs");
+    let obfs_password = q.get_ne("obfs-password");
+    if let Some(kind) = obfs
+        && kind != "salamander"
+    {
+        return Err(LinkError::Unsupported(
+            Diag::new(Key::LinkUnsupportedHysteriaObfs).arg(excerpt_debug(kind)),
+        ));
+    }
+    // A packet size belongs to the salamander mask; without an obfuscation it
+    // names a setting that cannot take effect, so it refuses the link instead
+    // of disappearing.
+    if obfs.is_none()
+        && obfs_password.is_none()
+        && let Some(key) = ["minPacketSize", "maxPacketSize"]
+            .into_iter()
+            .find(|key| q.get_ne(key).is_some())
+    {
+        return Err(LinkError::Unsupported(
+            Diag::new(Key::LinkUnsupportedQueryField).arg(key),
+        ));
+    }
+    if obfs.is_some() || obfs_password.is_some() {
+        let password =
+            obfs_password.ok_or_else(|| malformed(Diag::new(Key::LinkHysteriaObfsPassword)))?;
+        udp.push(FinalmaskUdpMask::Salamander {
+            settings: FinalmaskSalamander {
+                password: password.to_string(),
+                packet_size: hysteria_packet_size(q)?,
+                ..Default::default()
+            },
+            extra: Map::new(),
+        });
+    }
+    // The hop set comes from the authority's port list or `mport` — one
+    // spelling only, so a link naming both is refused rather than silently
+    // preferring one.
+    let ports = match (authority_ports, q.get_ne("mport")) {
+        (Some(_), Some(_)) => {
+            return Err(malformed(Diag::new(Key::LinkQueryDuplicate).arg("mport")));
+        }
+        (Some(ports), None) => ports.to_string(),
+        (None, Some(mport)) => {
+            // The core's `PortList` is the judge of this text; a value it
+            // cannot parse would fail at config load.
+            parse_hop_port_list(mport, "hysteria2")?;
+            mport.to_string()
+        }
+        (None, None) => String::new(),
+    };
+    if ports.is_empty() {
+        // A hop interval names nothing without a hop set.
+        if q.get_ne("hop_interval").is_some() {
+            return Err(LinkError::Unsupported(
+                Diag::new(Key::LinkUnsupportedQueryField).arg("hop_interval"),
+            ));
+        }
+    } else {
+        let mut hop = FinalmaskUdpHop {
+            remote_ports: FinalmaskPortList::Text(ports),
+            ..Default::default()
+        };
+        if let Some(interval) = q.get_ne("hop_interval") {
+            let seconds: i32 = interval
+                .parse()
+                .map_err(|_| malformed(Diag::new(Key::LinkHysteriaHopInterval)))?;
+            hop.mode = "intervalRemote".into();
+            hop.interval = Int32Range::single(seconds);
+        }
+        udp.push(FinalmaskUdpMask::Udphop {
+            settings: Box::new(hop),
+            extra: Map::new(),
+        });
+    }
+    let quic = hysteria_quic_params(q)?;
+    if udp.is_empty() && quic.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(FinalmaskModel {
+        udp,
+        quic_params: quic,
+        ..Default::default()
+    }))
+}
+
+/// `hysteria2://` / `hy2://` — Hysteria 2 over Xray's `hysteria` outbound and
+/// transport. Auth is the userinfo and TLS is always on; the link's
+/// obfuscation and hopping fields map onto `finalmask`.
+fn parse_hysteria2(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+    const SCHEME: &str = "hysteria2";
+    let (auth, query, frag) = split_link(body);
+    let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
+    let q = parse_query(query)?;
+    const OWN: &[&str] = &[
+        "security",
+        "sni",
+        "fp",
+        "alpn",
+        "ech",
+        "pcs",
+        "vcn",
+        "pinSHA256",
+        "obfs",
+        "obfs-password",
+        "minPacketSize",
+        "maxPacketSize",
+        "mport",
+        "hop_interval",
+        "upmbps",
+        "downmbps",
+        "bbr_profile",
+        "disable_chrome_parrot",
+    ];
+    validate_scheme_query(&q, OWN, ignored)?;
+    // Hysteria runs on QUIC with TLS always on: only an explicit `tls` is a
+    // value the grammar can honor.
+    match q.get("security") {
+        Some("") => return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("security"))),
+        Some("tls") | None => {}
+        Some(other) => {
+            return Err(malformed(
+                Diag::new(Key::LinkSecurityUnknown).arg(excerpt_debug(other)),
+            ));
+        }
+    }
+    let (host, port, authority_ports) = parse_hysteria_authority(hp, SCHEME)?;
+    let password = pct_decode(userinfo)?;
+    let mut stream = StreamModel::default();
+    apply_tls_params(&q, &mut stream, &host);
+    // `pinSHA256` is the emitting client's name for the certificate pin; a
+    // comma list names a leaf-certificate thumbprint this grammar cannot
+    // derive.
+    if let Some(pin) = q.get_ne("pinSHA256") {
+        if pin.contains(',') {
+            return Err(malformed(Diag::new(Key::LinkHysteriaPin)));
+        }
+        if let Some(tls) = stream.tls_settings.as_mut() {
+            if !tls.pinned_peer_cert_sha256.is_empty() {
+                return Err(malformed(
+                    Diag::new(Key::LinkQueryDuplicate).arg("pinSHA256"),
+                ));
+            }
+            tls.pinned_peer_cert_sha256 = pin.to_string();
+        }
+    }
+    stream.network = Network::Hysteria;
+    stream.hysteria_settings = Some(HysteriaTransport {
+        version: 2,
+        auth: password,
+        ..Default::default()
+    });
+    stream.finalmask = hysteria_finalmask(&q, authority_ports.as_deref())?;
+    let name = match fragment_name(frag)? {
+        Some(name) => name,
+        None => host.clone(),
+    };
+    let mut outbound = OutboundModel::new(Protocol::Hysteria);
+    outbound.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        version: 2,
+        address: host,
+        port,
+        ..Default::default()
+    });
+    outbound.stream = stream;
+    Ok(ServerProfile::new(name, outbound))
 }
 
 /// The import grammar's `?encryption=` check, delegating to the shared model
@@ -2316,10 +3438,10 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             }
         }
         Network::Hysteria => {
-            // The grammar spells no `type` for this transport, so a profile
-            // that names it cannot cross the import/export boundary either:
-            // the row's own check states the refusal.
-            transport_spec(Network::Hysteria).spelling()?;
+            // The import-only `hysteria2://` links build this transport, so
+            // the arm refuses nothing: export still refuses it through
+            // `transport_params`' `spelling()`, and `vless://…?type=hysteria`
+            // is refused as an unknown transport (the row spells no `type`).
         }
     }
     if let Some(finalmask) = stream.finalmask.as_ref() {
@@ -2423,6 +3545,59 @@ fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue
             }
             if !validate_2022_key(&settings.method, &settings.password) {
                 return Err(malformed(Diag::new(Key::LinkSsKeyMaterial)));
+            }
+        }
+        ProtocolSettings::Socks(settings) => {
+            validate_host(&settings.address, "socks")?;
+            if settings.port == 0 {
+                return Err(malformed(Diag::new(Key::LinkPortZero).arg("socks")));
+            }
+        }
+        ProtocolSettings::Http(settings) => {
+            validate_host(&settings.address, "http")?;
+            if settings.port == 0 {
+                return Err(malformed(Diag::new(Key::LinkPortZero).arg("http")));
+            }
+        }
+        ProtocolSettings::Wireguard(settings) => {
+            // The editor checks key material with `is_valid_wireguard_key`
+            // directly, but the model pass raises no WireGuard key rule (its
+            // `WireguardSecretKeyInvalid` / `WireguardPeerPublicKeyRequired`
+            // variants are declared and never emitted), so an imported link
+            // would otherwise reach the core and fail at config load — after
+            // the preview called it fine.
+            if settings.address.is_empty() {
+                return Err(malformed(Diag::new(Key::LinkWgAddress)));
+            }
+            if !crate::model::outbound::is_valid_wireguard_key(&settings.secret_key) {
+                return Err(malformed(Diag::new(Key::LinkWgSecretKey)));
+            }
+            let Some(peer) = settings.peers.first() else {
+                return Err(malformed(Diag::new(Key::LinkWgPeer)));
+            };
+            if peer.endpoint.is_empty() {
+                return Err(malformed(Diag::new(Key::LinkWgPeer)));
+            }
+            if !crate::model::outbound::is_valid_wireguard_key(&peer.public_key) {
+                return Err(malformed(Diag::new(Key::LinkWgPublicKey)));
+            }
+            if !peer.pre_shared_key.is_empty()
+                && !crate::model::outbound::is_valid_wireguard_key(&peer.pre_shared_key)
+            {
+                return Err(malformed(Diag::new(Key::LinkWgPresharedKey)));
+            }
+            if settings
+                .reserved
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() != 3)
+            {
+                return Err(malformed(Diag::new(Key::LinkWgReserved)));
+            }
+        }
+        ProtocolSettings::Hysteria(settings) => {
+            validate_host(&settings.address, "hysteria2")?;
+            if settings.port == 0 {
+                return Err(malformed(Diag::new(Key::LinkPortZero).arg("hysteria2")));
             }
         }
         other => return Err(unsupported_protocol(other.protocol())),
@@ -2662,8 +3837,9 @@ fn validate_exportable(profile: &ServerProfile) -> Result<(), LinkError> {
 // ---------- public API ----------
 
 /// Parse one share link into a fresh profile (random uuid id; name from the
-/// `#fragment`, else the server host).
-pub fn parse_link(s: &str) -> Result<ServerProfile, LinkError> {
+/// `#fragment`, else the server host) plus the compatibility parameters the
+/// grammar recognized but dropped.
+pub fn parse_link(s: &str) -> Result<ParsedLink, LinkError> {
     let s = s.trim();
     if s.len() > MAX_LINK_LEN {
         return Err(malformed(
@@ -2689,20 +3865,27 @@ pub fn parse_link(s: &str) -> Result<ServerProfile, LinkError> {
     }
     let body = &s[scheme_end + 3..];
     let lowered = scheme.to_ascii_lowercase();
-    let profile = match SHAREABLE.iter().find(|row| row.scheme == lowered.as_str()) {
-        Some(row) => (row.parse)(body),
-        None => Err(LinkError::Unsupported(
-            Diag::new(Key::LinkUnsupportedScheme).arg(excerpt(&lowered)),
-        )),
-    }?;
+    let row = SHAREABLE
+        .iter()
+        .chain(IMPORT_ONLY)
+        .find(|row| row.scheme == lowered.as_str());
+    let mut ignored = Vec::new();
+    let profile = match row {
+        Some(row) => (row.parse)(body, &mut ignored)?,
+        None => {
+            return Err(LinkError::Unsupported(
+                Diag::new(Key::LinkUnsupportedScheme).arg(excerpt(&lowered)),
+            ));
+        }
+    };
     validate_profile(&profile)?;
-    Ok(profile)
+    Ok(ParsedLink { profile, ignored })
 }
 
 /// Parse a paste/subscription blob: one link per line; blank lines and
 /// `#comment` lines are skipped. The whole blob is bounded by
 /// [`MAX_BULK_LEN`]; an oversized blob yields one `Malformed` error entry.
-pub fn parse_bulk(text: &str) -> Vec<Result<ServerProfile, LinkError>> {
+pub fn parse_bulk(text: &str) -> Vec<Result<ParsedLink, LinkError>> {
     if text.len() > MAX_BULK_LEN {
         return vec![Err(malformed(
             Diag::new(Key::LinkSubscriptionTooLarge)
@@ -2725,7 +3908,7 @@ pub fn parse_bulk(text: &str) -> Vec<Result<ServerProfile, LinkError>> {
 pub fn parse_bulk_cancellable(
     text: &str,
     cancel: &AtomicBool,
-) -> Option<Vec<Result<ServerProfile, LinkError>>> {
+) -> Option<Vec<Result<ParsedLink, LinkError>>> {
     if text.len() > MAX_BULK_LEN {
         return Some(vec![Err(malformed(
             Diag::new(Key::LinkSubscriptionTooLarge)
@@ -2845,13 +4028,23 @@ mod tests {
         assert_profile_eq(&p1, &p2);
         let s3 = to_link(&p2).unwrap();
         assert_eq!(s2, s3, "canonical form not stable for {}", redact(s));
-        (p2, s3)
+        (p2.profile, s3)
     }
 
     fn vmess_json(v: Value) -> String {
         format!(
             "vmess://{}",
             STANDARD.encode(serde_json::to_vec(&v).unwrap())
+        )
+    }
+
+    /// A valid `wg://` link: the model pass needs a 32-byte key pair and a
+    /// peer endpoint.
+    fn wireguard_link() -> String {
+        let secret = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let public = URL_SAFE_NO_PAD.encode([2_u8; 32]);
+        format!(
+            "wg://198.51.100.9:51820?private_key={secret}&public_key={public}&local_address=10.0.0.2%2F32#WG"
         )
     }
 
@@ -3403,10 +4596,42 @@ mod tests {
     }
 
     #[test]
-    fn vless_tcp_http_camo_query_is_rejected() {
-        expect_unsupported(&format!(
-            "vless://{UUID}@camo.example.com:8080?type=tcp&headerType=http&host=cdn.example.com&path=%2Fcamo"
-        ));
+    fn raw_http_camouflage_query_maps_into_raw_settings() {
+        // A client emits raw HTTP camouflage as `type=tcp&headerType=http` plus
+        // host/path; the model carries the same block the legacy VMess JSON
+        // path builds.
+        let link = format!(
+            "vless://{UUID}@camo.local:8080?encryption=none&type=tcp&headerType=http&host=cdn.example.com&path=%2Fcamo"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty());
+        let header = parsed
+            .outbound
+            .stream
+            .raw_settings
+            .as_ref()
+            .and_then(|settings| settings.header.as_ref())
+            .expect("the camouflage maps into rawSettings");
+        assert_eq!(header.r#type, "http");
+        let request = header.request.as_ref().expect("http carries a request");
+        assert_eq!(request.path, vec!["/camo".to_string()]);
+        assert_eq!(
+            request.headers["Host"],
+            Value::String("cdn.example.com".into())
+        );
+    }
+
+    #[test]
+    fn raw_header_type_none_is_a_silent_no_op() {
+        // Every `type=tcp` link a client emits carries `headerType=none`; it
+        // is the absence of camouflage, so it neither sets anything nor joins
+        // the dropped-parameter report.
+        let parsed = parse_link(&format!(
+            "vless://{UUID}@plain.local:443?encryption=none&type=tcp&headerType=none"
+        ))
+        .unwrap();
+        assert!(parsed.ignored.is_empty());
+        assert!(parsed.outbound.stream.raw_settings.is_none());
     }
 
     #[test]
@@ -3844,8 +5069,21 @@ mod tests {
     }
 
     #[test]
-    fn trojan_allow_insecure_is_rejected() {
-        expect_unsupported("trojan://pw@ai.example.com:443?allowInsecure=1&sni=x.com#AI");
+    fn insecure_switches_are_ignored_with_a_report() {
+        // `allowInsecure` / `insecure` have no Xray field (the certificate pin
+        // replaces them). Import keeps verification on, keeps the model
+        // default, and reports the drop.
+        let parsed = parse_link("trojan://pw@ai.example.com:443?allowInsecure=1&sni=x.com#AI")
+            .expect("an insecure request must not refuse the link");
+        assert_eq!(parsed.ignored, vec!["allowInsecure".to_string()]);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "x.com");
+        assert!(tls.pinned_peer_cert_sha256.is_empty());
+
+        // A switch spelling its off value is the default already: silent.
+        let parsed =
+            parse_link("trojan://pw@ai.example.com:443?allowInsecure=0&sni=x.com#AI").unwrap();
+        assert!(parsed.ignored.is_empty());
     }
 
     #[test]
@@ -4070,6 +5308,347 @@ mod tests {
         // an oversized body is rejected as Malformed without decoding.
         let body = STANDARD.encode(vec![0_u8; MAX_B64_INPUT_LEN]);
         expect_malformed(&format!("vmess://{body}"));
+    }
+
+    // ----- import-only schemes -----
+
+    #[test]
+    fn socks_accepts_both_userinfo_spellings_and_defaults_the_port() {
+        let parsed = parse_link("socks5://alice:s3cr3t@h.example.com#S").unwrap();
+        let ProtocolSettings::Socks(settings) = &parsed.outbound.settings else {
+            panic!("expected a socks profile");
+        };
+        assert_eq!(settings.address, "h.example.com");
+        assert_eq!(settings.port, 1080);
+        assert_eq!(settings.user, "alice");
+        assert_eq!(settings.pass, "s3cr3t");
+
+        // The base64 `user:pass` userinfo spelling.
+        let userinfo = URL_SAFE_NO_PAD.encode("bob:hunter2");
+        let parsed = parse_link(&format!("socks://{userinfo}@h.example.com:1080#S")).unwrap();
+        let ProtocolSettings::Socks(settings) = &parsed.outbound.settings else {
+            panic!("expected a socks profile");
+        };
+        assert_eq!(settings.user, "bob");
+        assert_eq!(settings.pass, "hunter2");
+
+        // `uot` has no Xray field; the link still imports and reports it.
+        let parsed = parse_link("socks5://h.example.com:1080?uot=1#S").unwrap();
+        assert_eq!(parsed.ignored, vec!["uot".to_string()]);
+    }
+
+    #[test]
+    fn http_https_and_headers_map() {
+        let parsed = parse_link(
+            "https://bob:hunter2@proxy.example.com?headers=X-A,1,X-B,2&path=%2Ftunnel#H",
+        )
+        .unwrap();
+        assert_eq!(parsed.ignored, vec!["path".to_string()]);
+        assert_eq!(parsed.outbound.stream.security, Security::Tls);
+        let ProtocolSettings::Http(settings) = &parsed.outbound.settings else {
+            panic!("expected an http profile");
+        };
+        assert_eq!(settings.port, 443);
+        assert_eq!(settings.headers["X-A"], Value::String("1".into()));
+        assert_eq!(settings.headers["X-B"], Value::String("2".into()));
+
+        // Plain `http` keeps its default port and no TLS.
+        let plain = parse_link("http://h.example.com#P").unwrap();
+        assert_eq!(plain.outbound.stream.security, Security::None);
+        assert_eq!(plain.outbound.protocol, Protocol::Http);
+        let ProtocolSettings::Http(settings) = &plain.outbound.settings else {
+            panic!("expected an http profile");
+        };
+        assert_eq!(settings.port, 80);
+
+        // An odd name,value list has no pairing.
+        expect_malformed("http://h.example.com?headers=only-name#H");
+
+        // `security=none` contradicts the scheme rather than a setting.
+        expect_malformed("https://h.example.com?security=none#H");
+        // `security=tls` on plain `http` turns TLS on, as the clients do.
+        let upgraded = parse_link("http://h.example.com?security=tls&sni=h.example.com#H").unwrap();
+        assert_eq!(upgraded.outbound.stream.security, Security::Tls);
+    }
+
+    #[test]
+    fn wireguard_accepts_both_client_grammars() {
+        let secret = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let public = URL_SAFE_NO_PAD.encode([2_u8; 32]);
+
+        // Private key in a parameter, dash-joined local addresses, plus an
+        // AmneziaWG switch with no Xray field.
+        let parameter_form = format!(
+            "wg://198.51.100.9:2408?private_key={secret}&local_address=10.0.0.2%2F32-2001%3Adb8%3A%3A2%2F128&public_key={public}&reserved=15-62-190&persistent_keepalive_interval=25&use_system_interface=true&jc=4#WG"
+        );
+        let parsed = parse_link(&parameter_form).unwrap();
+        assert_eq!(
+            parsed.ignored,
+            vec!["use_system_interface".to_string(), "jc".to_string()]
+        );
+        let ProtocolSettings::Wireguard(settings) = &parsed.outbound.settings else {
+            panic!("expected a wireguard profile");
+        };
+        assert_eq!(settings.secret_key, secret);
+        assert_eq!(
+            settings.address,
+            vec!["10.0.0.2/32".to_string(), "2001:db8::2/128".to_string()]
+        );
+        assert_eq!(settings.reserved, Some(vec![15, 62, 190]));
+        assert_eq!(settings.peers[0].public_key, public);
+        assert_eq!(settings.peers[0].endpoint, "198.51.100.9:2408");
+        assert_eq!(settings.peers[0].keep_alive, Some(25));
+
+        // Private key in the userinfo, comma-joined addresses, and a DNS entry.
+        let userinfo_form = format!(
+            "wireguard://{secret}@198.51.100.9:2408?publickey={public}&address=10.0.0.2%2F32&mtu=1280&dns=1.1.1.1#WG2"
+        );
+        let parsed = parse_link(&userinfo_form).unwrap();
+        assert!(parsed.ignored.is_empty());
+        let ProtocolSettings::Wireguard(settings) = &parsed.outbound.settings else {
+            panic!("expected a wireguard profile");
+        };
+        assert_eq!(settings.mtu, 1280);
+        assert_eq!(settings.remote_dns, vec!["1.1.1.1".to_string()]);
+
+        // Two spellings of one field must not silently pick a winner.
+        expect_malformed(&format!(
+            "wg://h.example.com:51820?private_key={secret}&privatekey={secret}&public_key={public}&local_address=10.0.0.2%2F32"
+        ));
+    }
+
+    #[test]
+    fn wireguard_refuses_material_the_core_cannot_use() {
+        // The model pass raises no WireGuard key rule, so the import grammar
+        // checks the material itself; otherwise the profile would only fail at
+        // core config load, after the preview called it importable.
+        let secret = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let public = URL_SAFE_NO_PAD.encode([2_u8; 32]);
+        expect_malformed(
+            "wg://h.example.com:51820?private_key=not-a-key&public_key=also-not&local_address=10.0.0.2%2F32",
+        );
+        expect_malformed(&format!(
+            "wg://h.example.com:51820?private_key={secret}&public_key=not-a-key&local_address=10.0.0.2%2F32"
+        ));
+        expect_malformed(&format!(
+            "wg://h.example.com:51820?private_key={secret}&public_key={public}&local_address=10.0.0.2%2F32&reserved=1-2"
+        ));
+    }
+
+    #[test]
+    fn default_port_grammars_still_refuse_a_garbled_bracketed_host() {
+        // The import-only schemes supply a default port, so bytes after the
+        // closing bracket that are not a port must not be swallowed.
+        expect_malformed("socks5://[::1]junk#S");
+        expect_malformed("hysteria2://pw@[::1]x#H");
+
+        // A bracketed literal with no port takes the scheme default.
+        let parsed = parse_link("socks5://[::1]#S").unwrap();
+        let ProtocolSettings::Socks(settings) = &parsed.outbound.settings else {
+            panic!("expected a socks profile");
+        };
+        assert_eq!(settings.address, "::1");
+        assert_eq!(settings.port, 1080);
+    }
+
+    #[test]
+    fn hysteria2_authority_port_range_forms_the_hop_set() {
+        // A provider link puts the hop range in the authority; the range's
+        // first port becomes the outbound destination and the whole list rides
+        // the hop mask.
+        let parsed = parse_link(
+            "hysteria2://letmein@hop.example.com:20000-30000?security=tls&sni=hop.example.com&allowInsecure=true#Node",
+        )
+        .unwrap();
+        assert_eq!(parsed.ignored, vec!["allowInsecure".to_string()]);
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.port, 20000);
+        assert_eq!(
+            parsed
+                .outbound
+                .stream
+                .tls_settings
+                .as_ref()
+                .unwrap()
+                .server_name,
+            "hop.example.com"
+        );
+        let finalmask = parsed.outbound.stream.finalmask.as_ref().unwrap();
+        let hop = finalmask
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Udphop { settings, .. } => Some(settings.as_ref()),
+                _ => None,
+            })
+            .expect("the authority range maps onto the udphop mask");
+        assert!(
+            matches!(&hop.remote_ports, FinalmaskPortList::Text(ports) if ports == "20000-30000")
+        );
+        assert_eq!(hop.mode, "perConnRemote");
+
+        // A mixed list keeps every item.
+        let parsed = parse_link("hysteria2://pw@h.example.com:20000-30000,443").unwrap();
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.port, 20000);
+        let hop = parsed
+            .outbound
+            .stream
+            .finalmask
+            .as_ref()
+            .unwrap()
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Udphop { settings, .. } => Some(settings.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&hop.remote_ports, FinalmaskPortList::Text(ports) if ports == "20000-30000,443")
+        );
+    }
+
+    #[test]
+    fn hysteria2_refuses_two_hop_spellings_and_bad_port_lists() {
+        expect_malformed("hysteria2://pw@h.example.com:20000-30000?mport=20000-30000");
+        expect_malformed("hysteria2://pw@h.example.com:30000-20000");
+        expect_malformed("hysteria2://pw@h.example.com?mport=bogus");
+        expect_malformed("hysteria2://pw@h.example.com:0");
+        // A hop interval names nothing without a hop set.
+        expect_unsupported("hysteria2://pw@h.example.com:443?hop_interval=30");
+    }
+
+    #[test]
+    fn hysteria2_maps_obfs_hop_and_rates() {
+        let pin = "a".repeat(64);
+        let link = format!(
+            "hysteria2://letmein@h.example.com:8443?sni=edge.example.com&alpn=h3&pinSHA256={pin}&obfs=salamander&obfs-password=obfspw&minPacketSize=1000&maxPacketSize=1400&mport=20000-30000%2C443&hop_interval=30&upmbps=100&downmbps=500&disable_chrome_parrot=true#Hy2"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty());
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.address, "h.example.com");
+        assert_eq!(settings.port, 8443);
+        assert_eq!(settings.version, 2);
+
+        let stream = &parsed.outbound.stream;
+        assert_eq!(stream.network, Network::Hysteria);
+        assert_eq!(stream.security, Security::Tls);
+        assert_eq!(stream.hysteria_settings.as_ref().unwrap().auth, "letmein");
+        let tls = stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "edge.example.com");
+        assert_eq!(tls.alpn, vec!["h3".to_string()]);
+        assert_eq!(tls.pinned_peer_cert_sha256, pin);
+
+        let finalmask = stream.finalmask.as_ref().unwrap();
+        let salamander = finalmask
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Salamander { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .expect("obfs maps onto the salamander mask");
+        assert_eq!(salamander.password, "obfspw");
+        assert_eq!(salamander.packet_size, Int32Range::new(1000, 1400));
+        let hop = finalmask
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Udphop { settings, .. } => Some(settings.as_ref()),
+                _ => None,
+            })
+            .expect("mport maps onto the udphop mask");
+        assert!(matches!(
+            &hop.remote_ports,
+            FinalmaskPortList::Text(ports) if ports == "20000-30000,443"
+        ));
+        assert_eq!(hop.mode, "intervalRemote");
+        assert_eq!(hop.interval, Int32Range::single(30));
+        let quic = finalmask.quic_params.as_ref().unwrap();
+        assert_eq!(quic.congestion, "force-brutal");
+        assert_eq!(quic.brutal_up, "100 mbps");
+        assert_eq!(quic.brutal_down, "500 mbps");
+        assert_eq!(quic.disable_chrome_parrot, Some(true));
+    }
+
+    #[test]
+    fn hysteria2_refuses_gecko_realm_and_one_sided_rates() {
+        expect_unsupported("hysteria2://pw@h.example.com:443?obfs=gecko&obfs-password=x");
+        expect_unsupported("hysteria2+realm://token@h.example.com:443/realm");
+        // A packet size only exists for the salamander mask.
+        expect_unsupported("hysteria2://pw@h.example.com:443?minPacketSize=1000");
+        expect_malformed("hysteria2://pw@h.example.com:443?upmbps=100");
+        expect_malformed(&format!(
+            "hysteria2://pw@h.example.com:443?pinSHA256={},{}",
+            "a".repeat(64),
+            "b".repeat(64)
+        ));
+    }
+
+    #[test]
+    fn recognized_compatibility_parameters_are_dropped_and_reported() {
+        // A parameter with no effective Xray field imports, keeps the model
+        // default, and names itself in the report.
+        let parsed = parse_link(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=none&security=tls&sni=h.example.com&mux=true&packetEncoding=xudp#M"
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.ignored,
+            vec!["mux".to_string(), "packetEncoding".to_string()]
+        );
+        assert!(parsed.outbound.mux.is_empty());
+
+        // A switch spelling its off value is the default already: silent.
+        let parsed = parse_link(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=none&security=tls&sni=h.example.com&mux=false#M"
+        ))
+        .unwrap();
+        assert!(parsed.ignored.is_empty());
+
+        // A bare flag is present in the link: it is reported, not assumed off.
+        let parsed = parse_link(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=none&security=tls&sni=h.example.com&mux#M"
+        ))
+        .unwrap();
+        assert_eq!(parsed.ignored, vec!["mux".to_string()]);
+
+        // A parameter the grammar does not know still refuses the link.
+        expect_unsupported(&format!(
+            "vless://{UUID}@h.example.com:443?encryption=none&futureTransport=1"
+        ));
+    }
+
+    #[test]
+    fn legacy_vmess_maps_tls_extras_and_drops_insecure() {
+        let pin = "a".repeat(64);
+        let link = vmess_json(serde_json::json!({
+            "v": "2", "ps": "V", "add": "v.example.com", "port": "443",
+            "id": UUID, "aid": "0", "scy": "auto", "net": "tcp", "tls": "tls",
+            "sni": "v.example.com", "insecure": "1", "vcn": "v.example.com", "pcs": pin
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(parsed.ignored, vec!["insecure".to_string()]);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.verify_peer_cert_by_name, "v.example.com");
+        assert_eq!(tls.pinned_peer_cert_sha256, pin);
+
+        // `insecure=0` is the default state: nothing was dropped.
+        let link = vmess_json(serde_json::json!({
+            "v": "2", "ps": "V", "add": "v.example.com", "port": "443",
+            "id": UUID, "aid": "0", "net": "tcp", "tls": "tls",
+            "sni": "v.example.com", "insecure": "0"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty());
     }
 
     // ----- malformed / unsupported -----
@@ -4718,23 +6297,55 @@ mod tests {
     }
     #[test]
     fn unsupported_inputs() {
-        expect_unsupported("http://example.com");
-        expect_unsupported("hy2://pw@h.example.com:443");
-        expect_unsupported("socks5://u:p@h.example.com:1080");
+        expect_unsupported("socks4://u:p@h.example.com:1080");
+        expect_unsupported("socks4a://u:p@h.example.com:1080");
+        expect_unsupported("hysteria://pw@h.example.com:443");
         expect_unsupported(&format!("vless://{UUID}@h.example.com:443?security=xtls"));
         expect_unsupported(&format!("vless://{UUID}@h.example.com:443?type=http"));
         expect_unsupported(&format!("vless://{UUID}@h.example.com:443?type=quic"));
-        expect_unsupported(&format!(
+        expect_malformed(&format!(
             "vless://{UUID}@h.example.com:443?type=tcp&headerType=bogus"
         ));
     }
 
     #[test]
-    fn to_link_unsupported_protocols() {
-        let p = ServerProfile::new("x", OutboundModel::new(Protocol::Wireguard));
-        match to_link(&p) {
-            Err(LinkError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported, got {}", outcome_shape(&other)),
+    fn to_link_refuses_the_import_only_protocols() {
+        // The import grammar names these protocols; export renders none of
+        // them. Hysteria refuses through its transport (the row spells no
+        // `type`) before the protocol-level check, exactly as it did before
+        // the hysteria2 link existed.
+        let cases = [
+            (
+                parse_link("socks5://u:p@h.example.com:1080")
+                    .unwrap()
+                    .profile,
+                t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"socks"]),
+            ),
+            (
+                parse_link("http://h.example.com:8080").unwrap().profile,
+                t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"http"]),
+            ),
+            (
+                parse_link("hysteria2://pw@h.example.com:443")
+                    .unwrap()
+                    .profile,
+                t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[]),
+            ),
+            (
+                parse_link(&wireguard_link()).unwrap().profile,
+                t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"wireguard"]),
+            ),
+        ];
+        for (profile, expected) in cases {
+            match to_link(&profile) {
+                Err(LinkError::Unsupported(message)) => {
+                    assert_eq!(message.text(Language::En), expected);
+                }
+                other => panic!(
+                    "expected Unsupported({expected:?}), got {}",
+                    outcome_shape(&other)
+                ),
+            }
         }
     }
 
@@ -4852,7 +6463,7 @@ mod tests {
         ];
         let mut servers = crate::model::ServersFile::default();
         for link in &links {
-            servers.profiles.push(parse_link(link).unwrap());
+            servers.profiles.push(parse_link(link).unwrap().profile);
         }
         let cfg = crate::r#gen::generate(&servers, &crate::model::Settings::default())
             .expect("generate config");
