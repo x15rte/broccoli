@@ -496,14 +496,17 @@ impl Default for DokodemoCfg {
     }
 }
 
+/// Bit per network token a dokodemo `network` list may name (Xray ORs the
+/// tokens it reads; `infra/conf/common.go:77`).
+const DOKODEMO_TCP: u8 = 1;
+const DOKODEMO_UDP: u8 = 2;
+const DOKODEMO_UNIX: u8 = 4;
+
 impl DokodemoCfg {
     /// Parse Xray's comma-separated NetworkList without normalizing the stored
     /// string. Xray accepts token casing, but does not trim token whitespace.
     pub(crate) fn network_mode(&self) -> Result<DokodemoNetwork, String> {
-        const TCP: u8 = 1;
-        const UDP: u8 = 2;
-        const TCP_UDP: u8 = TCP | UDP;
-        const UNIX: u8 = 4;
+        const TCP_UDP: u8 = DOKODEMO_TCP | DOKODEMO_UDP;
 
         if self.network.is_empty() {
             return Err("listener network is empty".into());
@@ -515,27 +518,44 @@ impl DokodemoCfg {
                 return Err("listener network contains an empty token".into());
             }
             if fold_eq(token, "tcp") {
-                networks |= TCP;
+                networks |= DOKODEMO_TCP;
             } else if fold_eq(token, "udp") {
-                networks |= UDP;
+                networks |= DOKODEMO_UDP;
             } else if fold_eq(token, "unix") {
-                networks |= UNIX;
+                networks |= DOKODEMO_UNIX;
             } else {
                 return Err(format!("listener network contains unknown token {token:?}"));
             }
         }
 
-        if networks & UNIX != 0 && networks & (TCP | UDP) != 0 {
+        if networks & DOKODEMO_UNIX != 0 && networks & (DOKODEMO_TCP | DOKODEMO_UDP) != 0 {
             return Err("UNIX cannot be mixed with TCP or UDP in one inbound".into());
         }
 
         match networks {
-            TCP => Ok(DokodemoNetwork::Tcp),
-            UDP => Ok(DokodemoNetwork::Udp),
+            DOKODEMO_TCP => Ok(DokodemoNetwork::Tcp),
+            DOKODEMO_UDP => Ok(DokodemoNetwork::Udp),
             TCP_UDP => Ok(DokodemoNetwork::TcpUdp),
-            UNIX => Ok(DokodemoNetwork::Unix),
+            DOKODEMO_UNIX => Ok(DokodemoNetwork::Unix),
             _ => Err("listener network is empty".into()),
         }
+    }
+
+    /// The IP protocol mask the emitted inbound binds when [`Self::network_mode`]
+    /// fails: the emitter answers an unparseable mode with the IP envelope
+    /// (`to_wire`), and the core still serves the tokens it could read
+    /// (infra/conf/common.go:77) — `tcp,` binds TCP, live on the pinned binary.
+    /// Zero when no token names tcp or udp: that shape binds nothing.
+    pub(crate) fn implied_ip_protocols(&self) -> u8 {
+        self.network.split(',').fold(0, |mask, token| {
+            if fold_eq(token, "tcp") {
+                mask | DOKODEMO_TCP
+            } else if fold_eq(token, "udp") {
+                mask | DOKODEMO_UDP
+            } else {
+                mask
+            }
+        })
     }
 
     /// Wire form of the dokodemo inbound. `enabled` and `tag` are GUI state;

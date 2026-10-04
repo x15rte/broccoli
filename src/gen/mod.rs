@@ -1134,14 +1134,6 @@ mod dokodemo_unix_tests {
         }
     }
 
-    fn generation_error(config: DokodemoCfg) -> String {
-        let mut settings = Settings::default();
-        settings.dokodemo.push(config);
-        generate_with_api_port(&ServersFile::default(), &settings, 19999)
-            .expect_err("invalid dokodemo must be rejected")
-            .to_string()
-    }
-
     #[test]
     fn unix_listener_uses_path_envelope_without_port() {
         let socket_path = r"C:\broccoli\sockets\dns.sock";
@@ -1166,42 +1158,78 @@ mod dokodemo_unix_tests {
         assert_eq!(inbound["settings"]["port"], 53);
     }
 
+    /// The dokodemo shapes the pinned core *starts* with (a real `xray run`,
+    /// not `run -test`, which never starts a listener): an unknown or empty
+    /// `network` token emits the IP envelope and the core logs no listening
+    /// endpoint for it, while its tokens that do parse still bind (`tcp,`
+    /// serves TCP), and a zero listen port is dropped so nothing binds. Those
+    /// warn and generation keeps working. The shape that fails the core's own
+    /// load keeps gating: a blank UNIX socket path emits a port-less blank
+    /// `listen` the core refuses ("Listen on AnyIP but no Port(s) set in
+    /// InboundDetour").
     #[test]
-    fn malformed_unix_and_network_endpoints_are_rejected() {
-        let cases = [
-            (
-                enabled_dokodemo("unix", "   ", 0),
-                "needs a UNIX socket path",
-            ),
-            (
-                enabled_dokodemo("unix,tcp", r"C:\broccoli\xray.sock", 5353),
-                "UNIX cannot be mixed with TCP or UDP",
-            ),
-            (
-                enabled_dokodemo("quic", r"C:\broccoli\xray.sock", 5353),
-                "unknown token",
-            ),
-            (
-                enabled_dokodemo("", r"C:\broccoli\xray.sock", 5353),
-                "listener network is empty",
-            ),
-            (
-                enabled_dokodemo("tcp,", r"C:\broccoli\xray.sock", 5353),
-                "empty token",
-            ),
-            (
-                enabled_dokodemo("tcp", r"C:\broccoli\xray.sock", 0),
-                "needs a non-zero listen port",
-            ),
-        ];
-
-        for (config, expected) in cases {
-            let error = generation_error(config);
-            assert!(
-                error.contains(expected),
-                "{error:?} did not contain {expected:?}"
+    fn dokodemo_shapes_the_core_starts_with_warn_instead_of_gating() {
+        for config in [
+            enabled_dokodemo("quic", r"C:\broccoli\xray.sock", 5353),
+            enabled_dokodemo("", r"C:\broccoli\xray.sock", 5353),
+            enabled_dokodemo("tcp,", r"C:\broccoli\xray.sock", 5353),
+            enabled_dokodemo("unix,tcp", r"C:\broccoli\xray.sock", 5353),
+            enabled_dokodemo("tcp", r"C:\broccoli\xray.sock", 0),
+        ] {
+            let mut settings = Settings::default();
+            settings.dokodemo.push(config.clone());
+            let verdict = crate::model::validation::validate_settings(
+                &settings,
+                &ServersFile::default(),
+                19999,
             );
+            assert!(!verdict.has_blocking(), "{config:?} must not gate");
+            assert!(
+                verdict.advisory().next().is_some(),
+                "{config:?} must warn: {verdict:?}"
+            );
+            generate_with_api_port(&ServersFile::default(), &settings, 19999)
+                .expect("the core starts with this shape");
         }
+
+        let mut settings = Settings::default();
+        settings.dokodemo.push(enabled_dokodemo("unix", "   ", 0));
+        let error = generate_with_api_port(&ServersFile::default(), &settings, 19999)
+            .expect_err("a blank socket path still gates")
+            .to_string();
+        assert!(error.contains("needs a UNIX socket path"), "{error:?}");
+    }
+
+    /// An unparseable mode still emits the IP envelope, so the tokens it does
+    /// name bind: two such entries on one address:port collide exactly like
+    /// parsed ones (the core exits at start on the second bind — live on the
+    /// pinned binary), while an entry whose tokens name only tcp/udp-free
+    /// spellings binds nothing and collides with nobody.
+    #[test]
+    fn warned_dokodemo_modes_still_join_the_listener_conflict_walk() {
+        let dokodemo = |tag: &str, network: &str| DokodemoCfg {
+            tag: tag.into(),
+            ..enabled_dokodemo(network, "", 5399)
+        };
+        let mut settings = Settings::default();
+        settings.local_inbounds[0].enabled = false;
+        settings.local_inbounds[1].enabled = false;
+
+        settings.dokodemo = vec![
+            dokodemo("in-doko-one", "tcp,"),
+            dokodemo("in-doko-two", "icmp"),
+        ];
+        generate_with_api_port(&ServersFile::default(), &settings, 19999)
+            .expect("only one of the two warned entries binds");
+
+        settings.dokodemo = vec![
+            dokodemo("in-doko-one", "tcp,"),
+            dokodemo("in-doko-two", "tcp,icmp"),
+        ];
+        let error = generate_with_api_port(&ServersFile::default(), &settings, 19999)
+            .expect_err("the implied TCP listeners collide")
+            .to_string();
+        assert!(error.contains("conflicts"), "{error}");
     }
 
     #[test]

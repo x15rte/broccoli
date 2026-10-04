@@ -476,14 +476,30 @@ pub enum ValidationCode {
     /// A dokodemo entry without a stable tag (1-based index).
     DokodemoTagMissing(usize),
     /// A dokodemo entry whose `network` does not name a legal mode (tag,
-    /// the mode parser's error text).
+    /// the mode parser's error text). `Network.Build` maps an unknown or empty
+    /// token onto `Network_Unknown` and the core starts without listening on
+    /// anything (infra/conf/common.go:77; live on the pinned binary: the
+    /// process runs and logs no listening endpoint), so this is an accepted
+    /// value that cannot work as configured — advisory
+    /// (Severity::Warning), never a gate.
     DokodemoNetworkInvalid(String, String),
-    /// A dokodemo UNIX listener without a socket path (tag).
+    /// A dokodemo UNIX listener without a socket path (tag). Error tier: the
+    /// emitted inbound carries the blank path as its top-level `listen` with
+    /// no port, and the core refuses the whole document at load ("Listen on
+    /// AnyIP but no Port(s) set in InboundDetour"; live on the pinned
+    /// binary), so the profile never runs.
     DokodemoUnixSocketRequired(String),
     /// Two dokodemo UNIX listeners normalize to the same socket path
-    /// (tag, other tag, path).
+    /// (tag, other tag, path). Error tier: the second listener cannot bind and
+    /// the core exits at start ("failed to listen Unix Domain Socket on ...",
+    /// live on the pinned binary), so the profile never runs.
     DokodemoUnixSocketConflict(String, String, String),
-    /// A dokodemo IP listener with listen port 0 (tag).
+    /// A dokodemo IP listener with listen port 0 (tag). Advisory
+    /// (Severity::Warning): the core drops a numeric zero port
+    /// (infra/conf/common.go:274-276) and creates no worker, so the inbound
+    /// binds nothing — an accepted value that cannot work as configured, the
+    /// same shape as [`Self::DokodemoNetworkInvalid`]. Live on the pinned
+    /// binary: the process starts and logs no listening endpoint.
     DokodemoPortZero(String),
     /// TUN mode without an IPv4 gateway: the adapter would carry no address
     /// while the in-tun DNS listener pins an address no adapter owns.
@@ -4342,7 +4358,7 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
         let tag = inbound.tag.clone();
         let mode = inbound.network_mode();
         if let Err(error) = &mode {
-            issues.push(issue(
+            issues.push(warning(
                 ValidationCode::DokodemoNetworkInvalid(excerpt(&tag), excerpt(error)),
                 None,
             ));
@@ -4383,7 +4399,10 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
             }
             Ok(DokodemoNetwork::Tcp | DokodemoNetwork::Udp | DokodemoNetwork::TcpUdp) => {
                 if inbound.listen_port == 0 {
-                    issues.push(issue(ValidationCode::DokodemoPortZero(excerpt(&tag)), None));
+                    issues.push(warning(
+                        ValidationCode::DokodemoPortZero(excerpt(&tag)),
+                        None,
+                    ));
                 }
                 let listen_valid = validate_listen_address(&inbound.listen).is_ok();
                 if !listen_valid {
@@ -4403,7 +4422,23 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
                     ));
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                // The emitter answers an unparseable mode with the IP
+                // envelope, so the tokens the core could still read bind and
+                // must join the conflict walk: `tcp,` serves TCP on the
+                // emitted `listen`+port, while an unknown-only token binds
+                // nothing.
+                let protocols = inbound.implied_ip_protocols();
+                let listen_valid = validate_listen_address(&inbound.listen).is_ok();
+                if protocols != 0 && listen_valid && inbound.listen_port != 0 {
+                    ip_listeners.push((
+                        format!("dokodemo inbound {:?}", excerpt(&tag)),
+                        inbound.listen.clone(),
+                        inbound.listen_port,
+                        protocols,
+                    ));
+                }
+            }
         }
         if !inbound_tags.insert(tag.clone()) {
             issues.push(issue(
