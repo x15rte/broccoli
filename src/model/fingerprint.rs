@@ -26,11 +26,11 @@
 //!   model rule and the editor's REALITY inline verdict):
 //!   [`reality_wire_supported`], the wire vocabulary minus the private
 //!   `REALITY_REJECTED_FINGERPRINTS` (`unsafe`, `hellogolang`), compared
-//!   ASCII case-insensitively;
+//!   under the core's own fold;
 //! - the untested-value advisory (the stream REALITY block's
 //!   `RealityFingerprintUntested` warning and the editor's REALITY inline
 //!   verdict): [`reality_fingerprint_outside_known_good`], the complement of
-//!   [`REALITY_EDITOR_OPTIONS`], compared ASCII case-insensitively.
+//!   [`REALITY_EDITOR_OPTIONS`], compared under the core's own fold.
 //!
 //! Adding a fingerprint from a future Xray release is one row in
 //! [`FINGERPRINTS`] when it belongs in the editor (the common case — it then
@@ -42,6 +42,8 @@
 //! Every entry is the exact string stored in profiles — profiles round-trip
 //! unchanged. The whole-config raw override stays unrestricted
 //! and never consults this table.
+
+use super::{fold_eq, vocabulary_holds};
 
 /// Canonical fingerprint table in the server editor's historical display
 /// order: every name broccoli renders in the TLS and realm-TLS combos,
@@ -140,13 +142,11 @@ pub const REALITY_EDITOR_OPTIONS: &[&str] = &["", "chrome", "firefox", "safari"]
 /// offers ([`REALITY_EDITOR_OPTIONS`]: the empty default plus `chrome`,
 /// `firefox`, and `safari`). The value is wire-valid and Xray still accepts
 /// it, but upstream's REALITY scenarios no longer exercise it, so it
-/// warrants the advisory. Compared ASCII case-insensitively, matching the
-/// wire predicates — Xray lowercases the fingerprint before its checks
+/// warrants the advisory. Compared under [`vocabulary_holds`], the fold the
+/// core applies — Xray lowercases the fingerprint before its checks
 /// (conf/transport_security.go client branch).
 pub fn reality_fingerprint_outside_known_good(name: &str) -> bool {
-    !REALITY_EDITOR_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    !vocabulary_holds(REALITY_EDITOR_OPTIONS, name)
 }
 
 /// The share-link REALITY grammar's fingerprint accept-set: [`FINGERPRINTS`]
@@ -161,29 +161,29 @@ pub fn reality_import_supported(name: &str) -> bool {
 }
 
 /// The wire-validation accept-set: the full canonical vocabulary (editor
-/// table plus wire-only names). ASCII case-insensitive, mirroring the
-/// historical validation allow-list which lowercased the value before
-/// matching — profiles written by hand in any casing of a table name stay
-/// accepted.
+/// table plus wire-only names). Compared under [`vocabulary_holds`], the fold
+/// the core applies to the value before it looks the name up
+/// (conf/transport_security.go), so a hand-written casing of a table name
+/// stays accepted.
 pub fn wire_validation_supported(name: &str) -> bool {
     FINGERPRINTS
         .iter()
         .chain(VALIDATION_ONLY_FINGERPRINTS)
-        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        .any(|candidate| fold_eq(name, candidate))
 }
 
 /// The REALITY wire-validation accept-set (the stream-block model rule, and
 /// the server editor's REALITY inline verdict): [`wire_validation_supported`]
-/// minus [`REALITY_REJECTED_FINGERPRINTS`], with the exclusion compared
-/// ASCII case-insensitively — Xray lowercases the fingerprint before its
-/// checks (conf/transport_security.go client branch). Wire-only names such
-/// as `randomizedalpn` are accepted here even though the editor never offers
+/// minus [`REALITY_REJECTED_FINGERPRINTS`], with the exclusion compared under
+/// the same fold — Xray lowercases the fingerprint before its checks
+/// (conf/transport_security.go client branch). Wire-only names such as
+/// `randomizedalpn` are accepted here even though the editor never offers
 /// them.
 pub fn reality_wire_supported(name: &str) -> bool {
     wire_validation_supported(name)
         && !REALITY_REJECTED_FINGERPRINTS
             .iter()
-            .any(|rejected| rejected.eq_ignore_ascii_case(name))
+            .any(|rejected| fold_eq(name, rejected))
 }
 
 #[cfg(test)]
@@ -351,5 +351,22 @@ mod tests {
             .filter(|name| !reality_import_supported(name))
             .collect::<Vec<_>>();
         assert_eq!(rejected, ["", "unsafe", "hellogolang"]);
+    }
+
+    /// The fingerprint predicates fold like the core: `transport_security.go`
+    /// lowercases the name before its lookup, and the pinned v26.9.9 binary
+    /// loads `safarİ` on both the TLS and the REALITY branches. The link
+    /// grammar stays exact — it is this app's own import contract, not the
+    /// core's match.
+    #[test]
+    fn fingerprint_vocabularies_fold_like_the_core() {
+        assert!(wire_validation_supported("safar\u{130}"));
+        assert!(reality_wire_supported("safar\u{130}"));
+        assert!(!reality_fingerprint_outside_known_good("safar\u{130}"));
+        assert!(!reality_import_supported("safar\u{130}"));
+
+        assert!(!wire_validation_supported("safarizz"));
+        assert!(!reality_wire_supported("safarizz"));
+        assert!(reality_fingerprint_outside_known_good("safarizz"));
     }
 }

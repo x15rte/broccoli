@@ -58,6 +58,7 @@ pub use validation::{ValidationCode, ValidationIssue};
 use crate::links::excerpt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -94,6 +95,51 @@ pub(crate) fn skip_zero_u16(v: &u16) -> bool {
 }
 pub(crate) fn skip_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+// ---------- wire-vocabulary matching ----------
+
+/// True when `value` names one of `options` under the fold the core applies
+/// before it matches a wire vocabulary: `strings.ToLower`, whose per-rune
+/// mapping is the Unicode *simple* one, so `İ` (U+0130) folds to `i` and the
+/// Kelvin sign (U+212A) to `k`. `eq_ignore_ascii_case` sees neither, and a
+/// spelling only it refuses is a profile the core still loads and runs.
+pub(crate) fn vocabulary_holds(options: &[&str], value: &str) -> bool {
+    options.iter().any(|candidate| fold_eq(value, candidate))
+}
+
+/// Equality under that simple lowercase fold, comparing rune by rune so
+/// nothing is allocated. Go folds one rune to one rune, so an equal fold
+/// implies equal rune counts.
+pub(crate) fn fold_eq(left: &str, right: &str) -> bool {
+    let mut left = left.chars();
+    let mut right = right.chars();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(l), Some(r)) if simple_lower(l) == simple_lower(r) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The core's `strings.ToLower` for a whole string: Go's simple per-rune
+/// lowercase mapping, borrowed when the fold changes nothing. Sites that need
+/// the folded value itself — a `match` against lowercase wire ids — use this;
+/// sites that only compare two strings use [`fold_eq`].
+pub(crate) fn fold_lower(value: &str) -> Cow<'_, str> {
+    if value.chars().all(|c| simple_lower(c) == c) {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(value.chars().map(simple_lower).collect())
+}
+
+/// One rune's simple lowercase mapping. Rust's `char::to_lowercase` yields
+/// the *full* mapping, which is one rune for every code point but U+0130
+/// (`İ` → `i` plus a combining dot); the first rune is the simple mapping Go
+/// uses, so the rest is dropped.
+fn simple_lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 // ---------- state file load/save (atomic, corrupt-proof) ----------

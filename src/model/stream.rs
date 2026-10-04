@@ -3,7 +3,9 @@
 //! serialization always emits flat `streamSettings` wire shape.
 
 use super::validation::ValidationCode;
-use super::{Int32Range, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false};
+use super::{
+    Int32Range, fold_eq, fold_lower, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
+};
 use crate::links::excerpt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -36,24 +38,24 @@ impl Network {
             Network::Hysteria => "hysteria",
         }
     }
-    /// Parse a `streamSettings.network` wire value (case-insensitive, with the
-    /// upstream transport aliases). Unrecognized transports return `None` —
-    /// deserialization is strict so a typo'd or trailing-space value fails the
-    /// load instead of silently downgrading to `Raw`.
+    /// Parse a `streamSettings.network` wire value (the core's own fold, with
+    /// the upstream transport aliases). Unrecognized transports return `None`
+    /// — deserialization is strict so a typo'd or trailing-space value fails
+    /// the load instead of silently downgrading to `Raw`.
     pub fn parse(s: &str) -> Option<Self> {
-        if s.eq_ignore_ascii_case("raw") || s.eq_ignore_ascii_case("tcp") {
+        if fold_eq(s, "raw") || fold_eq(s, "tcp") {
             Some(Network::Raw)
-        } else if s.eq_ignore_ascii_case("xhttp") || s.eq_ignore_ascii_case("splithttp") {
+        } else if fold_eq(s, "xhttp") || fold_eq(s, "splithttp") {
             Some(Network::Xhttp)
-        } else if s.eq_ignore_ascii_case("kcp") || s.eq_ignore_ascii_case("mkcp") {
+        } else if fold_eq(s, "kcp") || fold_eq(s, "mkcp") {
             Some(Network::Kcp)
-        } else if s.eq_ignore_ascii_case("grpc") {
+        } else if fold_eq(s, "grpc") {
             Some(Network::Grpc)
-        } else if s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("websocket") {
+        } else if fold_eq(s, "ws") || fold_eq(s, "websocket") {
             Some(Network::Ws)
-        } else if s.eq_ignore_ascii_case("httpupgrade") {
+        } else if fold_eq(s, "httpupgrade") {
             Some(Network::Httpupgrade)
-        } else if s.eq_ignore_ascii_case("hysteria") {
+        } else if fold_eq(s, "hysteria") {
             Some(Network::Hysteria)
         } else {
             None
@@ -114,11 +116,11 @@ impl Serialize for Security {
 impl<'de> Deserialize<'de> for Security {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let value = String::deserialize(d)?;
-        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        if value.is_empty() || fold_eq(&value, "none") {
             Ok(Security::None)
-        } else if value.eq_ignore_ascii_case("tls") {
+        } else if fold_eq(&value, "tls") {
             Ok(Security::Tls)
-        } else if value.eq_ignore_ascii_case("reality") {
+        } else if fold_eq(&value, "reality") {
             Ok(Security::Reality)
         } else {
             Err(serde::de::Error::custom(format!(
@@ -1498,8 +1500,12 @@ macro_rules! finalmask_masks {
                 }
 
                 pub fn from_known_type(kind: &str) -> Option<Self> {
+                    // The loader lowercases a mask id before it matches
+                    // (infra/conf/loader.go:46), so a spelling that folds onto
+                    // a known id names that mask.
+                    let folded = fold_lower(kind);
                     let extra = Map::new();
-                    Some(match kind {
+                    Some(match &*folded {
                         $( $kind => Self::$variant { settings: $default, extra }, )*
                         _ => return None,
                     })
@@ -1525,7 +1531,8 @@ macro_rules! finalmask_masks {
                     let Some((kind, settings, extra)) = split_finalmask_envelope(&raw) else {
                         return Ok(Self::Unknown(raw));
                     };
-                    match kind.as_str() {
+                    let folded = fold_lower(&kind);
+                    match &*folded {
                         $(
                             $kind => Ok(Self::$variant {
                                 settings: serde_json::from_value(settings)
@@ -1963,6 +1970,29 @@ mod tests {
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
+
+    /// The stream vocabularies fold like the core (Go's `strings.ToLower`):
+    /// `xray run -test` on the pinned v26.9.9 binary loads `SPLİTHTTP`,
+    /// `MΚCP`, `REALİTY` and a Kelvin-spelled mask id, so none of these
+    /// parses may refuse them.
+    #[test]
+    fn stream_vocabularies_fold_like_the_core() {
+        assert_eq!(Network::parse("SPL\u{130}THTTP"), Some(Network::Xhttp));
+        assert_eq!(Network::parse("M\u{212a}CP"), Some(Network::Kcp));
+        assert_eq!(Network::parse("WEBSOC\u{212a}ET"), Some(Network::Ws));
+        assert_eq!(Network::parse("frobnicate"), None);
+
+        let security: Security =
+            serde_json::from_value(json!("REAL\u{130}TY")).expect("the core folds the spelling");
+        assert_eq!(security, Security::Reality);
+        assert!(serde_json::from_value::<Security>(json!("plain")).is_err());
+
+        assert!(FinalmaskTcpMask::from_known_type("SUDO\u{212a}U").is_some());
+        let mask: FinalmaskUdpMask =
+            serde_json::from_value(json!({"type": "M\u{212a}CP-LEGACY", "settings": {}}))
+                .expect("the core folds the mask id");
+        assert_eq!(mask.known_type(), Some("mkcp-legacy"));
+    }
 
     /// The transport table's contract, over every variant: selecting a
     /// transport materializes exactly the block that network names, the wire

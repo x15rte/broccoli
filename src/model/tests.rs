@@ -1700,3 +1700,53 @@ fn failed_atomic_state_write_removes_the_temp_file() {
         "the failed write must not leave the temp file behind"
     );
 }
+
+/// The wire-vocabulary fold is Go's `strings.ToLower`, not ASCII
+/// case-insensitivity: the pinned v26.9.9 binary loads a strategy spelled
+/// `ForceİP`, because Go's simple mapping folds `İ` (U+0130) to `i`, and the
+/// Kelvin sign (U+212A) folds to `k`. A predicate that folds ASCII-only
+/// refuses those spellings and gates a profile the core runs.
+#[test]
+fn vocabulary_fold_matches_go_simple_lowercase() {
+    assert!(fold_eq("Force\u{130}P", "forceip"));
+    assert!(fold_eq("FORCEIP", "forceip"));
+    assert!(fold_eq("\u{212a}", "k"));
+    assert!(fold_eq("", ""));
+    assert!(vocabulary_holds(&["ForceIP", "UseIP"], "Use\u{130}P"));
+
+    assert!(!fold_eq("Force\u{130}P", "forceip4"));
+    // A length mismatch is not equality, and `İ` folds to the same `i` an
+    // ASCII `I` does, which is why the ASCII-only fold misses it.
+    assert!(!fold_eq("Force\u{130}P", "forcei"));
+    assert!(fold_eq("Force\u{130}P", "ForceIP"));
+    assert!(!fold_eq("UseIP", "UseIP4"));
+    // The fold is not a trim and not a normalizer: a padded or decomposed
+    // spelling is a different string to Go too.
+    assert!(!fold_eq(" forceip", "forceip"));
+    assert!(!vocabulary_holds(&["forceip"], "forceip\u{307}"));
+}
+
+/// The dokodemo listener network and the balancer strategy fold like the core:
+/// `Network.Build` and the router both lowercase the value first
+/// (infra/conf/common.go:77, infra/conf/router.go:37), and the pinned v26.9.9
+/// binary loads `unİx` and routes `leastpİng` to the same strategy.
+#[test]
+fn inbound_and_balancer_vocabularies_fold_like_the_core() {
+    let dokodemo = |network: &str| DokodemoCfg {
+        network: network.into(),
+        ..DokodemoCfg::default()
+    };
+    assert!(dokodemo("un\u{130}x").network_mode().is_ok());
+    assert!(dokodemo("TCP,UDP").network_mode().is_ok());
+    assert!(dokodemo("icmp").network_mode().is_err());
+
+    let balancer = |strategy: &str| Balancer {
+        strategy: crate::model::routing::StrategyCfg {
+            r#type: strategy.into(),
+            ..Default::default()
+        },
+        ..Balancer::default()
+    };
+    assert!(balancer("leastp\u{130}ng").needs_live_health());
+    assert!(!balancer("leastpong").needs_live_health());
+}

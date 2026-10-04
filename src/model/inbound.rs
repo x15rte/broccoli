@@ -2,8 +2,8 @@
 //! tun — plus the shared sniffing config and TUN settings (tun.go:15-54).
 
 use super::{
-    dns::DEFAULT_PLAINTEXT_RESOLVERS, skip_empty_str, skip_empty_vec, skip_false, skip_zero_u16,
-    skip_zero_u32,
+    dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, skip_empty_str, skip_empty_vec, skip_false,
+    skip_zero_u16, skip_zero_u32,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -514,11 +514,11 @@ impl DokodemoCfg {
             if token.is_empty() {
                 return Err("listener network contains an empty token".into());
             }
-            if token.eq_ignore_ascii_case("tcp") {
+            if fold_eq(token, "tcp") {
                 networks |= TCP;
-            } else if token.eq_ignore_ascii_case("udp") {
+            } else if fold_eq(token, "udp") {
                 networks |= UDP;
-            } else if token.eq_ignore_ascii_case("unix") {
+            } else if fold_eq(token, "unix") {
                 networks |= UNIX;
             } else {
                 return Err(format!("listener network contains unknown token {token:?}"));

@@ -44,7 +44,7 @@ use super::stream::{
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
     Network, Security, SockoptModel, StreamModel, XmuxConfig,
 };
-use super::{ServerProfile, ServersFile, Settings, TunCfg, emit};
+use super::{ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, vocabulary_holds};
 use crate::links::{excerpt, excerpt_debug};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -131,6 +131,14 @@ pub enum ValidationCode {
     /// live repro 2026-09-05, Xray 26.7.28) and the session only fails at
     /// dial/auth time, so this is advisory (Severity::Warning).
     Shadowsocks2022KeyInvalid,
+    /// VMess `settings.security` names a cipher the core does not read: the
+    /// account build lowercases the value and maps anything outside
+    /// {auto, aes-128-gcm, chacha20-poly1305} onto `auto`
+    /// (infra/conf/vmess.go:27-36), so the configuration loads and runs with
+    /// `auto` — an accepted value silently reinterpreted, and the generated
+    /// document carries that same fallback. Advisory (Severity::Warning); the
+    /// empty zero value is `auto`'s own spelling and stays silent.
+    VmessSecurityUnsupported,
     /// Trojan `settings` missing essentials — empty `address` / `password`,
     /// port 0 — that Xray's conf build rejects (conf/trojan.go). One rule,
     /// path-disambiguated.
@@ -797,10 +805,6 @@ pub enum ValidationCode {
     /// VMess `settings.id` is empty — the same missing-user state as
     /// [`Self::VlessIdRequired`].
     VmessIdRequired,
-    /// VMess `settings.security` is outside the vocabulary Xray's
-    /// `proxy/vmess/outbound` reads, so the core refuses connection attempts
-    /// with an unknown cipher instead of falling back to `auto`.
-    VmessSecurityUnsupported,
     /// Freedom `settings.fragment` cannot run: Xray's fragment manager
     /// requires a positive length range and a non-decreasing interval range.
     FreedomFragmentInvalid,
@@ -1093,21 +1097,24 @@ fn vless_flow_supported(flow: &str) -> bool {
     flow.is_empty() || is_vision_flow(flow)
 }
 
-/// The VMess `settings.security` vocabulary: the ciphers Xray's
-/// `proxy/vmess/outbound` reads, matched exactly (the core's cipher list is
-/// a map lookup, so a case variant is an unknown cipher). The editor combo
-/// and the share-link grammar both read this list.
+/// The VMess `settings.security` vocabulary: the ciphers the core's account
+/// build reads after it lowercases the value (infra/conf/vmess.go:27-36).
+/// The editor combo and the share-link grammar both read this list.
 pub const VMESS_SECURITY_OPTIONS: &[&str] = &["auto", "aes-128-gcm", "chacha20-poly1305"];
 
-/// True when a VMess `settings.security` names one of
-/// [`VMESS_SECURITY_OPTIONS`].
+/// True when a VMess `settings.security` is one the core reads: the empty zero
+/// value or one of [`VMESS_SECURITY_OPTIONS`], under [`vocabulary_holds`]. A
+/// value outside the set is not refused — the core maps it onto `auto` — so
+/// the rule wired to this predicate warns instead of gating.
 pub fn vmess_security_supported(security: &str) -> bool {
-    VMESS_SECURITY_OPTIONS.contains(&security)
+    security.is_empty() || vocabulary_holds(VMESS_SECURITY_OPTIONS, security)
 }
 
 /// The AEAD method vocabulary: the canonical spellings, then the legacy
 /// aliases Xray's `cipherFromString` folds onto them (each alias sits beside
-/// the canonical name it names). Compared case-insensitively.
+/// the canonical name it names). Compared under the core's own fold, which
+/// lowercases the value before its switch (infra/conf/shadowsocks.go:18); the
+/// 2022 names are a separate, exact list in the core.
 const SS_AEAD_METHODS: &[&str] = &[
     "aes-128-gcm",
     "aead_aes_128_gcm",
@@ -1152,10 +1159,7 @@ pub const SS_METHOD_OPTIONS: &[&str] = &[
 /// unsupported. The share-link grammar calls this predicate instead of
 /// re-listing the methods.
 pub fn shadowsocks_method_supported(method: &str) -> bool {
-    SS_AEAD_METHODS
-        .iter()
-        .any(|accepted| method.eq_ignore_ascii_case(accepted))
-        || SS_METHODS_2022.contains(&method)
+    vocabulary_holds(SS_AEAD_METHODS, method) || SS_METHODS_2022.contains(&method)
 }
 
 /// True when a Shadowsocks-2022 `password` is usable key
@@ -1502,13 +1506,12 @@ pub const TARGET_STRATEGY_OPTIONS: &[&str] = &[
 ];
 
 /// True when `target_strategy` names one of Xray's
-/// outbound target domain strategies, case-insensitively — Xray lowercases
-/// the value before its switch (infra/conf/xray.go OutboundDetectorConfig
-/// Build). Empty stays legal (the wire default `asis`).
+/// outbound target domain strategies, under [`vocabulary_holds`] — Xray
+/// lowercases the value before its switch (infra/conf/xray.go
+/// OutboundDetectorConfig Build). Empty stays legal (the wire default
+/// `asis`).
 fn target_strategy_supported(strategy: &str) -> bool {
-    TARGET_STRATEGY_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+    vocabulary_holds(TARGET_STRATEGY_OPTIONS, strategy)
 }
 
 /// True when a freedom `domainStrategy`
@@ -1536,15 +1539,13 @@ pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
 ];
 
 /// True when a WireGuard `domainStrategy` is one of
-/// [`WG_TARGET_STRATEGY_OPTIONS`], case-insensitively: `WireGuardConfig.Build`
-/// lowercases the value before matching and refuses the outbound at config
-/// load outside the five strategies and the empty zero value
-/// (infra/conf/wireguard.go:128-141). Nothing is trimmed — Go lowercases the
-/// stored bytes as they are.
+/// [`WG_TARGET_STRATEGY_OPTIONS`], under [`vocabulary_holds`]:
+/// `WireGuardConfig.Build` lowercases the value before matching and refuses
+/// the outbound at config load outside the five strategies and the empty zero
+/// value (infra/conf/wireguard.go:128-141). Nothing is trimmed — Go
+/// lowercases the stored bytes as they are.
 fn wireguard_domain_strategy_supported(strategy: &str) -> bool {
-    WG_TARGET_STRATEGY_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+    vocabulary_holds(WG_TARGET_STRATEGY_OPTIONS, strategy)
 }
 
 // ---------- outbound envelope / DNS-rule vocabularies ----------
@@ -1556,10 +1557,11 @@ fn wireguard_domain_strategy_supported(strategy: &str) -> bool {
 // private copies.
 
 /// True when a freedom `finalRules[].action` is one Xray's freedom build
-/// accepts — `allow` or `block`, compared case-insensitively (the editor
-/// combo offers exactly these spellings).
+/// accepts — `allow` or `block`, under [`vocabulary_holds`] (the core
+/// lowercases the action before its switch, infra/conf/freedom.go:255; the
+/// editor combo offers exactly these spellings).
 pub fn freedom_final_rule_supported(action: &str) -> bool {
-    matches!(action.to_ascii_lowercase().as_str(), "allow" | "block")
+    vocabulary_holds(&["allow", "block"], action)
 }
 
 /// The DNS-out `rules[].action` vocabulary — the four actions Xray's DNS
@@ -1567,9 +1569,11 @@ pub fn freedom_final_rule_supported(action: &str) -> bool {
 /// "(default)" display entry; an empty action is not an action.
 pub const DNS_OUT_ACTIONS: &[&str] = &["direct", "drop", "return", "hijack"];
 
-/// True when a DNS-out `rules[].action` names one of [`DNS_OUT_ACTIONS`].
+/// True when a DNS-out `rules[].action` names one of [`DNS_OUT_ACTIONS`],
+/// under [`vocabulary_holds`] — the core lowercases the action before its
+/// switch (infra/conf/dns_proxy.go:23).
 pub fn dns_out_action_supported(action: &str) -> bool {
-    DNS_OUT_ACTIONS.contains(&action)
+    vocabulary_holds(DNS_OUT_ACTIONS, action)
 }
 
 /// True when a `sendThrough` value is one Xray's dialer accepts —
@@ -1605,17 +1609,18 @@ mod cidr_shim {
 /// "fakedns" item the generator appends itself at wire time is part of this
 /// vocabulary, so the rule can never false-positive on it.
 pub fn sniffing_dest_override_supported(protocol: &str) -> bool {
-    [
-        "http",
-        "tls",
-        "https",
-        "ssl",
-        "quic",
-        "fakedns",
-        "fakedns+others",
-    ]
-    .iter()
-    .any(|candidate| protocol.eq_ignore_ascii_case(candidate))
+    vocabulary_holds(
+        &[
+            "http",
+            "tls",
+            "https",
+            "ssl",
+            "quic",
+            "fakedns",
+            "fakedns+others",
+        ],
+        protocol,
+    )
 }
 
 /// Validate one inbound sniffing block. `prefix`
@@ -1826,6 +1831,15 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                     Some("settings.id".into()),
                 ));
             }
+            // The core does not refuse the value: it lowercases the spelling
+            // and takes `auto` for anything else, which the generated document
+            // carries too. Advisory, never a gate.
+            if !vmess_security_supported(&settings.security) {
+                issues.push(warning(
+                    ValidationCode::VmessSecurityUnsupported,
+                    Some("settings.security".into()),
+                ));
+            }
         }
         ProtocolSettings::Trojan(settings) => {
             if settings.address.is_empty() {
@@ -1974,7 +1988,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             if let Some(sockopt) = o.stream.sockopt.as_ref()
                 && sockopt_address_port_strategy_supported(&sockopt.address_port_strategy)
                 && !sockopt.address_port_strategy.is_empty()
-                && !sockopt.address_port_strategy.eq_ignore_ascii_case("none")
+                && !fold_eq(&sockopt.address_port_strategy, "none")
             {
                 issues.push(issue(
                     ValidationCode::FreedomAddressPortStrategyUnsupported,
@@ -2795,11 +2809,9 @@ pub const SOCKOPT_DOMAIN_STRATEGY_OPTIONS: &[&str] = &[
 ];
 
 /// True when a sockopt `domainStrategy` is one of
-/// [`SOCKOPT_DOMAIN_STRATEGY_OPTIONS`], case-insensitively.
+/// [`SOCKOPT_DOMAIN_STRATEGY_OPTIONS`], under [`vocabulary_holds`].
 pub fn sockopt_domain_strategy_supported(strategy: &str) -> bool {
-    SOCKOPT_DOMAIN_STRATEGY_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+    vocabulary_holds(SOCKOPT_DOMAIN_STRATEGY_OPTIONS, strategy)
 }
 
 /// The sockopt `addressPortStrategy` vocabulary: the empty wire default plus
@@ -2817,11 +2829,9 @@ pub const SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS: &[&str] = &[
 ];
 
 /// True when a sockopt `addressPortStrategy` is one of
-/// [`SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS`], case-insensitively.
+/// [`SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS`], under [`vocabulary_holds`].
 pub fn sockopt_address_port_strategy_supported(strategy: &str) -> bool {
-    SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(strategy))
+    vocabulary_holds(SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS, strategy)
 }
 
 /// Validate one sockopt block. `prefix` is the wire path prefix that scopes
@@ -2891,12 +2901,10 @@ pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Verdict {
     // value silently never applies. The vocabulary is the shared
     // [`TPROXY_MODES`] list; the field has no widget any more, so a value
     // this flags came from a hand-edited profile or the raw config override.
-    if s.tproxy.as_deref().is_some_and(|value| {
-        !value.is_empty()
-            && !TPROXY_MODES
-                .iter()
-                .any(|mode| mode.eq_ignore_ascii_case(value))
-    }) {
+    if s.tproxy
+        .as_deref()
+        .is_some_and(|value| !value.is_empty() && !vocabulary_holds(TPROXY_MODES, value))
+    {
         issues.push(warning(
             ValidationCode::SockoptTproxySilentOff,
             Some(format!("{prefix}.tproxy")),
@@ -3312,32 +3320,38 @@ fn finalmask_validate_xmc(path: &str, settings: &FinalmaskXmc, issues: &mut Vec<
 /// yields `Some(0)` — a value that can never work, reported by the caller as
 /// too small instead of being read as unset.
 fn finalmask_parse_bandwidth_bps(value: &str) -> Result<Option<u64>, ValidationCode> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
+    let value = value.trim();
+    if value.is_empty() {
         return Ok(None);
     }
-    let index = normalized
+    let index = value
         .char_indices()
         .find_map(|(index, ch)| (!(ch.is_ascii_digit() || ch == '.')).then_some(index))
-        .unwrap_or(normalized.len());
-    let number: f64 = normalized[..index]
+        .unwrap_or(value.len());
+    let number: f64 = value[..index]
         .parse()
         .map_err(|_| ValidationCode::FinalmaskQuicBandwidthSyntax)?;
     if !number.is_finite() || number < 0.0 {
         return Err(ValidationCode::FinalmaskQuicBandwidthNonFinite);
     }
-    let unit = normalized[index..].trim();
-    let multiplier = match unit {
-        "" | "b" | "bps" => 1_u64,
-        "k" | "kb" | "kbps" => 1024,
-        "m" | "mb" | "mbps" => 1024 * 1024,
-        "g" | "gb" | "gbps" => 1024 * 1024 * 1024,
-        "t" | "tb" | "tbps" => 1024_u64 * 1024 * 1024 * 1024,
-        _ => {
-            return Err(ValidationCode::FinalmaskQuicBandwidthUnitInvalid(excerpt(
-                unit,
-            )));
-        }
+    // The core lowercases each unit with Go's simple fold before its own match
+    // (transport_method.go:697), so a Kelvin-sign `k` is a kilobyte here too.
+    // The value keeps its spelling for the message.
+    let unit = value[index..].trim();
+    let multiplier = if unit.is_empty() || fold_eq(unit, "b") || fold_eq(unit, "bps") {
+        1_u64
+    } else if fold_eq(unit, "k") || fold_eq(unit, "kb") || fold_eq(unit, "kbps") {
+        1024
+    } else if fold_eq(unit, "m") || fold_eq(unit, "mb") || fold_eq(unit, "mbps") {
+        1024 * 1024
+    } else if fold_eq(unit, "g") || fold_eq(unit, "gb") || fold_eq(unit, "gbps") {
+        1024 * 1024 * 1024
+    } else if fold_eq(unit, "t") || fold_eq(unit, "tb") || fold_eq(unit, "tbps") {
+        1024_u64 * 1024 * 1024 * 1024
+    } else {
+        return Err(ValidationCode::FinalmaskQuicBandwidthUnitInvalid(excerpt(
+            unit,
+        )));
     };
     let bits = number * multiplier as f64;
     if bits > u64::MAX as f64 {
@@ -3412,11 +3426,12 @@ fn finalmask_validate_quic_params(
             Some(format!("{path}.congestion")),
         ));
     }
-    let profile = quic.bbr_profile.to_ascii_lowercase();
-    if !matches!(
-        profile.as_str(),
-        "" | "conservative" | "standard" | "aggressive"
-    ) {
+    if !(quic.bbr_profile.is_empty()
+        || vocabulary_holds(
+            &["conservative", "standard", "aggressive"],
+            &quic.bbr_profile,
+        ))
+    {
         issues.push(issue(
             ValidationCode::FinalmaskQuicBbrProfileInvalid,
             Some(format!("{path}.bbrProfile")),
@@ -3544,7 +3559,7 @@ fn finalmask_validate_tcp_mask(
             }
         }
         FinalmaskTcpMask::Fragment { settings, .. } => {
-            if !settings.packets.is_empty() && !settings.packets.eq_ignore_ascii_case("tlshello") {
+            if !settings.packets.is_empty() && !fold_eq(&settings.packets, "tlshello") {
                 match Int32Range::parse(&settings.packets) {
                     Some(range) if range.from != 0 => {}
                     Some(_) => issues.push(issue(
@@ -3616,11 +3631,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::MkcpLegacy { settings, .. } => {
-            let header = settings.header.to_ascii_lowercase();
-            if !matches!(
-                header.as_str(),
-                "" | "dns" | "dtls" | "srtp" | "utp" | "wechat" | "wireguard"
-            ) {
+            if !(settings.header.is_empty()
+                || vocabulary_holds(
+                    &["dns", "dtls", "srtp", "utp", "wechat", "wireguard"],
+                    &settings.header,
+                ))
+            {
                 issues.push(issue(
                     ValidationCode::FinalmaskMkcpHeaderInvalid,
                     Some(format!("{path}.settings.header")),
@@ -3775,11 +3791,14 @@ enum FinalmaskUdpHopMode {
 /// at config load, so the mode gate reports it and the interval-hop advisory
 /// stays silent for it rather than adding a second message for one value.
 fn finalmask_udphop_mode(component: &str) -> Option<FinalmaskUdpHopMode> {
-    match component.to_ascii_lowercase().as_str() {
-        "intervallocal" => Some(FinalmaskUdpHopMode::IntervalLocal),
-        "intervalremote" => Some(FinalmaskUdpHopMode::IntervalRemote),
-        "perconnremote" => Some(FinalmaskUdpHopMode::PerConnRemote),
-        _ => None,
+    if fold_eq(component, "intervallocal") {
+        Some(FinalmaskUdpHopMode::IntervalLocal)
+    } else if fold_eq(component, "intervalremote") {
+        Some(FinalmaskUdpHopMode::IntervalRemote)
+    } else if fold_eq(component, "perconnremote") {
+        Some(FinalmaskUdpHopMode::PerConnRemote)
+    } else {
+        None
     }
 }
 
@@ -4589,6 +4608,46 @@ mod tests {
         issues.iter().map(|issue| issue.code.clone()).collect()
     }
 
+    /// The VMess security rule is advisory, because the core does not refuse
+    /// the value: `VMessAccount.Build` lowercases the spelling and maps
+    /// anything outside its three ciphers onto `auto` (infra/conf/vmess.go:27-36),
+    /// which `xray run -test` confirms on the pinned binary — `AES-128-GCM`
+    /// and `bogus` both exit 0, and the generated document carries `auto` for
+    /// either.
+    #[test]
+    fn vmess_security_outside_the_vocabulary_warns_without_gating() {
+        fn verdict(security: &str) -> Verdict {
+            let mut outbound = OutboundModel::new(Protocol::Vmess);
+            let ProtocolSettings::Vmess(settings) = &mut outbound.settings else {
+                unreachable!()
+            };
+            settings.address = "vmess.example.com".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.security = security.into();
+            validate_outbound(&outbound)
+        }
+
+        for accepted in ["", "auto", "AUTO", "AES-128-GCM", "chacha20-poly1305"] {
+            let verdict = verdict(accepted);
+            assert!(
+                verdict.iter().next().is_none(),
+                "{accepted:?} is a value the core reads: {verdict:?}"
+            );
+        }
+        for rewritten in ["bogus", "auto ", "aes128-gcm"] {
+            let verdict = verdict(rewritten);
+            assert!(!verdict.has_blocking(), "{rewritten:?} must not gate");
+            let issue = verdict
+                .advisory()
+                .next()
+                .unwrap_or_else(|| panic!("{rewritten:?} must warn: {verdict:?}"));
+            assert_eq!(issue.code, ValidationCode::VmessSecurityUnsupported);
+            assert_eq!(issue.severity, Severity::Warning);
+            assert_eq!(issue.path.as_deref(), Some("settings.security"));
+        }
+    }
+
     /// Every published field vocabulary and the predicate that judges it
     /// agree: the predicate accepts each entry of the list, and refuses the
     /// near-misses the list does not hold (a case variant of a case-sensitive
@@ -4679,12 +4738,109 @@ mod tests {
         couples(
             VMESS_SECURITY_OPTIONS,
             vmess_security_supported,
-            &["", "AES-128-GCM", "auto ", "bogus"],
+            &["auto ", "aes128-gcm", "bogus"],
         );
         couples(
             VISION_FLOW_OPTIONS,
             is_vision_flow,
             &["", "xtls-rprx-vision-udp444", "bogus"],
+        );
+    }
+
+    /// The nested mask vocabularies fold like the core: it lowercases the mKCP
+    /// `header` (`transport_finalmask.go:611`) and the QUIC `bbrProfile`
+    /// (`transport_internet.go:219`) before matching, and the pinned v26.9.9
+    /// binary loads each folded spelling below (`run -test` exits 0) — so
+    /// neither may gate.
+    #[test]
+    fn finalmask_vocabularies_fold_like_the_core() {
+        let folded: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "mkcp-legacy", "settings": {"header": "w\u{130}reguard"}}],
+            "quicParams": {"bbrProfile": "conservat\u{130}ve"}
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&folded);
+        assert!(issues.is_empty(), "{issues:#?}");
+
+        let outside: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "mkcp-legacy", "settings": {"header": "zzz"}}],
+            "quicParams": {"bbrProfile": "conservative!"}
+        }))
+        .expect("fixture is valid finalmask JSON");
+        assert_eq!(
+            codes(&validate_finalmask(&outside)),
+            vec![
+                ValidationCode::FinalmaskMkcpHeaderInvalid,
+                ValidationCode::FinalmaskQuicBbrProfileInvalid,
+            ],
+            "{:#?}",
+            validate_finalmask(&outside)
+        );
+    }
+
+    /// The fold the vocabularies use is Go's, not ASCII case-insensitivity:
+    /// the pinned v26.9.9 binary accepts each dotted-`İ`/Kelvin spelling below
+    /// (`run -test` exits 0), so a predicate that refuses one gates a profile
+    /// the core runs. The point the ASCII fold misses is that `İ` folds to
+    /// the same `i` an ASCII `I` does.
+    #[test]
+    fn vocabularies_fold_unicode_like_go_lower() {
+        type Predicate = fn(&str) -> bool;
+        // One row per predicate and the spelling only Go's fold reaches: `İ`
+        // (U+0130) folds to `i`, the Kelvin sign (U+212A) to `k`. The pinned
+        // v26.9.9 binary loads every value below (`run -test` exits 0).
+        let rows: &[(Predicate, &str)] = &[
+            (target_strategy_supported, "Force\u{130}P"),
+            (sockopt_domain_strategy_supported, "Use\u{130}P"),
+            (wireguard_domain_strategy_supported, "Force\u{130}P"),
+            (dns_out_action_supported, "h\u{130}jack"),
+            (freedom_final_rule_supported, "bloc\u{212a}"),
+            (sniffing_dest_override_supported, "qu\u{130}c"),
+            (shadowsocks_method_supported, "chacha20-\u{130}etf-poly1305"),
+        ];
+        for (accepts, value) in rows {
+            assert!(accepts(value), "{value:?} must fold like the core does");
+        }
+
+        // The one vocabulary with two regimes: the AEAD half folds
+        // (`shadowsocks.go:18`), the 2022 half is an exact list in the core
+        // (`shadowsocks.go:63`), so a Kelvin `k` is refused there.
+        assert!(!shadowsocks_method_supported(
+            "2022-bla\u{212a}e3-aes-128-gcm"
+        ));
+
+        // The nested mask vocabularies the same fold reaches.
+        assert!(matches!(
+            finalmask_udphop_mode("\u{130}ntervalLocal"),
+            Some(FinalmaskUdpHopMode::IntervalLocal)
+        ));
+        assert!(finalmask_udphop_mode("perconnremote\u{130}").is_none());
+        assert_eq!(
+            finalmask_parse_bandwidth_bps("1024 \u{212a}bps"),
+            Ok(Some(131_072))
+        );
+
+        // The tproxy vocabulary's core side maps by the same fold; `redirect`
+        // is its only spelling an `İ` can stand in for, and the observable
+        // half is that a folded spelling draws no warning while its near-miss
+        // does.
+        let sockopt = |tproxy: &str| SockoptModel {
+            tproxy: Some(tproxy.to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            validate_sockopt(&sockopt("red\u{130}rect"), "stream.sockopt")
+                .advisory()
+                .next()
+                .is_none(),
+            "a folded tproxy spelling is one the core maps"
+        );
+        assert!(
+            validate_sockopt(&sockopt("red\u{130}rected"), "stream.sockopt")
+                .advisory()
+                .next()
+                .is_some(),
+            "a spelling outside the vocabulary still warns"
         );
     }
 
@@ -4979,7 +5135,7 @@ mod tests {
                 Some("finalmask.quicParams.brutalUp")
             );
         }
-        for value in ["", "  ", "0", "0bps", "0.0 kbps"] {
+        for value in ["", "  ", "0", "0bps", "0.0 kbps", "0.0 \u{212a}bps"] {
             let issues = issues_for("brutal", value);
             assert!(
                 codes(&issues).is_empty(),
@@ -9338,7 +9494,12 @@ mod tests {
         for accepted in DNS_OUT_ACTIONS {
             assert!(dns_out_action_supported(accepted), "{accepted:?}");
         }
-        for refused in ["", "proxy", "Direct"] {
+        // The core lowercases the action before its switch, so a case variant
+        // and a folded `İ` spelling are the same action to it.
+        for accepted in ["Direct", "h\u{130}jack"] {
+            assert!(dns_out_action_supported(accepted), "{accepted:?}");
+        }
+        for refused in ["", "proxy", "direct4"] {
             assert!(!dns_out_action_supported(refused), "{refused:?}");
         }
     }

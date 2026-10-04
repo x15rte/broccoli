@@ -28,7 +28,7 @@ use crate::model::validation::{
     dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
     pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
     send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
-    validate_outbound, validate_sockopt, vmess_security_supported,
+    validate_outbound, validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -207,30 +207,27 @@ fn runnable_noise() -> Noise {
 }
 
 fn noise_is_valid(noise: &Noise) -> bool {
+    // The core trims the packet before it reads it (infra/conf/freedom.go:199),
+    // so a padded hex or base64 payload is the value it decodes.
+    let packet = noise.packet.trim();
     let packet_valid = match noise.r#type.as_str() {
-        "rand" => Int32Range::parse(&noise.packet)
-            .is_some_and(|range| range.from > 0 && range.to >= range.from),
+        "rand" => {
+            Int32Range::parse(packet).is_some_and(|range| range.from > 0 && range.to >= range.from)
+        }
         "str" => true,
         "hex" => {
-            noise.packet.len().is_multiple_of(2)
-                && noise.packet.bytes().all(|byte| byte.is_ascii_hexdigit())
+            packet.len().is_multiple_of(2) && packet.bytes().all(|byte| byte.is_ascii_hexdigit())
         }
         "base64" => {
-            let normalized = noise
-                .packet
-                .replace('+', "-")
-                .replace('/', "_")
-                .replace('=', "");
+            let normalized = packet.replace('+', "-").replace('/', "_").replace('=', "");
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(normalized)
                 .is_ok()
         }
         _ => false,
     };
-    let apply_to_valid = matches!(
-        noise.apply_to.to_ascii_lowercase().as_str(),
-        "" | "ip" | "all" | "ipv4" | "ipv6"
-    );
+    let apply_to_valid = noise.apply_to.is_empty()
+        || crate::model::vocabulary_holds(&["ip", "all", "ipv4", "ipv6"], &noise.apply_to);
     packet_valid && apply_to_valid
 }
 
@@ -417,17 +414,12 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
             }
         }
         ProtocolSettings::Vmess(settings) => {
-            // Port 0 and non-UUID ids are model rules below; the
-            // empty-address draft requirement and the empty-id "required"
-            // state are editor rules.
+            // Port 0, non-UUID ids, and the security vocabulary are model
+            // rules below; the empty-address draft requirement and the
+            // empty-id "required" state are editor rules.
             require_address(&mut blocking, &settings.address);
             if settings.id.is_empty() {
                 blocking.push(ValidationIssue::error(ValidationCode::VmessIdRequired));
-            }
-            if !vmess_security_supported(&settings.security) {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::VmessSecurityUnsupported,
-                ));
             }
         }
         ProtocolSettings::Trojan(_) => {
@@ -499,8 +491,7 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
     // (`TlsCertificateRequired`, its path naming the offending row) — so a
     // stream value has exactly one message channel here. What stays editor-only
     // is the draft-requirement tier above — the empty "not chosen yet" states,
-    // which the model treats as the valid default, and the VMess security
-    // vocabulary, which no model sweep judges — plus the inline hints the
+    // which the model treats as the valid default — plus the inline hints the
     // field editors draw beside a value for the row the user is editing.
 
     EditorValidationFindings {
@@ -7141,7 +7132,7 @@ mod tests {
         Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
         ServersScreen, SockoptUsage, StatusLine, basic_tab_inline_verdict, drag_scroll_delta,
         ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noise_is_valid, noises_editor,
         refresh_editor_validation, reorder_target, server_list_row, sockopt_findings,
         status_colors_of, status_toast_expired,
     };
@@ -9965,6 +9956,44 @@ Authentication: ML-KEM-768, Post-Quantum
             unreachable!();
         };
         assert_eq!(settings.level, Some(u32::MAX));
+    }
+
+    /// The freedom noise `applyTo` folds like the core: it lowercases the
+    /// value before its switch (`infra/conf/freedom.go:239`), and the pinned
+    /// v26.9.9 binary loads `İP` while refusing `IPVİ`. The `type` field stays
+    /// exact — the core compares it as written (`freedom.go:211`).
+    #[test]
+    fn freedom_noise_apply_to_folds_like_the_core() {
+        let noise = |apply_to: &str| Noise {
+            r#type: "str".into(),
+            apply_to: apply_to.into(),
+            ..Default::default()
+        };
+        for folded in ["\u{130}P", "\u{130}Pv4", "ALL"] {
+            assert!(noise_is_valid(&noise(folded)), "{folded:?}");
+        }
+        for outside in ["ipv\u{130}", "ip6", ""] {
+            let valid = noise_is_valid(&noise(outside));
+            assert_eq!(valid, outside.is_empty(), "{outside:?}");
+        }
+        let wrong_type = Noise {
+            r#type: "RAND".into(),
+            apply_to: "ip".into(),
+            ..Default::default()
+        };
+        assert!(!noise_is_valid(&wrong_type));
+
+        // The core trims the packet before it decodes it
+        // (infra/conf/freedom.go:199), so the padded payload below is the
+        // value it reads — while the parity check still applies afterwards.
+        let hex = |packet: &str| Noise {
+            r#type: "hex".into(),
+            packet: packet.into(),
+            apply_to: "ip".into(),
+            ..Default::default()
+        };
+        assert!(noise_is_valid(&hex(" AA ")));
+        assert!(!noise_is_valid(&hex(" AAA ")));
     }
 
     #[test]

@@ -3520,6 +3520,10 @@ fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue
                 return Err(malformed(Diag::new(Key::LinkPortZero).arg("vmess")));
             }
             check_uuid(&settings.id, "vmess")?;
+            // The link grammar stays stricter than the wire: the core maps an
+            // unknown spelling onto `auto` (the model pass warns about that),
+            // while this grammar — like the fingerprint one — refuses a link
+            // whose parameter it cannot carry as the sender meant it.
             if !crate::model::validation::vmess_security_supported(&settings.security) {
                 return Err(LinkError::Unsupported(
                     Diag::new(Key::LinkUnsupportedVmessEncryption)

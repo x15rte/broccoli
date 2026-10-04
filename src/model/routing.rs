@@ -4,7 +4,8 @@
 
 use super::inbound::DIRECT_OUTBOUND_TAG;
 use super::{
-    DurationMs, skip_duration_zero, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
+    DurationMs, fold_eq, skip_duration_zero, skip_empty_map, skip_empty_str, skip_empty_vec,
+    skip_false,
 };
 use crate::diag::Diag;
 use crate::i18n::{Key, t, t_fmt};
@@ -165,7 +166,8 @@ impl Balancer {
     /// `leastload` strategy, or a `fallbackTag` (roundrobin consults the
     /// observatory before it falls back).
     pub fn needs_live_health(&self) -> bool {
-        matches!(self.strategy.r#type.as_str(), "leastping" | "leastload")
+        fold_eq(&self.strategy.r#type, "leastping")
+            || fold_eq(&self.strategy.r#type, "leastload")
             || !self.fallback_tag.is_empty()
     }
 }

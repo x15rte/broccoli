@@ -2955,7 +2955,7 @@ fn validate_raw_override_candidate(
             services.iter().any(|service| {
                 service
                     .as_str()
-                    .is_some_and(|service| service.eq_ignore_ascii_case("StatsService"))
+                    .is_some_and(|service| crate::model::fold_eq(service, "StatsService"))
             })
         });
     if !has_stats {
@@ -3399,6 +3399,13 @@ mod safety_tests {
                 .unwrap_err()
                 .contains("loopback")
         );
+
+        let mut folded_stats = valid.clone();
+        // The core lowercases every service name before it matches
+        // (infra/conf/api.go:29), so these are the same two services — the
+        // pinned v26.9.9 binary loads the block.
+        folded_stats["api"]["services"] = json!(["Reflect\u{130}onService", "StatsServ\u{130}ce"]);
+        assert!(validate_raw_override_candidate(&settings, &folded_stats, Language::En).is_ok());
 
         let mut missing_stats = valid;
         missing_stats["api"]["services"] = json!(["ReflectionService"]);

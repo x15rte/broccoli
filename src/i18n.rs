@@ -4126,7 +4126,10 @@ mod en {
             Key::SrvVlessEncryptionInvalid => "VLESS encryption is invalid",
             Key::SrvVlessReverseTagRequired => "VLESS reverse tag is required",
             Key::SrvVmessIdUuid => "VMess id must be a UUID",
-            Key::SrvVmessSecurityUnsupported => "VMess security is unsupported",
+            Key::SrvVmessSecurityUnsupported => {
+                "Xray lowercases VMess security and uses auto for anything outside auto, \
+                 aes-128-gcm, and chacha20-poly1305, so this profile runs with auto"
+            }
             Key::SrvShadowsocksLevelRangeShort => "Shadowsocks level must be between 0 and 255",
             Key::SrvWgSecretInvalid => "WireGuard secret key is invalid",
             Key::SrvWgReservedThreeBytes => "WireGuard reserved must contain exactly three bytes",

@@ -5,7 +5,8 @@
 use super::inbound::Sniffing;
 use super::stream::StreamModel;
 use super::{
-    Int32Range, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false, skip_zero_u16,
+    Int32Range, fold_eq, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false, skip_zero_u16,
+    vocabulary_holds,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -578,23 +579,22 @@ pub(crate) fn blackhole_custom_response_data_decodes(value: &str) -> bool {
 }
 
 /// Whether Xray's blackhole conf accepts this `response.type`. The core
-/// lowercases the stored value before matching (infra/conf/blackhole.go:24),
-/// so the vocabulary is matched case-insensitively here: the empty spelling
-/// and `none` both select no response, `http` the canned response, `custom`
-/// the decoded payload. The stored spelling is never rewritten — the core
-/// lowercases on read, and the emitted configuration carries it as stored.
+/// lowercases the stored value before matching (infra/conf/blackhole.go:24)
+/// and compares the result exactly, so the vocabulary is matched under the
+/// same fold ([`vocabulary_holds`], Go's simple case mapping — not ASCII
+/// case-insensitivity): the empty spelling and `none` both select no
+/// response, `http` the canned response, `custom` the decoded payload. The
+/// stored spelling is never rewritten — the core lowercases on read, and the
+/// emitted configuration carries it as stored.
 pub(crate) fn blackhole_response_type_supported(value: &str) -> bool {
-    value.is_empty()
-        || value.eq_ignore_ascii_case("none")
-        || value.eq_ignore_ascii_case("http")
-        || value.eq_ignore_ascii_case("custom")
+    value.is_empty() || vocabulary_holds(&["none", "http", "custom"], value)
 }
 
 /// Whether Xray's conf build decodes `response.customResponseData` for this
 /// `response.type` (infra/conf/blackhole.go:29-34, matched after the same
 /// lowercasing): only `custom` reads the payload.
 pub(crate) fn blackhole_response_is_custom(value: &str) -> bool {
-    value.eq_ignore_ascii_case("custom")
+    fold_eq(value, "custom")
 }
 
 /// DNS outbound (dns_proxy.go:60-71). nonIPQuery/blockTypes deprecated → not modeled.
@@ -1027,12 +1027,11 @@ impl OutboundModel {
         if let ProtocolSettings::Vmess(settings) = &mut self.settings
             && !super::validation::vmess_security_supported(&settings.security)
         {
-            // The rewrite is generation's, not the profile's: a value outside
-            // the vocabulary dies silently on the wire (the emitted document
-            // carries the core's own default), so the editor refuses the
-            // value instead of rewriting it in place, and this branch only
-            // keeps generation able to emit a document from whatever the
-            // profile holds.
+            // The rewrite is generation's, not the profile's: the core takes
+            // its own default for a value outside the vocabulary, the model
+            // pass reports that fallback as an advisory, and the stored value
+            // stays as written while the emitted document carries what the
+            // core will actually do.
             settings.security = "auto".to_string();
         }
         if self.protocol == Protocol::Hysteria {
