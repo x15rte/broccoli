@@ -29,7 +29,7 @@
       "poolSize": 65535
     },
     {
-      "ipPool": "fc00::/18",
+      "ipPool": "2001:2::/48",
       "poolSize": 32768
     }
   ],

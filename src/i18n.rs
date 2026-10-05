@@ -3191,7 +3191,7 @@ mod en {
             Key::DnsIpPool => "IP pool",
             Key::DnsPoolCidrRequired => "pool CIDR is required",
             Key::DnsPoolCidrInvalid => {
-                "must be an IP CIDR range, for example 198.18.0.0/15 or fc00::/18"
+                "must be an IP CIDR range, for example 198.18.0.0/15 or 2001:2::/48"
             }
             Key::DnsPoolSize => "Pool size",
             Key::DnsAddPool => "+ Add pool",

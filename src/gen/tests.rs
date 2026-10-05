@@ -1746,8 +1746,9 @@ fn dns_and_dokodemo_use_exact_core_wire_types() {
     );
 }
 
-const GEOIP_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geoip.dat";
-const GEOSITE_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/geosite.dat";
+const GEOIP_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/geoip.dat";
+const GEOSITE_URL: &str =
+    "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/geosite.dat";
 
 #[test]
 fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {

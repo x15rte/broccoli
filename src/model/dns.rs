@@ -165,10 +165,11 @@ impl<'de> Deserialize<'de> for DnsServer {
 pub const DEFAULT_FAKEDNS_POOL_CIDR: &str = "198.18.0.0/15";
 /// Fresh-install default fakeDNS pool size.
 pub const DEFAULT_FAKEDNS_POOL_SIZE: i64 = 65_535;
-/// Fresh-install second fakeDNS pool (IPv6) — also the pool the DNS screen
-/// offers when adding a pool after the first (one canonical
-/// definition drives the seed, the UI placeholder, and the Add-pool button).
-pub const SECOND_FAKEDNS_POOL_CIDR: &str = "fc00::/18";
+/// Fresh-install second fakeDNS pool (IPv6) — the pool the core engine
+/// itself defaults to, and also the pool the DNS screen offers when adding
+/// a pool after the first (one canonical definition drives the seed, the UI
+/// placeholder, and the Add-pool button).
+pub const SECOND_FAKEDNS_POOL_CIDR: &str = "2001:2::/48";
 /// Fresh-install second fakeDNS pool size.
 pub const SECOND_FAKEDNS_POOL_SIZE: i64 = 32_768;
 
