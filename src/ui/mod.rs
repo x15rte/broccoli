@@ -568,6 +568,10 @@ pub(crate) struct TerminalErrorView {
     pub(crate) text: String,
     /// Captured core output (empty for an app-authored failure).
     pub(crate) output: String,
+    /// The failure is the core's leak-block filter install: the content block
+    /// offers the remedy the core's own message names (turn the block off and
+    /// retry the start) alongside the standing core-setup route.
+    pub(crate) leak_remedy: bool,
 }
 
 /// Which mount renders the shared core-setup surface. The component is one,

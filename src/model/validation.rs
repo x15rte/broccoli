@@ -31,7 +31,8 @@ use super::Int32Range;
 use super::dns::parse_pool_cidr;
 use super::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
-    LocalInboundProtocol, Sniffing, listen_endpoints_conflict,
+    LocalInboundProtocol, Sniffing, TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN,
+    listen_endpoints_conflict,
 };
 use super::outbound::{
     Fragment, MuxModel, Noise, OutboundModel, ProtocolSettings, blackhole_response_is_custom,
@@ -40,8 +41,9 @@ use super::outbound::{
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
-    FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
-    Network, Security, SockoptModel, StreamModel, XmuxConfig,
+    FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomainEntry,
+    FinalmaskXdnsResolverEntry, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security,
+    SockoptModel, StreamModel, XmuxConfig,
 };
 use super::{
     ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, fold_lower, go_std_base64_decode,
@@ -385,9 +387,32 @@ pub enum ValidationCode {
     /// token name. Error tier.
     FinalmaskNoiseExpArgumentNotAllowed(String),
     FinalmaskSalamanderPacketSize,
-    FinalmaskXdnsDomainRemoved,
-    FinalmaskXdnsEmpty,
-    FinalmaskXdnsResolverUdp,
+    /// A retired `xdns` spelling: the removed `domain` key, or a string where
+    /// `domains`/`resolvers` now hold objects. The value is retained in the
+    /// settings file and never reaches the wire, so the mask runs without it.
+    /// Advisory (Severity::Warning), never a gate.
+    FinalmaskXdnsShapeRetired,
+    /// An `xdns` domain `types` list is empty or names a type outside A (1),
+    /// CNAME (5), TXT (16), and AAAA (28): the domain build refuses it
+    /// (`transport/internet/finalmask/xdns/domain.go:88-98`). Error tier.
+    FinalmaskXdnsDomainTypesInvalid,
+    /// An `xdns` domain length limit is outside its range — `lenLimit` above
+    /// 255, `labelLimit` above 63, either negative, or `edns0` neither 0 nor
+    /// 512 through 4096 (`transport/internet/finalmask/xdns/domain.go:88-98`).
+    /// Error tier.
+    FinalmaskXdnsDomainLimitInvalid,
+    /// An `xdns` resolver `type` folds to neither `tcp` nor `udp`: the loader
+    /// reports an unknown config id
+    /// (`infra/conf/transport_finalmask.go:818-821`). Error tier.
+    FinalmaskXdnsResolverTypeUnknown,
+    /// An `xdns` resolver `settings.addr` is missing or is not the `host:port`
+    /// the mask parses before it dials
+    /// (`transport/internet/finalmask/xdns/resolver_tcp.go:28`,
+    /// `resolver_udp.go:26`). Error tier.
+    FinalmaskXdnsResolverAddrInvalid,
+    /// An `xdns` `extraPoll` is outside 0 through 3: the mask build refuses it
+    /// (`infra/conf/transport_finalmask.go:872-874`). Error tier.
+    FinalmaskXdnsExtraPollInvalid,
     FinalmaskXicmpIpInvalid,
     FinalmaskRealmScheme,
     FinalmaskRealmHostRequired,
@@ -561,6 +586,24 @@ pub enum ValidationCode {
     /// TUN mode without an IPv4 gateway: the adapter would carry no address
     /// while the in-tun DNS listener pins an address no adapter owns.
     TunIpv4GatewayRequired,
+    /// A non-empty leak block beside an empty routing table. The core's
+    /// filter install rides the routes of `autoSystemRoutingTable` and its
+    /// build refuses the pair ("autoSystemWfpBlockLeak needs
+    /// autoSystemRoutingTable to be set", live on the pinned binary), so the
+    /// configuration never loads. Error tier.
+    TunLeakRoutingTableRequired,
+    /// A leak-block value outside {`dns`, `misconfigtun`} (the offending
+    /// value, bounded). The core's build refuses any other spelling with
+    /// "unknown autoSystemWfpBlockLeak value: ..." (live on the pinned
+    /// binary), so the configuration never loads. Values fold
+    /// case-insensitively, so a mixed-case `DNS` is the same half. Error
+    /// tier.
+    TunLeakValueUnknown(String),
+    /// The emitted leak block leaves the unrouted-family half out: an address
+    /// family the routing table does not route into the tunnel can then send
+    /// traffic outside it. Advisory (Severity::Warning): the core loads and
+    /// runs the document, only without that filter.
+    TunLeakMisconfigTunOff,
     /// Two listeners share an endpoint (current label, other label, address,
     /// port).
     ListenerConflict(String, String, String, u16),
@@ -3982,6 +4025,26 @@ fn finalmask_valid_split_host_port(value: &str) -> bool {
     value.matches(':').count() == 1
 }
 
+/// True for the `host:port` an `xdns` resolver dials. The mask builds its
+/// destination as `net.ParseDestination("<type>:" + addr)`
+/// (`transport/internet/finalmask/xdns/resolver_tcp.go:28`,
+/// `resolver_udp.go:26`): a bracketed IPv6 host or a single colon, then a
+/// numeric port. A missing or malformed address leaves the mask unable to
+/// start.
+fn finalmask_valid_xdns_addr(value: &str) -> bool {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        match rest.split_once("]:") {
+            Some((host, port)) => (host, port),
+            None => return false,
+        }
+    } else if value.matches(':').count() == 1 {
+        value.split_once(':').expect("exactly one colon")
+    } else {
+        return false;
+    };
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 fn finalmask_validate_udp_mask(
     index: usize,
     mask: &FinalmaskUdpMask,
@@ -4070,24 +4133,83 @@ fn finalmask_validate_udp_mask(
         }
         FinalmaskUdpMask::Xdns { settings, .. } => {
             if !settings.domain.is_absent() {
-                issues.push(issue(
-                    ValidationCode::FinalmaskXdnsDomainRemoved,
+                issues.push(warning(
+                    ValidationCode::FinalmaskXdnsShapeRetired,
                     Some(format!("{path}.settings.domain")),
                 ));
             }
-            if settings.domains.is_empty() && settings.resolvers.is_empty() {
-                issues.push(issue(
-                    ValidationCode::FinalmaskXdnsEmpty,
-                    Some(format!("{path}.settings")),
-                ));
-            }
-            for (resolver_index, resolver) in settings.resolvers.iter().enumerate() {
-                if !resolver.contains("+udp://") {
+            for (domain_index, entry) in settings.domains.iter().enumerate() {
+                let entry_path = format!("{path}.settings.domains[{domain_index}]");
+                let domain = match entry {
+                    FinalmaskXdnsDomainEntry::Retired(_) => {
+                        issues.push(warning(
+                            ValidationCode::FinalmaskXdnsShapeRetired,
+                            Some(entry_path),
+                        ));
+                        continue;
+                    }
+                    FinalmaskXdnsDomainEntry::Domain(domain) => domain,
+                };
+                if domain.types.is_empty()
+                    || domain
+                        .types
+                        .iter()
+                        .any(|record_type| !matches!(record_type, 1 | 5 | 16 | 28))
+                {
                     issues.push(issue(
-                        ValidationCode::FinalmaskXdnsResolverUdp,
-                        Some(format!("{path}.settings.resolvers[{resolver_index}]")),
+                        ValidationCode::FinalmaskXdnsDomainTypesInvalid,
+                        Some(format!("{entry_path}.types")),
                     ));
                 }
+                if !(0..=255).contains(&domain.len_limit) {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                        Some(format!("{entry_path}.lenLimit")),
+                    ));
+                }
+                if !(0..=63).contains(&domain.label_limit) {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                        Some(format!("{entry_path}.labelLimit")),
+                    ));
+                }
+                if domain.edns0 != 0 && !(512..=4096).contains(&domain.edns0) {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                        Some(format!("{entry_path}.edns0")),
+                    ));
+                }
+            }
+            for (resolver_index, entry) in settings.resolvers.iter().enumerate() {
+                let entry_path = format!("{path}.settings.resolvers[{resolver_index}]");
+                let resolver = match entry {
+                    FinalmaskXdnsResolverEntry::Retired(_) => {
+                        issues.push(warning(
+                            ValidationCode::FinalmaskXdnsShapeRetired,
+                            Some(entry_path),
+                        ));
+                        continue;
+                    }
+                    FinalmaskXdnsResolverEntry::Resolver(resolver) => resolver,
+                };
+                if !matches!(fold_lower(&resolver.resolver_type).as_ref(), "tcp" | "udp") {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsResolverTypeUnknown,
+                        Some(format!("{entry_path}.type")),
+                    ));
+                }
+                if !finalmask_valid_xdns_addr(&resolver.settings.addr) {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsResolverAddrInvalid,
+                        Some(format!("{entry_path}.settings.addr")),
+                    ));
+                }
+            }
+            if !(0..=3).contains(&settings.extra_poll) {
+                issues.push(issue(
+                    ValidationCode::FinalmaskXdnsExtraPollInvalid,
+                    Some(format!("{path}.settings.extraPoll")),
+                ));
             }
         }
         FinalmaskUdpMask::Xicmp { settings, .. } => {
@@ -4834,6 +4956,37 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
     let tun_gateway = tun_ipv4_gateway(&settings.tun);
     if tun_on && tun_gateway.is_none() {
         issues.push(issue(ValidationCode::TunIpv4GatewayRequired, None));
+    }
+    // The core's leak block. The generator writes the key exactly while the
+    // TUN inbound and the DNS module are both present (`emit::dns_inbound_emitted`,
+    // the model side of the `config_runs_tun_dns` predicate the runtime reads
+    // back), so these rules judge the same document the core will load. The
+    // routing-table and value rules mirror refusals the app's wire can really
+    // hit; the dns half needs no check here — the generator overwrites the
+    // TUN inbound's resolver list with the in-tun gateway on the same gate
+    // (`gen::inbounds`), so the core's `len(v.DNS) == 0` refusal is satisfied
+    // structurally. The block is also the only mechanism that now keeps DNS
+    // and the unrouted family inside the tunnel, so a half switched off warns
+    // with what reopens.
+    if emit::dns_inbound_emitted(settings) {
+        let leak = &settings.tun.auto_system_wfp_block_leak;
+        if !leak.is_empty() && settings.tun.auto_system_routing_table.is_empty() {
+            issues.push(issue(ValidationCode::TunLeakRoutingTableRequired, None));
+        }
+        for (index, value) in leak.iter().enumerate() {
+            if !vocabulary_holds(&[TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN], value) {
+                issues.push(issue(
+                    ValidationCode::TunLeakValueUnknown(excerpt(value)),
+                    Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
+                ));
+            }
+        }
+        if !settings.tun.leak_blocks_misconfig_tun() {
+            issues.push(warning(
+                ValidationCode::TunLeakMisconfigTunOff,
+                Some("tun.autoSystemWfpBlockLeak".into()),
+            ));
+        }
     }
     // The tags the emitter appends behind the configured entries reserve their
     // slots here, in the emitter's own order: the insert that fails reports
@@ -5620,7 +5773,7 @@ mod tests {
                     "noise": [{"rand": 1, "type": "hex", "packet": "00"}]
                 }},
                 {"type": "salamander", "settings": {"packetSize": "0-2049"}},
-                {"type": "xdns", "settings": {"resolvers": ["https://dns.example"]}},
+                {"type": "xdns", "settings": {"resolvers": [{"type": "quic", "settings": {"addr": "1.1.1.1:53"}}]}},
                 {"type": "xicmp", "settings": {"ips": ["not-an-ip"]}},
                 {"type": "realm", "settings": {"url": "https://example", "stunServers": []}},
                 {"type": "udphop", "settings": {
@@ -5655,8 +5808,8 @@ mod tests {
                 "finalmask.udp[1].settings.packetSize",
             ),
             (
-                ValidationCode::FinalmaskXdnsResolverUdp,
-                "finalmask.udp[2].settings.resolvers[0]",
+                ValidationCode::FinalmaskXdnsResolverTypeUnknown,
+                "finalmask.udp[2].settings.resolvers[0].type",
             ),
             (
                 ValidationCode::FinalmaskXicmpIpInvalid,
@@ -5714,6 +5867,90 @@ mod tests {
                 "missing {code:?} at {path:?} in {issues:#?}"
             );
         }
+    }
+
+    /// Every `xdns` rule the core refuses at build time reports the offending
+    /// entry and field: an empty or unknown record type, a length limit or
+    /// `edns0` outside its range, an unknown resolver type, a missing or
+    /// malformed resolver address, and an `extraPoll` outside 0 through 3.
+    #[test]
+    fn finalmask_xdns_rules_mirror_the_core() {
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {
+                "domains": [
+                    {"name": "a.example", "types": [], "lenLimit": 256},
+                    {"name": "b.example", "types": [2]},
+                    {"name": "c.example", "types": [1], "labelLimit": 64},
+                    {"name": "d.example", "types": [1], "edns0": 100},
+                    {"name": "ok.example", "types": [1, 5, 16, 28],
+                     "lenLimit": 255, "labelLimit": 63, "edns0": 512}
+                ],
+                "resolvers": [
+                    {"type": "quic", "settings": {"addr": "1.1.1.1:53"}},
+                    {"type": "tcp", "settings": {"addr": "not-an-address"}},
+                    {"type": "udp", "settings": {}},
+                    {"type": "UDP", "settings": {"addr": "[2001:db8::1]:53"}}
+                ],
+                "extraPoll": 4
+            }}]
+        }))
+        .unwrap();
+        let issues = validate_finalmask(&fm);
+        for (code, path) in [
+            (
+                ValidationCode::FinalmaskXdnsDomainTypesInvalid,
+                "finalmask.udp[0].settings.domains[0].types",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                "finalmask.udp[0].settings.domains[0].lenLimit",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainTypesInvalid,
+                "finalmask.udp[0].settings.domains[1].types",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                "finalmask.udp[0].settings.domains[2].labelLimit",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainLimitInvalid,
+                "finalmask.udp[0].settings.domains[3].edns0",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsResolverTypeUnknown,
+                "finalmask.udp[0].settings.resolvers[0].type",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsResolverAddrInvalid,
+                "finalmask.udp[0].settings.resolvers[1].settings.addr",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsResolverAddrInvalid,
+                "finalmask.udp[0].settings.resolvers[2].settings.addr",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsExtraPollInvalid,
+                "finalmask.udp[0].settings.extraPoll",
+            ),
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == code && issue.path.as_deref() == Some(path)),
+                "missing {code:?} at {path:?} in {issues:#?}"
+            );
+        }
+        // The in-range domain and the folded bracketed-IPv6 resolver report
+        // nothing.
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.as_deref().is_some_and(
+                    |path| path.contains("domains[4]") || path.contains("resolvers[3]")
+                )),
+            "{issues:#?}"
+        );
     }
 
     /// Sub-byte bandwidths are values, not unset: a positive bit rate that

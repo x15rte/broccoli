@@ -317,10 +317,16 @@ impl DashboardScreen {
                 // status zone only chips (the phase badge stays the phase
                 // readout) is fully readable here, wrapped, with the captured
                 // core output behind it and the way to the core setup surface.
-                if let Some(error) = ctx.terminal_error
-                    && terminal_error_block(ui, ctx.settings.language, error)
-                {
-                    ctx.request_open_core_setup();
+                // A leak-block install failure adds the remedy the core's own
+                // message names.
+                if let Some(error) = ctx.terminal_error {
+                    let actions = terminal_error_block(ui, ctx.settings.language, error);
+                    if actions.open_core_setup {
+                        ctx.request_open_core_setup();
+                    }
+                    if actions.apply_leak_remedy {
+                        turn_off_leak_block_and_retry(ctx);
+                    }
                 }
 
                 // State + connect row.
@@ -933,15 +939,40 @@ struct HeaderCache {
     endpoints: Vec<(String, ListenerStatus)>,
 }
 
+/// The actions the terminal error block asks the shell to take.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct TerminalErrorActions {
+    /// Open the core setup surface — the block's standing route.
+    open_core_setup: bool,
+    /// Apply the leak-block remedy the core's own message names.
+    apply_leak_remedy: bool,
+}
+
+/// Apply the core's own remedy for a failed leak-filter install: drop the
+/// leak block from the model, persist the change through the config pipeline,
+/// and retry the start. The commit path re-checks the hazards, so a
+/// switched-off DNS half still shows what it reopens before a tunnel comes up
+/// without it.
+fn turn_off_leak_block_and_retry(ctx: &mut UiCtx) {
+    ctx.settings.tun.auto_system_wfp_block_leak.clear();
+    ctx.mark_dirty();
+    ctx.request_connect();
+}
+
 /// Render the terminal error block: the failure's headline and the captured
 /// core output behind it, both wrapped — never truncated, which is the point
 /// of the content-area surface — plus the button that opens the core setup
-/// surface. The shell owns the message's lifetime (the phase it describes
-/// moves on, or an action succeeds); this renders one frame. Returns true
-/// when the button was clicked.
-fn terminal_error_block(ui: &mut egui::Ui, lang: Language, error: &TerminalErrorView) -> bool {
+/// surface. A leak-block install failure adds the remedy its message names.
+/// The shell owns the message's lifetime (the phase it describes moves on, or
+/// an action succeeds); this renders one frame and reports the actions the
+/// user asked for.
+fn terminal_error_block(
+    ui: &mut egui::Ui,
+    lang: Language,
+    error: &TerminalErrorView,
+) -> TerminalErrorActions {
     let colors = status_colors_of(ui);
-    let mut open_core_setup = false;
+    let mut actions = TerminalErrorActions::default();
     egui::Frame::group(ui.style())
         .stroke(egui::Stroke::new(1.0, colors.err))
         .show(ui, |ui| {
@@ -969,11 +1000,22 @@ fn terminal_error_block(ui: &mut egui::Ui, lang: Language, error: &TerminalError
                     .wrap(),
                 );
             }
+            if error.leak_remedy {
+                ui.add_space(4.0);
+                if ui.button(t(lang, Key::TunLeakInstallRemedy)).clicked() {
+                    actions.apply_leak_remedy = true;
+                }
+                ui.label(
+                    egui::RichText::new(t(lang, Key::TunLeakInstallRemedyHint))
+                        .small()
+                        .weak(),
+                );
+            }
             ui.add_space(6.0);
-            open_core_setup = ui.button(t(lang, Key::DashboardOpenCoreSetup)).clicked();
+            actions.open_core_setup = ui.button(t(lang, Key::DashboardOpenCoreSetup)).clicked();
         });
     ui.add_space(8.0);
-    open_core_setup
+    actions
 }
 
 /// Pure phase/settings → status derivation for one local endpoint.
@@ -1055,7 +1097,7 @@ mod tests {
     };
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
     use crate::ui::TerminalErrorView;
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable as _};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1088,6 +1130,7 @@ mod tests {
             terminal_error: Some(TerminalErrorView {
                 text: message.text(Language::En),
                 output: output.to_owned(),
+                leak_remedy: false,
             }),
             ..Default::default()
         };
@@ -1097,7 +1140,7 @@ mod tests {
                 |ui, rig: &mut UiTestRig| {
                     let error = rig.terminal_error.clone().expect("fixture message");
                     let mut ctx = rig.ctx();
-                    if terminal_error_block(ui, ctx.settings.language, &error) {
+                    if terminal_error_block(ui, ctx.settings.language, &error).open_core_setup {
                         ctx.request_open_core_setup();
                     }
                 },
@@ -1137,6 +1180,79 @@ mod tests {
         assert!(
             harness.state().requests.open_core_setup,
             "the block's button must ask the shell to open the core setup surface"
+        );
+    }
+
+    /// The leak-block install failure offers the remedy the core's own message
+    /// names: the button clears the leak block, persists the change through
+    /// the config pipeline, and retries the start. A failure that is not the
+    /// filter install keeps the block's current presentation.
+    #[test]
+    fn leak_install_failure_offers_the_remedy_that_clears_the_block_and_retries() {
+        let core_message = "unable to block DNS and IPv4 and IPv6 outside the TUN \
+            (remove autoSystemWfpBlockLeak to run without): Access is denied.";
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.terminal_error = Some(TerminalErrorView {
+            text: t_fmt(Language::En, Key::TunLeakInstallFailed, &[&core_message]),
+            output: format!(
+                "Failed to start: app/proxyman/inbound: failed to start proxy > {core_message}"
+            ),
+            leak_remedy: true,
+        });
+        let mut harness =
+            screen_harness_at(egui::vec2(900.0, 1600.0), rig, DashboardScreen::default());
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunLeakInstallRemedyHint))
+                .is_some(),
+            "the remedy's advisory must render"
+        );
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::TunLeakInstallRemedy),
+            )
+            .click();
+        harness.run();
+
+        let rig = &harness.state().1;
+        assert!(
+            rig.settings.tun.auto_system_wfp_block_leak.is_empty(),
+            "the remedy must turn the leak block off"
+        );
+        assert!(
+            rig.requests.dirty,
+            "the change must persist through the config pipeline"
+        );
+        assert!(rig.requests.connect, "the remedy must retry the start");
+
+        // A failure that is not the filter install: no remedy button, and the
+        // standing core-setup route stays.
+        let plain = UiTestRig {
+            terminal_error: Some(TerminalErrorView {
+                text: t(Language::En, Key::RtPhaseConfigError).to_string(),
+                output: "Failed to start: app/proxyman/inbound: failed to start proxy > \
+                         Access is denied."
+                    .into(),
+                leak_remedy: false,
+            }),
+            ..Default::default()
+        };
+        let harness =
+            screen_harness_at(egui::vec2(900.0, 1600.0), plain, DashboardScreen::default());
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunLeakInstallRemedy))
+                .is_none(),
+            "a non-leak failure must not offer the leak remedy"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::DashboardOpenCoreSetup))
+                .is_some(),
+            "a non-leak failure keeps the standing core-setup route"
         );
     }
 

@@ -113,6 +113,7 @@ impl Lifecycle {
             config_candidate_pending: self.pending_transition.is_candidate_pending(),
             update_candidate_pending: self.core_update.is_candidate_pending(),
             starting: matches!(self.phase, CorePhase::Starting),
+            leak_install_failed: false,
             code,
         }
     }

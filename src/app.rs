@@ -3397,6 +3397,10 @@ struct TerminalError {
     /// The rendered message text and the language it was rendered in.
     text: String,
     language: Language,
+    /// The failure is the core's leak-block filter install: the content block
+    /// offers the remedy the core's message names. Keyed off the message the
+    /// runtime recorded, never re-derived from the captured output.
+    leak_remedy: bool,
 }
 
 impl TerminalError {
@@ -3405,11 +3409,13 @@ impl TerminalError {
     /// [`Self::render_in`] re-renders against.
     fn new(message: impl Into<AppMessage>, output: String, language: Language) -> Self {
         let message = message.into();
+        let leak_remedy = message.headline().key() == Key::TunLeakInstallFailed;
         Self {
             text: message.text(language),
             message,
             output,
             language,
+            leak_remedy,
         }
     }
 
@@ -3432,6 +3438,7 @@ impl TerminalError {
         ui::TerminalErrorView {
             text: self.text.clone(),
             output: self.output.clone(),
+            leak_remedy: self.leak_remedy,
         }
     }
 }

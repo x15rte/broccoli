@@ -2,8 +2,8 @@
 //! tun — plus the shared sniffing config and TUN settings (tun.go:15-54).
 
 use super::{
-    dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, skip_empty_str, skip_empty_vec, skip_false,
-    skip_zero_u16, skip_zero_u32,
+    dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, fold_lower, skip_empty_str, skip_empty_vec,
+    skip_false, skip_zero_u16, skip_zero_u32,
 };
 use crate::r#gen::keys;
 use serde::{Deserialize, Serialize};
@@ -981,6 +981,22 @@ pub struct TunCfg {
     pub auto_system_routing_table: Vec<String>,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub auto_outbounds_interface: String,
+    /// The core's leak block halves the tunnel runs: [`TUN_LEAK_DNS`] drops
+    /// DNS egress outside the tunnel, [`TUN_LEAK_MISCONFIG_TUN`] drops an
+    /// address family the routing table does not route into it
+    /// (infra/conf/tun.go). Values fold case-insensitively like every wire
+    /// vocabulary (the core lowercases each entry before it compares).
+    /// Always serialized (storage): the seeded both-on policy must survive a
+    /// round-trip after the user switches a half off, and the generator
+    /// emits it whenever the TUN inbound and the DNS module are both present
+    /// (the same predicate the runtime reads back).
+    pub auto_system_wfp_block_leak: Vec<String>,
+    /// Point the system resolver at the tunnel gateway. Linux-only upstream
+    /// (only `LinuxTun` implements `ConfigureSystemDNS`), so the core
+    /// accepts and no-ops it on Windows; the model carries it for wire
+    /// fidelity, with no UI and no finding.
+    #[serde(skip_serializing_if = "skip_false")]
+    pub auto_system_dns_to_gateway: bool,
     /// Inbound envelope sniffing; serialized outside TUN protocol settings.
     pub sniffing: Sniffing,
     #[serde(flatten)]
@@ -990,6 +1006,20 @@ pub struct TunCfg {
 /// The seeded TUN adapter name. The emitted inbound always names its
 /// adapter, so a blank setting ([`TunCfg::effective_name`]) resolves here.
 pub const DEFAULT_TUN_NAME: &str = "broccoli0";
+
+/// The leak-block half that keeps DNS inside the tunnel: the core drops
+/// port-53 egress outside it (`proxy/tun/tun_windows.go`). Its prerequisite
+/// is a non-empty TUN resolver list (`TunCfg::dns`).
+pub const TUN_LEAK_DNS: &str = "dns";
+
+/// The leak-block half that drops traffic of an address family the routing
+/// table does not route into the tunnel (`proxy/tun/tun_windows.go`).
+pub const TUN_LEAK_MISCONFIG_TUN: &str = "misconfigtun";
+
+/// The leak-block halves a fresh install runs, in the core's own value
+/// order. A TUN session keeps DNS and the unrouted family inside the tunnel
+/// until the user switches a half off.
+pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 2] = [TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN];
 
 impl Default for TunCfg {
     fn default() -> Self {
@@ -1011,6 +1041,11 @@ impl Default for TunCfg {
                 "8000::/1".into(),
             ],
             auto_outbounds_interface: "auto".into(),
+            auto_system_wfp_block_leak: DEFAULT_TUN_LEAK_BLOCK
+                .iter()
+                .map(|half| (*half).into())
+                .collect(),
+            auto_system_dns_to_gateway: false,
             extra: Map::new(),
         }
     }
@@ -1031,6 +1066,30 @@ impl TunCfg {
         } else {
             trimmed
         }
+    }
+
+    /// Whether the leak list carries the DNS half (folded the way the core
+    /// lowercases each entry before it compares).
+    pub fn leak_blocks_dns(&self) -> bool {
+        self.auto_system_wfp_block_leak
+            .iter()
+            .any(|half| fold_eq(half, TUN_LEAK_DNS))
+    }
+
+    /// Whether the leak list carries the unrouted-family half.
+    pub fn leak_blocks_misconfig_tun(&self) -> bool {
+        self.auto_system_wfp_block_leak
+            .iter()
+            .any(|half| fold_eq(half, TUN_LEAK_MISCONFIG_TUN))
+    }
+
+    /// The leak halves folded to the canonical spelling the core stores
+    /// (`strings.ToLower`, infra/conf/tun.go), in the model's own order.
+    pub fn folded_leak_block(&self) -> Vec<String> {
+        self.auto_system_wfp_block_leak
+            .iter()
+            .map(|half| fold_lower(half).into_owned())
+            .collect()
     }
 
     /// Wire form of the TUN inbound; `sniffing` lives in the inbound
@@ -1073,6 +1132,11 @@ impl TunCfg {
             if self.auto_system_routing_table.is_empty() {
                 o.remove("autoSystemRoutingTable");
             }
+            // The leak block is emitted by the generator, not here: the key
+            // reaches the wire only while the TUN inbound and the DNS module
+            // are both present (the predicate `config_runs_tun_dns` reads
+            // back), and the generator adds the folded value under that gate.
+            o.remove("autoSystemWfpBlockLeak");
         }
         // Built as a map directly: the envelope is an object by construction,
         // so adding the optional `sniffing` key needs no shape check.
@@ -1100,6 +1164,56 @@ mod tun_tests {
                 "::/1".to_string(),
                 "8000::/1".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn fresh_install_leak_block_covers_dns_and_the_unrouted_family() {
+        // Both halves seed on: the deleted app-side filter carried exactly
+        // this policy, and the core installs the same filters inside its own
+        // process.
+        let tun = TunCfg::default();
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            vec!["dns".to_string(), "misconfigtun".to_string()]
+        );
+        assert!(tun.leak_blocks_dns());
+        assert!(tun.leak_blocks_misconfig_tun());
+        assert!(!tun.auto_system_dns_to_gateway);
+    }
+
+    #[test]
+    fn leak_halves_fold_like_the_core_lowercases_them() {
+        // The core lowercases each entry before it compares
+        // (infra/conf/tun.go), so a stored mixed-case spelling is the same
+        // half and reaches the wire folded.
+        let tun = TunCfg {
+            auto_system_wfp_block_leak: vec!["DNS".into(), "MisconfigTun".into()],
+            ..Default::default()
+        };
+        assert!(tun.leak_blocks_dns());
+        assert!(tun.leak_blocks_misconfig_tun());
+        assert_eq!(
+            tun.folded_leak_block(),
+            vec!["dns".to_string(), "misconfigtun".to_string()]
+        );
+    }
+
+    #[test]
+    fn wire_form_leaves_the_leak_block_to_the_generator() {
+        // The key is a generator decision (TUN inbound plus DNS module), so
+        // the base wire projection never carries it on its own.
+        let tun = TunCfg::default();
+        assert!(
+            tun.to_wire(false)["settings"]
+                .get("autoSystemWfpBlockLeak")
+                .is_none()
+        );
+        assert!(
+            tun.to_wire(false)["settings"]
+                .get("autoSystemDnsToGateway")
+                .is_none(),
+            "the false Linux-only switch stays off the wire"
         );
     }
 
@@ -1158,6 +1272,7 @@ mod tun_tests {
             mtu: 0,
             gateway: Vec::new(),
             auto_system_routing_table: Vec::new(),
+            auto_system_wfp_block_leak: Vec::new(),
             ..Default::default()
         };
         let value = serde_json::to_value(&cleared).expect("serialize cleared tun state");
@@ -1186,6 +1301,11 @@ mod tun_tests {
             serde_json::json!([]),
             "a cleared route table must serialize explicitly, not be omitted"
         );
+        assert_eq!(
+            value["autoSystemWfpBlockLeak"],
+            serde_json::json!([]),
+            "a cleared leak block must serialize explicitly, not be omitted"
+        );
         let restored: TunCfg = serde_json::from_value(value).expect("load cleared tun state");
         assert_eq!(restored.name, "", "cleared name must load back empty");
         assert_eq!(restored.desc, "", "cleared desc must load back empty");
@@ -1199,6 +1319,11 @@ mod tun_tests {
             restored.auto_system_routing_table,
             Vec::<String>::new(),
             "cleared route table must load back empty"
+        );
+        assert_eq!(
+            restored.auto_system_wfp_block_leak,
+            Vec::<String>::new(),
+            "cleared leak block must load back empty, not resurrect the seed"
         );
     }
 }

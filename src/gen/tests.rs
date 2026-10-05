@@ -9,7 +9,7 @@ use crate::model::dns::{
 };
 use crate::model::inbound::{
     DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG, LocalInboundCfg, LocalInboundProtocol,
-    TUN_INBOUND_TAG,
+    TUN_INBOUND_TAG, config_runs_tun_dns,
 };
 use crate::model::stream::MasqueradeCfg;
 use crate::model::validation::ValidationCode;
@@ -1299,6 +1299,59 @@ fn golden_hysteria2_udphop_mask() {
     );
 }
 
+/// The `xdns` mask reaches the wire as the object schema the core reads
+/// (`infra/conf/transport_finalmask.go:828-832`): domain objects with their
+/// record types and limits, resolver objects with a type and an address, and
+/// the `extraPoll` counter. The emitted document must pass the pinned core's
+/// `run -test`.
+#[test]
+fn golden_hysteria2_xdns_mask() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "xdns.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "xdnspassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                domains: vec![FinalmaskXdnsDomainEntry::Domain(FinalmaskXdnsDomain {
+                    name: "tunnel.example.com".into(),
+                    len_limit: 255,
+                    label_limit: 63,
+                    types: vec![1, 28],
+                    edns0: 1232,
+                    ..Default::default()
+                })],
+                resolvers: vec![FinalmaskXdnsResolverEntry::Resolver(
+                    FinalmaskXdnsResolver {
+                        resolver_type: "udp".into(),
+                        settings: FinalmaskXdnsResolverSettings {
+                            addr: "1.1.1.1:53".into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )],
+                extra_poll: 2,
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_xdns.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn retired_quic_udp_hop_key_warns_and_never_reaches_the_wire() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);
@@ -2121,7 +2174,10 @@ fn port_collision_between_two_local_entries_is_rejected() {
 fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
-    settings.tun.dns.clear(); // no adapter DNS configured (stale-resolver state)
+    // A declared adapter resolver list that the pin must override: with the
+    // module answering in-tunnel, a query to the declared outside address
+    // would be dropped by the leak block.
+    settings.tun.dns = vec!["9.9.9.9".into()];
     settings.dns.servers.push(DnsServer {
         address: "https://1.1.1.1/dns-query".into(),
         ..Default::default()
@@ -2246,6 +2302,72 @@ fn tun_without_dns_module_keeps_stored_adapter_dns() {
         .find(|ib| ib["protocol"] == "tun")
         .expect("tun inbound");
     assert_eq!(tun["settings"]["dns"], json!(["9.9.9.9"]));
+}
+
+/// The TUN inbound's settings from an emitted document.
+fn tun_settings(cfg: &Value) -> &Value {
+    &cfg["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|inbound| inbound["protocol"] == "tun")
+        .expect("tun inbound")["settings"]
+}
+
+#[test]
+fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
+    // The leak key rides the same gate the runtime reads back
+    // (`config_runs_tun_dns`): a TUN inbound and a top-level DNS module. The
+    // default policy keeps DNS and the unrouted family inside the tunnel.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+
+    assert!(
+        config_runs_tun_dns(&cfg),
+        "the emitted document must read as tun plus DNS module"
+    );
+    let settings_obj = tun_settings(&cfg);
+    assert_eq!(
+        settings_obj["autoSystemWfpBlockLeak"],
+        json!(["dns", "misconfigtun"])
+    );
+    assert!(
+        settings_obj.get("autoSystemDnsToGateway").is_none(),
+        "the false Linux-only switch stays off the wire"
+    );
+}
+
+#[test]
+fn tun_without_dns_module_emits_no_leak_block() {
+    // No DNS module means nothing answers the adapter DNS, so the key would
+    // point the core at a listener the runtime never adds. The generator
+    // leaves the key off, and the predicate reads false for the same reason.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.dns.servers.clear();
+    settings.dns.enable_parallel_query = false;
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+
+    assert!(!config_runs_tun_dns(&cfg));
+    assert!(tun_settings(&cfg).get("autoSystemWfpBlockLeak").is_none());
+}
+
+#[test]
+fn a_switched_off_leak_half_leaves_the_key_without_it() {
+    // Turning the DNS half off keeps the key (the module still answers), but
+    // the emitted value no longer blocks DNS egress. The case folding the
+    // core applies runs on the way out too.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.tun.auto_system_wfp_block_leak = vec!["MisconfigTun".into()];
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+
+    assert!(config_runs_tun_dns(&cfg));
+    assert_eq!(
+        tun_settings(&cfg)["autoSystemWfpBlockLeak"],
+        json!(["misconfigtun"])
+    );
 }
 
 #[test]

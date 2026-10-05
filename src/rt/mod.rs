@@ -3104,10 +3104,13 @@ impl Runtime {
         self.prev_traffic.clear();
         self.prev_inbound_traffic.clear();
         let tail = self.output_tail(START_FAILURE_EXCERPT_LINES);
+        let leak_install = policy::leak_block_install_message(&tail);
 
         // The classifier owns the branch precedence; every arm below keeps
         // the side effects it had when the chain was inline.
-        match classify_core_exit(self.lifecycle.exit_facts(code)) {
+        let mut facts = self.lifecycle.exit_facts(code);
+        facts.leak_install_failed = leak_install.is_some();
+        match classify_core_exit(facts) {
             // A candidate timeout sets the armed rollback before requesting
             // termination; the rollback is deliberately reached only from this
             // confirmed-exit path.
@@ -3198,6 +3201,24 @@ impl Runtime {
                 // as installed — and the core's own config error is what the
                 // user sees.
                 let failure = PhaseError::new(Diag::new(Key::RtPhaseConfigError)).with_tail(tail);
+                self.settle_config_failure(failure);
+            }
+            ExitBranch::LeakBlockInstall => {
+                // The core chose not to start rather than come up with its
+                // filters missing, and the same configuration fails the same
+                // way in every process — so no retry, rollback or backoff can
+                // help. The config-class terminal record carries the core's
+                // own message, and the content block offers the remedy that
+                // message names.
+                let core_message = leak_install
+                    .expect("the leak-install branch is classified only when the message matched");
+                let failure =
+                    PhaseError::new(Diag::new(Key::TunLeakInstallFailed).arg(core_message))
+                        .with_tail(tail);
+                // No rollback is armed for a configuration the core refuses
+                // deterministically, so the candidate marker must not linger
+                // into the next start.
+                self.lifecycle.pending_transition.clear_candidate();
                 self.settle_config_failure(failure);
             }
             ExitBranch::ConfigError => {
@@ -3910,8 +3931,8 @@ mod tests {
         LatencyProbeResult, NO_PROGRESS_EMITTED, OutboundStatusView, PhaseError, ProbeFailure,
         ProfileValidationOrigin, ProfileValidationRequest, READY_TIMEOUT, READY_TIMEOUT_APPLIED,
         Runtime, STOP_TIMEOUT, TUN_BIND_RACE_RETRIES, TUN_STOP_WINDOW, connect_after_helper_launch,
-        policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE, should_emit_download_progress,
-        spawn_runtime, state::BackendState,
+        policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE, policy::LEAK_INSTALL_LINE,
+        should_emit_download_progress, spawn_runtime, state::BackendState,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t};
@@ -6618,6 +6639,54 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CoreEvt::RollbackResult { .. })),
             "no rollback may be attempted on the first failure"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leak_install_failure_settles_the_config_terminal_without_a_retry() {
+        // A TUN start the core aborts on its leak-filter install is
+        // deterministic: the same configuration fails the same way in every
+        // process, so the pre-readiness retry, the config rollback and the
+        // backoff restart are all skipped. The terminal record carries the
+        // core's own message, which is what the content block reads to offer
+        // the remedy.
+        let (mut runtime, events) = runtime_with_events();
+        runtime.lifecycle.backend = BackendState::for_test(false, true);
+        runtime.lifecycle.pending_transition.commit_candidate();
+        runtime.push_ring(LEAK_INSTALL_LINE);
+
+        runtime.on_core_exit(Some(-1)).await;
+
+        let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
+            panic!(
+                "the leak-install branch must land in the Error phase, got {:?}",
+                runtime.lifecycle.phase
+            );
+        };
+        assert_eq!(phase_message(error).key(), Key::TunLeakInstallFailed);
+        assert!(
+            phase_message(error).text(Language::En).contains(
+                "unable to block DNS and IPv4 and IPv6 outside the TUN \
+                 (remove autoSystemWfpBlockLeak to run without)"
+            ),
+            "the terminal headline must carry the core's own message, got: {}",
+            phase_message(error).text(Language::En)
+        );
+        assert_eq!(error.tail, LEAK_INSTALL_LINE);
+        assert!(
+            runtime.lifecycle.pending_restart.is_none(),
+            "a deterministic failure must not schedule a retry"
+        );
+        assert!(
+            !runtime.lifecycle.pending_transition.is_candidate_pending(),
+            "no rollback may be armed for a configuration the core refuses deterministically"
+        );
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::RollbackResult { .. })),
+            "the leak-install failure must not attempt a rollback"
         );
     }
 

@@ -20,6 +20,13 @@
       },
       {
         "address": "8.8.8.8"
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:xdns.example.com"
+        ],
+        "skipFallback": true
       }
     ]
   },
@@ -56,41 +63,6 @@
         "enabled": true
       },
       "tag": "in-http"
-    },
-    {
-      "protocol": "tun",
-      "settings": {
-        "autoOutboundsInterface": "auto",
-        "autoSystemRoutingTable": [
-          "0.0.0.0/1",
-          "128.0.0.0/1",
-          "::/1",
-          "8000::/1"
-        ],
-        "autoSystemWfpBlockLeak": [
-          "dns",
-          "misconfigtun"
-        ],
-        "desc": "Wintun",
-        "dns": [
-          "10.255.0.1"
-        ],
-        "gateway": [
-          "10.255.0.1/30",
-          "fd00::1/64"
-        ],
-        "mtu": 1500,
-        "name": "broccoli0"
-      },
-      "sniffing": {
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ],
-        "enabled": true
-      },
-      "tag": "in-tun"
     }
   ],
   "log": {
@@ -98,6 +70,58 @@
     "loglevel": "warning"
   },
   "outbounds": [
+    {
+      "protocol": "hysteria",
+      "settings": {
+        "address": "xdns.example.com",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "finalmask": {
+          "udp": [
+            {
+              "settings": {
+                "domains": [
+                  {
+                    "edns0": 1232,
+                    "labelLimit": 63,
+                    "lenLimit": 255,
+                    "name": "tunnel.example.com",
+                    "types": [
+                      1,
+                      28
+                    ]
+                  }
+                ],
+                "extraPoll": 2,
+                "resolvers": [
+                  {
+                    "settings": {
+                      "addr": "1.1.1.1:53"
+                    },
+                    "type": "udp"
+                  }
+                ]
+              },
+              "type": "xdns"
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "auth": "xdnspassword",
+          "udpIdleTimeout": 60,
+          "version": 2
+        },
+        "network": "hysteria",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {}
+      },
+      "tag": "srv-01234567"
+    },
     {
       "protocol": "freedom",
       "tag": "direct"
@@ -121,23 +145,6 @@
   },
   "routing": {
     "rules": [
-      {
-        "inboundTag": [
-          "dns-in",
-          "dns-in6"
-        ],
-        "network": "udp,tcp",
-        "outboundTag": "dns-out",
-        "port": "53"
-      },
-      {
-        "inboundTag": [
-          "in-tun"
-        ],
-        "network": "udp",
-        "outboundTag": "dns-out",
-        "port": "53"
-      },
       {
         "inboundTag": [
           "in-socks"

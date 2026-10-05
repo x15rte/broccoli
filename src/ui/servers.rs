@@ -7090,7 +7090,8 @@ mod tests {
     use crate::model::validation::{ValidationCode, ValidationIssue};
     use crate::model::{
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
-        FinalmaskQuicParams, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask,
+        FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask,
+        FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry,
         FreedomFinalRule, HysteriaTransport, Network, Noise, OutboundModel, Protocol,
         ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
         WireguardPeer, WsSettings, XhttpSettings,
@@ -13297,6 +13298,102 @@ Authentication: ML-KEM-768, Post-Quantum
             json!({"enabled": true, "timeout": 0, "lifetime": 0}),
             "{emitted}"
         );
+    }
+
+    #[test]
+    fn xdns_mask_editor_edits_objects_and_clears_retired_entries() {
+        fn xdns(mask: &FinalmaskUdpMask) -> &FinalmaskXdns {
+            match mask {
+                FinalmaskUdpMask::Xdns { settings, .. } => settings,
+                other => panic!("the harness renders an xdns mask, got {other:?}"),
+            }
+        }
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                domain: FinalmaskRawValue::Present(json!("legacy.example")),
+                domains: vec![FinalmaskXdnsDomainEntry::Retired("old.example".into())],
+                resolvers: vec![FinalmaskXdnsResolverEntry::Retired(
+                    "dns.example+udp://1.1.1.1:53".into(),
+                )],
+                ..Default::default()
+            },
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("xdns-editor-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+            );
+        });
+        harness.run();
+
+        // Each retired spelling — the string domain, the string resolver, and
+        // the removed `domain` key — renders its own notice and remove action.
+        let notices = |harness: &Harness<'_, ()>| {
+            harness
+                .query_all_by_label(t(Language::En, Key::FinalmaskXdnsShapeRetired))
+                .count()
+        };
+        assert_eq!(notices(&harness), 3, "one notice per retired spelling");
+
+        // The first remove action clears the retired string domain, then the
+        // string resolver, then the removed `domain` key.
+        let remove = |harness: &mut Harness<'_, ()>| {
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvRemove))
+                .next()
+                .expect("a retired row renders its remove action")
+                .click();
+            harness.run();
+        };
+        remove(&mut harness);
+        assert!(xdns(&mask.borrow()).domains.is_empty());
+        assert_eq!(notices(&harness), 2);
+        remove(&mut harness);
+        assert!(xdns(&mask.borrow()).resolvers.is_empty());
+        assert_eq!(notices(&harness), 1);
+        remove(&mut harness);
+        assert!(xdns(&mask.borrow()).domain.is_absent());
+        assert_eq!(notices(&harness), 0);
+
+        // The add actions append the object forms with the core's limits.
+        harness
+            .get_by_label(t(Language::En, Key::SrvAddXdnsDomain))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvAddXdnsResolver))
+            .click();
+        harness.run();
+        let settings = mask.borrow();
+        let settings = xdns(&settings);
+        match &settings.domains[..] {
+            [FinalmaskXdnsDomainEntry::Domain(domain)] => {
+                assert_eq!(domain.len_limit, 255);
+                assert_eq!(domain.label_limit, 63);
+                assert!(domain.types.is_empty());
+                assert_eq!(domain.edns0, 0);
+            }
+            other => panic!("the add-domain action must append one object row, got {other:?}"),
+        }
+        match &settings.resolvers[..] {
+            [FinalmaskXdnsResolverEntry::Resolver(resolver)] => {
+                assert!(resolver.resolver_type.is_empty());
+                assert!(resolver.settings.addr.is_empty());
+            }
+            other => panic!("the add-resolver action must append one object row, got {other:?}"),
+        }
     }
 
     #[test]

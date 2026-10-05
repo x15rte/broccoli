@@ -58,6 +58,26 @@ fn dns_in_bind_race(captured: &str) -> bool {
     captured.contains("failed to listen TCP on 53 >")
 }
 
+/// The exact tail of the core's message when it aborts a TUN start because
+/// its leak-block WFP filters could not be installed
+/// (`proxy/tun/tun_windows.go`: `unable to block <halves> outside the TUN
+/// (remove autoSystemWfpBlockLeak to run without)`). The parenthesized remedy
+/// is what makes the match narrow: no other core text carries it.
+const LEAK_INSTALL_MARKER: &str = " outside the TUN (remove autoSystemWfpBlockLeak to run without)";
+
+/// The core's own leak-block failure message from one captured output
+/// excerpt, or `None` when the excerpt does not carry it. The message runs
+/// from the core's `unable to block` prefix to the end of the line, so the
+/// terminal surface shows exactly what the core said it could not install
+/// (the named halves and the underlying cause).
+pub(super) fn leak_block_install_message(captured: &str) -> Option<&str> {
+    captured.lines().find_map(|line| {
+        let end = line.find(LEAK_INSTALL_MARKER)?;
+        let start = line[..end].rfind("unable to block ")?;
+        Some(line[start..].trim_end())
+    })
+}
+
 /// Pre-readiness failure kinds of a TUN-owned boot that are transient enough
 /// to earn an automatic retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +252,10 @@ pub(super) enum ExitBranch {
     UpdateConfigError,
     /// A pending core-update candidate exited before readiness.
     UpdatePreReadiness,
+    /// The captured output carries the core's leak-block filter-install
+    /// failure: a deterministic configuration fault that no retry, rollback
+    /// or backoff restart can repair.
+    LeakBlockInstall,
     /// Exit 23 outside both candidate paths: the startup config error.
     ConfigError,
     /// Any other unexpected exit: exponential backoff with jitter.
@@ -255,6 +279,8 @@ pub(super) struct CoreExitFacts {
     pub(super) update_candidate_pending: bool,
     /// The runtime is in its starting phase.
     pub(super) starting: bool,
+    /// The captured output carries the core's leak-block install failure.
+    pub(super) leak_install_failed: bool,
     /// The exit code the platform reported, if any.
     pub(super) code: Option<i32>,
 }
@@ -262,8 +288,9 @@ pub(super) struct CoreExitFacts {
 /// Classify one confirmed exit into the handler branch that owns it. The
 /// precedence is the rollback/retry machine's rule: armed rollbacks first
 /// (config, then update), then a silenced stop, then a requested
-/// restart/stop, then the two pre-readiness candidates, then the exit-23
-/// config error, and finally the backoff restart.
+/// restart/stop, then the deterministic leak-block install failure, then the
+/// two pre-readiness candidates, then the exit-23 config error, and finally
+/// the backoff restart.
 ///
 /// The core's config-load code outranks the update candidate: a config-class
 /// failure is evidence about a configuration, never about the payload the
@@ -281,6 +308,14 @@ pub(super) fn classify_core_exit(facts: CoreExitFacts) -> ExitBranch {
         ExitIntent::Restart => return ExitBranch::RestartQueued,
         ExitIntent::Stop => return ExitBranch::StopSettled,
         ExitIntent::Idle => {}
+    }
+    if facts.leak_install_failed {
+        // Deterministic: the same configuration fails the same way in every
+        // process, so the pre-readiness retry, the config rollback and the
+        // backoff restart all replay a configuration the core cannot run.
+        // The config-class terminal record is the one surface that can offer
+        // the remedy the core's own message names.
+        return ExitBranch::LeakBlockInstall;
     }
     if facts.config_candidate_pending {
         return ExitBranch::CandidatePreReadiness;
@@ -306,6 +341,15 @@ pub(super) fn classify_core_exit(facts: CoreExitFacts) -> ExitBranch {
 pub(super) const DNS_IN_BIND_RACE_LINE: &str = "Failed to start: app/proxyman/inbound: failed to listen TCP on 53 > \
 transport/internet: failed to listen on address: 10.255.0.1:53 > transport/internet/tcp: failed to listen TCP on \
 10.255.0.1:53 > listen tcp 10.255.0.1:53: bind: The requested address is not valid in its context.";
+
+/// Verbatim output of the pinned core when its leak-block WFP filters could
+/// not be installed (`proxy/tun/tun_windows.go`), wrapped by the run command's
+/// own start failure. Shared with the runtime's in-module tests so the
+/// recorded failure text has one home.
+#[cfg(test)]
+pub(super) const LEAK_INSTALL_LINE: &str = "Failed to start: app/proxyman/inbound: failed to start proxy > \
+unable to block DNS and IPv4 and IPv6 outside the TUN (remove autoSystemWfpBlockLeak to run without): \
+Access is denied.";
 
 #[cfg(test)]
 mod tests {
@@ -406,6 +450,7 @@ mod tests {
             config_candidate_pending: false,
             update_candidate_pending: true,
             starting: true,
+            leak_install_failed: false,
             code: None,
         };
         // The config-load code with an unproven update candidate: the
@@ -510,6 +555,7 @@ mod tests {
             config_candidate_pending: false,
             update_candidate_pending: false,
             starting: false,
+            leak_install_failed: false,
             code: None,
         }
     }
@@ -561,6 +607,46 @@ mod tests {
         f.update_candidate_pending = true;
         f.starting = true;
         assert_eq!(classify_core_exit(f), ExitBranch::UpdateConfigError);
+    }
+
+    /// The leak-block install failure is recognised only by the core's exact
+    /// message, and it owns the branch ahead of the retry/rollback candidates
+    /// and the exit-code split.
+    #[test]
+    fn leak_install_failure_owns_its_branch_and_matches_narrowly() {
+        assert_eq!(
+            leak_block_install_message(LEAK_INSTALL_LINE),
+            Some(
+                "unable to block DNS and IPv4 and IPv6 outside the TUN \
+                 (remove autoSystemWfpBlockLeak to run without): Access is denied."
+            )
+        );
+        // A line that merely names the key (a config-load refusal) is not the
+        // install failure: the marker is the parenthesized remedy the install
+        // message ends with.
+        assert_eq!(
+            leak_block_install_message(
+                "infra/conf: autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set"
+            ),
+            None
+        );
+        assert_eq!(leak_block_install_message(""), None);
+        assert_eq!(leak_block_install_message(DNS_IN_BIND_RACE_LINE), None);
+
+        // Precedence: the deterministic failure outranks a pending config
+        // candidate, so no retry or rollback is spent on it.
+        let mut f = facts();
+        f.leak_install_failed = true;
+        f.config_candidate_pending = true;
+        f.code = Some(-1);
+        assert_eq!(classify_core_exit(f), ExitBranch::LeakBlockInstall);
+
+        // A requested stop still wins: the user's intent is not a failure.
+        f.intent = ExitIntent::Stop;
+        assert_eq!(classify_core_exit(f), ExitBranch::StopSettled);
+        f.intent = ExitIntent::Idle;
+        f.config_candidate_pending = false;
+        assert_eq!(classify_core_exit(f), ExitBranch::LeakBlockInstall);
     }
 
     #[test]

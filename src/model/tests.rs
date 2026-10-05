@@ -465,6 +465,18 @@ fn roundtrip_inbounds() {
         "gateway": ["10.255.0.1/30"], "dns": ["1.1.1.1", "8.8.8.8"], "userLevel": 0,
         "autoSystemRoutingTable": ["0.0.0.0/1", "128.0.0.0/1"],
         "autoOutboundsInterface": "auto",
+        "autoSystemWfpBlockLeak": ["dns", "misconfigtun"],
+        "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
+    }));
+    // The Linux-only switch is wire-faithful: a set value round-trips, while
+    // the false default stays off the wire (skip_serializing_if).
+    check::<TunCfg>(json!({
+        "name": "broccoli0", "desc": "Wintun", "mtu": 1500,
+        "gateway": ["10.255.0.1/30"], "dns": ["1.1.1.1", "8.8.8.8"], "userLevel": 0,
+        "autoSystemRoutingTable": ["0.0.0.0/1", "128.0.0.0/1"],
+        "autoOutboundsInterface": "auto",
+        "autoSystemWfpBlockLeak": ["misconfigtun"],
+        "autoSystemDnsToGateway": true,
         "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
     }));
 }

@@ -12,7 +12,9 @@ use crate::model::{
     FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
     FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku, FinalmaskTcpItem,
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem,
-    FinalmaskUdpMask, FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert,
+    FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsDomainEntry,
+    FinalmaskXdnsResolver, FinalmaskXdnsResolverEntry, FinalmaskXmc, FinalmaskXmcProfile,
+    Int32Range, TlsCert,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -716,6 +718,156 @@ fn finalmask_xmc_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Finalm
     changed
 }
 
+/// Editor for the `xdns` settings: a server-domain list, a client-resolver
+/// list, and the `extraPoll` counter. A retired string entry — or the removed
+/// `domain` key — renders its notice and a remove action instead of an object
+/// row; the wire pass drops it, so it never leaves the settings file.
+fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut FinalmaskXdns) -> bool {
+    // The record types the core's `NewDomain` accepts, as the body's numbers.
+    const RECORD_TYPES: [(i32, &str); 4] = [(1, "A"), (5, "CNAME"), (16, "TXT"), (28, "AAAA")];
+    let notice = |ui: &mut egui::Ui| {
+        ui.colored_label(
+            status_colors_of(ui).warn,
+            t(lang, Key::FinalmaskXdnsShapeRetired),
+        );
+    };
+    let mut changed = false;
+
+    ui.label(t(lang, Key::SrvDomainsServer));
+    let mut remove_domain = None;
+    for (index, entry) in settings.domains.iter_mut().enumerate() {
+        ui.push_id(("xdns-domain", index), |ui| {
+            ui.group(|ui| match entry {
+                FinalmaskXdnsDomainEntry::Retired(text) => {
+                    notice(ui);
+                    ui.label(t_fmt(lang, Key::SrvPreserved, &[text]));
+                    if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+                        remove_domain = Some(index);
+                    }
+                }
+                FinalmaskXdnsDomainEntry::Domain(domain) => {
+                    ui.horizontal(|ui| {
+                        ui.label(t_fmt(lang, Key::SrvXdnsDomainN, &[&(index + 1)]));
+                        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+                            remove_domain = Some(index);
+                        }
+                    });
+                    changed |= widgets::text_field(ui, "name", &mut domain.name, "example.com");
+                    ui.horizontal(|ui| {
+                        ui.label("lenLimit");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut domain.len_limit).range(0..=255))
+                            .changed();
+                        ui.label("labelLimit");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut domain.label_limit).range(0..=63))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("types");
+                        for (record_type, label) in RECORD_TYPES {
+                            let mut on = domain.types.contains(&record_type);
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    domain.types.push(record_type);
+                                } else {
+                                    domain.types.retain(|value| *value != record_type);
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("edns0");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut domain.edns0).range(0..=4096))
+                            .changed();
+                    });
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_domain {
+        settings.domains.remove(index);
+        changed = true;
+    }
+    if ui.small_button(t(lang, Key::SrvAddXdnsDomain)).clicked() {
+        settings
+            .domains
+            .push(FinalmaskXdnsDomainEntry::Domain(FinalmaskXdnsDomain {
+                // The core's 255/63 defaults, written out so the row shows
+                // the limits it runs with.
+                len_limit: 255,
+                label_limit: 63,
+                ..Default::default()
+            }));
+        changed = true;
+    }
+
+    ui.label(t(lang, Key::SrvResolversClient));
+    let mut remove_resolver = None;
+    for (index, entry) in settings.resolvers.iter_mut().enumerate() {
+        ui.push_id(("xdns-resolver", index), |ui| {
+            ui.group(|ui| match entry {
+                FinalmaskXdnsResolverEntry::Retired(text) => {
+                    notice(ui);
+                    ui.label(t_fmt(lang, Key::SrvPreserved, &[text]));
+                    if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+                        remove_resolver = Some(index);
+                    }
+                }
+                FinalmaskXdnsResolverEntry::Resolver(resolver) => {
+                    ui.horizontal(|ui| {
+                        ui.label(t_fmt(lang, Key::SrvXdnsResolverN, &[&(index + 1)]));
+                        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+                            remove_resolver = Some(index);
+                        }
+                    });
+                    changed |= widgets::combo_str_labeled(
+                        ui,
+                        "type",
+                        &mut resolver.resolver_type,
+                        &["tcp", "udp"],
+                        t(lang, Key::SrvDefault),
+                        false,
+                    );
+                    changed |=
+                        widgets::text_field(ui, "addr", &mut resolver.settings.addr, "1.1.1.1:53");
+                }
+            });
+        });
+    }
+    if let Some(index) = remove_resolver {
+        settings.resolvers.remove(index);
+        changed = true;
+    }
+    if ui.small_button(t(lang, Key::SrvAddXdnsResolver)).clicked() {
+        settings
+            .resolvers
+            .push(FinalmaskXdnsResolverEntry::Resolver(
+                FinalmaskXdnsResolver::default(),
+            ));
+        changed = true;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("extraPoll");
+        changed |= ui
+            .add(egui::DragValue::new(&mut settings.extra_poll).range(0..=3))
+            .changed();
+    });
+
+    if !settings.domain.is_absent() {
+        notice(ui);
+        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+            settings.domain = FinalmaskRawValue::Absent;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 pub(super) fn finalmask_tcp_settings_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -1090,36 +1242,7 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
-        FinalmaskUdpMask::Xdns { settings, .. } => {
-            let mut changed = widgets::string_list(
-                ui,
-                lang,
-                t(lang, Key::SrvDomainsServer),
-                &mut settings.domains,
-                "example.com",
-            );
-            changed |= widgets::string_list(
-                ui,
-                lang,
-                t(lang, Key::SrvResolversClient),
-                &mut settings.resolvers,
-                "example.com+udp://1.1.1.1:53",
-            );
-            if !settings.domain.is_absent() {
-                ui.colored_label(
-                    status_colors_of(ui).err,
-                    t(lang, Key::SrvImportedDomainRemoved),
-                );
-                if ui
-                    .small_button(t(lang, Key::SrvRemoveObsoleteDomain))
-                    .clicked()
-                {
-                    settings.domain = FinalmaskRawValue::Absent;
-                    changed = true;
-                }
-            }
-            changed
-        }
+        FinalmaskUdpMask::Xdns { settings, .. } => finalmask_xdns_editor(ui, lang, settings),
         FinalmaskUdpMask::Xicmp { settings, .. } => {
             let mut changed = ui.checkbox(&mut settings.dgram, "dgram").changed();
             changed |= widgets::string_list(

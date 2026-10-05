@@ -1,13 +1,13 @@
 //! Coverage: a TUN configuration needs at least one IPv4 gateway.
 //!
 //! The gateway entries become the adapter's addresses, and the in-tun DNS
-//! address is derived from the gateway's IPv4 (the WFP DNS shield pins the
-//! adapter DNS to an address inside the TUN subnet). An empty or IPv6-only
-//! gateway list with TUN enabled is therefore a validation error: the
-//! generator refuses to emit a config (Apply/Connect are blocked through
-//! `config_error`), the TUN screen renders the error inline under the
-//! gateway editor, and the old hardcoded `10.255.0.1` fallback can never
-//! reach the wire.
+//! address is derived from the gateway's IPv4 (the core's DNS leak block
+//! permits port-53 only inside the TUN subnet, so the adapter DNS must point
+//! at the in-tun listener). An empty or IPv6-only gateway list with TUN
+//! enabled is therefore a validation error: the generator refuses to emit a
+//! config (Apply/Connect are blocked through `config_error`), the TUN screen
+//! renders the error inline under the gateway editor, and the old hardcoded
+//! `10.255.0.1` fallback can never reach the wire.
 //!
 //! The harness boots the real `BroccoliApp` for the UI assertions (the
 //! shared UI harness pattern: temp APPDATA with a pre-seeded settings.json,
@@ -187,6 +187,129 @@ fn tun_disabled_with_cleared_gateway_is_valid() {
         "TUN off must not consult the gateway list"
     );
     generate(&settings).expect("TUN off must not consult the gateway list");
+}
+
+// ---------- leak-block validation ----------
+
+/// The message the verdict renders for one leak rule.
+fn leak_message(code: &ValidationCode) -> String {
+    validation_message(code, Language::En)
+}
+
+/// TUN mode with the seeded module and the given leak list; every other TUN
+/// setting keeps its seeded value, so the routing table and adapter DNS are
+/// non-empty unless the test clears them.
+fn leak_settings(leak: Vec<String>) -> Settings {
+    Settings {
+        mode: Mode::Tun,
+        tun: TunCfg {
+            auto_system_wfp_block_leak: leak,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// True when the verdict carries the given code, blocking or advisory.
+fn verdict_carries(settings: &Settings, code: &ValidationCode) -> bool {
+    verdict(settings).iter().any(|issue| &issue.code == code)
+}
+
+#[test]
+fn leak_block_without_a_routing_table_is_a_validation_error() {
+    // The core installs its filters over the routes of
+    // autoSystemRoutingTable and refuses the pair when the table is empty
+    // (confirmed against the pinned binary: "autoSystemWfpBlockLeak needs
+    // autoSystemRoutingTable to be set").
+    let mut settings = leak_settings(TunCfg::default().auto_system_wfp_block_leak);
+    settings.tun.auto_system_routing_table.clear();
+    assert!(verdict_carries(
+        &settings,
+        &ValidationCode::TunLeakRoutingTableRequired
+    ));
+    let error = generate(&settings).expect_err("an empty routing table must be rejected");
+    assert!(
+        error.contains(leak_message(&ValidationCode::TunLeakRoutingTableRequired).as_str()),
+        "the error must name the routing-table requirement: {error:?}"
+    );
+}
+
+#[test]
+fn unknown_leak_value_is_a_validation_error() {
+    // Any value outside {dns, misconfigtun} makes the core refuse the whole
+    // document at load ("unknown autoSystemWfpBlockLeak value: ...", confirmed
+    // against the pinned binary).
+    let settings = leak_settings(vec!["bogus".into()]);
+    assert!(verdict_carries(
+        &settings,
+        &ValidationCode::TunLeakValueUnknown("bogus".into())
+    ));
+    let error = generate(&settings).expect_err("an unknown leak value must be rejected");
+    assert!(
+        error.contains(leak_message(&ValidationCode::TunLeakValueUnknown("bogus".into())).as_str()),
+        "the error must name the unknown value: {error:?}"
+    );
+}
+
+#[test]
+fn leak_halves_fold_case_insensitively_like_the_core() {
+    // The core lowercases each entry before it compares, so a mixed-case
+    // spelling is the same half and passes the vocabulary gate.
+    let settings = leak_settings(vec!["DNS".into(), "MisconfigTun".into()]);
+    assert!(!verdict(&settings).has_blocking());
+    generate(&settings).expect("mixed-case halves are the core's own values");
+}
+
+#[test]
+fn a_switched_off_family_half_warns_with_what_reopens() {
+    // The key still reaches the wire (the DNS module is present), but without
+    // the unrouted-family half an address family the routing table does not
+    // route into the tunnel can egress. Advisory, never a gate.
+    let settings = leak_settings(vec!["dns".into()]);
+    assert!(
+        verdict(&settings)
+            .advisory()
+            .any(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff),
+        "a missing family half must warn"
+    );
+    generate(&settings).expect("a switched-off half must not block generation");
+}
+
+#[test]
+fn the_leak_rules_are_gated_on_the_key_reaching_the_wire() {
+    // The generator writes the key only while the TUN inbound and the DNS
+    // module are both present, so a model state the core never sees must not
+    // block: with no module, a cleared routing table and an unknown value are
+    // both latent.
+    let mut settings = leak_settings(vec!["bogus".into()]);
+    settings.tun.auto_system_routing_table.clear();
+    settings.dns.servers.clear();
+    settings.dns.enable_parallel_query = false;
+    assert!(
+        verdict(&settings).iter().all(|issue| {
+            issue.code != ValidationCode::TunLeakValueUnknown("bogus".into())
+                && issue.code != ValidationCode::TunLeakRoutingTableRequired
+                && issue.code != ValidationCode::TunLeakMisconfigTunOff
+        }),
+        "no module means no leak key on the wire, so no leak finding"
+    );
+    generate(&settings).expect("the key never reaches the core without a module");
+}
+
+#[test]
+fn the_leak_rules_do_not_fire_outside_tun_mode() {
+    let mut settings = leak_settings(vec!["bogus".into()]);
+    settings.mode = Mode::Off;
+    assert!(
+        verdict(&settings).iter().all(|issue| !matches!(
+            issue.code,
+            ValidationCode::TunLeakValueUnknown(_)
+                | ValidationCode::TunLeakRoutingTableRequired
+                | ValidationCode::TunLeakMisconfigTunOff
+        )),
+        "TUN off means the key is never emitted"
+    );
+    generate(&settings).expect("TUN off leaves the leak list untouched");
 }
 
 // ---------- UI: inline error + Apply/Connect blocking ----------

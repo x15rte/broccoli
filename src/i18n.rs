@@ -470,6 +470,14 @@ keys! {
     TunAutoOutboundsNote 0,
     TunAutoOutboundsDown 1,
     TunAutoOutboundsMissing 1,
+    TunSectionLeakBlock 0,
+    TunLeakDnsLabel 0,
+    TunLeakDnsNote 0,
+    TunLeakMisconfigLabel 0,
+    TunLeakMisconfigNote 0,
+    TunLeakInstallFailed 1,
+    TunLeakInstallRemedy 0,
+    TunLeakInstallRemedyHint 0,
     TunSectionIfaces 0,
     // Dashboard screen.
     DashboardNetworkMode 0,
@@ -1244,8 +1252,6 @@ keys! {
     SrvPreserved 1,
     SrvWindow 0,
     SrvBrowse 0,
-    SrvRemoveObsoleteDomain 0,
-    SrvImportedDomainRemoved 0,
     // Server editor tabs (appended tail block; enum order == table order).
     SrvTabBasic 0,
     SrvTabTransport 0,
@@ -1388,6 +1394,10 @@ keys! {
     SrvOcspStaplingS 0,
     SrvDomainsServer 0,
     SrvResolversClient 0,
+    SrvXdnsDomainN 1,
+    SrvXdnsResolverN 1,
+    SrvAddXdnsDomain 0,
+    SrvAddXdnsResolver 0,
     SrvMaxIdleTimeoutS 0,
     SrvKeepAlivePeriodS 0,
     SrvRewriteAddress 0,
@@ -1562,9 +1572,12 @@ keys! {
     FinalmaskNoiseExpBytesInvalid 1,
     FinalmaskNoiseExpArgumentNotAllowed 1,
     FinalmaskSalamanderPacketSize 0,
-    FinalmaskXdnsDomainRemoved 0,
-    FinalmaskXdnsEmpty 0,
-    FinalmaskXdnsResolverUdp 0,
+    FinalmaskXdnsShapeRetired 0,
+    FinalmaskXdnsDomainTypesInvalid 0,
+    FinalmaskXdnsDomainLimitInvalid 0,
+    FinalmaskXdnsResolverTypeUnknown 0,
+    FinalmaskXdnsResolverAddrInvalid 0,
+    FinalmaskXdnsExtraPollInvalid 0,
     FinalmaskXicmpIpInvalid 0,
     FinalmaskRealmScheme 0,
     FinalmaskRealmHostRequired 0,
@@ -1675,6 +1688,9 @@ keys! {
     SettingsDokodemoUnixSocketConflict 3,
     SettingsDokodemoPortZero 1,
     SettingsTunIpv4GatewayRequired 0,
+    SettingsTunLeakRoutingTableRequired 0,
+    SettingsTunLeakValueUnknown 1,
+    SettingsTunLeakMisconfigTunOff 0,
     SettingsListenerConflict 4,
     SettingsRoutingRuleTarget 2,
     SettingsRoutingRuleOutboundMissing 2,
@@ -2528,9 +2544,12 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskNoiseExpBytesInvalid(_) => t(lang, Key::FinalmaskNoiseExpBytesInvalid),
         FinalmaskNoiseExpArgumentNotAllowed(_) => t(lang, Key::FinalmaskNoiseExpArgumentNotAllowed),
         FinalmaskSalamanderPacketSize => t(lang, Key::FinalmaskSalamanderPacketSize),
-        FinalmaskXdnsDomainRemoved => t(lang, Key::FinalmaskXdnsDomainRemoved),
-        FinalmaskXdnsEmpty => t(lang, Key::FinalmaskXdnsEmpty),
-        FinalmaskXdnsResolverUdp => t(lang, Key::FinalmaskXdnsResolverUdp),
+        FinalmaskXdnsShapeRetired => t(lang, Key::FinalmaskXdnsShapeRetired),
+        FinalmaskXdnsDomainTypesInvalid => t(lang, Key::FinalmaskXdnsDomainTypesInvalid),
+        FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
+        FinalmaskXdnsResolverTypeUnknown => t(lang, Key::FinalmaskXdnsResolverTypeUnknown),
+        FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
+        FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
         FinalmaskXicmpIpInvalid => t(lang, Key::FinalmaskXicmpIpInvalid),
         FinalmaskRealmScheme => t(lang, Key::FinalmaskRealmScheme),
         FinalmaskRealmHostRequired => t(lang, Key::FinalmaskRealmHostRequired),
@@ -2579,6 +2598,9 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         DokodemoUnixSocketConflict(_, _, _) => t(lang, Key::SettingsDokodemoUnixSocketConflict),
         DokodemoPortZero(_) => t(lang, Key::SettingsDokodemoPortZero),
         TunIpv4GatewayRequired => t(lang, Key::SettingsTunIpv4GatewayRequired),
+        TunLeakRoutingTableRequired => t(lang, Key::SettingsTunLeakRoutingTableRequired),
+        TunLeakValueUnknown(_) => t(lang, Key::SettingsTunLeakValueUnknown),
+        TunLeakMisconfigTunOff => t(lang, Key::SettingsTunLeakMisconfigTunOff),
         ListenerConflict(_, _, _, _) => t(lang, Key::SettingsListenerConflict),
         RoutingRuleTarget(_, _) => t(lang, Key::SettingsRoutingRuleTarget),
         RoutingRuleOutboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleOutboundMissing),
@@ -2643,6 +2665,7 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::FinalmaskNoiseExpBytesInvalid(arg)
         | ValidationCode::FinalmaskNoiseExpArgumentNotAllowed(arg)
         | ValidationCode::XhttpExtraShadowsSettings(arg)
+        | ValidationCode::TunLeakValueUnknown(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
@@ -3066,6 +3089,21 @@ mod en {
             Key::TunAutoOutboundsMissing => {
                 "'{0}' no longer exists. Pick an active interface or 'auto'."
             }
+            Key::TunSectionLeakBlock => "Leak block",
+            Key::TunLeakDnsLabel => "keep DNS inside the tunnel",
+            Key::TunLeakDnsNote => {
+                "The core permits DNS only through the tunnel. Set the resolvers on the DNS tab."
+            }
+            Key::TunLeakMisconfigLabel => "keep the unrouted family inside the tunnel",
+            Key::TunLeakMisconfigNote => {
+                "The core drops an address family the routing table does not route into the \
+                 tunnel. The family half needs a routing table."
+            }
+            Key::TunLeakInstallFailed => "The core could not install the leak block: {}",
+            Key::TunLeakInstallRemedy => "Turn the leak block off and retry",
+            Key::TunLeakInstallRemedyHint => {
+                "The TUN starts without the leak block. DNS can then leave the tunnel."
+            }
             // Dashboard screen.
             Key::DashboardNetworkMode => "Network mode:",
             Key::DashboardLocalEndpoints => "Local endpoints",
@@ -3281,8 +3319,8 @@ mod en {
                  authentication)."
             }
             Key::SafetyTunDnsUnprotected => {
-                "TUN mode has no DNS configuration. The adapter falls back to plaintext \
-                 1.1.1.1/8.8.8.8 and DNS is not intercepted."
+                "TUN mode has no DNS leak block. DNS can leave the tunnel and reach a resolver \
+                 outside it."
             }
             Key::SafetyBalancerSelectorNoMatch => {
                 "Balancer {} has no selector that matches any outbound tag. The balancer cannot \
@@ -4103,11 +4141,6 @@ mod en {
             Key::SrvPreserved => "preserved: {}",
             Key::SrvWindow => "window",
             Key::SrvBrowse => "Browse…",
-            Key::SrvRemoveObsoleteDomain => "Remove obsolete domain field",
-            Key::SrvImportedDomainRemoved => {
-                "Imported domain is a removed upstream field. It remains preserved until \
-                 removed."
-            }
             Key::SrvTabBasic => "Basic",
             Key::SrvTabTransport => "Transport",
             Key::SrvTabSecurity => "Security",
@@ -4287,6 +4320,10 @@ mod en {
             Key::SrvOcspStaplingS => "OCSP stapling (s)",
             Key::SrvDomainsServer => "domains (server)",
             Key::SrvResolversClient => "resolvers (client)",
+            Key::SrvXdnsDomainN => "Domain {}",
+            Key::SrvXdnsResolverN => "Resolver {}",
+            Key::SrvAddXdnsDomain => "Add domain",
+            Key::SrvAddXdnsResolver => "Add resolver",
             Key::SrvMaxIdleTimeoutS => "maxIdleTimeout (s)",
             Key::SrvKeepAlivePeriodS => "keepAlivePeriod (s)",
             Key::SrvRewriteAddress => "rewrite address",
@@ -4687,11 +4724,20 @@ mod en {
             Key::FinalmaskSalamanderPacketSize => {
                 "use 0 for normal Salamander, or a Gecko range from 1 through 2048"
             }
-            Key::FinalmaskXdnsDomainRemoved => {
-                "removed by Xray. Remove it and use domains/resolvers"
+            Key::FinalmaskXdnsShapeRetired => {
+                "Xray removed the old xdns spelling. Rebuild the entry as a domain object or a \
+                 resolver object."
             }
-            Key::FinalmaskXdnsEmpty => "add at least one server domain or client resolver",
-            Key::FinalmaskXdnsResolverUdp => "resolver must contain +udp://",
+            Key::FinalmaskXdnsDomainTypesInvalid => {
+                "use at least one of the record types A, CNAME, TXT, or AAAA"
+            }
+            Key::FinalmaskXdnsDomainLimitInvalid => {
+                "lenLimit must be 0 through 255, labelLimit 0 through 63, and edns0 0 or 512 \
+                 through 4096"
+            }
+            Key::FinalmaskXdnsResolverTypeUnknown => "choose tcp or udp",
+            Key::FinalmaskXdnsResolverAddrInvalid => "enter the resolver address as host:port",
+            Key::FinalmaskXdnsExtraPollInvalid => "use an extraPoll from 0 through 3",
             Key::FinalmaskXicmpIpInvalid => "enter a literal IPv4 or IPv6 address",
             Key::FinalmaskRealmScheme => "scheme must be realm or realm+http",
             Key::FinalmaskRealmHostRequired => "host is required",
@@ -4876,6 +4922,17 @@ mod en {
             Key::SettingsTunIpv4GatewayRequired => {
                 "TUN mode needs at least one IPv4 gateway (the in-tun DNS address is derived \
                  from it)"
+            }
+            Key::SettingsTunLeakRoutingTableRequired => {
+                "The leak block needs a non-empty routing table. The core refuses to load the \
+                 configuration without it."
+            }
+            Key::SettingsTunLeakValueUnknown => {
+                "Leak block value {} is unknown. The core refuses to load the configuration."
+            }
+            Key::SettingsTunLeakMisconfigTunOff => {
+                "The unrouted address family is not blocked. A family without a route into the \
+                 tunnel can send traffic outside it."
             }
             Key::SettingsListenerConflict => "{} conflicts with {} on {}:{}",
             Key::SettingsRoutingRuleTarget => "routing rule {}: {}",
@@ -6713,8 +6770,8 @@ mod tests {
                 },
                 lang,
             ),
-            "TUN mode has no DNS configuration. The adapter falls back to plaintext \
-             1.1.1.1/8.8.8.8 and DNS is not intercepted."
+            "TUN mode has no DNS leak block. DNS can leave the tunnel and reach a resolver \
+             outside it."
         );
         assert_eq!(
             safety_finding_message(

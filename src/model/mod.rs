@@ -48,10 +48,12 @@ pub use stream::{
     FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskRealmPortMapping,
     FinalmaskRealmTls, FinalmaskSalamander, FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask,
     FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask,
-    FinalmaskXdns, FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings, HappyEyeballs,
-    HttpCamouflageRequest, HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport,
-    KcpSettings, Network, RawHeader, RawSettings, RealityModel, Security, SockoptModel,
-    StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings, XmuxConfig,
+    FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolver,
+    FinalmaskXdnsResolverEntry, FinalmaskXdnsResolverSettings, FinalmaskXicmp, FinalmaskXmc,
+    FinalmaskXmcProfile, GrpcSettings, HappyEyeballs, HttpCamouflageRequest,
+    HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport, KcpSettings, Network,
+    RawHeader, RawSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
+    WsSettings, XhttpSettings, XmuxConfig,
 };
 pub use validation::{ValidationCode, ValidationIssue};
 

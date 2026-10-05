@@ -961,6 +961,17 @@ fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
         if emission.dns_on {
             if let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut) {
                 o.insert(keys::DNS.into(), json!([tun_dns_address(&settings.tun)]));
+                // The core's leak block. It is emitted exactly while the TUN
+                // inbound and the DNS module are both present — the
+                // `config_runs_tun_dns` predicate the runtime reads back — so
+                // the document the core loads carries the same protection the
+                // elevated helper's DNS takeover assumes. The value folds like
+                // the core lowercases it (infra/conf/tun.go), and an empty
+                // list stays a no-op the core accepts.
+                o.insert(
+                    "autoSystemWfpBlockLeak".into(),
+                    json!(settings.tun.folded_leak_block()),
+                );
             }
         } else if settings.tun.dns.is_empty()
             && let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut)

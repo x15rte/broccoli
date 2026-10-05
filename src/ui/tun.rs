@@ -1,11 +1,11 @@
 //! TUN screen: full-tunnel inbound settings + elevation state.
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
-use crate::model::Mode;
-use crate::model::TunCfg;
+use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, tun_ipv4_gateway};
+use crate::model::{Mode, TunCfg, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
 use crate::ui::UiCtx;
@@ -54,6 +54,20 @@ struct ValidationCache {
 fn tun_gateway_error(lang: Language, mode: Mode, tun: &TunCfg) -> Option<String> {
     (mode == Mode::Tun && tun_ipv4_gateway(tun).is_none())
         .then(|| validation_message(&ValidationCode::TunIpv4GatewayRequired, lang))
+}
+
+/// Write one leak-block half into the stored list: the core's canonical
+/// spelling when the switch turns it on, and every spelling of that half
+/// removed when it turns off. The other half — and any hand-edited value the
+/// core would refuse — keeps its place, so a toggle never rewrites entries it
+/// does not own, while the folded read ([`TunCfg::leak_blocks_dns`] and
+/// [`TunCfg::leak_blocks_misconfig_tun`]) stays truthful for a list edited
+/// into an odd shape.
+fn set_leak_half(list: &mut Vec<String>, half: &str, on: bool) {
+    list.retain(|entry| !fold_eq(entry, half));
+    if on {
+        list.push(half.to_string());
+    }
 }
 
 impl TunScreen {
@@ -195,6 +209,37 @@ impl TunScreen {
         });
         ui.add_space(4.0);
         let tun = &mut ctx.settings.tun;
+
+        // The leak block sits right under the privacy banner it feeds: both
+        // halves are switchable, both default on, and each note names what the
+        // half closes and what it needs. A toggle writes the folded value
+        // straight into the model, so the state survives a restart and reaches
+        // the generator; the privacy banner reads the same model through the
+        // safety pass, so a switched-off DNS half shows in both places.
+        widgets::section(ui, t(lang, Key::TunSectionLeakBlock), |ui| {
+            let mut dns_on = tun.leak_blocks_dns();
+            if widgets::noted(ui, t(lang, Key::TunLeakDnsNote), |ui| {
+                ui.checkbox(&mut dns_on, t(lang, Key::TunLeakDnsLabel))
+            })
+            .changed()
+            {
+                set_leak_half(&mut tun.auto_system_wfp_block_leak, TUN_LEAK_DNS, dns_on);
+                changed = true;
+            }
+            let mut misconfig_on = tun.leak_blocks_misconfig_tun();
+            if widgets::noted(ui, t(lang, Key::TunLeakMisconfigNote), |ui| {
+                ui.checkbox(&mut misconfig_on, t(lang, Key::TunLeakMisconfigLabel))
+            })
+            .changed()
+            {
+                set_leak_half(
+                    &mut tun.auto_system_wfp_block_leak,
+                    TUN_LEAK_MISCONFIG_TUN,
+                    misconfig_on,
+                );
+                changed = true;
+            }
+        });
 
         widgets::section(ui, t(lang, Key::TunSectionIdentity), |ui| {
             changed |= widgets::text_field(
@@ -367,8 +412,9 @@ mod tests {
     use super::*;
     use crate::i18n::{Key, t_fmt};
     use crate::model::settings::Language;
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::Harness;
+    use egui_kittest::kittest::NodeT as _;
     use egui_kittest::kittest::Queryable as _;
 
     /// A fixture adapter for the TUN screen tests — the verdict keys on the
@@ -615,6 +661,130 @@ mod tests {
             Mode::Off,
             CorePhase::Running,
             Key::TunBadgeNotElevated,
+        );
+    }
+
+    /// The toggled state of the leak checkbox the label names.
+    fn leak_switch(
+        harness: &Harness<'static, (TunScreen, UiTestRig)>,
+        label: &str,
+    ) -> Option<bool> {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .accesskit_node()
+            .toggled()
+            .map(|toggled| matches!(toggled, egui::accesskit::Toggled::True))
+    }
+
+    /// Render the screen over a rig at a viewport tall enough for every
+    /// section, so the leak switches sit in the AccessKit tree.
+    fn leak_harness(rig: UiTestRig) -> Harness<'static, (TunScreen, UiTestRig)> {
+        screen_harness_at(egui::vec2(900.0, 3200.0), rig, TunScreen::default())
+    }
+
+    /// The leak switches render each half's folded truth — including for a
+    /// hand-edited list — and a toggle writes only the half it owns, so the
+    /// other half and any entry the core would refuse keep their place.
+    #[test]
+    fn leak_switches_render_each_half_truthfully_and_write_through() {
+        // A list edited into an odd shape: the DNS half in a mixed-case
+        // spelling, a value the core would refuse, and no family half.
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["DNS".into(), "bogus".into()];
+        let mut harness = leak_harness(rig);
+
+        let dns_label = t(Language::En, Key::TunLeakDnsLabel);
+        let family_label = t(Language::En, Key::TunLeakMisconfigLabel);
+        assert_eq!(
+            leak_switch(&harness, dns_label),
+            Some(true),
+            "a mixed-case DNS entry is the DNS half, so its switch must read on"
+        );
+        assert_eq!(
+            leak_switch(&harness, family_label),
+            Some(false),
+            "an absent family half must read off"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, family_label)
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert!(
+            leak.iter().any(|half| half == TUN_LEAK_MISCONFIG_TUN),
+            "the family switch must add the core's spelling"
+        );
+        assert!(
+            leak.iter().any(|half| half == "bogus"),
+            "a toggle must not drop an entry it does not own"
+        );
+        assert!(
+            leak.iter().any(|half| half == "DNS"),
+            "the other half keeps the spelling it had"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, dns_label)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.settings.tun.auto_system_wfp_block_leak,
+            vec!["bogus".to_string(), TUN_LEAK_MISCONFIG_TUN.to_string()],
+            "turning the DNS half off must remove every spelling of it"
+        );
+    }
+
+    /// Each switch carries its note on the row hover: the note names what the
+    /// half closes and what it needs, and costs no permanent line.
+    #[test]
+    fn leak_switch_notes_ride_the_row_hover() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        let mut harness = leak_harness(rig);
+
+        for (label, note) in [
+            (Key::TunLeakDnsLabel, Key::TunLeakDnsNote),
+            (Key::TunLeakMisconfigLabel, Key::TunLeakMisconfigNote),
+        ] {
+            let note = t(Language::En, note);
+            assert!(
+                harness.query_by_label(note).is_none(),
+                "the note must not be a permanent line"
+            );
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, t(Language::En, label))
+                .hover();
+            harness.run();
+            assert!(
+                harness.query_all_by_label(note).next().is_some(),
+                "the switch hover must carry its note"
+            );
+        }
+    }
+
+    /// The privacy banner reads the safety hazard, so a switched-off DNS half
+    /// shows there as well as on the switch.
+    #[test]
+    fn switched_off_dns_half_shows_in_the_privacy_banner() {
+        let warning = t(Language::En, Key::SafetyTunDnsUnprotected);
+
+        let mut on = UiTestRig::default();
+        on.settings.mode = Mode::Tun;
+        let harness = leak_harness(on);
+        assert!(
+            harness.query_by_label(warning).is_none(),
+            "the seeded both-on block must not warn"
+        );
+
+        let mut off = UiTestRig::default();
+        off.settings.mode = Mode::Tun;
+        off.settings.tun.auto_system_wfp_block_leak = vec![TUN_LEAK_MISCONFIG_TUN.into()];
+        let harness = leak_harness(off);
+        assert!(
+            harness.query_by_label(warning).is_some(),
+            "a switched-off DNS half must warn in the privacy banner"
         );
     }
 }

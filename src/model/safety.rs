@@ -8,9 +8,9 @@
 //! [`HazardClass`], and a wire-style path. One
 //! pass per model, no short-circuit — a single `assess` call surfaces every
 //! hazard. Exposure rules cover listeners bound beyond loopback whose wire
-//! form authenticates nobody; privacy rules cover TUN mode without a DNS
-//! configuration; breakage rules cover balancers whose selectors match no
-//! outbound tag.
+//! form authenticates nobody; privacy rules cover TUN mode whose DNS can
+//! leave outside the tunnel; breakage rules cover balancers whose selectors
+//! match no outbound tag.
 
 use super::emit;
 use super::inbound::{DokodemoNetwork, LocalInboundProtocol, socket_address};
@@ -41,8 +41,12 @@ pub enum SafetyCode {
     /// dokodemo-door inbound enabled and bound beyond loopback — it has no
     /// authentication at all.
     DokodemoListenerExposed(String),
-    /// TUN mode without a DNS configuration: the adapter falls back to the
-    /// hardcoded plaintext 1.1.1.1/8.8.8.8 and DNS is not intercepted.
+    /// TUN mode whose DNS leaves outside the tunnel: the core's leak block
+    /// reaches the wire only while the TUN inbound and the DNS module are
+    /// both present, and only its `dns` half keeps port-53 egress inside the
+    /// tunnel. Either condition missing reopens that egress — the adapter
+    /// falls back to its stored resolvers, and queries can reach a server
+    /// outside the tunnel.
     TunDnsUnprotected,
     /// A balancer whose selectors match no emitted outbound tag — it cannot
     /// carry traffic. Payload is the balancer tag.
@@ -149,9 +153,9 @@ impl std::ops::Deref for SafetyVerdicts {
 /// authentication, so password mode with an empty account list serves
 /// everyone (the projection drops the empty list), while SOCKS password
 /// mode always authenticates and denies every uncredentialed connection.
-/// Privacy rules: TUN mode with no DNS configuration. Breakage rules: a
-/// balancer whose selectors match no emitted outbound tag. Private: callers
-/// hold a [`SafetyVerdicts`], which answers by path as well.
+/// Privacy rules: TUN mode whose DNS can leave outside the tunnel. Breakage
+/// rules: a balancer whose selectors match no emitted outbound tag. Private:
+/// callers hold a [`SafetyVerdicts`], which answers by path as well.
 fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     let mut findings = Vec::new();
 
@@ -194,10 +198,16 @@ fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
         }
     }
 
-    // Privacy: TUN mode without a DNS configuration. The emptiness
-    // predicate mirrors the generator's emission decision exactly.
-    let dns_empty = settings.dns.is_effectively_empty();
-    if settings.mode == Mode::Tun && dns_empty {
+    // Privacy: TUN mode whose DNS leaves outside the tunnel. The core's leak
+    // block is the only mechanism that keeps DNS inside it now — the deleted
+    // app-side filter is gone — and the key reaches the wire only while the
+    // TUN inbound and the DNS module are both present, carrying its `dns`
+    // half. So the hazard is derived from that half, not from the absence of
+    // a filter the app used to install: a missing module or a switched-off
+    // half reopens DNS egress. The predicate mirrors the generator's
+    // emission decision exactly.
+    let dns_block_on = emit::dns_inbound_emitted(settings) && settings.tun.leak_blocks_dns();
+    if settings.mode == Mode::Tun && !dns_block_on {
         findings.push(finding(
             "tun".into(),
             HazardClass::Privacy,
@@ -737,6 +747,33 @@ mod tests {
             ..Default::default()
         };
         assert!(SafetyVerdicts::of(&ServersFile::default(), &settings).is_empty());
+    }
+
+    #[test]
+    fn tun_with_dns_module_but_dns_half_off_warns_privacy() {
+        // The leak key reaches the wire while the module exists, but without
+        // its `dns` half the core drops no DNS egress outside the tunnel —
+        // the hazard is derived from that half, not from the module alone.
+        let settings = Settings {
+            mode: Mode::Tun,
+            tun: TunCfg {
+                auto_system_wfp_block_leak: vec!["misconfigtun".into()],
+                ..Default::default()
+            },
+            dns: DnsCfg {
+                servers: vec![DnsServer {
+                    address: "1.1.1.1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let findings = SafetyVerdicts::of(&ServersFile::default(), &settings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "tun");
+        assert_eq!(findings[0].class, HazardClass::Privacy);
+        assert_eq!(findings[0].code, SafetyCode::TunDnsUnprotected);
     }
 
     #[test]
