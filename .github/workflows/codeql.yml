@@ -1,6 +1,6 @@
 name: CodeQL
 
-# Advanced code scanning setup (ADR-0047). Default setup ran the same two
+# Advanced code scanning setup. Default setup ran the same two
 # analyses on every push with no filter and nothing to edit; this file exists
 # for the path filter below, so a push that cannot change what either analysis
 # reads does not spend twenty minutes proving it.
