@@ -715,6 +715,7 @@ keys! {
     RoutingIpListInvalid 0,
     InboundTags 0,
     InboundTagsHint 0,
+    InboundTagsSelect 0,
     SourceIps 0,
     SourceIpsHint 0,
     LocalIps 0,
@@ -3363,6 +3364,7 @@ mod en {
             }
             Key::InboundTags => "Inbound tags",
             Key::InboundTagsHint => "in-socks, in-http, in-doko-0, in-tun",
+            Key::InboundTagsSelect => "Select inbounds…",
             Key::SourceIps => "Source IPs",
             Key::SourceIpsHint => "geoip:cn, 1.2.3.0/24 (source side)",
             Key::LocalIps => "Local IPs",

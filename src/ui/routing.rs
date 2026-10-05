@@ -338,6 +338,13 @@ struct RoutingViewCache {
     /// built-in listeners plus every dokodemo tag. Rebuilt with the cache
     /// generation so an open dialog never clones the list per frame.
     known_inbounds: Vec<String>,
+    /// Inbound tags offered by the rule editor's inbound-tag selector: every
+    /// enabled local endpoint and dokodemo listener the settings carry, in
+    /// list order. Narrower than `known_inbounds` on purpose — a rule names a
+    /// listener the user configured, never the app's own `api` control plane,
+    /// tun inbound, or in-tun DNS listeners (which the TestRoute dialog does
+    /// offer, since the core answers for a tag it does not know).
+    rule_inbounds: Vec<String>,
 }
 
 /// The refreshed live trial-rule inventory `(target tag, rule tag)` the
@@ -1315,6 +1322,26 @@ impl RoutingScreen {
             )
             .chain(settings.dokodemo.iter().map(|entry| entry.tag.clone()))
             .collect();
+        // The rule editor's inbound selector offers the listeners the settings
+        // themselves carry — every enabled local endpoint and dokodemo
+        // listener, in list order — never the ones the app adds: the `api`
+        // control plane, the tun inbound, and the in-tun DNS listeners are not
+        // traffic a user scopes a rule by, the same reason the outbound menu
+        // omits the internal `dns-out`. The model pass still accepts the app's
+        // tags, so the text list beside the menu can carry one.
+        let rule_inbounds: Vec<String> = settings
+            .local_inbounds
+            .iter()
+            .filter(|entry| emit::local_inbound_emitted(entry))
+            .map(|entry| entry.tag.clone())
+            .chain(
+                settings
+                    .dokodemo
+                    .iter()
+                    .filter(|entry| emit::dokodemo_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .collect();
         // One `assess` per model generation, in the same rebuild as the
         // reference counts — never a second recomputation pattern and never
         // per frame (the inbounds ValidationCache precedent). Only the
@@ -1340,6 +1367,7 @@ impl RoutingScreen {
             balancer_headers,
             balancer_warnings,
             known_inbounds,
+            rule_inbounds,
         });
     }
 
@@ -1570,13 +1598,19 @@ impl RoutingScreen {
                     rule.local_port = buf.local_port.clone();
                     changed = true;
                 }
-                changed |= widgets::string_list(
-                    ui,
-                    lang,
-                    t(lang, Key::InboundTags),
-                    &mut rule.inbound_tag,
-                    t(lang, Key::InboundTagsHint),
-                );
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(t(lang, Key::InboundTags));
+                        changed |= self.inbound_tag_selector(ui, lang, &mut rule.inbound_tag);
+                    });
+                    changed |= widgets::string_list(
+                        ui,
+                        lang,
+                        "",
+                        &mut rule.inbound_tag,
+                        t(lang, Key::InboundTagsHint),
+                    );
+                });
                 ui.end_row();
 
                 changed |= widgets::string_list(
@@ -1797,6 +1831,53 @@ impl RoutingScreen {
         }
 
         changed
+    }
+
+    /// The rule editor's inbound-tag selector: a menu listing every inbound
+    /// tag the emitted document carries, each row toggling its tag in the
+    /// rule's `inbound_tag` list. The list below it stays for typing a tag the
+    /// document does not carry yet. Returns true when a row changed the list.
+    fn inbound_tag_selector(
+        &self,
+        ui: &mut Ui,
+        lang: Language,
+        selected: &mut Vec<String>,
+    ) -> bool {
+        let tags = &self
+            .view_cache
+            .as_ref()
+            .expect("view cache populated above")
+            .rule_inbounds;
+        let button = ui.button(t(lang, Key::InboundTagsSelect));
+        egui::Popup::from_toggle_button_response(&button)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .style(egui::containers::menu::menu_style)
+            .show(|ui| {
+                let mut changed = false;
+                // The row count follows the model, so the menu is bounded
+                // like the geodata picker's: a tag past the window edge would
+                // otherwise lay out but never be clickable.
+                ui.set_min_width(180.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for tag in tags {
+                            let on = selected.iter().any(|candidate| candidate == tag);
+                            if ui.selectable_label(on, tag.as_str()).clicked() {
+                                if on {
+                                    selected.retain(|candidate| candidate != tag);
+                                } else {
+                                    selected.push(tag.clone());
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                changed
+            })
+            .is_some_and(|opened| opened.inner)
     }
 
     fn start_geodata_load(&mut self, lang: Language, repaint: egui::Context) -> bool {
@@ -6369,6 +6450,101 @@ mod routing_local_os_tests {
                 .local_os
                 .is_empty(),
             "the row's edit must land in the rule model"
+        );
+    }
+}
+
+/// The rule editor's inbound-tag selector: the menu offers the listeners the
+/// settings carry, and a row toggles the tag in the rule.
+#[cfg(test)]
+mod routing_inbound_selector_tests {
+    use super::{Key, Language, RoutingScreen, Rule, t};
+    use crate::model::inbound::DIRECT_OUTBOUND_TAG;
+    use crate::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol};
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable as _;
+
+    fn harness_with_open_rule_editor() -> Harness<'static, (RoutingScreen, UiTestRig)> {
+        let screen = RoutingScreen {
+            edit_rule: Some(0),
+            ..RoutingScreen::default()
+        };
+        let mut rig = UiTestRig::default();
+        rig.settings.routing.rules = vec![Rule {
+            rule_tag: "r-1".into(),
+            outbound_tag: DIRECT_OUTBOUND_TAG.into(),
+            ..Rule::default()
+        }];
+        // A switched-off endpoint: the document does not carry its tag, so a
+        // rule may not reference it.
+        rig.settings.local_inbounds.push(LocalInboundCfg {
+            tag: "in-off".into(),
+            protocol: LocalInboundProtocol::Http,
+            enabled: false,
+            ..LocalInboundCfg::default()
+        });
+        rig.settings.dokodemo.push(DokodemoCfg {
+            tag: "in-doko-1".into(),
+            enabled: true,
+            ..DokodemoCfg::default()
+        });
+        let mut harness = screen_harness_at(egui::vec2(900.0, 1600.0), rig, screen);
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn the_selector_offers_configured_listeners_and_toggles_the_rule() {
+        let mut harness = harness_with_open_rule_editor();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::InboundTagsSelect),
+            )
+            .click();
+        // The popup lays out at its final size over the frames after the click.
+        harness.run_steps(3);
+
+        for tag in ["in-socks", "in-doko-1"] {
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::Button, tag)
+                    .is_some(),
+                "a configured listener's tag must be offered: {tag}"
+            );
+        }
+        for tag in ["in-off", "api"] {
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::Button, tag)
+                    .is_none(),
+                "a tag the settings do not carry as a listener must not be offered: {tag}"
+            );
+        }
+
+        // Selecting a row writes the tag into the rule; the menu stays open so
+        // a second tag can follow.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "in-socks")
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.settings.routing.rules[0].inbound_tag,
+            vec!["in-socks".to_owned()],
+            "the clicked row must land in the rule's inbound tag list"
+        );
+
+        // Clicking the selected row again removes it.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "in-socks")
+            .click();
+        harness.run();
+        assert!(
+            harness.state().1.settings.routing.rules[0]
+                .inbound_tag
+                .is_empty(),
+            "clicking a selected row must remove its tag"
         );
     }
 }
