@@ -668,9 +668,11 @@ keys! {
     SafetyDokodemoListenerExposed 1,
     SafetyTunDnsUnprotected 0,
     SafetyBalancerSelectorNoMatch 1,
+    SafetyXdriveLocalFolder 1,
     HazardClassExposure 0,
     HazardClassPrivacy 0,
     HazardClassBreakage 0,
+    HazardClassLocalWrite 0,
     // Apply-gate hazard acknowledgment dialog.
     SafetyAckTitle 0,
     SafetyAckExplanation 0,
@@ -1294,6 +1296,7 @@ keys! {
     SrvWsSettingsMissing 0,
     SrvHttpupgradeSettingsMissing 0,
     SrvHysteriaTransportSettingsMissing 0,
+    SrvXdriveSettingsMissing 0,
     SrvMasqueOutboundTransport 0,
     SrvMasqueTransportMissing 0,
     SrvMasqueSettingsMissing 0,
@@ -1309,6 +1312,54 @@ keys! {
     SrvMasqueUserColon 0,
     SrvMasqueAlpnHttp3 0,
     SrvMasqueHeaderValues 0,
+    SrvXdriveService 0,
+    SrvXdriveServiceUnset 0,
+    SrvXdriveRemoteFolder 0,
+    SrvXdriveFolderLocalHint 0,
+    SrvXdriveFolderDriveHint 0,
+    SrvXdriveFolderTemplateHint 0,
+    SrvXdriveSecrets 0,
+    SrvXdriveSecretsOrder 0,
+    SrvXdriveSegmentBytes 0,
+    SrvXdriveFlushInterval 0,
+    SrvXdrivePollInterval 0,
+    SrvXdriveMaxPollInterval 0,
+    SrvXdriveSessionTtl 0,
+    SrvXdriveConcurrency 0,
+    SrvXdriveEagerWindow 0,
+    SrvXdriveHoleTimeout 0,
+    SrvXdriveCoreDefault 1,
+    SrvXdriveTemplate 0,
+    SrvXdriveFlatten 0,
+    SrvXdriveAuth 0,
+    SrvXdriveUsername 0,
+    SrvXdrivePassword 0,
+    SrvXdriveTokenUrl 0,
+    SrvXdriveForm 0,
+    SrvXdriveTokenPath 0,
+    SrvXdriveExpiryPath 0,
+    SrvXdrivePut 0,
+    SrvXdriveGet 0,
+    SrvXdriveDelete 0,
+    SrvXdriveList 0,
+    SrvXdriveBody 0,
+    SrvXdriveNamesRegex 0,
+    SrvXdriveRetry 0,
+    SrvXdriveRetryStatus 0,
+    SrvXdriveRateReason 0,
+    SrvXdriveSubstitutions 1,
+    SrvXdriveLocalWarning 0,
+    SrvXdriveServiceUnsupported 1,
+    SrvXdriveServiceMissing 0,
+    SrvXdriveDriveSecrets 0,
+    SrvXdriveTemplateObject 0,
+    SrvXdriveRemoteFolderRequired 0,
+    SrvXdriveOperationUrl 1,
+    SrvXdriveNamesRegexInvalid 0,
+    SrvXdriveAuthTypeUnsupported 1,
+    SrvXdriveTokenUrlRequired 0,
+    SrvXdriveHeaderValues 0,
+    SrvXdriveScalarClamped 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
     SrvMasterKeyLogNotSupported 0,
@@ -1893,6 +1944,7 @@ keys! {
     LinkUnsupportedQueryField 1,
     LinkUnsupportedHysteria 0,
     LinkUnsupportedMasque 0,
+    LinkUnsupportedXdrive 0,
     LinkUnsupportedLegacyField 1,
     LinkUnsupportedLegacyVersion 1,
     LinkUnsupportedVmessAlterIdValue 1,
@@ -2406,6 +2458,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
             Network::Httpupgrade => t(lang, Key::SrvHttpupgradeSettingsMissing),
             Network::Hysteria => t(lang, Key::SrvHysteriaTransportSettingsMissing),
             Network::Masque => t(lang, Key::SrvMasqueSettingsMissing),
+            Network::Xdrive => t(lang, Key::SrvXdriveSettingsMissing),
             Network::Raw => {
                 debug_assert!(false, "TransportSettingsMissing cannot name raw");
                 t(lang, Key::SrvXhttpSettingsMissing)
@@ -2438,6 +2491,17 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         MasqueAuthorizationConflict => t(lang, Key::SrvMasqueAuthorizationConflict),
         MasqueUserColon => t(lang, Key::SrvMasqueUserColon),
         MasqueAlpnPrefersHttp3 => t(lang, Key::SrvMasqueAlpnHttp3),
+        XdriveServiceUnsupported(_) => t(lang, Key::SrvXdriveServiceUnsupported),
+        XdriveServiceMissing => t(lang, Key::SrvXdriveServiceMissing),
+        XdriveDriveSecretsInvalid => t(lang, Key::SrvXdriveDriveSecrets),
+        XdriveTemplateMissing => t(lang, Key::SrvXdriveTemplateObject),
+        XdriveRemoteFolderRequired => t(lang, Key::SrvXdriveRemoteFolderRequired),
+        XdriveTemplateOperationUrlRequired(_) => t(lang, Key::SrvXdriveOperationUrl),
+        XdriveTemplateNamesRegexInvalid => t(lang, Key::SrvXdriveNamesRegexInvalid),
+        XdriveTemplateAuthTypeUnsupported(_) => t(lang, Key::SrvXdriveAuthTypeUnsupported),
+        XdriveTemplateTokenUrlRequired => t(lang, Key::SrvXdriveTokenUrlRequired),
+        XdriveTemplateHeaderValuesNotStrings => t(lang, Key::SrvXdriveHeaderValues),
+        XdriveScalarClamped => t(lang, Key::SrvXdriveScalarClamped),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -2700,6 +2764,11 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::MasqueHeaderInvalid(arg)
         | ValidationCode::MasqueReservedHeader(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
+        ValidationCode::XdriveServiceUnsupported(arg)
+        | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
+            vec![format!("{arg:?}")]
+        }
+        ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
             arg.as_deref()
@@ -2814,6 +2883,7 @@ fn safety_template(code: &SafetyCode, lang: Language) -> &'static str {
         DokodemoListenerExposed(_) => t(lang, Key::SafetyDokodemoListenerExposed),
         TunDnsUnprotected => t(lang, Key::SafetyTunDnsUnprotected),
         BalancerSelectorNoMatch(_) => t(lang, Key::SafetyBalancerSelectorNoMatch),
+        XdriveLocalFolder(_) => t(lang, Key::SafetyXdriveLocalFolder),
     }
 }
 
@@ -2826,6 +2896,7 @@ pub fn safety_message(code: &SafetyCode, lang: Language) -> String {
         | SafetyCode::HttpListenerExposed(listen)
         | SafetyCode::DokodemoListenerExposed(listen) => listen,
         SafetyCode::BalancerSelectorNoMatch(tag) => tag,
+        SafetyCode::XdriveLocalFolder(folder) => folder,
         SafetyCode::TunDnsUnprotected => {
             return safety_template(code, lang).to_string();
         }
@@ -2846,6 +2917,7 @@ pub fn hazard_class_label(class: HazardClass, lang: Language) -> &'static str {
         HazardClass::Exposure => t(lang, Key::HazardClassExposure),
         HazardClass::Privacy => t(lang, Key::HazardClassPrivacy),
         HazardClass::Breakage => t(lang, Key::HazardClassBreakage),
+        HazardClass::LocalWrite => t(lang, Key::HazardClassLocalWrite),
     }
 }
 
@@ -3362,6 +3434,8 @@ mod en {
             Key::HazardClassExposure => "Exposure",
             Key::HazardClassPrivacy => "Privacy",
             Key::HazardClassBreakage => "Breakage",
+            Key::HazardClassLocalWrite => "Local write",
+            Key::SafetyXdriveLocalFolder => "The local XDRIVE service writes to {} on this machine",
             // Apply-gate hazard acknowledgment dialog.
             Key::SafetyAckTitle => "Safety hazards found",
             Key::SafetyAckExplanation => {
@@ -4253,6 +4327,59 @@ mod en {
             Key::SrvMasqueUserColon => "MASQUE user cannot contain a colon",
             Key::SrvMasqueAlpnHttp3 => "An ALPN list with both h2 and h3 makes MASQUE use HTTP/3",
             Key::SrvMasqueHeaderValues => "MASQUE header values must be strings",
+            Key::SrvXdriveSettingsMissing => "XDRIVE settings are missing",
+            Key::SrvXdriveService => "Service",
+            Key::SrvXdriveServiceUnset => "(choose a service)",
+            Key::SrvXdriveRemoteFolder => "Remote folder",
+            Key::SrvXdriveFolderLocalHint => "A path on this machine",
+            Key::SrvXdriveFolderDriveHint => "A Google Drive folder id",
+            Key::SrvXdriveFolderTemplateHint => "A folder token for the template",
+            Key::SrvXdriveSecrets => "Secrets",
+            Key::SrvXdriveSecretsOrder => "Order: client ID, client secret, refresh token",
+            Key::SrvXdriveSegmentBytes => "Segment bytes",
+            Key::SrvXdriveFlushInterval => "Flush interval (ms)",
+            Key::SrvXdrivePollInterval => "Poll interval (ms)",
+            Key::SrvXdriveMaxPollInterval => "Max poll interval (ms)",
+            Key::SrvXdriveSessionTtl => "Session TTL (s)",
+            Key::SrvXdriveConcurrency => "Concurrency",
+            Key::SrvXdriveEagerWindow => "Eager window (ms)",
+            Key::SrvXdriveHoleTimeout => "Hole timeout (ms)",
+            Key::SrvXdriveCoreDefault => "core default {}",
+            Key::SrvXdriveTemplate => "Template",
+            Key::SrvXdriveFlatten => "Flatten names",
+            Key::SrvXdriveAuth => "Authorization",
+            Key::SrvXdriveUsername => "Username",
+            Key::SrvXdrivePassword => "Password",
+            Key::SrvXdriveTokenUrl => "Token URL",
+            Key::SrvXdriveForm => "Form",
+            Key::SrvXdriveTokenPath => "Token path",
+            Key::SrvXdriveExpiryPath => "Expiry path",
+            Key::SrvXdrivePut => "Put",
+            Key::SrvXdriveGet => "Get",
+            Key::SrvXdriveDelete => "Delete",
+            Key::SrvXdriveList => "List",
+            Key::SrvXdriveBody => "Body",
+            Key::SrvXdriveNamesRegex => "Name pattern",
+            Key::SrvXdriveRetry => "Retry",
+            Key::SrvXdriveRetryStatus => "Retry statuses",
+            Key::SrvXdriveRateReason => "Rate limit reason path",
+            Key::SrvXdriveSubstitutions => "Substituted here: {}",
+            Key::SrvXdriveLocalWarning => "The local service writes to a path on this machine",
+            Key::SrvXdriveServiceUnsupported => "Unsupported XDRIVE service {}",
+            Key::SrvXdriveServiceMissing => "Choose the XDRIVE service",
+            Key::SrvXdriveDriveSecrets => {
+                "Google Drive needs 3 secrets: client ID, client secret, refresh token"
+            }
+            Key::SrvXdriveTemplateObject => r#"The template service needs a "template" object"#,
+            Key::SrvXdriveRemoteFolderRequired => "A remote folder is required",
+            Key::SrvXdriveOperationUrl => "The {} operation needs a URL",
+            Key::SrvXdriveNamesRegexInvalid => "The list name pattern needs one capture group",
+            Key::SrvXdriveAuthTypeUnsupported => "Unsupported template authorization type {}",
+            Key::SrvXdriveTokenUrlRequired => "The token flow needs a token URL",
+            Key::SrvXdriveHeaderValues => "Template header and form values must be strings",
+            Key::SrvXdriveScalarClamped => {
+                "The core overrides this value while it builds the transport"
+            }
             Key::SrvStreamOneNoDownload => "stream-one cannot use downloadSettings",
             Key::SrvDownloadNestingExceeds => {
                 "XHTTP downloadSettings nesting exceeds the safety depth"
@@ -5286,6 +5413,7 @@ mod en {
             Key::LinkUnsupportedQueryField => "The query field {} is not defined for this link.",
             Key::LinkUnsupportedHysteria => "The hysteria transport has no share-link mapping.",
             Key::LinkUnsupportedMasque => "The masque transport has no share-link mapping.",
+            Key::LinkUnsupportedXdrive => "The xdrive transport has no share-link mapping.",
             Key::LinkUnsupportedLegacyField => {
                 "The legacy vmess JSON field {} cannot be represented by the #716 URL format."
             }
@@ -6842,6 +6970,14 @@ mod tests {
         );
         assert_eq!(hazard_class_label(HazardClass::Privacy, lang), "Privacy");
         assert_eq!(hazard_class_label(HazardClass::Breakage, lang), "Breakage");
+        assert_eq!(
+            hazard_class_label(HazardClass::LocalWrite, lang),
+            "Local write"
+        );
+        assert_eq!(
+            safety_message(&SafetyCode::XdriveLocalFolder("U:/store".into()), lang),
+            "The local XDRIVE service writes to U:/store on this machine"
+        );
     }
 
     #[test]

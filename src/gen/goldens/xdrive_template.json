@@ -1,0 +1,155 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1"
+      },
+      {
+        "address": "8.8.8.8"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {},
+      "streamSettings": {
+        "network": "xdrive",
+        "xdriveSettings": {
+          "remoteFolder": "folder-token",
+          "secrets": [
+            "one",
+            "two"
+          ],
+          "service": "template",
+          "template": {
+            "auth": {
+              "expiryPath": "data.expires",
+              "form": {
+                "grant_type": "refresh_token"
+              },
+              "tokenPath": "data.token",
+              "tokenUrl": "https://auth.example.com/token",
+              "type": "oauth2"
+            },
+            "concurrency": 48,
+            "delete": {
+              "method": "DELETE",
+              "url": "https://api.example.com/{folder}/{name}"
+            },
+            "flatten": true,
+            "get": {
+              "url": "https://api.example.com/{folder}/{name}"
+            },
+            "list": {
+              "namesRegex": "\"name\":\"([^\"]+)\"",
+              "url": "https://api.example.com/{folder}?prefix={prefix}"
+            },
+            "put": {
+              "body": "{\"content\":\"{data}\"}",
+              "headers": {
+                "X-Frame": "xdrive"
+              },
+              "method": "POST",
+              "url": "https://api.example.com/{folder}/{name}"
+            },
+            "retry": {
+              "rateReason": "error.message",
+              "status": [
+                429,
+                503
+              ]
+            }
+          }
+        }
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      }
+    ]
+  },
+  "stats": {}
+}

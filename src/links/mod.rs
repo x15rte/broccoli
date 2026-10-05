@@ -1085,14 +1085,15 @@ impl TransportSpec {
     }
 }
 
-/// The refusal for a transport the share grammar cannot spell. Hysteria and
-/// MASQUE are the two — the grammar has no `type` value, no field and no
-/// scheme for either — and unlike the transports Xray removed they are live
-/// model networks, so export states the reason instead of reporting an
-/// unknown `type`.
+/// The refusal for a transport the share grammar cannot spell. Hysteria,
+/// MASQUE and XDRIVE are the three — the grammar has no `type` value, no
+/// field and no scheme for any of them — and unlike the transports Xray
+/// removed they are live model networks, so export states the reason instead
+/// of reporting an unknown `type`.
 fn unshareable_transport(network: Network) -> LinkError {
     let key = match network {
         Network::Masque => Key::LinkUnsupportedMasque,
+        Network::Xdrive => Key::LinkUnsupportedXdrive,
         Network::Raw
         | Network::Xhttp
         | Network::Kcp
@@ -1105,7 +1106,17 @@ fn unshareable_transport(network: Network) -> LinkError {
 }
 
 /// The table, in the order the representability ladder reports transports.
-const TRANSPORTS: &[TransportSpec] = &[RAW, KCP, WS, GRPC, HTTPUPGRADE, XHTTP, HYSTERIA, MASQUE];
+const TRANSPORTS: &[TransportSpec] = &[
+    RAW,
+    KCP,
+    WS,
+    GRPC,
+    HTTPUPGRADE,
+    XHTTP,
+    HYSTERIA,
+    MASQUE,
+    XDRIVE,
+];
 
 /// The row for `network`. The table declares every `Network` variant, so
 /// adding one is a compile error here rather than a transport the grammar
@@ -1120,6 +1131,7 @@ fn transport_spec(network: Network) -> &'static TransportSpec {
         Network::Xhttp => &XHTTP,
         Network::Hysteria => &HYSTERIA,
         Network::Masque => &MASQUE,
+        Network::Xdrive => &XDRIVE,
     }
 }
 
@@ -1754,6 +1766,20 @@ const MASQUE: TransportSpec = TransportSpec {
     fields: &[],
     refused: &[],
     is_present: |stream| option_has_fields(&stream.masque_settings),
+};
+
+/// XDRIVE is a live model network the share grammar cannot spell: no `type`
+/// value, no field and no scheme carry its settings. The row exists so the
+/// representability ladder reports it by name, and so `transport_spec` stays
+/// exhaustive over `Network`.
+const XDRIVE: TransportSpec = TransportSpec {
+    network: Network::Xdrive,
+    path: "streamSettings.xdriveSettings",
+    type_string: None,
+    type_aliases: &[],
+    fields: &[],
+    refused: &[],
+    is_present: |stream| option_has_fields(&stream.xdrive_settings),
 };
 
 /// Apply the link's `type` parameter: the row's fields, each with the link's
@@ -3471,6 +3497,11 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             // is refused as an unknown transport (the row spells no `type`).
         }
         Network::Masque => {
+            // No share format builds or spells this transport, so the arm
+            // refuses nothing: export refuses it through `transport_params`'
+            // `spelling()`.
+        }
+        Network::Xdrive => {
             // No share format builds or spells this transport, so the arm
             // refuses nothing: export refuses it through `transport_params`'
             // `spelling()`.

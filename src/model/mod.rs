@@ -54,7 +54,8 @@ pub use stream::{
     FinalmaskXmcProfile, GrpcSettings, HappyEyeballs, HttpCamouflageRequest,
     HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport, KcpSettings, MasqueTransport,
     Network, RawHeader, RawSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
-    TlsModel, WsSettings, XhttpSettings, XmuxConfig,
+    TlsModel, WsSettings, XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp,
+    XdriveTemplateRetry, XdriveTransport, XhttpSettings, XmuxConfig,
 };
 pub use validation::{ValidationCode, ValidationIssue};
 

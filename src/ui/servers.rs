@@ -21,7 +21,17 @@ use crate::model::outbound::{
     WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
 use crate::model::settings::Language;
-use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
+use crate::model::stream::{
+    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
+    XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+    XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
+    XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_TEMPLATE, XDRIVE_SERVICES,
+    XDRIVE_TEMPLATE_AUTH_TYPES, XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
+    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTemplateAuth,
+    XdriveTemplateOp,
+};
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
     dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
@@ -1139,6 +1149,63 @@ fn json_map_kv(
             k = format!("key{i}");
         }
         map.insert(k, serde_json::Value::String(String::new()));
+        changed = true;
+    }
+    changed
+}
+
+/// One xdrive numeric scalar: zero keeps the core's own default
+/// (transport/internet/xdrive/params.go:28-50), so the field spans `0..=max`
+/// and names the default it falls back to. `max` is the runtime's cap where
+/// it has one, and `u32::MAX` otherwise.
+fn xdrive_scalar(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    value: &mut u32,
+    max: u32,
+    default: u32,
+) -> bool {
+    ui.horizontal(|ui| {
+        let mut changed = false;
+        ui.label(label);
+        changed |= ui
+            .add(egui::DragValue::new(value).range(0..=max).speed(1.0))
+            .changed();
+        ui.weak(t_fmt(
+            lang,
+            Key::SrvXdriveCoreDefault,
+            &[&default.to_string()],
+        ));
+        changed
+    })
+    .inner
+}
+
+/// The template retry status list: one status code per row, with a row
+/// remove button and an add button. Sent as Go `[]int`, so the rows are
+/// numbers rather than text.
+fn xdrive_status_list(ui: &mut egui::Ui, lang: Language, statuses: &mut Vec<i64>) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    for (index, status) in statuses.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                    remove = Some(index);
+                }
+                changed |= ui
+                    .add(egui::DragValue::new(status).range(100..=599))
+                    .changed();
+            });
+        });
+    }
+    if let Some(index) = remove {
+        statuses.remove(index);
+        changed = true;
+    }
+    if ui.button(t(lang, Key::AddRow)).clicked() {
+        statuses.push(429);
         changed = true;
     }
     changed
@@ -4694,6 +4761,7 @@ impl ServersScreen {
                     Network::Ws,
                     Network::Httpupgrade,
                     Network::Hysteria,
+                    Network::Xdrive,
                 ]
             };
             for &n in networks {
@@ -5384,6 +5452,382 @@ impl ServersScreen {
                     st.masque_settings = Some(s);
                 }
             }
+            Network::Xdrive => {
+                let had_settings = st.xdrive_settings.is_some();
+                let mut s = st.xdrive_settings.take().unwrap_or_default();
+                changed |= widgets::combo_str_labeled(
+                    ui,
+                    t(lang, Key::SrvXdriveService),
+                    &mut s.service,
+                    XDRIVE_SERVICES,
+                    t(lang, Key::SrvXdriveServiceUnset),
+                    false,
+                );
+                // The service decides what the folder names, so the hint
+                // follows the choice and the field is required exactly where
+                // the core refuses an empty one at start.
+                let folder_hint = match s.service.as_str() {
+                    XDRIVE_SERVICE_LOCAL => t(lang, Key::SrvXdriveFolderLocalHint),
+                    XDRIVE_SERVICE_DRIVE => t(lang, Key::SrvXdriveFolderDriveHint),
+                    XDRIVE_SERVICE_TEMPLATE => t(lang, Key::SrvXdriveFolderTemplateHint),
+                    _ => "",
+                };
+                let folder_required =
+                    s.service == XDRIVE_SERVICE_LOCAL || s.service == XDRIVE_SERVICE_DRIVE;
+                changed |= widgets::validated_field(
+                    ui,
+                    t(lang, Key::SrvXdriveRemoteFolder),
+                    &mut s.remote_folder,
+                    folder_hint,
+                    |folder| {
+                        (folder_required && folder.is_empty()).then(|| {
+                            validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
+                        })
+                    },
+                );
+                changed |= widgets::string_list(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveSecrets),
+                    &mut s.secrets,
+                    "",
+                );
+                if s.service == XDRIVE_SERVICE_DRIVE {
+                    ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
+                    // The core's conf build refuses any count but three, so
+                    // the editor says so where the rows are.
+                    if s.secrets.len() != 3 {
+                        ui.colored_label(
+                            status_colors_of(ui).err,
+                            validation_message(&ValidationCode::XdriveDriveSecretsInvalid, lang),
+                        );
+                    }
+                }
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveSegmentBytes),
+                    &mut s.segment_bytes,
+                    XDRIVE_MAX_SEGMENT_BYTES,
+                    XDRIVE_DEFAULT_SEGMENT_BYTES,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveFlushInterval),
+                    &mut s.flush_interval_ms,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdrivePollInterval),
+                    &mut s.poll_interval_ms,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_POLL_INTERVAL_MS,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveMaxPollInterval),
+                    &mut s.max_poll_interval_ms,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+                );
+                // The core raises a max poll interval below the min poll
+                // interval (transport/internet/xdrive/params.go:65-67); the
+                // model warns for the same pair, so the editor shows it here
+                // where both fields are visible.
+                let effective = |value: u32, default: u32| if value == 0 { default } else { value };
+                if effective(s.max_poll_interval_ms, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS)
+                    < effective(s.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
+                {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        validation_message(&ValidationCode::XdriveScalarClamped, lang),
+                    );
+                }
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveSessionTtl),
+                    &mut s.session_ttl_seconds,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_SESSION_TTL_SECONDS,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveConcurrency),
+                    &mut s.concurrency,
+                    XDRIVE_MAX_CONCURRENCY,
+                    XDRIVE_DEFAULT_CONCURRENCY,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveEagerWindow),
+                    &mut s.eager_window_ms,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_EAGER_WINDOW_MS,
+                );
+                changed |= xdrive_scalar(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvXdriveHoleTimeout),
+                    &mut s.hole_timeout_ms,
+                    u32::MAX,
+                    XDRIVE_DEFAULT_HOLE_TIMEOUT_MS,
+                );
+                // The one configuration that writes outside the app's own
+                // state, so the user sees the warning where they type the
+                // path; the apply gate asks for the same acknowledgment.
+                if s.service == XDRIVE_SERVICE_LOCAL && !s.remote_folder.is_empty() {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        t(lang, Key::SrvXdriveLocalWarning),
+                    );
+                }
+                if s.service == XDRIVE_SERVICE_TEMPLATE {
+                    let had_template = s.template.is_some();
+                    let mut template = s.template.take().unwrap_or_default();
+                    if self.xdrive_template_editor(ui, lang, &mut template, s.secrets.len()) {
+                        changed = true;
+                    }
+                    if had_template || changed {
+                        s.template = Some(template);
+                    }
+                }
+                if had_settings || changed {
+                    st.xdrive_settings = Some(s);
+                }
+            }
+        }
+        changed
+    }
+
+    /// The xdrive template backend's editor: the authorization, the four
+    /// operations and the retry rules as fields, never a raw JSON box. Each
+    /// site that substitutes a variable lists the variables the runtime
+    /// expands there, so what the template sends is visible before the value
+    /// leaves the app.
+    fn xdrive_template_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Language,
+        template: &mut XdriveTemplate,
+        secret_count: usize,
+    ) -> bool {
+        let mut changed = false;
+        widgets::section(ui, t(lang, Key::SrvXdriveTemplate), |ui| {
+            changed |= ui
+                .checkbox(&mut template.flatten, t(lang, Key::SrvXdriveFlatten))
+                .changed();
+            changed |= xdrive_scalar(
+                ui,
+                lang,
+                t(lang, Key::SrvXdriveConcurrency),
+                &mut template.concurrency,
+                XDRIVE_TEMPLATE_MAX_CONCURRENCY,
+                XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
+            );
+        });
+        widgets::section(ui, t(lang, Key::SrvXdriveAuth), |ui| {
+            changed |= self.xdrive_auth_editor(ui, lang, &mut template.auth, secret_count);
+        });
+        for op in XdriveOperation::ALL {
+            let title = match op {
+                XdriveOperation::Put => t(lang, Key::SrvXdrivePut),
+                XdriveOperation::Get => t(lang, Key::SrvXdriveGet),
+                XdriveOperation::Delete => t(lang, Key::SrvXdriveDelete),
+                XdriveOperation::List => t(lang, Key::SrvXdriveList),
+            };
+            let variables = template.substitution_variables(op, secret_count);
+            ui.push_id(op.as_str(), |ui| {
+                ui.strong(title);
+                changed |= self.xdrive_operation_editor(
+                    ui,
+                    lang,
+                    op.as_str(),
+                    template.operation_mut(op),
+                    &variables,
+                    op == XdriveOperation::List,
+                );
+            });
+        }
+        widgets::section(ui, t(lang, Key::SrvXdriveRetry), |ui| {
+            ui.label(t(lang, Key::SrvXdriveRetryStatus));
+            changed |= xdrive_status_list(ui, lang, &mut template.retry.status);
+            changed |= widgets::text_field(
+                ui,
+                t(lang, Key::SrvXdriveRateReason),
+                &mut template.retry.rate_reason,
+                "",
+            );
+        });
+        changed
+    }
+
+    /// One template operation: method, URL, headers and body, plus the list
+    /// operation's capture pattern. The URL is required — the runtime refuses
+    /// the storage without it — so the field carries the model's verdict.
+    fn xdrive_operation_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Language,
+        name: &'static str,
+        op: &mut XdriveTemplateOp,
+        variables: &[String],
+        list_operation: bool,
+    ) -> bool {
+        let mut changed = false;
+        changed |= widgets::text_field(ui, t(lang, Key::HttpMethod), &mut op.method, "GET");
+        changed |= widgets::validated_field(
+            ui,
+            t(lang, Key::Url),
+            &mut op.url,
+            t(lang, Key::UrlHint),
+            |url| {
+                url.is_empty().then(|| {
+                    validation_message(
+                        &ValidationCode::XdriveTemplateOperationUrlRequired(name.into()),
+                        lang,
+                    )
+                })
+            },
+        );
+        ui.push_id("headers", |ui| {
+            changed |= json_map_kv(
+                ui,
+                lang,
+                &mut op.headers,
+                t(lang, Key::HeadersKeyHint),
+                t(lang, Key::HeadersValueHint),
+                &mut self.json_key_scratch,
+            );
+        });
+        if list_operation {
+            changed |= widgets::validated_field(
+                ui,
+                t(lang, Key::SrvXdriveNamesRegex),
+                &mut op.names_regex,
+                "name",
+                |pattern| {
+                    (!crate::model::stream::xdrive_names_regex_supported(pattern)).then(|| {
+                        validation_message(&ValidationCode::XdriveTemplateNamesRegexInvalid, lang)
+                    })
+                },
+            );
+        }
+        changed |= widgets::text_field(ui, t(lang, Key::SrvXdriveBody), &mut op.body, "");
+        // Where the variables land: the runtime substitutes them in this
+        // operation's URL, headers and body.
+        ui.weak(t_fmt(
+            lang,
+            Key::SrvXdriveSubstitutions,
+            &[&variables.join(" ")],
+        ));
+        changed
+    }
+
+    /// The template authorization: a type choice with the fields that type
+    /// uses — static headers, the token flow (URL, form, token path, expiry
+    /// path) or basic credentials.
+    fn xdrive_auth_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Language,
+        auth: &mut XdriveTemplateAuth,
+        secret_count: usize,
+    ) -> bool {
+        let mut changed = false;
+        changed |= widgets::combo_str_labeled(
+            ui,
+            t(lang, Key::SrvXdriveAuth),
+            &mut auth.r#type,
+            XDRIVE_TEMPLATE_AUTH_TYPES,
+            t(lang, Key::SrvDefault),
+            true,
+        );
+        let mut variables: Vec<String> = vec!["{folder}".into()];
+        for index in 0..secret_count {
+            variables.push(format!("{{secret{index}}}"));
+        }
+        match auth.r#type.as_str() {
+            "static" | "oauth2" => {
+                ui.push_id("authHeaders", |ui| {
+                    changed |= json_map_kv(
+                        ui,
+                        lang,
+                        &mut auth.header,
+                        t(lang, Key::HeadersKeyHint),
+                        t(lang, Key::HeadersValueHint),
+                        &mut self.json_key_scratch,
+                    );
+                });
+                if auth.r#type == "oauth2" {
+                    variables.push("{token}".into());
+                    changed |= widgets::validated_field(
+                        ui,
+                        t(lang, Key::SrvXdriveTokenUrl),
+                        &mut auth.token_url,
+                        t(lang, Key::UrlHint),
+                        |url| {
+                            url.is_empty().then(|| {
+                                validation_message(
+                                    &ValidationCode::XdriveTemplateTokenUrlRequired,
+                                    lang,
+                                )
+                            })
+                        },
+                    );
+                    ui.push_id("authForm", |ui| {
+                        changed |= json_map_kv(
+                            ui,
+                            lang,
+                            &mut auth.form,
+                            t(lang, Key::HeaderHint),
+                            t(lang, Key::ValueHint),
+                            &mut self.json_key_scratch,
+                        );
+                    });
+                    changed |= widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvXdriveTokenPath),
+                        &mut auth.token_path,
+                        "access_token",
+                    );
+                    changed |= widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvXdriveExpiryPath),
+                        &mut auth.expiry_path,
+                        "",
+                    );
+                }
+            }
+            "basic" => {
+                changed |= widgets::text_field(
+                    ui,
+                    t(lang, Key::SrvXdriveUsername),
+                    &mut auth.username,
+                    "",
+                );
+                changed |= widgets::text_field(
+                    ui,
+                    t(lang, Key::SrvXdrivePassword),
+                    &mut auth.password,
+                    "",
+                );
+            }
+            _ => {}
+        }
+        if !variables.is_empty() {
+            ui.weak(t_fmt(
+                lang,
+                Key::SrvXdriveSubstitutions,
+                &[&variables.join(" ")],
+            ));
         }
         changed
     }
@@ -9724,6 +10168,113 @@ Authentication: ML-KEM-768, Post-Quantum
         }
     }
 
+    /// The xdrive editor renders the service choice, the folder and every
+    /// scalar as widgets, and the template backend as its own structured
+    /// editor — the four operations, the authorization and the retry rules as
+    /// fields, with the substitution variables shown where they land.
+    #[test]
+    fn xdrive_transport_editor_renders_scalars_and_template_fields() {
+        let mut stream = StreamModel {
+            network: Network::Xdrive,
+            xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                service: crate::model::stream::XDRIVE_SERVICE_TEMPLATE.into(),
+                remote_folder: "token".into(),
+                secrets: vec!["client-id".into(), "client-secret".into()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+        });
+        for label in [
+            "Service",
+            "Remote folder",
+            "Secrets",
+            "Segment bytes",
+            "Flush interval",
+            "Poll interval",
+            "Max poll interval",
+            "Session TTL",
+            "Concurrency",
+            "Eager window",
+            "Hole timeout",
+        ] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the xdrive editor must render its {label:?} field"
+            );
+        }
+        // The template backend is authored as fields: the four operations and
+        // their URL fields, not a raw JSON box.
+        for label in ["Put", "Get", "Delete", "List", "Authorization", "Retry"] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the template editor must render {label:?}"
+            );
+        }
+        assert_eq!(
+            harness.query_all_by_label("URL").count(),
+            4,
+            "every operation exposes its own URL field"
+        );
+        assert_eq!(
+            harness
+                .query_all_by_label_contains("Substituted here")
+                .count(),
+            5,
+            "each substitution site lists the variables it expands"
+        );
+    }
+
+    /// A transport profile whose settings carry a template the runtime builds
+    /// must round-trip through the editor without the draft changing on an
+    /// idle frame.
+    #[test]
+    fn xdrive_template_editor_is_render_idempotent() {
+        let mut stream = StreamModel {
+            network: Network::Xdrive,
+            xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                service: crate::model::stream::XDRIVE_SERVICE_TEMPLATE.into(),
+                remote_folder: "token".into(),
+                template: Some(crate::model::stream::XdriveTemplate {
+                    put: crate::model::stream::XdriveTemplateOp {
+                        url: "https://api/{name}".into(),
+                        ..Default::default()
+                    },
+                    get: crate::model::stream::XdriveTemplateOp {
+                        url: "https://api/{name}".into(),
+                        ..Default::default()
+                    },
+                    delete: crate::model::stream::XdriveTemplateOp {
+                        url: "https://api/{name}".into(),
+                        ..Default::default()
+                    },
+                    list: crate::model::stream::XdriveTemplateOp {
+                        url: "https://api/{prefix}".into(),
+                        names_regex: "(.*)".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let before = serde_json::to_value(&stream).unwrap();
+        let mut screen = ServersScreen::default();
+        let mut reported_changed = false;
+        {
+            let _harness = Harness::new_ui(|ui| {
+                reported_changed |=
+                    screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+            });
+        }
+        assert!(!reported_changed);
+        assert_eq!(serde_json::to_value(&stream).unwrap(), before);
+    }
+
     #[test]
     fn transport_security_mux_and_advanced_tabs_are_render_idempotent() {
         for network in [
@@ -9735,6 +10286,7 @@ Authentication: ML-KEM-768, Post-Quantum
             Network::Httpupgrade,
             Network::Hysteria,
             Network::Masque,
+            Network::Xdrive,
         ] {
             let mut stream = StreamModel {
                 network,

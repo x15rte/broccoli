@@ -19,12 +19,14 @@ use super::settings::{Mode, Settings};
 
 /// Hazard classes: exposure (a listener open
 /// beyond loopback), privacy (proxying without DNS protection), breakage
-/// (a balancer that cannot carry traffic).
+/// (a balancer that cannot carry traffic), local write (a transport writing
+/// to a path on this machine).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HazardClass {
     Exposure,
     Privacy,
     Breakage,
+    LocalWrite,
 }
 
 /// Every safety hazard the model layer knows, keyed by rule rather than by
@@ -51,6 +53,13 @@ pub enum SafetyCode {
     /// A balancer whose selectors match no emitted outbound tag — it cannot
     /// carry traffic. Payload is the balancer tag.
     BalancerSelectorNoMatch(String),
+    /// The `local` XDRIVE service names a path this machine writes to: the
+    /// store is an ordinary filesystem directory the transport creates and
+    /// fills (transport/internet/xdrive/local.go:19-26). The app must not
+    /// block a user from pointing it somewhere they chose, but the profile
+    /// writes outside the app's own state, so the apply gate asks for an
+    /// explicit acknowledgment first. Payload is the path.
+    XdriveLocalFolder(String),
 }
 
 /// One safety finding: the hazard class, the message-key code, and the wire
@@ -102,7 +111,8 @@ impl SafetyVerdicts {
     }
 
     /// The findings, in pass order (local endpoints, dokodemo listeners, TUN
-    /// privacy, balancer breakage), for the callers that store the list.
+    /// privacy, balancer breakage, local transport writes), for the callers
+    /// that store the list.
     pub fn into_findings(self) -> Vec<SafetyFinding> {
         self.findings
     }
@@ -130,6 +140,12 @@ impl SafetyVerdicts {
         self.at_path(&format!("routing.balancers[{index}]"))
     }
 
+    /// The local-write finding of the profile at `index`, if its xdrive
+    /// transport writes to a path on this machine.
+    pub fn xdrive_local_folder(&self, index: usize) -> Option<&SafetyFinding> {
+        self.at_path(&xdrive_path(index))
+    }
+
     fn at_path(&self, path: &str) -> Option<&SafetyFinding> {
         self.findings.iter().find(|finding| finding.path == path)
     }
@@ -154,8 +170,10 @@ impl std::ops::Deref for SafetyVerdicts {
 /// everyone (the projection drops the empty list), while SOCKS password
 /// mode always authenticates and denies every uncredentialed connection.
 /// Privacy rules: TUN mode whose DNS can leave outside the tunnel. Breakage
-/// rules: a balancer whose selectors match no emitted outbound tag. Private:
-/// callers hold a [`SafetyVerdicts`], which answers by path as well.
+/// rules: a balancer whose selectors match no emitted outbound tag. Local
+/// write rules: an xdrive transport whose `local` service names a path this
+/// machine writes to. Private: callers hold a [`SafetyVerdicts`], which
+/// answers by path as well.
 fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     let mut findings = Vec::new();
 
@@ -234,7 +252,36 @@ fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
         }
     }
 
+    // Local write: a profile whose xdrive transport uses the `local` service
+    // names a directory on this machine the transport creates and fills
+    // (transport/internet/xdrive/local.go:19-26). An empty folder is the
+    // model's own required-field finding, not a write location, so only a
+    // named path warns. This belongs here, with the apply-gate hazards, and
+    // not in the advisory half of the validation pass: the path is legal and
+    // usable, and the app must not block it — it must make the user
+    // acknowledge where the profile writes.
+    for (index, profile) in servers.profiles.iter().enumerate() {
+        let Some(xdrive) = profile.outbound.stream.xdrive_settings.as_ref() else {
+            continue;
+        };
+        if xdrive.service != super::stream::XDRIVE_SERVICE_LOCAL || xdrive.remote_folder.is_empty()
+        {
+            continue;
+        }
+        findings.push(finding(
+            xdrive_path(index),
+            HazardClass::LocalWrite,
+            SafetyCode::XdriveLocalFolder(xdrive.remote_folder.clone()),
+        ));
+    }
+
     findings
+}
+
+/// The wire path of a profile's xdrive settings, for the hazards that live
+/// inside one profile's transport.
+fn xdrive_path(index: usize) -> String {
+    format!("servers.profiles[{index}].outbound.stream.xdriveSettings.remoteFolder")
 }
 
 #[cfg(test)]
@@ -939,5 +986,63 @@ mod tests {
             .collect();
         assert!(paths.contains(&"tun"));
         assert!(paths.contains(&"localInbounds[0].listen"));
+    }
+
+    /// The `local` XDRIVE service writes to a path on this machine, so an
+    /// apply with a named path must ask for an acknowledgment; an empty
+    /// folder (the model's own required-field finding) and a remote service
+    /// do not warn.
+    #[test]
+    fn xdrive_local_folder_is_a_local_write_hazard() {
+        use crate::model::outbound::{OutboundModel, Protocol};
+        use crate::model::stream::{
+            Network, StreamModel, XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL,
+            XDRIVE_SERVICE_TEMPLATE, XdriveTransport,
+        };
+
+        let profile = |service: &str, folder: &str| ServerProfile {
+            id: "0123456789abcdef".into(),
+            name: "xdrive".into(),
+            outbound: OutboundModel {
+                protocol: Protocol::Freedom,
+                stream: StreamModel {
+                    network: Network::Xdrive,
+                    xdrive_settings: Some(Box::new(XdriveTransport {
+                        service: service.into(),
+                        remote_folder: folder.into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            latency_ms: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let servers = ServersFile {
+            version: 1,
+            active: Some("0123456789abcdef".into()),
+            profiles: vec![
+                profile(XDRIVE_SERVICE_LOCAL, "U:/store"),
+                profile(XDRIVE_SERVICE_LOCAL, ""),
+                profile(XDRIVE_SERVICE_DRIVE, "folder-id"),
+                profile(XDRIVE_SERVICE_TEMPLATE, "token"),
+            ],
+            extra: serde_json::Map::new(),
+        };
+        let findings = SafetyVerdicts::of(&servers, &Settings::default());
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].class, HazardClass::LocalWrite);
+        assert_eq!(
+            findings[0].code,
+            SafetyCode::XdriveLocalFolder("U:/store".into())
+        );
+        assert!(
+            findings
+                .xdrive_local_folder(0)
+                .is_some_and(|finding| finding.class == HazardClass::LocalWrite)
+        );
+        assert!(findings.xdrive_local_folder(1).is_none());
     }
 }

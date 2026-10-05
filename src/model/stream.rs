@@ -5,6 +5,7 @@
 use super::validation::ValidationCode;
 use super::{
     Int32Range, fold_eq, fold_lower, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
+    skip_zero_u32,
 };
 use crate::links::excerpt;
 use base64::Engine as _;
@@ -26,6 +27,7 @@ pub enum Network {
     Httpupgrade,
     Hysteria,
     Masque,
+    Xdrive,
 }
 
 impl Network {
@@ -39,6 +41,7 @@ impl Network {
             Network::Httpupgrade => "httpupgrade",
             Network::Hysteria => "hysteria",
             Network::Masque => "masque",
+            Network::Xdrive => "xdrive",
         }
     }
     /// Parse a `streamSettings.network` wire value (the core's own fold, with
@@ -62,6 +65,8 @@ impl Network {
             Some(Network::Hysteria)
         } else if fold_eq(s, "masque") {
             Some(Network::Masque)
+        } else if fold_eq(s, "xdrive") {
+            Some(Network::Xdrive)
         } else {
             None
         }
@@ -84,7 +89,8 @@ impl<'de> Deserialize<'de> for Network {
         Network::parse(&value).ok_or_else(|| {
             serde::de::Error::custom(format!(
                 "unknown network value {:?} (expected one of: raw, tcp, xhttp, \
-                 splithttp, kcp, mkcp, grpc, ws, websocket, httpupgrade, hysteria, masque)",
+                 splithttp, kcp, mkcp, grpc, ws, websocket, httpupgrade, hysteria, masque, \
+                 xdrive)",
                 excerpt(&value)
             ))
         })
@@ -514,6 +520,359 @@ impl MasqueTransport {
         self.user.clear();
         self.pass.clear();
     }
+}
+
+// ---------- XDRIVE (infra/conf/transport_method.go:855-905) ----------
+
+/// `xdriveSettings.service` — the transport's discriminator; the value is
+/// matched exactly by the core's conf build (`infra/conf/transport_method.go:
+/// 876-887`) and decides what `remoteFolder` means and which backend rules
+/// apply. `Google Drive` keeps its space and capitalization: the core
+/// compares the literal string.
+pub const XDRIVE_SERVICE_LOCAL: &str = "local";
+pub const XDRIVE_SERVICE_DRIVE: &str = "Google Drive";
+pub const XDRIVE_SERVICE_TEMPLATE: &str = "template";
+pub const XDRIVE_SERVICES: &[&str] = &[
+    XDRIVE_SERVICE_LOCAL,
+    XDRIVE_SERVICE_DRIVE,
+    XDRIVE_SERVICE_TEMPLATE,
+];
+
+/// `xdriveSettings` scalar defaults and caps (`transport/internet/xdrive/
+/// params.go:6-16`). An unset (zero) scalar keeps the core's own default; the
+/// two capped scalars are clamped to their cap while the transport is built.
+pub const XDRIVE_DEFAULT_SEGMENT_BYTES: u32 = 512 * 1024;
+pub const XDRIVE_MAX_SEGMENT_BYTES: u32 = 16 * 1024 * 1024;
+pub const XDRIVE_DEFAULT_FLUSH_INTERVAL_MS: u32 = 20;
+pub const XDRIVE_DEFAULT_POLL_INTERVAL_MS: u32 = 50;
+pub const XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS: u32 = 500;
+pub const XDRIVE_DEFAULT_SESSION_TTL_SECONDS: u32 = 300;
+pub const XDRIVE_DEFAULT_CONCURRENCY: u32 = 8;
+pub const XDRIVE_MAX_CONCURRENCY: u32 = 64;
+pub const XDRIVE_DEFAULT_EAGER_WINDOW_MS: u32 = 2000;
+pub const XDRIVE_DEFAULT_HOLE_TIMEOUT_MS: u32 = 30_000;
+
+/// The template backend's own concurrency default and cap
+/// (`transport/internet/xdrive/template.go:89-95`, `:104`).
+pub const XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY: u32 = 32;
+pub const XDRIVE_TEMPLATE_MAX_CONCURRENCY: u32 = 256;
+
+/// True when `service` is one the core's conf build accepts
+/// (`infra/conf/transport_method.go:876-887`).
+pub fn xdrive_service_supported(service: &str) -> bool {
+    XDRIVE_SERVICES.contains(&service)
+}
+
+/// The template authorization type the core's runtime accepts, plus the empty
+/// spelling that means the same as `none`
+/// (`transport/internet/xdrive/template.go:163-186`).
+pub const XDRIVE_TEMPLATE_AUTH_TYPES: &[&str] = &["none", "static", "oauth2", "basic"];
+
+/// True when `auth_type` is a type the runtime accepts (including the empty
+/// spelling, which the runtime treats as `none`).
+pub fn xdrive_template_auth_type_supported(auth_type: &str) -> bool {
+    auth_type.is_empty() || XDRIVE_TEMPLATE_AUTH_TYPES.contains(&auth_type)
+}
+
+/// True when `pattern` carries at least one capture group — the one property
+/// the runtime demands of a template `list.namesRegex`
+/// (`namesRegex needs one capture group`, transport/internet/xdrive/
+/// template.go:77-87). Group syntax is Go's `regexp` (RE2): `(` starts a
+/// capturing group unless it is `(?:`, a flag group, or inside a character
+/// class, while `(?P<name>` and `(?<name>` are named capturing groups. A
+/// pattern the regexp engine rejects outright is the core's own refusal when
+/// the transport is built, so this predicate only reports the capture-group
+/// fact the model can decide without a regexp engine.
+pub fn xdrive_names_regex_supported(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut escaped = false;
+    let mut in_class = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => {
+                // `(?` opens a group only for the named forms; every other
+                // `(?` spelling is a flag group or a non-capturing group.
+                let capturing = match bytes.get(index + 1) {
+                    None => true,
+                    Some(b'?') => match bytes.get(index + 2) {
+                        Some(b'P') => bytes.get(index + 3) == Some(&b'<'),
+                        Some(b'<') => true,
+                        _ => false,
+                    },
+                    _ => true,
+                };
+                if capturing {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// One template operation, in the order the runtime's refusal lists them
+/// (`template needs put, get, list and delete operations`,
+/// transport/internet/xdrive/template.go:74-76).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XdriveOperation {
+    Put,
+    Get,
+    List,
+    Delete,
+}
+
+impl XdriveOperation {
+    /// The operation's JSON key — the name the runtime's own diagnostics and
+    /// this model's messages use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            XdriveOperation::Put => "put",
+            XdriveOperation::Get => "get",
+            XdriveOperation::List => "list",
+            XdriveOperation::Delete => "delete",
+        }
+    }
+    /// Every operation, in the refusal's order.
+    pub const ALL: [XdriveOperation; 4] = [
+        XdriveOperation::Put,
+        XdriveOperation::Get,
+        XdriveOperation::List,
+        XdriveOperation::Delete,
+    ];
+}
+
+/// One template operation (`opTemplate`, transport/internet/xdrive/
+/// template.go:30-36). Every header map is `map[string]string` in Go, so a
+/// non-string value is a document the runtime cannot unmarshal; the model
+/// keeps it for the round-trip and the validation pass reports it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveTemplateOp {
+    /// Empty means GET, the runtime's own default (template.go:293-295).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub method: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub url: String,
+    #[serde(skip_serializing_if = "skip_empty_map")]
+    pub headers: Map<String, Value>,
+    /// The body template; when non-empty the runtime injects the payload as
+    /// `{data}` (template.go:339-350).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub body: String,
+    /// The list operation's capture pattern (template.go:35, :77-87).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub names_regex: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// The template authorization (`authTemplate`, transport/internet/xdrive/
+/// template.go:19-28). `type` is one of `none` (or empty), `static`, `oauth2`
+/// and `basic`; the other fields are the per-type ones.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveTemplateAuth {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub r#type: String,
+    #[serde(skip_serializing_if = "skip_empty_map")]
+    pub header: Map<String, Value>,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub username: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub password: String,
+    /// The oauth2 token endpoint; not substituted (template.go:206-212).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub token_url: String,
+    #[serde(skip_serializing_if = "skip_empty_map")]
+    pub form: Map<String, Value>,
+    /// JSON path of the token in the response; empty means `access_token`
+    /// (template.go:236-239).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub token_path: String,
+    /// JSON path of the lifetime in seconds; empty means one hour
+    /// (template.go:241-246).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub expiry_path: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// The template retry rules (`retryTemplate`, transport/internet/xdrive/
+/// template.go:38-41).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveTemplateRetry {
+    /// HTTP statuses that trigger a retry (template.go:148-153).
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub status: Vec<i64>,
+    /// The JSON path checked on a 403 to recognize a rate-limit reply
+    /// (template.go:39-40, :151-158).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub rate_reason: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// The template backend's configuration (`storageTemplate`,
+/// transport/internet/xdrive/template.go:43-52). The core's conf build reads
+/// this as a raw JSON object and passes its text to the runtime, so the wire
+/// carries a nested object, never a string.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveTemplate {
+    /// Store names with `/` flattened to `~` (template.go:22, :44).
+    #[serde(skip_serializing_if = "skip_false")]
+    pub flatten: bool,
+    /// Zero keeps the runtime's default of 32; values above 256 are capped
+    /// (template.go:45, :89-95, :104).
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub concurrency: u32,
+    #[serde(skip_serializing_if = "XdriveTemplateAuth::is_default")]
+    pub auth: XdriveTemplateAuth,
+    #[serde(skip_serializing_if = "XdriveTemplateOp::is_default")]
+    pub put: XdriveTemplateOp,
+    #[serde(skip_serializing_if = "XdriveTemplateOp::is_default")]
+    pub get: XdriveTemplateOp,
+    #[serde(skip_serializing_if = "XdriveTemplateOp::is_default")]
+    pub delete: XdriveTemplateOp,
+    #[serde(skip_serializing_if = "XdriveTemplateOp::is_default")]
+    pub list: XdriveTemplateOp,
+    #[serde(skip_serializing_if = "XdriveTemplateRetry::is_default")]
+    pub retry: XdriveTemplateRetry,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl XdriveTemplateAuth {
+    /// Whether the block carries nothing — the wire omits it entirely.
+    fn is_default(&self) -> bool {
+        self.r#type.is_empty()
+            && self.header.is_empty()
+            && self.username.is_empty()
+            && self.password.is_empty()
+            && self.token_url.is_empty()
+            && self.form.is_empty()
+            && self.token_path.is_empty()
+            && self.expiry_path.is_empty()
+            && self.extra.is_empty()
+    }
+}
+
+impl XdriveTemplateOp {
+    fn is_default(&self) -> bool {
+        self.method.is_empty()
+            && self.url.is_empty()
+            && self.headers.is_empty()
+            && self.body.is_empty()
+            && self.names_regex.is_empty()
+            && self.extra.is_empty()
+    }
+}
+
+impl XdriveTemplateRetry {
+    fn is_default(&self) -> bool {
+        self.status.is_empty() && self.rate_reason.is_empty() && self.extra.is_empty()
+    }
+}
+
+impl XdriveTemplate {
+    /// The operation `op` names, for the reader that only inspects it.
+    pub fn operation(&self, op: XdriveOperation) -> &XdriveTemplateOp {
+        match op {
+            XdriveOperation::Put => &self.put,
+            XdriveOperation::Get => &self.get,
+            XdriveOperation::List => &self.list,
+            XdriveOperation::Delete => &self.delete,
+        }
+    }
+    /// The operation `op` names, for the editor that rewrites it.
+    pub fn operation_mut(&mut self, op: XdriveOperation) -> &mut XdriveTemplateOp {
+        match op {
+            XdriveOperation::Put => &mut self.put,
+            XdriveOperation::Get => &mut self.get,
+            XdriveOperation::List => &mut self.list,
+            XdriveOperation::Delete => &mut self.delete,
+        }
+    }
+
+    /// The substitution variables the runtime expands in `op`'s URL, headers
+    /// and body (`transport/internet/xdrive/template.go:108-130`, `:287-357`):
+    /// the folder token and one variable per secret everywhere, plus the
+    /// operation's own name — `{name}` for put, get and delete, `{prefix}`
+    /// for list — and `{data}` for the put body. The editor shows exactly
+    /// this list where those values land, so what leaves the app is not a
+    /// hidden substitution.
+    pub fn substitution_variables(&self, op: XdriveOperation, secret_count: usize) -> Vec<String> {
+        let mut variables = vec!["{folder}".to_string()];
+        for index in 0..secret_count {
+            variables.push(format!("{{secret{index}}}"));
+        }
+        match op {
+            XdriveOperation::List => variables.push("{prefix}".to_string()),
+            XdriveOperation::Put => {
+                variables.push("{name}".to_string());
+                variables.push("{data}".to_string());
+            }
+            XdriveOperation::Get | XdriveOperation::Delete => {
+                variables.push("{name}".to_string());
+            }
+        }
+        variables
+    }
+}
+
+/// `xdriveSettings` (infra/conf/transport_method.go:855-905). The service
+/// decides what `remoteFolder` means — a path on this machine for `local`, a
+/// Google Drive folder id, or a token for the template — and which of the
+/// backend rules apply. Every scalar the runtime reads is a field; zero keeps
+/// the core's own default (`transport/internet/xdrive/params.go`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveTransport {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub remote_folder: String,
+    /// Empty is unsupported: the core's conf build refuses it, naming the
+    /// empty spelling. The editor's combo offers the three real values.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub service: String,
+    /// Drive: exactly ClientID, ClientSecret, RefreshToken, in that order.
+    /// Template: substituted as `{secret0}` … `{secretN}`.
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub secrets: Vec<String>,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub segment_bytes: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub flush_interval_ms: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub poll_interval_ms: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub max_poll_interval_ms: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub session_ttl_seconds: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub concurrency: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub eager_window_ms: u32,
+    #[serde(skip_serializing_if = "skip_zero_u32")]
+    pub hole_timeout_ms: u32,
+    /// The `template` service's backend object; the core's conf build refuses
+    /// the service without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<XdriveTemplate>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 // ---------- TLS (transport_security.go:300-329) — allowInsecure is REMOVED ----------
@@ -1917,6 +2276,7 @@ transport_blocks! {
     Httpupgrade: httpupgrade_settings, HttpupgradeSettings => Some("httpupgradeSettings");
     Hysteria: hysteria_settings, HysteriaTransport => Some("hysteriaSettings");
     Masque: masque_settings, MasqueTransport => Some("masqueSettings");
+    Xdrive: xdrive_settings, Box<XdriveTransport> => Some("xdriveSettings");
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1948,6 +2308,12 @@ pub struct StreamModel {
     pub hysteria_settings: Option<HysteriaTransport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub masque_settings: Option<MasqueTransport>,
+    /// The xdrive block is the largest transport settings object (a nested
+    /// template with four operations), and `StreamModel` is embedded in every
+    /// profile and future, so the block lives on the heap; the model type and
+    /// the wire shape are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xdrive_settings: Option<Box<XdriveTransport>>,
     #[serde(skip_serializing_if = "Security::is_none")]
     pub security: Security,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2199,7 +2565,9 @@ mod tests {
         CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, HappyEyeballs, HysteriaTransport,
         Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
-        StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings, transport_settings_key,
+        StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
+        XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings,
+        transport_settings_key,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -3669,5 +4037,137 @@ mod tests {
             error.to_string().contains("downloadSettings"),
             "the refusal names the offending field: {error}"
         );
+    }
+
+    /// The xdrive block round-trips every field the core reads, the nested
+    /// template object included — the wire shape the core's conf build
+    /// expects (a JSON object, not a string), with the camelCase keys the
+    /// runtime unmarshals.
+    #[test]
+    fn xdrive_settings_round_trip_every_field() {
+        let settings = XdriveTransport {
+            remote_folder: "folder".into(),
+            service: super::XDRIVE_SERVICE_TEMPLATE.into(),
+            secrets: vec!["a".into(), "b".into()],
+            segment_bytes: 4096,
+            flush_interval_ms: 25,
+            poll_interval_ms: 60,
+            max_poll_interval_ms: 600,
+            session_ttl_seconds: 120,
+            concurrency: 16,
+            eager_window_ms: 1500,
+            hole_timeout_ms: 20_000,
+            template: Some(XdriveTemplate {
+                flatten: true,
+                concurrency: 48,
+                auth: XdriveTemplateAuth {
+                    r#type: "oauth2".into(),
+                    header: Map::new(),
+                    username: String::new(),
+                    password: String::new(),
+                    token_url: "https://token.example.com".into(),
+                    form: Map::new(),
+                    token_path: "data.token".into(),
+                    expiry_path: "data.expires".into(),
+                    extra: Map::new(),
+                },
+                put: XdriveTemplateOp {
+                    method: "POST".into(),
+                    url: "https://api.example.com/{folder}/{name}".into(),
+                    headers: Map::new(),
+                    body: "{\"data\":\"{data}\"}".into(),
+                    names_regex: String::new(),
+                    extra: Map::new(),
+                },
+                get: XdriveTemplateOp {
+                    url: "https://api.example.com/{name}".into(),
+                    ..Default::default()
+                },
+                delete: XdriveTemplateOp {
+                    url: "https://api.example.com/{name}".into(),
+                    ..Default::default()
+                },
+                list: XdriveTemplateOp {
+                    url: "https://api.example.com/{prefix}".into(),
+                    names_regex: "\"name\":\"([^\"]+)\"".into(),
+                    ..Default::default()
+                },
+                retry: XdriveTemplateRetry {
+                    status: vec![429, 503],
+                    rate_reason: "error.message".into(),
+                    extra: Map::new(),
+                },
+                extra: Map::new(),
+            }),
+            extra: Map::new(),
+        };
+        let wire = serde_json::to_value(&settings).expect("the block serializes");
+        assert_eq!(wire["remoteFolder"], json!("folder"));
+        assert_eq!(wire["service"], json!("template"));
+        assert_eq!(wire["segmentBytes"], json!(4096));
+        assert_eq!(wire["maxPollIntervalMs"], json!(600));
+        // A nested object, not a string: the core's conf build reads it as
+        // raw JSON and stringifies it into the proto field itself.
+        assert_eq!(wire["template"]["auth"]["type"], json!("oauth2"));
+        assert_eq!(
+            wire["template"]["put"]["body"],
+            json!("{\"data\":\"{data}\"}")
+        );
+        assert_eq!(
+            wire["template"]["list"]["namesRegex"],
+            json!("\"name\":\"([^\"]+)\"")
+        );
+        assert_eq!(wire["template"]["retry"]["status"], json!([429, 503]));
+        let round_tripped: XdriveTransport =
+            serde_json::from_value(wire).expect("the block deserializes");
+        assert_eq!(
+            serde_json::to_value(&round_tripped).unwrap(),
+            serde_json::to_value(&settings).unwrap()
+        );
+    }
+
+    /// The substitution variables the editor shows mirror the runtime: the
+    /// folder token and one per secret everywhere, the operation's own name,
+    /// and `{data}` for the put body.
+    #[test]
+    fn xdrive_template_variables_name_what_the_runtime_expands() {
+        let template = XdriveTemplate::default();
+        assert_eq!(
+            template.substitution_variables(XdriveOperation::Get, 2),
+            vec!["{folder}", "{secret0}", "{secret1}", "{name}"]
+        );
+        assert_eq!(
+            template.substitution_variables(XdriveOperation::List, 1),
+            vec!["{folder}", "{secret0}", "{prefix}"]
+        );
+        assert_eq!(
+            template.substitution_variables(XdriveOperation::Put, 1),
+            vec!["{folder}", "{secret0}", "{name}", "{data}"]
+        );
+    }
+
+    /// The capture-group predicate follows Go's `regexp` group syntax:
+    /// plain and named groups count, non-capturing and flag groups do not,
+    /// and a parenthesized character class is literal.
+    #[test]
+    fn xdrive_names_regex_predicate_counts_capturing_groups() {
+        for accepted in [
+            "(.*)",
+            "\"name\":\"([^\"]+)\"",
+            "(?P<n>[a-z]+)",
+            "(?<n>[a-z]+)",
+            "(a)",
+        ] {
+            assert!(
+                super::xdrive_names_regex_supported(accepted),
+                "{accepted:?} must carry a capture group"
+            );
+        }
+        for refused in ["", ".*", "(?:.*)", "(?i)x", r"\(x\)", r"x[()]"] {
+            assert!(
+                !super::xdrive_names_regex_supported(refused),
+                "{refused:?} must not count as a capture group"
+            );
+        }
     }
 }

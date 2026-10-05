@@ -44,7 +44,11 @@ use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomainEntry,
     FinalmaskXdnsResolverEntry, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security,
-    SockoptModel, StreamModel, XmuxConfig,
+    SockoptModel, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_TEMPLATE,
+    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XmuxConfig,
+    xdrive_names_regex_supported, xdrive_service_supported, xdrive_template_auth_type_supported,
 };
 use super::{
     ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, fold_lower, go_std_base64_decode,
@@ -956,6 +960,70 @@ pub enum ValidationCode {
     /// (transport/internet/masque/dialer.go:132-134), so the pair silently
     /// picks HTTP/3; the core accepts the config and runs it.
     MasqueAlpnPrefersHttp3,
+    /// `stream.xdriveSettings.service` outside `local`, `Google Drive` and
+    /// `template`: the core's conf build refuses the whole document with
+    /// `unsupported service` (infra/conf/transport_method.go:876-887). The
+    /// code carries the rejected spelling so the message names it. Error
+    /// tier.
+    XdriveServiceUnsupported(String),
+    /// `stream.xdriveSettings.service` is empty — a choice never made. The
+    /// core's conf build refuses it the same way it refuses any other
+    /// unsupported service (infra/conf/transport_method.go:876-887); this
+    /// rule exists so the message asks for a choice. Error tier.
+    XdriveServiceMissing,
+    /// A `Google Drive` `xdriveSettings` without exactly three non-empty
+    /// secrets in the order ClientID, ClientSecret, RefreshToken: the core's
+    /// conf build refuses the document (infra/conf/transport_method.go:
+    /// 878-881), and its storage build re-checks the same count and each
+    /// value (transport/internet/xdrive/drive.go:66-73). Error tier.
+    XdriveDriveSecretsInvalid,
+    /// The `template` service without a `template` object: the core's conf
+    /// build refuses the document (`service "template" needs a "template"
+    /// object`, infra/conf/transport_method.go:882-884). Error tier.
+    XdriveTemplateMissing,
+    /// A `local` or `Google Drive` `xdriveSettings` with an empty
+    /// `remoteFolder`: both storages refuse it while the transport is built
+    /// (`empty "remoteFolder"`, transport/internet/xdrive/local.go:20-22;
+    /// `empty "remoteFolder", it must be a Google Drive folder id`,
+    /// drive.go:62-64) — a start-time refusal the config-file check never
+    /// sees. One rule, path-disambiguated by the service. Error tier.
+    XdriveRemoteFolderRequired,
+    /// A `template` operation without a `url`: the template storage is built
+    /// when the transport is first used and refuses the document
+    /// (`template needs put, get, list and delete operations`,
+    /// transport/internet/xdrive/template.go:74-76) — a start-time refusal.
+    /// The code carries the operation's name. Error tier.
+    XdriveTemplateOperationUrlRequired(String),
+    /// A `template` `list.namesRegex` with no capture group (an empty pattern
+    /// included): the template storage refuses it
+    /// (`namesRegex needs one capture group`, transport/internet/xdrive/
+    /// template.go:77-87). Error tier. A pattern the regexp engine rejects is
+    /// the core's own refusal when the transport is built.
+    XdriveTemplateNamesRegexInvalid,
+    /// A `template` `auth.type` outside `none`, `static`, `oauth2` and
+    /// `basic`: the runtime refuses the first request
+    /// (`unsupported auth type`, transport/internet/xdrive/template.go:
+    /// 184-186). The code carries the rejected spelling. Error tier.
+    XdriveTemplateAuthTypeUnsupported(String),
+    /// An `oauth2` `template` auth without a `tokenUrl`: the token request is
+    /// built at the first request and cannot succeed without one
+    /// (transport/internet/xdrive/template.go:206-212). Error tier.
+    XdriveTemplateTokenUrlRequired,
+    /// A `template` header map carrying a value that is not a string: the
+    /// runtime unmarshals the template into Go `map[string]string` fields
+    /// (transport/internet/xdrive/template.go:19-36), so any other shape
+    /// fails the storage build. One rule; the path names the map. Error
+    /// tier.
+    XdriveTemplateHeaderValuesNotStrings,
+    /// Configuration warning (Severity::Warning): an `xdriveSettings` scalar
+    /// outside the range the runtime honours. `segmentBytes` above 16 MiB and
+    /// `concurrency` above 64 are capped while the transport is built
+    /// (transport/internet/xdrive/params.go:13-16, :43-50), a template
+    /// `concurrency` above 256 is capped (template.go:89-95, :104), and
+    /// `maxPollIntervalMs` below `pollIntervalMs` is raised to it
+    /// (params.go:65-67). The value is legal and the core silently rewrites
+    /// it, so the rule advises instead of gating.
+    XdriveScalarClamped,
 
     // ---- draft requirements ----
     //
@@ -2137,6 +2205,154 @@ fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<ValidationIssue
     }
 }
 
+/// The `xdrive` transport's own rules, on the stream where its settings live:
+/// the service discriminator and its per-service requirements, the template's
+/// four operations and its authorization, and the scalars the runtime
+/// rewrites. Called from `validate_stream`'s visit.
+///
+/// Only the service and the Drive-secret count are refused while the core
+/// loads the document; the folder, the template operations and the
+/// authorization are refused while the transport is built, which the
+/// config-file check never reaches. The model reports them all here because
+/// the app must not hand the runtime a document it knows will fail at start.
+fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<ValidationIssue>) {
+    if stream.network != Network::Xdrive {
+        return;
+    }
+    // An absent block is `TransportSettingsMissing`'s finding; nothing here
+    // can judge a block that is not there.
+    let Some(xdrive) = stream.xdrive_settings.as_ref() else {
+        return;
+    };
+    if xdrive.service.is_empty() {
+        issues.push(issue(
+            ValidationCode::XdriveServiceMissing,
+            Some("stream.xdriveSettings.service".into()),
+        ));
+    } else if !xdrive_service_supported(&xdrive.service) {
+        issues.push(issue(
+            ValidationCode::XdriveServiceUnsupported(excerpt(&xdrive.service)),
+            Some("stream.xdriveSettings.service".into()),
+        ));
+    }
+    match xdrive.service.as_str() {
+        XDRIVE_SERVICE_DRIVE => {
+            if xdrive.secrets.len() != 3 || xdrive.secrets.iter().any(String::is_empty) {
+                issues.push(issue(
+                    ValidationCode::XdriveDriveSecretsInvalid,
+                    Some("stream.xdriveSettings.secrets".into()),
+                ));
+            }
+            if xdrive.remote_folder.is_empty() {
+                issues.push(issue(
+                    ValidationCode::XdriveRemoteFolderRequired,
+                    Some("stream.xdriveSettings.remoteFolder".into()),
+                ));
+            }
+        }
+        XDRIVE_SERVICE_LOCAL => {
+            if xdrive.remote_folder.is_empty() {
+                issues.push(issue(
+                    ValidationCode::XdriveRemoteFolderRequired,
+                    Some("stream.xdriveSettings.remoteFolder".into()),
+                ));
+            }
+        }
+        XDRIVE_SERVICE_TEMPLATE => match xdrive.template.as_ref() {
+            None => issues.push(issue(
+                ValidationCode::XdriveTemplateMissing,
+                Some("stream.xdriveSettings.template".into()),
+            )),
+            Some(template) => validate_xdrive_template(template, issues),
+        },
+        _ => {}
+    }
+    if xdrive.segment_bytes > XDRIVE_MAX_SEGMENT_BYTES {
+        issues.push(warning(
+            ValidationCode::XdriveScalarClamped,
+            Some("stream.xdriveSettings.segmentBytes".into()),
+        ));
+    }
+    if xdrive.concurrency > XDRIVE_MAX_CONCURRENCY {
+        issues.push(warning(
+            ValidationCode::XdriveScalarClamped,
+            Some("stream.xdriveSettings.concurrency".into()),
+        ));
+    }
+    // Zero keeps the core's default, so the comparison uses the effective
+    // values the runtime compares (params.go:65-67).
+    let effective = |value: u32, default: u32| if value == 0 { default } else { value };
+    if effective(
+        xdrive.max_poll_interval_ms,
+        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    ) < effective(xdrive.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
+    {
+        issues.push(warning(
+            ValidationCode::XdriveScalarClamped,
+            Some("stream.xdriveSettings.maxPollIntervalMs".into()),
+        ));
+    }
+}
+
+/// The template backend's rules: every operation needs a URL, the list
+/// operation's pattern needs a capture group, the authorization type must be
+/// one the runtime knows (with a token URL for the oauth2 flow), and every
+/// header or form map must hold strings. Called from
+/// [`validate_xdrive_stream`]; the paths below are absolute wire paths.
+fn validate_xdrive_template(template: &XdriveTemplate, issues: &mut Vec<ValidationIssue>) {
+    for op in XdriveOperation::ALL {
+        let name = op.as_str();
+        let operation = template.operation(op);
+        if operation.url.is_empty() {
+            issues.push(issue(
+                ValidationCode::XdriveTemplateOperationUrlRequired(name.into()),
+                Some(format!("stream.xdriveSettings.template.{name}.url")),
+            ));
+        }
+        if !operation.headers.values().all(Value::is_string) {
+            issues.push(issue(
+                ValidationCode::XdriveTemplateHeaderValuesNotStrings,
+                Some(format!("stream.xdriveSettings.template.{name}.headers")),
+            ));
+        }
+    }
+    if !xdrive_names_regex_supported(&template.list.names_regex) {
+        issues.push(issue(
+            ValidationCode::XdriveTemplateNamesRegexInvalid,
+            Some("stream.xdriveSettings.template.list.namesRegex".into()),
+        ));
+    }
+    if !xdrive_template_auth_type_supported(&template.auth.r#type) {
+        issues.push(issue(
+            ValidationCode::XdriveTemplateAuthTypeUnsupported(excerpt(&template.auth.r#type)),
+            Some("stream.xdriveSettings.template.auth.type".into()),
+        ));
+    }
+    if template.auth.r#type == "oauth2" && template.auth.token_url.is_empty() {
+        issues.push(issue(
+            ValidationCode::XdriveTemplateTokenUrlRequired,
+            Some("stream.xdriveSettings.template.auth.tokenUrl".into()),
+        ));
+    }
+    for (map, suffix) in [
+        (&template.auth.header, "template.auth.header"),
+        (&template.auth.form, "template.auth.form"),
+    ] {
+        if !map.values().all(Value::is_string) {
+            issues.push(issue(
+                ValidationCode::XdriveTemplateHeaderValuesNotStrings,
+                Some(format!("stream.xdriveSettings.{suffix}")),
+            ));
+        }
+    }
+    if template.concurrency > XDRIVE_TEMPLATE_MAX_CONCURRENCY {
+        issues.push(warning(
+            ValidationCode::XdriveScalarClamped,
+            Some("stream.xdriveSettings.template.concurrency".into()),
+        ));
+    }
+}
+
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
@@ -2735,6 +2951,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             }
         }
         validate_masque_stream(stream, issues);
+        validate_xdrive_stream(stream, issues);
         if stream.security == Security::Reality && !stream.network.supports_reality() {
             issues.push(issue(
                 ValidationCode::RealityRequiresTransport,
@@ -5451,7 +5668,8 @@ mod tests {
     use crate::model::outbound::{OutboundModel, Protocol, ProtocolSettings};
     use crate::model::stream::{
         CustomSockopt, GrpcSettings, HttpupgradeSettings, HysteriaTransport, KcpSettings,
-        MasqueTransport, Security, SockoptModel, WsSettings, XhttpSettings,
+        MasqueTransport, Security, SockoptModel, WsSettings, XdriveTemplate, XdriveTemplateOp,
+        XdriveTransport, XhttpSettings,
     };
     use serde_json::json;
 
@@ -6284,6 +6502,250 @@ mod tests {
             found.contains(&ValidationCode::HeaderValuesNotStrings(Network::Masque)),
             "{found:#?}"
         );
+    }
+
+    /// An xdrive outbound on the given settings, over a protocol with no
+    /// required fields of its own so the transport findings stand alone.
+    fn xdrive_outbound(settings: XdriveTransport) -> OutboundModel {
+        let mut outbound = OutboundModel::new(Protocol::Freedom);
+        outbound.stream.network = Network::Xdrive;
+        outbound.stream.xdrive_settings = Some(Box::new(settings));
+        outbound
+    }
+
+    /// A complete template the runtime builds without complaint.
+    fn runnable_template() -> XdriveTemplate {
+        let operation = |name: &str| XdriveTemplateOp {
+            url: format!("https://api.example.com/{name}"),
+            ..Default::default()
+        };
+        XdriveTemplate {
+            put: operation("put"),
+            get: operation("get"),
+            delete: operation("delete"),
+            list: XdriveTemplateOp {
+                url: "https://api.example.com/list".into(),
+                names_regex: "\"name\":\"([^\"]+)\"".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The service discriminator and each backend's own requirement: an
+    /// unchosen or unsupported service is refused by name, Drive needs
+    /// exactly three non-empty secrets and a folder, local needs a folder,
+    /// and template needs its object.
+    #[test]
+    fn xdrive_service_rules_gate_each_backend() {
+        // No choice made.
+        let found = codes(&validate_outbound(&xdrive_outbound(XdriveTransport {
+            remote_folder: "folder".into(),
+            ..Default::default()
+        })));
+        assert!(
+            found.contains(&ValidationCode::XdriveServiceMissing),
+            "{found:#?}"
+        );
+
+        // A service the core's conf build refuses, named.
+        let found = codes(&validate_outbound(&xdrive_outbound(XdriveTransport {
+            service: "S3".into(),
+            remote_folder: "folder".into(),
+            ..Default::default()
+        })));
+        assert!(
+            found.contains(&ValidationCode::XdriveServiceUnsupported("S3".into())),
+            "{found:#?}"
+        );
+
+        // local: a named path is enough.
+        let local = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            remote_folder: "U:/store".into(),
+            ..Default::default()
+        });
+        assert!(!validate_outbound(&local).has_blocking());
+
+        // local: an empty folder is a start-time refusal the model reports.
+        let empty_local = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            ..Default::default()
+        });
+        let found = codes(&validate_outbound(&empty_local));
+        assert!(
+            found.contains(&ValidationCode::XdriveRemoteFolderRequired),
+            "{found:#?}"
+        );
+
+        // Google Drive: three non-empty secrets in order plus a folder id.
+        let drive = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_DRIVE.into(),
+            remote_folder: "folder-id".into(),
+            secrets: vec!["id".into(), "secret".into(), "refresh".into()],
+            ..Default::default()
+        });
+        assert!(!validate_outbound(&drive).has_blocking());
+
+        for secrets in [
+            vec!["id".into(), "secret".into()],
+            vec!["id".into(), "secret".into(), String::new()],
+        ] {
+            let broken_drive = xdrive_outbound(XdriveTransport {
+                service: super::XDRIVE_SERVICE_DRIVE.into(),
+                remote_folder: "folder-id".into(),
+                secrets,
+                ..Default::default()
+            });
+            let found = codes(&validate_outbound(&broken_drive));
+            assert!(
+                found.contains(&ValidationCode::XdriveDriveSecretsInvalid),
+                "{found:#?}"
+            );
+        }
+
+        // template: the object is required, and a complete one passes.
+        let missing = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_TEMPLATE.into(),
+            remote_folder: "token".into(),
+            ..Default::default()
+        });
+        let found = codes(&validate_outbound(&missing));
+        assert!(
+            found.contains(&ValidationCode::XdriveTemplateMissing),
+            "{found:#?}"
+        );
+
+        let complete = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_TEMPLATE.into(),
+            remote_folder: "token".into(),
+            template: Some(runnable_template()),
+            ..Default::default()
+        });
+        assert!(!validate_outbound(&complete).has_blocking());
+    }
+
+    /// The template's own rules: every operation needs a URL, the list
+    /// operation's pattern needs a capture group, the authorization type must
+    /// be one the runtime knows (with a token URL for oauth2), and header and
+    /// form maps hold strings only.
+    #[test]
+    fn xdrive_template_rules_gate_operations_auth_and_patterns() {
+        let with_template = |mutate: &dyn Fn(&mut XdriveTemplate)| -> Verdict {
+            let mut template = runnable_template();
+            mutate(&mut template);
+            validate_outbound(&xdrive_outbound(XdriveTransport {
+                service: super::XDRIVE_SERVICE_TEMPLATE.into(),
+                remote_folder: "token".into(),
+                template: Some(template),
+                ..Default::default()
+            }))
+        };
+
+        let verdict = with_template(&|template| template.put.url.clear());
+        let issue = verdict
+            .blocking()
+            .find(|issue| {
+                issue.code == ValidationCode::XdriveTemplateOperationUrlRequired("put".into())
+            })
+            .expect("the missing put URL is refused");
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.template.put.url")
+        );
+
+        let verdict = with_template(&|template| template.list.names_regex = ".*".into());
+        let issue = verdict
+            .blocking()
+            .find(|issue| issue.code == ValidationCode::XdriveTemplateNamesRegexInvalid)
+            .expect("a pattern with no capture group is refused");
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.template.list.namesRegex")
+        );
+
+        let verdict = with_template(&|template| template.auth.r#type = "bearer".into());
+        assert!(
+            codes(&verdict).contains(&ValidationCode::XdriveTemplateAuthTypeUnsupported(
+                "bearer".into()
+            )),
+            "{verdict:#?}"
+        );
+
+        let verdict = with_template(&|template| template.auth.r#type = "oauth2".into());
+        let issue = verdict
+            .blocking()
+            .find(|issue| issue.code == ValidationCode::XdriveTemplateTokenUrlRequired)
+            .expect("an oauth2 flow without a token URL is refused");
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.template.auth.tokenUrl")
+        );
+
+        let verdict = with_template(&|template| {
+            template.get.headers.insert("X-Num".into(), json!(1));
+        });
+        let issue = verdict
+            .blocking()
+            .find(|issue| issue.code == ValidationCode::XdriveTemplateHeaderValuesNotStrings)
+            .expect("a non-string header value is refused");
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.template.get.headers")
+        );
+    }
+
+    /// The scalars the runtime rewrites are advisory: the value is legal and
+    /// the core caps or raises it while the transport is built.
+    #[test]
+    fn xdrive_scalars_warn_where_the_core_rewrites_them() {
+        let advisory_paths = |settings: XdriveTransport| -> Vec<Option<String>> {
+            validate_outbound(&xdrive_outbound(settings))
+                .advisory()
+                .map(|issue| issue.path.clone())
+                .collect()
+        };
+
+        let local = |settings: XdriveTransport| XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            remote_folder: "U:/store".into(),
+            ..settings
+        };
+
+        let paths = advisory_paths(local(XdriveTransport {
+            concurrency: super::XDRIVE_MAX_CONCURRENCY + 1,
+            segment_bytes: super::XDRIVE_MAX_SEGMENT_BYTES + 1,
+            ..Default::default()
+        }));
+        assert!(
+            paths.contains(&Some("stream.xdriveSettings.concurrency".into())),
+            "{paths:#?}"
+        );
+        assert!(
+            paths.contains(&Some("stream.xdriveSettings.segmentBytes".into())),
+            "{paths:#?}"
+        );
+
+        // A max poll interval below the min poll interval, compared on the
+        // effective values the runtime uses.
+        let paths = advisory_paths(local(XdriveTransport {
+            max_poll_interval_ms: 10,
+            ..Default::default()
+        }));
+        assert!(
+            paths.contains(&Some("stream.xdriveSettings.maxPollIntervalMs".into())),
+            "{paths:#?}"
+        );
+
+        // In range: no advisory.
+        let paths = advisory_paths(local(XdriveTransport {
+            concurrency: super::XDRIVE_MAX_CONCURRENCY,
+            segment_bytes: super::XDRIVE_MAX_SEGMENT_BYTES,
+            poll_interval_ms: 50,
+            max_poll_interval_ms: 500,
+            ..Default::default()
+        }));
+        assert!(paths.is_empty(), "{paths:#?}");
     }
 
     #[test]

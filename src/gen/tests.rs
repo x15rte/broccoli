@@ -1301,6 +1301,130 @@ fn golden_masque() {
     );
 }
 
+/// An xdrive transport over the local backend: the service discriminator,
+/// the folder the runtime writes to on this machine, and the scalars it
+/// reads, as the pinned core accepts the document.
+#[test]
+fn golden_xdrive_local() {
+    let mut ob = OutboundModel::new(Protocol::Freedom);
+    ob.stream
+        .select_network(Network::Xdrive)
+        .expect("xdrive needs no security mode");
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "local".into();
+        xdrive.remote_folder = "xdrive-store".into();
+        xdrive.segment_bytes = 262144;
+        xdrive.flush_interval_ms = 10;
+        xdrive.poll_interval_ms = 40;
+        xdrive.max_poll_interval_ms = 400;
+        xdrive.session_ttl_seconds = 120;
+        xdrive.concurrency = 16;
+        xdrive.eager_window_ms = 1000;
+        xdrive.hole_timeout_ms = 15_000;
+    }
+    golden!(
+        "goldens/xdrive_local.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport over Google Drive: the three secrets in their
+/// documented order and the Drive folder id, as the pinned core accepts them.
+#[test]
+fn golden_xdrive_drive() {
+    let mut ob = OutboundModel::new(Protocol::Freedom);
+    ob.stream
+        .select_network(Network::Xdrive)
+        .expect("xdrive needs no security mode");
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "Google Drive".into();
+        xdrive.remote_folder = "drive-folder-id".into();
+        xdrive.secrets = vec![
+            "client-id".into(),
+            "client-secret".into(),
+            "refresh-token".into(),
+        ];
+    }
+    golden!(
+        "goldens/xdrive_drive.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport over the template backend: the authorization flow,
+/// the four operations and the retry rules nest as the JSON object the
+/// runtime unmarshals, and the pinned core accepts the document.
+#[test]
+fn golden_xdrive_template() {
+    let mut ob = OutboundModel::new(Protocol::Freedom);
+    ob.stream
+        .select_network(Network::Xdrive)
+        .expect("xdrive needs no security mode");
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "template".into();
+        xdrive.remote_folder = "folder-token".into();
+        xdrive.secrets = vec!["one".into(), "two".into()];
+        xdrive.template = Some(XdriveTemplate {
+            flatten: true,
+            concurrency: 48,
+            auth: XdriveTemplateAuth {
+                r#type: "oauth2".into(),
+                token_url: "https://auth.example.com/token".into(),
+                form: Map::from_iter([("grant_type".into(), json!("refresh_token"))]),
+                token_path: "data.token".into(),
+                expiry_path: "data.expires".into(),
+                ..Default::default()
+            },
+            put: XdriveTemplateOp {
+                method: "POST".into(),
+                url: "https://api.example.com/{folder}/{name}".into(),
+                headers: Map::from_iter([("X-Frame".into(), json!("xdrive"))]),
+                body: "{\"content\":\"{data}\"}".into(),
+                ..Default::default()
+            },
+            get: XdriveTemplateOp {
+                url: "https://api.example.com/{folder}/{name}".into(),
+                ..Default::default()
+            },
+            delete: XdriveTemplateOp {
+                method: "DELETE".into(),
+                url: "https://api.example.com/{folder}/{name}".into(),
+                ..Default::default()
+            },
+            list: XdriveTemplateOp {
+                url: "https://api.example.com/{folder}?prefix={prefix}".into(),
+                names_regex: "\"name\":\"([^\"]+)\"".into(),
+                ..Default::default()
+            },
+            retry: XdriveTemplateRetry {
+                status: vec![429, 503],
+                rate_reason: "error.message".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    golden!(
+        "goldens/xdrive_template.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_hysteria2_udphop_mask() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);
