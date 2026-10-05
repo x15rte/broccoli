@@ -1211,38 +1211,3 @@ fn app_log_events_render_in_the_active_language_with_the_gutter() {
         level.tag()
     );
 }
-
-/// The helper's shield reports drive the top bar's warning chip: a failed
-/// install raises it, a completed install clears it. This chip is the only
-/// surface outside the Logs screen that says the machine's DNS queries are
-/// not confined to the tunnel.
-#[test]
-fn dns_shield_reports_drive_the_topbar_warning() {
-    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
-    h.run();
-    common::dismiss_wizard(&mut h);
-
-    let chip = t(Language::En, Key::TopbarDnsShieldInactive);
-    assert!(
-        h.query_all_by_label(chip).next().is_none(),
-        "a fresh session must not carry the shield warning"
-    );
-
-    h.state().inject_event(CoreEvt::AppLog(
-        Diag::new(Key::HelperDnsShieldNotEngaged).into(),
-    ));
-    h.run_steps(2);
-    assert!(
-        h.query_all_by_label(chip).next().is_some(),
-        "a failed shield install must warn in the top bar"
-    );
-
-    h.state().inject_event(CoreEvt::AppLog(
-        Diag::new(Key::HelperDnsShieldEngaged).into(),
-    ));
-    h.run_steps(2);
-    assert!(
-        h.query_all_by_label(chip).next().is_none(),
-        "a completed install must clear the warning"
-    );
-}

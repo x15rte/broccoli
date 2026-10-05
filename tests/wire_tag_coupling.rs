@@ -1,19 +1,19 @@
 //! Wire-name coupling tests: the runtime teardown must remove
-//! exactly the tag the generator emits, the WFP DNS shield must trigger on
-//! exactly the emitted DNS listener, and every config reader must address the
-//! emitted document through the same section and field names. The production
-//! sides reference the canonical consts (`src/model/inbound.rs` for the tags,
-//! `src/gen/keys.rs` for the schema keys); these tests pin the wire-level
-//! agreement against the actual emitted config (and the golden fixtures) so a
-//! unilateral literal re-spelling on either side fails.
+//! exactly the tag the generator emits, the predicate that decides the DNS
+//! leak block and the DNS takeover must fire on exactly the emitted DNS
+//! listener, and every config reader must address the emitted document
+//! through the same section and field names. The production sides reference
+//! the canonical consts (`src/model/inbound.rs` for the tags, `src/gen/keys.rs`
+//! for the schema keys); these tests pin the wire-level agreement against the
+//! actual emitted config (and the golden fixtures) so a unilateral literal
+//! re-spelling on either side fails.
 
 use broccoli::r#gen::{generate_with_api_port, keys};
 use broccoli::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
-    DNS_OUTBOUND_TAG, TUN_INBOUND_TAG,
+    DNS_OUTBOUND_TAG, TUN_INBOUND_TAG, config_runs_tun_dns,
 };
 use broccoli::model::{Mode, ServersFile, Settings};
-use broccoli::rt::config_needs_dns_shield;
 use broccoli::rt::dns_in;
 use serde_json::Value;
 
@@ -248,66 +248,27 @@ fn golden_nested_keys_match_schema_consts() {
 }
 
 #[test]
-fn wfp_shield_fires_on_exactly_the_emitted_dns_module() {
-    // The full emitted TUN config must need the shield: a tun inbound plus
-    // the DNS module whose in-tun listener the runtime adds. If the shield
-    // matched a drifted marker instead, this positive assertion fails.
+fn tun_dns_predicate_matches_the_emitted_dns_module() {
+    // The full emitted TUN config must read as "tun plus DNS module": the
+    // leak block and the DNS takeover both hang off that one predicate. If
+    // it matched a drifted marker instead, this positive assertion fails.
     let config = emitted_tun_config();
-    assert!(config_needs_dns_shield(&config));
+    assert!(config_runs_tun_dns(&config));
 
-    // Tun alone (module absent) -> no shield: nothing answers the adapter DNS.
+    // Tun alone (module absent) -> false: nothing answers the adapter DNS.
     let mut no_module = config.clone();
     no_module
         .as_object_mut()
         .expect("config is an object")
         .remove(keys::DNS);
-    assert!(!config_needs_dns_shield(&no_module));
+    assert!(!config_runs_tun_dns(&no_module));
 
-    // Module alone (no tun inbound) -> no shield: no TUN interface to protect.
+    // Module alone (no tun inbound) -> false: no TUN interface to protect.
     let no_tun = without_inbounds(&config, &["tun"]);
-    assert!(!config_needs_dns_shield(&no_tun));
+    assert!(!config_runs_tun_dns(&no_tun));
 
-    // No inbounds at all -> no shield.
-    assert!(!config_needs_dns_shield(
+    // No inbounds at all -> false.
+    assert!(!config_runs_tun_dns(
         &serde_json::json!({ keys::INBOUNDS: [] })
     ));
-}
-
-#[test]
-fn wfp_shield_reads_the_emitted_gateway_families() {
-    // The shield's IPv6 question must address the emitted gateway list
-    // through the field names the generator writes: the default tunnel is
-    // dual-stack, so the shield blocks only the DNS path, and the same
-    // config with the IPv6 entry removed reads as a family the tunnel does
-    // not carry — the shield then blocks IPv6 whole. A drifted field name
-    // would answer false for the dual-stack config and block IPv6 on every
-    // tunnel.
-    let config = emitted_tun_config();
-    assert!(
-        broccoli::rt::config_carries_ipv6(&config),
-        "the default emitted tunnel carries IPv6"
-    );
-
-    let mut v4_only = config;
-    let gateways = v4_only
-        .get_mut(keys::INBOUNDS)
-        .and_then(Value::as_array_mut)
-        .and_then(|inbounds| {
-            inbounds
-                .iter_mut()
-                .find(|inbound| inbound.get(keys::PROTOCOL).and_then(Value::as_str) == Some("tun"))
-        })
-        .and_then(|tun| tun.get_mut(keys::SETTINGS))
-        .and_then(|settings| settings.get_mut(keys::GATEWAY))
-        .and_then(Value::as_array_mut)
-        .expect("the emitted tun inbound carries a gateway list");
-    gateways.retain(|entry| entry.as_str().is_some_and(|cidr| !cidr.contains(':')));
-    assert!(
-        tun_gateway_ipv6(&v4_only).is_none(),
-        "the fixture must actually drop the IPv6 gateway"
-    );
-    assert!(
-        !broccoli::rt::config_carries_ipv6(&v4_only),
-        "an IPv4-only gateway list means the tunnel does not carry IPv6"
-    );
 }

@@ -432,10 +432,6 @@ pub struct BroccoliApp {
     /// phase it describes and cleared when that phase moves on or an action
     /// succeeds.
     terminal_error: Option<TerminalError>,
-    /// The helper reported that it could not install the WFP egress shield
-    /// for the running session: the top bar warns until a later install
-    /// succeeds or the session ends.
-    dns_shield_inactive: bool,
     /// An install this shell started has run and its transaction is still
     /// open: set by the progress event, cleared when the terminal consumes it
     /// or the runtime releases the exclusive record. Only such a terminal
@@ -882,7 +878,6 @@ impl BroccoliApp {
             core_available,
             core_setup,
             terminal_error: None,
-            dns_shield_inactive: false,
             install_in_flight: false,
             is_elevated: sys::elevation::is_elevated(),
             screen: Screen::Dashboard,
@@ -1033,11 +1028,6 @@ impl BroccoliApp {
                     // pairing this event with the last one.
                     self.active_transport = transport;
                     self.phase = phase.clone();
-                    // The shield belongs to one session: a teardown ends it,
-                    // so the warning must not outlive the core it describes.
-                    if matches!(phase, CorePhase::Stopped) {
-                        self.dns_shield_inactive = false;
-                    }
                     // Any phase change means a different core session (or
                     // none): trial rules never survive a restart or config
                     // commit, so the cached live list is stale by definition.
@@ -1083,13 +1073,6 @@ impl BroccoliApp {
                     // and its level comes from the key the runtime chose.
                     let lang = self.settings.language;
                     let key = message.headline().key();
-                    // The shield's own reports drive the top-bar warning: a
-                    // failed install raises it, a completed one clears it.
-                    match key {
-                        Key::HelperDnsShieldNotEngaged => self.dns_shield_inactive = true,
-                        Key::HelperDnsShieldEngaged => self.dns_shield_inactive = false,
-                        _ => {}
-                    }
                     self.push_keyed_log(key, message.text(lang));
                 }
                 CoreEvt::Stats(tick) => {
@@ -2165,7 +2148,6 @@ impl eframe::App for BroccoliApp {
                         config_error: self.config_error.as_deref(),
                         state_error: self.state_error.as_deref(),
                         persistence_error: self.persistence_error.as_deref(),
-                        dns_shield_inactive: self.dns_shield_inactive,
                         stats_generation: self.ui_ctx_snapshot.stats_generation,
                         unit: self.settings.traffic_unit,
                         stats: self.ui_ctx_snapshot.stats.as_ref(),
@@ -2685,7 +2667,10 @@ fn validate_raw_override_candidate(
     // pinned core fails the whole config build on `proxySettings`
     // (infra/conf/xray.go:262) and ignores `finalmask.quicParams.udpHop`
     // silently, and the profile model reports the same findings under the
-    // same codes, so each message is rendered once.
+    // same codes, so each message is rendered once. Both are refused here
+    // even though the ignored one is only an advisory against a profile:
+    // this surface has no advisory channel, and a document carrying a key
+    // the core drops would otherwise look configured.
     if let Some(index) = raw_override_retired_proxy_settings(config) {
         let issue = crate::model::validation::ValidationIssue {
             code: crate::model::validation::ValidationCode::OutboundProxySettingsRemoved,
@@ -4390,7 +4375,6 @@ mod unsaved_changes_tests {
                                 config_error: None,
                                 state_error: None,
                                 persistence_error: None,
-                                dns_shield_inactive: false,
                                 stats_generation: 0,
                                 unit: crate::model::settings::TrafficUnit::Auto,
                                 stats: None,

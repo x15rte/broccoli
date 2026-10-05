@@ -53,9 +53,9 @@ pub struct NetIf {
 /// drop — a `Vec<u8>` (alignment 1) cast to `*mut IP_ADAPTER_ADDRESSES_LH`
 /// would be UB by contract and would only work via allocator over-alignment.
 ///
-/// `pub(crate)` because the WFP DNS-shield adapter lookup
-/// (`src/rt/wfp.rs::interface_index_by_name`) walks the same API and uses
-/// the same aligned-allocation discipline instead of duplicating it.
+/// `pub(crate)` because [`dns_takeover`](crate::sys::dns_takeover) walks the
+/// same API and uses the same aligned-allocation discipline instead of
+/// duplicating it.
 pub(crate) struct AdapterBuffer {
     ptr: *mut u8,
     layout: Layout,
@@ -112,6 +112,17 @@ pub fn list() -> Vec<NetIf> {
 /// Returns an empty vec on any API failure (best-effort enumeration).
 pub fn list_all() -> Vec<NetIf> {
     enumerate(false)
+}
+
+/// Resolve a network adapter's interface index by its friendly name. The
+/// elevated helper uses this to find the TUN adapter the staged core created,
+/// so the system-DNS takeover can exclude the tunnel adapter itself from the
+/// capture. Matches the name exactly; `None` when no adapter reports it.
+pub fn interface_index_by_name(name: &str) -> Option<u32> {
+    list_all()
+        .into_iter()
+        .find(|iface| iface.name == name)
+        .map(|iface| iface.index)
 }
 
 /// Shared `GetAdaptersAddresses` walk behind `list` and `list_all`.

@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use crate::diag::{Diag, DiagArg, DiagError, DiagResult};
 use crate::i18n::Key;
-use crate::rt::wfp::{ShieldCommand, set_dns_shield};
 use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -1205,10 +1204,10 @@ enum HelperCommand {
     Stop,
     Status,
     /// Clean the machine's TUN leftovers without starting anything: stop a
-    /// core this helper still holds, drop the DNS shield, restore the DNS
-    /// servers a session took over, and remove leftover wintun devnodes of
-    /// `adapter_name`. The terminal is the `cleaned` event; a helper the GUI
-    /// launched for this request alone exits when that pipe closes.
+    /// core this helper still holds, restore the DNS servers a session took
+    /// over, and remove leftover wintun devnodes of `adapter_name`. The
+    /// terminal is the `cleaned` event; a helper the GUI launched for this
+    /// request alone exits when that pipe closes.
     CleanUp {
         adapter_name: String,
     },
@@ -1584,7 +1583,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // session on disk and the adapters pointed at a tunnel address that no
     // longer exists. The record is that session's repair instruction, and
     // this is the first moment a repair may run: authenticated, before any
-    // command stages a core. Best-effort, like the shield.
+    // command stages a core. Best-effort.
     match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
         Ok(Some(0)) | Ok(None) => {}
         Ok(Some(adapters)) => send_log(
@@ -1697,11 +1696,11 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     {
         child.kill();
     }
-    // The reaper that would restore the DNS servers with the shield cannot
-    // win a race against this process exiting (it polls the killed child),
-    // and the child's job object dies with this process, so the session is
-    // over now: hand the captured servers back before returning. A failure
-    // keeps the record for the next helper's startup repair.
+    // The reaper that would restore the DNS servers cannot win a race
+    // against this process exiting (it polls the killed child), and the
+    // child's job object dies with this process, so the session is over now:
+    // hand the captured servers back before returning. A failure keeps the
+    // record for the next helper's startup repair.
     release_dns_takeover(&writer);
     Ok(())
 }
@@ -1847,14 +1846,13 @@ fn validate_staged_config(stage: &Path) -> Result<(), DiagError> {
 }
 
 /// True while the slot still names `pid` and that child has not exited —
-/// the liveness probe the DNS-shield installer uses.
-/// The shield's permit app-id names this child's staged `xray.exe`, so the
-/// shield may only stay installed while this exact child is the live
-/// current occupant: once the slot is empty, holds a different pid (a
-/// superseding start), or holds this pid as a corpse, the stage is (or is
-/// about to be) deleted and the shield must be removed. A poisoned slot
-/// lock reports false — fail toward removing the shield, never toward
-/// keeping a possibly-stale port-53 block.
+/// the liveness probe the system-DNS takeover installer uses. The takeover
+/// may only be applied while this exact child is the live current occupant:
+/// once the slot is empty, holds a different pid (a superseding start), or
+/// holds this pid as a corpse, there is no live tunnel at the staged
+/// adapter, so nothing may be taken over for it. A poisoned slot lock
+/// reports false — fail toward leaving the system's DNS alone, never toward
+/// taking it over for a dead child.
 fn child_is_live_current(current: &Arc<Mutex<Option<HelperChild>>>, pid: u32) -> bool {
     match current.lock() {
         Ok(mut slot) => slot.as_mut().is_some_and(|child| {
@@ -1993,25 +1991,23 @@ fn helper_start(
             _stage: stage,
         });
     }
-    // WFP egress shield: while a TUN core with a DNS module runs, block
-    // direct DNS dials to port 53 outside the tunnel so Windows multi-homed
-    // resolution cannot reach the physical adapters' on-link gateway DNS,
-    // and block the whole IPv6 family when the tunnel carries no IPv6
-    // gateway. Weight order in the broccoli sublayer: xray's app-id permit
-    // (13) > un-carried-family block (12) > TUN-interface index (11) >
-    // port-53 block (10). The TUN adapter (and its interface index) exists
-    // only after the child's tun inbound comes up, so the index is resolved
-    // by polling GetAdaptersAddresses for the staged tun name. The block
-    // half needs no adapter and lands first, so the startup window does not
-    // leak; the TUN-interface permits are added by a second install once the
-    // index resolves. Installed after the slot assignment so a concurrently
-    // exiting previous child's reaper never removes a shield this start has
-    // just installed (the reaper only removes when no child occupies the
-    // slot). If this child dies during the poll nothing must keep a shield
-    // whose permit app-id names a stage the reaper is about to delete, so
-    // the installer re-checks slot/child liveness after installing (and
-    // while polling) and removes the shield again when the child is gone —
-    // see the poll and post-install checks below. Best-effort: failures are
+    // System DNS takeover: while a TUN core with a DNS module runs, point
+    // every other adapter's DNS servers at the tunnel so a name the tunnel
+    // answers with a negative result does not wait out the resolver's whole
+    // retry schedule (see `sys::dns_takeover`). It triggers on the same gate
+    // that makes the core emit its leak block: a TUN inbound and a top-level
+    // `dns` object. The TUN adapter (and its interface index) exists only
+    // after the child's tun inbound comes up, so the index is resolved by
+    // polling `GetAdaptersAddresses` for the staged tun name, and that index
+    // is what excludes the tunnel adapter itself from the capture. The
+    // capture is written before anything changes, so a failure still leaves
+    // a repair behind. Installed after the slot assignment so a concurrently
+    // exiting previous child's reaper never tears down a takeover this start
+    // has just applied. If this child dies during the poll nothing may be
+    // taken over for a corpse whose stage the reaper is about to delete, so
+    // the installer re-checks slot/child liveness after the index resolves
+    // (and while polling) and skips the takeover when the child is gone —
+    // see the poll and post-resolve checks below. Best-effort: failures are
     // logged, never fatal.
     let config_text = fs::read_to_string(stage_path.join(STAGED_CONFIG)).ok();
     let config: Option<serde_json::Value> = config_text
@@ -2019,148 +2015,78 @@ fn helper_start(
         .and_then(|text| serde_json::from_str(text).ok());
     let needs = config
         .as_ref()
-        .is_some_and(crate::rt::wfp::config_needs_dns_shield);
-    let carries_ipv6 = config
-        .as_ref()
-        .is_some_and(crate::rt::wfp::config_carries_ipv6);
-    let xray_exe = stage_path.join("xray.exe");
-    let shield_error = if needs {
-        // Fail-closed first install: the block half needs no adapter, so it
-        // covers the whole startup window, before the poll below.
-        match set_dns_shield(ShieldCommand::Install {
-            xray_exe: &xray_exe,
-            tun_ifindex: None,
-            carries_ipv6,
-        }) {
-            Err(error) => {
-                Some(DiagError::new(Diag::new(Key::HelperDnsShieldNotEngaged)).caused_by(error))
+        .is_some_and(crate::model::inbound::config_runs_tun_dns);
+    let takeover_error = if needs {
+        match config_text
+            .as_deref()
+            .and_then(crate::sys::wintun::staged_tun_adapter_name)
+        {
+            None => Some(DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))),
+            Some(name) => {
+                // The staged core can die while its TUN inbound is still
+                // coming up (wintun fault, bad config, a racing stop).
+                // Polling on would only resolve the index of an adapter whose
+                // owner is gone, so the poll stops as soon as the slot no
+                // longer holds this live child, and nothing is taken over for
+                // a corpse — this start's reaper reports the exit.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut ifindex = crate::sys::netif::interface_index_by_name(&name);
+                while ifindex.is_none() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if !child_is_live_current(current, pid) {
+                        break;
+                    }
+                    ifindex = crate::sys::netif::interface_index_by_name(&name);
+                }
+                // Resolving the index can take up to the poll deadline; the
+                // child may have died inside it, leaving no live tunnel to
+                // point the system's DNS at.
+                if !child_is_live_current(current, pid) {
+                    None
+                } else if let Some(ifindex) = ifindex {
+                    // The takeover targets the in-tun listener address,
+                    // derived from the same staged config; its capture is
+                    // written before the first change, so a failure here
+                    // still leaves a repair behind.
+                    let outcome = (|| -> Result<usize, DiagError> {
+                        let path = dns_takeover_record_path()?;
+                        let in_tun = crate::rt::dns_in::listener_for_bytes(config_bytes)
+                            .ok_or_else(|| {
+                                DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))
+                            })?;
+                        crate::sys::dns_takeover::engage(
+                            &path,
+                            ifindex,
+                            crate::sys::dns_takeover::Targets {
+                                v4: in_tun.v4,
+                                v6: in_tun.v6,
+                            },
+                        )
+                    })();
+                    match outcome {
+                        Ok(adapters) => {
+                            send_log(
+                                writer,
+                                Diag::new(Key::HelperDnsTakeoverApplied).arg(adapters),
+                            );
+                            None
+                        }
+                        Err(error) => Some(
+                            DiagError::new(Diag::new(Key::HelperDnsTakeoverNotEngaged))
+                                .caused_by(error),
+                        ),
+                    }
+                } else {
+                    Some(DiagError::new(
+                        Diag::new(Key::HelperTunAdapterMissing).arg(name),
+                    ))
+                }
             }
-            Ok(()) => match config_text
-                .as_deref()
-                .and_then(crate::sys::wintun::staged_tun_adapter_name)
-            {
-                None => {
-                    release_dns_shield(writer);
-                    Some(DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter)))
-                }
-                Some(name) => {
-                    // The staged core can die while its TUN inbound is still
-                    // coming up (wintun fault, bad config, a racing stop).
-                    // Polling on would only resolve the index of an adapter
-                    // whose owner is gone, so the poll stops as soon as the
-                    // slot no longer holds this live child — the permits
-                    // below then never land for a corpse, and this start's
-                    // reaper reports the exit.
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    let mut ifindex = crate::rt::wfp::interface_index_by_name(&name);
-                    while ifindex.is_none() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(500));
-                        if !child_is_live_current(current, pid) {
-                            break;
-                        }
-                        ifindex = crate::rt::wfp::interface_index_by_name(&name);
-                    }
-                    match ifindex {
-                        Some(ifindex) => {
-                            // Residual race between the last poll and the WFP
-                            // call: the child can exit while `set_dns_shield`
-                            // runs. The reaper for this child only spawns
-                            // after this whole block returns, so the
-                            // installer itself re-checks liveness right
-                            // after installing and removes the shield it
-                            // just installed when the child is gone. That
-                            // re-check (or the poll bail-out above) removes
-                            // the shield before the reaper drops the stage,
-                            // so no port-53 block can outlive the stage
-                            // directory its permit app-id names. A live
-                            // current child's shield is untouched; the
-                            // reaper's removal serialization against
-                            // superseding starts is unchanged.
-                            match set_dns_shield(ShieldCommand::Install {
-                                xray_exe: &xray_exe,
-                                tun_ifindex: Some(ifindex),
-                                carries_ipv6,
-                            }) {
-                                Ok(()) if child_is_live_current(current, pid) => {
-                                    send_log(writer, Diag::new(Key::HelperDnsShieldEngaged));
-                                    // The shield and the takeover guard the
-                                    // same resolver: with the shield up, a
-                                    // DNS server another adapter still lists
-                                    // never answers, and the resolver waits
-                                    // out its whole retry schedule before it
-                                    // accepts a negative answer. The
-                                    // takeover writes its capture before it
-                                    // changes anything, so a failure here
-                                    // still leaves a repair behind.
-                                    let outcome = (|| -> Result<usize, DiagError> {
-                                        let path = dns_takeover_record_path()?;
-                                        let in_tun =
-                                            crate::rt::dns_in::listener_for_bytes(config_bytes)
-                                                .ok_or_else(|| {
-                                                    DiagError::new(Diag::new(
-                                                        Key::HelperConfigNoTunAdapter,
-                                                    ))
-                                                })?;
-                                        crate::sys::dns_takeover::engage(
-                                            &path,
-                                            ifindex,
-                                            crate::sys::dns_takeover::Targets {
-                                                v4: in_tun.v4,
-                                                v6: in_tun.v6,
-                                            },
-                                        )
-                                    })();
-                                    match outcome {
-                                        Ok(adapters) => {
-                                            send_log(
-                                                writer,
-                                                Diag::new(Key::HelperDnsTakeoverApplied)
-                                                    .arg(adapters),
-                                            );
-                                            None
-                                        }
-                                        Err(error) => Some(
-                                            DiagError::new(Diag::new(
-                                                Key::HelperDnsTakeoverNotEngaged,
-                                            ))
-                                            .caused_by(error),
-                                        ),
-                                    }
-                                }
-                                Ok(()) => Some(DiagError::new(
-                                    Diag::new(if release_dns_shield(writer) {
-                                        Key::HelperShieldRemovedAfterExit
-                                    } else {
-                                        Key::HelperShieldNotInstalledAfterExit
-                                    })
-                                    .arg(pid),
-                                )),
-                                Err(error) => Some(
-                                    DiagError::new(Diag::new(Key::HelperDnsShieldNotEngaged))
-                                        .caused_by(error),
-                                ),
-                            }
-                        }
-                        None if !child_is_live_current(current, pid) => {
-                            release_dns_shield(writer);
-                            Some(DiagError::new(
-                                Diag::new(Key::HelperShieldNotInstalledAfterExit).arg(pid),
-                            ))
-                        }
-                        None => {
-                            release_dns_shield(writer);
-                            Some(DiagError::new(
-                                Diag::new(Key::HelperTunAdapterMissing).arg(name),
-                            ))
-                        }
-                    }
-                }
-            },
         }
     } else {
         None
     };
-    if let Some(error) = shield_error {
+    if let Some(error) = takeover_error {
         send_log_record(writer, &error);
     }
     send_event(
@@ -2225,22 +2151,20 @@ fn helper_start(
                 }
                 _ => None,
             };
-            // DNS shield teardown: only when this reaper took the current
+            // System-DNS teardown: only when this reaper took the current
             // child AND no superseding start has claimed the slot. The
-            // removal runs while holding the slot lock so it serializes
-            // against helper_start's assign-then-install: either the new
-            // start's slot write happened before this check (no removal), or
-            // the start is blocked until the removal completes (its install
+            // restore runs while holding the slot lock so it serializes
+            // against helper_start's assign-then-take-over: either the new
+            // start's slot write happened before this check (no restore), or
+            // the start is blocked until the restore completes (its takeover
             // lands last). The exit event below — which triggers any
-            // app-side restart — is sent after the removal, so a restart
-            // re-installs the shield without racing this teardown. No
-            // lock-order inversion: nothing acquires the slot lock while
-            // holding the shield lock.
+            // app-side restart — is sent after the restore, so a restart
+            // re-applies the takeover without racing this teardown.
             if let Ok(slot) = current.lock()
                 && finished.is_some()
                 && slot.is_none()
             {
-                release_dns_shield(&writer);
+                release_dns_takeover(&writer);
             }
             // Dropping the exact exited child removes only the allowlisted
             // non-reparse secure-stage entries (payload locks were released
@@ -2255,33 +2179,12 @@ fn helper_start(
     }
 }
 
-/// Remove the shield and restore the captured DNS servers. Returns whether
-/// the removal left nothing behind. Every path that must not let a shield
-/// outlive its start goes through here, so the two halves always stop
-/// together.
-fn release_dns_shield(writer: &Arc<Mutex<File>>) -> bool {
-    let removed = match set_dns_shield(ShieldCommand::Remove) {
-        Ok(()) => true,
-        Err(error) => {
-            send_log_record(
-                writer,
-                &DiagError::new(Diag::new(Key::HelperDnsShieldTeardownFailed)).caused_by(error),
-            );
-            false
-        }
-    };
-    // The takeover is restored whatever the shield removal reported: the two
-    // halves are independent pieces of OS state, and a filter left behind
-    // must not keep the machine pointed at a tunnel DNS server that is gone.
-    release_dns_takeover(writer);
-    removed
-}
-
-/// Undo this session's system-DNS takeover and delete its record. Runs
-/// wherever the DNS shield is removed: the two halves guard the same
-/// resolver, so they start and stop together. Best-effort — a failure keeps
-/// the record, and the next helper start repairs from it. Returns the number
-/// of adapters whose captured servers were restored.
+/// Undo this session's system-DNS takeover and delete its record. Runs at
+/// every teardown path — the reaper, the parent-death exit, the manual
+/// cleanup and the startup repair — so a machine never stays pointed at a
+/// tunnel that is gone. Best-effort — a failure keeps the record, and the
+/// next helper start repairs from it. Returns the number of adapters whose
+/// captured servers were restored.
 fn release_dns_takeover(writer: &Arc<Mutex<File>>) -> usize {
     match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
         Ok(Some(0)) | Ok(None) => 0,
@@ -2343,10 +2246,10 @@ fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) {
 }
 
 /// The manual cleanup (`HelperCommand::CleanUp`): stop a core this helper
-/// still holds, drop the DNS shield, restore the captured DNS servers, and
-/// remove leftover devnodes of `adapter_name`, then report the counts as the
-/// `cleaned` terminal. Every step is best-effort and logs its own failure, so
-/// one failing step never hides the others; the caller is the GUI's manual
+/// still holds, restore the captured DNS servers, and remove leftover
+/// devnodes of `adapter_name`, then report the counts as the `cleaned`
+/// terminal. Every step is best-effort and logs its own failure, so one
+/// failing step never hides the others; the caller is the GUI's manual
 /// repair, which runs this when a session ended unexpectedly and left the
 /// machine pointed at a tunnel that is gone.
 fn helper_cleanup(
@@ -2359,7 +2262,7 @@ fn helper_cleanup(
     {
         child.kill();
     }
-    release_dns_shield(writer);
+    release_dns_takeover(writer);
     // The startup repair restores captured servers before this command is
     // read, so the report is everything restored since the last report —
     // never a zero that would tell the user nothing needed cleaning, and
@@ -2538,9 +2441,6 @@ wire_keys!(
     HelperDirectoryCreateFailed,
     HelperDirectoryInspectFailed,
     HelperDirectoryNotOrdinary,
-    HelperDnsShieldEngaged,
-    HelperDnsShieldNotEngaged,
-    HelperDnsShieldTeardownFailed,
     HelperDnsTakeoverApplied,
     HelperDnsTakeoverNotEngaged,
     HelperDnsTakeoverRepaired,
@@ -2580,8 +2480,6 @@ wire_keys!(
     HelperProgramDataNotDirectory,
     HelperProgramDataResolveFailed,
     HelperReaderThreadFailed,
-    HelperShieldNotInstalledAfterExit,
-    HelperShieldRemovedAfterExit,
     HelperStageEntryInspectFailed,
     HelperStageEntryReadFailed,
     HelperStageEntryRemoveFailed,
@@ -2624,10 +2522,6 @@ wire_keys!(
     SupervisorSpawnFailed,
     SupervisorVerifyFailed,
     SupervisorVerifyWorkerFailed,
-    WfpAppIdReadFailed,
-    WfpEngineOpenFailed,
-    WfpFilterAddFailed,
-    WfpSubLayerAddFailed,
 );
 
 /// One keyed message layer as the pipe carries it: the key name plus its
@@ -3166,10 +3060,10 @@ impl HelperPipe {
     }
 
     /// Ask the helper to clean this machine's TUN leftovers
-    /// ([`HelperCommand::CleanUp`]): its own core, the DNS shield, the
-    /// captured DNS servers, and leftover devnodes of `adapter_name`. The
-    /// terminal is [`HelperEvent::Cleaned`], which arrives on the pipe's own
-    /// event stream like every other helper event.
+    /// ([`HelperCommand::CleanUp`]): its own core, the captured DNS servers,
+    /// and leftover devnodes of `adapter_name`. The terminal is
+    /// [`HelperEvent::Cleaned`], which arrives on the pipe's own event stream
+    /// like every other helper event.
     pub fn cleanup(&self, adapter_name: &str) -> Result<(), DiagError> {
         self.send(&HelperCommand::CleanUp {
             adapter_name: adapter_name.to_string(),
@@ -3515,9 +3409,6 @@ mod tests {
             Key::HelperDnsTakeoverRepaired,
             Key::HelperDnsTakeoverRestored,
             Key::HelperDnsTakeoverRestoreFailed,
-            Key::HelperDnsShieldEngaged,
-            Key::HelperDnsShieldNotEngaged,
-            Key::HelperDnsShieldTeardownFailed,
             Key::HelperTunCleanupConfigReadFailed,
             Key::HelperTunCleanupTimeout,
         ] {
@@ -4660,16 +4551,15 @@ mod tests {
         );
     }
 
-    /// Mechanism check: `child_is_live_current` is the
-    /// probe the DNS-shield installer uses to keep a shield from outliving
-    /// the child (and stage directory) it was installed for. It must hold
-    /// only while the slot names this exact pid and the process has not
-    /// exited — false for an empty slot, a different occupant pid, or a
-    /// dead occupant are the exact states in which the installer removes
-    /// the shield it just installed (and in which the reaper deletes the
-    /// staged payload the shield's permit app-id names).
+    /// Mechanism check: `child_is_live_current` is the probe the system-DNS
+    /// takeover installer uses to avoid taking the system's DNS over for a
+    /// child that is already gone. It must hold only while the slot names
+    /// this exact pid and the process has not exited — false for an empty
+    /// slot, a different occupant pid, or a dead occupant are the exact
+    /// states in which the installer skips the takeover (and in which the
+    /// reaper deletes the staged payload).
     #[test]
-    fn dns_shield_liveness_probe_tracks_the_installed_child() {
+    fn child_liveness_probe_tracks_the_current_occupant() {
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
 
@@ -4701,7 +4591,7 @@ mod tests {
         // The probe child stays alive while its piped stdin stays open.
         assert!(
             child_is_live_current(&current, pid),
-            "a live occupant with the matching pid must keep the shield"
+            "a live occupant with the matching pid must be usable for the takeover"
         );
         // A different pid (superseding start): not this child.
         assert!(!child_is_live_current(&current, pid.wrapping_add(1)));
@@ -4713,7 +4603,7 @@ mod tests {
             .expect("occupied probe slot");
         assert!(!child_is_live_current(&current, pid));
         // Dead occupant still in the slot (reaper has not run yet): the
-        // installer must remove the shield it just installed.
+        // installer must skip the takeover.
         taken.child.kill().expect("kill probe child");
         let _ = taken.child.wait();
         *current.lock().expect("probe slot lock") = Some(taken);

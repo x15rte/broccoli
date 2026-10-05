@@ -1,13 +1,12 @@
 //! System DNS takeover while a TUN core with a DNS module runs.
 //!
-//! The WFP DNS shield (`rt::wfp`) blocks port-53 egress outside the TUN. The
-//! resolver still holds the *other* adapters' DNS servers in its server set,
-//! and those queries never answer, so a name the tunnel answers with a
-//! negative result costs the whole retry schedule: Windows completes a query
-//! only after every configured server answered, and a NODATA from the tunnel
-//! DNS is not final. Measured on a host whose `wired` adapter kept its DHCP
-//! server: about ten seconds for one AAAA query, and the same for one TXT or
-//! NXDOMAIN query.
+//! The core's leak block drops port-53 egress outside the TUN. The resolver
+//! still holds the *other* adapters' DNS servers in its server set, and those
+//! queries never answer, so a name the tunnel answers with a negative result
+//! costs the whole retry schedule: Windows completes a query only after every
+//! configured server answered, and a NODATA from the tunnel DNS is not final.
+//! Measured on a host whose `wired` adapter kept its DHCP server: about ten
+//! seconds for one AAAA query, and the same for one TXT or NXDOMAIN query.
 //!
 //! The DNS client sends each query from the interface that owns the server,
 //! so a route cannot move those queries into the tunnel: only the adapter's
@@ -624,7 +623,7 @@ mod tests {
     fn the_plan_captures_the_ipv6_family_the_tunnel_serves() {
         // An adapter carries IPv6 servers and the tunnel has an IPv6 gateway,
         // so the takeover owns that family too — it is the family the resolver
-        // would otherwise send to a shield-blocked server.
+        // would otherwise send to a server the leak block drops.
         let views = [
             view("{tun}", 9, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["192.168.124.1", "fd00:124::1"]),

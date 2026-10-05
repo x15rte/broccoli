@@ -5,6 +5,7 @@ use super::{
     dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, skip_empty_str, skip_empty_vec, skip_false,
     skip_zero_u16, skip_zero_u32,
 };
+use crate::r#gen::keys;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -18,8 +19,8 @@ pub const TUN_INBOUND_TAG: &str = "in-tun";
 
 /// Wire tag of the loopback DNS inbound listener: `"dns-in"`. Referenced in
 /// emission of the DNS module's inbound listener, in routing rules that
-/// steer resolution traffic to it, and in WFP shield detection that checks
-/// whether the system DNS points at this listener.
+/// steer resolution traffic to it, and in the runtime's in-tun listener
+/// derivation that reads the tag back out of a running config.
 pub const DNS_INBOUND_TAG: &str = "dns-in";
 
 /// Wire tag of the tunnel's IPv6 DNS listener: `"dns-in6"`. The runtime adds
@@ -909,6 +910,28 @@ mod stable_tag_tests {
     }
 }
 
+/// Whether the generated configuration runs a TUN inbound alongside the
+/// top-level `dns` object: the TUN inbound owns the adapter DNS, and the DNS
+/// module is what answers it. The runtime adds the module's in-tun listener
+/// to the running core (`rt::dns_in`), the generator emits the core's leak
+/// block on this same gate, and the elevated helper's system-DNS takeover
+/// triggers on it. Either half alone has no tunnel DNS to protect, so both
+/// consumers must read the decision from here rather than re-deriving it.
+pub fn config_runs_tun_dns(config: &Value) -> bool {
+    let has_tun = config
+        .get(keys::INBOUNDS)
+        .and_then(Value::as_array)
+        .is_some_and(|inbounds| {
+            inbounds.iter().any(|inbound| {
+                inbound
+                    .get(keys::PROTOCOL)
+                    .and_then(Value::as_str)
+                    .is_some_and(|protocol| protocol == "tun")
+            })
+        });
+    has_tun && config.get(keys::DNS).is_some()
+}
+
 /// TUN inbound (tun.go:15-54). Contract defaults:
 /// name broccoli0, mtu 1500, gateway 10.255.0.1/30 + fd00::1/64
 /// (dual-stack — every entry becomes an adapter address on Windows,
@@ -998,9 +1021,9 @@ impl TunCfg {
     /// setting, or [`DEFAULT_TUN_NAME`] when the setting is blank. The core
     /// fills a name-less TUN inbound with a random free `utun10`-`utun1024`
     /// name (infra/conf/tun.go), which nothing on this side can map back to
-    /// the devnode to clean up, the interface to shield, or the adapter to
-    /// exclude from the latency probe's uplink pick — so the inbound always
-    /// names its adapter.
+    /// the devnode to clean up, the tunnel adapter the DNS takeover must
+    /// exclude from its capture, or the adapter to exclude from the latency
+    /// probe's uplink pick — so the inbound always names its adapter.
     pub fn effective_name(&self) -> &str {
         let trimmed = self.name.trim();
         if trimmed.is_empty() {
@@ -1084,9 +1107,10 @@ mod tun_tests {
     fn wire_form_always_names_the_adapter() {
         // A name-less TUN inbound would let the core create a random
         // `utun10`-`utun1024` adapter (infra/conf/tun.go) that nothing on
-        // this side maps back to the devnode to clean up, the interface to
-        // shield, or the adapter to exclude from the probe's uplink pick, so
-        // the emitted settings always carry a name.
+        // this side maps back to the devnode to clean up, the tunnel adapter
+        // the DNS takeover must exclude from its capture, or the adapter to
+        // exclude from the probe's uplink pick, so the emitted settings
+        // always carry a name.
         let blank = TunCfg {
             name: " \t ".into(),
             ..Default::default()

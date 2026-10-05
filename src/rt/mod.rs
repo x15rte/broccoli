@@ -18,7 +18,6 @@ mod readiness;
 mod seat;
 mod state;
 pub mod supervisor;
-mod wfp;
 
 use policy::{
     CANDIDATE_RETRY_DELAY, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure, READY_TIMEOUT,
@@ -83,14 +82,6 @@ pub use grpc::{
     BalancerInfoView, GrpcClient, HealthPingView, OutboundStatusView, RuntimeEntryView, StatsTick,
 };
 
-/// WFP shield predicates (see [`wfp`]): [`config_needs_dns_shield`] is true
-/// when the config runs a TUN inbound alongside the DNS module's loopback
-/// listener, and [`config_carries_ipv6`] is true when the tunnel assigns an
-/// IPv6 gateway. Re-exported from the runtime root so the wire-tag coupling
-/// tests can pin them against the emitted config without widening the `wfp`
-/// module.
-pub use wfp::{config_carries_ipv6, config_needs_dns_shield};
-
 /// Terminal verdict of one accepted `CoreCmd::TestConfig`: `Ok((accepted,
 /// output))` when the core ran the validation, `Err` when it never did
 /// (rejection or cancellation text). Travels the request's own reply
@@ -126,12 +117,12 @@ pub enum CoreCmd {
     Stop,
     Restart,
     /// Clean the machine's TUN leftovers without connecting: stop a running
-    /// core, drop the DNS shield, restore the DNS servers a session took
-    /// over, remove leftover wintun devnodes of `adapter_name`, and flush the
-    /// resolver cache. The manual repair for a session that ended
-    /// unexpectedly; `adapter_name` is the effective adapter name the TUN
-    /// settings derive, because a cleanup has no staged config to read it
-    /// from. The terminal is the operation bookend plus a summary log line.
+    /// core, restore the DNS servers a session took over, remove leftover
+    /// wintun devnodes of `adapter_name`, and flush the resolver cache. The
+    /// manual repair for a session that ended unexpectedly; `adapter_name`
+    /// is the effective adapter name the TUN settings derive, because a
+    /// cleanup has no staged config to read it from. The terminal is the
+    /// operation bookend plus a summary log line.
     CleanUp {
         adapter_name: String,
     },
@@ -3402,7 +3393,7 @@ impl Runtime {
     /// carries. Attempts are capped through the shared
     /// [`spend_retry_attempt`] rule; a success, or a spent budget, drops the
     /// address from the pending set so the retry arm stops firing for it.
-    /// Best-effort, like the helper's DNS shield: a core that is serving
+    /// Best-effort, like the helper's takeover: a core that is serving
     /// traffic is never torn down because a listener could not be added.
     async fn dns_in_poll(&mut self) {
         if self.lifecycle.dns_in_pending.is_empty() {
