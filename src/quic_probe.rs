@@ -471,13 +471,13 @@ mod tests {
         );
         let ca = make_cert("Probe Intermediate", &[]);
         let transcript = render_capture(
-            "rm-eco.example.com",
+            "quic.example.com",
             9000,
-            "rm-eco.example.com",
+            "quic.example.com",
             &[leaf.clone(), ca.clone()],
         );
-        assert!(transcript.starts_with("QUIC handshake:  rm-eco.example.com:9000\n"));
-        assert!(transcript.contains("SNI:  rm-eco.example.com\n"));
+        assert!(transcript.starts_with("QUIC handshake:  quic.example.com:9000\n"));
+        assert!(transcript.contains("SNI:  quic.example.com\n"));
         assert!(transcript.contains("Handshake succeeded\n"));
         assert!(transcript.contains("TLS Version:  TLS 1.3\n"));
         assert!(transcript.contains("ALPN:  h3\n"));
