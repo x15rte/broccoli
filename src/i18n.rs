@@ -4393,9 +4393,7 @@ mod en {
                  typically the camouflage site's domain."
             }
             // Outbound `settings` rules. Error messages name the accepted
-            // vocabulary / format; the Shadowsocks-2022 key rule is advisory
-            // — Xray accepts the config, the session fails at dial time
-            // instead.
+            // vocabulary / format.
             Key::OutboundVlessFlowUnsupported => {
                 "VLESS flow must be empty, xtls-rprx-vision, or xtls-rprx-vision-udp443"
             }
@@ -4411,10 +4409,10 @@ mod en {
                  not support legacy stream ciphers."
             }
             Key::OutboundShadowsocks2022KeyInvalid => {
-                "Shadowsocks-2022 key must be base64 of exactly the method's key length: 16 bytes \
-                 for 2022-blake3-aes-128-gcm, 32 bytes for 2022-blake3-aes-256-gcm and \
-                 2022-blake3-chacha20-poly1305. The ChaCha20 method has no multi-key form. Xray \
-                 accepts this config, but every dial fails authentication."
+                "Shadowsocks-2022 keys are standard padded base64 of the method's key length: 16 \
+                 bytes for 2022-blake3-aes-128-gcm, 32 bytes for the other 2022 methods. Xray \
+                 refuses a key it cannot decode, a shorter key, and the ChaCha20 multi-key form. A \
+                 longer key still runs, because Xray hashes it down to the method's size."
             }
             Key::OutboundTrojanSettingsIncomplete => {
                 "Trojan requires a server address, a non-zero port, and a password"
@@ -4616,7 +4614,8 @@ mod en {
             Key::FinalmaskPortListInvalid => "{} is not a port, port range, or env:NAME entry",
             Key::FinalmaskBytesValueRequired => "{} byte syntax requires a packet/bytes value",
             Key::FinalmaskArrayByteSyntax => {
-                "array byte syntax must be a JSON array of integers from 0 through 255"
+                "array byte syntax must be a JSON array of integers from 0 through 255 or \
+                 standard padded base64"
             }
             Key::FinalmaskStrByteSyntax => "str byte syntax requires a string",
             Key::FinalmaskHexByteSyntax => {

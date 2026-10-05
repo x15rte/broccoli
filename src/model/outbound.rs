@@ -555,29 +555,6 @@ impl Default for BlackholeResponse {
     }
 }
 
-/// Whether Xray's `base64.StdEncoding.DecodeString` accepts this payload
-/// (the decode at infra/conf/blackhole.go:31): the standard alphabet with the
-/// canonical `=` padding, `\r`/`\n` ignored anywhere, and non-zero trailing
-/// bits tolerated because Go's decoder is not strict. The bundled engine's
-/// strict trailing-bit check is relaxed here so the two agree on every input.
-pub(crate) fn blackhole_custom_response_data_decodes(value: &str) -> bool {
-    use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
-
-    const GO_STANDARD: GeneralPurpose = GeneralPurpose::new(
-        &base64::alphabet::STANDARD,
-        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
-    );
-
-    let stripped;
-    let encoded = if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-        stripped = value.replace(['\r', '\n'], "");
-        stripped.as_str()
-    } else {
-        value
-    };
-    GO_STANDARD.decode(encoded).is_ok()
-}
-
 /// Whether Xray's blackhole conf accepts this `response.type`. The core
 /// lowercases the stored value before matching (infra/conf/blackhole.go:24)
 /// and compares the result exactly, so the vocabulary is matched under the
@@ -906,8 +883,8 @@ fn is_vless_encryption_key_part(part: &str) -> bool {
     // Go's non-strict `base64.RawURLEncoding`: non-zero trailing bits decode
     // to the same bytes and are tolerated, `=` padding is not part of the
     // grammar, and the bundled engine's stricter trailing-bit check is
-    // relaxed so the two agree on every input (as the blackhole decoder
-    // above does for the standard alphabet).
+    // relaxed so the two agree on every input (as the shared standard-alphabet
+    // decoder in `super` does).
     const GO_RAW_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
         &base64::alphabet::URL_SAFE,
         GeneralPurposeConfig::new()
@@ -1192,8 +1169,8 @@ impl<'de> Deserialize<'de> for OutboundModel {
 mod tests {
     use super::{
         BlackholeSettings, Fragment, Int32Range, Noise, OutboundModel, Protocol, ProtocolSettings,
-        WireguardPeer, WireguardSettings, blackhole_custom_response_data_decodes,
-        endpoint_requires_transport_security, is_valid_wireguard_key,
+        WireguardPeer, WireguardSettings, endpoint_requires_transport_security,
+        is_valid_wireguard_key,
     };
     use crate::model::settings::Language;
     use crate::model::stream::{
@@ -1254,31 +1231,6 @@ mod tests {
             format!("{}!", "A".repeat(42)),
         ] {
             assert!(!is_valid_wireguard_key(&value), "{value}");
-        }
-    }
-
-    #[test]
-    fn blackhole_custom_response_data_matches_the_cores_base64_decoder() {
-        // Every accepted form below passed `xray run -test` on the pinned
-        // v26.9.9 binary; every rejected form made it exit before loading.
-        for value in [
-            "", "aGk=", "a+R/", "AAA=", "aR==", "aG\nk=", "aG\r\nk=", "\r\n",
-        ] {
-            assert!(blackhole_custom_response_data_decodes(value), "{value:?}");
-        }
-        for value in [
-            "aGk",
-            "aGk==",
-            "a-R_",
-            "=",
-            "AA",
-            "AAAAA",
-            "aGk= ",
-            "aG k=",
-            "AA=A",
-            "aGk=\r\n=",
-        ] {
-            assert!(!blackhole_custom_response_data_decodes(value), "{value:?}");
         }
     }
 

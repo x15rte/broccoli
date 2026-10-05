@@ -1750,3 +1750,41 @@ fn inbound_and_balancer_vocabularies_fold_like_the_core() {
     assert!(balancer("leastp\u{130}ng").needs_live_health());
     assert!(!balancer("leastpong").needs_live_health());
 }
+
+/// The shared standard-alphabet decoder agrees with Go's non-strict
+/// `base64.StdEncoding.DecodeString`, the function behind both the blackhole
+/// response body (`infra/conf/blackhole.go`) and the finalmask byte encodings
+/// (`infra/conf/transport_finalmask.go`, `PraseByteSlice`): the canonical `=`
+/// padding is required, `\r`/`\n` are skipped anywhere, and non-zero trailing
+/// bits decode to the same bytes. Every accepted form below passed
+/// `xray run -test` on the pinned v26.9.9 binary; every refused form made it
+/// exit before loading.
+#[test]
+fn go_std_base64_decodes_matches_the_cores_decoder() {
+    for value in [
+        "", "aGk=", "a+R/", "AAA=", "aR==", "aG\nk=", "aG\r\nk=", "\r\n", "AA==", "AB==", "A\nA==",
+        "AA==\n", "\r\nAA==", "AA==\r\n", "AAAA", "AQ==", "aGVsbG8=",
+    ] {
+        assert!(go_std_base64_decodes(value), "{value:?}");
+    }
+    for value in [
+        "aGk",
+        "aGk==",
+        "a-R_",
+        "=",
+        "AA",
+        "AAAAA",
+        "aGk= ",
+        "aG k=",
+        "AA=A",
+        "aGk=\r\n=",
+        "AA=",
+        "AA===",
+        "====",
+        "A A==",
+        "AB",
+        "aGVsbG8",
+    ] {
+        assert!(!go_std_base64_decodes(value), "{value:?}");
+    }
+}

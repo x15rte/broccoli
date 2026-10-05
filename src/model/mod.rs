@@ -473,6 +473,42 @@ pub(crate) fn parse_range_go(s: &str) -> Option<(i64, i64)> {
     }
 }
 
+/// Go's non-strict `base64.StdEncoding` decode: the standard alphabet with the
+/// canonical `=` padding, `\r`/`\n` ignored anywhere, and non-zero trailing
+/// bits tolerated because Go's decoder is not strict. `None` is exactly the
+/// input set Go's decoder rejects. The core sites that read a base64 body
+/// through `StdEncoding.DecodeString` — the blackhole response
+/// (`infra/conf/blackhole.go`), the finalmask byte encodings
+/// (`infra/conf/transport_finalmask.go`, `PraseByteSlice`), the realm
+/// `echServerKeys` (`infra/conf/transport_security.go`), and a
+/// Shadowsocks-2022 key (`proxy/shadowsocks_2022`) — all agree with it; the
+/// bundled engine's strict trailing-bit check is relaxed here so the two match
+/// on every input.
+pub(crate) fn go_std_base64_decode(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
+
+    const GO_STANDARD: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
+
+    let stripped;
+    let encoded = if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        stripped = value.replace(['\r', '\n'], "");
+        stripped.as_str()
+    } else {
+        value
+    };
+    GO_STANDARD.decode(encoded).ok()
+}
+
+/// [`go_std_base64_decode`] as a yes/no question, for a rule that only gates on
+/// whether the payload decodes.
+pub(crate) fn go_std_base64_decodes(value: &str) -> bool {
+    go_std_base64_decode(value).is_some()
+}
+
 impl Int32Range {
     pub fn single(v: i32) -> Self {
         Self { from: v, to: v }

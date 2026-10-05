@@ -15,10 +15,10 @@ use egui::{Color32, RichText, Stroke, StrokeKind};
 use crate::r#gen::keys::{DIALER_PROXY, SOCKOPT, STREAM_SETTINGS};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
+use crate::model::go_std_base64_decodes;
 use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
-    WireguardPeer, blackhole_custom_response_data_decodes, blackhole_response_is_custom,
-    blackhole_response_type_supported,
+    WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
 use crate::model::settings::Language;
 use crate::model::stream::{MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg};
@@ -4459,7 +4459,7 @@ impl ServersScreen {
                             &mut response.custom_response_data,
                             t(lang, Key::SrvBlackholeDataHint),
                             |value| {
-                                if blackhole_custom_response_data_decodes(value) {
+                                if go_std_base64_decodes(value) {
                                     return None;
                                 }
                                 Some(t(lang, Key::SrvBlackholeCustomDataInvalid).to_string())

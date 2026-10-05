@@ -34,8 +34,7 @@ use super::inbound::{
     LocalInboundProtocol, Sniffing, listen_endpoints_conflict,
 };
 use super::outbound::{
-    Fragment, MuxModel, Noise, OutboundModel, ProtocolSettings,
-    blackhole_custom_response_data_decodes, blackhole_response_is_custom,
+    Fragment, MuxModel, Noise, OutboundModel, ProtocolSettings, blackhole_response_is_custom,
     blackhole_response_type_supported, endpoint_requires_transport_security,
     is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_supported,
 };
@@ -45,8 +44,8 @@ use super::stream::{
     Network, Security, SockoptModel, StreamModel, XmuxConfig,
 };
 use super::{
-    ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, fold_lower, parse_range_go,
-    vocabulary_holds,
+    ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, fold_lower, go_std_base64_decode,
+    go_std_base64_decodes, parse_range_go, vocabulary_holds,
 };
 use crate::links::{excerpt, excerpt_debug};
 use base64::Engine as _;
@@ -128,12 +127,14 @@ pub enum ValidationCode {
     /// `shadowaead_2022.List`; legacy stream ciphers hit the same unknown-
     /// cipher load error). Vocabulary mirrors the import whitelist.
     ShadowsocksMethodUnsupported,
-    /// Shadowsocks-2022 `settings.password` is not base64 of the method's
-    /// key length (16 B for `2022-blake3-aes-128-gcm`, 32 B for the other
-    /// 2022 methods; the ChaCha20 2022 method also rejects multi-psk
-    /// colon-separated keys). Xray accepts the config (`run -test` passes —
-    /// live repro 2026-09-05, Xray 26.7.28) and the session only fails at
-    /// dial/auth time, so this is advisory (Severity::Warning).
+    /// Shadowsocks-2022 `settings.password` cannot be used: the core decodes
+    /// it with `base64.StdEncoding` while it builds the method and refuses the
+    /// whole config when the decode fails, the decoded key is shorter than the
+    /// method's size (16 B for `2022-blake3-aes-128-gcm`, 32 B for the other
+    /// 2022 methods), or the ChaCha20 2022 method carries the colon-joined
+    /// multi-psk form (`proxy/shadowsocks_2022`, live on the pinned v26.9.9
+    /// binary). A key *longer* than the method's size loads and runs, so that
+    /// one shape is advisory (Severity::Warning); the refusals are errors.
     Shadowsocks2022KeyInvalid,
     /// VMess `settings.security` names a cipher the core does not read: the
     /// account build lowercases the value and maps anything outside
@@ -1184,32 +1185,67 @@ pub fn shadowsocks_method_supported(method: &str) -> bool {
     vocabulary_holds(SS_AEAD_METHODS, method) || SS_METHODS_2022.contains(&method)
 }
 
-/// True when a Shadowsocks-2022 `password` is usable key
-/// material for `method` — base64 (padded or raw) decoding to exactly the
-/// method's key length (16 B for `2022-blake3-aes-128-gcm`, 32 B for
-/// `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`), with the
-/// ChaCha20 2022 method rejecting the multi-psk colon-separated form. Any
-/// other method treats the password as opaque. Mirrors `links`'
-/// `validate_2022_key`. Empty passwords pass here — the required-value rule
-/// (`ShadowsocksSettingsIncomplete`, Error) owns them, and Xray's conf build
-/// rejects them outright.
-fn shadowsocks_2022_key_supported(method: &str, password: &str) -> bool {
+/// True when `password` carries usable key material for `method` — the
+/// question the share-link grammar asks before it imports a profile. `None`
+/// from [`shadowsocks_2022_key`] (a non-2022 method, or an empty password the
+/// required-value rule owns) is usable here.
+pub fn shadowsocks_2022_key_usable(method: &str, password: &str) -> bool {
+    !matches!(
+        shadowsocks_2022_key(method, password),
+        Some(Shadowsocks2022Key::Unusable)
+    )
+}
+
+/// What the pinned core's Shadowsocks-2022 client does with one `password`
+/// key at config build.
+enum Shadowsocks2022Key {
+    /// Padded standard base64 for every part, each exactly the method's size.
+    Canonical,
+    /// The core loads and runs it, but a part is longer than the method's
+    /// size, so the key is not the canonical one.
+    NonCanonical,
+    /// The core refuses the whole config: a part that does not decode, a part
+    /// shorter than the method's size, or the colon-joined multi-psk form
+    /// under the ChaCha20 method.
+    Unusable,
+}
+
+/// The core's verdict on a Shadowsocks-2022 `password` for `method`, or `None`
+/// when the method carries no key rule or the password is empty (the
+/// required-value rule owns that state). Everything is decoded with
+/// [`go_std_base64_decode`], because the core reads the key with
+/// `base64.StdEncoding` while it builds the method
+/// (`proxy/shadowsocks_2022`): the padding is required, `\r`/`\n` are skipped
+/// anywhere, and non-zero trailing bits are tolerated. A part shorter than the
+/// method's size fails the build ("bad key"), a longer part runs.
+///
+/// Every branch is live on the pinned v26.9.9 binary (`xray run -test`): an
+/// unpadded, a 15-byte, and a `not base64!` key exit 23 with
+/// `proxy/shadowsocks_2022: create method`, a 24-byte key for the AES-128
+/// method exits 0, and the ChaCha20 colon form exits 23.
+fn shadowsocks_2022_key(method: &str, password: &str) -> Option<Shadowsocks2022Key> {
     let key_len = match method {
         "2022-blake3-aes-128-gcm" => 16,
         "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => 32,
-        _ => return true,
+        _ => return None,
     };
     if password.is_empty() {
-        return true;
+        return None;
     }
     if method == "2022-blake3-chacha20-poly1305" && password.contains(':') {
-        return false;
+        return Some(Shadowsocks2022Key::Unusable);
     }
-    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-    password.split(':').all(|key| {
-        base64::Engine::decode(&STANDARD, key)
-            .or_else(|_| base64::Engine::decode(&STANDARD_NO_PAD, key))
-            .is_ok_and(|decoded| decoded.len() == key_len)
+    let mut canonical = true;
+    for part in password.split(':') {
+        match go_std_base64_decode(part) {
+            Some(key) if key.len() >= key_len => canonical &= key.len() == key_len,
+            _ => return Some(Shadowsocks2022Key::Unusable),
+        }
+    }
+    Some(if canonical {
+        Shadowsocks2022Key::Canonical
+    } else {
+        Shadowsocks2022Key::NonCanonical
     })
 }
 
@@ -1777,7 +1813,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             ));
         }
         if blackhole_response_is_custom(&response.r#type)
-            && !blackhole_custom_response_data_decodes(&response.custom_response_data)
+            && !go_std_base64_decodes(&response.custom_response_data)
         {
             issues.push(issue(
                 ValidationCode::BlackholeCustomResponseDataInvalid,
@@ -1887,9 +1923,9 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     // essentials, and VLESS/VMess port-0 / non-UUID id rows the editor combos
     // and the share-link grammar already refuse. These gate save/apply exactly
     // like an import refusal, whatever the source of the profile (state file,
-    // deserialization, draft). The SS-2022 key-length rule is the exception:
-    // Xray accepts the config (`run -test` passes) and the session only fails
-    // at dial/auth time — advisory.
+    // deserialization, draft). The SS-2022 key rule joins them for every key
+    // the core refuses at load; only a key longer than the method's size, which
+    // the core hashes down and runs, warns.
     // Paths are the wire paths of the offending fields.
     match &o.settings {
         ProtocolSettings::Vless(settings) => {
@@ -1986,11 +2022,16 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                     Some("settings.method".into()),
                 ));
             }
-            if !shadowsocks_2022_key_supported(&settings.method, &settings.password) {
-                issues.push(warning(
+            match shadowsocks_2022_key(&settings.method, &settings.password) {
+                Some(Shadowsocks2022Key::Unusable) => issues.push(issue(
                     ValidationCode::Shadowsocks2022KeyInvalid,
                     Some("settings.password".into()),
-                ));
+                )),
+                Some(Shadowsocks2022Key::NonCanonical) => issues.push(warning(
+                    ValidationCode::Shadowsocks2022KeyInvalid,
+                    Some("settings.password".into()),
+                )),
+                Some(Shadowsocks2022Key::Canonical) | None => {}
             }
         }
         _ => {}
@@ -3189,16 +3230,21 @@ fn finalmask_validate_bytes(
         }
         return;
     };
-    if value.is_null() {
-        return;
-    }
     match &*kind {
         "" | "array" => {
-            let valid = value.as_array().is_some_and(|values| {
-                values
-                    .iter()
-                    .all(|value| value.as_u64().is_some_and(|byte| byte <= u8::MAX as u64))
-            });
+            // `json.Unmarshal` into `[]byte` reads a number array or a base64
+            // string, and `null` clears the field — the core accepts all
+            // three.
+            let valid = match value {
+                Value::Null => true,
+                Value::Array(values) => values.iter().all(|value| {
+                    // A `null` element is the zero byte: Go's decoder leaves
+                    // the element's value alone and reports no error.
+                    value.is_null() || value.as_u64().is_some_and(|byte| byte <= u8::MAX as u64)
+                }),
+                Value::String(text) => go_std_base64_decodes(text),
+                _ => false,
+            };
             if !valid {
                 issues.push(issue(
                     ValidationCode::FinalmaskArrayByteSyntax,
@@ -3207,30 +3253,42 @@ fn finalmask_validate_bytes(
             }
         }
         "str" => {
-            if !value.is_string() {
+            if !(value.is_string() || value.is_null()) {
                 issues.push(issue(
                     ValidationCode::FinalmaskStrByteSyntax,
                     Some(path.to_string()),
                 ));
             }
         }
-        "hex" => match value.as_str() {
-            Some(text)
-                if text.len() % 2 == 0 && text.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
-            _ => issues.push(issue(
-                ValidationCode::FinalmaskHexByteSyntax,
-                Some(path.to_string()),
-            )),
-        },
-        "base64" => match value.as_str() {
-            Some(text)
-                if base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text)
-                    .is_ok() => {}
-            _ => issues.push(issue(
-                ValidationCode::FinalmaskBase64ByteSyntax,
-                Some(path.to_string()),
-            )),
-        },
+        "hex" => {
+            let valid = match value {
+                Value::Null => true,
+                Value::String(text) => {
+                    text.len().is_multiple_of(2)
+                        && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }
+                _ => false,
+            };
+            if !valid {
+                issues.push(issue(
+                    ValidationCode::FinalmaskHexByteSyntax,
+                    Some(path.to_string()),
+                ));
+            }
+        }
+        "base64" => {
+            let valid = match value {
+                Value::Null => true,
+                Value::String(text) => go_std_base64_decodes(text),
+                _ => false,
+            };
+            if !valid {
+                issues.push(issue(
+                    ValidationCode::FinalmaskBase64ByteSyntax,
+                    Some(path.to_string()),
+                ));
+            }
+        }
         _ => issues.push(issue(
             ValidationCode::FinalmaskUnknownByteSyntax(excerpt_debug(encoding)),
             Some(path.to_string()),
@@ -4048,13 +4106,7 @@ fn finalmask_validate_realm_tls(
             ));
         }
     }
-    if !tls.ech_server_keys.is_empty()
-        && base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &tls.ech_server_keys,
-        )
-        .is_err()
-    {
+    if !tls.ech_server_keys.is_empty() && !go_std_base64_decodes(&tls.ech_server_keys) {
         issues.push(issue(
             ValidationCode::FinalmaskRealmEchKeysBase64,
             Some(format!("{path}.echServerKeys")),
@@ -4899,6 +4951,209 @@ mod tests {
             is_vision_flow,
             &["", "xtls-rprx-vision-udp444", "bogus"],
         );
+    }
+
+    /// The findings one `header-custom` client item with `encoding` and
+    /// `packet` draws from the finalmask pass.
+    fn mask_codes(encoding: &str, packet: serde_json::Value) -> Vec<ValidationCode> {
+        let model: FinalmaskModel = serde_json::from_value(json!({
+            "tcp": [{
+                "type": "header-custom",
+                "settings": {"clients": [[{"type": encoding, "packet": packet}]]},
+            }],
+        }))
+        .expect("fixture is valid finalmask JSON");
+        codes(&validate_finalmask(&model).into_issues())
+    }
+
+    /// Each mask byte encoding routes to its own shape check, mirroring
+    /// `PraseByteSlice` (`infra/conf/transport_finalmask.go`): `""`/`array`
+    /// takes a JSON byte array or a base64 string, `str` a JSON string, `hex`
+    /// Go's `hex.DecodeString`, and `base64` Go's non-strict `StdEncoding`.
+    /// The decoder's own quirks (`=` padding, trailing bits, `\r`/`\n`) are
+    /// pinned by `go_std_base64_decodes_matches_the_cores_decoder`, and the
+    /// pinned v26.9.9 binary loads every accepted row below (`xray run -test`
+    /// exits 0) while it exits 23 on every gated one.
+    #[test]
+    fn finalmask_byte_encodings_route_each_encoding_to_its_shape_check() {
+        let gated = [
+            (
+                "base64",
+                json!("AA"),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            ("hex", json!("A"), ValidationCode::FinalmaskHexByteSyntax),
+            ("str", json!(7), ValidationCode::FinalmaskStrByteSyntax),
+            (
+                "array",
+                json!([256]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            ("array", json!(7), ValidationCode::FinalmaskArrayByteSyntax),
+        ];
+        let buildable = [
+            (
+                "base64",
+                json!("AA=="),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            ("hex", json!("AA"), ValidationCode::FinalmaskHexByteSyntax),
+            (
+                "str",
+                json!("anything"),
+                ValidationCode::FinalmaskStrByteSyntax,
+            ),
+            (
+                "array",
+                json!([1, 2]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            // `json.Unmarshal` into `[]byte` also reads a base64 string, and
+            // `null` is the zero value every known encoding takes.
+            (
+                "array",
+                json!("AA=="),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            (
+                "array",
+                json!(null),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            ("str", json!(null), ValidationCode::FinalmaskStrByteSyntax),
+            ("hex", json!(null), ValidationCode::FinalmaskHexByteSyntax),
+            (
+                "base64",
+                json!(null),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            ("", json!(null), ValidationCode::FinalmaskArrayByteSyntax),
+        ];
+        for (encoding, packet, code) in buildable {
+            let codes = mask_codes(encoding, packet.clone());
+            assert!(
+                !codes.contains(&code),
+                "{encoding} {packet:?} must stay buildable: {codes:?}"
+            );
+        }
+        for (encoding, packet, code) in gated {
+            let codes = mask_codes(encoding, packet.clone());
+            assert!(
+                codes.contains(&code),
+                "{encoding} {packet:?} must gate: {codes:?}"
+            );
+        }
+
+        // An unknown encoding fails the build whatever the payload carries —
+        // `null` included, where every known encoding's `null` is its zero
+        // value.
+        for packet in [json!(null), json!("AA=="), json!([1]), json!("")] {
+            let codes = mask_codes("zzz", packet.clone());
+            assert!(
+                codes
+                    .iter()
+                    .any(|code| matches!(code, ValidationCode::FinalmaskUnknownByteSyntax(_))),
+                "zzz {packet:?} must gate: {codes:?}"
+            );
+        }
+
+        // The decoder's own shapes pin the routing: a strict engine or an
+        // array-only check fails these, and the pinned binary accepts them.
+        for (encoding, packet, code) in [
+            (
+                "base64",
+                json!("AB=="),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            (
+                "base64",
+                json!("A\nA=="),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            (
+                "array",
+                json!("A\nA=="),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            (
+                "array",
+                json!([null]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            (
+                "array",
+                json!([1, null, 2]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+        ] {
+            let codes = mask_codes(encoding, packet.clone());
+            assert!(
+                !codes.contains(&code),
+                "{encoding} {packet:?} must stay buildable: {codes:?}"
+            );
+        }
+        for (encoding, packet, code) in [
+            (
+                "base64",
+                json!("AA="),
+                ValidationCode::FinalmaskBase64ByteSyntax,
+            ),
+            (
+                "array",
+                json!(["x"]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+            (
+                "array",
+                json!([null, 256]),
+                ValidationCode::FinalmaskArrayByteSyntax,
+            ),
+        ] {
+            let codes = mask_codes(encoding, packet.clone());
+            assert!(
+                codes.contains(&code),
+                "{encoding} {packet:?} must gate: {codes:?}"
+            );
+        }
+    }
+
+    /// The realm `echServerKeys` decode is the same Go `StdEncoding` the mask
+    /// byte encodings use — `infra/conf/transport_security.go` reads the field
+    /// with `base64.StdEncoding.DecodeString` — so a payload with non-zero
+    /// trailing bits or interior `\r`/`\n` loads on the pinned v26.9.9 binary
+    /// while a padding violation exits 23. The decoder's own rows live in
+    /// `go_std_base64_decodes_matches_the_cores_decoder`; this pins that the
+    /// rule routes through it.
+    #[test]
+    fn finalmask_realm_ech_keys_decode_like_the_core() {
+        fn realm_codes(value: &str) -> Vec<ValidationCode> {
+            let model: FinalmaskModel = serde_json::from_value(json!({
+                "udp": [{
+                    "type": "realm",
+                    "settings": {
+                        "url": "realm://token@realm.example/id",
+                        "tlsConfig": {"echServerKeys": value},
+                    },
+                }],
+            }))
+            .expect("fixture is valid finalmask JSON");
+            codes(&validate_finalmask(&model).into_issues())
+        }
+
+        for value in ["", "AA==", "AB==", "A\nA==", "AA==\r\n"] {
+            let codes = realm_codes(value);
+            assert!(
+                !codes.contains(&ValidationCode::FinalmaskRealmEchKeysBase64),
+                "{value:?} must stay buildable: {codes:?}"
+            );
+        }
+        for value in ["AA", "A A==", "AA==="] {
+            let codes = realm_codes(value);
+            assert!(
+                codes.contains(&ValidationCode::FinalmaskRealmEchKeysBase64),
+                "{value:?} must gate: {codes:?}"
+            );
+        }
     }
 
     /// The nested mask vocabularies fold like the core: it lowercases the mKCP
@@ -9349,47 +9604,72 @@ mod tests {
     }
 
     #[test]
-    fn shadowsocks2022_key_rule_warns_and_never_gates() {
-        // Wrong-length key for the method: xray `run -test` accepts the
-        // config (live repro 2026-09-05) and the session fails at dial/auth
-        // time — advisory, never blocking.
-        let mut outbound = shadowsocks_canonical();
-        let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
-            unreachable!()
-        };
-        settings.method = "2022-blake3-aes-128-gcm".into();
-        // Base64 of 24 bytes — not the required 16 — for the AES-128 method.
-        settings.password = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3".into();
-        let issues = validate_outbound(&outbound);
-        let key_issue = finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid)
-            .unwrap_or_else(|| panic!("wrong-length 2022 key must warn: {issues:#?}"));
-        assert_eq!(key_issue.severity, Severity::Warning, "{key_issue:?}");
-        assert_eq!(key_issue.path.as_deref(), Some("settings.password"));
-        assert!(
-            !issues
-                .iter()
-                .filter(|issue| issue.severity == Severity::Error)
-                .any(|issue| issue.code == ValidationCode::Shadowsocks2022KeyInvalid),
-            "a Warning finding must never gate"
+    fn shadowsocks2022_key_rule_gates_the_keys_the_core_refuses() {
+        // A key longer than the method's size loads and runs: `xray run -test`
+        // accepts this 24-byte key for the AES-128 method, so only that
+        // non-canonical shape warns, never blocks.
+        let non_canonical = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3";
+        assertions_on_key_rule(
+            "2022-blake3-aes-128-gcm",
+            non_canonical,
+            Some(Severity::Warning),
         );
 
-        // ChaCha20 2022 rejects the multi-psk colon form.
-        let mut outbound = shadowsocks_canonical();
-        let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
-            unreachable!()
-        };
-        settings.method = "2022-blake3-chacha20-poly1305".into();
-        let key: String =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [b'0'; 32]);
-        settings.password = format!("{key}:{key}");
-        let issues = validate_outbound(&outbound);
-        assert!(
-            finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid).is_some(),
-            "colon-separated ChaCha20-2022 key must warn: {issues:#?}"
-        );
+        // The core refuses the whole config while it builds the method on an
+        // undecodable key, a key shorter than the method's size, or the
+        // colon-joined form under the ChaCha20 method — every row exits 23 on
+        // the pinned v26.9.9 binary under
+        // `proxy/shadowsocks_2022: create method`. They gate.
+        let key_16 = "AQEBAQEBAQEBAQEBAQEBAQ==";
+        let key_15 = "AQEBAQEBAQEBAQEBAQEB";
+        let key_32 = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
+        for (method, password) in [
+            // 15-byte key for the AES-128 method (decodes, too short).
+            ("2022-blake3-aes-128-gcm", key_15),
+            // Unpadded key: the core's decoder requires the `=` padding.
+            ("2022-blake3-aes-128-gcm", key_16.trim_end_matches('=')),
+            ("2022-blake3-aes-128-gcm", "not base64!"),
+            // 16-byte key for an AES-256 method.
+            ("2022-blake3-aes-256-gcm", key_16),
+            ("2022-blake3-chacha20-poly1305", key_16),
+            // ChaCha20 2022 rejects the multi-psk colon form.
+            (
+                "2022-blake3-chacha20-poly1305",
+                &format!("{key_32}:{key_32}"),
+            ),
+            // Every part must clear the floor, not just the first: the second
+            // part decodes to 15 bytes.
+            ("2022-blake3-aes-128-gcm", &format!("{key_16}:{key_15}")),
+        ] {
+            assertions_on_key_rule(method, password, Some(Severity::Error));
+        }
+
+        // A colon-joined multi-psk key loads under the AES methods, and each
+        // part must clear the method's floor.
+        for (method, password, expected) in [
+            (
+                "2022-blake3-aes-128-gcm",
+                format!("{key_16}:{key_16}"),
+                None,
+            ),
+            (
+                "2022-blake3-aes-256-gcm",
+                format!("{key_32}:{key_32}"),
+                None,
+            ),
+            // A longer part is the non-canonical shape, not a refusal.
+            (
+                "2022-blake3-aes-128-gcm",
+                format!("{key_16}:{non_canonical}"),
+                Some(Severity::Warning),
+            ),
+        ] {
+            assertions_on_key_rule(method, &password, expected);
+        }
 
         // An empty password on a 2022 method belongs to the required-value
-        // Error rule only — the advisory key rule must not double-report.
+        // Error rule only — the key rule must not double-report.
+        assertions_on_key_rule("2022-blake3-aes-128-gcm", "", None);
         let mut outbound = shadowsocks_canonical();
         let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
             unreachable!()
@@ -9404,26 +9684,40 @@ mod tests {
             }),
             "empty 2022 password must stay an Error: {issues:#?}"
         );
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.code == ValidationCode::Shadowsocks2022KeyInvalid),
-            "empty 2022 password must not double-report as a key warning: {issues:#?}"
-        );
 
         // Non-2022 methods treat the password as opaque.
+        assertions_on_key_rule("aes-256-gcm", "any-garbage!!", None);
+    }
+
+    /// The one `Shadowsocks2022KeyInvalid` finding `password` draws under
+    /// `method`, asserted against `expected` severity (`None` = silent), with
+    /// its wire path.
+    fn assertions_on_key_rule(method: &str, password: &str, expected: Option<Severity>) {
         let mut outbound = shadowsocks_canonical();
         let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
             unreachable!()
         };
-        settings.password = "any-garbage!!".into();
+        settings.method = method.into();
+        settings.password = password.into();
         let issues = validate_outbound(&outbound);
-        assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.code == ValidationCode::Shadowsocks2022KeyInvalid),
-            "classic AEAD passwords are opaque: {issues:#?}"
-        );
+        let finding = finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid);
+        match expected {
+            Some(severity) => {
+                let issue = finding
+                    .unwrap_or_else(|| panic!("{method} {password:?} must report: {issues:#?}"));
+                assert_eq!(issue.severity, severity, "{method} {password:?}");
+                assert_eq!(issue.path.as_deref(), Some("settings.password"));
+                assert_eq!(
+                    severity == Severity::Error,
+                    issues.iter().any(|issue| issue.severity == Severity::Error),
+                    "{method} {password:?}: only a refusal may gate"
+                );
+            }
+            None => assert!(
+                finding.is_none(),
+                "{method} {password:?} must stay silent: {issues:#?}"
+            ),
+        }
     }
 
     #[test]

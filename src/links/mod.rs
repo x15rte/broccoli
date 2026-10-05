@@ -3450,23 +3450,6 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
     Ok(())
 }
 
-fn validate_2022_key(method: &str, password: &str) -> bool {
-    let key_len = match method {
-        "2022-blake3-aes-128-gcm" => 16,
-        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => 32,
-        _ => return true,
-    };
-    if method == "2022-blake3-chacha20-poly1305" && password.contains(':') {
-        return false;
-    }
-    password.split(':').all(|key| {
-        STANDARD
-            .decode(key)
-            .or_else(|_| STANDARD_NO_PAD.decode(key))
-            .is_ok_and(|decoded| decoded.len() == key_len)
-    })
-}
-
 /// Pure, side-effect-free validation for imported/shareable profiles.
 ///
 /// This mirrors the local Xray configuration builders' required fields and
@@ -3547,7 +3530,10 @@ fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue
                     Diag::new(Key::LinkSsMethod).arg(excerpt_debug(&settings.method)),
                 ));
             }
-            if !validate_2022_key(&settings.method, &settings.password) {
+            if !crate::model::validation::shadowsocks_2022_key_usable(
+                &settings.method,
+                &settings.password,
+            ) {
                 return Err(malformed(Diag::new(Key::LinkSsKeyMaterial)));
             }
         }
@@ -5167,7 +5153,9 @@ mod tests {
 
     #[test]
     fn ss_2022_method() {
-        let key = STANDARD_NO_PAD.encode([3_u8; 16]);
+        // The core reads a 2022 key with `base64.StdEncoding`, so the padding
+        // is part of the accepted form.
+        let key = STANDARD.encode([3_u8; 16]);
         let ui = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{key}"));
         let link = format!("ss://{ui}@ss5.example.com:8388#SS2022");
         let (p, _) = round_trip(&link);
@@ -5979,17 +5967,24 @@ mod tests {
         let empty_password = URL_SAFE_NO_PAD.encode("aes-128-gcm:");
         expect_malformed(&format!("ss://{empty_password}@ss.example.com:8388"));
 
-        let key16_a = STANDARD_NO_PAD.encode([1_u8; 16]);
+        let key16_a = STANDARD.encode([1_u8; 16]);
         let key16_b = STANDARD.encode([2_u8; 16]);
         let aes_multi =
             URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{key16_a}:{key16_b}"));
         parse_link(&format!("ss://{aes_multi}@ss.example.com:8388")).unwrap();
 
+        // The core decodes a 2022 key with `base64.StdEncoding` and requires
+        // at least the method's key size, so an unpadded or short key is
+        // refused at import exactly as the core refuses the built config.
+        let unpadded16 = STANDARD_NO_PAD.encode([1_u8; 16]);
+        let unpadded = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{unpadded16}"));
+        expect_malformed(&format!("ss://{unpadded}@ss.example.com:8388"));
+
         let bad_aes = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-256-gcm:{key16_a}"));
         expect_malformed(&format!("ss://{bad_aes}@ss.example.com:8388"));
 
-        let key32_a = STANDARD_NO_PAD.encode([3_u8; 32]);
-        let key32_b = STANDARD_NO_PAD.encode([4_u8; 32]);
+        let key32_a = STANDARD.encode([3_u8; 32]);
+        let key32_b = STANDARD.encode([4_u8; 32]);
         for method in ["2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"] {
             let valid = URL_SAFE_NO_PAD.encode(format!("{method}:{key32_a}"));
             parse_link(&format!("ss://{valid}@ss.example.com:8388"))
@@ -5998,6 +5993,14 @@ mod tests {
         let bad_chacha =
             URL_SAFE_NO_PAD.encode(format!("2022-blake3-chacha20-poly1305:{key32_a}:{key32_b}"));
         expect_malformed(&format!("ss://{bad_chacha}@ss.example.com:8388"));
+
+        // A part longer than the method's size loads (the core hashes it down
+        // to the method's length), so the import keeps it and the profile
+        // carries only the model's advisory finding.
+        let long_part = STANDARD.encode([5_u8; 24]);
+        let longer = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{long_part}"));
+        parse_link(&format!("ss://{longer}@ss.example.com:8388"))
+            .unwrap_or_else(|error| panic!("a longer 2022 key must import: {error}"));
     }
 
     #[test]
