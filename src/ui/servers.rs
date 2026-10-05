@@ -3898,17 +3898,6 @@ impl ServersScreen {
                     }
                 });
             }
-            // The retired `quicParams.udpHop` finding's other way out: a user
-            // who wants no hop at all drops the key here instead of building
-            // the mask; the control is the finding row's own and never appears
-            // for any other rule.
-            if retired_udp_hop_present(&draft.profile) {
-                ui.horizontal(|ui| {
-                    if ui.button(t(lang, Key::SrvRemoveUdpHopKey)).clicked() {
-                        dismissed_retired_hop = true;
-                    }
-                });
-            }
         }
         // Configuration warnings render amber under their own header;
         // unlike the error block above they never gate Validate-and-save.
@@ -3929,6 +3918,17 @@ impl ServersScreen {
                         );
                     }
                 });
+        }
+        // The retired `quicParams.udpHop` advisory's other way out: a user who
+        // wants no hop at all drops the key here instead of building the mask.
+        // The key applies normally, so the control renders whenever it is
+        // present, whatever else the profile's verdict says.
+        if retired_udp_hop_present(&draft.profile) {
+            ui.horizontal(|ui| {
+                if ui.button(t(lang, Key::SrvRemoveUdpHopKey)).clicked() {
+                    dismissed_retired_hop = true;
+                }
+            });
         }
         ui.separator();
         // One gate for the action row: Validate-and-save commits a changed
@@ -4246,8 +4246,8 @@ impl ServersScreen {
                     &mut settings.address,
                     "10.0.0.2/32",
                 );
-                // The widget hands each row the list length, so the sentinel
-                // verdict follows the list as rows come and go.
+                // Every entry is validated as an address literal; the retired
+                // `local` sentinel is refused like any other non-address entry.
                 changed |= widgets::noted(ui, t(lang, Key::SrvWgRemoteDnsNote), |ui| {
                     widgets::validated_string_list(
                         ui,
@@ -4255,7 +4255,7 @@ impl ServersScreen {
                         t(lang, Key::SrvWgRemoteDns),
                         &mut settings.remote_dns,
                         t(lang, Key::SrvWgRemoteDnsHint),
-                        |entry, list_len| v_wg_remote_dns_entry(lang, entry, list_len),
+                        |entry, _list_len| v_wg_remote_dns_entry(lang, entry),
                     )
                 });
                 let mut mtu = (settings.mtu != 0).then_some(settings.mtu);
@@ -11644,6 +11644,13 @@ Authentication: ML-KEM-768, Post-Quantum
         editor_memo(&harness.state().0).findings.blocking.clone()
     }
 
+    /// The draft's advisory findings, as the editor's own sweep produced them.
+    fn editor_advisory(
+        harness: &Harness<'static, (ServersScreen, UiTestRig)>,
+    ) -> Vec<ValidationIssue> {
+        editor_memo(&harness.state().0).findings.advisory.clone()
+    }
+
     #[test]
     fn retired_proxy_settings_finding_lists_the_chain_fix_and_clears_on_a_chain_decision() {
         // A stored profile from a build that still wrote `proxySettings`:
@@ -12157,17 +12164,19 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn retired_udp_hop_finding_lists_the_mask_fix_and_clears_on_a_rebuild() {
         // A stored profile from a build that still wrote the hop under the
-        // QUIC parameters: the editor opens on it, the blocking list names
-        // the mask and the equivalence, and only building the mask resolves
-        // the key.
+        // QUIC parameters: the editor opens on it, the amber advisory list
+        // names the mask and the equivalence, and only building the mask
+        // resolves the key.
         let mut harness = wide_servers_harness(retired_hop_rig());
         harness.run();
         assert!(
             harness.state().0.existing_draft.is_some(),
             "a profile with the retired key must stay editable"
         );
-        let blocking = editor_blocking(&harness);
-        let hop = finding(&blocking, ValidationCode::FinalmaskQuicHopMoved);
+        let hop = finding(
+            &editor_advisory(&harness),
+            ValidationCode::FinalmaskQuicHopMoved,
+        );
         let message = validation_issue_message(&hop, Language::En);
         assert!(
             message.contains("intervalLocal") && message.contains("intervalRemote"),
@@ -12219,11 +12228,11 @@ Authentication: ML-KEM-768, Post-Quantum
             "rebuilding the hop as the mask must clear the retired key"
         );
         assert!(
-            !editor_blocking(&harness)
+            !editor_advisory(&harness)
                 .iter()
                 .any(|issue| issue.code == ValidationCode::FinalmaskQuicHopMoved),
             "{:#?}",
-            editor_blocking(&harness)
+            editor_advisory(&harness)
         );
         let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
         assert_eq!(
@@ -12296,11 +12305,11 @@ Authentication: ML-KEM-768, Post-Quantum
             "the dismissed profile must serialize without the key: {persisted}"
         );
         assert!(
-            !editor_blocking(&harness)
+            !editor_advisory(&harness)
                 .iter()
                 .any(|issue| issue.code == ValidationCode::FinalmaskQuicHopMoved),
             "{:#?}",
-            editor_blocking(&harness)
+            editor_advisory(&harness)
         );
     }
 
@@ -13141,45 +13150,17 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn wireguard_remote_dns_sentinel_renders_alone_and_reports_a_mixed_list() {
-        // The sentinel reads as the list's only entry. Alone it is valid and
-        // silent; next to an address the core would parse the word as an
-        // address and crash, so that entry alone carries the verdict.
+    fn wireguard_remote_dns_rejects_the_retired_sentinel() {
+        // The retired `local` sentinel is refused wherever it sits: the core
+        // parses every entry as an address and the process dies when it
+        // cannot, so the row reports its own verdict and the profile gates.
         let mut harness = wide_servers_harness(wireguard_rig(&["local"]));
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
-                .is_none(),
-            "the sentinel alone must not report"
-        );
-        assert!(
-            !editor_blocking(&harness)
-                .iter()
-                .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
-            "{:#?}",
-            editor_blocking(&harness)
-        );
-
-        // Adding a row makes the sentinel invalid, although its own text
-        // never changed: the verdict must follow the list length, not sit
-        // frozen on the frame it was first computed.
-        remote_dns_row(&harness, "local").scroll_to_me();
-        harness.run();
-        let sentinel_y = remote_dns_row(&harness, "local").rect().center().y;
-        remote_dns_add_button(&harness, sentinel_y).click();
-        harness.run();
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
-                .is_some(),
-            "the sentinel row must gain its verdict when another row joins the list"
-        );
-        assert!(
-            harness
                 .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
                 .is_some(),
-            "the empty new row must report its own verdict"
+            "the sentinel row must report its own verdict"
         );
         assert!(
             editor_blocking(&harness)
@@ -13190,65 +13171,35 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         drop(harness);
 
-        // The seeded mixed list reports on the sentinel row, and removing the
-        // address row clears it.
-        let mut harness = wide_servers_harness(wireguard_rig(&["local", "1.1.1.1"]));
-        harness.run();
-        remote_dns_row(&harness, "local").scroll_to_me();
+        // Address literals, the zoned IPv6 form included, stay silent.
+        let mut harness = wide_servers_harness(wireguard_rig(&["1.1.1.1", "fe80::1%eth0"]));
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
-                .is_some(),
-            "the mixed list must report on the sentinel row"
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .is_none(),
+            "address literals must not report"
         );
         assert!(
-            editor_blocking(&harness)
+            !editor_blocking(&harness)
                 .iter()
                 .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",
             editor_blocking(&harness)
         );
 
-        // Removing the address row leaves the sentinel alone in the list. The
-        // surviving row's text never changed, so its verdict must key on the
-        // list length too — a verdict frozen from the longer list would keep
-        // reporting here (and keep the profile gated) forever.
-        let row_y = remote_dns_row(&harness, "1.1.1.1").rect().center().y;
-        harness
-            .get_all_by_label(t(Language::En, Key::DeleteRow))
-            .find(|node| (node.rect().center().y - row_y).abs() < 8.0)
-            .expect("the address row renders its delete button")
-            .click();
-        harness.run_steps(2);
-        let draft = harness
-            .state()
-            .0
-            .existing_draft
-            .as_ref()
-            .expect("the editor stays open");
-        let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
-            panic!("the draft stays a WireGuard profile");
-        };
-        assert_eq!(
-            settings.remote_dns,
-            vec!["local".to_owned()],
-            "the deleted row must leave the model"
-        );
-        assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsLocalOnly))
-                .is_none(),
-            "the surviving sentinel row's verdict must clear with the list"
-        );
+        // A fresh empty row reports its own verdict, and the profile gates.
+        let last_row_y = remote_dns_row(&harness, "fe80::1%eth0").rect().center().y;
+        remote_dns_add_button(&harness, last_row_y).click();
+        harness.run();
         assert!(
             harness
                 .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
-                .is_none(),
-            "no row may keep a verdict from the longer list"
+                .is_some(),
+            "the empty new row must report its own verdict"
         );
         assert!(
-            !editor_blocking(&harness)
+            editor_blocking(&harness)
                 .iter()
                 .any(|issue| issue.code == ValidationCode::WireguardRemoteDnsInvalid),
             "{:#?}",

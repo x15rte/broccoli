@@ -123,18 +123,19 @@ pub enum ValidationCode {
     /// default, which emit normalization renders `none` on the wire.
     VlessEncryptionUnsupported,
     /// Shadowsocks `settings.method` outside Xray's AEAD + 2022 + legacy
-    /// alias vocabulary (conf/shadowsocks.go `cipherFromString` /
-    /// `shadowaead_2022.List`; legacy stream ciphers hit the same unknown-
-    /// cipher load error). Vocabulary mirrors the import whitelist.
+    /// alias vocabulary (`infra/conf/shadowsocks.go` `cipherFromString`,
+    /// case-insensitive, and `proxy/shadowsocks_2022.GetCipherMethod`, also
+    /// case-insensitive; legacy stream ciphers hit the same unknown-cipher
+    /// load error). Vocabulary mirrors the import whitelist.
     ShadowsocksMethodUnsupported,
-    /// Shadowsocks-2022 `settings.password` cannot be used: the core decodes
-    /// it with `base64.StdEncoding` while it builds the method and refuses the
-    /// whole config when the decode fails, the decoded key is shorter than the
-    /// method's size (16 B for `2022-blake3-aes-128-gcm`, 32 B for the other
-    /// 2022 methods), or the ChaCha20 2022 method carries the colon-joined
-    /// multi-psk form (`proxy/shadowsocks_2022`, live on the pinned v26.9.9
-    /// binary). A key *longer* than the method's size loads and runs, so that
-    /// one shape is advisory (Severity::Warning); the refusals are errors.
+    /// Shadowsocks-2022 `settings.password` cannot be used: the rewritten core
+    /// parses each colon-separated part through `ParseKey`
+    /// (`proxy/shadowsocks_2022/kdf.go`), which decodes standard base64 and
+    /// falls back to the raw bytes, then refuses the whole config unless the
+    /// result is exactly the method's key size (16 B for
+    /// `2022-blake3-aes-128-gcm`, 32 B for the other 2022 methods); the
+    /// ChaCha20 2022 method rejects the colon-joined multi-psk form
+    /// (`outbound.go`). Error tier: the profile gates until the key is fixed.
     Shadowsocks2022KeyInvalid,
     /// VMess `settings.security` names a cipher the core does not read: the
     /// account build lowercases the value and maps anything outside
@@ -251,6 +252,7 @@ pub enum ValidationCode {
     /// applies without the hop until the user rebuilds it as a mask. The key
     /// is kept for the settings file (JSON `null` is the Go zero shape and
     /// counts as absent), never serialized to the wire, and never migrated.
+    /// Advisory (Severity::Warning), never a gate.
     FinalmaskQuicHopMoved,
     /// The `udphop` mask `mode` is not a comma-separated set of
     /// `intervalLocal` / `intervalRemote` / `perConnRemote` — the mask build
@@ -258,9 +260,20 @@ pub enum ValidationCode {
     /// (`infra/conf/transport_finalmask.go:930-940`).
     FinalmaskUdpHopModeInvalid,
     /// The `udphop` mask `interval` states an endpoint below the core's
-    /// 5-second floor — including an unset zero: the wrap refuses anything
-    /// less (`transport/internet/finalmask/udphop/conn.go:71-73`).
+    /// 5-second floor. The mask build replaces a fully unset `0/0` range with
+    /// its own `30/30` default and then refuses anything below 5
+    /// (`infra/conf/transport_finalmask.go:1098-1104`), and the wrap refuses
+    /// either endpoint below 5 at dial (`udphop/conn.go:56-58`). An unset
+    /// `0/0` stays legal and the key is omitted; any other shape with an
+    /// endpoint below 5 gates.
     FinalmaskUdpHopIntervalTooSmall,
+    /// The `udphop` mask carried the retired `sockopt` key: the mask build
+    /// dropped the field (`infra/conf/transport_finalmask.go:1063-1068`,
+    /// proto field 1 reserved) and the core ignores the unknown key, so the
+    /// per-hop socket options never take effect. The value stays for the
+    /// settings file and is stripped from the generated document. Advisory
+    /// (Severity::Warning), never a gate.
+    FinalmaskUdpHopSockoptRetired,
     /// A `udphop` mask `remoteIPs` entry is neither an address nor a CIDR
     /// prefix — the mask build refuses the entry at config load
     /// (`infra/conf/transport_finalmask.go:950-960`).
@@ -332,6 +345,45 @@ pub enum ValidationCode {
     FinalmaskUdpHeaderModeInvalid,
     FinalmaskMkcpHeaderInvalid,
     FinalmaskNoisePacketExclusive,
+    /// A `noise` item declares `type: "exp"` but its `packet` is absent or
+    /// not a JSON string: the mask build unmarshals `packet` into a `string`
+    /// and refuses the whole config otherwise
+    /// (`infra/conf/transport_finalmask.go:319-322`). Error tier.
+    FinalmaskNoiseExpPacketNotString,
+    /// A `noise` `exp` expression holds no token at all (or only
+    /// whitespace): the mask build refuses an empty parse
+    /// (`infra/conf/transport_finalmask.go:389-391`). Error tier.
+    FinalmaskNoiseExpEmpty,
+    /// A `noise` `exp` expression carries text outside its `<token>` pieces:
+    /// the mask build refuses any non-whitespace between and after the
+    /// matched tokens, naming the text
+    /// (`infra/conf/transport_finalmask.go:366-388`). Error tier.
+    FinalmaskNoiseExpTrailingText(String),
+    /// A `noise` `exp` token is outside the token set (`b`, `r`, `rc`, `rd`,
+    /// `t`, `c`, `n`): the mask build refuses the unknown key
+    /// (`infra/conf/transport_finalmask.go:429-431`). The payload is the
+    /// token name. Error tier.
+    FinalmaskNoiseExpUnknownToken(String),
+    /// A sized `noise` `exp` token (`r`, `rc`, `rd`) carries no size: the
+    /// mask build refuses the missing argument
+    /// (`infra/conf/transport_finalmask.go:396-398`). The payload is the
+    /// token name. Error tier.
+    FinalmaskNoiseExpMissingSize(String),
+    /// A sized `noise` `exp` token carries a size outside `0..=65535` or a
+    /// reversed range (`lo > hi`), or one that is not a range at all: the
+    /// mask build refuses it (`infra/conf/transport_finalmask.go:399-405`).
+    /// The payload is the size argument. Error tier.
+    FinalmaskNoiseExpSizeInvalid(String),
+    /// The `noise` `exp` `<b>` token carries no hexadecimal digits, an
+    /// odd count, or a non-hex character: the mask build refuses the bytes
+    /// (`infra/conf/transport_finalmask.go:407-417`). The payload is the
+    /// argument. Error tier.
+    FinalmaskNoiseExpBytesInvalid(String),
+    /// A `noise` `exp` token that takes no size (`t`, `c`, `n`) carries one:
+    /// the mask build refuses the argument
+    /// (`infra/conf/transport_finalmask.go:419-428`). The payload is the
+    /// token name. Error tier.
+    FinalmaskNoiseExpArgumentNotAllowed(String),
     FinalmaskSalamanderPacketSize,
     FinalmaskXdnsDomainRemoved,
     FinalmaskXdnsEmpty,
@@ -369,21 +421,21 @@ pub enum ValidationCode {
     /// one of {direct, drop, return, hijack} — Xray's DNS build rejects
     /// unknown actions.
     DnsRuleActionInvalid,
-    /// A WireGuard `settings.remoteDNS` list holds an entry that is neither
-    /// an IP literal nor the `local` sentinel as the list's only entry. The
-    /// pinned core builds the in-network resolver set with
+    /// A WireGuard `settings.remoteDNS` list holds an entry that is not an
+    /// IP literal. The pinned core builds the in-network resolver set with
     /// `netip.MustParseAddr` while it creates the outbound
-    /// (proxy/wireguard/client.go:117-124), so any other entry panics the
-    /// whole process during config load — the config can never start. Error
+    /// (proxy/wireguard/client.go:102-108), so any other entry — the retired
+    /// `local` sentinel and every near-miss spelling included — panics the
+    /// whole process during config load: the config can never start. Error
     /// tier: the profile gates until the list is fixed.
     WireguardRemoteDnsInvalid,
-    /// WireGuard `settings.domainStrategy` is outside the vocabulary the
-    /// pinned core reads: `WireGuardConfig.Build` lowercases the value and
-    /// refuses the outbound at config load for anything but `forceip` (what
-    /// the empty value selects), `forceipv4`, `forceipv6`, `forceipv4v6`,
-    /// and `forceipv6v4` (infra/conf/wireguard.go:128-141). Error tier: the
-    /// profile gates until the value is fixed.
-    WireguardDomainStrategyInvalid,
+    /// WireGuard `settings.domainStrategy` carried a value the pinned core no
+    /// longer reads: the field and the strategy switch that read it are gone
+    /// (infra/conf/wireguard.go), and the loader ignores an unknown key, so
+    /// the value never takes effect. The value stays for the settings file and
+    /// is stripped from the generated document. Advisory (Severity::Warning),
+    /// never a gate; the replacement is `streamSettings.sockopt.domainStrategy`.
+    WireguardDomainStrategyRetired,
     /// WireGuard `settings.secretKey` is empty or is not a key the pinned
     /// core builds: `WireGuardConfig.Build` runs it through
     /// `ParseWireGuardKey` (infra/conf/wireguard.go), which refuses the
@@ -1151,8 +1203,9 @@ const SS_AEAD_METHODS: &[&str] = &[
     "xchacha20-ietf-poly1305",
 ];
 
-/// The Shadowsocks-2022 method names, matched exactly by Xray's
-/// `shadowaead_2022.List` (a map lookup: a case variant is not a method).
+/// The Shadowsocks-2022 method names. `GetCipherMethod` lowercases the whole
+/// value before its map lookup (`proxy/shadowsocks_2022/cipher.go:24-30`), so
+/// a case variant is the same method the core builds.
 const SS_METHODS_2022: &[&str] = &[
     "2022-blake3-aes-128-gcm",
     "2022-blake3-aes-256-gcm",
@@ -1176,77 +1229,63 @@ pub const SS_METHOD_OPTIONS: &[&str] = &[
 
 /// True when a Shadowsocks `method` is in Xray's
 /// accepted vocabulary — the AEAD methods and their legacy alias spellings
-/// (case-insensitive, `cipherFromString`) plus the exact 2022 method names
-/// (`shadowaead_2022.List`). Legacy *stream* ciphers (e.g. `aes-256-cfb`)
-/// and anything else fall through to the unknown-cipher load error and are
-/// unsupported. The share-link grammar calls this predicate instead of
-/// re-listing the methods.
+/// (`cipherFromString`) plus the 2022 method names. Every spelling folds
+/// case-insensitively, exactly as the core folds it before its own lookup
+/// (`infra/conf/shadowsocks.go:17` and
+/// `proxy/shadowsocks_2022/cipher.go:24`). Legacy *stream* ciphers (e.g.
+/// `aes-256-cfb`) and anything else fall through to the unknown-cipher load
+/// error and are unsupported. The share-link grammar calls this predicate
+/// instead of re-listing the methods.
 pub fn shadowsocks_method_supported(method: &str) -> bool {
-    vocabulary_holds(SS_AEAD_METHODS, method) || SS_METHODS_2022.contains(&method)
+    vocabulary_holds(SS_AEAD_METHODS, method) || vocabulary_holds(SS_METHODS_2022, method)
 }
 
-/// True when `password` carries usable key material for `method` — the
-/// question the share-link grammar asks before it imports a profile. `None`
-/// from [`shadowsocks_2022_key`] (a non-2022 method, or an empty password the
-/// required-value rule owns) is usable here.
-pub fn shadowsocks_2022_key_usable(method: &str, password: &str) -> bool {
-    !matches!(
-        shadowsocks_2022_key(method, password),
-        Some(Shadowsocks2022Key::Unusable)
-    )
+/// The key size one Shadowsocks-2022 method uses, or `None` for a method that
+/// is not a 2022 method (the core then treats the password as an opaque legacy
+/// key). The name folds like the core's own lookup.
+fn shadowsocks_2022_key_length(method: &str) -> Option<usize> {
+    if fold_eq(method, "2022-blake3-aes-128-gcm") {
+        Some(16)
+    } else if fold_eq(method, "2022-blake3-aes-256-gcm")
+        || fold_eq(method, "2022-blake3-chacha20-poly1305")
+    {
+        Some(32)
+    } else {
+        None
+    }
 }
 
-/// What the pinned core's Shadowsocks-2022 client does with one `password`
-/// key at config build.
-enum Shadowsocks2022Key {
-    /// Padded standard base64 for every part, each exactly the method's size.
-    Canonical,
-    /// The core loads and runs it, but a part is longer than the method's
-    /// size, so the key is not the canonical one.
-    NonCanonical,
-    /// The core refuses the whole config: a part that does not decode, a part
-    /// shorter than the method's size, or the colon-joined multi-psk form
-    /// under the ChaCha20 method.
-    Unusable,
-}
-
-/// The core's verdict on a Shadowsocks-2022 `password` for `method`, or `None`
-/// when the method carries no key rule or the password is empty (the
-/// required-value rule owns that state). Everything is decoded with
-/// [`go_std_base64_decode`], because the core reads the key with
-/// `base64.StdEncoding` while it builds the method
-/// (`proxy/shadowsocks_2022`): the padding is required, `\r`/`\n` are skipped
-/// anywhere, and non-zero trailing bits are tolerated. A part shorter than the
-/// method's size fails the build ("bad key"), a longer part runs.
+/// True when `password` carries key material the rewritten core's
+/// Shadowsocks-2022 client builds — the question the share-link grammar asks
+/// before it imports a profile, and the rule the outbound pass uses. `None`
+/// from [`shadowsocks_2022_key_length`] (a non-2022 method) and an empty
+/// password (the required-value rule owns that state) are usable here.
 ///
-/// Every branch is live on the pinned v26.9.9 binary (`xray run -test`): an
-/// unpadded, a 15-byte, and a `not base64!` key exit 23 with
-/// `proxy/shadowsocks_2022: create method`, a 24-byte key for the AES-128
-/// method exits 0, and the ChaCha20 colon form exits 23.
-fn shadowsocks_2022_key(method: &str, password: &str) -> Option<Shadowsocks2022Key> {
-    let key_len = match method {
-        "2022-blake3-aes-128-gcm" => 16,
-        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => 32,
-        _ => return None,
+/// The core parses the password as a colon-separated PSK list (`ParsePSKList`
+/// in `proxy/shadowsocks_2022/kdf.go`), and each part through `ParseKey`: it
+/// decodes the part as standard base64 and falls back to the raw bytes when
+/// the decode fails, then requires the decoded length to equal the method's
+/// key size exactly. The ChaCha20 method accepts one part only
+/// (`outbound.go`). So a wrong-length key — base64 or raw — is refused, and a
+/// right-length key in either form is accepted.
+pub fn shadowsocks_2022_key_usable(method: &str, password: &str) -> bool {
+    let Some(key_len) = shadowsocks_2022_key_length(method) else {
+        return true;
     };
     if password.is_empty() {
-        return None;
+        return true;
     }
-    if method == "2022-blake3-chacha20-poly1305" && password.contains(':') {
-        return Some(Shadowsocks2022Key::Unusable);
+    if fold_eq(method, "2022-blake3-chacha20-poly1305") && password.contains(':') {
+        return false;
     }
-    let mut canonical = true;
-    for part in password.split(':') {
-        match go_std_base64_decode(part) {
-            Some(key) if key.len() >= key_len => canonical &= key.len() == key_len,
-            _ => return Some(Shadowsocks2022Key::Unusable),
-        }
-    }
-    Some(if canonical {
-        Shadowsocks2022Key::Canonical
-    } else {
-        Shadowsocks2022Key::NonCanonical
-    })
+    password
+        .split(':')
+        .all(|part| match go_std_base64_decode(part) {
+            Some(decoded) => decoded.len() == key_len,
+            // Go falls back to `[]byte(key)` when the decode fails, so the raw
+            // UTF-8 byte length is what the key-size check then reads.
+            None => part.len() == key_len,
+        })
 }
 
 /// The UUID format policy, one definition: true when an id is a canonical
@@ -1582,11 +1621,11 @@ fn freedom_domain_strategy_supported(strategy: &str) -> bool {
     target_strategy_supported(strategy)
 }
 
-/// The `settings.domainStrategy` vocabulary the WireGuard editor offers —
-/// the resolution strategies the core's WireGuard endpoint dial runs a peer
-/// host through, plus the empty zero value that selects the core's own
-/// `forceip` default. The combo offers the list verbatim, and
-/// [`wireguard_domain_strategy_supported`] is its predicate.
+/// The `settings.domainStrategy` vocabulary the WireGuard editor offers while
+/// the retired key still has an editor row. The pinned core removed the field
+/// and the switch that read it (infra/conf/wireguard.go), so none of these
+/// values reaches the generated document; any carried value draws the
+/// advisory [`ValidationCode::WireguardDomainStrategyRetired`].
 pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "",
     "ForceIP",
@@ -1595,16 +1634,6 @@ pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
     "ForceIPv4v6",
     "ForceIPv6v4",
 ];
-
-/// True when a WireGuard `domainStrategy` is one of
-/// [`WG_TARGET_STRATEGY_OPTIONS`], under [`vocabulary_holds`]:
-/// `WireGuardConfig.Build` lowercases the value before matching and refuses
-/// the outbound at config load outside the five strategies and the empty zero
-/// value (infra/conf/wireguard.go:128-141). Nothing is trimmed — Go
-/// lowercases the stored bytes as they are.
-fn wireguard_domain_strategy_supported(strategy: &str) -> bool {
-    vocabulary_holds(WG_TARGET_STRATEGY_OPTIONS, strategy)
-}
 
 // ---------- outbound envelope / DNS-rule vocabularies ----------
 //
@@ -1830,17 +1859,11 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         ));
     }
     // WireGuard settings the core cannot build — the in-network resolver
-    // list, the endpoint-resolution strategy, and the key/peer material. The
-    // resolver list: the pinned core parses each entry with
-    // `netip.MustParseAddr` while it creates the outbound client and reads
-    // `local` as the sentinel only when the list length is one, so a
-    // non-address entry or a mixed list panics the whole process during
-    // config load (proxy/wireguard/client.go:117-124; verified against the
-    // pinned binary, which exits with that panic under `run -test`). The
-    // strategy: `WireGuardConfig.Build` lowercases the value and refuses the
-    // outbound outside the five spellings it reads
-    // (infra/conf/wireguard.go:128-141; the pinned binary exits 23 on the
-    // near-miss `forceip4` and accepts the mixed-case spellings). The
+    // list and the key/peer material. The resolver list: the pinned core
+    // parses each entry with `netip.MustParseAddr` while it creates the
+    // outbound client, so a non-address entry panics the whole process
+    // during config load (proxy/wireguard/client.go:102-108; verified against
+    // the pinned binary, which exits with that panic under `run -test`). The
     // material: `WireGuardConfig.Build` refuses a non-buildable `secretKey`
     // (infra/conf/wireguard.go:76) and a `reserved` that is set but not three
     // bytes (infra/conf/wireguard.go:123), and each peer's non-empty
@@ -1851,6 +1874,10 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     // config load, all reached by `run -test`. Error tier: the profile gates
     // until the field is fixed.
     //
+    // The retired `domainStrategy` key is different: the core ignores it
+    // (the field and its switch are gone), the value never reaches the
+    // generated document, and the profile applies normally — advisory tier.
+    //
     // The predicates are the editor's old draft requirements, moved here so
     // one verdict covers the editor, generation, and the importer.
     if let ProtocolSettings::Wireguard(settings) = &o.settings {
@@ -1860,9 +1887,9 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                 Some("settings.remoteDNS".into()),
             ));
         }
-        if !wireguard_domain_strategy_supported(&settings.domain_strategy) {
-            issues.push(issue(
-                ValidationCode::WireguardDomainStrategyInvalid,
+        if !settings.domain_strategy.is_empty() {
+            issues.push(warning(
+                ValidationCode::WireguardDomainStrategyRetired,
                 Some("settings.domainStrategy".into()),
             ));
         }
@@ -2022,16 +2049,11 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                     Some("settings.method".into()),
                 ));
             }
-            match shadowsocks_2022_key(&settings.method, &settings.password) {
-                Some(Shadowsocks2022Key::Unusable) => issues.push(issue(
+            if !shadowsocks_2022_key_usable(&settings.method, &settings.password) {
+                issues.push(issue(
                     ValidationCode::Shadowsocks2022KeyInvalid,
                     Some("settings.password".into()),
-                )),
-                Some(Shadowsocks2022Key::NonCanonical) => issues.push(warning(
-                    ValidationCode::Shadowsocks2022KeyInvalid,
-                    Some("settings.password".into()),
-                )),
-                Some(Shadowsocks2022Key::Canonical) | None => {}
+                ));
             }
         }
         _ => {}
@@ -3210,6 +3232,168 @@ fn finalmask_valid_var_name(value: &str) -> bool {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
+/// One matched `<key arg>` token of a `noise` `exp` expression: the key name,
+/// the argument text (empty when the token carried none), and the byte offset
+/// just past the closing `>`.
+struct NoiseExpToken<'a> {
+    key: &'a str,
+    arg: &'a str,
+    end: usize,
+}
+
+/// Match one `noise` `exp` token anchored at the `<` at `open`, with the
+/// pinned core's regex `<\\s*([a-z]+)(?:\\s+([^>]*?))?\\s*>`
+/// (`infra/conf/transport_finalmask.go:362`): optional whitespace, a
+/// lowercase key, an optional whitespace-prefixed argument that stops before
+/// the first `>` (trailing whitespace excluded by the lazy group), optional
+/// whitespace, and the closing `>`. `None` when no token starts here.
+fn match_noise_exp_token(expression: &str, open: usize) -> Option<NoiseExpToken<'_>> {
+    let bytes = expression.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let key_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_lowercase() {
+        i += 1;
+    }
+    if i == key_start {
+        return None;
+    }
+    let key = &expression[key_start..i];
+    if i < bytes.len() && bytes[i] == b'>' {
+        return Some(NoiseExpToken {
+            key,
+            arg: "",
+            end: i + 1,
+        });
+    }
+    if i >= bytes.len() || !bytes[i].is_ascii_whitespace() {
+        return None;
+    }
+    // `\s+` is greedy; the argument then runs to the smallest index whose
+    // suffix up to the first `>` is whitespace.
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let close = j + expression[j..].find('>')?;
+    let mut arg_end = close;
+    while arg_end > j && bytes[arg_end - 1].is_ascii_whitespace() {
+        arg_end -= 1;
+    }
+    Some(NoiseExpToken {
+        key,
+        arg: &expression[j..arg_end],
+        end: close + 1,
+    })
+}
+
+/// The verdict of one `noise` `exp` `packet` value, mirroring the mask
+/// build: a JSON string is parsed as the token mini-language, JSON `null` is
+/// Go's zero string (an empty expression), and anything else — the field
+/// absent included — fails the string unmarshal
+/// (`infra/conf/transport_finalmask.go:318-326`).
+fn finalmask_validate_noise_exp(packet: &FinalmaskRawValue) -> Result<(), ValidationCode> {
+    match packet.value() {
+        None => Err(ValidationCode::FinalmaskNoiseExpPacketNotString),
+        Some(Value::String(expression)) => finalmask_validate_noise_exp_expression(expression),
+        Some(Value::Null) => Err(ValidationCode::FinalmaskNoiseExpEmpty),
+        Some(_) => Err(ValidationCode::FinalmaskNoiseExpPacketNotString),
+    }
+}
+
+/// Parse one `noise` `exp` expression the way `parseNoiseExp` does
+/// (`infra/conf/transport_finalmask.go:364-391`): tokens matched left to
+/// right, only whitespace allowed between and after them, at least one token
+/// required, and every token built by [`build_noise_exp_segment`].
+fn finalmask_validate_noise_exp_expression(expression: &str) -> Result<(), ValidationCode> {
+    let mut last = 0usize;
+    let mut cursor = 0usize;
+    let mut segments = 0usize;
+    while cursor < expression.len() {
+        let Some(open) = expression[cursor..].find('<').map(|offset| cursor + offset) else {
+            break;
+        };
+        let Some(token) = match_noise_exp_token(expression, open) else {
+            cursor = open + 1;
+            continue;
+        };
+        if !expression[last..open].trim().is_empty() {
+            return Err(ValidationCode::FinalmaskNoiseExpTrailingText(excerpt(
+                expression[last..open].trim(),
+            )));
+        }
+        build_noise_exp_segment(&token)?;
+        segments += 1;
+        last = token.end;
+        cursor = token.end;
+    }
+    if !expression[last..].trim().is_empty() {
+        return Err(ValidationCode::FinalmaskNoiseExpTrailingText(excerpt(
+            expression[last..].trim(),
+        )));
+    }
+    if segments == 0 {
+        return Err(ValidationCode::FinalmaskNoiseExpEmpty);
+    }
+    Ok(())
+}
+
+/// Build one `noise` `exp` token the way `buildNoiseSegment` does
+/// (`infra/conf/transport_finalmask.go:393-434`): `<b HEX>` is a byte
+/// literal, `<r|rc|rd SIZE>` a sized random segment, `<t>`/`<c>`/`<n>` a
+/// no-argument segment, and anything else an unknown token.
+fn build_noise_exp_segment(token: &NoiseExpToken<'_>) -> Result<(), ValidationCode> {
+    let size_segment = || {
+        if token.arg.is_empty() {
+            return Err(ValidationCode::FinalmaskNoiseExpMissingSize(
+                token.key.to_owned(),
+            ));
+        }
+        match parse_range_go(token.arg) {
+            Some((from, to)) if from >= 0 && to >= from && to <= 65535 => Ok(()),
+            _ => Err(ValidationCode::FinalmaskNoiseExpSizeInvalid(excerpt(
+                token.arg,
+            ))),
+        }
+    };
+    match token.key {
+        "b" => {
+            // `strings.Fields` + `Join` drops every whitespace run, then the
+            // optional `0x`/`0X` prefix is stripped before the hex decode.
+            let joined: String = token.arg.split_whitespace().collect();
+            let hex = joined.strip_prefix("0x").unwrap_or(&joined);
+            let hex = hex.strip_prefix("0X").unwrap_or(hex);
+            if hex.is_empty()
+                || !hex.len().is_multiple_of(2)
+                || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                let named = if token.arg.is_empty() {
+                    token.key.to_owned()
+                } else {
+                    excerpt(token.arg)
+                };
+                return Err(ValidationCode::FinalmaskNoiseExpBytesInvalid(named));
+            }
+            Ok(())
+        }
+        "r" | "rc" | "rd" => size_segment(),
+        "t" | "c" | "n" => {
+            if token.arg.is_empty() {
+                Ok(())
+            } else {
+                Err(ValidationCode::FinalmaskNoiseExpArgumentNotAllowed(
+                    token.key.to_owned(),
+                ))
+            }
+        }
+        other => Err(ValidationCode::FinalmaskNoiseExpUnknownToken(
+            other.to_owned(),
+        )),
+    }
+}
+
 fn finalmask_validate_bytes(
     path: &str,
     encoding: &str,
@@ -3670,12 +3854,12 @@ fn finalmask_validate_quic_params(
     }
     if quic.retired_udp_hop.is_some() {
         // The retired `quicParams.udpHop` key left this mark behind: the
-        // core now ignores the key and the hop would die silently, so the
-        // profile gates until the user rebuilds it as a `udphop` UDP mask.
-        // Nothing is migrated — the raw value stays for the settings file.
-        // Carries no path: the key is a settings-file fact, not a field of
-        // the generated document.
-        issues.push(issue(ValidationCode::FinalmaskQuicHopMoved, None));
+        // core ignores the key and the hop would die silently, so the user is
+        // told to rebuild it as a `udphop` UDP mask. Nothing is migrated —
+        // the raw value stays for the settings file and the generated
+        // document never carries it. Carries no path: the key is a
+        // settings-file fact, not a field of the generated document.
+        issues.push(warning(ValidationCode::FinalmaskQuicHopMoved, None));
     }
     for (name, value) in [
         ("initStreamReceiveWindow", quic.init_stream_receive_window),
@@ -3844,6 +4028,16 @@ fn finalmask_validate_udp_mask(
                         ValidationCode::FinalmaskNoisePacketExclusive,
                         Some(item_path.clone()),
                     ));
+                }
+                // `type: "exp"` (folded, `infra/conf/transport_finalmask.go:318`)
+                // takes the packet as a string holding the token mini-language;
+                // the core returns before it reads `randRange`, so the other
+                // checks below apply to the legacy byte-encoding types only.
+                if fold_eq(&item.encoding, "exp") {
+                    if let Err(code) = finalmask_validate_noise_exp(&item.packet) {
+                        issues.push(issue(code, Some(format!("{item_path}.packet"))));
+                    }
+                    continue;
                 }
                 if let Some(range) = item.rand_range {
                     let (from, to) = finalmask_range_bounds(range);
@@ -4043,10 +4237,14 @@ fn finalmask_validate_udphop(
             Some(format!("{path}.mode")),
         ));
     }
-    // The wrap refuses either endpoint below 5 seconds, so an unset zero is
-    // refused alongside 1 through 4.
+    // The build replaces a fully unset `0/0` range with its own `30/30`
+    // default, so the key is optional and the core picks the period; any
+    // other shape with an endpoint below 5 seconds is refused — the load
+    // check reads `From` (`infra/conf/transport_finalmask.go:1098-1104`) and
+    // the wrap refuses either endpoint below 5 at dial
+    // (`udphop/conn.go:56-58`), so both bounds must clear the floor.
     let (from, to) = finalmask_range_bounds(settings.interval);
-    if from < 5 || to < 5 {
+    if (from != 0 || to != 0) && (from < 5 || to < 5) {
         issues.push(issue(
             ValidationCode::FinalmaskUdpHopIntervalTooSmall,
             Some(format!("{path}.interval")),
@@ -4065,8 +4263,15 @@ fn finalmask_validate_udphop(
             ));
         }
     }
-    if let Some(sockopt) = &settings.sockopt {
-        issues.extend(validate_sockopt(sockopt, &format!("{path}.sockopt")));
+    if settings.sockopt.is_some() {
+        // The retired `sockopt` key left this mark behind: the mask build
+        // dropped the field and the core ignores the unknown key, so the
+        // per-hop socket options never take effect. The value stays for the
+        // settings file and is stripped from the generated document.
+        issues.push(warning(
+            ValidationCode::FinalmaskUdpHopSockoptRetired,
+            Some(format!("{path}.sockopt")),
+        ));
     }
 }
 
@@ -4620,9 +4825,9 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
     }
 
     // The TUN gateway entries become the adapter's addresses, and the
-    // in-tun DNS listener anchors on the gateway's IPv4 (the WFP DNS shield
-    // permits port-53 only inside the TUN subnet). The IPv4 gateway is a
-    // virtual address that needs no IPv4 from the network — an IPv6-only
+    // in-tun DNS listener anchors on the gateway's IPv4 (the core's DNS leak
+    // block permits port-53 only inside the TUN subnet). The IPv4 gateway is
+    // a virtual address that needs no IPv4 from the network — an IPv6-only
     // uplink still works with it — so an IPv6-only gateway list is refused
     // by design, not for want of an address. An empty list is refused with
     // it: nothing would own the address the adapter DNS pins.
@@ -4892,11 +5097,6 @@ mod tests {
             &["asis+", "bogus"],
         );
         couples(
-            WG_TARGET_STRATEGY_OPTIONS,
-            wireguard_domain_strategy_supported,
-            &["forceip4", "asis", "ForceIPv6v4 ", "bogus"],
-        );
-        couples(
             SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
             sockopt_address_port_strategy_supported,
             &["srvportonly ", "txtportandaddress!", "bogus"],
@@ -4904,7 +5104,7 @@ mod tests {
         couples(
             SS_METHOD_OPTIONS,
             shadowsocks_method_supported,
-            &["", "aes-128-gcm ", "2022-BLAKE3-AES-128-GCM", "bogus"],
+            &["", "aes-128-gcm ", "2022-blake3-bogus", "bogus"],
         );
         couples(
             XHTTP_MODE_OPTIONS,
@@ -5158,7 +5358,7 @@ mod tests {
 
     /// The nested mask vocabularies fold like the core: it lowercases the mKCP
     /// `header` (`transport_finalmask.go:611`) and the QUIC `bbrProfile`
-    /// (`transport_internet.go:219`) before matching, and the pinned v26.9.9
+    /// (`transport_internet.go:219`) before matching, and the pinned v26.9.30
     /// binary loads each folded spelling below (`run -test` exits 0) — so
     /// neither may gate.
     #[test]
@@ -5188,7 +5388,7 @@ mod tests {
     }
 
     /// The fold the vocabularies use is Go's, not ASCII case-insensitivity:
-    /// the pinned v26.9.9 binary accepts each dotted-`İ`/Kelvin spelling below
+    /// the pinned v26.9.30 binary accepts each dotted-`İ`/Kelvin spelling below
     /// (`run -test` exits 0), so a predicate that refuses one gates a profile
     /// the core runs. The point the ASCII fold misses is that `İ` folds to
     /// the same `i` an ASCII `I` does.
@@ -5197,11 +5397,10 @@ mod tests {
         type Predicate = fn(&str) -> bool;
         // One row per predicate and the spelling only Go's fold reaches: `İ`
         // (U+0130) folds to `i`, the Kelvin sign (U+212A) to `k`. The pinned
-        // v26.9.9 binary loads every value below (`run -test` exits 0).
+        // v26.9.30 binary loads every value below (`run -test` exits 0).
         let rows: &[(Predicate, &str)] = &[
             (target_strategy_supported, "Force\u{130}P"),
             (sockopt_domain_strategy_supported, "Use\u{130}P"),
-            (wireguard_domain_strategy_supported, "Force\u{130}P"),
             (dns_out_action_supported, "h\u{130}jack"),
             (freedom_final_rule_supported, "bloc\u{212a}"),
             (sniffing_dest_override_supported, "qu\u{130}c"),
@@ -5211,10 +5410,10 @@ mod tests {
             assert!(accepts(value), "{value:?} must fold like the core does");
         }
 
-        // The one vocabulary with two regimes: the AEAD half folds
-        // (`shadowsocks.go:18`), the 2022 half is an exact list in the core
-        // (`shadowsocks.go:63`), so a Kelvin `k` is refused there.
-        assert!(!shadowsocks_method_supported(
+        // The 2022 method names fold too: `GetCipherMethod` lowercases the
+        // whole string before its map lookup (proxy/shadowsocks_2022/cipher.go),
+        // so a Kelvin `k` reaches the canonical method.
+        assert!(shadowsocks_method_supported(
             "2022-bla\u{212a}e3-aes-128-gcm"
         ));
 
@@ -5568,9 +5767,11 @@ mod tests {
     }
 
     /// The `udphop` mask gates what the mask build and the wrap refuse: a
-    /// mode outside the three names (empty included) and an interval
-    /// endpoint below 5 seconds (unset included). The editor's fresh mask
-    /// and every accepted spelling stay clean.
+    /// mode outside the three names (empty included). An unset interval is
+    /// legal — the core substitutes its own `30/30` default and the key is
+    /// omitted — while any other shape with an endpoint below 5 seconds is
+    /// refused. The editor's fresh mask and every accepted spelling stay
+    /// clean.
     #[test]
     fn udphop_mask_gates_the_mode_set_and_the_five_second_floor() {
         let codes_for = |settings: &str| {
@@ -5582,6 +5783,11 @@ mod tests {
         };
 
         for settings in [
+            // An unset interval and the explicit zero range are the same
+            // shape: the core substitutes its own default.
+            r#"{"mode":"perConnRemote"}"#,
+            r#"{"mode":"perConnRemote","interval":0}"#,
+            r#"{"mode":"perConnRemote","interval":"0-0"}"#,
             r#"{"mode":"perConnRemote","interval":"5-10"}"#,
             r#"{"mode":"intervalLocal,intervalRemote","interval":"5-5"}"#,
             r#"{"mode":"INTERVALREMOTE,INTERVALLOCAL","interval":"5-30"}"#,
@@ -5613,7 +5819,17 @@ mod tests {
             );
         }
 
-        for interval in [json!(0), json!(4), json!("2-10"), json!("5-4")] {
+        // Any shape with an endpoint below 5 seconds is refused: 1 through 4,
+        // a zero bound beside a non-zero one, and a reversed range whose low
+        // end sits below the floor.
+        for interval in [
+            json!(4),
+            json!("2-10"),
+            json!("5-4"),
+            json!("0-10"),
+            json!("5-0"),
+            json!("-1-10"),
+        ] {
             let found = codes_for(&format!(
                 r#"{{"mode":"perConnRemote","interval":{interval}}}"#
             ));
@@ -5651,6 +5867,162 @@ mod tests {
                 r#"{"mode":"perConnRemote","interval":"5-10","remoteIPs":["203.0.113.10","2001:db8::/48","::1","fe80::1%eth0","2001:db8::1%en0","fe80::1%eth0/64","fe80::1%eth0%more","fe80::1%eth0/64%x"]}"#
             )
             .is_empty()
+        );
+    }
+
+    /// The `noise` `type: "exp"` packet mini-language, row by row from the
+    /// pinned v26.9.30 binary: every accepted expression loads there and every
+    /// refused row exits with the message the rule names.
+    #[test]
+    fn noise_exp_packet_grammar_matches_the_core() {
+        let codes_for = |item: serde_json::Value| {
+            let fm: FinalmaskModel = serde_json::from_value(json!({
+                "udp": [{"type": "noise", "settings": {"noise": [item]}}]
+            }))
+            .expect("fixture is valid finalmask JSON");
+            codes(&validate_finalmask(&fm))
+        };
+        let accepted = |packet: &str| {
+            let found = codes_for(json!({"type": "exp", "packet": packet}));
+            assert!(
+                found.is_empty(),
+                "packet {packet:?} must be legal: {found:?}"
+            );
+        };
+        let refused = |item: serde_json::Value, expected: ValidationCode| {
+            let found = codes_for(item.clone());
+            assert_eq!(found, vec![expected], "item {item}");
+        };
+
+        // The whole token set, in the pinned core's spelling, with spaces the
+        // regex tolerates around and inside a token.
+        accepted("<b 0x00ff><r 4-8><rc 1-2><rd 1><t><c><n>");
+        accepted("  <r 4-8 >  <t> ");
+        accepted("<r 0>");
+        accepted("<rc 65535>");
+        accepted("<b 00>");
+        accepted("<b 0Xff>");
+        accepted("<t>");
+
+        // `type` folds case-insensitively, so an upper-cased spelling is the
+        // same token set.
+        let found = codes_for(json!({"type": "EXP", "packet": "<t>"}));
+        assert!(found.is_empty(), "{found:?}");
+
+        // Empty: no token at all.
+        refused(
+            json!({"type": "exp", "packet": ""}),
+            ValidationCode::FinalmaskNoiseExpEmpty,
+        );
+        refused(
+            json!({"type": "exp", "packet": "   "}),
+            ValidationCode::FinalmaskNoiseExpEmpty,
+        );
+        refused(
+            json!({"type": "exp", "packet": null}),
+            ValidationCode::FinalmaskNoiseExpEmpty,
+        );
+
+        // Trailing text: text the pattern cannot absorb, before or after a
+        // token, names the text.
+        refused(
+            json!({"type": "exp", "packet": "x<r 4>"}),
+            ValidationCode::FinalmaskNoiseExpTrailingText("x".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<r 4>x"}),
+            ValidationCode::FinalmaskNoiseExpTrailingText("x".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<R 4>"}),
+            ValidationCode::FinalmaskNoiseExpTrailingText("<R 4>".into()),
+        );
+
+        // Unknown token, named.
+        refused(
+            json!({"type": "exp", "packet": "<z 4>"}),
+            ValidationCode::FinalmaskNoiseExpUnknownToken("z".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<rb 4>"}),
+            ValidationCode::FinalmaskNoiseExpUnknownToken("rb".into()),
+        );
+
+        // Missing size, named.
+        refused(
+            json!({"type": "exp", "packet": "<r>"}),
+            ValidationCode::FinalmaskNoiseExpMissingSize("r".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<rd >"}),
+            ValidationCode::FinalmaskNoiseExpMissingSize("rd".into()),
+        );
+
+        // Out-of-range and unparsable sizes.
+        refused(
+            json!({"type": "exp", "packet": "<r 70000>"}),
+            ValidationCode::FinalmaskNoiseExpSizeInvalid("70000".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<r -1-10>"}),
+            ValidationCode::FinalmaskNoiseExpSizeInvalid("-1-10".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<r 8-4>"}),
+            ValidationCode::FinalmaskNoiseExpSizeInvalid("8-4".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<r 4 - 8>"}),
+            ValidationCode::FinalmaskNoiseExpSizeInvalid("4 - 8".into()),
+        );
+
+        // Byte literals: empty, odd, and non-hex.
+        refused(
+            json!({"type": "exp", "packet": "<b>"}),
+            ValidationCode::FinalmaskNoiseExpBytesInvalid("b".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<b 0>"}),
+            ValidationCode::FinalmaskNoiseExpBytesInvalid("0".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<b zz>"}),
+            ValidationCode::FinalmaskNoiseExpBytesInvalid("zz".into()),
+        );
+
+        // A no-argument token carrying one.
+        refused(
+            json!({"type": "exp", "packet": "<t 4>"}),
+            ValidationCode::FinalmaskNoiseExpArgumentNotAllowed("t".into()),
+        );
+        refused(
+            json!({"type": "exp", "packet": "<c 4>"}),
+            ValidationCode::FinalmaskNoiseExpArgumentNotAllowed("c".into()),
+        );
+
+        // The packet must be a JSON string; absent is the unmarshal failure.
+        refused(
+            json!({"type": "exp"}),
+            ValidationCode::FinalmaskNoiseExpPacketNotString,
+        );
+        refused(
+            json!({"type": "exp", "packet": 5}),
+            ValidationCode::FinalmaskNoiseExpPacketNotString,
+        );
+
+        // The one refusal carries the wire path of the packet field.
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "noise", "settings": {"noise": [
+                {"type": "exp", "packet": "<t>"},
+                {"type": "exp", "packet": "<z>"}
+            ]}}]
+        }))
+        .unwrap();
+        let issues = validate_finalmask(&fm);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(
+            issues[0].path.as_deref(),
+            Some("finalmask.udp[0].settings.noise[1].packet")
         );
     }
 
@@ -9604,72 +9976,65 @@ mod tests {
     }
 
     #[test]
-    fn shadowsocks2022_key_rule_gates_the_keys_the_core_refuses() {
-        // A key longer than the method's size loads and runs: `xray run -test`
-        // accepts this 24-byte key for the AES-128 method, so only that
-        // non-canonical shape warns, never blocks.
-        let non_canonical = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3";
-        assertions_on_key_rule(
-            "2022-blake3-aes-128-gcm",
-            non_canonical,
-            Some(Severity::Warning),
-        );
+    fn shadowsocks2022_key_rule_gates_the_keys_the_rewritten_core_refuses() {
+        // The method name folds case-insensitively (`GetCipherMethod`
+        // lowercases before its map lookup), so the mixed-case spelling is
+        // the same method the core builds.
+        assertions_on_key_rule("2022-BLAKE3-AES-128-GCM", KEY_16, false);
+        assertions_on_key_rule("2022-blake3-AES-128-GCM", KEY_16, false);
 
-        // The core refuses the whole config while it builds the method on an
-        // undecodable key, a key shorter than the method's size, or the
-        // colon-joined form under the ChaCha20 method — every row exits 23 on
-        // the pinned v26.9.9 binary under
-        // `proxy/shadowsocks_2022: create method`. They gate.
-        let key_16 = "AQEBAQEBAQEBAQEBAQEBAQ==";
-        let key_15 = "AQEBAQEBAQEBAQEBAQEB";
-        let key_32 = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
+        // The core parses each colon-separated part through `ParseKey`: it
+        // decodes standard base64, falls back to the raw bytes when the decode
+        // fails, and requires exactly the method's key size. Every row below
+        // was re-probed on the pinned v26.9.30 binary (`xray run -test`).
+        //
+        // Accepted: a right-length key in base64 or raw form, and the
+        // colon-joined multi-psk form under the AES methods.
         for (method, password) in [
-            // 15-byte key for the AES-128 method (decodes, too short).
-            ("2022-blake3-aes-128-gcm", key_15),
-            // Unpadded key: the core's decoder requires the `=` padding.
-            ("2022-blake3-aes-128-gcm", key_16.trim_end_matches('=')),
-            ("2022-blake3-aes-128-gcm", "not base64!"),
-            // 16-byte key for an AES-256 method.
-            ("2022-blake3-aes-256-gcm", key_16),
-            ("2022-blake3-chacha20-poly1305", key_16),
-            // ChaCha20 2022 rejects the multi-psk colon form.
-            (
-                "2022-blake3-chacha20-poly1305",
-                &format!("{key_32}:{key_32}"),
-            ),
-            // Every part must clear the floor, not just the first: the second
-            // part decodes to 15 bytes.
-            ("2022-blake3-aes-128-gcm", &format!("{key_16}:{key_15}")),
-        ] {
-            assertions_on_key_rule(method, password, Some(Severity::Error));
-        }
-
-        // A colon-joined multi-psk key loads under the AES methods, and each
-        // part must clear the method's floor.
-        for (method, password, expected) in [
-            (
-                "2022-blake3-aes-128-gcm",
-                format!("{key_16}:{key_16}"),
-                None,
-            ),
+            ("2022-blake3-aes-128-gcm", KEY_16),
+            // Raw 16 bytes: base64 decoding fails, so the raw bytes are read.
+            ("2022-blake3-aes-128-gcm", "!!!!!!!!!!!!!!!!"),
+            ("2022-blake3-aes-256-gcm", KEY_32),
             (
                 "2022-blake3-aes-256-gcm",
-                format!("{key_32}:{key_32}"),
-                None,
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
             ),
-            // A longer part is the non-canonical shape, not a refusal.
-            (
-                "2022-blake3-aes-128-gcm",
-                format!("{key_16}:{non_canonical}"),
-                Some(Severity::Warning),
-            ),
+            ("2022-blake3-chacha20-poly1305", KEY_32),
+            ("2022-blake3-aes-128-gcm", &format!("{KEY_16}:{KEY_16_B}")),
+            ("2022-blake3-aes-256-gcm", &format!("{KEY_32}:{KEY_32}")),
         ] {
-            assertions_on_key_rule(method, &password, expected);
+            assertions_on_key_rule(method, password, false);
+        }
+
+        // Refused: a base64 body longer or shorter than the method's size, a
+        // base64 body that happens to be the right *string* length but decodes
+        // to the wrong byte count, a right-length key for the wrong method,
+        // and the ChaCha20 multi-psk form. (A 24-byte key for AES-128 exited 0
+        // under the old core; it now exits 23 with `invalid key`.)
+        let longer = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3";
+        let key_15 = "AQEBAQEBAQEBAQEBAQEB";
+        for (method, password) in [
+            ("2022-blake3-aes-128-gcm", longer),
+            ("2022-blake3-aes-128-gcm", key_15),
+            // 16 base64 characters decode to 12 bytes.
+            ("2022-blake3-aes-128-gcm", "AQEBAQEBAQEBAQEB"),
+            // Right string length, wrong decoded length.
+            ("2022-blake3-aes-128-gcm", KEY_16.trim_end_matches('=')),
+            ("2022-blake3-aes-256-gcm", KEY_16),
+            ("2022-blake3-chacha20-poly1305", KEY_16),
+            (
+                "2022-blake3-chacha20-poly1305",
+                &format!("{KEY_32}:{KEY_32}"),
+            ),
+            // Every part must clear the size, not just the first.
+            ("2022-blake3-aes-128-gcm", &format!("{KEY_16}:{key_15}")),
+        ] {
+            assertions_on_key_rule(method, password, true);
         }
 
         // An empty password on a 2022 method belongs to the required-value
         // Error rule only — the key rule must not double-report.
-        assertions_on_key_rule("2022-blake3-aes-128-gcm", "", None);
+        assertions_on_key_rule("2022-blake3-aes-128-gcm", "", false);
         let mut outbound = shadowsocks_canonical();
         let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
             unreachable!()
@@ -9686,13 +10051,20 @@ mod tests {
         );
 
         // Non-2022 methods treat the password as opaque.
-        assertions_on_key_rule("aes-256-gcm", "any-garbage!!", None);
+        assertions_on_key_rule("aes-256-gcm", "any-garbage!!", false);
     }
 
+    /// Padded standard base64 of 16 and 32 bytes, for the Shadowsocks-2022 key
+    /// rules.
+    const KEY_16: &str = "AQEBAQEBAQEBAQEBAQEBAQ==";
+    const KEY_16_B: &str = "AgICAgICAgICAgICAgICAg==";
+    const KEY_32: &str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
+
     /// The one `Shadowsocks2022KeyInvalid` finding `password` draws under
-    /// `method`, asserted against `expected` severity (`None` = silent), with
-    /// its wire path.
-    fn assertions_on_key_rule(method: &str, password: &str, expected: Option<Severity>) {
+    /// `method`: `refused` says whether the core refuses the key, and the
+    /// finding must then be a gating Error at `settings.password`; otherwise it
+    /// must stay silent.
+    fn assertions_on_key_rule(method: &str, password: &str, refused: bool) {
         let mut outbound = shadowsocks_canonical();
         let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
             unreachable!()
@@ -9701,22 +10073,20 @@ mod tests {
         settings.password = password.into();
         let issues = validate_outbound(&outbound);
         let finding = finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid);
-        match expected {
-            Some(severity) => {
-                let issue = finding
-                    .unwrap_or_else(|| panic!("{method} {password:?} must report: {issues:#?}"));
-                assert_eq!(issue.severity, severity, "{method} {password:?}");
-                assert_eq!(issue.path.as_deref(), Some("settings.password"));
-                assert_eq!(
-                    severity == Severity::Error,
-                    issues.iter().any(|issue| issue.severity == Severity::Error),
-                    "{method} {password:?}: only a refusal may gate"
-                );
-            }
-            None => assert!(
+        if refused {
+            let issue =
+                finding.unwrap_or_else(|| panic!("{method} {password:?} must report: {issues:#?}"));
+            assert_eq!(issue.severity, Severity::Error, "{method} {password:?}");
+            assert_eq!(issue.path.as_deref(), Some("settings.password"));
+            assert!(
+                issues.iter().any(|issue| issue.severity == Severity::Error),
+                "{method} {password:?}: a refusal gates"
+            );
+        } else {
+            assert!(
                 finding.is_none(),
                 "{method} {password:?} must stay silent: {issues:#?}"
-            ),
+            );
         }
     }
 

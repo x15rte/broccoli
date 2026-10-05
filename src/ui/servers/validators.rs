@@ -85,24 +85,16 @@ pub(super) fn v_optional_wg_key(lang: Language, v: &str) -> Option<String> {
     }
 }
 
-/// Per-entry verdict for the WireGuard in-network DNS list. `entry_count` is
-/// the list length because the core reads `local` as the sentinel only when
-/// the list holds nothing else (proxy/wireguard/client.go:117-124); the
-/// sentinel entry itself carries the mixed-list verdict, every other
-/// unacceptable entry the format verdict.
-pub(super) fn v_wg_remote_dns_entry(
-    lang: Language,
-    entry: &str,
-    entry_count: usize,
-) -> Option<String> {
-    if wireguard_remote_dns_entry_supported(entry, entry_count) {
+/// Per-entry verdict for the WireGuard in-network DNS list: the entry must be
+/// an address literal (an IPv6 literal may carry a zone), because the core
+/// parses every entry with `netip.MustParseAddr` and a bad one crashes the
+/// process. The retired `local` sentinel is refused like any other non-address
+/// entry.
+pub(super) fn v_wg_remote_dns_entry(lang: Language, entry: &str) -> Option<String> {
+    if wireguard_remote_dns_entry_supported(entry) {
         return None;
     }
-    if entry == "local" {
-        Some(t(lang, Key::SrvWgRemoteDnsLocalOnly).to_string())
-    } else {
-        Some(t(lang, Key::SrvWgRemoteDnsEntryInvalid).to_string())
-    }
+    Some(t(lang, Key::SrvWgRemoteDnsEntryInvalid).to_string())
 }
 
 /// The tool-output guard for a generated encryption value. Delegates to the

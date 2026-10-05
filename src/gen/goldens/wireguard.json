@@ -69,7 +69,6 @@
         "address": [
           "10.0.0.1/32"
         ],
-        "domainStrategy": "forceip",
         "mtu": 1420,
         "peers": [
           {

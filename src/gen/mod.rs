@@ -419,10 +419,11 @@ fn classify_latency_probe_ipv4(ip: Ipv4Addr) -> Option<&'static str> {
 }
 
 /// The in-tun DNS address: the TUN gateway's IPv4 address (the model
-/// predicate [`tun_ipv4_gateway`] is the shared fact). The WFP DNS shield
-/// permits port-53 only when it egresses the TUN interface, so the adapter
-/// DNS must live inside the TUN subnet — queries then route into the tunnel,
-/// where the in-tun listener answers them. The gateway's own address is the only
+/// predicate [`tun_ipv4_gateway`] is the shared fact). The core's DNS leak
+/// block (`autoSystemWfpBlockLeak` includes `dns`) permits port-53 only when
+/// it egresses the TUN interface, so the adapter DNS must live inside the TUN
+/// subnet — queries then route into the tunnel, where the in-tun listener
+/// answers them. The gateway's own address is the only
 /// in-subnet address Xray's stack treats as local and the OS lets a
 /// dokodemo bind; deriving it from the user-editable gateway keeps the two
 /// coupled. Callers only reach this after [`validate_settings`] has
@@ -951,12 +952,12 @@ fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
         let mut wire = settings.tun.to_wire(emission.fakedns);
         // With a DNS module the adapter DNS is pinned to the in-tun
         // listener — dnscache queries converge on the TUN gateway address
-        // no matter which adapter it picks (the WFP DNS shield permits
-        // port-53 only through the TUN interface), and the DNS module (DNS
-        // tab) is the only place users customize resolution. Without a
-        // module nothing listens there, so fall back to the previous
-        // behavior (stored list, or plaintext resolvers when empty): leaky
-        // but functional, as the TUN screen banner states.
+        // no matter which adapter it picks (the core's DNS leak block
+        // permits port-53 only through the TUN interface), and the DNS
+        // module (DNS tab) is the only place users customize resolution.
+        // Without a module nothing listens there, so fall back to the
+        // previous behavior (stored list, or plaintext resolvers when
+        // empty): leaky but functional, as the TUN screen banner states.
         if emission.dns_on {
             if let Some(o) = wire.get_mut(keys::SETTINGS).and_then(Value::as_object_mut) {
                 o.insert(keys::DNS.into(), json!([tun_dns_address(&settings.tun)]));

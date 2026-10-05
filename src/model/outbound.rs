@@ -282,7 +282,7 @@ pub struct HttpSettings {
     pub extra: Map<String, Value>,
 }
 
-/// WireGuard (wireguard.go:59-68). mtu default 1420, domainStrategy "forceip".
+/// WireGuard (wireguard.go:59-68). mtu default 1420.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WireguardSettings {
@@ -297,19 +297,28 @@ pub struct WireguardSettings {
     /// 0 or exactly 3 bytes; serializes as a JSON array of numbers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<Vec<u8>>,
+    /// The retired `domainStrategy` key. The pinned core deleted the field
+    /// and the strategy switch that read it (infra/conf/wireguard.go), and
+    /// its loader ignores an unknown key, so a retained value never reaches
+    /// the generated document and the model reports it once as an advisory.
+    /// The replacement is the stream-level `sockopt.domainStrategy`, which
+    /// still steers how peer endpoint names resolve
+    /// (proxy/wireguard/client.go resolveLocal). Empty is the fresh-profile
+    /// state.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub domain_strategy: String,
     #[serde(skip_serializing_if = "skip_false")]
     pub no_kernel_tun: bool,
     /// In-network resolvers (`remoteDNS`, wireguard.go:69): an empty list
-    /// keeps the core's built-in resolver list, and the single entry `local`
-    /// uses the core's own DNS client instead
-    /// (proxy/wireguard/client.go:113-124). Every other entry must be an
+    /// keeps the core's built-in resolver list. Every entry must be an
     /// address literal there — an IPv6 literal may carry a zone
-    /// (`fe80::1%eth0`) — and the core builds the resolver set with
-    /// `netip.MustParseAddr`, which panics the process during outbound
-    /// creation on anything else, so [`wireguard_remote_dns_supported`] is
-    /// the validity predicate for this field.
+    /// (`fe80::1%eth0`) — because the core feeds each one to
+    /// `netip.MustParseAddr` while it creates the outbound client and panics
+    /// the whole process on anything else (proxy/wireguard/client.go:102-108).
+    /// The retired `local` sentinel is gone upstream and is refused like
+    /// every other non-address entry, so
+    /// [`wireguard_remote_dns_supported`] is the validity predicate for this
+    /// field.
     #[serde(rename = "remoteDNS", skip_serializing_if = "skip_empty_vec")]
     pub remote_dns: Vec<String>,
     #[serde(flatten)]
@@ -324,7 +333,7 @@ impl Default for WireguardSettings {
             peers: Vec::new(),
             mtu: 1420,
             reserved: None,
-            domain_strategy: "forceip".into(),
+            domain_strategy: String::new(),
             no_kernel_tun: false,
             remote_dns: Vec::new(),
             extra: Map::new(),
@@ -332,18 +341,13 @@ impl Default for WireguardSettings {
     }
 }
 
-/// True when one `remoteDNS` entry is acceptable in a list of `list_len`
-/// entries: an address literal the core's `netip.ParseAddr` accepts (an IPv6
-/// literal may carry a zone, e.g. `fe80::1%eth0`), or the exact `local`
-/// sentinel as the list's only entry. The sentinel comparison is
-/// case-sensitive and does not trim — the core reads it with
-/// `dns[0] == "local"` and parses every other entry verbatim
-/// (proxy/wireguard/client.go:117-124), so a near-miss spelling must be
-/// rejected rather than normalized.
-pub fn wireguard_remote_dns_entry_supported(entry: &str, list_len: usize) -> bool {
-    if entry == "local" {
-        return list_len == 1;
-    }
+/// True when one `remoteDNS` entry is an address literal the core's
+/// `netip.ParseAddr` accepts: an IPv4 or IPv6 literal, and an IPv6 literal
+/// may carry a zone (e.g. `fe80::1%eth0`). The core feeds every entry to
+/// `netip.MustParseAddr` while it creates the outbound client
+/// (proxy/wireguard/client.go:102-108), so the retired `local` sentinel and
+/// every near-miss spelling are refused rather than normalized.
+pub fn wireguard_remote_dns_entry_supported(entry: &str) -> bool {
     parses_as_remote_dns_address(entry)
 }
 
@@ -360,14 +364,12 @@ fn parses_as_remote_dns_address(entry: &str) -> bool {
     }
 }
 
-/// True when a whole `remoteDNS` list is one the pinned core can build: every
-/// entry is acceptable at that list length — the core reads `local` as the
-/// sentinel only when the list length is one, and otherwise parses it as an
-/// address and panics.
+/// True when a whole `remoteDNS` list is one the pinned core can build:
+/// every entry is an address literal.
 pub fn wireguard_remote_dns_supported(entries: &[String]) -> bool {
     entries
         .iter()
-        .all(|entry| wireguard_remote_dns_entry_supported(entry, entries.len()))
+        .all(|entry| wireguard_remote_dns_entry_supported(entry))
 }
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key
 /// size: 64 hexadecimal digits, or raw standard/URL-safe base64 with zero or
@@ -1032,6 +1034,12 @@ impl OutboundModel {
         // and the generated document never carries it (the pinned core
         // refuses an outbound that does — infra/conf/xray.go:262).
         normalized.retired_proxy_settings = None;
+        // Same for the retired WireGuard `domainStrategy`: the core removed
+        // the field and its loader ignores an unknown key, so the generated
+        // document drops the retained value and the model pass warns.
+        if let ProtocolSettings::Wireguard(settings) = &mut normalized.settings {
+            settings.domain_strategy.clear();
+        }
         normalized.stream.retain_selected_stream_blocks_for_wire();
         let mut value = serde_json::to_value(&normalized).expect(
             "model serialization is infallible: the OutboundModel subtree serializes with \
@@ -1813,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn wireguard_remote_dns_round_trips_unset_sentinel_and_list() {
+    fn wireguard_remote_dns_round_trips_unset_list_and_retired_sentinel() {
         // Unset: the key never appears in the settings file or the wire.
         assert_eq!(emitted_remote_dns(None), None);
         assert_eq!(emitted_remote_dns(Some(Vec::new())), None);
@@ -1829,16 +1837,14 @@ mod tests {
             None
         );
 
-        // The sentinel, alone: the upstream key spelling, byte for byte.
-        assert_eq!(
-            emitted_remote_dns(Some(vec!["local".into()])),
-            Some(json!(["local"]))
-        );
+        // The retired sentinel still loads and round-trips through the
+        // settings file byte for byte — the profile is refused by the
+        // validity rule instead of being rewritten or dropped.
         let sentinel: OutboundModel = serde_json::from_value(json!({
             "protocol": "wireguard",
             "settings": {"secretKey": "k", "remoteDNS": ["local"]}
         }))
-        .expect("the sentinel loads");
+        .expect("the retired sentinel loads");
         let ProtocolSettings::Wireguard(settings) = &sentinel.settings else {
             unreachable!();
         };
@@ -1890,7 +1896,6 @@ mod tests {
         for buildable in [
             None,
             Some(Vec::new()),
-            Some(vec!["local".into()]),
             Some(vec!["1.1.1.1".into()]),
             Some(vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()]),
             // Go's netip keeps an optional zone on the IPv6 form; the pinned
@@ -1911,8 +1916,13 @@ mod tests {
             vec!["1.1.1.1:53"],
             vec!["LOCAL"],
             vec![" 1.1.1.1"],
+            // The retired `local` sentinel is refused in every position: the
+            // core parses each entry as an address and the process dies when
+            // it cannot (proxy/wireguard/client.go:107).
+            vec!["local"],
             vec!["local", "1.1.1.1"],
             vec!["1.1.1.1", "local"],
+            vec!["Local"],
             // Zone shapes the core refuses: an empty zone, a zone on the IPv4
             // form, and a zone without an address.
             vec!["fe80::1%"],
@@ -2267,13 +2277,14 @@ mod tests {
         assert_eq!(issue.path.as_deref(), Some("settings.noises[1]"));
     }
 
-    /// The WireGuard endpoint-resolution vocabulary at the model pass: every
-    /// spelling the pinned core reads (it lowercases before matching) and the
-    /// empty zero value stay silent, and anything else gates with its wire
-    /// path. `xray run -test` on the pinned v26.9.9 binary accepts each
-    /// accepted value below and exits 23 on each refused one.
+    /// The retired WireGuard `domainStrategy` key at the model pass: the
+    /// pinned core deleted the field and the switch that read it
+    /// (infra/conf/wireguard.go), so a retained value is ignored. Empty is
+    /// the fresh-profile zero value and stays silent; any carried value warns
+    /// once, never blocks, and is stripped from the generated document while
+    /// the settings file keeps it verbatim.
     #[test]
-    fn wireguard_domain_strategy_gates_only_spellings_the_core_refuses() {
+    fn wireguard_domain_strategy_retired_warns_and_never_reaches_the_wire() {
         use crate::model::validation::{Severity, ValidationCode, validate_outbound};
 
         fn with_strategy(strategy: &str) -> OutboundModel {
@@ -2285,35 +2296,62 @@ mod tests {
             outbound
         }
 
-        for accepted in [
-            "",
+        // Empty is the zero value: nothing was carried, nothing is reported,
+        // and the key stays out of the settings file and the wire.
+        let fresh = with_strategy("");
+        assert!(validate_outbound(&fresh).is_empty(), "{fresh:#?}");
+        assert!(
+            serde_json::to_value(&fresh).unwrap()["settings"]
+                .get("domainStrategy")
+                .is_none()
+        );
+        assert!(
+            fresh.to_wire("wg")["settings"]
+                .get("domainStrategy")
+                .is_none()
+        );
+
+        for carried in [
             "forceip",
             "ForceIP",
             "FORCEIPv4",
             "forceipv6",
             "forceipv4v6",
             "forceipv6v4",
+            // The spellings the v26.9.9 core refused are ignored exactly the
+            // same way now, so they warn like every other value.
+            "bogus",
+            "AsIs",
+            "forceip4",
+            " ForceIP",
         ] {
+            let outbound = with_strategy(carried);
+            let issues = validate_outbound(&outbound);
             assert!(
-                !validate_outbound(&with_strategy(accepted)).has_blocking(),
-                "{accepted:?} must stay buildable"
+                !issues.has_blocking(),
+                "{carried:?} must never gate: {issues:#?}"
             );
-        }
-
-        // `forceip4` is the near-miss the core refuses (the spelling it reads
-        // is `forceipv4`), and `AsIs` is the strategy spelling of the other
-        // blocks. Neither Go nor the rule trims.
-        for refused in ["bogus", "AsIs", "forceip4", " ForceIP", "ForceIPv4v6 "] {
-            let issues = validate_outbound(&with_strategy(refused));
             let issue = issues
                 .iter()
-                .find(|issue| issue.code == ValidationCode::WireguardDomainStrategyInvalid)
-                .unwrap_or_else(|| panic!("{refused:?} must be refused: {issues:?}"));
-            assert_eq!(issue.severity, Severity::Error, "{refused:?}");
+                .find(|issue| issue.code == ValidationCode::WireguardDomainStrategyRetired)
+                .unwrap_or_else(|| panic!("{carried:?} must warn: {issues:?}"));
+            assert_eq!(issue.severity, Severity::Warning, "{carried:?}");
             assert_eq!(
                 issue.path.as_deref(),
                 Some("settings.domainStrategy"),
-                "{refused:?}"
+                "{carried:?}"
+            );
+            // The settings file keeps the value verbatim.
+            assert_eq!(
+                serde_json::to_value(&outbound).unwrap()["settings"]["domainStrategy"],
+                json!(carried)
+            );
+            // The generated document never carries it.
+            assert!(
+                outbound.to_wire("wg")["settings"]
+                    .get("domainStrategy")
+                    .is_none(),
+                "{carried:?} must be stripped from the wire"
             );
         }
     }

@@ -5973,9 +5973,10 @@ mod tests {
             URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{key16_a}:{key16_b}"));
         parse_link(&format!("ss://{aes_multi}@ss.example.com:8388")).unwrap();
 
-        // The core decodes a 2022 key with `base64.StdEncoding` and requires
-        // at least the method's key size, so an unpadded or short key is
-        // refused at import exactly as the core refuses the built config.
+        // The core parses a 2022 key with both `base64.StdEncoding` and the
+        // raw-bytes fallback, and requires exactly the method's key size, so
+        // an unpadded, short, or long key is refused at import exactly as the
+        // core refuses the built config.
         let unpadded16 = STANDARD_NO_PAD.encode([1_u8; 16]);
         let unpadded = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{unpadded16}"));
         expect_malformed(&format!("ss://{unpadded}@ss.example.com:8388"));
@@ -5994,13 +5995,19 @@ mod tests {
             URL_SAFE_NO_PAD.encode(format!("2022-blake3-chacha20-poly1305:{key32_a}:{key32_b}"));
         expect_malformed(&format!("ss://{bad_chacha}@ss.example.com:8388"));
 
-        // A part longer than the method's size loads (the core hashes it down
-        // to the method's length), so the import keeps it and the profile
-        // carries only the model's advisory finding.
+        // A part longer than the method's size is a wrong-length key: the
+        // rewritten core refuses the whole config (`invalid key`), so the
+        // import refuses it too.
         let long_part = STANDARD.encode([5_u8; 24]);
         let longer = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{long_part}"));
-        parse_link(&format!("ss://{longer}@ss.example.com:8388"))
-            .unwrap_or_else(|error| panic!("a longer 2022 key must import: {error}"));
+        expect_malformed(&format!("ss://{longer}@ss.example.com:8388"));
+
+        // A right-length key in raw (non-base64) form is accepted, matching
+        // the core's raw-bytes fallback.
+        let raw16 = "!!!!!!!!!!!!!!!!";
+        let raw = URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-128-gcm:{raw16}"));
+        parse_link(&format!("ss://{raw}@ss.example.com:8388"))
+            .unwrap_or_else(|error| panic!("a raw 2022 key must import: {error}"));
     }
 
     #[test]

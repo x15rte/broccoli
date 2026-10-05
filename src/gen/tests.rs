@@ -1134,6 +1134,38 @@ fn golden_trojan_raw_tls() {
     );
 }
 
+/// The Shadowsocks outbound `level` reaches the generated settings. The
+/// rewritten core carries `level` into the built config for a single-user
+/// 2022 server (`ServerConfig.level`) and for every relay destination
+/// (`RelayDestination.level`); the client's own level rides the same
+/// `settings.level` key, and the emitted document must carry it.
+#[test]
+fn shadowsocks_level_reaches_the_generated_settings() {
+    for method in ["aes-128-gcm", "2022-blake3-aes-128-gcm"] {
+        let password = if method.starts_with("2022") {
+            "AQEBAQEBAQEBAQEBAQEBAQ==".to_owned()
+        } else {
+            "pw".to_owned()
+        };
+        let mut ob = OutboundModel::new(Protocol::Shadowsocks);
+        ob.settings = ProtocolSettings::Shadowsocks(ShadowsocksSettings {
+            address: "ss.example.com".into(),
+            port: 8388,
+            method: method.into(),
+            password,
+            level: Some(7),
+            ..Default::default()
+        });
+        let cfg =
+            generate_deterministic(&single_server(ob), &base_settings()).expect("generate config");
+        assert_eq!(
+            cfg["outbounds"][0]["settings"]["level"],
+            json!(7),
+            "{method}"
+        );
+    }
+}
+
 #[test]
 fn golden_ss_2022() {
     let mut ob = OutboundModel::new(Protocol::Shadowsocks);
@@ -1268,7 +1300,7 @@ fn golden_hysteria2_udphop_mask() {
 }
 
 #[test]
-fn retired_quic_udp_hop_key_gates_generation_and_never_reaches_the_wire() {
+fn retired_quic_udp_hop_key_warns_and_never_reaches_the_wire() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);
     ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
         address: "hy2.example.com".into(),
@@ -1290,12 +1322,20 @@ fn retired_quic_udp_hop_key_gates_generation_and_never_reaches_the_wire() {
         ..Default::default()
     });
 
-    // The stored hop can no longer generate: the core would drop the key
-    // silently, so the profile gates with the migration text.
-    let message = invalid_model_message(&single_server(ob.clone()));
-    assert!(message.contains("udphop"), "{message}");
-    assert!(message.contains("intervalLocal"), "{message}");
-    assert!(message.contains("intervalRemote"), "{message}");
+    // The stored hop no longer gates: the core drops the key silently, so the
+    // profile applies with one advisory naming the mask migration.
+    let servers = single_server(ob.clone());
+    let issues = validate_profiles(&servers.profiles, servers.active.as_deref(), false);
+    let issue = issues
+        .iter()
+        .find(|issue| issue.code == ValidationCode::FinalmaskQuicHopMoved)
+        .unwrap_or_else(|| panic!("the retired key must warn: {issues:#?}"));
+    assert_eq!(issue.severity, crate::model::validation::Severity::Warning);
+    assert!(
+        invalid_model_error(issues).is_none(),
+        "a warning-only profile must generate"
+    );
+    generate_deterministic(&servers, &base_settings()).expect("the profile applies");
 
     // The settings file keeps the key; the generated document never does.
     let persisted = serde_json::to_value(&ob).expect("the outbound serializes");
@@ -2089,9 +2129,9 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
     let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
 
     // The adapter DNS is contract-pinned to the in-tun listener address: the
-    // WFP shield permits port-53 only through the TUN interface, so dnscache
-    // queries must route into the tunnel via the gateway address. The
-    // listener itself is added to the running core by the runtime
+    // core's DNS leak block permits port-53 only through the TUN interface,
+    // so dnscache queries must route into the tunnel via the gateway address.
+    // The listener itself is added to the running core by the runtime
     // (src/rt/dns_in.rs), which derives its bind address from this pin — so
     // no inbound carries the listener's tag in the emitted config.
     let tun = cfg["inbounds"]
@@ -2676,10 +2716,11 @@ fn explicit_user_domain_strategy_is_not_overridden() {
 
 #[test]
 fn wireguard_domain_endpoint_joins_bootstrap_without_sockopt() {
-    // WG peer endpoints resolve through the DNS module via
-    // settings.domainStrategy, not sockopt (XTLS/Xray-core#5363) — the
-    // endpoint domain still joins the bootstrap scope, but no sockopt is
-    // injected into its wire form.
+    // A WireGuard peer endpoint domain joins the bootstrap scope, but no
+    // sockopt is injected into its wire form: the endpoint name resolves
+    // through `streamSettings.sockopt.domainStrategy` (empty here) or the
+    // core's own DNS client (XTLS/Xray-core#5363), and the retired
+    // `settings.domainStrategy` key is gone upstream.
     let mut ob = OutboundModel::new(Protocol::Wireguard);
     ob.settings = ProtocolSettings::Wireguard(WireguardSettings {
         secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
@@ -3616,9 +3657,10 @@ fn golden_routing_local_os() {
 
 /// WireGuard's in-network resolver list reaches the wire under its upstream
 /// spelling: `infra/conf/wireguard.go` reads `remoteDNS` into
-/// `DeviceConfig.DNS`, and `proxy/wireguard/client.go` uses it as the
-/// resolver set. The sentinel profile proves `local` travels alone; the
-/// unset shape is `goldens/wireguard.json`, which must stay byte-identical.
+/// `DeviceConfig.DNS`, and `proxy/wireguard/client.go` feeds every entry to
+/// `netip.MustParseAddr`. The zoned IPv6 profile proves the zone travels
+/// verbatim; the unset shape is `goldens/wireguard.json`, which must stay
+/// byte-identical.
 #[test]
 fn golden_wireguard_remote_dns() {
     let explicit = ServerProfile {
@@ -3635,25 +3677,6 @@ fn golden_wireguard_remote_dns() {
                     ..Default::default()
                 }],
                 remote_dns: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
-                ..Default::default()
-            });
-            outbound
-        })
-    };
-    let sentinel = ServerProfile {
-        id: "fedcba9876543210".into(),
-        ..ServerProfile::new("dns-local", {
-            let mut outbound = OutboundModel::new(Protocol::Wireguard);
-            outbound.settings = ProtocolSettings::Wireguard(WireguardSettings {
-                secret_key: "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY=".into(),
-                address: vec!["10.0.0.2/32".into()],
-                peers: vec![WireguardPeer {
-                    public_key: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into(),
-                    endpoint: "203.0.113.11:51820".into(),
-                    allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
-                    ..Default::default()
-                }],
-                remote_dns: vec!["local".into()],
                 ..Default::default()
             });
             outbound
@@ -3684,7 +3707,7 @@ fn golden_wireguard_remote_dns() {
     let servers = ServersFile {
         version: 1,
         active: Some(explicit.id.clone()),
-        profiles: vec![explicit, sentinel, zoned],
+        profiles: vec![explicit, zoned],
         extra: Map::new(),
     };
     golden!(
@@ -3871,6 +3894,44 @@ fn golden_hysteria2_ordered_mask_chain() {
     });
     golden!(
         "goldens/hysteria2_ordered_mask_chain.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// The `noise` `type: "exp"` packet language reaches the wire as the packet
+/// string the core parses into segments
+/// (`infra/conf/transport_finalmask.go:318-434`), with the other echo fields
+/// kept per item. The emitted document must pass the pinned core's
+/// `run -test`.
+#[test]
+fn golden_hysteria2_noise_exp() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "noise.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "noisepassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![
+            serde_json::from_value(json!({
+                "type": "noise",
+                "settings": {"noise": [
+                    {"type": "exp", "packet": "<b 0x00ff><r 4-8><rc 2-4><rd 1-2><t><c><n>"},
+                    {"type": "exp", "packet": "<rd 2>", "delay": "1-3"}
+                ]}
+            }))
+            .expect("the noise envelope loads"),
+        ],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_noise_exp.json",
         generate_deterministic(&single_server(ob), &base_settings())
     );
 }

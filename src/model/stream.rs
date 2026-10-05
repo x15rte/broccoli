@@ -926,6 +926,11 @@ impl Default for FinalmaskFragment {
     }
 }
 
+/// One `noise` item (`infra/conf/transport_finalmask.go:298-305`). `type`
+/// selects how `packet` is read: the byte-encoding types (`""`/`array`,
+/// `str`, `hex`, `base64`) through `PraseByteSlice`, and the `exp` token
+/// language (folded, `:318`) as a plain string that
+/// [`crate::model::validation`] validates against the core's grammar.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskNoiseItem {
@@ -933,8 +938,11 @@ pub struct FinalmaskNoiseItem {
     pub rand: Int32Range,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rand_range: Option<Int32Range>,
+    /// `""`/`array`, `str`, `hex`, `base64`, or `exp` (case-insensitive).
     #[serde(rename = "type", skip_serializing_if = "skip_empty_str")]
     pub encoding: String,
+    /// The packet for the item's `type`: the raw JSON value for a
+    /// byte-encoding type, and the token expression string for `exp`.
     #[serde(skip_serializing_if = "FinalmaskRawValue::is_absent")]
     pub packet: FinalmaskRawValue,
     #[serde(skip_serializing_if = "finalmask_zero_range")]
@@ -1202,12 +1210,16 @@ impl Default for FinalmaskPortList {
     }
 }
 
-/// The `udphop` UDP mask settings (`infra/conf/transport_finalmask.go:911-965`
-/// at v26.9.9). The mask hops the destination of the outbound's own UDP
-/// socket: `mode` selects when a hop happens (a comma-separated, combinable
-/// set of `intervalLocal` / `intervalRemote` / `perConnRemote`), `interval`
-/// is the seconds range a period hop waits, `remotePorts` / `remoteIPs`
-/// replace the destination, and `sockopt` configures each hopped socket.
+/// The `udphop` UDP mask settings. The mask hops the destination of the
+/// outbound's own UDP socket: `mode` selects when a hop happens (a
+/// comma-separated, combinable set of `intervalLocal` / `intervalRemote` /
+/// `perConnRemote`), `interval` is the seconds range a period hop waits, and
+/// `remotePorts` / `remoteIPs` replace the destination. An unset `interval`
+/// (`0/0`) emits no key and the core substitutes its own `30/30` default; an
+/// endpoint below the core's 5-second floor is refused. `sockopt` is the
+/// retired per-hop socket block: the core removed the key, so a retained value
+/// never reaches the generated document and the model reports it once as an
+/// advisory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskUdpHop {
@@ -1231,9 +1243,10 @@ impl Default for FinalmaskUdpHop {
             sockopt: None,
             // The core refuses an empty mode at config load, so a fresh mask
             // starts on the mode every UDP transport accepts. The interval
-            // starts at the core's 5-second floor.
+            // starts unset: the core then substitutes its own 30/30 default,
+            // and the key stays out of the generated document.
             mode: "perConnRemote".into(),
-            interval: Int32Range::new(5, 10),
+            interval: Int32Range::single(0),
             remote_ports: FinalmaskPortList::default(),
             remote_ips: Vec::new(),
             extra: Map::new(),
@@ -1317,13 +1330,13 @@ pub struct FinalmaskQuicParams {
     /// The raw value of the retired `quicParams.udpHop` key the stored
     /// object carried, when it did (any JSON shape). The hop moved to the
     /// `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`) and the
-    /// core now ignores the old key silently, so the profile stays gated
-    /// until the user rebuilds the hop; the value is kept so the settings
-    /// file round-trips it, while the wire pass
+    /// core ignores the old key silently, so the config applies without the
+    /// hop until the user rebuilds it as a mask; the value is kept so the
+    /// settings file round-trips it, while the wire pass
     /// ([`StreamModel::retain_selected_stream_blocks_for_wire`]) never emits
     /// it. JSON `null` is the Go zero shape — the field upstream is a
     /// pointer — and counts as absent, so the key is then dropped on the
-    /// next save. The gating finding is
+    /// next save. The advisory is
     /// `crate::model::validation::ValidationCode::FinalmaskQuicHopMoved`.
     #[serde(rename = "udpHop", skip_serializing_if = "Option::is_none")]
     pub retired_udp_hop: Option<Value>,
@@ -1844,6 +1857,11 @@ impl StreamModel {
             }
             for mask in finalmask.udp.iter_mut() {
                 if let FinalmaskUdpMask::Udphop { settings, .. } = mask {
+                    // The retired `sockopt` key is a settings-file fact only:
+                    // the core removed the field and its loader ignores the
+                    // unknown key, so the generated document drops the
+                    // retained value and the model pass warns.
+                    settings.sockopt = None;
                     // The hop socket takes prefixes; an address entry is
                     // spelled out with its width (`infra/conf/
                     // transport_finalmask.go:950-960` normalizes the same
@@ -1964,9 +1982,10 @@ impl StreamModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs,
-        HysteriaTransport, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
-        StreamModel, TlsCert, TlsModel, WsSettings, XhttpSettings, transport_settings_key,
+        CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
+        HappyEyeballs, HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network,
+        RawSettings, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
+        XhttpSettings, transport_settings_key,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -2279,7 +2298,17 @@ mod tests {
         });
         let model: FinalmaskModel = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&model).unwrap(), value);
-        assert!(crate::model::validation::validate_finalmask(&model).is_empty());
+        // The `udphop` envelope above carries the retired `sockopt` key, so
+        // its one advisory stands; every other mask validates clean.
+        let issues = crate::model::validation::validate_finalmask(&model);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.code.clone())
+                .collect::<Vec<_>>(),
+            vec![crate::model::validation::ValidationCode::FinalmaskUdpHopSockoptRetired],
+            "{issues:#?}"
+        );
         assert_eq!(model.tcp.len(), 4);
         assert_eq!(model.udp.len(), 7);
 
@@ -2665,11 +2694,11 @@ mod tests {
     }
 
     #[test]
-    fn retired_quic_udp_hop_key_gates_with_the_mask_migration_text() {
+    fn retired_quic_udp_hop_key_warns_with_the_mask_migration_text() {
         use crate::model::validation::{Severity, ValidationCode, validate_finalmask};
 
-        // The retired key produces one gating finding that names the mask and
-        // the equivalence, while the hopped shape itself stays legal.
+        // The retired key produces one advisory that names the mask and the
+        // equivalence, while the hopped shape itself stays legal.
         let stream: StreamModel = serde_json::from_value(json!({
             "network": "hysteria",
             "finalmask": {"quicParams": {"udpHop": {"ports": "443", "interval": 0}}}
@@ -2678,7 +2707,7 @@ mod tests {
         let issues = validate_finalmask(stream.finalmask.as_ref().unwrap());
         assert_eq!(issues.len(), 1, "{issues:#?}");
         assert_eq!(issues[0].code, ValidationCode::FinalmaskQuicHopMoved);
-        assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].severity, Severity::Warning);
         assert_eq!(issues[0].path, None);
 
         // A rebuilt hop mask validates clean.
@@ -2749,6 +2778,66 @@ mod tests {
                 "fe80::1%",
                 "1.2.3.4%eth0"
             ])
+        );
+    }
+
+    #[test]
+    fn udphop_unset_interval_and_retired_sockopt_never_reach_the_wire() {
+        use crate::model::validation::{Severity, ValidationCode, validate_finalmask};
+
+        // A fresh mask leaves the interval unset: the key is absent from the
+        // settings file and the wire, and the core substitutes its own 30/30
+        // default.
+        let fresh = FinalmaskUdpHop::default();
+        assert_eq!(fresh.interval, Int32Range::single(0));
+        assert!(
+            serde_json::to_value(&fresh)
+                .unwrap()
+                .get("interval")
+                .is_none(),
+            "an unset interval must not serialize"
+        );
+
+        // A retained retired `sockopt` value round-trips in the settings file,
+        // draws one advisory, and is stripped from the generated document.
+        let mut stream: StreamModel = serde_json::from_value(json!({
+            "network": "hysteria",
+            "finalmask": {"udp": [{"type": "udphop", "settings": {
+                "mode": "perConnRemote",
+                "remotePorts": "443",
+                "sockopt": {"domainStrategy": "UseIPv4", "interface": "eth0"}
+            }}]}
+        }))
+        .unwrap();
+        let stored = serde_json::to_value(&stream).expect("the stream serializes");
+        assert_eq!(
+            stored["finalmask"]["udp"][0]["settings"]["sockopt"],
+            json!({"domainStrategy": "UseIPv4", "interface": "eth0"})
+        );
+        let issues = validate_finalmask(stream.finalmask.as_ref().unwrap());
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(
+            issues[0].code,
+            ValidationCode::FinalmaskUdpHopSockoptRetired
+        );
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert_eq!(
+            issues[0].path.as_deref(),
+            Some("finalmask.udp[0].settings.sockopt")
+        );
+        stream.retain_selected_stream_blocks_for_wire();
+        let wire = serde_json::to_value(&stream).expect("the stream serializes");
+        assert!(
+            wire["finalmask"]["udp"][0]["settings"]
+                .get("sockopt")
+                .is_none(),
+            "{wire}"
+        );
+        assert!(
+            wire["finalmask"]["udp"][0]["settings"]
+                .get("interval")
+                .is_none(),
+            "an unset interval must stay out of the wire: {wire}"
         );
     }
 

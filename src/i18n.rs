@@ -401,7 +401,6 @@ keys! {
     TopbarRetrySave 0,
     TopbarOpenStateFolder 0,
     TopbarErrorChip 0,
-    TopbarDnsShieldInactive 0,
     // Topbar right edge: xray core + broccoli app versions.
     TopbarXrayAppVersions 2,
     TopbarAppVersion 1,
@@ -1272,9 +1271,8 @@ keys! {
     SrvWgPeerEndpointRequired 0,
     SrvWgPresharedInvalid 0,
     SrvWgRemoteDnsInvalid 0,
-    SrvWgDomainStrategyInvalid 0,
+    SrvWgDomainStrategyRetired 0,
     SrvWgRemoteDnsEntryInvalid 0,
-    SrvWgRemoteDnsLocalOnly 0,
     SrvFreedomFragmentInvalid 0,
     SrvFreedomNoiseInvalid 0,
     SrvFreedomFinalRuleInvalid 0,
@@ -1518,6 +1516,7 @@ keys! {
     FinalmaskQuicHopMoved 0,
     FinalmaskUdpHopModeInvalid 0,
     FinalmaskUdpHopIntervalTooSmall 0,
+    FinalmaskUdpHopSockoptRetired 0,
     FinalmaskUdpHopIpInvalid 0,
     FinalmaskDialerProxyConflict 0,
     FinalmaskUdpMaskNotLast 1,
@@ -1554,6 +1553,14 @@ keys! {
     FinalmaskUdpHeaderModeInvalid 0,
     FinalmaskMkcpHeaderInvalid 0,
     FinalmaskNoisePacketExclusive 0,
+    FinalmaskNoiseExpPacketNotString 0,
+    FinalmaskNoiseExpEmpty 0,
+    FinalmaskNoiseExpTrailingText 1,
+    FinalmaskNoiseExpUnknownToken 1,
+    FinalmaskNoiseExpMissingSize 1,
+    FinalmaskNoiseExpSizeInvalid 1,
+    FinalmaskNoiseExpBytesInvalid 1,
+    FinalmaskNoiseExpArgumentNotAllowed 1,
     FinalmaskSalamanderPacketSize 0,
     FinalmaskXdnsDomainRemoved 0,
     FinalmaskXdnsEmpty 0,
@@ -2140,11 +2147,6 @@ keys! {
     HelperStageRefused (Log, Error, 0),
     HelperCoreSpawnFailed (Log, Error, 0),
     HelperJobSetupFailed (Log, Error, 0),
-    HelperShieldRemovedAfterExit (Log, Warn, 1),
-    HelperShieldNotInstalledAfterExit (Log, Warn, 1),
-    HelperDnsShieldTeardownFailed (Log, Error, 0),
-    HelperDnsShieldEngaged (Log, Info, 0),
-    HelperDnsShieldNotEngaged (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
     HelperDnsTakeoverRestored (Log, Info, 1),
@@ -2195,10 +2197,6 @@ keys! {
     SupervisorChildExited 0,
     SupervisorJobCreateFailed 0,
     SupervisorJobAssignFailed 0,
-    WfpEngineOpenFailed 2,
-    WfpSubLayerAddFailed 2,
-    WfpAppIdReadFailed 2,
-    WfpFilterAddFailed 2,
     CoreDlPayloadRewindFailed 1,
     CoreDlPayloadCreateFailed 1,
     CoreDlPayloadCopyFailed 1,
@@ -2480,6 +2478,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskQuicHopMoved => t(lang, Key::FinalmaskQuicHopMoved),
         FinalmaskUdpHopModeInvalid => t(lang, Key::FinalmaskUdpHopModeInvalid),
         FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
+        FinalmaskUdpHopSockoptRetired => t(lang, Key::FinalmaskUdpHopSockoptRetired),
         FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
         FinalmaskDialerProxyConflict => t(lang, Key::FinalmaskDialerProxyConflict),
         FinalmaskUdpMaskNotLast(_) => t(lang, Key::FinalmaskUdpMaskNotLast),
@@ -2520,6 +2519,14 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskUdpHeaderModeInvalid => t(lang, Key::FinalmaskUdpHeaderModeInvalid),
         FinalmaskMkcpHeaderInvalid => t(lang, Key::FinalmaskMkcpHeaderInvalid),
         FinalmaskNoisePacketExclusive => t(lang, Key::FinalmaskNoisePacketExclusive),
+        FinalmaskNoiseExpPacketNotString => t(lang, Key::FinalmaskNoiseExpPacketNotString),
+        FinalmaskNoiseExpEmpty => t(lang, Key::FinalmaskNoiseExpEmpty),
+        FinalmaskNoiseExpTrailingText(_) => t(lang, Key::FinalmaskNoiseExpTrailingText),
+        FinalmaskNoiseExpUnknownToken(_) => t(lang, Key::FinalmaskNoiseExpUnknownToken),
+        FinalmaskNoiseExpMissingSize(_) => t(lang, Key::FinalmaskNoiseExpMissingSize),
+        FinalmaskNoiseExpSizeInvalid(_) => t(lang, Key::FinalmaskNoiseExpSizeInvalid),
+        FinalmaskNoiseExpBytesInvalid(_) => t(lang, Key::FinalmaskNoiseExpBytesInvalid),
+        FinalmaskNoiseExpArgumentNotAllowed(_) => t(lang, Key::FinalmaskNoiseExpArgumentNotAllowed),
         FinalmaskSalamanderPacketSize => t(lang, Key::FinalmaskSalamanderPacketSize),
         FinalmaskXdnsDomainRemoved => t(lang, Key::FinalmaskXdnsDomainRemoved),
         FinalmaskXdnsEmpty => t(lang, Key::FinalmaskXdnsEmpty),
@@ -2544,7 +2551,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FreedomFinalRuleInvalid => t(lang, Key::SrvFreedomFinalRuleInvalid),
         DnsRuleActionInvalid => t(lang, Key::SrvDnsRuleActionInvalidShort),
         WireguardRemoteDnsInvalid => t(lang, Key::SrvWgRemoteDnsInvalid),
-        WireguardDomainStrategyInvalid => t(lang, Key::SrvWgDomainStrategyInvalid),
+        WireguardDomainStrategyRetired => t(lang, Key::SrvWgDomainStrategyRetired),
         // Settings-level verdict rules (validate_settings /
         // validate_profiles). Parameterized rules return the template that
         // validation_issue_message fills with the code-carried values.
@@ -2629,6 +2636,12 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::FinalmaskQuicBandwidthUnitInvalid(arg)
         | ValidationCode::FinalmaskUdpMaskNotLast(arg)
         | ValidationCode::FinalmaskUdpMaskNotFirst(arg)
+        | ValidationCode::FinalmaskNoiseExpTrailingText(arg)
+        | ValidationCode::FinalmaskNoiseExpUnknownToken(arg)
+        | ValidationCode::FinalmaskNoiseExpMissingSize(arg)
+        | ValidationCode::FinalmaskNoiseExpSizeInvalid(arg)
+        | ValidationCode::FinalmaskNoiseExpBytesInvalid(arg)
+        | ValidationCode::FinalmaskNoiseExpArgumentNotAllowed(arg)
         | ValidationCode::XhttpExtraShadowsSettings(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
@@ -2938,7 +2951,6 @@ mod en {
             Key::TopbarRetrySave => "Retry save",
             Key::TopbarOpenStateFolder => "Open state folder",
             Key::TopbarErrorChip => "View error",
-            Key::TopbarDnsShieldInactive => "DNS leak protection inactive",
             // Topbar right edge: xray core + broccoli app versions.
             Key::TopbarXrayAppVersions => "Xray core {} · app {}",
             Key::TopbarAppVersion => "app {}",
@@ -4125,14 +4137,14 @@ mod en {
             Key::SrvWgPeerEndpointRequired => "every WireGuard peer requires an endpoint",
             Key::SrvWgPresharedInvalid => "a WireGuard pre-shared key is invalid",
             Key::SrvWgRemoteDnsInvalid => {
-                "Every WireGuard remote DNS entry must be an IP address. The local entry must \
-                 be the only entry."
+                "Every WireGuard remote DNS entry must be an IP address. A bad entry crashes the \
+                 core at startup."
             }
-            Key::SrvWgRemoteDnsEntryInvalid => "Enter an IP address or the word local.",
-            Key::SrvWgDomainStrategyInvalid => {
-                "domainStrategy is not supported by Xray WireGuardConfig"
+            Key::SrvWgRemoteDnsEntryInvalid => "Enter an IP address.",
+            Key::SrvWgDomainStrategyRetired => {
+                "WireGuard domainStrategy is retired. Xray ignores it. Use the stream sockopt \
+                 domainStrategy instead."
             }
-            Key::SrvWgRemoteDnsLocalOnly => "The local entry must be the only entry.",
             Key::SrvFreedomFragmentInvalid => {
                 "Freedom fragmentation requires valid packets, length, and interval"
             }
@@ -4322,7 +4334,9 @@ mod en {
             Key::SrvCustomOptHint => "numeric socket option",
             Key::SrvVlessEncryptionHint => "none | mlkem768x25519plus…",
             Key::SrvVlessReverseTagHint => "inbound tag to reverse-dial",
-            Key::SrvShadowsocksPasswordHint => "2022 methods: base64 key of exact length",
+            Key::SrvShadowsocksPasswordHint => {
+                "2022 methods: base64 or raw bytes at the exact key length"
+            }
             Key::SrvSecretKeyHint => "base64, 32 bytes",
             Key::SrvWgPeerPublicKeyHint => "remote peer public key",
             Key::SrvPacketsHint => "tlshello | 1-3 | empty = all",
@@ -4401,10 +4415,9 @@ mod en {
                  not support legacy stream ciphers."
             }
             Key::OutboundShadowsocks2022KeyInvalid => {
-                "Shadowsocks-2022 keys are standard padded base64 of the method's key length: 16 \
-                 bytes for 2022-blake3-aes-128-gcm, 32 bytes for the other 2022 methods. Xray \
-                 refuses a key it cannot decode, a shorter key, and the ChaCha20 multi-key form. A \
-                 longer key still runs, because Xray hashes it down to the method's size."
+                "Shadowsocks-2022 keys are standard base64 or raw bytes at the method's key size. \
+                 The AES-128 method needs 16 bytes, and the other 2022 methods need 32. Xray \
+                 refuses a key of any other length and the ChaCha20 multi-key form."
             }
             Key::OutboundTrojanSettingsIncomplete => {
                 "Trojan requires a server address, a non-zero port, and a password"
@@ -4574,7 +4587,11 @@ mod en {
                 "choose intervalLocal, intervalRemote, or perConnRemote"
             }
             Key::FinalmaskUdpHopIntervalTooSmall => {
-                "set each interval endpoint to at least 5 seconds"
+                "Set each interval endpoint to at least 5 seconds, or leave the interval unset"
+            }
+            Key::FinalmaskUdpHopSockoptRetired => {
+                "The udphop sockopt key is retired. Xray ignores it. Use the transport sockopt \
+                 instead."
             }
             Key::FinalmaskUdpHopIpInvalid => "enter an IP address or a CIDR prefix",
             Key::FinalmaskDialerProxyConflict => {
@@ -4648,6 +4665,25 @@ mod en {
             Key::FinalmaskNoisePacketExclusive => {
                 "packet bytes and a positive random-length range are mutually exclusive"
             }
+            Key::FinalmaskNoiseExpPacketNotString => {
+                "A noise exp item needs a packet string holding the token expression"
+            }
+            Key::FinalmaskNoiseExpEmpty => {
+                "The noise expression is empty. Add at least one token such as <t>"
+            }
+            Key::FinalmaskNoiseExpTrailingText => "{} is outside the noise expression tokens",
+            Key::FinalmaskNoiseExpUnknownToken => {
+                "{} is not a known noise expression token. Use b, r, rc, rd, t, c, or n"
+            }
+            Key::FinalmaskNoiseExpMissingSize => "<{}> needs a size",
+            Key::FinalmaskNoiseExpSizeInvalid => {
+                "{} is not a size from 0 through 65535 with the low end first"
+            }
+            Key::FinalmaskNoiseExpBytesInvalid => {
+                "{} is not hexadecimal byte data. Use an even number of hex digits, with an \
+                 optional 0x prefix"
+            }
+            Key::FinalmaskNoiseExpArgumentNotAllowed => "<{}> takes no size",
             Key::FinalmaskSalamanderPacketSize => {
                 "use 0 for normal Salamander, or a Gecko range from 1 through 2048"
             }
@@ -5733,15 +5769,6 @@ mod en {
             Key::HelperJobSetupFailed => {
                 "elevated helper could not isolate the staged core in a job object"
             }
-            Key::HelperShieldRemovedAfterExit => {
-                "core {} exited during the adapter index poll; the DNS shield was removed again"
-            }
-            Key::HelperShieldNotInstalledAfterExit => {
-                "core {} exited during the adapter index poll; the DNS shield was not installed"
-            }
-            Key::HelperDnsShieldTeardownFailed => "elevated helper could not remove the DNS shield",
-            Key::HelperDnsShieldEngaged => "elevated helper installed the DNS shield",
-            Key::HelperDnsShieldNotEngaged => "elevated helper could not install the DNS shield",
             Key::HelperDnsTakeoverApplied => {
                 "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
             }
@@ -5852,20 +5879,6 @@ mod en {
                 "The app could not create the job object for the core"
             }
             Key::SupervisorJobAssignFailed => "The app could not assign the core to its job",
-            Key::WfpEngineOpenFailed => {
-                "The elevated helper could not open the Windows filter engine. The status is {} \
-                 ({})."
-            }
-            Key::WfpSubLayerAddFailed => {
-                "The elevated helper could not add the DNS shield sublayer. The status is {} ({})."
-            }
-            Key::WfpAppIdReadFailed => {
-                "The elevated helper could not read the staged xray application identity. The status \
-                 is {} ({})."
-            }
-            Key::WfpFilterAddFailed => {
-                "The elevated helper could not add a DNS shield filter. The status is {} ({})."
-            }
             Key::CoreDlPayloadRewindFailed => "The app could not rewind the staged payload {}",
             Key::CoreDlPayloadCreateFailed => "The app could not create the protected payload {}",
             Key::CoreDlPayloadCopyFailed => "The app could not copy the protected payload {}",

@@ -20,6 +20,13 @@
       },
       {
         "address": "8.8.8.8"
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:noise.example.com"
+        ],
+        "skipFallback": true
       }
     ]
   },
@@ -64,53 +71,46 @@
   },
   "outbounds": [
     {
-      "protocol": "wireguard",
+      "protocol": "hysteria",
       "settings": {
-        "address": [
-          "10.0.0.1/32"
-        ],
-        "mtu": 1420,
-        "peers": [
-          {
-            "allowedIPs": [
-              "0.0.0.0/0",
-              "::/0"
-            ],
-            "endpoint": "203.0.113.10:51820",
-            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
-          }
-        ],
-        "remoteDNS": [
-          "1.1.1.1",
-          "2606:4700:4700::1111"
-        ],
-        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
+        "address": "noise.example.com",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "finalmask": {
+          "udp": [
+            {
+              "settings": {
+                "noise": [
+                  {
+                    "packet": "<b 0x00ff><r 4-8><rc 2-4><rd 1-2><t><c><n>",
+                    "type": "exp"
+                  },
+                  {
+                    "delay": "1-3",
+                    "packet": "<rd 2>",
+                    "type": "exp"
+                  }
+                ]
+              },
+              "type": "noise"
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "auth": "noisepassword",
+          "udpIdleTimeout": 60,
+          "version": 2
+        },
+        "network": "hysteria",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {}
       },
       "tag": "srv-01234567"
-    },
-    {
-      "protocol": "wireguard",
-      "settings": {
-        "address": [
-          "10.0.0.3/32"
-        ],
-        "mtu": 1420,
-        "peers": [
-          {
-            "allowedIPs": [
-              "0.0.0.0/0",
-              "::/0"
-            ],
-            "endpoint": "203.0.113.12:51820",
-            "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
-          }
-        ],
-        "remoteDNS": [
-          "fe80::1%eth0"
-        ],
-        "secretKey": "5fIY2zEKwnvOylBo+6fzM9bKxz29gTWFM2mBZ0s5rcY="
-      },
-      "tag": "srv-00112233"
     },
     {
       "protocol": "freedom",
