@@ -386,12 +386,8 @@ keys! {
     ModeTun 0,
     TrayShow 0,
     TrayConnectDisconnect 0,
-    TrayRestart 0,
     TrayQuit 0,
     TrayTooltipStopped 0,
-    TrayTooltipRenderLost 0,
-    NoticeDeviceLostTitle 0,
-    NoticeDeviceLostText 1,
     TopbarMode 1,
     TopbarActiveServer 1,
     TopbarCoreNotInstalled 0,
@@ -2926,14 +2922,8 @@ mod en {
             Key::ModeTun => "TUN",
             Key::TrayShow => "Show broccoli",
             Key::TrayConnectDisconnect => "Connect / Disconnect",
-            Key::TrayRestart => "Restart broccoli",
             Key::TrayQuit => "Quit",
             Key::TrayTooltipStopped => "broccoli — Stopped",
-            Key::TrayTooltipRenderLost => "broccoli — Window lost",
-            Key::NoticeDeviceLostTitle => "Graphics device lost",
-            Key::NoticeDeviceLostText => {
-                "The app lost the graphics device, so it cannot draw the window. The connection keeps running. Use the tray menu to restart the app. Details are in {}."
-            }
             Key::TopbarMode => "mode: {}",
             Key::TopbarActiveServer => "server: {}",
             Key::TopbarCoreNotInstalled => "Xray core not installed",

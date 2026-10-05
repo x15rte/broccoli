@@ -118,10 +118,10 @@ fn surface_disposition(status: &eframe::wgpu::CurrentSurfaceTexture) -> SurfaceD
         // A hidden window legitimately draws nothing, and the wake that
         // restores it arrives with the window's own events.
         Status::Occluded => SurfaceDisposition::Skip { hidden: true },
-        // A timeout, or a validation error inside the acquire — a lost device
-        // is the usual reason — may clear on its own: ask for the frame that
-        // finds out. A device loss is reported to the app through its
-        // device-lost callback, which owns the recovery from there.
+        // A timeout — the swapchain did not hand an image over inside wgpu's
+        // one-second acquire budget, which a congested present path reaches —
+        // and a validation error inside the acquire both may clear on their
+        // own: ask for the frame that finds out.
         _ => SurfaceDisposition::Skip { hidden: false },
     }
 }
@@ -142,27 +142,12 @@ pub(crate) fn record_ui_context(ctx: &egui::Context) {
 
 /// How long a skipped frame waits before the retry the app asks for.
 ///
-/// The retry must not be immediate: a surface that keeps failing — a device
-/// that stays lost, a window that stays unusable — would otherwise repaint in
-/// a tight loop, re-running a failing acquire every millisecond. A quarter
-/// second hides a transient failure while keeping the failing case at a few
-/// frames per second, and it costs nothing once the window is hidden, which is
-/// what a device loss ends in.
+/// The retry must not be immediate: a surface that keeps failing — an acquire
+/// that stays congested, a window that stays unusable — would otherwise
+/// repaint in a tight loop, re-running a failing acquire every millisecond. A
+/// quarter second hides a transient failure while keeping the failing case at
+/// a few frames per second.
 const SURFACE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Whether a device loss has already taken rendering out for this run.
-///
-/// The surface-status handler stops scheduling retries once it is set: a
-/// retry exists for a failure that may clear on its own, and a lost device
-/// clears only when the process restarts, so the frames after this point
-/// belong to the events that arrive anyway.
-static RENDER_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Record that rendering is over for this run: the device is gone and the
-/// window is hidden (see the app's render-lost state).
-pub(crate) fn note_render_lost() {
-    RENDER_LOST.store(true, std::sync::atomic::Ordering::Release);
-}
 
 /// The app's surface-status handler: [`surface_disposition`]'s action, the
 /// repaint a skipped frame needs, and the diagnostic the default handler
@@ -180,9 +165,7 @@ fn on_surface_status(
                 tracing::trace!("Skipping frame due to occlusion.");
             } else {
                 tracing::warn!("Dropped frame with error: {status:?}");
-                if !RENDER_LOST.load(std::sync::atomic::Ordering::Acquire)
-                    && let Some(ctx) = UI_CONTEXT.get()
-                {
+                if let Some(ctx) = UI_CONTEXT.get() {
                     ctx.request_repaint_after(SURFACE_RETRY_DELAY);
                 }
             }

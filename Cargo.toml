@@ -16,28 +16,27 @@ geoip_sha256 = "4149e607530f91da697bad4696f8c59f0a475af38e69405e4124438c9886c721
 geosite_sha256 = "2064a1a4074e145d5022ac49f2c30341e7b7cb6c7948da4fdca973b3fa8411b2"
 
 [patch.crates-io]
-# Vendored with five local fixes:
+# Vendored with four local fixes:
 # - eframe: persist the last measurable window geometry while the window is
 #   minimized (a minimized window's client area cannot be read, and skipping
 #   the save loses a resize made just before minimizing)
 # - eframe: re-arm a repaint egui still owes when nothing is scheduled, so one
 #   wake lost while a native menu ran cannot silence every later request
-# - eframe: catch a panic raised by the paint call, which runs inside winit's
-#   window procedure where a panic cannot unwind to a handler, and disable
-#   painting for the rest of the session instead of aborting the process
-# - egui-wgpu: drop a frame whose staging buffer cannot be created — the device
-#   is gone — with an error and the previous frame's slices, instead of
-#   panicking on a staging write the code assumed could not fail
 # - egui-winit: clamp restored window size to min/max inner size
-# Bump all three forks in lockstep with the egui family: a fork left at an older
-# version than the family makes cargo drop the patch (the lock then records
-# it under `[[patch.unused]]`) and the fixes are silently lost — that is
-# what a bare egui_kittest bump did. supply-chain/config.toml marks all three
+# - wgpu-hal: a Vulkan swapchain acquire whose fence wait runs out is a skipped
+#   frame, not a lost device — mapping `VK_TIMEOUT` through the device errors
+#   invalidates every GPU resource the app holds
+#   (https://github.com/gfx-rs/wgpu/issues/9029)
+# Bump the egui-family forks in lockstep with the egui family, and the wgpu-hal
+# fork in lockstep with wgpu: a fork left at an older version than the crate it
+# patches makes cargo drop the patch (the lock then records it under
+# `[[patch.unused]]`) and the fix is silently lost — that is what a bare
+# egui_kittest bump did. supply-chain/config.toml marks every patched fork
 # `audit-as-crates-io = false`, since cargo-vet must not treat these patched
 # forks as the published crates.
 eframe = { path = "vendor/eframe" }
-egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 [lints.clippy]
 # Mechanical form of the repo's Rust code-quality rules. The repo carries no lint
