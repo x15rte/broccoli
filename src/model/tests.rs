@@ -1098,6 +1098,57 @@ fn user_restricted_attributes_carry_a_valid_dacl() {
     );
 }
 
+/// A save rewrites a state file only when its bytes changed: the file already
+/// holding the serialized value accepts the skip, and the same file refuses
+/// the rewrite a changed value needs.
+///
+/// The read-only attribute is the oracle: a state file that is readable but
+/// not replaceable proves nothing was written, and then proves the write is
+/// real once the value differs. Windows refuses `MoveFileExW` over a
+/// read-only target, which is what [`write_state_atomic`]'s rename is.
+#[test]
+fn an_unchanged_state_file_is_left_alone() {
+    with_appdata(|| {
+        let servers = ServersFile::default();
+        servers.save().expect("the first save writes the file");
+        let path = state_file("servers.json");
+        let set_readonly = |readonly: bool| {
+            let mut permissions = std::fs::metadata(&path)
+                .expect("the state file exists")
+                .permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(&path, permissions).expect("permissions are set");
+        };
+
+        set_readonly(true);
+        servers
+            .save()
+            .expect("an unchanged save leaves the file alone");
+
+        // A kill between the temp write and the rename strands a
+        // full-plaintext temp file, which the skipped save must clear.
+        let stranded = state_temp_file(&path);
+        std::fs::write(&stranded, b"stale plaintext").expect("strand a state temp file");
+        servers.save().expect("a skipped save still succeeds");
+        assert!(
+            !stranded.exists(),
+            "a skipped save must clear a stranded state temp file"
+        );
+
+        let mut changed = servers;
+        changed.profiles.push(ServerProfile::new(
+            "extra",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        assert!(
+            changed.save().is_err(),
+            "a changed value must attempt the rewrite"
+        );
+
+        set_readonly(false);
+    });
+}
+
 #[test]
 fn save_creates_state_and_config_dirs_with_user_only_dacl() {
     with_appdata(|| {

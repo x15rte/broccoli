@@ -62,8 +62,10 @@ const APP_LOG_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 *
 
 /// Minimum spacing between GUI-state saves while the model stays dirty. A
 /// drag or keystroke marks the model dirty on every frame, and each save is
-/// two fsync'd atomic writes (`servers.save()` + `settings.save()`) plus a
-/// full candidate generation, so continuous edits must not persist per frame.
+/// up to two fsync'd atomic rewrites (`servers.save()` + `settings.save()`,
+/// and only the files whose bytes changed actually rewrite) plus, on a config
+/// save, a full candidate generation, so continuous edits must not persist
+/// per frame.
 /// A repaint scheduled at the flush deadline lands the final state ~interval
 /// after the last change. Seconds on egui's clock (`ctx.input(|i| i.time)`),
 /// which eframe drives from real time and the kittest harness from its step

@@ -334,17 +334,10 @@ where
 /// next to the live file. The writer handle is closed by then, so the removal
 /// is not blocked by the open file.
 fn write_state_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = state_temp_file(path);
     let result = flush_and_replace(&tmp, path, bytes);
-    if result.is_err()
-        && let Err(error) = std::fs::remove_file(&tmp)
-    {
-        tracing::debug!(
-            "removing unwritten state temp file {} failed: {error}",
-            tmp.display()
-        );
+    if result.is_err() {
+        discard_state_temp(&tmp);
     }
     result
 }
@@ -364,9 +357,70 @@ fn flush_and_replace(tmp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()
 /// DACL by `ensure_dirs` before this write (the single enforcement point),
 /// so a state file only ever lands in a
 /// current-user-only directory, and the file inherits that ACE on creation.
+///
+/// The rewrite is skipped when the file already holds exactly these bytes.
+/// The temp file, the `sync_all` and the rename are the whole cost of the
+/// rewrite — serializing the value and this comparison still run — and the
+/// app persists both state files on every throttled save, so one of them is
+/// usually unchanged: without the skip a language switch would fsync the
+/// server list it never touched and a profile edit the settings. A skipped
+/// save leaves the existing file and its inherited ACEs untouched.
+/// Every write goes through [`write_state_atomic`], so the file's contents
+/// are either absent, its last serialized value, or a hand-edit; comparing
+/// the bytes needs no in-memory cache to go stale, and a read that fails is a
+/// write, so the skip is only taken when the destination provably matches.
 pub(crate) fn save_state<T: Serialize>(name: &str, value: &T) -> anyhow::Result<()> {
     crate::sys::paths::ensure_dirs()?;
-    write_state_atomic(&state_file(name), &serde_json::to_vec_pretty(value)?)
+    let path = state_file(name);
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if state_file_holds(&path, &bytes) {
+        // A kill between the temp write and the rename can strand a
+        // full-plaintext `<file>.tmp`; the write path truncates and renames
+        // that temp away, so the skip has to clear it instead.
+        discard_state_temp(&state_temp_file(&path));
+        return Ok(());
+    }
+    write_state_atomic(&path, &bytes)
+}
+
+/// True when the state file at `path` already holds exactly `bytes`. The read
+/// is bounded by the reader rather than by a size sampled beforehand, so a
+/// hand-edited or corrupted oversized file — the case [`STATE_FILE_MAX_BYTES`]
+/// exists for — and one that grows under a concurrent writer are both read
+/// through at most `bytes.len() + 1` bytes and compared. Anything else counts
+/// as a change: a missing or unreadable file, or one whose bytes differ.
+fn state_file_holds(path: &Path, bytes: &[u8]) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut existing = Vec::new();
+    file.take(bytes.len() as u64 + 1)
+        .read_to_end(&mut existing)
+        .is_ok_and(|_| existing == bytes)
+}
+
+/// The sibling temp file one atomic write of `path` stages through.
+fn state_temp_file(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
+/// Best-effort removal of a staged state temp file: it holds the full
+/// plaintext state (passwords, UUIDs, the WireGuard key), so neither a failed
+/// write nor a skipped one may leave it beside the live file. An absent temp
+/// is the normal case.
+fn discard_state_temp(tmp: &Path) {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(
+                "removing the state temp file {} failed: {error}",
+                tmp.display()
+            );
+        }
+    }
 }
 
 // ---------- wipe-then-delete of `.broken-*` quarantines ----------
