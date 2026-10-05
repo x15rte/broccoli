@@ -453,6 +453,26 @@ pub struct Int32Range {
     pub to: i32,
 }
 
+/// Go's `ParseRangeString` (`infra/conf/common.go:355`) in Go's own width:
+/// `strconv.Atoi` is a 64-bit parse, `""` reads as `(0, 0)`, and anything else
+/// splits on the dash — from the second dash when the value starts with one,
+/// so negatives work. Nothing is trimmed: a padded value fails on the wire, so
+/// it fails here. Callers holding a 32-bit field narrow the result themselves;
+/// a wire string judged only for its zero-ness needs the full width.
+pub(crate) fn parse_range_go(s: &str) -> Option<(i64, i64)> {
+    if let Ok(value) = s.parse::<i64>() {
+        return Some((value, value));
+    }
+    if s.is_empty() {
+        return Some((0, 0));
+    }
+    let search_from = usize::from(s.starts_with('-'));
+    match s[search_from..].find('-').map(|i| i + search_from) {
+        Some(i) => Some((s[..i].parse().ok()?, s[i + 1..].parse().ok()?)),
+        None => None,
+    }
+}
+
 impl Int32Range {
     pub fn single(v: i32) -> Self {
         Self { from: v, to: v }
@@ -460,20 +480,20 @@ impl Int32Range {
     pub fn new(from: i32, to: i32) -> Self {
         Self { from, to }
     }
+    /// The text-field entry point: the wire grammar with surrounding
+    /// whitespace tolerated, because a field hands back what the user typed.
+    /// An empty value is absence, not zero, and a value outside `i32` cannot
+    /// be stored: both are refused, never coerced.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
-        // Split from the second dash so negatives work (Go splitFromSecondDash).
-        let search_from = if s.starts_with('-') { 1 } else { 0 };
-        match s[search_from..].find('-').map(|i| i + search_from) {
-            Some(i) => Some(Self {
-                from: s[..i].parse().ok()?,
-                to: s[i + 1..].parse().ok()?,
-            }),
-            None => {
-                let v: i32 = s.parse().ok()?;
-                Some(Self::single(v))
-            }
+        if s.is_empty() {
+            return None;
         }
+        let (from, to) = parse_range_go(s)?;
+        Some(Self {
+            from: i32::try_from(from).ok()?,
+            to: i32::try_from(to).ok()?,
+        })
     }
 }
 

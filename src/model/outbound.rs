@@ -1191,8 +1191,8 @@ impl<'de> Deserialize<'de> for OutboundModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlackholeSettings, OutboundModel, Protocol, ProtocolSettings, WireguardPeer,
-        WireguardSettings, blackhole_custom_response_data_decodes,
+        BlackholeSettings, Fragment, Int32Range, Noise, OutboundModel, Protocol, ProtocolSettings,
+        WireguardPeer, WireguardSettings, blackhole_custom_response_data_decodes,
         endpoint_requires_transport_security, is_valid_wireguard_key,
     };
     use crate::model::settings::Language;
@@ -2076,6 +2076,243 @@ mod tests {
             ValidationCode::WireguardPresharedKeyInvalid,
             "settings.peers[].preSharedKey",
         );
+    }
+
+    /// The freedom `settings.fragment` block gates exactly the shapes
+    /// `Fragment.Build` refuses while it builds the configuration, and only
+    /// those. The pinned v26.9.9 binary loads every accepted row below
+    /// (`xray run -test` exits 0) and exits 23 on every gated row, so an
+    /// inverted or negative bound — which `RandBetween` swaps at runtime — is
+    /// no finding, while a padded `packets` is: Go's `ParseRangeString` never
+    /// trims.
+    #[test]
+    fn freedom_fragment_gates_the_shapes_the_core_cannot_load() {
+        use crate::model::validation::{Severity, ValidationCode, validate_outbound};
+
+        fn outbound(
+            packets: &str,
+            length: Option<Int32Range>,
+            interval: Option<Int32Range>,
+        ) -> OutboundModel {
+            let mut outbound = OutboundModel::new(Protocol::Freedom);
+            let ProtocolSettings::Freedom(settings) = &mut outbound.settings else {
+                unreachable!("the helper builds a freedom outbound")
+            };
+            settings.fragment = Some(Fragment {
+                packets: packets.into(),
+                length,
+                interval,
+                ..Default::default()
+            });
+            outbound
+        }
+
+        let length = Int32Range::single(100);
+        let interval = Int32Range::single(10);
+
+        // Accepted on the pinned binary: nothing may gate.
+        for (packets, row_length) in [
+            ("tlshello", Some(length)),
+            ("", Some(length)),
+            ("1-3", Some(length)),
+            ("-1", Some(length)),
+            // `Atoi` is 64-bit, so a start past `i32` still loads.
+            ("9999999999", Some(length)),
+            ("-9999999999", Some(length)),
+            ("2147483648", Some(length)),
+            ("tlshello", Some(Int32Range::new(5, 3))),
+            ("tlshello", Some(Int32Range::new(-5, 5))),
+            // The wire orders the pair before it reads the start, so a 0
+            // second element with a negative first one is a start of -5.
+            ("tlshello", Some(Int32Range::new(0, -5))),
+        ] {
+            let issues = validate_outbound(&outbound(packets, row_length, Some(interval)));
+            assert!(
+                !issues.has_blocking(),
+                "packets={packets:?} length={row_length:?} must stay buildable: {issues:?}"
+            );
+        }
+        for row_interval in [Int32Range::new(5, 3), Int32Range::single(0)] {
+            let issues = validate_outbound(&outbound("tlshello", Some(length), Some(row_interval)));
+            assert!(
+                !issues.has_blocking(),
+                "interval={row_interval:?} must stay buildable: {issues:?}"
+            );
+        }
+        let mut split = outbound("tlshello", Some(length), Some(interval));
+        let ProtocolSettings::Freedom(settings) = &mut split.settings else {
+            unreachable!("the helper builds a freedom outbound")
+        };
+        settings
+            .fragment
+            .as_mut()
+            .expect("the helper sets a fragment")
+            .max_split = Some(Int32Range::new(5, 3));
+        assert!(
+            !validate_outbound(&split).has_blocking(),
+            "an inverted maxSplit must stay buildable"
+        );
+
+        // Refused on the pinned binary: each row gates with the block's code,
+        // field path, and error tier.
+        for (packets, row_length, row_interval) in [
+            ("0-3", Some(length), Some(interval)),
+            ("0", Some(length), Some(interval)),
+            ("bogus", Some(length), Some(interval)),
+            (" 1-3", Some(length), Some(interval)),
+            ("tlshello", Some(Int32Range::single(0)), Some(interval)),
+            // The wire orders `3-0` to a 0 start, which the core refuses.
+            ("tlshello", Some(Int32Range::new(3, 0)), Some(interval)),
+            ("tlshello", None, Some(interval)),
+            ("tlshello", Some(length), None),
+        ] {
+            let issues = validate_outbound(&outbound(packets, row_length, row_interval));
+            let issue = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::FreedomFragmentInvalid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "packets={packets:?} length={row_length:?} interval={row_interval:?} \
+                         must gate: {issues:?}"
+                    )
+                });
+            assert_eq!(issue.severity, Severity::Error);
+            assert_eq!(issue.path.as_deref(), Some("settings.fragment"));
+        }
+    }
+
+    /// The freedom `settings.noises` entries gate exactly what `ParseNoise`
+    /// (`infra/conf/freedom.go`) refuses while it builds the configuration, and
+    /// only those: `type` is compared as written, `packet` is trimmed and then
+    /// read per type, and `applyTo` folds like the core. The pinned v26.9.9
+    /// binary loads every accepted row below (`xray run -test` exits 0) and
+    /// exits 23 on every gated row.
+    #[test]
+    fn freedom_noises_gate_the_shapes_the_core_cannot_load() {
+        use crate::model::validation::{Severity, ValidationCode, validate_outbound};
+
+        fn entry(kind: &str, packet: &str, apply_to: &str) -> Noise {
+            Noise {
+                r#type: kind.into(),
+                packet: packet.into(),
+                apply_to: apply_to.into(),
+                ..Default::default()
+            }
+        }
+
+        fn outbound(noises: Vec<Noise>) -> OutboundModel {
+            let mut outbound = OutboundModel::new(Protocol::Freedom);
+            let ProtocolSettings::Freedom(settings) = &mut outbound.settings else {
+                unreachable!("the helper builds a freedom outbound")
+            };
+            settings.noises = noises;
+            outbound
+        }
+
+        // Accepted on the pinned binary: nothing may gate.
+        for (kind, packet) in [
+            ("str", "x"),
+            ("str", ""),
+            ("rand", "50-100"),
+            ("rand", " 50-100 "),
+            ("rand", "5-3"),
+            ("rand", "-5-5"),
+            ("rand", "9999999999"),
+            ("hex", "AA"),
+            ("hex", " AA "),
+            ("hex", ""),
+            ("base64", "AA"),
+            ("base64", "AA=="),
+            ("base64", ""),
+            // Go's decoder is non-strict: trailing bits are ignored and
+            // `\r`/`\n` are skipped anywhere in the payload.
+            ("base64", "AB"),
+            ("base64", "AAA"),
+            ("base64", "AAB"),
+            ("base64", "AB="),
+            ("base64", "A\nA"),
+            ("base64", "A\r\nA"),
+        ] {
+            let issues = validate_outbound(&outbound(vec![entry(kind, packet, "ip")]));
+            assert!(
+                !issues.has_blocking(),
+                "type={kind:?} packet={packet:?} must stay buildable: {issues:?}"
+            );
+        }
+        for apply_to in [
+            "",
+            "ip",
+            "all",
+            "ipv4",
+            "ipv6",
+            "IPv4",
+            "\u{130}P",
+            "\u{130}Pv4",
+            "ALL",
+        ] {
+            let issues = validate_outbound(&outbound(vec![entry("str", "x", apply_to)]));
+            assert!(
+                !issues.has_blocking(),
+                "applyTo={apply_to:?} must stay buildable: {issues:?}"
+            );
+        }
+        // `delay` carries no rule of its own, and an empty list is legal.
+        for delay in [
+            None,
+            Some(Int32Range::new(5, 3)),
+            Some(Int32Range::single(0)),
+        ] {
+            let mut row = entry("str", "x", "ip");
+            row.delay = delay;
+            let issues = validate_outbound(&outbound(vec![row]));
+            assert!(
+                !issues.has_blocking(),
+                "delay={delay:?} must stay buildable: {issues:?}"
+            );
+        }
+        assert!(
+            !validate_outbound(&outbound(Vec::new())).has_blocking(),
+            "an empty noise list must stay buildable"
+        );
+
+        // Refused on the pinned binary: the entry gates with its own index.
+        for (kind, packet, apply_to) in [
+            ("rand", "", "ip"),
+            ("rand", "0-5", "ip"),
+            ("rand", "bogus", "ip"),
+            ("hex", "AAA", "ip"),
+            ("base64", "A", "ip"),
+            ("base64", "A A", "ip"),
+            ("RAND", "50-100", "ip"),
+            ("", "x", "ip"),
+            (" rand", "50-100", "ip"),
+            ("str", "x", "ipv4v6"),
+            ("str", "x", "ip6"),
+            ("str", "x", "ipv\u{130}"),
+        ] {
+            let issues = validate_outbound(&outbound(vec![entry(kind, packet, apply_to)]));
+            let issue = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::FreedomNoiseInvalid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "type={kind:?} packet={packet:?} applyTo={apply_to:?} must gate: {issues:?}"
+                    )
+                });
+            assert_eq!(issue.severity, Severity::Error);
+            assert_eq!(issue.path.as_deref(), Some("settings.noises[0]"));
+        }
+
+        // The finding names the offending entry, not the block.
+        let issues = validate_outbound(&outbound(vec![
+            entry("str", "x", "ip"),
+            entry("hex", "AAA", "ip"),
+        ]));
+        let issue = issues
+            .iter()
+            .find(|issue| issue.code == ValidationCode::FreedomNoiseInvalid)
+            .expect("the second entry gates");
+        assert_eq!(issue.path.as_deref(), Some("settings.noises[1]"));
     }
 
     /// The WireGuard endpoint-resolution vocabulary at the model pass: every

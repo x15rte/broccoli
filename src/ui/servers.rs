@@ -3,7 +3,6 @@
 //! protocols, all 7 transports, TLS/REALITY, mux, and the advanced envelope
 //! (sendThrough / targetStrategy / finalmask / sockopt).
 
-use base64::Engine as _;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -183,52 +182,12 @@ fn runnable_fragment() -> Fragment {
     }
 }
 
-fn fragment_is_valid(fragment: &Fragment) -> bool {
-    let packets_valid = matches!(
-        fragment.packets.to_ascii_lowercase().as_str(),
-        "" | "tlshello"
-    ) || Int32Range::parse(&fragment.packets)
-        .is_some_and(|range| range.from > 0 && range.to >= range.from);
-    let length_valid = fragment
-        .length
-        .is_some_and(|range| range.from > 0 && range.to >= range.from);
-    let interval_valid = fragment
-        .interval
-        .is_some_and(|range| range.from >= 0 && range.to >= range.from);
-    packets_valid && length_valid && interval_valid
-}
-
 fn runnable_noise() -> Noise {
     Noise {
         r#type: "str".into(),
         packet: "padding".into(),
         ..Default::default()
     }
-}
-
-fn noise_is_valid(noise: &Noise) -> bool {
-    // The core trims the packet before it reads it (infra/conf/freedom.go:199),
-    // so a padded hex or base64 payload is the value it decodes.
-    let packet = noise.packet.trim();
-    let packet_valid = match noise.r#type.as_str() {
-        "rand" => {
-            Int32Range::parse(packet).is_some_and(|range| range.from > 0 && range.to >= range.from)
-        }
-        "str" => true,
-        "hex" => {
-            packet.len().is_multiple_of(2) && packet.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }
-        "base64" => {
-            let normalized = packet.replace('+', "-").replace('/', "_").replace('=', "");
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(normalized)
-                .is_ok()
-        }
-        _ => false,
-    };
-    let apply_to_valid = noise.apply_to.is_empty()
-        || crate::model::vocabulary_holds(&["ip", "all", "ipv4", "ipv6"], &noise.apply_to);
-    packet_valid && apply_to_valid
 }
 
 fn runnable_final_rule() -> FreedomFinalRule {
@@ -286,7 +245,8 @@ struct EditorValidationRender {
     stream_sockopt: Vec<String>,
     ech_sockopt: Vec<String>,
     /// The Basic tab's inline outbound verdicts: the blocking findings whose
-    /// code names a public-endpoint transport-security rule.
+    /// code the tab renders itself — the public-endpoint transport-security
+    /// rules and the freedom fragment and noise blocks.
     basic_inline: Vec<String>,
 }
 
@@ -300,15 +260,19 @@ fn render_findings<'a>(
         .collect()
 }
 
-/// True for the public-endpoint transport-security rules the Basic tab
-/// renders inline at the fields they name — the same findings the error list
-/// carries, filtered by code where they render instead of re-derived.
+/// True for the rules the Basic tab renders inline under the protocol fields —
+/// the public-endpoint transport-security findings and the freedom fragment
+/// and noise blocks the tab's own editors fill in. These are the same findings
+/// the error list carries, filtered by code where they render instead of
+/// re-derived.
 fn basic_tab_inline_verdict(code: &ValidationCode) -> bool {
     matches!(
         code,
         ValidationCode::VisionRequiresTlsOrReality
             | ValidationCode::PublicVlessRequiresTlsOrEncryption
             | ValidationCode::PublicTrojanRequiresTlsOrReality
+            | ValidationCode::FreedomFragmentInvalid
+            | ValidationCode::FreedomNoiseInvalid
     )
 }
 
@@ -445,19 +409,10 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
             // the editor pushes were the same predicates on the same values,
             // from a verdict this list already merges.
         }
-        ProtocolSettings::Freedom(settings) => {
-            if settings
-                .fragment
-                .as_ref()
-                .is_some_and(|fragment| !fragment_is_valid(fragment))
-            {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::FreedomFragmentInvalid,
-                ));
-            }
-            if settings.noises.iter().any(|noise| !noise_is_valid(noise)) {
-                blocking.push(ValidationIssue::error(ValidationCode::FreedomNoiseInvalid));
-            }
+        ProtocolSettings::Freedom(_) => {
+            // The fragment and noises blocks are model rules below
+            // (validate_outbound) whose old editor shapes were both stricter
+            // and looser than the core's, so the editor keeps no copy.
             // finalRules actions are a model rule below (validate_outbound).
         }
         ProtocolSettings::Blackhole(_) => {
@@ -4070,7 +4025,8 @@ impl ServersScreen {
         profile: &mut ServerProfile,
         target: Option<DraftTarget<'_>>,
         // The Basic tab's memoized inline outbound verdicts (the
-        // public-endpoint TLS rules), rendered under the protocol fields.
+        // public-endpoint TLS rules and the freedom blocks), rendered under
+        // the protocol fields.
         inline_errors: &[String],
     ) -> bool {
         let mut changed = false;
@@ -4455,12 +4411,6 @@ impl ServersScreen {
                         &mut fragment.max_split,
                         1..=1000,
                     );
-                    if !fragment_is_valid(fragment) {
-                        ui.colored_label(
-                            status_colors_of(ui).err,
-                            t(lang, Key::SrvFragmentationInvalid),
-                        );
-                    }
                 }
                 changed |= noises_editor(ui, lang, &mut settings.noises);
                 changed |= final_rules_editor(ui, lang, &mut settings.final_rules);
@@ -4617,7 +4567,7 @@ impl ServersScreen {
                 changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
             }
         }
-        // The public-endpoint TLS rules render from the memoized validation
+        // The Basic tab's inline rules render from the memoized validation
         // cache (keyed on the draft generation + language), never from a
         // per-repaint sweep; same text and order as the error list's
         // `validate_outbound` pass.
@@ -7050,9 +7000,6 @@ fn noises_editor(ui: &mut egui::Ui, lang: Language, noises: &mut Vec<Noise>) -> 
                     t(lang, Key::SrvDefault),
                     false,
                 );
-                if !noise_is_valid(n) {
-                    ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvNoiseInvalid));
-                }
                 if ui.button(t(lang, Key::SrvRemoveNoise)).clicked() {
                     del = Some(i);
                 }
@@ -7132,7 +7079,7 @@ mod tests {
         Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
         ServersScreen, SockoptUsage, StatusLine, basic_tab_inline_verdict, drag_scroll_delta,
         ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noise_is_valid, noises_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor,
         refresh_editor_validation, reorder_target, server_list_row, sockopt_findings,
         status_colors_of, status_toast_expired,
     };
@@ -9956,44 +9903,6 @@ Authentication: ML-KEM-768, Post-Quantum
             unreachable!();
         };
         assert_eq!(settings.level, Some(u32::MAX));
-    }
-
-    /// The freedom noise `applyTo` folds like the core: it lowercases the
-    /// value before its switch (`infra/conf/freedom.go:239`), and the pinned
-    /// v26.9.9 binary loads `İP` while refusing `IPVİ`. The `type` field stays
-    /// exact — the core compares it as written (`freedom.go:211`).
-    #[test]
-    fn freedom_noise_apply_to_folds_like_the_core() {
-        let noise = |apply_to: &str| Noise {
-            r#type: "str".into(),
-            apply_to: apply_to.into(),
-            ..Default::default()
-        };
-        for folded in ["\u{130}P", "\u{130}Pv4", "ALL"] {
-            assert!(noise_is_valid(&noise(folded)), "{folded:?}");
-        }
-        for outside in ["ipv\u{130}", "ip6", ""] {
-            let valid = noise_is_valid(&noise(outside));
-            assert_eq!(valid, outside.is_empty(), "{outside:?}");
-        }
-        let wrong_type = Noise {
-            r#type: "RAND".into(),
-            apply_to: "ip".into(),
-            ..Default::default()
-        };
-        assert!(!noise_is_valid(&wrong_type));
-
-        // The core trims the packet before it decodes it
-        // (infra/conf/freedom.go:199), so the padded payload below is the
-        // value it reads — while the parity check still applies afterwards.
-        let hex = |packet: &str| Noise {
-            r#type: "hex".into(),
-            packet: packet.into(),
-            apply_to: "ip".into(),
-            ..Default::default()
-        };
-        assert!(noise_is_valid(&hex(" AA ")));
-        assert!(!noise_is_valid(&hex(" AAA ")));
     }
 
     #[test]

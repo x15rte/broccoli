@@ -1112,7 +1112,6 @@ keys! {
     SrvRemovePeer 0,
     SrvAddPeer 0,
     SrvRemove 0,
-    SrvFragmentationInvalid 0,
     SrvBlackholeResponseInvalid 0,
     SrvDnsRuleActionRequired 0,
     SrvAddDnsRule 0,
@@ -1325,7 +1324,6 @@ keys! {
     SrvMuxDeprecatedNote 0,
     SrvRulesColon 0,
     SrvNoisesUdpObfuscation 0,
-    SrvNoiseInvalid 0,
     SrvRemoveNoise 0,
     SrvFinalRulesPostFragment 0,
     SrvFinalRuleActionInvalid 0,
@@ -3931,9 +3929,6 @@ mod en {
             Key::SrvRemovePeer => "remove peer",
             Key::SrvAddPeer => "+ peer",
             Key::SrvRemove => "remove",
-            Key::SrvFragmentationInvalid => {
-                "fragmentation requires valid packets plus non-empty length and interval"
-            }
             Key::SrvBlackholeResponseInvalid => {
                 "Blackhole response type must be none, http or custom."
             }
@@ -4216,7 +4211,6 @@ mod en {
             }
             Key::SrvRulesColon => "rules:",
             Key::SrvNoisesUdpObfuscation => "noises (UDP obfuscation):",
-            Key::SrvNoiseInvalid => "noise type/packet/applyTo is invalid",
             Key::SrvRemoveNoise => "remove noise",
             Key::SrvFinalRulesPostFragment => "finalRules (post-fragment filtering):",
             Key::SrvFinalRuleActionInvalid => "final rule action must be allow or block",

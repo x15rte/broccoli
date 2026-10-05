@@ -34,21 +34,25 @@ use super::inbound::{
     LocalInboundProtocol, Sniffing, listen_endpoints_conflict,
 };
 use super::outbound::{
-    MuxModel, OutboundModel, ProtocolSettings, blackhole_custom_response_data_decodes,
-    blackhole_response_is_custom, blackhole_response_type_supported,
-    endpoint_requires_transport_security, is_valid_wireguard_key, vless_encryption_supported,
-    wireguard_remote_dns_supported,
+    Fragment, MuxModel, Noise, OutboundModel, ProtocolSettings,
+    blackhole_custom_response_data_decodes, blackhole_response_is_custom,
+    blackhole_response_type_supported, endpoint_requires_transport_security,
+    is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_supported,
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
     Network, Security, SockoptModel, StreamModel, XmuxConfig,
 };
-use super::{ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, vocabulary_holds};
+use super::{
+    ServerProfile, ServersFile, Settings, TunCfg, emit, fold_eq, fold_lower, parse_range_go,
+    vocabulary_holds,
+};
 use crate::links::{excerpt, excerpt_debug};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Every rejection the model layer knows, keyed by rule rather than by
@@ -821,12 +825,14 @@ pub enum ValidationCode {
     /// VMess `settings.id` is empty — the same missing-user state as
     /// [`Self::VlessIdRequired`].
     VmessIdRequired,
-    /// Freedom `settings.fragment` cannot run: Xray's fragment manager
-    /// requires a positive length range and a non-decreasing interval range.
+    /// Freedom `settings.fragment` cannot load: `Fragment.Build`
+    /// (`infra/conf/freedom.go`) refuses a `packets` value it cannot read, a
+    /// `length` or `interval` that is absent, and a `length` that starts at 0.
     FreedomFragmentInvalid,
-    /// A Freedom `settings.noises` entry cannot run: its `type`, `packet`
-    /// payload and `applyTo` value must each match the shape Xray's noise
-    /// manager reads.
+    /// A Freedom `settings.noises` entry cannot load: `ParseNoise`
+    /// (`infra/conf/freedom.go`) refuses a `type` outside rand/str/hex/base64,
+    /// a `packet` that does not decode for its type (a `rand` start of 0
+    /// included), and an `applyTo` outside its vocabulary.
     FreedomNoiseInvalid,
     /// Loopback `settings.inboundTag` is empty: the outbound hands the
     /// connection back to the inbound it names, and no inbound carries the
@@ -1660,6 +1666,84 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Verdict {
     Verdict::from_issues(issues)
 }
 
+/// True when a freedom `settings.fragment` block cannot load.
+///
+/// `Fragment.Build` (`infra/conf/freedom.go`) folds `packets` with
+/// `strings.ToLower` and then reads one of three shapes: `tlshello` (TLS
+/// Hello fragmentation), empty (every packet), or a `ParseRangeString` value
+/// whose start is not 0 — that parser never trims and is 64-bit, so
+/// `"9999999999"` loads while a padded `" 1-3"` fails the build. `length` and
+/// `interval` must both be present, and a `length` whose ordered start is 0 is
+/// refused (`Int32Range.UnmarshalJSON` swaps the pair first, so `"3-0"` reads
+/// as a 0 start on the wire). Bounds that only look backwards still load:
+/// `crypto.RandBetween` swaps an inverted pair (`common/crypto/crypto.go:12`),
+/// so an inverted or negative range is no finding. Every row of that table is
+/// live on the pinned v26.9.9 binary (`xray run -test`: exit 0 accepted,
+/// exit 23 refused).
+fn freedom_fragment_unrunnable(fragment: &Fragment) -> bool {
+    let packets_unrunnable = !fragment.packets.is_empty()
+        && !fold_eq(&fragment.packets, "tlshello")
+        && parse_range_go(&fragment.packets).is_none_or(|(start, _)| start == 0);
+    packets_unrunnable
+        || fragment
+            .length
+            .is_none_or(|range| range.from.min(range.to) == 0)
+        || fragment.interval.is_none()
+}
+
+/// True when a freedom `settings.noises` entry cannot load.
+///
+/// `ParseNoise` (`infra/conf/freedom.go`) reads the entry in three parts. The
+/// `type` is compared exactly — no fold, no trim — over `rand`/`str`/`hex`/
+/// `base64`. The `packet` is trimmed first and then read per type: `rand`
+/// parses it with the same 64-bit, never-trimmed `ParseRangeString` the
+/// fragment's `packets` uses (its start must not be 0); `str` takes it as
+/// written; `hex` must decode as hex, an empty payload being zero bytes; and
+/// `base64` is normalized (`+`→`-`, `/`→`_`, `=` dropped) and decoded as raw
+/// URL base64. `applyTo` folds with `strings.ToLower` over the empty default
+/// plus `ip`, `all`, `ipv4`, `ipv6`. `delay` is read when present and
+/// constrains nothing. Every row of that table is live on the pinned v26.9.9
+/// binary (`xray run -test`: exit 0 accepted, exit 23 refused).
+fn freedom_noise_unrunnable(noise: &Noise) -> bool {
+    let packet = noise.packet.trim();
+    let packet_unrunnable = match noise.r#type.as_str() {
+        "rand" => parse_range_go(packet).is_none_or(|(start, _)| start == 0),
+        "str" => false,
+        "hex" => !(packet.len().is_multiple_of(2) && packet.bytes().all(|b| b.is_ascii_hexdigit())),
+        "base64" => {
+            use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
+            // Go's non-strict `base64.RawURLEncoding`: non-zero trailing bits
+            // decode to the same bytes, and `\r`/`\n` are skipped anywhere, so
+            // the bundled engine's strict trailing-bit check is relaxed and
+            // the newlines are dropped before the decode.
+            const GO_RAW_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+                &base64::alphabet::URL_SAFE,
+                GeneralPurposeConfig::new()
+                    .with_decode_allow_trailing_bits(true)
+                    .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+            );
+
+            let normalized = packet.replace('+', "-").replace('/', "_").replace('=', "");
+            let stripped = if normalized.contains(['\r', '\n']) {
+                Cow::Owned(
+                    normalized
+                        .chars()
+                        .filter(|c| !matches!(c, '\r' | '\n'))
+                        .collect::<String>(),
+                )
+            } else {
+                Cow::Borrowed(normalized.as_str())
+            };
+            GO_RAW_URL_SAFE.decode(stripped.as_bytes()).is_err()
+        }
+        _ => true,
+    };
+    let apply_to_unrunnable = !noise.apply_to.is_empty()
+        && !vocabulary_holds(&["ip", "all", "ipv4", "ipv6"], &noise.apply_to);
+    packet_unrunnable || apply_to_unrunnable
+}
+
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
@@ -2131,6 +2215,34 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         && let Some(sniffing) = settings.sniffing.as_ref()
     {
         issues.extend(validate_sniffing(sniffing, "settings.sniffing"));
+    }
+
+    // Freedom's fragment and noises blocks are load-fatal — `Fragment.Build`
+    // and `ParseNoise` (infra/conf/freedom.go) refuse a value they cannot read,
+    // a fragment `length` or `interval` that is absent, and a fragment
+    // `length` whose ordered start is 0 — so every profile that carries one
+    // gates here, keyed by the offending block's wire path. The editor used to
+    // carry these rules alone, which left raw-JSON and imported profiles
+    // ungated.
+    if let ProtocolSettings::Freedom(settings) = &o.settings {
+        if settings
+            .fragment
+            .as_ref()
+            .is_some_and(freedom_fragment_unrunnable)
+        {
+            issues.push(issue(
+                ValidationCode::FreedomFragmentInvalid,
+                Some("settings.fragment".into()),
+            ));
+        }
+        for (index, noise) in settings.noises.iter().enumerate() {
+            if freedom_noise_unrunnable(noise) {
+                issues.push(issue(
+                    ValidationCode::FreedomNoiseInvalid,
+                    Some(format!("settings.noises[{index}]")),
+                ));
+            }
+        }
     }
 
     // Editor rules that decide configuration validity — moved into the
@@ -3063,9 +3175,13 @@ fn finalmask_validate_bytes(
     raw: &FinalmaskRawValue,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    let kind = encoding.to_ascii_lowercase();
+    // `PraseByteSlice` folds the spelling with `strings.ToLower`
+    // (`infra/conf/transport_finalmask.go:35`); no accepted value carries an
+    // `i` or a `k` — the two letters where Go's simple fold and an ASCII fold
+    // part ways — so this compares exactly, not by ASCII accident.
+    let kind = fold_lower(encoding);
     let Some(value) = raw.value() else {
-        if !matches!(kind.as_str(), "" | "array") {
+        if !matches!(&*kind, "" | "array") {
             issues.push(issue(
                 ValidationCode::FinalmaskBytesValueRequired(excerpt(&kind)),
                 Some(path.to_string()),
@@ -3076,7 +3192,7 @@ fn finalmask_validate_bytes(
     if value.is_null() {
         return;
     }
-    match kind.as_str() {
+    match &*kind {
         "" | "array" => {
             let valid = value.as_array().is_some_and(|values| {
                 values
@@ -3432,9 +3548,12 @@ fn finalmask_validate_quic_params(
     quic: &FinalmaskQuicParams,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    let congestion = quic.congestion.to_ascii_lowercase();
+    // `strings.ToLower` on the wire (`infra/conf/transport_internet.go:250`);
+    // the vocabulary carries no `i` or `k`, so the primitive folds it exactly
+    // rather than by an ASCII accident a future value would break.
+    let congestion = fold_lower(&quic.congestion);
     if !matches!(
-        congestion.as_str(),
+        &*congestion,
         "" | "brutal" | "reno" | "bbr" | "force-brutal"
     ) {
         issues.push(issue(
