@@ -168,6 +168,7 @@ fn protocol_wire_strings() {
         (Protocol::Dns, "dns"),
         (Protocol::Loopback, "loopback"),
         (Protocol::Hysteria, "hysteria"),
+        (Protocol::Masque, "masque"),
     ];
     for (p, s) in expect {
         assert_eq!(p.as_str(), s);
@@ -176,7 +177,7 @@ fn protocol_wire_strings() {
     }
     assert_eq!(Protocol::from_str_lossy("direct"), Protocol::Freedom);
     assert_eq!(Protocol::from_str_lossy("block"), Protocol::Blackhole);
-    assert_eq!(Protocol::ALL.len(), 12);
+    assert_eq!(Protocol::ALL.len(), 13);
 }
 
 #[test]

@@ -7,6 +7,7 @@ use super::{
     Int32Range, fold_eq, fold_lower, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
 };
 use crate::links::excerpt;
+use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -24,6 +25,7 @@ pub enum Network {
     Ws,
     Httpupgrade,
     Hysteria,
+    Masque,
 }
 
 impl Network {
@@ -36,6 +38,7 @@ impl Network {
             Network::Ws => "ws",
             Network::Httpupgrade => "httpupgrade",
             Network::Hysteria => "hysteria",
+            Network::Masque => "masque",
         }
     }
     /// Parse a `streamSettings.network` wire value (the core's own fold, with
@@ -57,6 +60,8 @@ impl Network {
             Some(Network::Httpupgrade)
         } else if fold_eq(s, "hysteria") {
             Some(Network::Hysteria)
+        } else if fold_eq(s, "masque") {
+            Some(Network::Masque)
         } else {
             None
         }
@@ -79,7 +84,7 @@ impl<'de> Deserialize<'de> for Network {
         Network::parse(&value).ok_or_else(|| {
             serde::de::Error::custom(format!(
                 "unknown network value {:?} (expected one of: raw, tcp, xhttp, \
-                 splithttp, kcp, mkcp, grpc, ws, websocket, httpupgrade, hysteria)",
+                 splithttp, kcp, mkcp, grpc, ws, websocket, httpupgrade, hysteria, masque)",
                 excerpt(&value)
             ))
         })
@@ -452,6 +457,62 @@ impl Default for HysteriaTransport {
             masquerade: None,
             extra: Map::new(),
         }
+    }
+}
+
+// ---------- MASQUE (infra/conf/transport_method.go:793-849) ----------
+
+/// The core's `masqueSettings.path` default
+/// (`transport/internet/masque/config.go`: `DefaultPath`); the model keeps an
+/// unset path empty and the wire carries this value.
+pub const MASQUE_DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
+
+/// `masqueSettings` (infra/conf/transport_method.go:793-849). `user`/`pass`
+/// are conf-only keys the core folds into a single `Authorization: Basic`
+/// header while it builds the transport; the wire carries the folded header
+/// alone, so both fields stay here for the editor and round-trip.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MasqueTransport {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub host: String,
+    /// Empty means the core's `DefaultPath`; the wire carries that value.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub path: String,
+    /// Conf-only basic-auth user. A `:` is refused by the core's own build.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub user: String,
+    /// Conf-only basic-auth password.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub pass: String,
+    /// `host` and `capsule-protocol` are reserved; `authorization` clashes
+    /// with `user`/`pass`. All three are refused by the core's build.
+    #[serde(skip_serializing_if = "skip_empty_map")]
+    pub headers: Map<String, Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl MasqueTransport {
+    /// Rewrite the draft into the document the core receives: fill the
+    /// default path, fold `user`/`pass` into the one `Authorization: Basic`
+    /// header the core's own conf build synthesizes, and drop the conf-only
+    /// keys (infra/conf/transport_method.go:801-844).
+    pub(crate) fn normalize_for_wire(&mut self) {
+        if self.path.is_empty() {
+            self.path = MASQUE_DEFAULT_PATH.to_string();
+        }
+        if self.user.is_empty() && self.pass.is_empty() {
+            return;
+        }
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", self.user, self.pass));
+        self.headers.insert(
+            "Authorization".into(),
+            Value::String(format!("Basic {encoded}")),
+        );
+        self.user.clear();
+        self.pass.clear();
     }
 }
 
@@ -1768,7 +1829,7 @@ impl FinalmaskModel {
 /// The transport-block table: one row per `network`, naming the settings
 /// field it owns and the wire key that field serializes under.
 ///
-/// `network` is a discriminator whose payload lives in seven sibling fields,
+/// `network` is a discriminator whose payload lives in eight sibling fields,
 /// so "which block does this transport use" is a fact every reader needs:
 /// selecting a transport, dropping the others on the wire, judging a
 /// transport block missing, the editor's tab, and `is_default`'s "no
@@ -1855,6 +1916,7 @@ transport_blocks! {
     Ws: ws_settings, WsSettings => Some("wsSettings");
     Httpupgrade: httpupgrade_settings, HttpupgradeSettings => Some("httpupgradeSettings");
     Hysteria: hysteria_settings, HysteriaTransport => Some("hysteriaSettings");
+    Masque: masque_settings, MasqueTransport => Some("masqueSettings");
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1884,6 +1946,8 @@ pub struct StreamModel {
     pub httpupgrade_settings: Option<HttpupgradeSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hysteria_settings: Option<HysteriaTransport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub masque_settings: Option<MasqueTransport>,
     #[serde(skip_serializing_if = "Security::is_none")]
     pub security: Security,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1916,6 +1980,10 @@ impl StreamModel {
                 .httpupgrade_settings
                 .as_ref()
                 .map(|settings| (&settings.headers, "stream.httpupgradeSettings.headers")),
+            Network::Masque => self
+                .masque_settings
+                .as_ref()
+                .map(|settings| (&settings.headers, "stream.masqueSettings.headers")),
             _ => None,
         }
     }
@@ -1948,6 +2016,13 @@ impl StreamModel {
             }
             Security::Tls => self.reality_settings = None,
             Security::Reality => self.tls_settings = None,
+        }
+        if let Some(masque) = self.masque_settings.as_mut() {
+            // The conf-only keys and the unset default are draft facts: the
+            // generated document carries the core's effective values (the
+            // default path and the folded basic-auth header) exactly as the
+            // core's own conf build would produce them.
+            masque.normalize_for_wire();
         }
         if let Some(websocket) = self.ws_settings.as_mut() {
             // `self` is the cloned wire model. Canonicalize Xray's accepted
@@ -2052,6 +2127,9 @@ impl StreamModel {
     pub fn select_security(&mut self, security: Security) -> Result<(), ValidationCode> {
         if self.network == Network::Hysteria && security != Security::Tls {
             return Err(ValidationCode::HysteriaTransportRequiresTls);
+        }
+        if self.network == Network::Masque && security != Security::Tls {
+            return Err(ValidationCode::MasqueTransportRequiresTls);
         }
         if security == Security::Reality && !self.network.supports_reality() {
             return Err(ValidationCode::RealityRequiresTransport);

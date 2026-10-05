@@ -1261,6 +1261,46 @@ fn golden_hysteria2() {
     );
 }
 
+/// A MASQUE outbound over its own transport: the `masqueSettings` block
+/// carries the default-path placeholders, the reserved-name-free headers map
+/// and the credentials folded into one `Authorization: Basic` header, which is
+/// what the pinned core accepts.
+#[test]
+fn golden_masque() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        remote_dns: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
+        ..Default::default()
+    });
+    {
+        let masque = ob
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound materializes its transport");
+        masque.host = "masque.example.com".into();
+        masque.path = "/.well-known/masque/ip/{target}/{ipproto}/".into();
+        masque.user = "user".into();
+        masque.pass = "secret".into();
+        masque
+            .headers
+            .insert("X-Trace".into(), Value::String("1".into()));
+    }
+    let tls = ob
+        .stream
+        .tls_settings
+        .as_mut()
+        .expect("a masque outbound carries TLS");
+    tls.server_name = "masque.example.com".into();
+    tls.alpn = vec!["h2".into()];
+    golden!(
+        "goldens/masque.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_hysteria2_udphop_mask() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);

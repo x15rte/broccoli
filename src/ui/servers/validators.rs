@@ -97,6 +97,21 @@ pub(super) fn v_wg_remote_dns_entry(lang: Language, entry: &str) -> Option<Strin
     Some(t(lang, Key::SrvWgRemoteDnsEntryInvalid).to_string())
 }
 
+/// Per-entry verdict for the MASQUE in-tunnel DNS list: the entry must be an
+/// address literal, because the core parses every entry with `netip.ParseAddr`
+/// while it builds the outbound and refuses the config
+/// (infra/conf/masque.go:27-30). The message is the model's own
+/// `MasqueRemoteDnsInvalid` text — one message channel per rule.
+pub(super) fn v_masque_remote_dns_entry(lang: Language, entry: &str) -> Option<String> {
+    if crate::model::outbound::masque_remote_dns_entry_supported(entry) {
+        return None;
+    }
+    Some(crate::i18n::validation_message(
+        &crate::model::validation::ValidationCode::MasqueRemoteDnsInvalid,
+        lang,
+    ))
+}
+
 /// The tool-output guard for a generated encryption value. Delegates to the
 /// shared model predicate (`vless_encryption_supported`), so the keygen row,
 /// the import grammar, and the field's model finding agree about what the

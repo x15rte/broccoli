@@ -62,8 +62,8 @@ use finalmask_editors::{
 use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
 use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
 use validators::{
-    v_optional_wg_key, v_required, v_uuid, v_uuid_required, v_vless_encryption,
-    v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
+    v_masque_remote_dns_entry, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
+    v_vless_encryption, v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
 };
 use xray_tool::XrayToolKind;
 
@@ -429,6 +429,10 @@ fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindin
         ProtocolSettings::Hysteria(settings) => {
             require_remote(&mut blocking, &settings.address, settings.port);
             // version is a model invariant reported below.
+        }
+        ProtocolSettings::Masque(_) => {
+            // Address/port requiredness, the transport/TLS pair, mux, and the
+            // remote-DNS list are model rules below — one message channel.
         }
     }
     // Model validation pass: protocol + stream + transport security in one
@@ -3766,13 +3770,17 @@ impl ServersScreen {
                             inline_errors,
                         )
                     }
-                    EditorTab::Transport => self.transport_tab(
-                        ui,
-                        lang,
-                        &mut draft.profile.outbound.stream,
-                        0,
-                        Some(target),
-                    ),
+                    EditorTab::Transport => {
+                        let masque_outbound = draft.profile.outbound.protocol == Protocol::Masque;
+                        self.transport_tab(
+                            ui,
+                            lang,
+                            &mut draft.profile.outbound.stream,
+                            masque_outbound,
+                            0,
+                            Some(target),
+                        )
+                    }
                     EditorTab::Security => {
                         let address = draft.profile.server_address();
                         let ech_sockopt_errors: &[String] = draft
@@ -4566,6 +4574,19 @@ impl ServersScreen {
             ProtocolSettings::Hysteria(settings) => {
                 changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
             }
+            ProtocolSettings::Masque(settings) => {
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                // Every entry is an address literal; a bad one refuses the
+                // config at load (the model's `MasqueRemoteDnsInvalid`).
+                changed |= widgets::validated_string_list(
+                    ui,
+                    lang,
+                    t(lang, Key::SrvMasqueRemoteDns),
+                    &mut settings.remote_dns,
+                    "1.1.1.1",
+                    |entry, _list_len| v_masque_remote_dns_entry(lang, entry),
+                );
+            }
         }
         // The Basic tab's inline rules render from the memoized validation
         // cache (keyed on the draft generation + language), never from a
@@ -4652,21 +4673,30 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         st: &mut StreamModel,
+        // Whether the outbound in scope is MASQUE. The transport selector
+        // offers the masque transport only for a masque outbound and only it
+        // for one, so both mismatches the model reports are unreachable here.
+        masque_outbound: bool,
         depth: u32,
         target: Option<DraftTarget<'_>>,
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvNetwork));
-            for n in [
-                Network::Raw,
-                Network::Xhttp,
-                Network::Kcp,
-                Network::Grpc,
-                Network::Ws,
-                Network::Httpupgrade,
-                Network::Hysteria,
-            ] {
+            let networks: &[Network] = if masque_outbound {
+                &[Network::Masque]
+            } else {
+                &[
+                    Network::Raw,
+                    Network::Xhttp,
+                    Network::Kcp,
+                    Network::Grpc,
+                    Network::Ws,
+                    Network::Httpupgrade,
+                    Network::Hysteria,
+                ]
+            };
+            for &n in networks {
                 let allowed = st.security != Security::Reality
                     || n.supports_reality()
                     || n == Network::Hysteria;
@@ -4693,6 +4723,12 @@ impl ServersScreen {
                     _ => response,
                 };
                 if response.clicked() && st.network != n && st.select_network(n).is_ok() {
+                    // MASQUE runs only over TLS, so choosing its transport
+                    // selects that security mode too rather than leaving a
+                    // pair the model would refuse.
+                    if n == Network::Masque {
+                        let _ = st.select_security(Security::Tls);
+                    }
                     changed = true;
                 }
             }
@@ -4712,6 +4748,19 @@ impl ServersScreen {
                 ui.colored_label(
                     status_colors_of(ui).err,
                     t(lang, Key::SrvHysteriaRequiresTls),
+                );
+                if ui.small_button(t(lang, Key::SrvSwitchToTls)).clicked()
+                    && st.select_security(Security::Tls).is_ok()
+                {
+                    changed = true;
+                }
+            });
+        }
+        if st.network == Network::Masque && st.security != Security::Tls {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    status_colors_of(ui).err,
+                    validation_message(&ValidationCode::MasqueTransportRequiresTls, lang),
                 );
                 if ui.small_button(t(lang, Key::SrvSwitchToTls)).clicked()
                     && st.select_security(Security::Tls).is_ok()
@@ -5107,8 +5156,14 @@ impl ServersScreen {
                             }
                             if let Some(download) = s.download_settings.as_mut() {
                                 ui.indent(("download", depth), |ui| {
-                                    changed |=
-                                        self.transport_tab(ui, lang, download, depth + 1, target);
+                                    changed |= self.transport_tab(
+                                        ui,
+                                        lang,
+                                        download,
+                                        masque_outbound,
+                                        depth + 1,
+                                        target,
+                                    );
                                     changed |= self.security_tab_readonly(ui, lang, download);
                                 });
                             }
@@ -5309,6 +5364,26 @@ impl ServersScreen {
                     st.hysteria_settings = Some(s);
                 }
             }
+            Network::Masque => {
+                let had_settings = st.masque_settings.is_some();
+                let mut s = st.masque_settings.take().unwrap_or_default();
+                changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                // An unset path leaves the core's own default; the field hint
+                // shows that value, and only the two placeholders survive the
+                // model's `MasquePathInvalid` rule.
+                changed |= widgets::text_field(
+                    ui,
+                    "path",
+                    &mut s.path,
+                    crate::model::stream::MASQUE_DEFAULT_PATH,
+                );
+                changed |= widgets::text_field(ui, "user", &mut s.user, "");
+                changed |= widgets::text_field(ui, "pass", &mut s.pass, "");
+                changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                if had_settings || changed {
+                    st.masque_settings = Some(s);
+                }
+            }
         }
         changed
     }
@@ -5349,10 +5424,18 @@ impl ServersScreen {
         ech_sockopt_errors: &[String],
     ) -> bool {
         let mut changed = false;
+        // MASQUE runs only over TLS, so its transport narrows the selector to
+        // that one mode exactly as the hysteria transport does.
+        let masque_transport = st.network == Network::Masque;
         if st.network == Network::Hysteria && st.security != Security::Tls {
             ui.colored_label(
                 status_colors_of(ui).err,
                 t(lang, Key::SrvHysteria2RequiresTlsSelectBelow),
+            );
+        } else if masque_transport && st.security != Security::Tls {
+            ui.colored_label(
+                status_colors_of(ui).err,
+                validation_message(&ValidationCode::MasqueTransportRequiresTls, lang),
             );
         } else if st.security == Security::Reality && !st.network.supports_reality() {
             ui.colored_label(
@@ -5368,7 +5451,7 @@ impl ServersScreen {
                     Security::Tls => "tls",
                     Security::Reality => "reality",
                 };
-                let allowed = if st.network == Network::Hysteria {
+                let allowed = if st.network == Network::Hysteria || masque_transport {
                     sec == Security::Tls
                 } else {
                     sec != Security::Reality || st.network.supports_reality()
@@ -5380,6 +5463,11 @@ impl ServersScreen {
                     response
                 } else if st.network == Network::Hysteria {
                     response.on_disabled_hover_text(t(lang, Key::SrvHysteria2RequiresTls))
+                } else if masque_transport {
+                    response.on_disabled_hover_text(validation_message(
+                        &ValidationCode::MasqueTransportRequiresTls,
+                        lang,
+                    ))
                 } else {
                     response.on_disabled_hover_text(validation_message(
                         &ValidationCode::RealityRequiresTransport,
@@ -5422,6 +5510,18 @@ impl ServersScreen {
                     &mut s.alpn,
                     t(lang, Key::SrvAlpnHint),
                 );
+                // The MASQUE transport dials HTTP/2 only when `h2` is present
+                // and `h3` is absent, so the pair silently picks HTTP/3; the
+                // model warning fires for the same pair.
+                if masque_transport
+                    && s.alpn.iter().any(|protocol| protocol == "h2")
+                    && s.alpn.iter().any(|protocol| protocol == "h3")
+                {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang),
+                    );
+                }
                 changed |= widgets::noted(ui, t(lang, Key::SrvTlsFingerprintNote), |ui| {
                     fingerprint_editor(
                         ui,
@@ -6298,13 +6398,18 @@ impl ServersScreen {
                                     inline_errors,
                                 )
                             }
-                            EditorTab::Transport => self.transport_tab(
-                                ui,
-                                lang,
-                                &mut draft.profile.outbound.stream,
-                                0,
-                                Some(target),
-                            ),
+                            EditorTab::Transport => {
+                                let masque_outbound =
+                                    draft.profile.outbound.protocol == Protocol::Masque;
+                                self.transport_tab(
+                                    ui,
+                                    lang,
+                                    &mut draft.profile.outbound.stream,
+                                    masque_outbound,
+                                    0,
+                                    Some(target),
+                                )
+                            }
                             EditorTab::Security => {
                                 let address = draft.profile.server_address();
                                 let ech_sockopt_errors: &[String] = draft
@@ -7092,9 +7197,9 @@ mod tests {
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
         FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask,
         FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry,
-        FreedomFinalRule, HysteriaTransport, Network, Noise, OutboundModel, Protocol,
-        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-        WireguardPeer, WsSettings, XhttpSettings,
+        FreedomFinalRule, HysteriaTransport, MasqueTransport, Network, Noise, OutboundModel,
+        Protocol, ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
+        TlsModel, WireguardPeer, WsSettings, XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -9514,6 +9619,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         ui,
                         Language::En,
                         &mut stream,
+                        false,
                         0,
                         draft_target(DraftKind::Existing, "0123456789abcdef", 1),
                     );
@@ -9534,6 +9640,90 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
+    /// The transport selector offers the masque transport only for a masque
+    /// outbound, and only it for one — the two mismatches the model reports
+    /// stay unreachable through the editor.
+    #[test]
+    fn transport_selector_offers_masque_only_for_a_masque_outbound() {
+        {
+            let mut stream = StreamModel {
+                network: Network::Ws,
+                ..Default::default()
+            };
+            let mut screen = ServersScreen::default();
+            let harness = Harness::new_ui(|ui| {
+                let _ = screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+            });
+            assert!(
+                harness
+                    .query_all_by_label_contains("masque")
+                    .next()
+                    .is_none(),
+                "a non-masque outbound must not offer the masque transport"
+            );
+            assert!(
+                harness
+                    .query_all_by_label_contains("httpupgrade")
+                    .next()
+                    .is_some(),
+                "a non-masque outbound offers the other transports"
+            );
+        }
+        {
+            let mut stream = StreamModel {
+                network: Network::Masque,
+                security: Security::Tls,
+                ..Default::default()
+            };
+            let mut screen = ServersScreen::default();
+            let harness = Harness::new_ui(|ui| {
+                let _ = screen.transport_tab(ui, Language::En, &mut stream, true, 0, None);
+            });
+            assert!(
+                harness
+                    .query_all_by_label_contains("masque")
+                    .next()
+                    .is_some(),
+                "a masque outbound must offer the masque transport"
+            );
+            assert!(
+                harness
+                    .query_all_by_label_contains("httpupgrade")
+                    .next()
+                    .is_none(),
+                "a masque outbound must offer no other transport"
+            );
+        }
+    }
+
+    /// The masque transport's options render as real widgets — host, path,
+    /// and the two credentials — instead of a raw JSON box.
+    #[test]
+    fn masque_transport_editor_renders_its_fields() {
+        let mut stream = StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            masque_settings: Some(MasqueTransport {
+                host: "masque.example.com".into(),
+                path: crate::model::stream::MASQUE_DEFAULT_PATH.into(),
+                user: "user".into(),
+                pass: "pass".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(ui, Language::En, &mut stream, true, 0, None);
+        });
+        for label in ["host", "path", "user", "pass"] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the masque editor must render its {label:?} field"
+            );
+        }
+    }
+
     #[test]
     fn transport_security_mux_and_advanced_tabs_are_render_idempotent() {
         for network in [
@@ -9544,6 +9734,7 @@ Authentication: ML-KEM-768, Post-Quantum
             Network::Ws,
             Network::Httpupgrade,
             Network::Hysteria,
+            Network::Masque,
         ] {
             let mut stream = StreamModel {
                 network,
@@ -9554,8 +9745,14 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut reported_changed = false;
             {
                 let _harness = Harness::new_ui(|ui| {
-                    reported_changed |=
-                        screen.transport_tab(ui, Language::En, &mut stream, 0, None);
+                    reported_changed |= screen.transport_tab(
+                        ui,
+                        Language::En,
+                        &mut stream,
+                        network == Network::Masque,
+                        0,
+                        None,
+                    );
                 });
             }
             assert!(!reported_changed, "{}", network.as_str());
@@ -10305,7 +10502,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut reported_changed = false;
         {
             let _harness = Harness::new_ui(|ui| {
-                reported_changed |= screen.transport_tab(ui, Language::En, &mut stream, 0, None);
+                reported_changed |=
+                    screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
             });
         }
         assert!(!reported_changed);
@@ -13419,6 +13617,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 &mut stream_for_ui.borrow_mut(),
+                false,
                 0,
                 None,
             );

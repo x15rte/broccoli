@@ -137,6 +137,7 @@ impl ServerProfile {
             ProtocolSettings::Socks(settings) => (&settings.address, settings.port),
             ProtocolSettings::Http(settings) => (&settings.address, settings.port),
             ProtocolSettings::Hysteria(settings) => (&settings.address, settings.port),
+            ProtocolSettings::Masque(settings) => (&settings.address, settings.port),
             ProtocolSettings::Wireguard(settings) => {
                 let endpoint = settings
                     .peers

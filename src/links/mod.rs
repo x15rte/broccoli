@@ -1080,20 +1080,32 @@ impl TransportSpec {
     /// The `type` value, or the refusal for a transport the grammar cannot
     /// spell.
     fn spelling(&self) -> Result<&'static str, LinkError> {
-        self.type_string.ok_or_else(unshareable_transport)
+        self.type_string
+            .ok_or_else(|| unshareable_transport(self.network))
     }
 }
 
-/// The refusal for a transport the share grammar cannot spell. Hysteria is the
-/// only one — the grammar has no `type` value, no field and no scheme for it —
-/// and unlike the transports Xray removed it is a live model network, so
-/// export states the reason instead of reporting an unknown `type`.
-fn unshareable_transport() -> LinkError {
-    LinkError::Unsupported(Diag::new(Key::LinkUnsupportedHysteria))
+/// The refusal for a transport the share grammar cannot spell. Hysteria and
+/// MASQUE are the two — the grammar has no `type` value, no field and no
+/// scheme for either — and unlike the transports Xray removed they are live
+/// model networks, so export states the reason instead of reporting an
+/// unknown `type`.
+fn unshareable_transport(network: Network) -> LinkError {
+    let key = match network {
+        Network::Masque => Key::LinkUnsupportedMasque,
+        Network::Raw
+        | Network::Xhttp
+        | Network::Kcp
+        | Network::Grpc
+        | Network::Ws
+        | Network::Httpupgrade
+        | Network::Hysteria => Key::LinkUnsupportedHysteria,
+    };
+    LinkError::Unsupported(Diag::new(key))
 }
 
 /// The table, in the order the representability ladder reports transports.
-const TRANSPORTS: &[TransportSpec] = &[RAW, KCP, WS, GRPC, HTTPUPGRADE, XHTTP, HYSTERIA];
+const TRANSPORTS: &[TransportSpec] = &[RAW, KCP, WS, GRPC, HTTPUPGRADE, XHTTP, HYSTERIA, MASQUE];
 
 /// The row for `network`. The table declares every `Network` variant, so
 /// adding one is a compile error here rather than a transport the grammar
@@ -1107,6 +1119,7 @@ fn transport_spec(network: Network) -> &'static TransportSpec {
         Network::Httpupgrade => &HTTPUPGRADE,
         Network::Xhttp => &XHTTP,
         Network::Hysteria => &HYSTERIA,
+        Network::Masque => &MASQUE,
     }
 }
 
@@ -1727,6 +1740,20 @@ const HYSTERIA: TransportSpec = TransportSpec {
     fields: &[],
     refused: &[],
     is_present: |stream| option_has_fields(&stream.hysteria_settings),
+};
+
+/// MASQUE is a live model network the share grammar cannot spell: no `type`
+/// value, no field and no scheme carry its settings. The row exists so the
+/// representability ladder reports it by name, and so `transport_spec` stays
+/// exhaustive over `Network`.
+const MASQUE: TransportSpec = TransportSpec {
+    network: Network::Masque,
+    path: "streamSettings.masqueSettings",
+    type_string: None,
+    type_aliases: &[],
+    fields: &[],
+    refused: &[],
+    is_present: |stream| option_has_fields(&stream.masque_settings),
 };
 
 /// Apply the link's `type` parameter: the row's fields, each with the link's
@@ -3442,6 +3469,11 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             // the arm refuses nothing: export still refuses it through
             // `transport_params`' `spelling()`, and `vless://…?type=hysteria`
             // is refused as an unknown transport (the row spells no `type`).
+        }
+        Network::Masque => {
+            // No share format builds or spells this transport, so the arm
+            // refuses nothing: export refuses it through `transport_params`'
+            // `spelling()`.
         }
     }
     if let Some(finalmask) = stream.finalmask.as_ref() {

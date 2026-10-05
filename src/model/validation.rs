@@ -35,9 +35,10 @@ use super::inbound::{
     listen_endpoints_conflict,
 };
 use super::outbound::{
-    Fragment, MuxModel, Noise, OutboundModel, ProtocolSettings, blackhole_response_is_custom,
-    blackhole_response_type_supported, endpoint_requires_transport_security,
-    is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_supported,
+    Fragment, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
+    blackhole_response_is_custom, blackhole_response_type_supported,
+    endpoint_requires_transport_security, is_valid_wireguard_key, masque_remote_dns_supported,
+    vless_encryption_supported, wireguard_remote_dns_supported,
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
@@ -887,6 +888,74 @@ pub enum ValidationCode {
     /// Configuration warning (class E, Severity::Warning): the
     /// code carries the offending key.
     XhttpExtraShadowsSettings(String),
+    /// The `masque` transport is carried by an outbound whose protocol is not
+    /// `masque`: the pinned core refuses the document while it builds the
+    /// outbound (`the masque transport can only be used by the masque
+    /// outbound`, infra/conf/xray.go:351-353). Error tier: the profile gates
+    /// until the protocol or the transport changes.
+    MasqueTransportRequiresMasqueOutbound,
+    /// A `masque` outbound does not carry the `masque` transport. The core
+    /// loads the document and refuses the outbound while it creates the
+    /// handler (`not masque transport`, proxy/masque/client.go:59-61), so a
+    /// config-file check never sees it — the model reports it instead. Error
+    /// tier: the profile cannot start.
+    MasqueOutboundRequiresMasqueTransport,
+    /// A `masque` outbound with `mux.enabled`: the pinned core refuses the
+    /// outbound at load (``masque outbound does not support "mux"``,
+    /// infra/conf/xray.go:347-350). Error tier.
+    MasqueOutboundMuxUnsupported,
+    /// The `masque` transport without `security: tls`. The core loads the
+    /// document and refuses the outbound while it creates the handler
+    /// (``MASQUE requires "security": "tls"``, proxy/masque/client.go:61-63);
+    /// REALITY is refused earlier by the transport itself, and no other
+    /// security mode carries TLS. Error tier.
+    MasqueTransportRequiresTls,
+    /// A `masque` outbound with an empty `settings.address` or a zero
+    /// `settings.port`: the core's own conf build refuses both at load
+    /// (``MASQUE: "address" is not set`` / ``MASQUE: "port" is not set``,
+    /// infra/conf/masque.go:20-26). One rule, path-disambiguated. Error tier.
+    MasqueSettingsIncomplete,
+    /// A `masque` `settings.remoteDNS` entry is not an address literal: the
+    /// core parses every entry with `netip.ParseAddr` while it builds the
+    /// outbound (infra/conf/masque.go:27-30) and refuses the document. An
+    /// empty list stays legal — the core substitutes its own default. Error
+    /// tier.
+    MasqueRemoteDnsInvalid,
+    /// `stream.masqueSettings.path` is neither empty (the core's own default)
+    /// nor a `/`-prefixed string whose only placeholders are `{target}` and
+    /// `{ipproto}`: the core rewrites those two and refuses a path with a
+    /// leading character other than `/` or any brace left over
+    /// (infra/conf/transport_method.go:801-813). Error tier.
+    MasquePathInvalid,
+    /// `stream.masqueSettings.host` is not a bare `host[:port]` authority:
+    /// the core parses `"https://" + host` and requires the parsed authority
+    /// to equal the input (infra/conf/transport_method.go:813-817), so a
+    /// scheme, path, query, fragment or userinfo is refused. Error tier.
+    MasqueHostInvalid,
+    /// A `stream.masqueSettings.headers` entry the core's HTTP field-name or
+    /// field-value check refuses (infra/conf/transport_method.go:818-822).
+    /// The code carries the offending header name. Error tier.
+    MasqueHeaderInvalid(String),
+    /// A `stream.masqueSettings.headers` entry named `host` or
+    /// `capsule-protocol` (case-insensitively): the core reserves both and
+    /// refuses the document (infra/conf/transport_method.go:823-825). The
+    /// code carries the offending spelling. Error tier.
+    MasqueReservedHeader(String),
+    /// `stream.masqueSettings.headers` carries an `authorization` entry while
+    /// `user` or `pass` is set: the core synthesizes that header itself and
+    /// refuses the clash (infra/conf/transport_method.go:826-830). Error
+    /// tier.
+    MasqueAuthorizationConflict,
+    /// `stream.masqueSettings.user` carries a `:`, which the basic-auth
+    /// header cannot represent; the core refuses it
+    /// (infra/conf/transport_method.go:833-835). Error tier.
+    MasqueUserColon,
+    /// Configuration warning (Severity::Warning): `stream.tlsSettings.alpn`
+    /// carries both `h2` and `h3` on a `masque` stream. The transport dials
+    /// HTTP/2 only when `h2` is present and `h3` is absent
+    /// (transport/internet/masque/dialer.go:132-134), so the pair silently
+    /// picks HTTP/3; the core accepts the config and runs it.
+    MasqueAlpnPrefersHttp3,
 
     // ---- draft requirements ----
     //
@@ -1852,6 +1921,222 @@ fn freedom_noise_unrunnable(noise: &Noise) -> bool {
     packet_unrunnable || apply_to_unrunnable
 }
 
+/// True when a `masqueSettings.path` is one the pinned core builds:
+/// `infra/conf/transport_method.go:801-813` substitutes the default for an
+/// empty path, rewrites `{target}` and `{ipproto}` to `*`, and then requires
+/// a leading `/` and no leftover braces. The core additionally rewrites the
+/// four combined `{?…}`/`{&…}` query forms; the app accepts only the two
+/// documented placeholders, so a path built on a combined form is refused
+/// here even though the core would run it.
+fn masque_path_supported(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let replaced = path.replace("{target}", "*").replace("{ipproto}", "*");
+    replaced.starts_with('/') && !replaced.contains('{') && !replaced.contains('}')
+}
+
+/// True when a `masqueSettings.host` is the bare `host[:port]` authority the
+/// core's `url.Parse("https://" + host)` accepts with `u.Host == host`
+/// (infra/conf/transport_method.go:813-817): no scheme, path, query, fragment
+/// or userinfo separator, an optional all-digit port, and — when bracketed —
+/// an IPv6 literal. Empty stays valid (the core leaves the request authority
+/// to the dial address).
+fn masque_host_supported(host: &str) -> bool {
+    if host.is_empty() {
+        return true;
+    }
+    // The URL parser always reports a scheme/mark separator outside the
+    // authority as a different host, so any of these makes `u.Host` differ
+    // from the input.
+    if host
+        .bytes()
+        .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'/' | b'?' | b'#' | b'@' | b'\\'))
+    {
+        return false;
+    }
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        let Some((literal, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if literal.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return match tail.strip_prefix(':') {
+            Some(port) => !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
+            None => tail.is_empty(),
+        };
+    } else {
+        match host.split_once(':') {
+            Some((name, port)) => {
+                if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return false;
+                }
+                name
+            }
+            None => host,
+        }
+    };
+    !name.is_empty()
+}
+
+/// True when one `masqueSettings.headers` name is a valid HTTP field name
+/// (the core's `httpguts.ValidHeaderFieldName`, a non-empty RFC 7230 token).
+fn masque_header_name_supported(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// True when one `masqueSettings.headers` value is a valid HTTP field value
+/// (the core's `httpguts.ValidHeaderFieldValue`): no control byte other than
+/// the two line whitespace characters, and no DEL.
+fn masque_header_value_supported(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| (byte >= b' ' || byte == b'\t') && byte != 0x7f)
+}
+
+/// The MASQUE outbound/transport pair rules and the transport's own option
+/// rules. The pair rules need the outbound protocol and the stream at once,
+/// so they live here; the transport's own rules (`path`, `host`, `headers`,
+/// credentials, the ALPN pair) ride `validate_stream` below.
+fn validate_masque(o: &OutboundModel, issues: &mut Vec<ValidationIssue>) {
+    if o.protocol == Protocol::Masque && o.stream.network != Network::Masque {
+        issues.push(issue(
+            ValidationCode::MasqueOutboundRequiresMasqueTransport,
+            Some("stream.network".into()),
+        ));
+    }
+    if o.stream.network == Network::Masque && o.protocol != Protocol::Masque {
+        issues.push(issue(
+            ValidationCode::MasqueTransportRequiresMasqueOutbound,
+            Some("stream.network".into()),
+        ));
+    }
+    if o.protocol == Protocol::Masque && o.mux.enabled {
+        issues.push(issue(
+            ValidationCode::MasqueOutboundMuxUnsupported,
+            Some("mux.enabled".into()),
+        ));
+    }
+    if let ProtocolSettings::Masque(settings) = &o.settings {
+        if settings.address.is_empty() {
+            issues.push(issue(
+                ValidationCode::MasqueSettingsIncomplete,
+                Some("settings.address".into()),
+            ));
+        }
+        if settings.port == 0 {
+            issues.push(issue(
+                ValidationCode::MasqueSettingsIncomplete,
+                Some("settings.port".into()),
+            ));
+        }
+        if !masque_remote_dns_supported(&settings.remote_dns) {
+            issues.push(issue(
+                ValidationCode::MasqueRemoteDnsInvalid,
+                Some("settings.remoteDNS".into()),
+            ));
+        }
+    }
+}
+
+/// The `masque` transport's own option rules, on the stream where its
+/// settings live: TLS, `path`, `host`, `headers`, credentials and the ALPN
+/// pair. Called from `validate_stream`'s visit.
+fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<ValidationIssue>) {
+    if stream.network != Network::Masque {
+        return;
+    }
+    if stream.security != Security::Tls {
+        issues.push(issue(
+            ValidationCode::MasqueTransportRequiresTls,
+            Some("stream.security".into()),
+        ));
+    }
+    if let Some(masque) = stream.masque_settings.as_ref() {
+        if !masque_path_supported(&masque.path) {
+            issues.push(issue(
+                ValidationCode::MasquePathInvalid,
+                Some("stream.masqueSettings.path".into()),
+            ));
+        }
+        if !masque_host_supported(&masque.host) {
+            issues.push(issue(
+                ValidationCode::MasqueHostInvalid,
+                Some("stream.masqueSettings.host".into()),
+            ));
+        }
+        let credentials = !masque.user.is_empty() || !masque.pass.is_empty();
+        if credentials && masque.user.contains(':') {
+            issues.push(issue(
+                ValidationCode::MasqueUserColon,
+                Some("stream.masqueSettings.user".into()),
+            ));
+        }
+        for (name, value) in &masque.headers {
+            // A non-string value has its own rule (`HeaderValuesNotStrings`);
+            // this pass only judges the names and values that reach the
+            // core's string-typed map. The core checks the name/value shape
+            // before the reserved-name switch, so that order is kept.
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            if !masque_header_name_supported(name) || !masque_header_value_supported(value) {
+                issues.push(issue(
+                    ValidationCode::MasqueHeaderInvalid(excerpt(name)),
+                    Some("stream.masqueSettings.headers".into()),
+                ));
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if matches!(lower.as_str(), "host" | "capsule-protocol") {
+                issues.push(issue(
+                    ValidationCode::MasqueReservedHeader(excerpt(name)),
+                    Some("stream.masqueSettings.headers".into()),
+                ));
+            } else if lower == "authorization" && credentials {
+                issues.push(issue(
+                    ValidationCode::MasqueAuthorizationConflict,
+                    Some("stream.masqueSettings.headers".into()),
+                ));
+            }
+        }
+    }
+    // The transport dials HTTP/2 only when the TLS ALPN list carries `h2` and
+    // no `h3` (transport/internet/masque/dialer.go:132-134); with both the
+    // list picks HTTP/3, which the core accepts silently.
+    if stream.security == Security::Tls
+        && let Some(tls) = stream.tls_settings.as_ref()
+        && tls.alpn.iter().any(|value| value == "h2")
+        && tls.alpn.iter().any(|value| value == "h3")
+    {
+        issues.push(warning(
+            ValidationCode::MasqueAlpnPrefersHttp3,
+            Some("stream.tlsSettings.alpn".into()),
+        ));
+    }
+}
+
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
@@ -2396,6 +2681,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         ));
     }
 
+    validate_masque(o, &mut issues);
     issues.extend(validate_stream(&o.stream));
     Verdict::from_issues(issues)
 }
@@ -2448,6 +2734,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 ));
             }
         }
+        validate_masque_stream(stream, issues);
         if stream.security == Security::Reality && !stream.network.supports_reality() {
             issues.push(issue(
                 ValidationCode::RealityRequiresTransport,
@@ -5163,8 +5450,8 @@ mod tests {
     use super::*;
     use crate::model::outbound::{OutboundModel, Protocol, ProtocolSettings};
     use crate::model::stream::{
-        CustomSockopt, GrpcSettings, HttpupgradeSettings, HysteriaTransport, KcpSettings, Security,
-        SockoptModel, WsSettings, XhttpSettings,
+        CustomSockopt, GrpcSettings, HttpupgradeSettings, HysteriaTransport, KcpSettings,
+        MasqueTransport, Security, SockoptModel, WsSettings, XhttpSettings,
     };
     use serde_json::json;
 
@@ -5753,6 +6040,249 @@ mod tests {
         assert_eq!(
             version_issues[1].path.as_deref(),
             Some("stream.hysteriaSettings.version")
+        );
+    }
+
+    /// A runnable MASQUE outbound: address and port set, and the masque
+    /// transport with TLS that `OutboundModel::new` materializes.
+    fn runnable_masque() -> OutboundModel {
+        let mut outbound = OutboundModel::new(Protocol::Masque);
+        let ProtocolSettings::Masque(settings) = &mut outbound.settings else {
+            unreachable!()
+        };
+        settings.address = "masque.example.com".into();
+        settings.port = 443;
+        outbound
+    }
+
+    /// The pinned core refuses the masque transport on another protocol at
+    /// config load and refuses a masque outbound without its transport, with
+    /// mux, or without TLS at instance creation; the model gates each.
+    #[test]
+    fn masque_outbound_and_transport_pair_rules_gate_both_directions() {
+        assert!(
+            !validate_outbound(&runnable_masque()).has_blocking(),
+            "a masque outbound over its own transport must pass"
+        );
+
+        // A masque outbound on another transport (the core answers `not
+        // masque transport` at instance creation).
+        let mut orphan = runnable_masque();
+        orphan.stream.network = Network::Raw;
+        let found = codes(&validate_outbound(&orphan));
+        assert!(
+            found.contains(&ValidationCode::MasqueOutboundRequiresMasqueTransport),
+            "{found:#?}"
+        );
+
+        // The masque transport on another protocol (a config-load refusal).
+        let mut foreign = runnable_masque();
+        foreign.protocol = Protocol::Vless;
+        foreign.settings = ProtocolSettings::default_for(Protocol::Vless);
+        let found = codes(&validate_outbound(&foreign));
+        assert!(
+            found.contains(&ValidationCode::MasqueTransportRequiresMasqueOutbound),
+            "{found:#?}"
+        );
+
+        // Mux on the masque outbound (a config-load refusal).
+        let mut muxed = runnable_masque();
+        muxed.mux.enabled = true;
+        let found = codes(&validate_outbound(&muxed));
+        assert!(found.contains(&ValidationCode::MasqueOutboundMuxUnsupported));
+
+        // No TLS on the masque transport (an instance-creation refusal).
+        let mut plain = runnable_masque();
+        plain.stream.security = Security::None;
+        let found = codes(&validate_outbound(&plain));
+        assert!(
+            found.contains(&ValidationCode::MasqueTransportRequiresTls),
+            "{found:#?}"
+        );
+
+        // Missing address and port (config-load refusals).
+        let mut incomplete = runnable_masque();
+        let ProtocolSettings::Masque(settings) = &mut incomplete.settings else {
+            unreachable!()
+        };
+        settings.address = String::new();
+        settings.port = 0;
+        let issues = validate_outbound(&incomplete);
+        let paths: Vec<&str> = issues
+            .iter()
+            .filter(|issue| issue.code == ValidationCode::MasqueSettingsIncomplete)
+            .filter_map(|issue| issue.path.as_deref())
+            .collect();
+        assert_eq!(paths, ["settings.address", "settings.port"]);
+
+        // A remote DNS entry that is not an address literal.
+        let mut dns = runnable_masque();
+        let ProtocolSettings::Masque(settings) = &mut dns.settings else {
+            unreachable!()
+        };
+        settings.remote_dns = vec!["not-an-ip".into()];
+        let found = codes(&validate_outbound(&dns));
+        assert!(found.contains(&ValidationCode::MasqueRemoteDnsInvalid));
+
+        // An empty remote DNS list stays legal: the core substitutes its own.
+        let ProtocolSettings::Masque(settings) = &mut dns.settings else {
+            unreachable!()
+        };
+        settings.remote_dns.clear();
+        let found = codes(&validate_outbound(&dns));
+        assert!(!found.contains(&ValidationCode::MasqueRemoteDnsInvalid));
+    }
+
+    /// The masque transport's own option rules: path placeholders, host
+    /// shape, header names and values, the reserved names, the credential
+    /// clash, and the HTTP/2-versus-HTTP/3 ALPN pair.
+    #[test]
+    fn masque_transport_option_rules_gate_path_host_headers_and_credentials() {
+        let with_transport = |mutate: &dyn Fn(&mut MasqueTransport)| -> Verdict {
+            let mut outbound = runnable_masque();
+            let masque = outbound
+                .stream
+                .masque_settings
+                .as_mut()
+                .expect("a masque outbound materializes its transport");
+            mutate(masque);
+            validate_outbound(&outbound)
+        };
+
+        // Empty path (the core's own default) and the two documented
+        // placeholders are accepted.
+        for accepted in [
+            "",
+            "/.well-known/masque/ip/*/*/",
+            "/.well-known/masque/ip/{target}/{ipproto}/",
+        ] {
+            let verdict = with_transport(&|masque| masque.path = accepted.into());
+            assert!(
+                !codes(&verdict).contains(&ValidationCode::MasquePathInvalid),
+                "{accepted:?} must be accepted"
+            );
+        }
+        // A missing leading slash, an undocumented placeholder, or a combined
+        // query form is refused.
+        for refused in ["x/y", "/x/{foo}/", "/x/{?target,ipproto}"] {
+            let verdict = with_transport(&|masque| masque.path = refused.into());
+            assert!(
+                codes(&verdict).contains(&ValidationCode::MasquePathInvalid),
+                "{refused:?} must be refused"
+            );
+        }
+
+        // A bare host with an optional port is accepted.
+        for accepted in ["", "example.com", "example.com:8443", "[::1]:443"] {
+            let verdict = with_transport(&|masque| masque.host = accepted.into());
+            assert!(
+                !codes(&verdict).contains(&ValidationCode::MasqueHostInvalid),
+                "{accepted:?} must be accepted"
+            );
+        }
+        // A scheme, userinfo, path or space is refused.
+        for refused in [
+            "http://evil/x",
+            "user@example.com",
+            "example.com/path",
+            "exa mple",
+        ] {
+            let verdict = with_transport(&|masque| masque.host = refused.into());
+            assert!(
+                codes(&verdict).contains(&ValidationCode::MasqueHostInvalid),
+                "{refused:?} must be refused"
+            );
+        }
+
+        // The two reserved names, whatever their case.
+        for reserved in ["Host", "host", "Capsule-Protocol"] {
+            let verdict = with_transport(&|masque| {
+                masque.headers.insert(reserved.into(), json!("x"));
+            });
+            let found = codes(&verdict);
+            assert!(
+                found.contains(&ValidationCode::MasqueReservedHeader(reserved.into())),
+                "{reserved:?}: {found:#?}"
+            );
+        }
+
+        // An invalid field name and an invalid field value, each carried by
+        // the offending name.
+        let verdict = with_transport(&|masque| {
+            masque.headers.insert("Bad Name".into(), json!("x"));
+        });
+        assert!(codes(&verdict).contains(&ValidationCode::MasqueHeaderInvalid("Bad Name".into())));
+        let verdict = with_transport(&|masque| {
+            masque.headers.insert("X-Test".into(), json!("bad\nvalue"));
+        });
+        assert!(codes(&verdict).contains(&ValidationCode::MasqueHeaderInvalid("X-Test".into())));
+
+        // An explicit authorization header beside credentials.
+        let verdict = with_transport(&|masque| {
+            masque.user = "user".into();
+            masque.pass = "pass".into();
+            masque
+                .headers
+                .insert("Authorization".into(), json!("Basic x"));
+        });
+        assert!(codes(&verdict).contains(&ValidationCode::MasqueAuthorizationConflict));
+
+        // A colon in the user cannot be represented by the folded header.
+        let verdict = with_transport(&|masque| {
+            masque.user = "a:b".into();
+            masque.pass = "pass".into();
+        });
+        assert!(codes(&verdict).contains(&ValidationCode::MasqueUserColon));
+
+        // Both protocol identifiers make the transport pick HTTP/3 without
+        // the user asking for it; the core runs the config, so this warns.
+        let mut outbound = runnable_masque();
+        outbound
+            .stream
+            .tls_settings
+            .as_mut()
+            .expect("a masque outbound carries TLS")
+            .alpn = vec!["h2".into(), "h3".into()];
+        let verdict = validate_outbound(&outbound);
+        assert!(!verdict.has_blocking(), "the ALPN pair must not gate");
+        assert!(
+            verdict
+                .advisory()
+                .any(|issue| issue.code == ValidationCode::MasqueAlpnPrefersHttp3),
+            "{verdict:#?}"
+        );
+
+        // A single HTTP/2 identifier is the explicit choice and stays silent.
+        let mut outbound = runnable_masque();
+        outbound.stream.tls_settings.as_mut().unwrap().alpn = vec!["h2".into()];
+        assert!(validate_outbound(&outbound).advisory().next().is_none());
+    }
+
+    /// The `masqueSettings` block is required like every other block-carrying
+    /// transport, and a non-string header value is the shared
+    /// `HeaderValuesNotStrings` finding.
+    #[test]
+    fn masque_transport_settings_missing_and_non_string_headers_are_reported() {
+        let mut outbound = runnable_masque();
+        outbound.stream.masque_settings = None;
+        let found = codes(&validate_outbound(&outbound));
+        assert!(
+            found.contains(&ValidationCode::TransportSettingsMissing(Network::Masque)),
+            "{found:#?}"
+        );
+
+        let mut outbound = runnable_masque();
+        outbound
+            .stream
+            .masque_settings
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("X-Num".into(), json!(1));
+        let found = codes(&validate_outbound(&outbound));
+        assert!(
+            found.contains(&ValidationCode::HeaderValuesNotStrings(Network::Masque)),
+            "{found:#?}"
         );
     }
 

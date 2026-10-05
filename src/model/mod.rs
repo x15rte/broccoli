@@ -31,9 +31,10 @@ pub use inbound::{
 };
 pub use outbound::{
     BlackholeResponse, BlackholeSettings, DnsOutRule, DnsOutboundSettings, Fragment,
-    FreedomFinalRule, FreedomSettings, HttpSettings, HysteriaSettings, LoopbackSettings, MuxModel,
-    Noise, OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings, SocksSettings,
-    TrojanSettings, VlessReverse, VlessSettings, VmessSettings, WireguardPeer, WireguardSettings,
+    FreedomFinalRule, FreedomSettings, HttpSettings, HysteriaSettings, LoopbackSettings,
+    MasqueSettings, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
+    ShadowsocksSettings, SocksSettings, TrojanSettings, VlessReverse, VlessSettings, VmessSettings,
+    WireguardPeer, WireguardSettings,
 };
 pub use routing::{
     Balancer, BurstObservatoryCfg, LeastLoadSettings, ObservatoryCfg, PingConfig, RoutingCfg, Rule,
@@ -51,9 +52,9 @@ pub use stream::{
     FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolver,
     FinalmaskXdnsResolverEntry, FinalmaskXdnsResolverSettings, FinalmaskXicmp, FinalmaskXmc,
     FinalmaskXmcProfile, GrpcSettings, HappyEyeballs, HttpCamouflageRequest,
-    HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport, KcpSettings, Network,
-    RawHeader, RawSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-    WsSettings, XhttpSettings, XmuxConfig,
+    HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport, KcpSettings, MasqueTransport,
+    Network, RawHeader, RawSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
+    TlsModel, WsSettings, XhttpSettings, XmuxConfig,
 };
 pub use validation::{ValidationCode, ValidationIssue};
 

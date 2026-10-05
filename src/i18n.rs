@@ -1294,6 +1294,21 @@ keys! {
     SrvWsSettingsMissing 0,
     SrvHttpupgradeSettingsMissing 0,
     SrvHysteriaTransportSettingsMissing 0,
+    SrvMasqueOutboundTransport 0,
+    SrvMasqueTransportMissing 0,
+    SrvMasqueSettingsMissing 0,
+    SrvMasqueMuxUnsupported 0,
+    SrvMasqueTransportTls 0,
+    SrvMasqueSettingsIncomplete 0,
+    SrvMasqueRemoteDns 0,
+    SrvMasquePathInvalid 0,
+    SrvMasqueHostInvalid 0,
+    SrvMasqueHeaderInvalid 1,
+    SrvMasqueReservedHeader 1,
+    SrvMasqueAuthorizationConflict 0,
+    SrvMasqueUserColon 0,
+    SrvMasqueAlpnHttp3 0,
+    SrvMasqueHeaderValues 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
     SrvMasterKeyLogNotSupported 0,
@@ -1877,6 +1892,7 @@ keys! {
     LinkUnsupportedVmessAlterId 0,
     LinkUnsupportedQueryField 1,
     LinkUnsupportedHysteria 0,
+    LinkUnsupportedMasque 0,
     LinkUnsupportedLegacyField 1,
     LinkUnsupportedLegacyVersion 1,
     LinkUnsupportedVmessAlterIdValue 1,
@@ -2389,6 +2405,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
             Network::Ws => t(lang, Key::SrvWsSettingsMissing),
             Network::Httpupgrade => t(lang, Key::SrvHttpupgradeSettingsMissing),
             Network::Hysteria => t(lang, Key::SrvHysteriaTransportSettingsMissing),
+            Network::Masque => t(lang, Key::SrvMasqueSettingsMissing),
             Network::Raw => {
                 debug_assert!(false, "TransportSettingsMissing cannot name raw");
                 t(lang, Key::SrvXhttpSettingsMissing)
@@ -2400,6 +2417,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
             Network::Xhttp => t(lang, Key::LinkXhttpHeaderValues),
             Network::Ws => t(lang, Key::LinkWsHeaderValues),
             Network::Httpupgrade => t(lang, Key::LinkHttpupgradeHeaderValues),
+            Network::Masque => t(lang, Key::SrvMasqueHeaderValues),
             _ => {
                 debug_assert!(false, "HeaderValuesNotStrings cannot name {network:?}");
                 t(lang, Key::LinkWsHeaderValues)
@@ -2407,6 +2425,19 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         },
         HysteriaTransportRequiresTls => t(lang, Key::SrvHysteriaTransportTls),
         HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
+        MasqueTransportRequiresMasqueOutbound => t(lang, Key::SrvMasqueOutboundTransport),
+        MasqueOutboundRequiresMasqueTransport => t(lang, Key::SrvMasqueTransportMissing),
+        MasqueOutboundMuxUnsupported => t(lang, Key::SrvMasqueMuxUnsupported),
+        MasqueTransportRequiresTls => t(lang, Key::SrvMasqueTransportTls),
+        MasqueSettingsIncomplete => t(lang, Key::SrvMasqueSettingsIncomplete),
+        MasqueRemoteDnsInvalid => t(lang, Key::SrvMasqueRemoteDns),
+        MasquePathInvalid => t(lang, Key::SrvMasquePathInvalid),
+        MasqueHostInvalid => t(lang, Key::SrvMasqueHostInvalid),
+        MasqueHeaderInvalid(_) => t(lang, Key::SrvMasqueHeaderInvalid),
+        MasqueReservedHeader(_) => t(lang, Key::SrvMasqueReservedHeader),
+        MasqueAuthorizationConflict => t(lang, Key::SrvMasqueAuthorizationConflict),
+        MasqueUserColon => t(lang, Key::SrvMasqueUserColon),
+        MasqueAlpnPrefersHttp3 => t(lang, Key::SrvMasqueAlpnHttp3),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -2666,6 +2697,8 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::FinalmaskNoiseExpArgumentNotAllowed(arg)
         | ValidationCode::XhttpExtraShadowsSettings(arg)
         | ValidationCode::TunLeakValueUnknown(arg)
+        | ValidationCode::MasqueHeaderInvalid(arg)
+        | ValidationCode::MasqueReservedHeader(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
@@ -4199,6 +4232,27 @@ mod en {
             Key::SrvWsSettingsMissing => "WebSocket settings are missing",
             Key::SrvHttpupgradeSettingsMissing => "HTTPUpgrade settings are missing",
             Key::SrvHysteriaTransportSettingsMissing => "Hysteria transport settings are missing",
+            Key::SrvMasqueOutboundTransport => "MASQUE transport requires a MASQUE outbound",
+            Key::SrvMasqueTransportMissing => "MASQUE outbound requires the MASQUE transport",
+            Key::SrvMasqueSettingsMissing => "MASQUE settings are missing",
+            Key::SrvMasqueMuxUnsupported => "MASQUE outbound does not support mux",
+            Key::SrvMasqueTransportTls => "MASQUE transport requires TLS",
+            Key::SrvMasqueSettingsIncomplete => "MASQUE server address and port are required",
+            Key::SrvMasqueRemoteDns => "Every MASQUE remote DNS entry must be an IP address",
+            Key::SrvMasquePathInvalid => {
+                "MASQUE path must start with a slash and use only the target and ipproto placeholders"
+            }
+            Key::SrvMasqueHostInvalid => {
+                "MASQUE host must be a host name or address with an optional port"
+            }
+            Key::SrvMasqueHeaderInvalid => "Invalid MASQUE header: {}",
+            Key::SrvMasqueReservedHeader => "The MASQUE headers map cannot carry {}",
+            Key::SrvMasqueAuthorizationConflict => {
+                "The MASQUE headers map cannot carry authorization while user or pass is set"
+            }
+            Key::SrvMasqueUserColon => "MASQUE user cannot contain a colon",
+            Key::SrvMasqueAlpnHttp3 => "An ALPN list with both h2 and h3 makes MASQUE use HTTP/3",
+            Key::SrvMasqueHeaderValues => "MASQUE header values must be strings",
             Key::SrvStreamOneNoDownload => "stream-one cannot use downloadSettings",
             Key::SrvDownloadNestingExceeds => {
                 "XHTTP downloadSettings nesting exceeds the safety depth"
@@ -5231,6 +5285,7 @@ mod en {
             }
             Key::LinkUnsupportedQueryField => "The query field {} is not defined for this link.",
             Key::LinkUnsupportedHysteria => "The hysteria transport has no share-link mapping.",
+            Key::LinkUnsupportedMasque => "The masque transport has no share-link mapping.",
             Key::LinkUnsupportedLegacyField => {
                 "The legacy vmess JSON field {} cannot be represented by the #716 URL format."
             }

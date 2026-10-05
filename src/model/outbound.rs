@@ -24,7 +24,7 @@ macro_rules! outbound_protocols {
         $(#[$variant_meta:meta])*
         $variant:ident = $wire:literal $( | $alias:literal )* => $settings:ident,
     )*) => {
-        /// The 12 client-side outbound protocols (infra/conf/xray.go:37-52).
+        /// The 13 client-side outbound protocols (infra/conf/xray.go:37-52).
         /// Serializes to the Xray protocol string.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
         pub enum Protocol {
@@ -121,6 +121,7 @@ outbound_protocols! {
     Dns = "dns" => DnsOutboundSettings,
     Loopback = "loopback" => LoopbackSettings,
     Hysteria = "hysteria" => HysteriaSettings,
+    Masque = "masque" => MasqueSettings,
 }
 
 impl Serialize for Protocol {
@@ -371,6 +372,22 @@ pub fn wireguard_remote_dns_supported(entries: &[String]) -> bool {
         .iter()
         .all(|entry| wireguard_remote_dns_entry_supported(entry))
 }
+
+/// True when one MASQUE `remoteDNS` entry parses as an address literal
+/// through the core's `netip.ParseAddr` (infra/conf/masque.go:27-30).
+pub fn masque_remote_dns_entry_supported(entry: &str) -> bool {
+    parses_as_remote_dns_address(entry)
+}
+
+/// True when a whole MASQUE `remoteDNS` list is one the pinned core can
+/// build: every entry parses as an address literal. Empty is legal — the core
+/// substitutes its own four-server default (proxy/masque/client.go:73-75).
+pub fn masque_remote_dns_supported(entries: &[String]) -> bool {
+    entries
+        .iter()
+        .all(|entry| masque_remote_dns_entry_supported(entry))
+}
+
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key
 /// size: 64 hexadecimal digits, or raw standard/URL-safe base64 with zero or
 /// one trailing padding character. Go trims one `=` and ignores CR and LF
@@ -648,6 +665,24 @@ impl Default for HysteriaSettings {
             extra: Map::new(),
         }
     }
+}
+
+/// MASQUE outbound (infra/conf/masque.go:13-39). The outbound runs only over
+/// the `masque` transport with `security: tls`, and the pinned core refuses
+/// `mux` on it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MasqueSettings {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub address: String,
+    #[serde(skip_serializing_if = "skip_zero_u16")]
+    pub port: u16,
+    /// In-tunnel resolvers; every entry must be an address literal. Empty
+    /// leaves the core's own four-server default.
+    #[serde(rename = "remoteDNS", skip_serializing_if = "skip_empty_vec")]
+    pub remote_dns: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Deserialize a JSON value with the failing field path attached, so import
@@ -966,8 +1001,20 @@ impl OutboundModel {
             settings: ProtocolSettings::default_for(p),
             ..Default::default()
         };
+        if p == Protocol::Masque {
+            model.enter_masque_transport();
+        }
         model.enforce_invariants();
         model
+    }
+
+    /// Put a MASQUE outbound on the transport and security it must run over:
+    /// the `masque` transport with TLS. Only a fresh model and a protocol
+    /// switch call this — a loaded profile that carries the pair wrongly is
+    /// left for the model pass to report, never repaired on the way in.
+    fn enter_masque_transport(&mut self) {
+        let _ = self.stream.select_security(super::stream::Security::Tls);
+        let _ = self.stream.select_network(super::stream::Network::Masque);
     }
 
     /// Make this outbound dial through `tag` — the one chain spelling the
@@ -980,18 +1027,27 @@ impl OutboundModel {
         self.stream.sockopt = Some(sockopt);
     }
 
-    /// Switch protocol and normalize the transport state that Hysteria2 owns.
+    /// Switch protocol and normalize the transport state that Hysteria2 and
+    /// MASQUE own.
     pub fn select_protocol(&mut self, protocol: Protocol) {
         let leaving_hysteria = self.protocol == Protocol::Hysteria
             || self.stream.network == super::stream::Network::Hysteria;
+        let leaving_masque = self.protocol == Protocol::Masque
+            || self.stream.network == super::stream::Network::Masque;
         self.protocol = protocol;
         self.settings = ProtocolSettings::default_for(protocol);
         if protocol == Protocol::Hysteria {
             let _ = self.stream.select_network(super::stream::Network::Hysteria);
+        } else if protocol == Protocol::Masque {
+            self.enter_masque_transport();
         } else if leaving_hysteria {
             self.stream.network = super::stream::Network::Raw;
             self.stream.raw_settings = None;
             self.stream.hysteria_settings = None;
+        } else if leaving_masque {
+            self.stream.network = super::stream::Network::Raw;
+            self.stream.raw_settings = None;
+            self.stream.masque_settings = None;
         }
         self.enforce_invariants();
     }
@@ -1433,6 +1489,97 @@ mod tests {
         assert_eq!(outbound.stream.security, Security::Tls);
         assert!(outbound.stream.hysteria_settings.is_none());
         assert!(matches!(outbound.settings, ProtocolSettings::Trojan(_)));
+    }
+
+    /// A MASQUE profile round-trips through the settings file unchanged, and
+    /// its wire form carries the folded basic-auth header and the core's
+    /// default path instead of the conf-only fields.
+    #[test]
+    fn masque_model_round_trips_and_folds_credentials_and_default_path_on_wire() {
+        let mut outbound = OutboundModel::new(Protocol::Masque);
+        assert_eq!(outbound.stream.network, Network::Masque);
+        assert_eq!(outbound.stream.security, Security::Tls);
+        assert!(outbound.stream.masque_settings.is_some());
+        let ProtocolSettings::Masque(settings) = &mut outbound.settings else {
+            unreachable!()
+        };
+        settings.address = "masque.example.com".into();
+        settings.port = 443;
+        settings.remote_dns = vec!["1.1.1.1".into()];
+        {
+            let masque = outbound.stream.masque_settings.as_mut().unwrap();
+            masque.host = "masque.example.com".into();
+            masque.user = "user".into();
+            masque.pass = "pass".into();
+        }
+
+        // The stored file keeps the conf-only credentials and the unset path.
+        let stored = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(
+            stored["settings"]["remoteDNS"],
+            json!(["1.1.1.1"]),
+            "the wire key is the core's own"
+        );
+        let restored: OutboundModel = serde_json::from_value(stored).unwrap();
+        let ProtocolSettings::Masque(settings) = &restored.settings else {
+            unreachable!()
+        };
+        assert_eq!(settings.address, "masque.example.com");
+        assert_eq!(settings.port, 443);
+        let masque = restored.stream.masque_settings.as_ref().unwrap();
+        assert_eq!(masque.user, "user");
+        assert_eq!(masque.pass, "pass");
+        assert!(masque.path.is_empty(), "an unset path stays unset");
+        assert!(
+            masque.headers.is_empty(),
+            "the draft carries no synthesized header"
+        );
+
+        let wire = restored.to_wire("srv-01234567");
+        let masque = &wire["streamSettings"]["masqueSettings"];
+        assert_eq!(masque["path"], crate::model::stream::MASQUE_DEFAULT_PATH);
+        assert_eq!(masque["host"], "masque.example.com");
+        assert_eq!(masque["user"], Value::Null);
+        assert_eq!(masque["pass"], Value::Null);
+        assert_eq!(
+            masque["headers"]["Authorization"],
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("user:pass")
+            )
+        );
+    }
+
+    /// Switching to MASQUE arms its transport and TLS, and leaving it drops
+    /// the block — the UI cannot leave the pair half-set.
+    #[test]
+    fn masque_protocol_transition_arms_and_leaves_the_transport() {
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.select_protocol(Protocol::Masque);
+        assert_eq!(outbound.stream.network, Network::Masque);
+        assert_eq!(outbound.stream.security, Security::Tls);
+        assert!(outbound.stream.masque_settings.is_some());
+
+        outbound.select_protocol(Protocol::Vless);
+        assert_eq!(outbound.stream.network, Network::Raw);
+        assert!(outbound.stream.masque_settings.is_none());
+    }
+
+    /// The masque transport refuses a nont-TLS security mode through the
+    /// selector's own guard, so the pair the core refuses is unreachable.
+    #[test]
+    fn masque_transport_security_selector_refuses_non_tls() {
+        let mut stream = crate::model::stream::StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            ..Default::default()
+        };
+        assert_eq!(
+            stream.select_security(Security::None),
+            Err(crate::model::validation::ValidationCode::MasqueTransportRequiresTls)
+        );
+        assert_eq!(stream.security, Security::Tls);
+        assert!(stream.select_security(Security::Tls).is_ok());
     }
 
     #[test]
