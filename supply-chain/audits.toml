@@ -4746,6 +4746,10 @@ version = "1.0.69"
 criteria = "safe-to-deploy"
 version = "2.0.20"
 
+[[audits.thiserror]]
+criteria = "safe-to-deploy"
+version = "2.0.21"
+
 [[audits.thiserror-impl]]
 criteria = "safe-to-deploy"
 version = "1.0.69"
@@ -4753,6 +4757,10 @@ version = "1.0.69"
 [[audits.thiserror-impl]]
 criteria = "safe-to-deploy"
 version = "2.0.20"
+
+[[audits.thiserror-impl]]
+criteria = "safe-to-deploy"
+version = "2.0.21"
 
 [[audits.thread_local]]
 criteria = "safe-to-deploy"
