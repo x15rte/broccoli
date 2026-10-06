@@ -162,8 +162,6 @@ fn wireguard_editor_hides_non_applicable_fields() {
 /// checkbox fails here. `GUARDS` are the field labels those groups carried:
 /// they sat in collapsed headers, whose bodies egui never builds, so they pin
 /// the fields against a future direct widget rather than against this change.
-/// The same editor also renders inside every UDP mask's socket options
-/// (`SockoptUsage::Mask`), which this test does not reach.
 #[test]
 fn sockopt_editor_hides_fields_without_a_windows_reader() {
     /// Labels rendered before this change: the regression pins.

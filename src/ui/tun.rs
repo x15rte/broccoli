@@ -4,7 +4,7 @@ use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
-use crate::model::validation::{ValidationCode, tun_ipv4_gateway};
+use crate::model::validation::{ValidationCode, tun_ipv4_gateway, tun_leak_misconfig_tun_off};
 use crate::model::{Mode, TunCfg, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
@@ -37,13 +37,15 @@ pub struct TunScreen {
 
 /// One generation of the TUN screen's per-generation verdicts: the
 /// pre-rendered privacy-warning message for the "tun" finding from
-/// [`assess`] ("TUN mode with no DNS configuration") and the inline
-/// validation error for a gateway list without an IPv4 entry — both
-/// computed once per model generation.
+/// [`assess`] ("TUN mode with no DNS configuration"), the inline validation
+/// error for a gateway list without an IPv4 entry, and the unrouted-family
+/// advisory rendered under the leak-block switch — all computed once per
+/// model generation.
 struct ValidationCache {
     generation: u64,
     tun_warning: Option<String>,
     gateway_error: Option<String>,
+    leak_warning: Option<String>,
 }
 
 /// The inline validation error for the gateways editor, or `None` when the
@@ -139,6 +141,8 @@ impl TunScreen {
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
                 gateway_error: tun_gateway_error(lang, ctx.settings.mode, &ctx.settings.tun),
+                leak_warning: tun_leak_misconfig_tun_off(ctx.settings)
+                    .then(|| validation_message(&ValidationCode::TunLeakMisconfigTunOff, lang)),
             });
         }
         let tun_warning = match &self.validation {
@@ -147,6 +151,10 @@ impl TunScreen {
         };
         let gateway_error = match &self.validation {
             Some(cache) => cache.gateway_error.as_deref(),
+            None => unreachable!("validation is built when absent, above"),
+        };
+        let leak_warning = match &self.validation {
+            Some(cache) => cache.leak_warning.as_deref(),
             None => unreachable!("validation is built when absent, above"),
         };
 
@@ -238,6 +246,18 @@ impl TunScreen {
                     misconfig_on,
                 );
                 changed = true;
+            }
+            // The unrouted-family advisory's own message, right under the
+            // switch that turns the half off: the same bytes the settings
+            // pass renders, never a second sentence. A plain label consumes
+            // no auto-id slot, so the section's widget ids do not shift when
+            // it appears or clears.
+            if let Some(message) = leak_warning {
+                ui.label(
+                    egui::RichText::new(message)
+                        .small()
+                        .color(status_colors_of(ui).warn),
+                );
             }
         });
 

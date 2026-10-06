@@ -1365,8 +1365,9 @@ keys! {
     SrvProxySettingsRemoved 0,
     SrvRemoveProxySettingsKey 0,
     SrvRemoveUdpHopKey 0,
-    SrvMaskSockoptNote 0,
-    SrvPenetrateMaskNote 0,
+    SrvRemoveWgDomainStrategyKey 0,
+    SrvRemoveUdpHopSockoptKey 0,
+    SrvRemoveAllowInsecureKey 0,
     SrvFromMitmOnlyAlpnShort 0,
     SrvTlsCertFileOrPem 0,
     SrvRealitySettingsMissing 0,
@@ -1405,14 +1406,12 @@ keys! {
     SrvPaddingMinLegacy 0,
     SrvPaddingMaxLegacy 0,
     SrvCustomTableLegacy 0,
-    SrvAllowInsecureRemovedLabel 0,
     SrvAlpn 0,
     SrvIdUuid 0,
     SrvLocalAddresses 0,
     SrvWgRemoteDns 0,
     SrvWgRemoteDnsHint 0,
     SrvWgRemoteDnsNote 0,
-    SrvDomainStrategy 0,
     SrvReservedColon 0,
     SrvKeepaliveS 0,
     SrvIntervalMs 0,
@@ -4391,10 +4390,9 @@ mod en {
             }
             Key::SrvRemoveProxySettingsKey => "Remove the proxySettings key",
             Key::SrvRemoveUdpHopKey => "Remove the udpHop key",
-            Key::SrvMaskSockoptNote => {
-                "The hop socket takes these values. TCP-only fields do not affect it"
-            }
-            Key::SrvPenetrateMaskNote => "Penetrate does not affect the hop socket.",
+            Key::SrvRemoveWgDomainStrategyKey => "Remove the domainStrategy key",
+            Key::SrvRemoveUdpHopSockoptKey => "Remove the sockopt key",
+            Key::SrvRemoveAllowInsecureKey => "Remove the allowInsecure key",
             Key::SrvFromMitmOnlyAlpnShort => "fromMitm must be the only ALPN value",
             Key::SrvTlsCertFileOrPem => "every TLS certificate needs a file or inline PEM",
             Key::SrvRealitySettingsMissing => "REALITY settings are missing",
@@ -4442,7 +4440,6 @@ mod en {
             Key::SrvPaddingMinLegacy => "padding_min (legacy)",
             Key::SrvPaddingMaxLegacy => "padding_max (legacy)",
             Key::SrvCustomTableLegacy => "custom_table (legacy)",
-            Key::SrvAllowInsecureRemovedLabel => "allowInsecure (removed)",
             Key::SrvAlpn => "ALPN",
             Key::SrvIdUuid => "id (uuid)",
             Key::SrvLocalAddresses => "local addresses",
@@ -4452,7 +4449,6 @@ mod en {
                 "An empty list uses the core's built-in resolvers. The single entry local uses \
                  the core's DNS client."
             }
-            Key::SrvDomainStrategy => "domain strategy",
             Key::SrvReservedColon => "reserved:",
             Key::SrvKeepaliveS => "keepalive (s)",
             Key::SrvIntervalMs => "interval (ms)",

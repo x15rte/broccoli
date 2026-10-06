@@ -24,9 +24,7 @@ use crate::ui::widgets;
 use super::raw_editor::{
     FieldKey, JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
 };
-use super::{
-    TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, mask_sockopt_editor, path_field,
-};
+use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
 // ---------- finalmask typed editor ----------
 
@@ -616,8 +614,9 @@ fn finalmask_udp_items_editor(
 }
 
 /// The `udphop` mask editor: the mode set (three combinable tokens), the
-/// seconds interval, the remote port list, the remote address/prefix list,
-/// and the mask's own socket options.
+/// seconds interval, the remote port list, and the remote address/prefix
+/// list. The retired `sockopt` key renders its advisory and a removal
+/// control instead of a sub-editor.
 fn finalmask_udphop_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -694,7 +693,20 @@ fn finalmask_udphop_editor(
         &mut settings.remote_ips,
         "198.51.100.0/24 or 2001:db8::1",
     );
-    changed |= mask_sockopt_editor(ui, lang, &mut settings.sockopt);
+    // The retired `sockopt` key has no authoring control: the pinned core
+    // removed the field, so a stored block draws the advisory here and a
+    // control that drops it on the next commit. The advisory names the
+    // replacement (the transport sockopt).
+    if settings.sockopt.is_some() {
+        ui.colored_label(
+            status_colors_of(ui).warn,
+            validation_message(&ValidationCode::FinalmaskUdpHopSockoptRetired, lang),
+        );
+        if ui.button(t(lang, Key::SrvRemoveUdpHopSockoptKey)).clicked() {
+            settings.sockopt = None;
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -1052,17 +1064,20 @@ fn finalmask_realm_tls_editor(
     tls: &mut FinalmaskRealmTls,
     buffers: &mut SeededBuffers,
 ) -> bool {
-    let mut changed = widgets::opt_bool(
-        ui,
-        t(lang, Key::SrvAllowInsecureRemovedLabel),
-        &mut tls.allow_insecure,
-        t(lang, Key::SrvUnset),
-    );
-    if tls.allow_insecure == Some(true) {
+    // The removed `allowInsecure` key has no authoring control: Xray's TLS
+    // build refuses any non-zero value (infra/conf/transport_security.go), so
+    // a stored value draws the model's own message here and a control that
+    // drops it on the next commit.
+    let mut changed = false;
+    if tls.allow_insecure.is_some() {
         ui.colored_label(
-            status_colors_of(ui).err,
-            t(lang, Key::SrvAllowInsecureRemoved),
+            status_colors_of(ui).warn,
+            validation_message(&ValidationCode::FinalmaskRealmAllowInsecureRemoved, lang),
         );
+        if ui.button(t(lang, Key::SrvRemoveAllowInsecureKey)).clicked() {
+            tls.allow_insecure = None;
+            changed = true;
+        }
     }
     changed |= widgets::text_field(ui, "serverName", &mut tls.server_name, "example.com");
     changed |= widgets::string_list(ui, lang, t(lang, Key::SrvAlpn), &mut tls.alpn, "h2");

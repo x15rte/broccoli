@@ -92,7 +92,6 @@ const FINGERPRINTS: &[&str] = crate::model::fingerprint::FINGERPRINTS;
 // profile's field is empty, and the combo must still offer the way back to
 // it). A field's spellings live in the model, never here.
 const TARGET_STRATEGIES: &[&str] = validation::TARGET_STRATEGY_OPTIONS;
-const WG_TARGET_STRATEGIES: &[&str] = validation::WG_TARGET_STRATEGY_OPTIONS;
 const VMESS_SECURITY: &[&str] = validation::VMESS_SECURITY_OPTIONS;
 const XHTTP_MODES: &[&str] = validation::XHTTP_MODE_OPTIONS;
 const X_PADDING_PLACEMENTS: &[&str] = validation::X_PADDING_PLACEMENT_OPTIONS;
@@ -719,33 +718,29 @@ fn tcp_fast_open_editor(
 enum SockoptUsage {
     Stream,
     EchDnsQuery,
-    Mask,
 }
 
 impl SockoptUsage {
     /// The wire path prefix the block's findings are scoped with. The ECH
     /// DNS-query block lives under the TLS settings, not `stream.sockopt`
     /// (the model's `validate_outbound` sweep scopes it the same way), so
-    /// the inline verdict names the field the user can actually find. A
-    /// mask's block is numbered by its mask index, which this fixed prefix
-    /// cannot name — the memoized finalmask error list carries those paths.
+    /// the inline verdict names the field the user can actually find.
     fn path_prefix(self) -> &'static str {
         match self {
             Self::Stream => "stream.sockopt",
             Self::EchDnsQuery => "stream.tlsSettings.echSockopt",
-            Self::Mask => "finalmask.udp[].settings.sockopt",
         }
     }
 }
 
-/// Outbound-role socket options (stream, ECH DNS query, UDP mask). Options the
-/// Windows outbound path never reads render no widget here: the Linux-only
-/// knobs (`mark`, `tproxy`, `tcpCongestion`, `tcpWindowClamp`, `tcpMaxSeg`,
-/// `tcpUserTimeout`), `tcpMptcp` (Go's dialer consumes it on Linux only), and
-/// the listener-only values (`v6only`, `acceptProxyProtocol`,
-/// `trustedXForwardedFor`, which only listeners consume). The model keeps them
-/// so a hand-edited profile round-trips unchanged. Every widget below has a
-/// reader in the core this app runs.
+/// Outbound-role socket options (the stream block and the ECH DNS-query
+/// block). Options the Windows outbound path never reads render no widget
+/// here: the Linux-only knobs (`mark`, `tproxy`, `tcpCongestion`,
+/// `tcpWindowClamp`, `tcpMaxSeg`, `tcpUserTimeout`), `tcpMptcp` (Go's dialer
+/// consumes it on Linux only), and the listener-only values (`v6only`,
+/// `acceptProxyProtocol`, `trustedXForwardedFor`, which only listeners
+/// consume). The model keeps them so a hand-edited profile round-trips
+/// unchanged. Every widget below has a reader in the core this app runs.
 fn sockopt_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -753,8 +748,8 @@ fn sockopt_editor(
     usage: SockoptUsage,
     // The stream block is the chain surface: its `dialerProxy` renders as a
     // picker over the caller's chain-target options. The ECH DNS-query block
-    // and the mask blocks embed the same struct but sit in editors with no
-    // profile list, so they keep the free-text field (`None`).
+    // embeds the same struct but sits in an editor with no profile list, so
+    // it keeps the free-text field (`None`).
     dialer_proxy_options: Option<&[String]>,
     // The block's memoized `validate_sockopt` verdicts (its usage's wire
     // path in the message), rendered under the fields.
@@ -862,17 +857,6 @@ fn sockopt_editor(
             });
             ui.weak(t(lang, Key::SrvPenetrateEchNote));
         }
-        SockoptUsage::Mask => {
-            ui.add_enabled_ui(false, |ui| {
-                changed |= widgets::opt_bool(
-                    ui,
-                    t(lang, Key::SrvPenetrateDownloadOnly),
-                    &mut sockopt.penetrate,
-                    t(lang, Key::SrvUnset),
-                );
-            });
-            ui.weak(t(lang, Key::SrvPenetrateMaskNote));
-        }
     }
 
     if ui.button(t(lang, Key::SrvAddCustomSockopt)).clicked() {
@@ -955,33 +939,6 @@ fn ech_sockopt_editor(
     if let Some(sockopt) = sockopt.as_mut() {
         ui.indent("ech-dns-query-sockopt", |ui| {
             changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::EchDnsQuery, None, errors);
-        });
-    }
-    changed
-}
-
-/// The per-mask socket-options block of a `udphop` UDP mask: the socket the
-/// hop dials (`settings.sockopt`). The block's findings ride the memoized
-/// finalmask sweep (`validate_finalmask` validates the same field under its
-/// mask-scoped path), which renders them under the mask list.
-fn mask_sockopt_editor(
-    ui: &mut egui::Ui,
-    lang: Language,
-    sockopt: &mut Option<SockoptModel>,
-) -> bool {
-    let mut changed = false;
-    let mut enabled = sockopt.is_some();
-    if ui
-        .checkbox(&mut enabled, "sockopt")
-        .on_hover_text(t(lang, Key::SrvMaskSockoptNote))
-        .changed()
-    {
-        *sockopt = enabled.then(SockoptModel::default);
-        changed = true;
-    }
-    if let Some(sockopt) = sockopt.as_mut() {
-        ui.indent("mask-sockopt", |ui| {
-            changed |= sockopt_editor(ui, lang, sockopt, SockoptUsage::Mask, None, &[]);
         });
     }
     changed
@@ -4338,14 +4295,24 @@ impl ServersScreen {
                     settings.mtu = mtu.unwrap_or_default();
                     changed = true;
                 }
-                changed |= widgets::combo_str_labeled(
-                    ui,
-                    t(lang, Key::SrvDomainStrategy),
-                    &mut settings.domain_strategy,
-                    WG_TARGET_STRATEGIES,
-                    t(lang, Key::SrvDefault),
-                    false,
-                );
+                // The retired `domainStrategy` key has no authoring control:
+                // the pinned core deleted the field, so a stored value draws
+                // the advisory here and a control that drops it on the next
+                // commit. The advisory names the replacement (the stream
+                // sockopt strategy).
+                if !settings.domain_strategy.is_empty() {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        validation_message(&ValidationCode::WireguardDomainStrategyRetired, lang),
+                    );
+                    if ui
+                        .button(t(lang, Key::SrvRemoveWgDomainStrategyKey))
+                        .clicked()
+                    {
+                        settings.domain_strategy.clear();
+                        changed = true;
+                    }
+                }
                 let mut has_reserved = settings.reserved.is_some();
                 if ui
                     .checkbox(&mut has_reserved, t(lang, Key::SrvReservedBytes))
@@ -7657,11 +7624,11 @@ mod tests {
     use crate::model::{
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskNoise,
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
-        FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask, FinalmaskXdns,
-        FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule, HysteriaTransport,
-        MasqueTransport, Network, Noise, OutboundModel, Protocol, ProtocolSettings, RealityModel,
-        Security, SockoptModel, StreamModel, TlsCert, TlsModel, WireguardPeer, WsSettings,
-        XhttpSettings,
+        FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
+        FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule,
+        HysteriaTransport, MasqueTransport, Network, Noise, OutboundModel, Protocol,
+        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
+        WireguardPeer, WsSettings, XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -13083,6 +13050,244 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
+    /// A WireGuard profile carrying the retired `settings.domainStrategy`
+    /// key in the shape a stored file would hold.
+    fn wireguard_domain_strategy_rig(strategy: &str) -> UiTestRig {
+        let mut profile = ServerProfile::new("wg", OutboundModel::new(Protocol::Wireguard));
+        if let ProtocolSettings::Wireguard(settings) = &mut profile.outbound.settings {
+            settings.domain_strategy = strategy.to_owned();
+        }
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id);
+        rig
+    }
+
+    /// A profile whose single `udphop` UDP mask carries the retired `sockopt`
+    /// key in the shape a stored file would hold.
+    fn udphop_sockopt_rig() -> UiTestRig {
+        let mut profile = ServerProfile::new("Hy", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![FinalmaskUdpMask::Udphop {
+                settings: Box::new(FinalmaskUdpHop {
+                    sockopt: Some(SockoptModel {
+                        domain_strategy: "UseIPv4".into(),
+                        interface: "eth0".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                extra: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.active = Some(profile.id);
+        rig
+    }
+
+    #[test]
+    fn wireguard_domain_strategy_offers_no_picker_and_its_notice_clears_the_key() {
+        // The pinned core deleted the field, so the editor offers no way to
+        // set it: a retained value draws the advisory inline with a control
+        // that drops it, and clearing leaves the generated document without
+        // the key.
+        let message = validation_message(
+            &ValidationCode::WireguardDomainStrategyRetired,
+            Language::En,
+        );
+        let mut harness = wide_servers_harness(wireguard_domain_strategy_rig("ForceIPv4"));
+        harness.run();
+
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .all(|node| node.value().as_deref() != Some("ForceIPv4")),
+            "no picker may offer the retired strategy"
+        );
+        assert!(
+            harness.query_by_label("domain strategy").is_none(),
+            "the strategy combo's own label must be gone"
+        );
+        assert!(
+            editor_advisory(&harness)
+                .iter()
+                .any(|issue| issue.code == ValidationCode::WireguardDomainStrategyRetired),
+            "{:#?}",
+            editor_advisory(&harness)
+        );
+
+        let remove = t(Language::En, Key::SrvRemoveWgDomainStrategyKey);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .scroll_to_me();
+        harness.run();
+        // The model's message renders here as well as in the warnings list.
+        assert!(
+            harness
+                .query_all_by_label_contains(message.as_str())
+                .next()
+                .is_some(),
+            "the advisory's own text must render with its removal control"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .click();
+        harness.run();
+        harness.run();
+
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .clone();
+        let ProtocolSettings::Wireguard(settings) = &draft.outbound.settings else {
+            panic!("the draft stays a WireGuard profile");
+        };
+        assert!(
+            settings.domain_strategy.is_empty(),
+            "the removal must clear the stored value"
+        );
+        assert!(
+            !editor_advisory(&harness)
+                .iter()
+                .any(|issue| issue.code == ValidationCode::WireguardDomainStrategyRetired),
+            "{:#?}",
+            editor_advisory(&harness)
+        );
+        assert!(
+            draft.outbound.to_wire("wg")["settings"]
+                .get("domainStrategy")
+                .is_none(),
+            "the cleared key must stay out of the generated document"
+        );
+    }
+
+    #[test]
+    fn wireguard_domain_strategy_notice_stays_quiet_for_a_fresh_profile() {
+        let message = validation_message(
+            &ValidationCode::WireguardDomainStrategyRetired,
+            Language::En,
+        );
+        let harness = wide_servers_harness(wireguard_domain_strategy_rig(""));
+        assert!(
+            harness
+                .query_all_by_label_contains(message.as_str())
+                .next()
+                .is_none(),
+            "an empty strategy must not draw the notice"
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvRemoveWgDomainStrategyKey))
+                .next()
+                .is_none(),
+            "an empty strategy must not draw the removal control"
+        );
+    }
+
+    #[test]
+    fn udphop_sockopt_has_no_sub_editor_and_its_notice_clears_the_key() {
+        // The core removed the per-hop `sockopt` key, so the mask editor drops
+        // its sub-editor: a retained block draws the advisory inline with a
+        // control that drops it, while the mask's own fields stay.
+        let message =
+            validation_message(&ValidationCode::FinalmaskUdpHopSockoptRetired, Language::En);
+        let remove = t(Language::En, Key::SrvRemoveUdpHopSockoptKey);
+        let mut harness = wide_servers_harness(udphop_sockopt_rig());
+        harness.run();
+        harness.get_by_label("Advanced").click();
+        harness.run();
+
+        assert_eq!(
+            harness
+                .query_all_by_role_and_label(egui::accesskit::Role::CheckBox, "sockopt")
+                .count(),
+            0,
+            "the mask sockopt sub-editor's switch must be gone"
+        );
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .all(|node| node.value().as_deref() != Some("UseIPv4")),
+            "the retired block's values must not be editable"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .scroll_to_me();
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label_contains(message.as_str())
+                .next()
+                .is_some(),
+            "the advisory's own text must render with its removal control"
+        );
+        // The mask's own live fields keep rendering.
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, "perConnRemote")
+                .accesskit_node()
+                .toggled()
+                .is_some(),
+            "the mask's mode switches must stay"
+        );
+        assert!(
+            harness.query_all_by_label("remotePorts").next().is_some(),
+            "the mask's remote port field must stay"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .click();
+        harness.run();
+        harness.run();
+
+        let draft = harness
+            .state()
+            .0
+            .existing_draft
+            .as_ref()
+            .expect("the editor stays open")
+            .profile
+            .clone();
+        let mask = draft
+            .outbound
+            .stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| finalmask.udp.first())
+            .expect("the draft keeps the mask");
+        let FinalmaskUdpMask::Udphop { settings, .. } = mask else {
+            panic!("the draft keeps the udphop mask");
+        };
+        assert!(
+            settings.sockopt.is_none(),
+            "the removal must clear the stored block"
+        );
+        assert!(
+            !editor_memo(&harness.state().0)
+                .findings
+                .finalmask
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskUdpHopSockoptRetired),
+            "{:#?}",
+            editor_memo(&harness.state().0).findings.finalmask
+        );
+        let wire = draft.outbound.to_wire("Hy");
+        assert!(
+            wire["streamSettings"]["finalmask"]["udp"][0]["settings"]
+                .get("sockopt")
+                .is_none(),
+            "the cleared block must stay out of the generated document: {wire}"
+        );
+    }
+
     /// The combo control an `opt_bool` row renders: the switch label and its
     /// combo sit in one horizontal row, and the combo carries no accessible
     /// name of its own, so it is found as the single combo in the label's
@@ -13288,8 +13493,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness
                 .query_by_role_and_label(egui::accesskit::Role::CheckBox, "sockopt")
-                .is_some(),
-            "the per-mask socket options must render"
+                .is_none(),
+            "the retired per-mask socket options must not render an editor"
         );
 
         // intervalLocal joins the set; the stored unknown token rides along.
@@ -14066,6 +14271,82 @@ Authentication: ML-KEM-768, Post-Quantum
             emitted["settings"]["portMapping"],
             json!({"enabled": true, "timeout": 0, "lifetime": 0}),
             "{emitted}"
+        );
+    }
+
+    #[test]
+    fn realm_tls_allow_insecure_has_no_authoring_control_and_clears_on_demand() {
+        // The core refuses the removed `allowInsecure` field, so the realm
+        // TLS editor offers no way to set it: a retained value draws the
+        // model's own message with a control that drops it.
+        fn realm_tls(mask: &FinalmaskUdpMask) -> FinalmaskRealmTls {
+            match mask {
+                FinalmaskUdpMask::Realm { settings, .. } => settings
+                    .tls_config
+                    .clone()
+                    .expect("the fixture carries tlsConfig"),
+                other => panic!("the harness renders a realm mask, got {other:?}"),
+            }
+        }
+
+        let message = validation_message(
+            &ValidationCode::FinalmaskRealmAllowInsecureRemoved,
+            Language::En,
+        );
+        let remove = t(Language::En, Key::SrvRemoveAllowInsecureKey);
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Realm {
+            settings: Box::new(FinalmaskRealm {
+                url: "realm://token@realm.example/id".into(),
+                tls_config: Some(FinalmaskRealmTls {
+                    allow_insecure: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("realm-allow-insecure-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+            );
+        });
+        harness.run();
+
+        assert!(
+            harness.query_by_label("allowInsecure (removed)").is_none(),
+            "the removed allowInsecure switch must not come back"
+        );
+        assert!(
+            harness.query_by_label_contains(message.as_str()).is_some(),
+            "the removed-key notice must render while the value stands"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, remove)
+            .click();
+        harness.run();
+        assert!(
+            realm_tls(&mask.borrow()).allow_insecure.is_none(),
+            "the removal must clear the stored value"
+        );
+        assert!(
+            harness.query_by_label_contains(message.as_str()).is_none(),
+            "the notice must clear with the value"
         );
     }
 

@@ -1798,20 +1798,6 @@ fn freedom_domain_strategy_supported(strategy: &str) -> bool {
     target_strategy_supported(strategy)
 }
 
-/// The `settings.domainStrategy` vocabulary the WireGuard editor offers while
-/// the retired key still has an editor row. The pinned core removed the field
-/// and the switch that read it (infra/conf/wireguard.go), so none of these
-/// values reaches the generated document; any carried value draws the
-/// advisory [`ValidationCode::WireguardDomainStrategyRetired`].
-pub const WG_TARGET_STRATEGY_OPTIONS: &[&str] = &[
-    "",
-    "ForceIP",
-    "ForceIPv4",
-    "ForceIPv6",
-    "ForceIPv4v6",
-    "ForceIPv6v4",
-];
-
 // ---------- outbound envelope / DNS-rule vocabularies ----------
 //
 // These three rules used to live only in the servers editor's error list.
@@ -5035,6 +5021,16 @@ pub fn tun_ipv6_gateway(tun: &TunCfg) -> Option<&str> {
         .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains(':')))
 }
 
+/// True when the emitted document carries the leak block without the
+/// unrouted-family half — the state [`ValidationCode::TunLeakMisconfigTunOff`]
+/// reports. The generator writes the key only while the TUN inbound and the
+/// DNS module are both present (`emit::dns_inbound_emitted`), so this is the
+/// exact predicate the settings pass judges; the TUN screen calls it too and
+/// renders that code's own message where the switch lives.
+pub fn tun_leak_misconfig_tun_off(settings: &Settings) -> bool {
+    emit::dns_inbound_emitted(settings) && !settings.tun.leak_blocks_misconfig_tun()
+}
+
 /// Canonical form of a Windows socket path (case-folded, `/` → `\`,
 /// `.`/`..` resolved, separators collapsed) — the comparison key for the
 /// dokodemo UNIX-listener conflict rule and the inbounds screen's row
@@ -5523,7 +5519,7 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
                 ));
             }
         }
-        if !settings.tun.leak_blocks_misconfig_tun() {
+        if tun_leak_misconfig_tun_off(settings) {
             issues.push(warning(
                 ValidationCode::TunLeakMisconfigTunOff,
                 Some("tun.autoSystemWfpBlockLeak".into()),
