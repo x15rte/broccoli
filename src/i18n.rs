@@ -1335,7 +1335,6 @@ keys! {
     SrvXdriveUsername 0,
     SrvXdrivePassword 0,
     SrvXdriveTokenUrl 0,
-    SrvXdriveForm 0,
     SrvXdriveTokenPath 0,
     SrvXdriveExpiryPath 0,
     SrvXdrivePut 0,
@@ -1505,6 +1504,7 @@ keys! {
     SrvMldsa65VerifyHint 0,
     SrvSendThroughHint 0,
     SrvNoisePacketHint 0,
+    SrvNoiseExpHint 0,
     SrvXmcPasswordHint 0,
     SrvXmcTexturesValueHint 0,
     SrvXmcTexturesSignatureHint 0,
@@ -1638,7 +1638,9 @@ keys! {
     FinalmaskSalamanderPacketSize 0,
     FinalmaskXdnsShapeRetired 0,
     FinalmaskXdnsDomainTypesInvalid 0,
+    FinalmaskXdnsDomainNameInvalid 0,
     FinalmaskXdnsDomainLimitInvalid 0,
+    FinalmaskXdnsDomainCapacityInvalid 0,
     FinalmaskXdnsResolverTypeUnknown 0,
     FinalmaskXdnsResolverAddrInvalid 0,
     FinalmaskXdnsExtraPollInvalid 0,
@@ -2637,7 +2639,9 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskSalamanderPacketSize => t(lang, Key::FinalmaskSalamanderPacketSize),
         FinalmaskXdnsShapeRetired => t(lang, Key::FinalmaskXdnsShapeRetired),
         FinalmaskXdnsDomainTypesInvalid => t(lang, Key::FinalmaskXdnsDomainTypesInvalid),
+        FinalmaskXdnsDomainNameInvalid => t(lang, Key::FinalmaskXdnsDomainNameInvalid),
         FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
+        FinalmaskXdnsDomainCapacityInvalid => t(lang, Key::FinalmaskXdnsDomainCapacityInvalid),
         FinalmaskXdnsResolverTypeUnknown => t(lang, Key::FinalmaskXdnsResolverTypeUnknown),
         FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
         FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
@@ -4346,7 +4350,6 @@ mod en {
             Key::SrvXdriveUsername => "Username",
             Key::SrvXdrivePassword => "Password",
             Key::SrvXdriveTokenUrl => "Token URL",
-            Key::SrvXdriveForm => "Form",
             Key::SrvXdriveTokenPath => "Token path",
             Key::SrvXdriveExpiryPath => "Expiry path",
             Key::SrvXdrivePut => "Put",
@@ -4567,6 +4570,7 @@ mod en {
             Key::SrvMldsa65VerifyHint => "base64url ML-DSA-65 seed→verify",
             Key::SrvSendThroughHint => "local IP, CIDR, origin, or srcip",
             Key::SrvNoisePacketHint => "payload or range",
+            Key::SrvNoiseExpHint => "b, r, rc, rd, t, c, or n tokens in angle brackets",
             Key::SrvXmcPasswordHint => "RSA derivation password",
             Key::SrvXmcTexturesValueHint => "signed Mojang textures value",
             Key::SrvXmcTexturesSignatureHint => "signed Mojang textures signature",
@@ -4900,9 +4904,14 @@ mod en {
             Key::FinalmaskXdnsDomainTypesInvalid => {
                 "use at least one of the record types A, CNAME, TXT, or AAAA"
             }
+            Key::FinalmaskXdnsDomainNameInvalid => "the name cannot contain two dots in a row",
             Key::FinalmaskXdnsDomainLimitInvalid => {
                 "lenLimit must be 0 through 255, labelLimit 0 through 63, and edns0 0 or 512 \
                  through 4096"
+            }
+            Key::FinalmaskXdnsDomainCapacityInvalid => {
+                "the name and limits leave too little room for the encoded payload. Raise \
+                 lenLimit or shorten the name"
             }
             Key::FinalmaskXdnsResolverTypeUnknown => "choose tcp or udp",
             Key::FinalmaskXdnsResolverAddrInvalid => "enter the resolver address as host:port",

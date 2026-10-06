@@ -1679,6 +1679,16 @@ impl Runtime {
         }
     }
 
+    /// Begin the output window of one start: drop every line an earlier start
+    /// left in the error-surface ring, so [`Self::output_tail`] reads the
+    /// current start's output alone. Called where the backend is spawned,
+    /// after every pre-spawn guard has passed.
+    fn begin_start_output_window(&mut self) {
+        if let Ok(mut ring) = self.output_ring.lock() {
+            ring.clear();
+        }
+    }
+
     // -- command handling ----------------------------------------------------
 
     async fn handle_cmd(&mut self, cmd: CoreCmd) {
@@ -2619,6 +2629,7 @@ impl Runtime {
         // child the runtime spawns is exactly the configuration this start
         // produced. The release-pin verify runs on the blocking pool; the
         // spawn resumes on the executor with the verified payload locks held.
+        self.begin_start_output_window();
         let log = self.log_sink();
         match supervisor::spawn(&apply::active_path(), &log).await {
             Ok(mut child) => {
@@ -2689,6 +2700,10 @@ impl Runtime {
     }
 
     fn start_via_helper(&mut self) {
+        // The helper owns the child that runs this start's configuration, so
+        // the output window opens here for both the restart and the fresh
+        // launch.
+        self.begin_start_output_window();
         if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
             // `start_backend` guaranteed the captured bytes before this
             // restart branch; a missing
@@ -6687,6 +6702,38 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CoreEvt::RollbackResult { .. })),
             "the leak-install failure must not attempt a rollback"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_leak_line_stays_out_of_the_next_starts_window() {
+        // The error-surface ring belongs to one start. A leak-install line an
+        // earlier start left behind must not classify the next start, or an
+        // unrelated short failure would offer a remedy that cannot fix it.
+        // `begin_start_output_window` is the call a spawn makes before the
+        // child writes its first line.
+        let (mut runtime, events) = runtime_with_events();
+        runtime.push_ring(LEAK_INSTALL_LINE);
+        runtime.begin_start_output_window();
+        runtime.push_ring("[stdout] 2026/09/05 failed to parse config");
+
+        runtime.on_core_exit(Some(-1)).await;
+
+        assert!(
+            matches!(runtime.lifecycle.phase, super::CorePhase::Backoff { .. }),
+            "the unrelated failure must take its own branch, got {:?}",
+            runtime.lifecycle.phase
+        );
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            !emitted.iter().any(|event| matches!(
+                event,
+                CoreEvt::State {
+                    phase: super::CorePhase::Error(error),
+                    ..
+                } if phase_message(error).key() == Key::TunLeakInstallFailed
+            )),
+            "the stale leak line must not reach the leak terminal, got: {emitted:?}"
         );
     }
 

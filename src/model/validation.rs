@@ -42,9 +42,9 @@ use super::outbound::{
 };
 use super::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
-    FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomainEntry,
-    FinalmaskXdnsResolverEntry, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security,
-    SockoptModel, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomain,
+    FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
+    Network, Security, SockoptModel, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
     XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_TEMPLATE,
     XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XmuxConfig,
@@ -389,11 +389,20 @@ pub enum ValidationCode {
     /// CNAME (5), TXT (16), and AAAA (28): the domain build refuses it
     /// (`transport/internet/finalmask/xdns/domain.go:88-98`). Error tier.
     FinalmaskXdnsDomainTypesInvalid,
+    /// An `xdns` domain `name` holds two dots in a row: the domain build
+    /// refuses it (`transport/internet/finalmask/xdns/domain.go:83-85`).
+    /// Error tier.
+    FinalmaskXdnsDomainNameInvalid,
     /// An `xdns` domain length limit is outside its range — `lenLimit` above
     /// 255, `labelLimit` above 63, either negative, or `edns0` neither 0 nor
     /// 512 through 4096 (`transport/internet/finalmask/xdns/domain.go:88-98`).
     /// Error tier.
     FinalmaskXdnsDomainLimitInvalid,
+    /// An `xdns` domain's limits leave too little room: `lenLimit` sits below
+    /// the wire length of the name plus one, or the generated labels' derived
+    /// capacity is below 17 bytes
+    /// (`transport/internet/finalmask/xdns/domain.go:112-128`). Error tier.
+    FinalmaskXdnsDomainCapacityInvalid,
     /// An `xdns` resolver `type` folds to neither `tcp` nor `udp`: the loader
     /// reports an unknown config id
     /// (`infra/conf/transport_finalmask.go:818-821`). Error tier.
@@ -3845,6 +3854,22 @@ fn finalmask_validate_noise_exp_expression(expression: &str) -> Result<(), Valid
     Ok(())
 }
 
+/// The finding for one `noise` `exp` expression string, for the editor's
+/// inline verdict: `None` when the mask build accepts the expression. The
+/// string half of [`finalmask_validate_noise_exp`], the verdict the packet
+/// carries when its value is a JSON string.
+pub fn noise_exp_finding(expression: &str) -> Option<ValidationCode> {
+    finalmask_validate_noise_exp_expression(expression).err()
+}
+
+/// The finding for one whole `noise` `exp` `packet` value, for the editor's
+/// inline verdict: `None` when the mask build accepts it. The same verdict
+/// the pass stores for the packet, so a loaded value the editor cannot read
+/// as a string still renders the rule that refused it.
+pub fn noise_exp_packet_finding(packet: &FinalmaskRawValue) -> Option<ValidationCode> {
+    finalmask_validate_noise_exp(packet).err()
+}
+
 /// Build one `noise` `exp` token the way `buildNoiseSegment` does
 /// (`infra/conf/transport_finalmask.go:393-434`): `<b HEX>` is a byte
 /// literal, `<r|rc|rd SIZE>` a sized random segment, `<t>`/`<c>`/`<n>` a
@@ -4507,6 +4532,49 @@ fn finalmask_valid_xdns_addr(value: &str) -> bool {
     !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
+/// Whether one `xdns` domain's limits leave the room its name needs. The
+/// loader substitutes a zero `lenLimit` with 255 and a zero `labelLimit` with
+/// 63 before it builds the domain
+/// (`infra/conf/transport_finalmask.go:838-843`); the build then refuses a
+/// `lenLimit` below the wire length of `name` plus one, and a derived label
+/// capacity below 17 bytes
+/// (`transport/internet/finalmask/xdns/domain.go:112-128`). The name's wire
+/// length is its bytes plus the trailing root dot, exactly the `uint8(len)`
+/// the core's `dnsmessage.NewName(name + ".")` records
+/// (`transport/internet/finalmask/xdns/domain.go:112-115`). `None` when a
+/// limit is outside its own range: the core refuses that first, and the
+/// caller reports it instead.
+fn finalmask_xdns_capacity_refused(domain: &FinalmaskXdnsDomain) -> bool {
+    if !(0..=255).contains(&domain.len_limit) || !(0..=63).contains(&domain.label_limit) {
+        return false;
+    }
+    let len_limit = if domain.len_limit == 0 {
+        255
+    } else {
+        domain.len_limit
+    };
+    let label_limit = if domain.label_limit == 0 {
+        63
+    } else {
+        domain.label_limit
+    };
+    let name_len = domain.name.len() as i32 + 1;
+    if len_limit < name_len + 1 {
+        return true;
+    }
+    let room = len_limit - name_len - 1;
+    let label = label_limit + 1;
+    let mut total = (room / label) * label_limit;
+    let left = room % label;
+    if left > 1 {
+        total += left - 1;
+    }
+    // `base32.StdEncoding.WithPadding(NoPadding).DecodedLen(total)`, the
+    // capacity table `NewDomain` indexes (`domain.go:47-53`, `:126-128`):
+    // `total/8*5 + total%8*5/8`, which is the floor of five eighths.
+    total * 5 / 8 < 17
+}
+
 fn finalmask_validate_udp_mask(
     index: usize,
     mask: &FinalmaskUdpMask,
@@ -4623,6 +4691,12 @@ fn finalmask_validate_udp_mask(
                         Some(format!("{entry_path}.types")),
                     ));
                 }
+                if domain.name.contains("..") {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsDomainNameInvalid,
+                        Some(format!("{entry_path}.name")),
+                    ));
+                }
                 if !(0..=255).contains(&domain.len_limit) {
                     issues.push(issue(
                         ValidationCode::FinalmaskXdnsDomainLimitInvalid,
@@ -4639,6 +4713,12 @@ fn finalmask_validate_udp_mask(
                     issues.push(issue(
                         ValidationCode::FinalmaskXdnsDomainLimitInvalid,
                         Some(format!("{entry_path}.edns0")),
+                    ));
+                }
+                if finalmask_xdns_capacity_refused(domain) {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                        Some(entry_path),
                     ));
                 }
             }
@@ -6820,9 +6900,11 @@ mod tests {
     }
 
     /// Every `xdns` rule the core refuses at build time reports the offending
-    /// entry and field: an empty or unknown record type, a length limit or
-    /// `edns0` outside its range, an unknown resolver type, a missing or
-    /// malformed resolver address, and an `extraPoll` outside 0 through 3.
+    /// entry and field: an empty or unknown record type, a name holding two
+    /// dots, a length limit or `edns0` outside its range, limits that leave
+    /// too little room for the name and the encoded payload, an unknown
+    /// resolver type, a missing or malformed resolver address, and an
+    /// `extraPoll` outside 0 through 3.
     #[test]
     fn finalmask_xdns_rules_mirror_the_core() {
         let fm: FinalmaskModel = serde_json::from_value(json!({
@@ -6833,7 +6915,13 @@ mod tests {
                     {"name": "c.example", "types": [1], "labelLimit": 64},
                     {"name": "d.example", "types": [1], "edns0": 100},
                     {"name": "ok.example", "types": [1, 5, 16, 28],
-                     "lenLimit": 255, "labelLimit": 63, "edns0": 512}
+                     "lenLimit": 255, "labelLimit": 63, "edns0": 512},
+                    {"name": "a..b", "types": [1]},
+                    {"name": "tunnel.example.com", "types": [1], "lenLimit": 3},
+                    {"name": "a", "types": [1], "lenLimit": 3},
+                    {"name": "tight.example", "types": [1], "lenLimit": 20, "labelLimit": 63},
+                    {"name": "a", "types": [1], "lenLimit": 32, "labelLimit": 63},
+                    {"name": "a", "types": [1], "lenLimit": 31, "labelLimit": 63}
                 ],
                 "resolvers": [
                     {"type": "quic", "settings": {"addr": "1.1.1.1:53"}},
@@ -6868,6 +6956,26 @@ mod tests {
                 "finalmask.udp[0].settings.domains[3].edns0",
             ),
             (
+                ValidationCode::FinalmaskXdnsDomainNameInvalid,
+                "finalmask.udp[0].settings.domains[5].name",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                "finalmask.udp[0].settings.domains[6]",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                "finalmask.udp[0].settings.domains[7]",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                "finalmask.udp[0].settings.domains[8]",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                "finalmask.udp[0].settings.domains[10]",
+            ),
+            (
                 ValidationCode::FinalmaskXdnsResolverTypeUnknown,
                 "finalmask.udp[0].settings.resolvers[0].type",
             ),
@@ -6891,14 +6999,16 @@ mod tests {
                 "missing {code:?} at {path:?} in {issues:#?}"
             );
         }
-        // The in-range domain and the folded bracketed-IPv6 resolver report
+        // The in-range domain, the capacity boundary that clears the core's
+        // 17-byte floor, and the folded bracketed-IPv6 resolver report
         // nothing.
         assert!(
-            !issues
-                .iter()
-                .any(|issue| issue.path.as_deref().is_some_and(
-                    |path| path.contains("domains[4]") || path.contains("resolvers[3]")
-                )),
+            !issues.iter().any(|issue| issue
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("domains[4]")
+                    || path.contains("domains[9]")
+                    || path.contains("resolvers[3]"))),
             "{issues:#?}"
         );
     }

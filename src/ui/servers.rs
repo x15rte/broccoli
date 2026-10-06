@@ -7638,12 +7638,13 @@ mod tests {
     use crate::model::stream::MasqueradeCfg;
     use crate::model::validation::{ValidationCode, ValidationIssue};
     use crate::model::{
-        BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel,
-        FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm, FinalmaskTcpItem, FinalmaskTcpMask,
-        FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry,
-        FreedomFinalRule, HysteriaTransport, MasqueTransport, Network, Noise, OutboundModel,
-        Protocol, ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
-        TlsModel, WireguardPeer, WsSettings, XhttpSettings,
+        BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskNoise,
+        FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
+        FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpMask, FinalmaskXdns,
+        FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule, HysteriaTransport,
+        MasqueTransport, Network, Noise, OutboundModel, Protocol, ProtocolSettings, RealityModel,
+        Security, SockoptModel, StreamModel, TlsCert, TlsModel, WireguardPeer, WsSettings,
+        XhttpSettings,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -14145,6 +14146,91 @@ Authentication: ML-KEM-768, Post-Quantum
             }
             other => panic!("the add-resolver action must append one object row, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn noise_exp_item_offers_its_type_and_edits_as_text() {
+        fn noise(mask: &FinalmaskUdpMask) -> &FinalmaskNoise {
+            match mask {
+                FinalmaskUdpMask::Noise { settings, .. } => settings,
+                other => panic!("the harness renders a noise mask, got {other:?}"),
+            }
+        }
+
+        // A loaded `exp` item: the type sits outside the byte-encoding kinds,
+        // so it reaches the editor through its own combo and edits as text.
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Noise {
+            settings: FinalmaskNoise {
+                noise: vec![FinalmaskNoiseItem {
+                    encoding: "exp".into(),
+                    packet: FinalmaskRawValue::Present(json!("<b 0x12>")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("noise-editor-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+            );
+        });
+        harness.run();
+
+        // The type combo shows the loaded type and offers `exp`.
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some("exp"))
+            .expect("the packet type combo shows the loaded exp type")
+            .click();
+        harness.run();
+        harness.get_by_label("exp").click();
+        harness.run();
+
+        // The packet edits as a text field carrying the stored expression,
+        // never as a JSON buffer quoting it.
+        let field = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, "packet")
+            .next()
+            .expect("the exp packet edits as a text field");
+        assert_eq!(field.value().as_deref(), Some("<b 0x12>"));
+        field.click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the packet field takes focus")
+            .type_text("<z>");
+        harness.run();
+
+        let borrowed = mask.borrow();
+        assert_eq!(
+            noise(&borrowed).noise[0].packet.value().cloned(),
+            Some(json!("<b 0x12><z>"))
+        );
+        assert!(
+            harness
+                .query_by_label(&t_fmt(
+                    Language::En,
+                    Key::FinalmaskNoiseExpUnknownToken,
+                    &[&"z"]
+                ))
+                .is_some(),
+            "the exp finding must render inline under the field"
+        );
     }
 
     #[test]

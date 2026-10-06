@@ -6409,26 +6409,105 @@ mod tests {
     }
 
     #[test]
+    fn every_unshareable_transport_names_its_own_refusal() {
+        // The export path cannot reach every rung of this ladder — a masque
+        // profile is refused by its protocol before the ladder runs — so the
+        // rows are pinned here: a transport that lost its own message would
+        // otherwise stay silent until a user met the wrong one.
+        for (network, key) in [
+            (Network::Masque, Key::LinkUnsupportedMasque),
+            (Network::Xdrive, Key::LinkUnsupportedXdrive),
+            (Network::Hysteria, Key::LinkUnsupportedHysteria),
+        ] {
+            match unshareable_transport(network) {
+                LinkError::Unsupported(message) => assert_eq!(
+                    message.text(Language::En),
+                    t_fmt(Language::En, key, &[]),
+                    "{network:?}"
+                ),
+                other => panic!(
+                    "expected Unsupported({key:?}) for {network:?}, got {}",
+                    other.text(Language::En)
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn hysteria_has_no_share_grammar_in_either_direction() {
         // The grammar spells no `type` for hysteria: import reports the value
         // as an unknown transport, and export refuses the live model network
         // with its own message.
         expect_malformed(&format!("vless://{UUID}@h.example.com:443?type=hysteria"));
 
-        let mut profile = parse_link(&format!(
+        let mut hysteria = parse_link(&format!(
             "vless://{UUID}@tls.local:443?security=tls&sni=tls.local#Hysteria"
         ))
         .unwrap();
-        profile.outbound.stream.network = Network::Hysteria;
-        profile.outbound.stream.hysteria_settings =
-            Some(crate::model::stream::HysteriaTransport::default());
-        match to_link(&profile) {
+        hysteria.outbound.stream.network = Network::Hysteria;
+        hysteria.outbound.stream.hysteria_settings = Some(HysteriaTransport::default());
+
+        // XDRIVE has no share grammar either, and export reaches its
+        // transport row's own refusal: the profile's protocol is one the
+        // grammar names, so only the transport blocks the export.
+        let mut xdrive = parse_link(&format!(
+            "vless://{UUID}@tls.local:443?security=tls&sni=tls.local#Xdrive"
+        ))
+        .unwrap();
+        xdrive
+            .outbound
+            .stream
+            .select_network(Network::Xdrive)
+            .expect("xdrive needs no security mode");
+        {
+            let xdrive = xdrive
+                .outbound
+                .stream
+                .xdrive_settings
+                .as_mut()
+                .expect("selecting xdrive materializes its block");
+            xdrive.service = crate::model::stream::XDRIVE_SERVICE_LOCAL.into();
+            xdrive.remote_folder = "xdrive-store".into();
+        }
+
+        for (profile, key) in [
+            (hysteria.profile, Key::LinkUnsupportedHysteria),
+            (xdrive.profile, Key::LinkUnsupportedXdrive),
+        ] {
+            match to_link(&profile) {
+                Err(LinkError::Unsupported(message)) => {
+                    assert_eq!(message.text(Language::En), t_fmt(Language::En, key, &[]));
+                }
+                other => panic!(
+                    "expected Unsupported({key:?}), got {}",
+                    outcome_shape(&other)
+                ),
+            }
+        }
+
+        // MASQUE carries no share format either, but a masque profile is
+        // refused one step earlier: its protocol has no share format, so
+        // export never reaches the transport row's own refusal. The case
+        // pins the message a masque profile actually shows.
+        let mut masque = OutboundModel::new(Protocol::Masque);
+        if let ProtocolSettings::Masque(settings) = &mut masque.settings {
+            settings.address = "masque.example.com".into();
+            settings.port = 443;
+            settings.remote_dns = vec!["1.1.1.1".into()];
+        }
+        masque
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("the masque outbound arms its transport")
+            .host = "masque.example.com".into();
+        match to_link(&ServerProfile::new("Masque", masque)) {
             Err(LinkError::Unsupported(message)) => assert_eq!(
                 message.text(Language::En),
-                t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[])
+                t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"masque"])
             ),
             other => panic!(
-                "expected Unsupported(Hysteria), got {}",
+                "expected Unsupported(masque protocol), got {}",
                 outcome_shape(&other)
             ),
         }

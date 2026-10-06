@@ -5,16 +5,18 @@
 //! recursion. Raw-JSON and PEM fields edit through the screen's seeded
 //! buffer machinery (`super::raw_editor`). Private to the screen.
 
-use crate::i18n::{Key, t, t_fmt};
+use crate::i18n::{Key, t, t_fmt, validation_message};
 use crate::model::settings::Language;
-use crate::model::validation::{ValidationCode, pinned_peer_cert_sha256_valid};
+use crate::model::validation::{
+    ValidationCode, noise_exp_finding, noise_exp_packet_finding, pinned_peer_cert_sha256_valid,
+};
 use crate::model::{
     FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
     FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku, FinalmaskTcpItem,
     FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem,
     FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsDomainEntry,
     FinalmaskXdnsResolver, FinalmaskXdnsResolverEntry, FinalmaskXmc, FinalmaskXmcProfile,
-    Int32Range, TlsCert,
+    Int32Range, TlsCert, fold_eq,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -161,13 +163,30 @@ fn finalmask_raw_value_editor(
         t(lang, Key::SrvDefault),
         false,
     );
+    changed |= finalmask_raw_value_body(ui, lang, label, encoding, raw, field);
+    changed
+}
+
+/// The part of a raw-value field below its `type` combo: the present
+/// checkbox and the value widget. Split out so a field whose type set is
+/// wider than the byte-encoding kinds — the `noise` item's `exp` — can
+/// render its own combo over the same body.
+fn finalmask_raw_value_body(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    encoding: &str,
+    raw: &mut FinalmaskRawValue,
+    field: RawField<'_>,
+) -> bool {
+    let mut changed = false;
     let mut present = !raw.is_absent();
     if ui
         .checkbox(&mut present, t_fmt(lang, Key::SrvSetLabel, &[&label]))
         .changed()
     {
         *raw = if present {
-            FinalmaskRawValue::Present(match encoding.as_str() {
+            FinalmaskRawValue::Present(match encoding {
                 "str" | "hex" | "base64" => serde_json::Value::String(String::new()),
                 _ => serde_json::json!([]),
             })
@@ -179,7 +198,7 @@ fn finalmask_raw_value_editor(
     let Some(value) = raw.value_mut() else {
         return changed;
     };
-    if matches!(encoding.as_str(), "str" | "hex" | "base64")
+    if matches!(encoding, "str" | "hex" | "base64")
         && let serde_json::Value::String(text) = value
     {
         // The string case edits the model's own text in place — the widget
@@ -200,6 +219,75 @@ fn finalmask_raw_value_editor(
                 rows: 2,
             },
         );
+    }
+    changed
+}
+
+/// The `noise` item's `packet`. The byte-encoding kinds edit through
+/// [`finalmask_raw_value_editor`]; `exp` reads a JSON string and parses it as
+/// the token mini-language (`infra/conf/transport_finalmask.go:318-326`), so
+/// its type edits the expression as plain text and never as a raw JSON
+/// buffer.
+fn finalmask_noise_packet_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    item: &mut FinalmaskNoiseItem,
+    field: RawField<'_>,
+) -> bool {
+    let mut changed = widgets::combo_str_labeled(
+        ui,
+        &t_fmt(lang, Key::SrvLabelSyntax, &[&"packet"]),
+        &mut item.encoding,
+        &["", "array", "str", "hex", "base64", "exp"],
+        t(lang, Key::SrvDefault),
+        false,
+    );
+    if fold_eq(&item.encoding, "exp") {
+        changed |= finalmask_noise_exp_field(ui, lang, &mut item.packet);
+    } else {
+        changed |=
+            finalmask_raw_value_body(ui, lang, "packet", &item.encoding, &mut item.packet, field);
+    }
+    changed
+}
+
+/// The `noise` item's `exp` packet: the token expression in a plain text
+/// field, with the model's own finding under it. A loaded packet that is not
+/// a string cannot be read as an expression, so its finding renders and the
+/// present checkbox replaces the value with the string the field edits.
+fn finalmask_noise_exp_field(
+    ui: &mut egui::Ui,
+    lang: Language,
+    raw: &mut FinalmaskRawValue,
+) -> bool {
+    let mut changed = false;
+    let mut present = !raw.is_absent();
+    if ui
+        .checkbox(&mut present, t_fmt(lang, Key::SrvSetLabel, &[&"packet"]))
+        .changed()
+    {
+        *raw = if present {
+            FinalmaskRawValue::Present(serde_json::Value::String(String::new()))
+        } else {
+            FinalmaskRawValue::Absent
+        };
+        changed = true;
+    }
+    match raw.value_mut() {
+        Some(serde_json::Value::String(expression)) => {
+            changed |= widgets::validated_field(
+                ui,
+                "packet",
+                expression,
+                t(lang, Key::SrvNoiseExpHint),
+                |text| noise_exp_finding(text).map(|code| validation_message(&code, lang)),
+            );
+        }
+        _ => {
+            if let Some(code) = noise_exp_packet_finding(raw) {
+                ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
+            }
+        }
     }
     changed
 }
@@ -753,6 +841,10 @@ fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Final
                         }
                     });
                     changed |= widgets::text_field(ui, "name", &mut domain.name, "example.com");
+                    // The limits stay the core's own ranges. Whether a pair
+                    // leaves room for the encoded payload depends on the name
+                    // edited in this row, so the row cannot offer a tighter
+                    // bound; the validation pass reports a pair that does not.
                     ui.horizontal(|ui| {
                         ui.label("lenLimit");
                         changed |= ui
@@ -1209,12 +1301,10 @@ pub(super) fn finalmask_udp_settings_editor(
                         changed |=
                             widgets::opt_range(ui, "randRange", &mut item.rand_range, 0..=255);
                         changed |= range_editor(ui, "delay", &mut item.delay, i32::MIN..=i32::MAX);
-                        changed |= finalmask_raw_value_editor(
+                        changed |= finalmask_noise_packet_editor(
                             ui,
                             lang,
-                            "packet",
-                            &mut item.encoding,
-                            &mut item.packet,
+                            item,
                             RawField {
                                 id: FieldKey {
                                     key: field.id.key.with(("noise", index)),

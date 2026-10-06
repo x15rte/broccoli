@@ -1239,7 +1239,7 @@ mod tests {
     use crate::model::settings::Language;
     use crate::model::stream::{
         FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HysteriaTransport, Network,
-        RawSettings, Security, XhttpSettings,
+        RawSettings, Security, XdriveTemplate, XhttpSettings,
     };
     use base64::Engine as _;
     use serde_json::{Value, json};
@@ -1603,6 +1603,57 @@ mod tests {
         assert!(!stream.contains_key("hysteriaSettings"));
         assert!(outbound.stream.xhttp_settings.is_some());
         assert!(outbound.stream.hysteria_settings.is_some());
+    }
+
+    /// The nested xdrive template backend belongs to the `template` service:
+    /// the wire drops it for every other service, and the settings file keeps
+    /// it so switching the service back restores the draft.
+    #[test]
+    fn xdrive_wire_drops_the_template_backend_for_other_services() {
+        let mut outbound = OutboundModel::new(Protocol::Freedom);
+        outbound
+            .stream
+            .select_network(Network::Xdrive)
+            .expect("xdrive needs no security mode");
+        {
+            let xdrive = outbound
+                .stream
+                .xdrive_settings
+                .as_mut()
+                .expect("selecting xdrive materializes its block");
+            xdrive.service = "local".into();
+            xdrive.remote_folder = "xdrive-store".into();
+            xdrive.template = Some(XdriveTemplate {
+                flatten: true,
+                ..Default::default()
+            });
+        }
+
+        let wire = outbound.to_wire("direct");
+        let xdrive = &wire["streamSettings"]["xdriveSettings"];
+        assert_eq!(xdrive["service"], "local");
+        assert!(
+            xdrive.get("template").is_none(),
+            "a non-template service must not carry the backend on the wire: {wire}"
+        );
+        assert!(
+            outbound
+                .stream
+                .xdrive_settings
+                .as_ref()
+                .unwrap()
+                .template
+                .is_some(),
+            "the stored draft keeps the template"
+        );
+
+        outbound.stream.xdrive_settings.as_mut().unwrap().service = "template".into();
+        let wire = outbound.to_wire("direct");
+        assert_eq!(
+            wire["streamSettings"]["xdriveSettings"]["template"]["flatten"],
+            json!(true),
+            "switching the service back restores the template: {wire}"
+        );
     }
 
     #[test]

@@ -2390,6 +2390,17 @@ impl StreamModel {
             // core's own conf build would produce them.
             masque.normalize_for_wire();
         }
+        if let Some(xdrive) = self.xdrive_settings.as_mut() {
+            // The nested template backend belongs to the `template` service
+            // alone: the conf build reads it only there and refuses that
+            // service without it (`infra/conf/transport_method.go:883-899`),
+            // so the other services' documents carry no `template` key. The
+            // stored value stays in the settings file, so switching the
+            // service back restores it.
+            if xdrive.service != XDRIVE_SERVICE_TEMPLATE {
+                xdrive.template = None;
+            }
+        }
         if let Some(websocket) = self.ws_settings.as_mut() {
             // `self` is the cloned wire model. Canonicalize Xray's accepted
             // legacy Host header here without mutating persisted/imported
