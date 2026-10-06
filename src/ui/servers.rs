@@ -5474,16 +5474,33 @@ impl ServersScreen {
                 };
                 let folder_required =
                     s.service == XDRIVE_SERVICE_LOCAL || s.service == XDRIVE_SERVICE_DRIVE;
-                changed |= widgets::validated_field(
+                let folder_validate = |folder: &str| {
+                    (folder_required && folder.is_empty()).then(|| {
+                        validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
+                    })
+                };
+                // The local service is the one that names a directory on this
+                // machine — the one folder whose format the user cannot guess
+                // — so it gets the picker. The Drive folder id and the
+                // template token are opaque to the outside, and the button
+                // comes and goes with the service chosen above.
+                let mut pick_folder = |ui: &mut egui::Ui| -> Option<String> {
+                    if !ui.small_button(t(lang, Key::SrvBrowse)).clicked() {
+                        return None;
+                    }
+                    rfd::FileDialog::new()
+                        .pick_folder()
+                        .map(|folder| folder.to_string_lossy().into_owned())
+                };
+                let folder_picker: Option<widgets::Trailing<'_>> =
+                    (s.service == XDRIVE_SERVICE_LOCAL).then_some(&mut pick_folder);
+                changed |= widgets::validated_field_with_trailing(
                     ui,
                     t(lang, Key::SrvXdriveRemoteFolder),
                     &mut s.remote_folder,
                     folder_hint,
-                    |folder| {
-                        (folder_required && folder.is_empty()).then(|| {
-                            validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
-                        })
-                    },
+                    folder_validate,
+                    folder_picker,
                 );
                 changed |= widgets::string_list(
                     ui,

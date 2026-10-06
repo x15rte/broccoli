@@ -211,17 +211,50 @@ struct FieldContext {
     caption: Option<egui::Id>,
 }
 
+/// The one control a validated field's row renders after its text box: it
+/// draws itself into the row and returns the text it wants the field to hold
+/// — a browse button handing over the folder the user picked — or `None` to
+/// leave the field alone, the user having cancelled the control's dialog.
+/// The control receives the row's `Ui` and not the field's buffer, because
+/// the buffer belongs to the widget that renders the text box; the text it
+/// yields is how a control writes to the field.
+pub type Trailing<'a> = &'a mut dyn FnMut(&mut egui::Ui) -> Option<String>;
+
 /// Label + validated single-line text field. When `validate` returns
 /// `Some(msg)` the field gets a red border, a hover tooltip, and the message
 /// in red under the field. `validate` is a pure parse of the text and runs
 /// only when the text changed (or on first display); only an actual edit
 /// (not the error state) counts as "changed".
+///
+/// [`validated_field_with_trailing`] with no trailing control.
 pub fn validated_field(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut String,
     hint: &str,
     validate: impl Fn(&str) -> Option<String>,
+) -> bool {
+    validated_field_with_trailing(ui, label, value, hint, validate, None)
+}
+
+/// [`validated_field`] whose row also carries one [`Trailing`] control after
+/// the text box: the form for a field a small button supplies the value to,
+/// a folder picker beside a folder path. The control renders at the row's
+/// right edge and the text box takes what it leaves, so the field's fill
+/// width never pushes the control out of the clip rect. The hint, the
+/// verdict and the required rule are the plain field's.
+///
+/// The control serves the field: the text it yields becomes the field's text
+/// and counts as this field's change, while `None` leaves the field alone.
+/// The verdict follows the yielded text on the next frame, like any other
+/// rewrite of the buffer.
+pub fn validated_field_with_trailing(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    validate: impl Fn(&str) -> Option<String>,
+    trailing: Option<Trailing<'_>>,
 ) -> bool {
     validated_field_impl(
         ui,
@@ -230,7 +263,10 @@ pub fn validated_field(
         hint,
         FieldContext::default(),
         validate,
-        None,
+        FieldExtras {
+            trailing,
+            ..FieldExtras::default()
+        },
     )
 }
 
@@ -258,7 +294,7 @@ pub fn validated_field_with_revision(
             ..FieldContext::default()
         },
         validate,
-        None,
+        FieldExtras::default(),
     )
 }
 
@@ -283,7 +319,10 @@ pub fn validated_field_with_warning(
         hint,
         FieldContext::default(),
         validate,
-        warning,
+        FieldExtras {
+            warning,
+            ..FieldExtras::default()
+        },
     )
 }
 
@@ -311,7 +350,7 @@ pub fn validated_field_captioned(
             ..FieldContext::default()
         },
         validate,
-        None,
+        FieldExtras::default(),
     )
 }
 
@@ -422,8 +461,22 @@ fn paint_validation(
     }
 }
 
+/// The optional adornments of a validated row: the amber `warning` line
+/// ([`validated_field_with_warning`]) and the one `trailing` control after the
+/// text box ([`validated_field_with_trailing`]). A plain [`validated_field`]
+/// row carries neither.
+#[derive(Default)]
+struct FieldExtras<'a> {
+    warning: Option<&'a str>,
+    trailing: Option<Trailing<'a>>,
+}
+
 /// Shared body of the [`validated_field`] family: renders the labelled field,
-/// then the error/warning lines.
+/// then the error/warning lines. When the extras carry a trailing control the
+/// row is a [`Sides`](egui::containers::Sides) whose right side is that
+/// control: the control is measured first and the text box is given what is
+/// left of the row, so an unbounded field cannot claim the row and push the
+/// control past the clip rect (invisible, unclickable).
 fn validated_field_impl(
     ui: &mut egui::Ui,
     label: &str,
@@ -431,29 +484,51 @@ fn validated_field_impl(
     hint: &str,
     context: FieldContext,
     validate: impl Fn(&str) -> Option<String>,
-    warning: Option<&str>,
+    extras: FieldExtras<'_>,
 ) -> bool {
+    let FieldExtras { warning, trailing } = extras;
     let (changed, rect, error) = ui
         .horizontal(|ui| {
-            let label_response = ui.label(label);
-            let mut r = ui.add(
-                egui::TextEdit::singleline(value)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY),
-            );
-            // The group caption (when the caller rendered one) reads before
-            // the field's own label, so the name of a field that repeats once
-            // per group distinguishes the instances: "Pool 1 IP pool".
-            if let Some(caption) = context.caption {
-                r = r.labelled_by(caption);
-            }
-            let r = r.labelled_by(label_response.id);
-            let error = validation_verdict(ui, &r, label, value, context.revision, &validate);
-            let r = match error.as_deref().or(warning) {
-                Some(message) => r.on_hover_text(message),
-                None => r,
+            // One row body for both shapes: the label, the text box, and the
+            // verdict. Without a trailing control the row body *is* the row;
+            // with one it is the row's left side.
+            let mut row = |ui: &mut egui::Ui| {
+                let label_response = ui.label(label);
+                let mut r = ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                );
+                // The group caption (when the caller rendered one) reads before
+                // the field's own label, so the name of a field that repeats once
+                // per group distinguishes the instances: "Pool 1 IP pool".
+                if let Some(caption) = context.caption {
+                    r = r.labelled_by(caption);
+                }
+                let r = r.labelled_by(label_response.id);
+                let error = validation_verdict(ui, &r, label, value, context.revision, &validate);
+                let r = match error.as_deref().or(warning) {
+                    Some(message) => r.on_hover_text(message),
+                    None => r,
+                };
+                (r.changed(), r.rect, error)
             };
-            (r.changed(), r.rect, error)
+            match trailing {
+                Some(trailing) => {
+                    let ((row_changed, rect, error), yielded) = egui::containers::Sides::new()
+                        .shrink_left()
+                        .show(ui, |ui| row(ui), trailing);
+                    let changed = match yielded {
+                        Some(text) => {
+                            *value = text;
+                            true
+                        }
+                        None => row_changed,
+                    };
+                    (changed, rect, error)
+                }
+                None => row(ui),
+            }
         })
         .inner;
     paint_validation(ui, rect, error.as_deref(), warning);
@@ -1308,6 +1383,100 @@ mod tests {
         assert!(
             harness.query_by_label("already used").is_none(),
             "clearing the context must clear the verdict"
+        );
+    }
+
+    /// A validated field's trailing control is how a browse button feeds the
+    /// field it sits beside: the text the control yields becomes the field's
+    /// text and counts as the field's change, while a control that yields
+    /// nothing — a dialog the user cancelled — leaves the field alone. The
+    /// control renders after the text box and stays inside the row: the
+    /// field's fill width must not claim the control's own space.
+    #[test]
+    fn validated_field_trailing_control_feeds_the_field_it_sits_beside() {
+        /// The row's inputs and what its last frame reported.
+        #[derive(Default)]
+        struct Row {
+            folder: String,
+            /// What the control yields on the next frame, one shot — the
+            /// shape a dialog has: it opens, it yields, the frame runs on.
+            yielded: Option<String>,
+            changed: bool,
+        }
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 160.0))
+            .build_ui_state(
+                |ui, row: &mut Row| {
+                    let Row {
+                        folder,
+                        yielded,
+                        changed,
+                    } = row;
+                    let mut control = |ui: &mut egui::Ui| {
+                        let _ = ui.small_button("Pick");
+                        yielded.take()
+                    };
+                    *changed = validated_field_with_trailing(
+                        ui,
+                        "folder",
+                        folder,
+                        "",
+                        |_| None,
+                        Some(&mut control),
+                    );
+                },
+                Row::default(),
+            );
+        harness.run();
+
+        // The row renders both parts, the control after the text box, and the
+        // control sits inside the viewport — a field that claimed the whole
+        // row would leave it clipped and unclickable.
+        let field = harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "folder")
+            .rect();
+        let control = harness.get_by_label("Pick").rect();
+        assert!(
+            control.left() >= field.right(),
+            "the control renders after the text box (field {field:?}, control {control:?})"
+        );
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 160.0));
+        assert!(
+            viewport.contains(control.center()),
+            "the field's fill width must leave the control its own row space \
+             (control {control:?}, viewport {viewport:?})"
+        );
+
+        // A control that yields nothing — a cancelled dialog — leaves the
+        // field alone and reports no change.
+        assert!(!harness.state().changed, "an idle row reports no change");
+        assert!(harness.state().folder.is_empty());
+
+        // The text the control yields is the field's new text, and the row
+        // reports it as the field's change (one frame, so the report is the
+        // yielding frame's).
+        harness.state_mut().yielded = Some("C:\\xdrive".to_owned());
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().folder,
+            "C:\\xdrive",
+            "the control's yielded text must land in the field's own buffer"
+        );
+        assert!(
+            harness.state().changed,
+            "the control's text counts as the field's change"
+        );
+
+        // The text box shows the yielded text on the following frame.
+        harness.run_steps(1);
+        assert_eq!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, "folder")
+                .value()
+                .as_deref(),
+            Some("C:\\xdrive"),
+            "the field must render the text the control yielded"
         );
     }
 }
