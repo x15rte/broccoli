@@ -1,5 +1,5 @@
 # broccoli 🥦
-a Windows Xray-core GUI client in Rust (egui/eframe) 🦀  
+a Windows Xray-core GUI client in Rust (egui/eframe)
 - Full client-side Xray-core functionality, kept up to date with upstream.
 - User-friendly: most configuration is doable in the GUI.
 - Customizable.
