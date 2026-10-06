@@ -1766,7 +1766,7 @@ fn failed_atomic_state_write_removes_the_temp_file() {
 }
 
 /// The wire-vocabulary fold is Go's `strings.ToLower`, not ASCII
-/// case-insensitivity: the pinned v26.9.9 binary loads a strategy spelled
+/// case-insensitivity: the pinned v26.9.30 binary loads a strategy spelled
 /// `ForceİP`, because Go's simple mapping folds `İ` (U+0130) to `i`, and the
 /// Kelvin sign (U+212A) folds to `k`. A predicate that folds ASCII-only
 /// refuses those spellings and gates a profile the core runs.
@@ -1792,7 +1792,7 @@ fn vocabulary_fold_matches_go_simple_lowercase() {
 
 /// The dokodemo listener network and the balancer strategy fold like the core:
 /// `Network.Build` and the router both lowercase the value first
-/// (infra/conf/common.go:77, infra/conf/router.go:37), and the pinned v26.9.9
+/// (infra/conf/common.go:77, infra/conf/router.go:37), and the pinned v26.9.30
 /// binary loads `unİx` and routes `leastpİng` to the same strategy.
 #[test]
 fn inbound_and_balancer_vocabularies_fold_like_the_core() {
@@ -1821,7 +1821,7 @@ fn inbound_and_balancer_vocabularies_fold_like_the_core() {
 /// (`infra/conf/transport_finalmask.go`, `PraseByteSlice`): the canonical `=`
 /// padding is required, `\r`/`\n` are skipped anywhere, and non-zero trailing
 /// bits decode to the same bytes. Every accepted form below passed
-/// `xray run -test` on the pinned v26.9.9 binary; every refused form made it
+/// `xray run -test` on the pinned v26.9.30 binary; every refused form made it
 /// exit before loading.
 #[test]
 fn go_std_base64_decodes_matches_the_cores_decoder() {

@@ -3080,7 +3080,7 @@ mod safety_tests {
         let mut folded_stats = valid.clone();
         // The core lowercases every service name before it matches
         // (infra/conf/api.go:29), so these are the same two services — the
-        // pinned v26.9.9 binary loads the block.
+        // pinned v26.9.30 binary loads the block.
         folded_stats["api"]["services"] = json!(["Reflect\u{130}onService", "StatsServ\u{130}ce"]);
         assert!(validate_raw_override_candidate(&settings, &folded_stats, Language::En).is_ok());
 

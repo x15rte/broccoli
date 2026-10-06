@@ -354,7 +354,7 @@ mod tests {
     }
 
     /// The fingerprint predicates fold like the core: `transport_security.go`
-    /// lowercases the name before its lookup, and the pinned v26.9.9 binary
+    /// lowercases the name before its lookup, and the pinned v26.9.30 binary
     /// loads `safarİ` on both the TLS and the REALITY branches. The link
     /// grammar stays exact — it is this app's own import contract, not the
     /// core's match.

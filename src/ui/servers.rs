@@ -11241,11 +11241,9 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn mask_lists_render_their_order_captions() {
         // Both mask lists carry an order caption. The UDP list names the
-        // types the wrap pins to the last entry and the type it pins to the
-        // first; the TCP list states that no type is pinned, because only the
-        // UDP masks check their level while they wrap
-        // (`transport/internet/finalmask/sudoku/config.go` and the other
-        // per-type checks are UDP-only).
+        // types the wrap pins to the last entry; the TCP list states that no
+        // type is pinned, because only a UDP mask declares `HandleDial` or
+        // `HandleListen` (`transport/internet/finalmask/finalmask.go`).
         let mut screen = ServersScreen::default();
         let mut profile =
             ServerProfile::new("caption-order", OutboundModel::new(Protocol::Freedom));
@@ -11276,8 +11274,11 @@ Authentication: ML-KEM-768, Post-Quantum
             );
         }
         let udp = t(Language::En, Key::SrvUdpMaskOrderNote);
-        for name in ["udphop", "realm", "xicmp", "sudoku"] {
+        for name in ["udphop", "xicmp"] {
             assert!(udp.contains(name), "{udp:?} must name {name}");
+        }
+        for absent in ["realm", "sudoku"] {
+            assert!(!udp.contains(absent), "{udp:?} must not name {absent}");
         }
     }
 

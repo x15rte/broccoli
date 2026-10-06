@@ -1263,7 +1263,7 @@ mod tests {
         // Two spellings Go's decoder reads but a strict Rust engine does not:
         // the same 32 bytes of `0x01` with non-zero trailing bits in the last
         // symbol, and with a CR/LF pair the decoder ignores. Both keys below
-        // passed `xray run -test` on the pinned v26.9.9 binary, so refusing
+        // passed `xray run -test` on the pinned v26.9.30 binary, so refusing
         // them would gate a profile the core runs.
         for value in [
             "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
@@ -2189,7 +2189,7 @@ mod tests {
 
     /// The freedom `settings.fragment` block gates exactly the shapes
     /// `Fragment.Build` refuses while it builds the configuration, and only
-    /// those. The pinned v26.9.9 binary loads every accepted row below
+    /// those. The pinned v26.9.30 binary loads every accepted row below
     /// (`xray run -test` exits 0) and exits 23 on every gated row, so an
     /// inverted or negative bound — which `RandBetween` swaps at runtime — is
     /// no finding, while a padded `packets` is: Go's `ParseRangeString` never
@@ -2293,7 +2293,7 @@ mod tests {
     /// The freedom `settings.noises` entries gate exactly what `ParseNoise`
     /// (`infra/conf/freedom.go`) refuses while it builds the configuration, and
     /// only those: `type` is compared as written, `packet` is trimmed and then
-    /// read per type, and `applyTo` folds like the core. The pinned v26.9.9
+    /// read per type, and `applyTo` folds like the core. The pinned v26.9.30
     /// binary loads every accepted row below (`xray run -test` exits 0) and
     /// exits 23 on every gated row.
     #[test]
@@ -2465,8 +2465,9 @@ mod tests {
             "forceipv6",
             "forceipv4v6",
             "forceipv6v4",
-            // The spellings the v26.9.9 core refused are ignored exactly the
-            // same way now, so they warn like every other value.
+            // The spellings the core refused before it dropped the key are
+            // ignored exactly the same way on the pinned v26.9.30 binary, so
+            // they warn like every other value.
             "bogus",
             "AsIs",
             "forceip4",

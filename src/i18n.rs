@@ -1594,9 +1594,7 @@ keys! {
     FinalmaskUdpHopIntervalTooSmall 0,
     FinalmaskUdpHopSockoptRetired 0,
     FinalmaskUdpHopIpInvalid 0,
-    FinalmaskDialerProxyConflict 0,
     FinalmaskUdpMaskNotLast 1,
-    FinalmaskUdpMaskNotFirst 1,
     FinalmaskUdpHopIntervalTransportConflict 0,
     FinalmaskQuicReceiveWindowTooSmall 0,
     FinalmaskQuicMaxIdleTimeoutInvalid 0,
@@ -2591,9 +2589,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
         FinalmaskUdpHopSockoptRetired => t(lang, Key::FinalmaskUdpHopSockoptRetired),
         FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
-        FinalmaskDialerProxyConflict => t(lang, Key::FinalmaskDialerProxyConflict),
         FinalmaskUdpMaskNotLast(_) => t(lang, Key::FinalmaskUdpMaskNotLast),
-        FinalmaskUdpMaskNotFirst(_) => t(lang, Key::FinalmaskUdpMaskNotFirst),
         FinalmaskUdpHopIntervalTransportConflict => {
             t(lang, Key::FinalmaskUdpHopIntervalTransportConflict)
         }
@@ -2752,7 +2748,6 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::FinalmaskRealmUrlSyntax(arg)
         | ValidationCode::FinalmaskQuicBandwidthUnitInvalid(arg)
         | ValidationCode::FinalmaskUdpMaskNotLast(arg)
-        | ValidationCode::FinalmaskUdpMaskNotFirst(arg)
         | ValidationCode::FinalmaskNoiseExpTrailingText(arg)
         | ValidationCode::FinalmaskNoiseExpUnknownToken(arg)
         | ValidationCode::FinalmaskNoiseExpMissingSize(arg)
@@ -4180,7 +4175,7 @@ mod en {
             Key::SrvAddTcpMask => "+ TCP mask",
             Key::SrvAddUdpMask => "+ UDP mask",
             Key::SrvTcpMaskOrderNote => "The core accepts any TCP mask order.",
-            Key::SrvUdpMaskOrderNote => "Put udphop, realm, and xicmp last and sudoku first.",
+            Key::SrvUdpMaskOrderNote => "Put udphop and xicmp last.",
             Key::SrvSockopt => "sockopt",
             Key::SrvAddServerWindow => "Add server",
             Key::SrvProtocol => "protocol",
@@ -4812,15 +4807,8 @@ mod en {
                  instead."
             }
             Key::FinalmaskUdpHopIpInvalid => "enter an IP address or a CIDR prefix",
-            Key::FinalmaskDialerProxyConflict => {
-                "The udphop, realm, and xicmp masks cannot dial through another server. Remove \
-                 the mask or clear sockopt.dialerProxy"
-            }
             Key::FinalmaskUdpMaskNotLast => {
                 "{} must be the last UDP mask entry. Move it to the end of the list"
-            }
-            Key::FinalmaskUdpMaskNotFirst => {
-                "{} must be the first UDP mask entry. Move it to the beginning of the list"
             }
             Key::FinalmaskUdpHopIntervalTransportConflict => {
                 "The udphop interval modes need hysteria2, HTTP/3 xhttp, or WireGuard. Other \
@@ -6714,24 +6702,14 @@ mod tests {
         use crate::model::validation::{Severity, ValidationIssue};
 
         let not_last = ValidationIssue {
-            code: ValidationCode::FinalmaskUdpMaskNotLast("realm".into()),
+            code: ValidationCode::FinalmaskUdpMaskNotLast("udphop".into()),
             path: Some("finalmask.udp[0]".into()),
             severity: Severity::Error,
         };
         assert_eq!(
             validation_issue_message(&not_last, Language::En),
-            "finalmask.udp[0]: realm must be the last UDP mask entry. Move it to the end of the \
+            "finalmask.udp[0]: udphop must be the last UDP mask entry. Move it to the end of the \
              list"
-        );
-        let not_first = ValidationIssue {
-            code: ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
-            path: Some("finalmask.udp[1]".into()),
-            severity: Severity::Error,
-        };
-        assert_eq!(
-            validation_issue_message(&not_first, Language::En),
-            "finalmask.udp[1]: sudoku must be the first UDP mask entry. Move it to the \
-             beginning of the list"
         );
         let interval = ValidationIssue {
             code: ValidationCode::FinalmaskUdpHopIntervalTransportConflict,

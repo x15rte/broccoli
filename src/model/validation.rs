@@ -255,7 +255,7 @@ pub enum ValidationCode {
     FinalmaskQuicForceBrutalNeedsUp,
     /// A profile's `quicParams` carried the retired `udpHop` key: the hop
     /// moved to the `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`
-    /// at v26.9.9) and the core ignores the old key silently, so the config
+    /// at v26.9.30) and the core ignores the old key silently, so the config
     /// applies without the hop until the user rebuilds it as a mask. The key
     /// is kept for the settings file (JSON `null` is the Go zero shape and
     /// counts as absent), never serialized to the wire, and never migrated.
@@ -285,30 +285,18 @@ pub enum ValidationCode {
     /// prefix — the mask build refuses the entry at config load
     /// (`infra/conf/transport_finalmask.go:950-960`).
     FinalmaskUdpHopIpInvalid,
-    /// A mask that wraps the outbound's own packet connection (`udphop`,
-    /// `realm`, or `xicmp`) and a dial-through chain on the same outbound:
-    /// each of those client wraps refuses a proxied packet connection — an
-    /// `internet.FakePacketConn`, which is what `sockopt.dialerProxy` yields
-    /// (`transport/internet/finalmask/{udphop,realm,xicmp}/config.go:11-13`).
-    /// The core starts and every dial fails, so this is a configuration
-    /// warning, never a gate.
-    FinalmaskDialerProxyConflict,
-    /// A `udphop` / `realm` / `xicmp` UDP mask sits anywhere but the last
-    /// list entry: the UDP mask manager reverses the list at construction
-    /// and wraps forward, so the JSON list's last entry is wrapped first
-    /// (`transport/internet/finalmask/finalmask.go:21-25,28-31`), and those
-    /// wraps demand that first slot — level 0
-    /// (`.../udphop/config.go:11-13`, `.../realm/config.go:11-20`,
-    /// `.../xicmp/config.go:11-20`). The core starts and every dial fails,
-    /// so this gates. Carries the mask type name.
+    /// A `udphop` / `xicmp` UDP mask sits anywhere but the last list entry.
+    /// `NewFinalMask` reverses both mask slices at construction and the wrap
+    /// runs forward (`transport/internet/finalmask/finalmask.go:44-46`), so
+    /// the JSON list's last entry is the outermost wrap. A mask that declares
+    /// `HandleDial` or `HandleListen` owns the outbound's own socket and must
+    /// sit at index 0 after that reversal — `udphop` declares `HandleDial`
+    /// (`.../udphop/config.go:9`) and `xicmp` both (`.../xicmp/config.go:10-12`)
+    /// — and the core refuses any other index with `incorrect index: %d %T`
+    /// (`finalmask.go:149-152` for `HandleDial`, `:218-221` for
+    /// `HandleListen`). The core starts and every dial fails, so this gates.
+    /// Carries the mask type name.
     FinalmaskUdpMaskNotLast(String),
-    /// A `sudoku` UDP mask sits anywhere but the first list entry: its wrap
-    /// demands the last-wrapped slot — level `levelCount`
-    /// (`transport/internet/finalmask/sudoku/config.go:39-49`), which the
-    /// reversed-and-forward manager maps to the JSON list's first entry. The
-    /// core starts and every dial fails, so this gates. Carries the mask
-    /// type name.
-    FinalmaskUdpMaskNotFirst(String),
     /// A `udphop` mask carries an interval mode on a transport that cannot
     /// run a hop: `intervalLocal` dials a fresh local socket per hop and
     /// `intervalRemote` re-rolls the remote address
@@ -1923,7 +1911,7 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Verdict {
 /// as a 0 start on the wire). Bounds that only look backwards still load:
 /// `crypto.RandBetween` swaps an inverted pair (`common/crypto/crypto.go:12`),
 /// so an inverted or negative range is no finding. Every row of that table is
-/// live on the pinned v26.9.9 binary (`xray run -test`: exit 0 accepted,
+/// live on the pinned v26.9.30 binary (`xray run -test`: exit 0 accepted,
 /// exit 23 refused).
 fn freedom_fragment_unrunnable(fragment: &Fragment) -> bool {
     let packets_unrunnable = !fragment.packets.is_empty()
@@ -1947,7 +1935,7 @@ fn freedom_fragment_unrunnable(fragment: &Fragment) -> bool {
 /// `base64` is normalized (`+`→`-`, `/`→`_`, `=` dropped) and decoded as raw
 /// URL base64. `applyTo` folds with `strings.ToLower` over the empty default
 /// plus `ip`, `all`, `ipv4`, `ipv6`. `delay` is read when present and
-/// constrains nothing. Every row of that table is live on the pinned v26.9.9
+/// constrains nothing. Every row of that table is live on the pinned v26.9.30
 /// binary (`xray run -test`: exit 0 accepted, exit 23 refused).
 fn freedom_noise_unrunnable(noise: &Noise) -> bool {
     let packet = noise.packet.trim();
@@ -3278,28 +3266,6 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         }
         if let Some(finalmask) = &stream.finalmask {
             issues.extend(validate_finalmask(finalmask));
-            // The outermost masks wrap the outbound's own packet connection,
-            // and their client wraps refuse a proxied packet connection
-            // (`transport/internet/finalmask/{udphop,realm,xicmp}/config.go:
-            // 11-13` reject an `internet.FakePacketConn`, which is what a
-            // dialerProxy dial yields). The core starts, and every dial
-            // fails, so this is a configuration warning, never a gate.
-            let wraps_the_dialed_connection = finalmask.udp.iter().any(|mask| {
-                matches!(
-                    mask,
-                    FinalmaskUdpMask::Udphop { .. }
-                        | FinalmaskUdpMask::Realm { .. }
-                        | FinalmaskUdpMask::Xicmp { .. }
-                )
-            });
-            if wraps_the_dialed_connection
-                && stream
-                    .sockopt
-                    .as_ref()
-                    .is_some_and(|sockopt| !sockopt.dialer_proxy.is_empty())
-            {
-                issues.push(warning(ValidationCode::FinalmaskDialerProxyConflict, None));
-            }
         }
         // XHTTP enum vocabularies and cross-field rules: every value below is
         // refused by Xray's SplitHTTPConfig Build at config load
@@ -3687,16 +3653,16 @@ pub fn validate_finalmask(fm: &FinalmaskModel) -> Verdict {
     Verdict::from_issues(issues)
 }
 
-/// Gate the UDP mask positions the wrap refuses. The manager reverses the
-/// list at construction and wraps forward
-/// (`transport/internet/finalmask/finalmask.go:21-25,28-31` at v26.9.9), so
-/// the JSON list's last entry wraps first and the first entry wraps last.
-/// `udphop`, `realm`, and `xicmp` demand the first-wrapped slot — level 0
-/// (`.../udphop/config.go:11-13`, `.../realm/config.go:11-20`,
-/// `.../xicmp/config.go:11-20`) — so they belong at the end of the list, and
-/// `sudoku` demands the last-wrapped slot — level `levelCount`
-/// (`.../sudoku/config.go:39-49`) — so it belongs at the start. A
-/// single-entry list fills both slots, and no TCP mask type is pinned. The
+/// Gate the UDP mask positions the wrap refuses. `NewFinalMask` reverses both
+/// mask slices at construction and the wrap then runs forward
+/// (`transport/internet/finalmask/finalmask.go:44-46`), so the JSON list's
+/// last entry is the outermost wrap. A mask that declares `HandleDial` or
+/// `HandleListen` owns the outbound's own socket and must be that outermost
+/// wrap — the core refuses any other index with `incorrect index: %d %T`
+/// (`finalmask.go:149-152` for `HandleDial`, `:218-221` for `HandleListen`).
+/// `udphop` declares `HandleDial` (`.../udphop/config.go:9`) and `xicmp`
+/// declares both (`.../xicmp/config.go:10-12`), so each belongs at the end of
+/// the list; no other UDP mask type, and no TCP mask type, is pinned. The
 /// core enforces this only while it wraps a connection, so the config build
 /// accepts a misordered chain and every dial fails; the app gates it instead.
 fn finalmask_validate_udp_order(masks: &[FinalmaskUdpMask], issues: &mut Vec<ValidationIssue>) {
@@ -3705,15 +3671,7 @@ fn finalmask_validate_udp_order(masks: &[FinalmaskUdpMask], issues: &mut Vec<Val
     };
     for (index, mask) in masks.iter().enumerate() {
         match mask {
-            FinalmaskUdpMask::Sudoku { .. } if index != 0 => issues.push(issue(
-                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
-                Some(format!("finalmask.udp[{index}]")),
-            )),
-            FinalmaskUdpMask::Realm { .. }
-            | FinalmaskUdpMask::Xicmp { .. }
-            | FinalmaskUdpMask::Udphop { .. }
-                if index != last =>
-            {
+            FinalmaskUdpMask::Xicmp { .. } | FinalmaskUdpMask::Udphop { .. } if index != last => {
                 issues.push(issue(
                     ValidationCode::FinalmaskUdpMaskNotLast(
                         mask.known_type()
@@ -5830,7 +5788,7 @@ mod tests {
     /// Go's `hex.DecodeString`, and `base64` Go's non-strict `StdEncoding`.
     /// The decoder's own quirks (`=` padding, trailing bits, `\r`/`\n`) are
     /// pinned by `go_std_base64_decodes_matches_the_cores_decoder`, and the
-    /// pinned v26.9.9 binary loads every accepted row below (`xray run -test`
+    /// pinned v26.9.30 binary loads every accepted row below (`xray run -test`
     /// exits 0) while it exits 23 on every gated one.
     #[test]
     fn finalmask_byte_encodings_route_each_encoding_to_its_shape_check() {
@@ -5978,7 +5936,7 @@ mod tests {
     /// The realm `echServerKeys` decode is the same Go `StdEncoding` the mask
     /// byte encodings use — `infra/conf/transport_security.go` reads the field
     /// with `base64.StdEncoding.DecodeString` — so a payload with non-zero
-    /// trailing bits or interior `\r`/`\n` loads on the pinned v26.9.9 binary
+    /// trailing bits or interior `\r`/`\n` loads on the pinned v26.9.30 binary
     /// while a padding violation exits 23. The decoder's own rows live in
     /// `go_std_base64_decodes_matches_the_cores_decoder`; this pins that the
     /// rule routes through it.
@@ -7255,85 +7213,24 @@ mod tests {
         );
     }
 
-    /// The outermost UDP masks wrap the outbound's own packet connection, so
-    /// a dial-through chain cannot run with `udphop`, `realm`, or `xicmp`:
-    /// each of those client wraps refuses the proxied packet connection, and
-    /// the advisory names the pair while every other combination stays quiet.
+    /// The UDP mask wrap pins only the masks that own the outbound's own
+    /// socket to the last list entry. `NewFinalMask` reverses both mask slices
+    /// at construction and wraps forward
+    /// (`transport/internet/finalmask/finalmask.go:44-46`), and only a mask
+    /// that declares `HandleDial` or `HandleListen` is position-bound —
+    /// `udphop` declares `HandleDial` and `xicmp` both, so the core refuses
+    /// any other index with `incorrect index` at dial. No other mask type is
+    /// pinned: `realm`, `sudoku` and the unconstrained types wrap in any
+    /// order. A misplaced pinned entry gates with its path and the required
+    /// end, and the editor's move operation repairs it.
     #[test]
-    fn proxied_chains_warn_for_every_outermost_mask_without_gating() {
-        let mask = |envelope: serde_json::Value| FinalmaskModel {
-            udp: vec![serde_json::from_value(envelope).expect("the mask envelope loads")],
-            ..Default::default()
-        };
-        let conflicts = |outbound: &OutboundModel| -> usize {
-            validate_outbound(outbound)
-                .iter()
-                .filter(|issue| issue.code == ValidationCode::FinalmaskDialerProxyConflict)
-                .count()
-        };
-
-        for (envelope, label) in [
-            (
-                json!({"type": "udphop", "settings": {"mode": "perConnRemote", "interval": "5-10"}}),
-                "udphop",
-            ),
-            (json!({"type": "realm", "settings": {}}), "realm"),
-            (json!({"type": "xicmp", "settings": {}}), "xicmp"),
-        ] {
-            let mut outbound = OutboundModel::new(Protocol::Vless);
-            outbound.stream.finalmask = Some(mask(envelope.clone()));
-            assert_eq!(
-                conflicts(&outbound),
-                0,
-                "{label} without a chain must stay quiet"
-            );
-            outbound.chain_via("srv-exit");
-            let issues = validate_outbound(&outbound);
-            let found: Vec<_> = issues
-                .iter()
-                .filter(|issue| issue.code == ValidationCode::FinalmaskDialerProxyConflict)
-                .collect();
-            assert_eq!(found.len(), 1, "{label}: {issues:#?}");
-            assert_eq!(found[0].severity, Severity::Warning, "{label}");
-            assert_eq!(found[0].path, None, "{label}");
-        }
-
-        // A chain with a mask that never wraps the packet connection stays
-        // quiet.
-        let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.stream.finalmask = Some(mask(
-            json!({"type": "salamander", "settings": {"password": "pw"}}),
-        ));
-        outbound.chain_via("srv-exit");
-        assert_eq!(
-            conflicts(&outbound),
-            0,
-            "{:#?}",
-            validate_outbound(&outbound)
-        );
-    }
-
-    /// The UDP mask manager reverses the list at construction and wraps
-    /// forward (`transport/internet/finalmask/finalmask.go:21-25,28-31` at
-    /// v26.9.9), so the wrap pins `udphop`/`realm`/`xicmp` to the last list
-    /// entry and `sudoku` to the first. A misplaced entry gates with its
-    /// path and the required end; the previously valid `[realm, sudoku]`
-    /// chain errors both ways and the editor's move operation repairs it.
-    /// Single-mask chains and unconstrained chains stay clean.
-    #[test]
-    fn udp_mask_order_gates_each_pinned_type_and_the_previous_chain_shape() {
+    fn udp_mask_order_gates_the_self_dialing_masks_only() {
         let order_findings = |list: &str| -> Vec<ValidationIssue> {
             let fm: FinalmaskModel = serde_json::from_str(&format!(r#"{{"udp":{list}}}"#))
                 .expect("fixture is valid finalmask JSON");
             validate_finalmask(&fm)
                 .into_iter()
-                .filter(|issue| {
-                    matches!(
-                        issue.code,
-                        ValidationCode::FinalmaskUdpMaskNotLast(_)
-                            | ValidationCode::FinalmaskUdpMaskNotFirst(_)
-                    )
-                })
+                .filter(|issue| matches!(issue.code, ValidationCode::FinalmaskUdpMaskNotLast(_)))
                 .collect()
         };
         let paths = |findings: &[ValidationIssue]| -> Vec<Option<String>> {
@@ -7356,13 +7253,13 @@ mod tests {
             );
         }
 
-        // Both pinned ends at once: sudoku first, the last-slot type last.
+        // A pinned type at the last entry, with unconstrained masks around it,
+        // stays clean.
         for chain in [
             format!("[{SUDOKU},{UDPHOP}]"),
-            format!("[{SUDOKU},{REALM}]"),
-            format!("[{SUDOKU},{XICMP}]"),
+            format!("[{REALM},{XICMP}]"),
             format!("[{SUDOKU},{SALAMANDER},{UDPHOP}]"),
-            format!("[{SUDOKU},{HEADER},{REALM}]"),
+            format!("[{HEADER},{REALM},{XICMP}]"),
         ] {
             assert!(
                 order_findings(&chain).is_empty(),
@@ -7370,10 +7267,12 @@ mod tests {
             );
         }
 
-        // Unconstrained types wrap in any order.
+        // The masks with no position marker wrap in any order.
         for chain in [
+            format!("[{REALM},{SUDOKU}]"),
+            format!("[{SUDOKU},{REALM}]"),
+            format!("[{SUDOKU},{SALAMANDER}]"),
             format!("[{SALAMANDER},{HEADER}]"),
-            format!("[{HEADER},{SALAMANDER}]"),
             format!("[{HEADER},{SALAMANDER},{HEADER}]"),
         ] {
             assert!(
@@ -7382,32 +7281,8 @@ mod tests {
             );
         }
 
-        // The previously valid shape: realm was first, sudoku last. Both
-        // entries now sit at the wrong end.
-        let previous = order_findings(&format!("[{REALM},{SUDOKU}]"));
-        assert_eq!(
-            codes(&previous),
-            vec![
-                ValidationCode::FinalmaskUdpMaskNotLast("realm".into()),
-                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
-            ],
-            "{previous:#?}"
-        );
-        assert_eq!(
-            paths(&previous),
-            vec![
-                Some("finalmask.udp[0]".to_string()),
-                Some("finalmask.udp[1]".to_string())
-            ]
-        );
-        assert!(
-            previous
-                .iter()
-                .all(|issue| issue.severity == Severity::Error)
-        );
-
-        // Each last-pinned type misordered at each non-last position.
-        for (mask, name) in [(REALM, "realm"), (XICMP, "xicmp"), (UDPHOP, "udphop")] {
+        // Each pinned type misordered at each non-last position.
+        for (mask, name) in [(XICMP, "xicmp"), (UDPHOP, "udphop")] {
             let chain = format!("[{mask},{SALAMANDER}]");
             let found = order_findings(&chain);
             assert_eq!(
@@ -7427,43 +7302,26 @@ mod tests {
             assert_eq!(paths(&found), vec![Some("finalmask.udp[1]".to_string())]);
         }
 
-        // The last-slot type directly before the end and sudoku anywhere but
-        // the start each report on their own entry.
+        // A pinned type directly before the end reports on its own entry.
         let found = order_findings(&format!("[{SALAMANDER},{UDPHOP},{REALM}]"));
         assert_eq!(
             codes(&found),
             vec![ValidationCode::FinalmaskUdpMaskNotLast("udphop".into())],
             "{found:#?}"
         );
-        let found = order_findings(&format!("[{SALAMANDER},{SUDOKU}]"));
-        assert_eq!(
-            codes(&found),
-            vec![ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into())],
-            "{found:#?}"
-        );
-        let found = order_findings(&format!("[{UDPHOP},{SUDOKU}]"));
-        assert_eq!(
-            codes(&found),
-            vec![
-                ValidationCode::FinalmaskUdpMaskNotLast("udphop".into()),
-                ValidationCode::FinalmaskUdpMaskNotFirst("sudoku".into()),
-            ],
-            "{found:#?}"
-        );
+        assert!(found.iter().all(|issue| issue.severity == Severity::Error));
 
-        // The editor's move buttons swap neighbouring entries: the old
-        // shape becomes the new legal shape with one move.
+        // The editor's move buttons swap neighbouring entries: one move turns
+        // a misplaced pinned type into the legal shape.
         let mut fm: FinalmaskModel =
-            serde_json::from_str(&format!(r#"{{"udp":[{REALM},{SUDOKU}]}}"#))
+            serde_json::from_str(&format!(r#"{{"udp":[{UDPHOP},{SALAMANDER}]}}"#))
                 .expect("fixture is valid finalmask JSON");
         assert!(!validate_finalmask(&fm).is_empty());
         fm.udp.swap(0, 1);
         assert!(
-            validate_finalmask(&fm).iter().all(|issue| !matches!(
-                issue.code,
-                ValidationCode::FinalmaskUdpMaskNotLast(_)
-                    | ValidationCode::FinalmaskUdpMaskNotFirst(_)
-            )),
+            validate_finalmask(&fm)
+                .iter()
+                .all(|issue| !matches!(issue.code, ValidationCode::FinalmaskUdpMaskNotLast(_))),
             "one move must repair the chain"
         );
     }
@@ -9460,16 +9318,16 @@ mod tests {
                         {{"type":"{hostile}","packet":"00"}},
                         {{"type":"{hostile}"}}
                     ]}}}},
-                    {{"type":"realm","settings":{{"url":"no-scheme-host","stunServers":["h:1"]}}}},
                     {{"type":"udphop","settings":{{"mode":"intervalLocal","interval":"5-10",
-                        "remotePorts":"1-5,{hostile}"}}}}
+                        "remotePorts":"1-5,{hostile}"}}}},
+                    {{"type":"realm","settings":{{"url":"no-scheme-host","stunServers":["h:1"]}}}}
                 ],
                 "quicParams":{{"congestion":"bbr","brutalUp":"1 {hostile}"}}}}"#
         ))
         .expect("fixture is valid finalmask JSON");
         let issues = validate_finalmask(&fm);
-        // The chain is deliberately misordered (`realm` sits before the last,
-        // `udphop`, entry), so the order gate reports `realm` between the TCP
+        // The chain is deliberately misordered (`udphop` sits before the last,
+        // `realm`, entry), so the order gate reports `udphop` between the TCP
         // findings and the UDP per-mask findings; every entry still renders
         // bounded.
         assert_eq!(issues.len(), 8, "{issues:#?}");
@@ -9480,8 +9338,8 @@ mod tests {
             Some(&excerpted), // FinalmaskUnknownUdpMask
             Some(&quoted),    // FinalmaskUnknownByteSyntax
             Some(&excerpted), // FinalmaskBytesValueRequired
-            None,             // FinalmaskRealmUrlSyntax (url crate error text)
             Some(&quoted),    // FinalmaskPortListInvalid
+            None,             // FinalmaskRealmUrlSyntax (url crate error text)
             Some(&excerpted), // FinalmaskQuicBandwidthUnitInvalid
         ];
         for (issue, expected) in issues.iter().zip(payloads) {
@@ -9504,11 +9362,9 @@ mod tests {
                     | ValidationCode::FinalmaskPortListInvalid(payload),
                     Some(expected),
                 ) => assert_eq!(payload, expected, "{issue:?}"),
-                (
-                    ValidationCode::FinalmaskUdpMaskNotLast(name)
-                    | ValidationCode::FinalmaskUdpMaskNotFirst(name),
-                    None,
-                ) => assert_eq!(name, "realm", "{issue:?}"),
+                (ValidationCode::FinalmaskUdpMaskNotLast(name), None) => {
+                    assert_eq!(name, "udphop", "{issue:?}")
+                }
                 (ValidationCode::FinalmaskRealmUrlSyntax(payload), None) => assert!(
                     payload.len() < 256
                         && payload.chars().count() <= crate::links::MAX_ERROR_EXCERPT_CHARS + 1,
