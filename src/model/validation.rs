@@ -11168,11 +11168,18 @@ mod tests {
 
     #[test]
     fn shadowsocks2022_key_rule_gates_the_keys_the_rewritten_core_refuses() {
+        // Every key text is built from its bytes: the rule reads the decoded
+        // byte count, and a password-shaped literal in the source is what
+        // these fixtures must not be.
+        let key_16 = base64_run(1, 16);
+        let key_16_b = base64_run(2, 16);
+        let key_32 = base64_run(b'0', 32);
+
         // The method name folds case-insensitively (`GetCipherMethod`
         // lowercases before its map lookup), so the mixed-case spelling is
         // the same method the core builds.
-        assertions_on_key_rule("2022-BLAKE3-AES-128-GCM", KEY_16, false);
-        assertions_on_key_rule("2022-blake3-AES-128-GCM", KEY_16, false);
+        assertions_on_key_rule("2022-BLAKE3-AES-128-GCM", &key_16, false);
+        assertions_on_key_rule("2022-blake3-AES-128-GCM", &key_16, false);
 
         // The core parses each colon-separated part through `ParseKey`: it
         // decodes standard base64, falls back to the raw bytes when the decode
@@ -11182,17 +11189,14 @@ mod tests {
         // Accepted: a right-length key in base64 or raw form, and the
         // colon-joined multi-psk form under the AES methods.
         for (method, password) in [
-            ("2022-blake3-aes-128-gcm", KEY_16),
+            ("2022-blake3-aes-128-gcm", key_16.as_str()),
             // Raw 16 bytes: base64 decoding fails, so the raw bytes are read.
-            ("2022-blake3-aes-128-gcm", "!!!!!!!!!!!!!!!!"),
-            ("2022-blake3-aes-256-gcm", KEY_32),
-            (
-                "2022-blake3-aes-256-gcm",
-                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
-            ),
-            ("2022-blake3-chacha20-poly1305", KEY_32),
-            ("2022-blake3-aes-128-gcm", &format!("{KEY_16}:{KEY_16_B}")),
-            ("2022-blake3-aes-256-gcm", &format!("{KEY_32}:{KEY_32}")),
+            ("2022-blake3-aes-128-gcm", &"!".repeat(16)),
+            ("2022-blake3-aes-256-gcm", key_32.as_str()),
+            ("2022-blake3-aes-256-gcm", &"!".repeat(32)),
+            ("2022-blake3-chacha20-poly1305", key_32.as_str()),
+            ("2022-blake3-aes-128-gcm", &format!("{key_16}:{key_16_b}")),
+            ("2022-blake3-aes-256-gcm", &format!("{key_32}:{key_32}")),
         ] {
             assertions_on_key_rule(method, password, false);
         }
@@ -11202,30 +11206,29 @@ mod tests {
         // to the wrong byte count, a right-length key for the wrong method,
         // and the ChaCha20 multi-psk form. (A 24-byte key for AES-128 exited 0
         // under the old core; it now exits 23 with `invalid key`.)
-        let longer = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3";
-        let key_15 = "AQEBAQEBAQEBAQEBAQEB";
+        let longer = base64_run(1, 24);
+        let key_15 = base64_run(1, 15);
         for (method, password) in [
-            ("2022-blake3-aes-128-gcm", longer),
-            ("2022-blake3-aes-128-gcm", key_15),
+            ("2022-blake3-aes-128-gcm", longer.as_str()),
+            ("2022-blake3-aes-128-gcm", key_15.as_str()),
             // 16 base64 characters decode to 12 bytes.
-            ("2022-blake3-aes-128-gcm", "AQEBAQEBAQEBAQEB"),
+            ("2022-blake3-aes-128-gcm", &base64_run(1, 12)),
             // Right string length, wrong decoded length.
-            ("2022-blake3-aes-128-gcm", KEY_16.trim_end_matches('=')),
-            ("2022-blake3-aes-256-gcm", KEY_16),
-            ("2022-blake3-chacha20-poly1305", KEY_16),
+            ("2022-blake3-aes-128-gcm", key_16.trim_end_matches('=')),
+            ("2022-blake3-aes-256-gcm", key_16.as_str()),
+            ("2022-blake3-chacha20-poly1305", key_16.as_str()),
             (
                 "2022-blake3-chacha20-poly1305",
-                &format!("{KEY_32}:{KEY_32}"),
+                &format!("{key_32}:{key_32}"),
             ),
             // Every part must clear the size, not just the first.
-            ("2022-blake3-aes-128-gcm", &format!("{KEY_16}:{key_15}")),
+            ("2022-blake3-aes-128-gcm", &format!("{key_16}:{key_15}")),
         ] {
             assertions_on_key_rule(method, password, true);
         }
 
         // An empty password on a 2022 method belongs to the required-value
         // Error rule only — the key rule must not double-report.
-        assertions_on_key_rule("2022-blake3-aes-128-gcm", "", false);
         let mut outbound = shadowsocks_canonical();
         let ProtocolSettings::Shadowsocks(settings) = &mut outbound.settings else {
             unreachable!()
@@ -11240,16 +11243,22 @@ mod tests {
             }),
             "empty 2022 password must stay an Error: {issues:#?}"
         );
+        assert!(
+            finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid).is_none(),
+            "an empty 2022 password belongs to the required-value rule alone: {issues:#?}"
+        );
 
         // Non-2022 methods treat the password as opaque.
-        assertions_on_key_rule("aes-256-gcm", "any-garbage!!", false);
+        assertions_on_key_rule("aes-256-gcm", &"garbage".repeat(2), false);
     }
 
-    /// Padded standard base64 of 16 and 32 bytes, for the Shadowsocks-2022 key
-    /// rules.
-    const KEY_16: &str = "AQEBAQEBAQEBAQEBAQEBAQ==";
-    const KEY_16_B: &str = "AgICAgICAgICAgICAgICAg==";
-    const KEY_32: &str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
+    /// Standard base64 of `count` copies of `byte`: the Shadowsocks-2022 key
+    /// rules read the decoded byte count, so every key text a row needs is
+    /// built here rather than spelled out.
+    fn base64_run(byte: u8, count: usize) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(vec![byte; count])
+    }
 
     /// The one `Shadowsocks2022KeyInvalid` finding `password` draws under
     /// `method`: `refused` says whether the core refuses the key, and the
@@ -11265,18 +11274,22 @@ mod tests {
         let issues = validate_outbound(&outbound);
         let finding = finding(&issues, &ValidationCode::Shadowsocks2022KeyInvalid);
         if refused {
-            let issue =
-                finding.unwrap_or_else(|| panic!("{method} {password:?} must report: {issues:#?}"));
-            assert_eq!(issue.severity, Severity::Error, "{method} {password:?}");
+            let issue = finding
+                .unwrap_or_else(|| panic!("{method}: a refused key must report: {issues:#?}"));
+            assert_eq!(
+                issue.severity,
+                Severity::Error,
+                "{method}: a refusal is an error"
+            );
             assert_eq!(issue.path.as_deref(), Some("settings.password"));
             assert!(
                 issues.iter().any(|issue| issue.severity == Severity::Error),
-                "{method} {password:?}: a refusal gates"
+                "{method}: a refusal gates"
             );
         } else {
             assert!(
                 finding.is_none(),
-                "{method} {password:?} must stay silent: {issues:#?}"
+                "{method}: the key rule must stay silent: {issues:#?}"
             );
         }
     }
