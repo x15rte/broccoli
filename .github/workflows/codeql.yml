@@ -73,6 +73,8 @@ jobs:
 
       # No build: both languages are analyzed from source, which is what
       # default setup did and why this workflow needs no Rust toolchain.
+      # The two CodeQL steps share one action version: init writes the run's
+      # configuration file and analyze refuses one from a different version.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
@@ -81,6 +83,7 @@ jobs:
 
       # One category per language: without it the two matrix legs would upload
       # into the same analysis slot and overwrite each other's results.
+      # Version must match the init pin above.
       - name: Analyze
         uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:

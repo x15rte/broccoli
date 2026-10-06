@@ -10,6 +10,14 @@ updates:
     # soon as it exists.
     cooldown:
       default-days: 7
+    # The two codeql-action sub-actions are separate dependencies, because a
+    # SHA-pinned `uses:` is named by repository and sub-path, so a bump arrives
+    # as one PR per sub-action — and neither passes alone, since the two action
+    # versions must match. The group keeps one bump in one PR.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
   - package-ecosystem: cargo
     directory: /
     schedule:
