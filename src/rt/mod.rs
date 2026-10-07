@@ -2180,38 +2180,21 @@ impl Runtime {
                             self.release_exclusive();
                             return;
                         };
-                        self.set_phase(CorePhase::Error(PhaseError::new(
+                        self.fail_tun_start(PhaseError::new(
                             DiagError::new(Diag::new(Key::RtPhaseHelperUnavailable))
                                 .caused_by(error),
-                        )));
-                        self.release_exclusive();
+                        ));
                         return;
                     }
                 };
                 let events = pipe.take_events();
-                let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
-                    self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
-                        Key::RtPhaseHelperConfigLost,
-                    ))));
-                    self.release_exclusive();
-                    return;
-                };
-                if let Err(error) = pipe.start(self.api_port, config_bytes) {
-                    self.set_phase(CorePhase::Error(PhaseError::new(
-                        DiagError::new(Diag::new(Key::RtPhaseHelperStartFailed)).caused_by(error),
-                    )));
-                    self.release_exclusive();
-                    return;
+                match self.start_helper_pipe(&pipe) {
+                    Ok(()) => {
+                        self.lifecycle.backend.attach_tun(pipe, events);
+                        self.publish_tun_start();
+                    }
+                    Err(error) => self.fail_tun_start(error),
                 }
-                self.lifecycle.backend.attach_tun(pipe, events);
-                self.lifecycle.backend.mark_tun_started();
-                // The TUN adapter is up; drop stale resolver answers cached
-                // before it existed.
-                self.flush_dns_cache();
-                self.lifecycle.readiness.defer();
-                self.emit_active_config();
-                self.set_phase(CorePhase::Starting);
-                self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
             }
             ExclusiveOutcome::ApplyValidated {
                 ok,
@@ -2699,40 +2682,62 @@ impl Runtime {
         }
     }
 
+    /// Run the captured configuration on an attached helper `pipe`: the one
+    /// call that turns a connected helper into a starting core, shared by the
+    /// fresh connect and the restart over the live pipe. The caller settles
+    /// the outcome with [`Self::publish_tun_start`] or
+    /// [`Self::fail_tun_start`].
+    ///
+    /// A missing capture is an invariant break — the launch path guaranteed the
+    /// bytes before the pipe existed — and must fail loudly, never fall back to
+    /// a file re-read; a refused start is the helper's own failure.
+    fn start_helper_pipe(&self, pipe: &helper::HelperPipe) -> Result<(), PhaseError> {
+        let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
+            return Err(PhaseError::new(Diag::new(Key::RtPhaseHelperConfigLost)));
+        };
+        pipe.start(self.api_port, config_bytes).map_err(|error| {
+            PhaseError::new(
+                DiagError::new(Diag::new(Key::RtPhaseHelperStartFailed)).caused_by(error),
+            )
+        })
+    }
+
+    /// Publish the running-attempt state after a helper pipe accepted the
+    /// configuration: the TUN adapter is up, so stale resolver answers are
+    /// dropped, the readiness clock is disarmed until the helper reports the
+    /// spawn, the active config is emitted, and the phase moves to `Starting`.
+    /// Both start paths run exactly this list.
+    fn publish_tun_start(&mut self) {
+        self.lifecycle.backend.mark_tun_started();
+        // The TUN adapter is up; drop stale resolver answers cached before it
+        // existed.
+        self.flush_dns_cache();
+        self.lifecycle.readiness.defer();
+        self.emit_active_config();
+        self.set_phase(CorePhase::Starting);
+        self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
+    }
+
+    /// Settle a TUN start that never reached `Starting`: publish the failure
+    /// and give up the busy window.
+    fn fail_tun_start(&mut self, error: PhaseError) {
+        self.set_phase(CorePhase::Error(error));
+        self.release_exclusive();
+    }
+
     fn start_via_helper(&mut self) {
         // The helper owns the child that runs this start's configuration, so
         // the output window opens here for both the restart and the fresh
         // launch.
         self.begin_start_output_window();
+        // A restart over the live pipe: the attached helper takes the new
+        // configuration through the one start sequence ([`start_helper_pipe`]),
+        // exactly as a fresh connect does.
         if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
-            // `start_backend` guaranteed the captured bytes before this
-            // restart branch; a missing
-            // capture is an invariant break and must fail loudly, never
-            // fall back to a file re-read.
-            let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
-                self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
-                    Key::RtPhaseHelperConfigLost,
-                ))));
-                self.release_exclusive();
-                return;
-            };
-            match pipe.start(self.api_port, config_bytes) {
-                Ok(()) => {
-                    self.lifecycle.backend.mark_tun_started();
-                    // The TUN adapter is up; drop stale resolver answers
-                    // cached before it existed.
-                    self.flush_dns_cache();
-                    self.lifecycle.readiness.defer();
-                    self.emit_active_config();
-                    self.set_phase(CorePhase::Starting);
-                    self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
-                }
-                Err(error) => {
-                    self.set_phase(CorePhase::Error(PhaseError::new(
-                        DiagError::new(Diag::new(Key::RtPhaseHelperStartFailed)).caused_by(error),
-                    )));
-                    self.release_exclusive();
-                }
+            let result = self.start_helper_pipe(pipe);
+            match result {
+                Ok(()) => self.publish_tun_start(),
+                Err(error) => self.fail_tun_start(error),
             }
             return;
         }
