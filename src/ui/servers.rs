@@ -34,10 +34,10 @@ use crate::model::stream::{
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
-    dns_out_action_supported, freedom_final_rule_supported, mux_conflicts_with_vision_flow,
-    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
-    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
-    validate_outbound, validate_sockopt,
+    dns_out_action_supported, ech_sockopt_emitted, freedom_final_rule_supported,
+    mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid,
+    reality_public_key_valid, send_through_supported, server_name_implausible, tls_version_rank,
+    validate_finalmask, validate_outbound, validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -132,15 +132,10 @@ const VLESS_FLOW: [&str; validation::VISION_FLOW_OPTIONS.len() + 1] = [
     validation::VISION_FLOW_OPTIONS[1],
 ];
 
-/// The uplink placement options the combos off `packet-up` offer: the model
-/// vocabulary minus the placements the cross-field rule refuses there
-/// (cookies and headers carry the upload only in the packet-up form), so the
-/// stream-up/stream-one tables are the first entries of the model list.
-const UPLINK_STREAM_PLACEMENTS: [&str; 3] = [
-    validation::UPLINK_DATA_PLACEMENT_OPTIONS[0],
-    validation::UPLINK_DATA_PLACEMENT_OPTIONS[1],
-    validation::UPLINK_DATA_PLACEMENT_OPTIONS[2],
-];
+/// The uplink placement options the combos off `packet-up` offer: the model's
+/// own subset for those forms, so the combo and the rule that refuses the
+/// rest cannot drift.
+const UPLINK_STREAM_PLACEMENTS: [&str; 3] = validation::UPLINK_STREAM_PLACEMENT_OPTIONS;
 
 // ---------- delete-confirmation reference scan ----------
 
@@ -153,9 +148,7 @@ fn server_reference_paths(
     settings: &Settings,
     profile_id: &str,
 ) -> Vec<String> {
-    let outbound_tags = crate::model::emit::outbound_tags(servers, settings);
-    crate::model::dial::DialGraph::new(&servers.profiles, &outbound_tags)
-        .references(settings, profile_id)
+    crate::model::dial::DialGraph::for_settings(servers, settings).references(settings, profile_id)
 }
 
 // ---------- editor validation sweep ----------
@@ -332,13 +325,9 @@ fn sockopt_findings_for(profile: &ServerProfile) -> (Verdict, Verdict) {
         .as_ref()
         .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::Stream))
         .unwrap_or_default();
-    // Only the TLS security mode renders the ECH block, mirroring the model
-    // sweep's condition in `validate_outbound`.
-    let ech_findings = stream
-        .tls_settings
-        .as_ref()
-        .filter(|_| stream.security == Security::Tls)
-        .and_then(|tls| tls.ech_sockopt.as_ref())
+    // The model sweep's own gate decides which block is judged, so the inline
+    // verdict and the error list always cover the same one.
+    let ech_findings = ech_sockopt_emitted(stream)
         .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::EchDnsQuery))
         .unwrap_or_default();
     (stream_findings, ech_findings)
@@ -1462,7 +1451,18 @@ impl ProfileDraft {
     /// validation request is staged with, and the generation a verdict must
     /// still match to be applied.
     fn target(&self) -> ToolTarget {
-        ToolTarget::draft(self.kind, &self.id, self.generation)
+        self.draft_target().owned()
+    }
+
+    /// This draft's borrowed identity — the form the tab closures take and
+    /// the one [`ToolTarget::matches`] compares a staged request against, so
+    /// "is this verdict still for the open draft" has one definition.
+    fn draft_target(&self) -> DraftTarget<'_> {
+        DraftTarget {
+            kind: self.kind,
+            profile_id: &self.id,
+            generation: self.generation,
+        }
     }
 }
 
@@ -1566,9 +1566,8 @@ fn refresh_dialer_proxy_options<'a>(
         .as_ref()
         .is_some_and(|cached| cached.generation == set_key && cached.own_id.as_str() == own_id);
     if !unchanged {
-        let outbound_tags = crate::model::emit::profile_outbound_tags(profiles);
-        let options = crate::model::dial::DialGraph::new(profiles, &outbound_tags)
-            .chain_target_options(own_id);
+        let options =
+            crate::model::dial::DialGraph::for_profiles(profiles).chain_target_options(own_id);
         *slot = Some(DialerProxyOptions {
             generation: set_key,
             own_id: own_id.to_owned(),
@@ -2467,9 +2466,8 @@ impl ServersScreen {
     /// generation: a tool or validation verdict for a draft that has been
     /// edited, replaced or closed since the request went out is dropped here.
     fn current_draft(&self, target: &ToolTarget) -> Option<&ProfileDraft> {
-        self.draft(target.draft_kind()).filter(|draft| {
-            draft.id == target.profile_id() && draft.generation == target.generation()
-        })
+        self.draft(target.draft_kind())
+            .filter(|draft| target.matches(draft.draft_target()))
     }
 
     /// The gate of the open draft in `kind`'s slot as this frame sees it;
@@ -6609,9 +6607,13 @@ impl ServersScreen {
                             ui,
                             lang,
                             mask,
-                            egui::Id::new(("fm", key, "tcp", index)),
-                            key,
-                            buffers,
+                            RawField {
+                                id: FieldKey {
+                                    key: egui::Id::new(("fm", key, "tcp", index)),
+                                    profile: key,
+                                },
+                                buffers: &mut *buffers,
+                            },
                         );
                     });
                 });

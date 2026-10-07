@@ -22,7 +22,7 @@ use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
 
 use super::raw_editor::{
-    FieldKey, JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
+    JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
 };
 use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
@@ -114,9 +114,7 @@ fn finalmask_unknown_editor(
     ui: &mut egui::Ui,
     lang: Language,
     raw: &mut serde_json::Value,
-    key: egui::Id,
-    profile: &str,
-    buffers: &mut SeededBuffers,
+    field: RawField<'_>,
 ) -> bool {
     ui.colored_label(
         status_colors_of(ui).warn,
@@ -133,10 +131,7 @@ fn finalmask_unknown_editor(
         ui,
         lang,
         t(lang, Key::SrvPreservedRawValue),
-        RawField {
-            id: FieldKey { key, profile },
-            buffers,
-        },
+        field,
         raw,
         &JsonEditorSpec {
             hint: "{}",
@@ -294,14 +289,12 @@ fn finalmask_transform_editor(
     ui: &mut egui::Ui,
     lang: Language,
     transform: &mut FinalmaskTransform,
-    key: egui::Id,
-    profile: &str,
-    buffers: &mut SeededBuffers,
+    mut field: RawField<'_>,
 ) -> bool {
     let mut changed = widgets::text_field(ui, "op", &mut transform.op, "operation");
     let mut remove = None;
     for (index, arg) in transform.args.iter_mut().enumerate() {
-        ui.push_id(("transform-arg", key, index), |ui| {
+        ui.push_id(("transform-arg", field.id.key, index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(t_fmt(lang, Key::SrvArgumentN, &[&(index + 1)]));
@@ -358,13 +351,7 @@ fn finalmask_transform_editor(
                             "bytes",
                             &mut arg.encoding,
                             &mut arg.bytes,
-                            RawField {
-                                id: FieldKey {
-                                    key: key.with(("arg", index, "bytes")),
-                                    profile,
-                                },
-                                buffers,
-                            },
+                            field.with(("arg", index, "bytes")),
                         );
                     }
                     "u64" => {
@@ -382,9 +369,7 @@ fn finalmask_transform_editor(
                                 ui,
                                 lang,
                                 nested,
-                                key.with(("arg", index, "nested")),
-                                profile,
-                                buffers,
+                                field.with(("arg", index, "nested")),
                             );
                         }
                     }
@@ -411,9 +396,7 @@ fn finalmask_tcp_item_editor(
     ui: &mut egui::Ui,
     lang: Language,
     item: &mut FinalmaskTcpItem,
-    key: egui::Id,
-    profile: &str,
-    buffers: &mut SeededBuffers,
+    mut field: RawField<'_>,
 ) -> bool {
     let mut changed = range_editor(ui, "delay", &mut item.delay, i32::MIN..=i32::MAX);
     changed |= ui
@@ -432,13 +415,7 @@ fn finalmask_tcp_item_editor(
         "packet",
         &mut item.encoding,
         &mut item.packet,
-        RawField {
-            id: FieldKey {
-                key: key.with("packet"),
-                profile,
-            },
-            buffers,
-        },
+        field.with("packet"),
     );
     let mut has_transform = item.transform.is_some();
     if ui.checkbox(&mut has_transform, "transform").changed() {
@@ -446,14 +423,7 @@ fn finalmask_tcp_item_editor(
         changed = true;
     }
     if let Some(transform) = item.transform.as_mut() {
-        changed |= finalmask_transform_editor(
-            ui,
-            lang,
-            transform,
-            key.with("transform"),
-            profile,
-            buffers,
-        );
+        changed |= finalmask_transform_editor(ui, lang, transform, field.with("transform"));
     }
     changed
 }
@@ -462,9 +432,7 @@ fn finalmask_udp_item_editor(
     ui: &mut egui::Ui,
     lang: Language,
     item: &mut FinalmaskUdpItem,
-    key: egui::Id,
-    profile: &str,
-    buffers: &mut SeededBuffers,
+    mut field: RawField<'_>,
 ) -> bool {
     let mut changed = ui
         .horizontal(|ui| {
@@ -482,13 +450,7 @@ fn finalmask_udp_item_editor(
         "packet",
         &mut item.encoding,
         &mut item.packet,
-        RawField {
-            id: FieldKey {
-                key: key.with("packet"),
-                profile,
-            },
-            buffers,
-        },
+        field.with("packet"),
     );
     let mut has_transform = item.transform.is_some();
     if ui.checkbox(&mut has_transform, "transform").changed() {
@@ -496,14 +458,7 @@ fn finalmask_udp_item_editor(
         changed = true;
     }
     if let Some(transform) = item.transform.as_mut() {
-        changed |= finalmask_transform_editor(
-            ui,
-            lang,
-            transform,
-            key.with("transform"),
-            profile,
-            buffers,
-        );
+        changed |= finalmask_transform_editor(ui, lang, transform, field.with("transform"));
     }
     changed
 }
@@ -513,7 +468,7 @@ fn finalmask_tcp_sequences_editor(
     lang: Language,
     label: &str,
     sequences: &mut Vec<Vec<FinalmaskTcpItem>>,
-    field: RawField<'_>,
+    mut field: RawField<'_>,
 ) -> bool {
     let mut changed = false;
     ui.label(label);
@@ -544,9 +499,7 @@ fn finalmask_tcp_sequences_editor(
                                 ui,
                                 lang,
                                 item,
-                                field.id.key.with((sequence_index, item_index)),
-                                field.id.profile,
-                                &mut *field.buffers,
+                                field.with((sequence_index, item_index)),
                             );
                         });
                     });
@@ -578,7 +531,7 @@ fn finalmask_udp_items_editor(
     lang: Language,
     label: &str,
     items: &mut Vec<FinalmaskUdpItem>,
-    field: RawField<'_>,
+    mut field: RawField<'_>,
 ) -> bool {
     let mut changed = false;
     ui.label(label);
@@ -591,14 +544,7 @@ fn finalmask_udp_items_editor(
                     if ui.small_button(t(lang, Key::SrvRemoveItem)).clicked() {
                         remove = Some(index);
                     }
-                    changed |= finalmask_udp_item_editor(
-                        ui,
-                        lang,
-                        item,
-                        field.id.key.with(index),
-                        field.id.profile,
-                        &mut *field.buffers,
-                    );
+                    changed |= finalmask_udp_item_editor(ui, lang, item, field.with(index));
                 });
         });
     }
@@ -976,9 +922,7 @@ pub(super) fn finalmask_tcp_settings_editor(
     ui: &mut egui::Ui,
     lang: Language,
     mask: &mut FinalmaskTcpMask,
-    key: egui::Id,
-    profile: &str,
-    buffers: &mut SeededBuffers,
+    mut field: RawField<'_>,
 ) -> bool {
     match mask {
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
@@ -987,39 +931,21 @@ pub(super) fn finalmask_tcp_settings_editor(
                 lang,
                 "clients",
                 &mut settings.clients,
-                RawField {
-                    id: FieldKey {
-                        key: key.with("clients"),
-                        profile,
-                    },
-                    buffers,
-                },
+                field.with("clients"),
             );
             changed |= finalmask_tcp_sequences_editor(
                 ui,
                 lang,
                 "servers",
                 &mut settings.servers,
-                RawField {
-                    id: FieldKey {
-                        key: key.with("servers"),
-                        profile,
-                    },
-                    buffers,
-                },
+                field.with("servers"),
             );
             changed |= finalmask_tcp_sequences_editor(
                 ui,
                 lang,
                 "errors",
                 &mut settings.errors,
-                RawField {
-                    id: FieldKey {
-                        key: key.with("errors"),
-                        profile,
-                    },
-                    buffers,
-                },
+                field.with("errors"),
             );
             changed
         }
@@ -1052,7 +978,7 @@ pub(super) fn finalmask_tcp_settings_editor(
         FinalmaskTcpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
         FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings),
         FinalmaskTcpMask::Unknown(raw) => {
-            finalmask_unknown_editor(ui, lang, raw, key.with("unknown"), profile, buffers)
+            finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }
     }
 }
@@ -1243,7 +1169,7 @@ pub(super) fn finalmask_udp_settings_editor(
     ui: &mut egui::Ui,
     lang: Language,
     mask: &mut FinalmaskUdpMask,
-    field: RawField<'_>,
+    mut field: RawField<'_>,
 ) -> bool {
     match mask {
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
@@ -1260,26 +1186,14 @@ pub(super) fn finalmask_udp_settings_editor(
                 lang,
                 "client",
                 &mut settings.client,
-                RawField {
-                    id: FieldKey {
-                        key: field.id.key.with("client"),
-                        profile: field.id.profile,
-                    },
-                    buffers: &mut *field.buffers,
-                },
+                field.with("client"),
             );
             changed |= finalmask_udp_items_editor(
                 ui,
                 lang,
                 "server",
                 &mut settings.server,
-                RawField {
-                    id: FieldKey {
-                        key: field.id.key.with("server"),
-                        profile: field.id.profile,
-                    },
-                    buffers: &mut *field.buffers,
-                },
+                field.with("server"),
             );
             changed
         }
@@ -1320,13 +1234,7 @@ pub(super) fn finalmask_udp_settings_editor(
                             ui,
                             lang,
                             item,
-                            RawField {
-                                id: FieldKey {
-                                    key: field.id.key.with(("noise", index)),
-                                    profile: field.id.profile,
-                                },
-                                buffers: &mut *field.buffers,
-                            },
+                            field.with(("noise", index)),
                         );
                     });
                 });
@@ -1424,14 +1332,9 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Udphop { settings, .. } => finalmask_udphop_editor(ui, lang, settings),
-        FinalmaskUdpMask::Unknown(raw) => finalmask_unknown_editor(
-            ui,
-            lang,
-            raw,
-            field.id.key.with("unknown"),
-            field.id.profile,
-            &mut *field.buffers,
-        ),
+        FinalmaskUdpMask::Unknown(raw) => {
+            finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
+        }
     }
 }
 

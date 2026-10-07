@@ -196,6 +196,21 @@ pub(super) struct RawField<'a> {
     pub(super) buffers: &'a mut SeededBuffers,
 }
 
+impl RawField<'_> {
+    /// A nested field under this one: the same profile and buffer store, with
+    /// this field's key extended by `salt`. Every editor in the chain names
+    /// its buffers this way, so one identity scheme reaches every entry.
+    pub(super) fn with(&mut self, salt: impl egui::AsIdSalt) -> RawField<'_> {
+        RawField {
+            id: FieldKey {
+                key: self.id.key.with(salt),
+                profile: self.id.profile,
+            },
+            buffers: &mut *self.buffers,
+        }
+    }
+}
+
 /// Outcome of one buffered edit pass: whether the committed value changed.
 struct EditPass {
     changed: bool,
