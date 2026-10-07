@@ -16,10 +16,12 @@
 //! tag" have one definition each.
 
 use super::ServerProfile;
+use super::ServersFile;
 use super::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use super::settings::Settings;
 use super::validation::{ValidationCode, ValidationIssue};
 use crate::links::excerpt;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 /// The profile-set dial graph, resolved against the tags the generated
@@ -30,17 +32,48 @@ use std::collections::BTreeSet;
 /// that names no profile is a built-in outbound the child resolves itself.
 pub struct DialGraph<'a> {
     profiles: &'a [ServerProfile],
-    outbound_tags: &'a BTreeSet<String>,
+    /// The outbound tags the graph resolves chain targets against: borrowed
+    /// when the caller already holds them — the validation pass judges every
+    /// other reference against the same set — and owned when a constructor
+    /// below built them for a scope.
+    outbound_tags: Cow<'a, BTreeSet<String>>,
 }
 
 impl<'a> DialGraph<'a> {
-    /// The graph of `profiles`, resolved against `outbound_tags` — the set
-    /// `emit::outbound_tags` (settings scope) or
-    /// `emit::profile_outbound_tags` (profile scope) answers.
+    /// The graph of `profiles`, resolved against `outbound_tags` — the tags
+    /// the caller's document carries. Prefer [`DialGraph::for_settings`] or
+    /// [`DialGraph::for_profiles`], which pick the universe for a scope
+    /// instead of making every call site restate the choice.
     pub fn new(profiles: &'a [ServerProfile], outbound_tags: &'a BTreeSet<String>) -> Self {
         Self {
             profiles,
-            outbound_tags,
+            outbound_tags: Cow::Borrowed(outbound_tags),
+        }
+    }
+
+    /// The graph over a whole settings document: chain targets resolve against
+    /// every outbound tag the generated document carries, the `dns-out` arm
+    /// included, so a hop naming it is a built-in rather than a dangling
+    /// reference. This is the settings-wide scope — the validation pass judges
+    /// the same universe, and the delete-confirmation reference scan reads the
+    /// whole document. The generator's dial site asks a narrower question
+    /// (which profiles the document dials, no settings involved) and takes
+    /// [`DialGraph::for_profiles`].
+    pub fn for_settings(servers: &'a ServersFile, settings: &Settings) -> Self {
+        Self {
+            profiles: &servers.profiles,
+            outbound_tags: Cow::Owned(crate::model::emit::outbound_tags(servers, settings)),
+        }
+    }
+
+    /// The graph of a profile list alone, with no settings to read — the
+    /// latency probe's ad-hoc list, the chain-target picker, and the
+    /// generator's dial site. The universe is the profile tags plus the
+    /// built-ins; `dns-out` is a settings-scope tag no profile chain can name.
+    pub fn for_profiles(profiles: &'a [ServerProfile]) -> Self {
+        Self {
+            profiles,
+            outbound_tags: Cow::Owned(crate::model::emit::profile_outbound_tags(profiles)),
         }
     }
 
@@ -295,12 +328,6 @@ mod tests {
         sockopt.dialer_proxy = target.to_string();
     }
 
-    /// The outbound universe of `profiles`, as the graph resolves against it:
-    /// the caller keeps it alive beside the graph.
-    fn tags_of(profiles: &[ServerProfile]) -> BTreeSet<String> {
-        crate::model::emit::profile_outbound_tags(profiles)
-    }
-
     /// A profile with no hop, one with a hop to a profile, and one whose hop
     /// names the built-in `direct` are the three dial shapes: only the middle
     /// one reaches its server through the chain, so the document dials the
@@ -314,8 +341,7 @@ mod tests {
         chain(&mut chained, &hop.tag());
         let plain = profile("plain");
         let profiles = vec![direct.clone(), chained.clone(), hop.clone(), plain.clone()];
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
         // The list's first profile is the default route; every other profile
         // is a standby the settings never reference.
         let settings = Settings::default();
@@ -350,8 +376,7 @@ mod tests {
         chain(&mut profiles[0], &second.tag());
         chain(&mut profiles[1], &third.tag());
         chain(&mut profiles[2], &first.tag());
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
 
         let dependencies = graph.dependencies(&first.tag());
         assert_eq!(
@@ -371,8 +396,7 @@ mod tests {
         let mut dangling = profile("dangling");
         chain(&mut dangling, "srv-not-emitted");
         let mut profiles = vec![dangling];
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
         let findings = graph.chain_findings();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(matches!(
@@ -385,8 +409,7 @@ mod tests {
         profiles = vec![a.clone(), b.clone()];
         chain(&mut profiles[0], &b.tag());
         chain(&mut profiles[1], &a.tag());
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
         let findings = graph.chain_findings();
         assert_eq!(findings.len(), 1, "one report per graph: {findings:?}");
         let ValidationCode::OutboundChainCycle(path) = &findings[0].code else {
@@ -405,8 +428,7 @@ mod tests {
         let first = profile("first");
         let second = profile("second");
         let profiles = vec![first.clone(), second.clone()];
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
         assert_eq!(
             graph.chain_target_options(&first.id),
             [
@@ -425,8 +447,7 @@ mod tests {
         let mut chained = profile("chained");
         chain(&mut chained, &target.tag());
         let profiles = vec![target.clone(), chained.clone()];
-        let tags = tags_of(&profiles);
-        let graph = DialGraph::new(&profiles, &tags);
+        let graph = DialGraph::for_profiles(&profiles);
         let mut settings = Settings::default();
         settings.routing.rules.push(crate::model::Rule {
             outbound_tag: target.tag(),

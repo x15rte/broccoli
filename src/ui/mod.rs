@@ -459,8 +459,7 @@ impl<'a> UiCtx<'a> {
         // the model: the same resolution the generator and the validation
         // pass use, so a hop a builtin resolves and a dangling reference are
         // read the same way everywhere.
-        let tags = crate::model::emit::profile_outbound_tags(&self.servers.profiles);
-        let graph = crate::model::dial::DialGraph::new(&self.servers.profiles, &tags);
+        let graph = crate::model::dial::DialGraph::for_profiles(&self.servers.profiles);
         let mut chain = vec![profile];
         chain.extend(graph.dependencies(&chain[0].tag()).into_iter().cloned());
         self.send_latency_probe(chain)

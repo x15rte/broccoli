@@ -1643,6 +1643,17 @@ pub fn xpadding_method_supported(method: &str) -> bool {
 /// of the four placements Xray accepts.
 pub const UPLINK_DATA_PLACEMENT_OPTIONS: &[&str] = &["", "auto", "body", "cookie", "header"];
 
+/// The placements only the `packet-up` form accepts: a cookie or a header
+/// carries the upload in a request with its own headers, which only that form
+/// sends. [`uplink_placement_mode_supported`] refuses exactly these off
+/// `packet-up`; [`UPLINK_STREAM_PLACEMENT_OPTIONS`] is the vocabulary minus
+/// them, and the three lists sit here together so the pair cannot drift.
+const UPLINK_PACKET_UP_ONLY_PLACEMENTS: [&str; 2] = ["cookie", "header"];
+
+/// The placements a `stream-up`/`stream-one` `uplinkDataPlacement` accepts —
+/// the editor combos' options off `packet-up`.
+pub const UPLINK_STREAM_PLACEMENT_OPTIONS: [&str; 3] = ["", "auto", "body"];
+
 /// True when an `uplinkDataPlacement` is one of
 /// [`UPLINK_DATA_PLACEMENT_OPTIONS`].
 pub fn uplink_data_placement_supported(placement: &str) -> bool {
@@ -1683,7 +1694,7 @@ pub fn xpadding_bytes_supported(range: Option<Int32Range>) -> bool {
 /// condition in both seams (compare the raw string exactly like upstream's
 /// build does).
 pub fn uplink_placement_mode_supported(placement: &str, mode: &str) -> bool {
-    !matches!(placement, "cookie" | "header") || mode == "packet-up"
+    !UPLINK_PACKET_UP_ONLY_PLACEMENTS.contains(&placement) || mode == "packet-up"
 }
 
 /// Cross-field predicate: `uplinkHTTPMethod` GET only in
@@ -3248,12 +3259,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         if let Some(sockopt) = &stream.sockopt {
             issues.extend(validate_sockopt(sockopt, "stream.sockopt"));
         }
-        if stream.security == Security::Tls
-            && let Some(ech_sockopt) = stream
-                .tls_settings
-                .as_ref()
-                .and_then(|tls| tls.ech_sockopt.as_ref())
-        {
+        if let Some(ech_sockopt) = ech_sockopt_emitted(stream) {
             issues.extend(validate_sockopt(
                 ech_sockopt,
                 "stream.tlsSettings.echSockopt",
@@ -3531,6 +3537,18 @@ pub const SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS: &[&str] = &[
 /// [`SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS`], under [`vocabulary_holds`].
 pub fn sockopt_address_port_strategy_supported(strategy: &str) -> bool {
     vocabulary_holds(SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS, strategy)
+}
+
+/// The stream's ECH sockopt block, when it reaches the wire: Xray reads
+/// `tlsSettings.echSockopt` under TLS only, so a block stored under any other
+/// security is never emitted and never judged. The one gate for both the
+/// model sweep and the editor's inline ECH verdict, so a stored block is
+/// either checked in both places or in neither.
+pub fn ech_sockopt_emitted(stream: &StreamModel) -> Option<&SockoptModel> {
+    if stream.security != Security::Tls {
+        return None;
+    }
+    stream.tls_settings.as_ref()?.ech_sockopt.as_ref()
 }
 
 /// Validate one sockopt block. `prefix` is the wire path prefix that scopes
@@ -5265,435 +5283,530 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
     // verdict's chain targets, the balancer fallbacks, the rules — judges the
     // tags the generated document carries.
     let outbound_tags = emit::outbound_tags(servers, settings);
-    let mut issues = profile_set_verdict(
+    let issues = profile_set_verdict(
         &servers.profiles,
         servers.active.as_deref(),
         false,
         &outbound_tags,
     )
     .into_issues();
-    let tun_on = emit::tun_inbound_emitted(settings);
+    SettingsWalk {
+        settings,
+        outbound_tags: &outbound_tags,
+        issues,
+        balancer_tags: BTreeSet::new(),
+        // The emitted inbound universe (`emit::inbound_tags`: API, TUN,
+        // dns-in, the emitted local endpoints, the emitted dokodemo
+        // listeners). It is grown by insertion because the insert that fails
+        // IS the duplicate rule — the arm that inserts second reports the
+        // collision, in emission order, and `run` calls the families in that
+        // order so the findings read as their refusal does. Which entries are
+        // emitted and which tags the emitter adds itself are `emit`'s answers
+        // (`local_inbound_emitted`, `dokodemo_emitted`,
+        // `appended_inbound_tags`), so the two readers of the universe can
+        // never drift apart.
+        inbound_tags: BTreeSet::from([API_INBOUND_TAG.to_string()]),
+        ip_listeners: vec![("API".to_string(), "127.0.0.1".to_string(), api_port, 1_u8)],
+        unix_listeners: BTreeMap::new(),
+        tun_gateway: tun_ipv4_gateway(&settings.tun),
+    }
+    .run()
+}
 
-    let mut balancer_tags = BTreeSet::new();
-    for (index, balancer) in settings.routing.balancers.iter().enumerate() {
-        if balancer.tag.trim().is_empty() {
-            issues.push(issue(ValidationCode::BalancerTagMissing(index + 1), None));
-            // The remaining checks would name a tag that does not exist.
-            continue;
-        }
-        if balancer
-            .selector
-            .iter()
-            .all(|selector| selector.trim().is_empty())
-        {
-            issues.push(issue(
-                ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
-                None,
-            ));
-        }
-        if !balancer_tags.insert(balancer.tag.clone()) {
-            issues.push(issue(
-                ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
-                None,
-            ));
-        }
-        if !balancer.fallback_tag.is_empty() && !outbound_tags.contains(&balancer.fallback_tag) {
-            issues.push(issue(
-                ValidationCode::BalancerFallbackMissing(
-                    excerpt(&balancer.tag),
-                    excerpt(&balancer.fallback_tag),
-                ),
-                None,
-            ));
-        }
+/// The state one settings-level walk threads through its rule families: the
+/// findings the profile verdict already contributed plus what the families
+/// accumulate, and the listener bookkeeping they share — the emitted
+/// inbound-tag set, the IP listeners the collision rule pairs against earlier
+/// ones, the UNIX-socket paths it dedupes, and the balancer tags the routing
+/// rules resolve against. Each family is one method, and
+/// [`SettingsWalk::run`] calls them in the order the findings read; that order
+/// is the walk's contract.
+struct SettingsWalk<'a> {
+    settings: &'a Settings,
+    /// The outbound tags the generated document carries.
+    outbound_tags: &'a BTreeSet<String>,
+    issues: Vec<ValidationIssue>,
+    balancer_tags: BTreeSet<String>,
+    inbound_tags: BTreeSet<String>,
+    ip_listeners: Vec<(String, String, u16, u8)>,
+    unix_listeners: BTreeMap<String, String>,
+    /// The TUN gateway's IPv4 address, when the settings carry one: the leak
+    /// block's in-tun DNS listener anchors on it.
+    tun_gateway: Option<&'a str>,
+}
+
+impl<'a> SettingsWalk<'a> {
+    /// Run every rule family, in the order their findings read, and hand back
+    /// the one verdict.
+    fn run(mut self) -> Verdict {
+        self.balancers();
+        self.local_inbounds();
+        self.dokodemo();
+        self.tun();
+        self.emitter_reserved_inbounds();
+        self.listener_conflicts();
+        self.routing_rules();
+        self.dns();
+        self.geodata();
+        Verdict::from_issues(self.issues)
     }
 
-    let mut ip_listeners = vec![("API".to_string(), "127.0.0.1".to_string(), api_port, 1_u8)];
-    // The set this walk grows is the emitted inbound universe
-    // (`emit::inbound_tags`: API, TUN, dns-in, the emitted local endpoints,
-    // the emitted dokodemo listeners). It is built by insertion because the
-    // insert that fails IS the duplicate rule — the arm that inserts second
-    // reports the collision, in emission order, so the findings below stay in
-    // the order their refusal reads. Which entries are emitted and which tags
-    // the emitter adds itself are `emit`'s answers (`local_inbound_emitted`,
-    // `dokodemo_emitted`, `appended_inbound_tags`), so the two readers of the
-    // universe can never drift apart.
-    let mut inbound_tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
-    // Local endpoints: every emitted entry must bind a valid listen address
-    // on a non-zero port, and its tag must be unique among all emitted
-    // inbound tags (local endpoints, TUN, dns-in, API, dokodemo).
-    for (index, entry) in settings.local_inbounds.iter().enumerate() {
-        if !emit::local_inbound_emitted(entry) {
-            continue;
-        }
-        // "Require authentication" ticked with zero accounts is a lie at
-        // any bind: the wire projection drops the empty list and Xray's
-        // HTTP inbound then serves everyone. SOCKS password mode with an
-        // empty list denies all and never traps.
-        if inbound_auth_trap(entry) {
-            issues.push(issue(
-                ValidationCode::LocalInboundAuthRequiresAccounts,
-                None,
-            ));
-        }
-        if entry.port == 0 {
-            issues.push(issue(
-                ValidationCode::LocalInboundPortZero(excerpt(&entry.tag)),
-                None,
-            ));
-        }
-        let listen_valid = validate_listen_address(&entry.listen).is_ok();
-        if !listen_valid {
-            issues.push(issue(
-                ValidationCode::ListenAddressInvalid,
-                Some(format!("local inbound {:?}", excerpt(&entry.tag))),
-            ));
-        }
-        // Inbound sniffing vocabulary: Xray refuses the whole config at
-        // load on an unknown destOverride protocol, so this gates
-        // generate/apply exactly like the load refusal. The "fakedns" item
-        // the generator appends at wire time is part of the accepted
-        // vocabulary, so it can never false-positive here.
-        for finding in
-            validate_sniffing(&entry.sniffing, &format!("localInbounds[{index}].sniffing"))
-        {
-            issues.push(ValidationIssue {
-                code: finding.code,
-                path: Some(format!("local inbound {:?}", excerpt(&entry.tag))),
-                severity: finding.severity,
-            });
-        }
-        if listen_valid && entry.port != 0 {
-            let protocols = match entry.protocol {
-                LocalInboundProtocol::Socks => 1 | if entry.udp { 2 } else { 0 },
-                LocalInboundProtocol::Http => 1,
-            };
-            ip_listeners.push((
-                format!("local inbound {:?}", excerpt(&entry.tag)),
-                entry.listen.clone(),
-                entry.port,
-                protocols,
-            ));
-        }
-        if !inbound_tags.insert(entry.tag.clone()) {
-            issues.push(issue(
-                ValidationCode::InboundTagDuplicated(excerpt(&entry.tag)),
-                None,
-            ));
-        }
-    }
-
-    let mut unix_listeners = BTreeMap::<String, String>::new();
-    for (index, inbound) in settings.dokodemo.iter().enumerate() {
-        if !emit::dokodemo_emitted(inbound) {
-            continue;
-        }
-        if inbound.tag.is_empty() {
-            issues.push(issue(ValidationCode::DokodemoTagMissing(index + 1), None));
-        }
-        let tag = inbound.tag.clone();
-        let mode = inbound.network_mode();
-        if let Err(error) = &mode {
-            issues.push(warning(
-                ValidationCode::DokodemoNetworkInvalid(excerpt(&tag), excerpt(error)),
-                None,
-            ));
-        }
-        // Same sniffing gate as the local endpoints above.
-        for finding in validate_sniffing(&inbound.sniffing, &format!("dokodemo[{index}].sniffing"))
-        {
-            issues.push(ValidationIssue {
-                code: finding.code,
-                path: Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
-                severity: finding.severity,
-            });
-        }
-        match mode {
-            Ok(DokodemoNetwork::Unix) => {
-                let path = inbound.unix_socket_path.trim();
-                if path.is_empty() {
-                    issues.push(issue(
-                        ValidationCode::DokodemoUnixSocketRequired(excerpt(&tag)),
-                        None,
-                    ));
-                } else {
-                    let normalized = normalize_windows_socket_path(path);
-                    match unix_listeners.get(&normalized) {
-                        Some(other) => issues.push(issue(
-                            ValidationCode::DokodemoUnixSocketConflict(
-                                excerpt(&tag),
-                                excerpt(other),
-                                excerpt(path),
-                            ),
-                            None,
-                        )),
-                        None => {
-                            unix_listeners.insert(normalized, tag.clone());
-                        }
-                    }
-                }
+    /// One balancer's own rules: a missing tag skips the entry (the checks
+    /// below would name a tag that does not exist), a selector of only blanks,
+    /// a duplicate tag, and a `fallbackTag` outside the emitted outbound
+    /// universe.
+    fn balancers(&mut self) {
+        for (index, balancer) in self.settings.routing.balancers.iter().enumerate() {
+            if balancer.tag.trim().is_empty() {
+                self.issues
+                    .push(issue(ValidationCode::BalancerTagMissing(index + 1), None));
+                // The remaining checks would name a tag that does not exist.
+                continue;
             }
-            Ok(DokodemoNetwork::Tcp | DokodemoNetwork::Udp | DokodemoNetwork::TcpUdp) => {
-                if inbound.listen_port == 0 {
-                    issues.push(warning(
-                        ValidationCode::DokodemoPortZero(excerpt(&tag)),
-                        None,
-                    ));
-                }
-                let listen_valid = validate_listen_address(&inbound.listen).is_ok();
-                if !listen_valid {
-                    issues.push(issue(
-                        ValidationCode::ListenAddressInvalid,
-                        Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
-                    ));
-                }
-                if listen_valid && inbound.listen_port != 0 {
-                    let protocols =
-                        dokodemo_ip_protocols(mode.expect("matched IP mode")).expect("IP mask");
-                    ip_listeners.push((
-                        format!("dokodemo inbound {:?}", excerpt(&tag)),
-                        inbound.listen.clone(),
-                        inbound.listen_port,
-                        protocols,
-                    ));
-                }
-            }
-            Err(_) => {
-                // The emitter answers an unparseable mode with the IP
-                // envelope, so the tokens the core could still read bind and
-                // must join the conflict walk: `tcp,` serves TCP on the
-                // emitted `listen`+port, while an unknown-only token binds
-                // nothing.
-                let protocols = inbound.implied_ip_protocols();
-                let listen_valid = validate_listen_address(&inbound.listen).is_ok();
-                if protocols != 0 && listen_valid && inbound.listen_port != 0 {
-                    ip_listeners.push((
-                        format!("dokodemo inbound {:?}", excerpt(&tag)),
-                        inbound.listen.clone(),
-                        inbound.listen_port,
-                        protocols,
-                    ));
-                }
-            }
-        }
-        if !inbound_tags.insert(tag.clone()) {
-            issues.push(issue(
-                ValidationCode::InboundTagDuplicated(excerpt(&tag)),
-                None,
-            ));
-        }
-    }
-
-    // The TUN gateway entries become the adapter's addresses, and the
-    // in-tun DNS listener anchors on the gateway's IPv4 (the core's DNS leak
-    // block permits port-53 only inside the TUN subnet). The IPv4 gateway is
-    // a virtual address that needs no IPv4 from the network — an IPv6-only
-    // uplink still works with it — so an IPv6-only gateway list is refused
-    // by design, not for want of an address. An empty list is refused with
-    // it: nothing would own the address the adapter DNS pins.
-    let tun_gateway = tun_ipv4_gateway(&settings.tun);
-    if tun_on && tun_gateway.is_none() {
-        issues.push(issue(ValidationCode::TunIpv4GatewayRequired, None));
-    }
-    // The core's leak block. The generator writes the key exactly while the
-    // TUN inbound and the DNS module are both present (`emit::dns_inbound_emitted`,
-    // the model side of the `config_runs_tun_dns` predicate the runtime reads
-    // back), so these rules judge the same document the core will load. The
-    // routing-table and value rules mirror refusals the app's wire can really
-    // hit; the dns half needs no check here — the generator overwrites the
-    // TUN inbound's resolver list with the in-tun gateway on the same gate
-    // (`gen::inbounds`), so the core's `len(v.DNS) == 0` refusal is satisfied
-    // structurally. The block is also the only mechanism that now keeps DNS
-    // and the unrouted family inside the tunnel, so a half switched off warns
-    // with what reopens.
-    if emit::dns_inbound_emitted(settings) {
-        let leak = &settings.tun.auto_system_wfp_block_leak;
-        if !leak.is_empty() && settings.tun.auto_system_routing_table.is_empty() {
-            issues.push(issue(ValidationCode::TunLeakRoutingTableRequired, None));
-        }
-        for (index, value) in leak.iter().enumerate() {
-            if !vocabulary_holds(&[TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN], value) {
-                issues.push(issue(
-                    ValidationCode::TunLeakValueUnknown(excerpt(value)),
-                    Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
+            if balancer
+                .selector
+                .iter()
+                .all(|selector| selector.trim().is_empty())
+            {
+                self.issues.push(issue(
+                    ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
+                    None,
                 ));
             }
-        }
-        if tun_leak_misconfig_tun_off(settings) {
-            issues.push(warning(
-                ValidationCode::TunLeakMisconfigTunOff,
-                Some("tun.autoSystemWfpBlockLeak".into()),
-            ));
-        }
-    }
-    // The tags the emitter appends behind the configured entries reserve their
-    // slots here, in the emitter's own order: the insert that fails reports
-    // the collision for the arm walked second, so a configured entry reusing
-    // one of these tags is reported on the reserved arm exactly as the
-    // document carries it.
-    for tag in emit::appended_inbound_tags(settings) {
-        if !inbound_tags.insert(tag.to_string()) {
-            issues.push(issue(
-                ValidationCode::InboundTagDuplicated(tag.into()),
-                None,
-            ));
-        }
-    }
-    // The in-tun DNS listeners (one per gateway address family, port 53,
-    // TCP+UDP) are added to the running TUN core while a DNS module exists; a
-    // user listener on either endpoint must be rejected like any other
-    // collision.
-    if emit::dns_inbound_emitted(settings) {
-        if let Some(address) = tun_gateway {
-            ip_listeners.push(("DNS-in".into(), address.to_string(), 53, 3));
-        }
-        if let Some(address) = tun_ipv6_gateway(&settings.tun) {
-            ip_listeners.push(("DNS-in6".into(), address.to_string(), 53, 3));
-        }
-    }
-    // The conjunction itself is one definition
-    // (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps
-    // the model-level concerns — each entry's label, the pairing against
-    // earlier listeners, and the `ListenerConflict` code. Disabled entries,
-    // invalid listen addresses, and zero ports never reach `ip_listeners`.
-    for current in 0..ip_listeners.len() {
-        let (label, address, port, protocols) = &ip_listeners[current];
-        let endpoint = (*port, *protocols, address.as_str());
-        if let Some(other) = ip_listeners[..current].iter().find(|other| {
-            let (_, other_address, other_port, other_protocols) = other;
-            listen_endpoints_conflict(
-                endpoint,
-                (*other_port, *other_protocols, other_address.as_str()),
-            )
-        }) {
-            issues.push(issue(
-                ValidationCode::ListenerConflict(
-                    label.clone(),
-                    other.0.clone(),
-                    address.clone(),
-                    *port,
-                ),
-                None,
-            ));
-        }
-    }
-
-    for (index, rule) in settings.routing.rules.iter().enumerate() {
-        if let Some(error) = rule.target_error() {
-            issues.push(issue(
-                ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
-                None,
-            ));
-            // The reference checks below would name an unresolved target.
-            continue;
-        }
-        if !rule.outbound_tag.is_empty() && !outbound_tags.contains(&rule.outbound_tag) {
-            issues.push(issue(
-                ValidationCode::RoutingRuleOutboundMissing(index + 1, excerpt(&rule.outbound_tag)),
-                None,
-            ));
-        }
-        if !rule.balancer_tag.is_empty() && !balancer_tags.contains(&rule.balancer_tag) {
-            issues.push(issue(
-                ValidationCode::RoutingRuleBalancerMissing(index + 1, excerpt(&rule.balancer_tag)),
-                None,
-            ));
-        }
-        if let Some(tag) = rule
-            .inbound_tag
-            .iter()
-            .find(|tag| !inbound_tags.contains(*tag))
-        {
-            issues.push(issue(
-                ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
-                None,
-            ));
-        }
-    }
-
-    // The GUI bootstrap override replaces the auto-derived first server as
-    // the resolver for proxy-server domains, so it must be an endpoint the
-    // generator can emit as the scoped `+local` entry: an IP-literal host
-    // (behind `https://`, `h2c://`, `quic://`, `tcp://` or bare) or the
-    // literal `localhost`. A domain host would need that very resolution, so
-    // the generator emits nothing and the override silently has no effect.
-    // The auto-derived path is not judged here: its input is the server list.
-    let bootstrap = settings.dns.bootstrap.trim();
-    if !bootstrap.is_empty()
-        && bootstrap != "localhost"
-        && crate::model::dns::scoped_bootstrap_endpoint(bootstrap, None).is_none()
-    {
-        issues.push(warning(
-            ValidationCode::DnsBootstrapNotResolvable,
-            Some("dns.bootstrap".into()),
-        ));
-    }
-    for (index, server) in settings.dns.servers.iter().enumerate() {
-        if server.address.trim().is_empty() {
-            issues.push(issue(
-                ValidationCode::DnsServerAddressMissing(index + 1),
-                None,
-            ));
-        }
-    }
-    // fakeDNS pools must be CIDRs Xray's fakeip holder can build: a bad
-    // range, a non-positive size, or an LRU size not smaller than the
-    // subnet fails the core at start (app/dns/fakedns/fake.go:82-90) — such
-    // a config must never be applied.
-    for (index, pool) in settings.dns.fakedns.pools.iter().enumerate() {
-        let parsed = parse_pool_cidr(&pool.ip_pool);
-        if parsed.is_none() {
-            issues.push(issue(
-                ValidationCode::FakeDnsPoolCidrInvalid(index + 1),
-                None,
-            ));
-        }
-        if pool.pool_size < 1 {
-            issues.push(issue(
-                ValidationCode::FakeDnsPoolSizeInvalid(index + 1),
-                None,
-            ));
-        }
-        if let Some((_, host_bits)) = parsed
-            && pool.pool_size >= 1
-            && host_bits < 63
-            && (pool.pool_size as u64) >= (1u64 << host_bits)
-        {
-            issues.push(issue(
-                ValidationCode::FakeDnsPoolCapacityExceeded(
-                    index + 1,
-                    pool.pool_size,
-                    excerpt(&pool.ip_pool),
-                ),
-                None,
-            ));
-        }
-    }
-
-    // Geodata block: when configured, every URL must be HTTPS-with-host and
-    // the cron (when set) must be the 5-field shape. Empty = unconfigured.
-    if settings.geodata.is_configured() {
-        for (url, file) in [
-            (settings.geodata.geoip_url.as_deref(), "geoip.dat"),
-            (settings.geodata.geosite_url.as_deref(), "geosite.dat"),
-        ] {
-            if let Some(url) = url
-                && !crate::model::settings::geodata_url_valid(url)
+            if !self.balancer_tags.insert(balancer.tag.clone()) {
+                self.issues.push(issue(
+                    ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
+                    None,
+                ));
+            }
+            if !balancer.fallback_tag.is_empty()
+                && !self.outbound_tags.contains(&balancer.fallback_tag)
             {
-                issues.push(issue(
-                    ValidationCode::GeodataUrlInvalid(file.to_string()),
+                self.issues.push(issue(
+                    ValidationCode::BalancerFallbackMissing(
+                        excerpt(&balancer.tag),
+                        excerpt(&balancer.fallback_tag),
+                    ),
                     None,
                 ));
             }
         }
-        if let Some(cron) = settings.geodata.cron.as_deref()
-            && !crate::model::settings::geodata_cron_valid(cron)
-        {
-            issues.push(issue(ValidationCode::GeodataCronInvalid, None));
+    }
+
+    /// Local endpoints: every emitted entry must bind a valid listen address on
+    /// a non-zero port, and its tag must be unique among all emitted inbound
+    /// tags (local endpoints, TUN, dns-in, API, dokodemo).
+    fn local_inbounds(&mut self) {
+        for (index, entry) in self.settings.local_inbounds.iter().enumerate() {
+            if !emit::local_inbound_emitted(entry) {
+                continue;
+            }
+            // "Require authentication" ticked with zero accounts is a lie at
+            // any bind: the wire projection drops the empty list and Xray's
+            // HTTP inbound then serves everyone. SOCKS password mode with an
+            // empty list denies all and never traps.
+            if inbound_auth_trap(entry) {
+                self.issues.push(issue(
+                    ValidationCode::LocalInboundAuthRequiresAccounts,
+                    None,
+                ));
+            }
+            if entry.port == 0 {
+                self.issues.push(issue(
+                    ValidationCode::LocalInboundPortZero(excerpt(&entry.tag)),
+                    None,
+                ));
+            }
+            let listen_valid = validate_listen_address(&entry.listen).is_ok();
+            if !listen_valid {
+                self.issues.push(issue(
+                    ValidationCode::ListenAddressInvalid,
+                    Some(format!("local inbound {:?}", excerpt(&entry.tag))),
+                ));
+            }
+            // Inbound sniffing vocabulary: Xray refuses the whole config at
+            // load on an unknown destOverride protocol, so this gates
+            // generate/apply exactly like the load refusal. The "fakedns" item
+            // the generator appends at wire time is part of the accepted
+            // vocabulary, so it can never false-positive here.
+            for finding in
+                validate_sniffing(&entry.sniffing, &format!("localInbounds[{index}].sniffing"))
+            {
+                self.issues.push(ValidationIssue {
+                    code: finding.code,
+                    path: Some(format!("local inbound {:?}", excerpt(&entry.tag))),
+                    severity: finding.severity,
+                });
+            }
+            if listen_valid && entry.port != 0 {
+                let protocols = match entry.protocol {
+                    LocalInboundProtocol::Socks => 1 | if entry.udp { 2 } else { 0 },
+                    LocalInboundProtocol::Http => 1,
+                };
+                self.ip_listeners.push((
+                    format!("local inbound {:?}", excerpt(&entry.tag)),
+                    entry.listen.clone(),
+                    entry.port,
+                    protocols,
+                ));
+            }
+            if !self.inbound_tags.insert(entry.tag.clone()) {
+                self.issues.push(issue(
+                    ValidationCode::InboundTagDuplicated(excerpt(&entry.tag)),
+                    None,
+                ));
+            }
         }
     }
 
-    Verdict::from_issues(issues)
+    /// Dokodemo listeners: tag presence, the network-mode vocabulary and its
+    /// transport-specific rules (UNIX-socket path required and unique, IP listen
+    /// address and port), the sniffing vocabulary, and the tag uniqueness every
+    /// emitted inbound shares.
+    fn dokodemo(&mut self) {
+        for (index, inbound) in self.settings.dokodemo.iter().enumerate() {
+            if !emit::dokodemo_emitted(inbound) {
+                continue;
+            }
+            if inbound.tag.is_empty() {
+                self.issues
+                    .push(issue(ValidationCode::DokodemoTagMissing(index + 1), None));
+            }
+            let tag = inbound.tag.clone();
+            let mode = inbound.network_mode();
+            if let Err(error) = &mode {
+                self.issues.push(warning(
+                    ValidationCode::DokodemoNetworkInvalid(excerpt(&tag), excerpt(error)),
+                    None,
+                ));
+            }
+            // Same sniffing gate as the local endpoints above.
+            for finding in
+                validate_sniffing(&inbound.sniffing, &format!("dokodemo[{index}].sniffing"))
+            {
+                self.issues.push(ValidationIssue {
+                    code: finding.code,
+                    path: Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
+                    severity: finding.severity,
+                });
+            }
+            match mode {
+                Ok(DokodemoNetwork::Unix) => {
+                    let path = inbound.unix_socket_path.trim();
+                    if path.is_empty() {
+                        self.issues.push(issue(
+                            ValidationCode::DokodemoUnixSocketRequired(excerpt(&tag)),
+                            None,
+                        ));
+                    } else {
+                        let normalized = normalize_windows_socket_path(path);
+                        match self.unix_listeners.get(&normalized) {
+                            Some(other) => self.issues.push(issue(
+                                ValidationCode::DokodemoUnixSocketConflict(
+                                    excerpt(&tag),
+                                    excerpt(other),
+                                    excerpt(path),
+                                ),
+                                None,
+                            )),
+                            None => {
+                                self.unix_listeners.insert(normalized, tag.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(DokodemoNetwork::Tcp | DokodemoNetwork::Udp | DokodemoNetwork::TcpUdp) => {
+                    if inbound.listen_port == 0 {
+                        self.issues.push(warning(
+                            ValidationCode::DokodemoPortZero(excerpt(&tag)),
+                            None,
+                        ));
+                    }
+                    let listen_valid = validate_listen_address(&inbound.listen).is_ok();
+                    if !listen_valid {
+                        self.issues.push(issue(
+                            ValidationCode::ListenAddressInvalid,
+                            Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
+                        ));
+                    }
+                    if listen_valid && inbound.listen_port != 0 {
+                        let protocols =
+                            dokodemo_ip_protocols(mode.expect("matched IP mode")).expect("IP mask");
+                        self.ip_listeners.push((
+                            format!("dokodemo inbound {:?}", excerpt(&tag)),
+                            inbound.listen.clone(),
+                            inbound.listen_port,
+                            protocols,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // The emitter answers an unparseable mode with the IP
+                    // envelope, so the tokens the core could still read bind and
+                    // must join the conflict walk: `tcp,` serves TCP on the
+                    // emitted `listen`+port, while an unknown-only token binds
+                    // nothing.
+                    let protocols = inbound.implied_ip_protocols();
+                    let listen_valid = validate_listen_address(&inbound.listen).is_ok();
+                    if protocols != 0 && listen_valid && inbound.listen_port != 0 {
+                        self.ip_listeners.push((
+                            format!("dokodemo inbound {:?}", excerpt(&tag)),
+                            inbound.listen.clone(),
+                            inbound.listen_port,
+                            protocols,
+                        ));
+                    }
+                }
+            }
+            if !self.inbound_tags.insert(tag.clone()) {
+                self.issues.push(issue(
+                    ValidationCode::InboundTagDuplicated(excerpt(&tag)),
+                    None,
+                ));
+            }
+        }
+    }
+
+    /// The TUN gateway rule and the core's leak block. The TUN gateway entries
+    /// become the adapter's addresses, and the in-tun DNS listener anchors on
+    /// the gateway's IPv4 (the core's DNS leak block permits port-53 only inside
+    /// the TUN subnet). The IPv4 gateway is a virtual address that needs no IPv4
+    /// from the network — an IPv6-only uplink still works with it — so an
+    /// IPv6-only gateway list is refused by design, not for want of an address.
+    /// An empty list is refused with it: nothing would own the address the
+    /// adapter DNS pins.
+    fn tun(&mut self) {
+        let tun_on = emit::tun_inbound_emitted(self.settings);
+        if tun_on && self.tun_gateway.is_none() {
+            self.issues
+                .push(issue(ValidationCode::TunIpv4GatewayRequired, None));
+        }
+        // The generator writes the leak key exactly while the TUN inbound and
+        // the DNS module are both present (`emit::dns_inbound_emitted`, the model
+        // side of the `config_runs_tun_dns` predicate the runtime reads back),
+        // so these rules judge the same document the core will load. The
+        // routing-table and value rules mirror refusals the app's wire can really
+        // hit; the dns half needs no check here — the generator overwrites the
+        // TUN inbound's resolver list with the in-tun gateway on the same gate
+        // (`gen::inbounds`), so the core's `len(v.DNS) == 0` refusal is satisfied
+        // structurally. The block is also the only mechanism that now keeps DNS
+        // and the unrouted family inside the tunnel, so a half switched off warns
+        // with what reopens.
+        if emit::dns_inbound_emitted(self.settings) {
+            let leak = &self.settings.tun.auto_system_wfp_block_leak;
+            if !leak.is_empty() && self.settings.tun.auto_system_routing_table.is_empty() {
+                self.issues
+                    .push(issue(ValidationCode::TunLeakRoutingTableRequired, None));
+            }
+            for (index, value) in leak.iter().enumerate() {
+                if !vocabulary_holds(&[TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN], value) {
+                    self.issues.push(issue(
+                        ValidationCode::TunLeakValueUnknown(excerpt(value)),
+                        Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
+                    ));
+                }
+            }
+            if tun_leak_misconfig_tun_off(self.settings) {
+                self.issues.push(warning(
+                    ValidationCode::TunLeakMisconfigTunOff,
+                    Some("tun.autoSystemWfpBlockLeak".into()),
+                ));
+            }
+        }
+    }
+
+    /// Reserve the tags the emitter appends behind the configured entries, in
+    /// the emitter's own order, then add the in-tun DNS listeners the runtime
+    /// mounts while a DNS module exists.
+    fn emitter_reserved_inbounds(&mut self) {
+        // The insert that fails reports the collision for the arm walked second,
+        // so a configured entry reusing one of these tags is reported on the
+        // reserved arm exactly as the document carries it.
+        for tag in emit::appended_inbound_tags(self.settings) {
+            if !self.inbound_tags.insert(tag.to_string()) {
+                self.issues.push(issue(
+                    ValidationCode::InboundTagDuplicated(tag.into()),
+                    None,
+                ));
+            }
+        }
+        // The in-tun DNS listeners (one per gateway address family, port 53,
+        // TCP+UDP) are added to the running TUN core while a DNS module exists; a
+        // user listener on either endpoint must be rejected like any other
+        // collision.
+        if emit::dns_inbound_emitted(self.settings) {
+            if let Some(address) = self.tun_gateway {
+                self.ip_listeners
+                    .push(("DNS-in".into(), address.to_string(), 53, 3));
+            }
+            if let Some(address) = tun_ipv6_gateway(&self.settings.tun) {
+                self.ip_listeners
+                    .push(("DNS-in6".into(), address.to_string(), 53, 3));
+            }
+        }
+    }
+
+    /// Pair every IP listener against the earlier ones. The conjunction itself
+    /// is one definition (`crate::model::inbound::listen_endpoints_conflict`);
+    /// this walk keeps the model-level concerns — each entry's label, the
+    /// pairing against earlier listeners, and the `ListenerConflict` code.
+    /// Disabled entries, invalid listen addresses, and zero ports never reach
+    /// `ip_listeners`.
+    fn listener_conflicts(&mut self) {
+        for current in 0..self.ip_listeners.len() {
+            let (label, address, port, protocols) = &self.ip_listeners[current];
+            let endpoint = (*port, *protocols, address.as_str());
+            if let Some(other) = self.ip_listeners[..current].iter().find(|other| {
+                let (_, other_address, other_port, other_protocols) = other;
+                listen_endpoints_conflict(
+                    endpoint,
+                    (*other_port, *other_protocols, other_address.as_str()),
+                )
+            }) {
+                self.issues.push(issue(
+                    ValidationCode::ListenerConflict(
+                        label.clone(),
+                        other.0.clone(),
+                        address.clone(),
+                        *port,
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    /// Routing rules: an unresolved target short-circuits (the reference checks
+    /// below would name it), then the outbound, balancer and inbound references
+    /// each resolve against the set their emitter produced.
+    fn routing_rules(&mut self) {
+        for (index, rule) in self.settings.routing.rules.iter().enumerate() {
+            if let Some(error) = rule.target_error() {
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
+                    None,
+                ));
+                // The reference checks below would name an unresolved target.
+                continue;
+            }
+            if !rule.outbound_tag.is_empty() && !self.outbound_tags.contains(&rule.outbound_tag) {
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleOutboundMissing(
+                        index + 1,
+                        excerpt(&rule.outbound_tag),
+                    ),
+                    None,
+                ));
+            }
+            if !rule.balancer_tag.is_empty() && !self.balancer_tags.contains(&rule.balancer_tag) {
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleBalancerMissing(
+                        index + 1,
+                        excerpt(&rule.balancer_tag),
+                    ),
+                    None,
+                ));
+            }
+            if let Some(tag) = rule
+                .inbound_tag
+                .iter()
+                .find(|tag| !self.inbound_tags.contains(*tag))
+            {
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
+                    None,
+                ));
+            }
+        }
+    }
+
+    /// The DNS module: the GUI bootstrap override, the server list, and the
+    /// fakeDNS pools. The bootstrap override replaces the auto-derived first
+    /// server as the resolver for proxy-server domains, so it must be an
+    /// endpoint the generator can emit as the scoped `+local` entry: an
+    /// IP-literal host (behind `https://`, `h2c://`, `quic://`, `tcp://` or
+    /// bare) or the literal `localhost`. A domain host would need that very
+    /// resolution, so the generator emits nothing and the override silently has
+    /// no effect. The auto-derived path is not judged here: its input is the
+    /// server list. The pools must be CIDRs Xray's fakeip holder can build: a
+    /// bad range, a non-positive size, or an LRU size not smaller than the
+    /// subnet fails the core at start (app/dns/fakedns/fake.go:82-90) — such a
+    /// config must never be applied.
+    fn dns(&mut self) {
+        let bootstrap = self.settings.dns.bootstrap.trim();
+        if !bootstrap.is_empty()
+            && bootstrap != "localhost"
+            && crate::model::dns::scoped_bootstrap_endpoint(bootstrap, None).is_none()
+        {
+            self.issues.push(warning(
+                ValidationCode::DnsBootstrapNotResolvable,
+                Some("dns.bootstrap".into()),
+            ));
+        }
+        for (index, server) in self.settings.dns.servers.iter().enumerate() {
+            if server.address.trim().is_empty() {
+                self.issues.push(issue(
+                    ValidationCode::DnsServerAddressMissing(index + 1),
+                    None,
+                ));
+            }
+        }
+        for (index, pool) in self.settings.dns.fakedns.pools.iter().enumerate() {
+            let parsed = parse_pool_cidr(&pool.ip_pool);
+            if parsed.is_none() {
+                self.issues.push(issue(
+                    ValidationCode::FakeDnsPoolCidrInvalid(index + 1),
+                    None,
+                ));
+            }
+            if pool.pool_size < 1 {
+                self.issues.push(issue(
+                    ValidationCode::FakeDnsPoolSizeInvalid(index + 1),
+                    None,
+                ));
+            }
+            if let Some((_, host_bits)) = parsed
+                && pool.pool_size >= 1
+                && host_bits < 63
+                && (pool.pool_size as u64) >= (1u64 << host_bits)
+            {
+                self.issues.push(issue(
+                    ValidationCode::FakeDnsPoolCapacityExceeded(
+                        index + 1,
+                        pool.pool_size,
+                        excerpt(&pool.ip_pool),
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    /// The geo data block: when configured, every URL must be HTTPS-with-host
+    /// and the cron (when set) must be the 5-field shape. Empty = unconfigured.
+    fn geodata(&mut self) {
+        if self.settings.geodata.is_configured() {
+            for (url, file) in [
+                (self.settings.geodata.geoip_url.as_deref(), "geoip.dat"),
+                (self.settings.geodata.geosite_url.as_deref(), "geosite.dat"),
+            ] {
+                if let Some(url) = url
+                    && !crate::model::settings::geodata_url_valid(url)
+                {
+                    self.issues.push(issue(
+                        ValidationCode::GeodataUrlInvalid(file.to_string()),
+                        None,
+                    ));
+                }
+            }
+            if let Some(cron) = self.settings.geodata.cron.as_deref()
+                && !crate::model::settings::geodata_cron_valid(cron)
+            {
+                self.issues
+                    .push(issue(ValidationCode::GeodataCronInvalid, None));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5842,6 +5955,45 @@ mod tests {
             VISION_FLOW_OPTIONS,
             is_vision_flow,
             &["", "xtls-rprx-vision-udp444", "bogus"],
+        );
+    }
+
+    /// The uplink placement lists partition the vocabulary: every advertised
+    /// placement is accepted in some mode, and the two mode subsets are
+    /// disjoint and cover it — so the editor's off-`packet-up` combo and the
+    /// rule that refuses the rest cannot drift.
+    #[test]
+    fn uplink_placement_subsets_partition_the_vocabulary() {
+        for placement in UPLINK_DATA_PLACEMENT_OPTIONS {
+            assert!(
+                uplink_placement_mode_supported(placement, "packet-up"),
+                "{placement:?} must be accepted in packet-up"
+            );
+        }
+        for placement in UPLINK_STREAM_PLACEMENT_OPTIONS {
+            assert!(
+                uplink_placement_mode_supported(placement, "stream-up"),
+                "{placement:?} is advertised off packet-up and refused there"
+            );
+            assert!(
+                UPLINK_DATA_PLACEMENT_OPTIONS.contains(&placement),
+                "{placement:?} is not in the vocabulary"
+            );
+        }
+        for placement in UPLINK_PACKET_UP_ONLY_PLACEMENTS {
+            assert!(
+                !uplink_placement_mode_supported(placement, "stream-up"),
+                "{placement:?} is packet-up-only and accepted off it"
+            );
+            assert!(
+                UPLINK_DATA_PLACEMENT_OPTIONS.contains(&placement),
+                "{placement:?} is not in the vocabulary"
+            );
+        }
+        assert_eq!(
+            UPLINK_STREAM_PLACEMENT_OPTIONS.len() + UPLINK_PACKET_UP_ONLY_PLACEMENTS.len(),
+            UPLINK_DATA_PLACEMENT_OPTIONS.len(),
+            "the two mode subsets must cover the vocabulary exactly"
         );
     }
 

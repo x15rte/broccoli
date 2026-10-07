@@ -244,7 +244,8 @@ fn generate_reporting(
     // server answers it without the tunnel; emitting one without the other
     // would leave the dial on the OS resolver or deadlock it inside the
     // module (the DoH dial needs the very chain the query is for).
-    let dialed = dialed_outbound_tags(servers, settings);
+    let dialed = crate::model::dial::DialGraph::for_profiles(&servers.profiles)
+        .dialed_outbound_tags(settings);
     let mut server_domains: Vec<String> = servers
         .profiles
         .iter()
@@ -568,18 +569,6 @@ fn invalid_model_error(verdict: Verdict) -> Option<GenerateError> {
     verdict
         .into_first_blocking()
         .map(|issue| GenerateError::InvalidFinding(Box::new(issue)))
-}
-
-/// Tags of the outbounds the emitted document dials, each mapped to its chain
-/// terminal: every profile whose server address this machine dials while this
-/// document runs. The walk over dial-through references ends on the profile
-/// itself when it names no target, or a builtin (`direct`/`block`), which has
-/// no server to reach. A reference naming another profile excludes the
-/// referencing outbound: that hop's server is reached through the chain and
-/// resolves on the far side.
-fn dialed_outbound_tags(servers: &ServersFile, settings: &Settings) -> BTreeSet<String> {
-    let tags = crate::model::emit::profile_outbound_tags(&servers.profiles);
-    crate::model::dial::DialGraph::new(&servers.profiles, &tags).dialed_outbound_tags(settings)
 }
 
 /// The proxy-server host of a profile when it is a domain (not an IP
