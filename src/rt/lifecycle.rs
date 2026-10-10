@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use super::CorePhase;
+use super::helper::ChildPhase;
 use super::policy::CoreExitFacts;
 use super::readiness::Readiness;
 use super::state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
@@ -118,16 +119,16 @@ impl Lifecycle {
         }
     }
 
-    /// The elevated helper reports a state and the PID of the child it
+    /// The elevated helper reports a phase and the PID of the child it
     /// spawned: the spawn confirmation arms the readiness clock, and the PID
-    /// is what the owning-PID check compares against. Other states are
+    /// is what the owning-PID check compares against. Other phases are
     /// informational; an unknown (0) PID never records.
-    pub(super) fn on_helper_state(&mut self, state: &str, pid: u32) {
-        if state == "starting" || state == "running" {
+    pub(super) fn on_helper_state(&mut self, phase: ChildPhase, pid: u32) {
+        if matches!(phase, ChildPhase::Starting | ChildPhase::Running) {
             self.backend.set_child_pid(pid);
         }
         self.readiness.on_helper_state(
-            state,
+            phase,
             self.pending_transition.is_candidate_pending(),
             self.backend.is_tun_owned(),
         );

@@ -11,6 +11,7 @@
 
 use std::time::Instant;
 
+use super::helper::ChildPhase;
 use super::policy::{helper_state_arms_readiness, readiness_deadline_reached, readiness_timeout};
 
 /// The readiness clock. `deadline` is `Some` while armed, `None` while
@@ -51,16 +52,16 @@ impl Readiness {
         self.deadline = None;
     }
 
-    /// Take one helper state report. Only the spawn confirmation arms the
-    /// clock, and only while it is disarmed; the other states are
+    /// Take one helper phase report. Only the spawn confirmation arms the
+    /// clock, and only while it is disarmed; the other phases are
     /// informational.
     pub(super) fn on_helper_state(
         &mut self,
-        state: &str,
+        phase: ChildPhase,
         applied_candidate_pending: bool,
         tun_owned: bool,
     ) {
-        if helper_state_arms_readiness(state, self.armed()) {
+        if helper_state_arms_readiness(phase, self.armed()) {
             self.arm(applied_candidate_pending, tun_owned);
         }
     }
@@ -139,17 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn the_spawn_confirmation_arms_once_and_the_armed_clock_ignores_later_states() {
+    fn the_spawn_confirmation_arms_once_and_the_armed_clock_ignores_later_phases() {
         let mut clock = Readiness::new();
         clock.defer();
-        clock.on_helper_state("starting", false, true);
+        clock.on_helper_state(ChildPhase::Starting, false, true);
         assert!(clock.armed());
         let armed = clock.deadline();
-        clock.on_helper_state("running", false, true);
+        clock.on_helper_state(ChildPhase::Running, false, true);
         assert_eq!(
             clock.deadline(),
             armed,
-            "an informational state must not re-arm or extend the clock"
+            "an informational phase must not re-arm or extend the clock"
         );
     }
 }

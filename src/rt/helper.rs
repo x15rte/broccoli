@@ -1343,7 +1343,7 @@ impl Drop for WatchedParent {
 struct HelperChild {
     child: std::process::Child,
     job: Job,
-    state: String,
+    state: ChildPhase,
     api_port: u16,
     _stage: SecureRuntimeStage,
 }
@@ -1363,7 +1363,7 @@ impl HelperChild {
     /// slot lock; doing so would turn the bounded stall into a deadlock.
     fn kill(&mut self) {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
-            self.state = "stopped".to_string();
+            self.state = ChildPhase::Stopped;
             return;
         }
 
@@ -1390,7 +1390,7 @@ impl HelperChild {
 
         self.job.terminate();
         let _ = self.child.kill();
-        self.state = "stopped".to_string();
+        self.state = ChildPhase::Stopped;
     }
 }
 
@@ -1662,7 +1662,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     drop(slot);
                     send_event(
                         &writer,
-                        &serde_json::json!({"event":"state","state":"stopped","pid":0}),
+                        &serde_json::json!({"event":"state","state":ChildPhase::Stopped,"pid":0}),
                     );
                 }
             }
@@ -1671,8 +1671,8 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                     continue;
                 };
                 let (state, pid) = match slot.as_ref() {
-                    Some(child) => (child.state.clone(), child.child.id()),
-                    None => ("stopped".to_string(), 0),
+                    Some(child) => (child.state, child.child.id()),
+                    None => (ChildPhase::Stopped, 0),
                 };
                 drop(slot);
                 send_event(
@@ -1986,7 +1986,7 @@ fn helper_start(
         *slot = Some(HelperChild {
             child,
             job,
-            state: "starting".to_string(),
+            state: ChildPhase::Starting,
             api_port,
             _stage: stage,
         });
@@ -2091,7 +2091,7 @@ fn helper_start(
     }
     send_event(
         writer,
-        &serde_json::json!({"event":"state","state":"starting","pid":pid}),
+        &serde_json::json!({"event":"state","state":ChildPhase::Starting,"pid":pid}),
     );
 
     // Informational helper state. Runtime readiness still comes from gRPC.
@@ -2107,14 +2107,14 @@ fn helper_start(
                 return;
             };
             if child.child.id() == pid
-                && child.state == "starting"
+                && child.state == ChildPhase::Starting
                 && matches!(child.child.try_wait(), Ok(None))
             {
-                child.state = "running".to_string();
+                child.state = ChildPhase::Running;
                 drop(slot);
                 send_event(
                     &writer,
-                    &serde_json::json!({"event":"state","state":"running","pid":pid}),
+                    &serde_json::json!({"event":"state","state":ChildPhase::Running,"pid":pid}),
                 );
             }
         });
@@ -2173,7 +2173,7 @@ fn helper_start(
             send_event(&writer, &serde_json::json!({"event":"exit","code":code}));
             send_event(
                 &writer,
-                &serde_json::json!({"event":"state","state":"stopped","pid":pid}),
+                &serde_json::json!({"event":"state","state":ChildPhase::Stopped,"pid":pid}),
             );
         });
     }
@@ -2601,10 +2601,34 @@ pub enum HelperLog {
     Raw(String),
 }
 
+/// The phase of the xray child the elevated helper owns, as it travels on the
+/// helper pipe. The helper is the only writer; the runtime reads it to record
+/// the child's pid and to arm its readiness clock, and the readiness rule
+/// decides on the variant.
+///
+/// The wire spelling is the derived serialization (one variant, one word), so
+/// both ends of the pipe share this one vocabulary instead of the writer
+/// spelling states and the reader comparing literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildPhase {
+    /// The child was spawned (and attached to its kill-on-close job) and has
+    /// not been promoted yet. The helper reports this phase as the spawn
+    /// confirmation, which is what starts the readiness clock.
+    Starting,
+    /// The child outlived the promotion window: the helper reports it
+    /// informationally, since readiness itself comes from the control-plane
+    /// poll.
+    Running,
+    /// The child exited or was killed. Reported on the status replay, on a
+    /// refusal to start, and by the reaper that saw this child exit.
+    Stopped,
+}
+
 #[derive(Debug)]
 pub enum HelperEvent {
     State {
-        state: String,
+        state: ChildPhase,
         pid: u32,
     },
     Log(HelperLog),
@@ -2620,7 +2644,8 @@ pub enum HelperEvent {
 
 /// Decode one `{"event":...}` record from the helper. `None` means the record
 /// names no event this build knows, which the reader skips — a helper from
-/// the same build only ever sends the events above.
+/// the same build only ever sends the events above, and never a state
+/// spelling outside [`ChildPhase`].
 fn decode_helper_event(value: &serde_json::Value) -> Option<HelperEvent> {
     let decode = |key: &str| {
         value
@@ -2631,11 +2656,8 @@ fn decode_helper_event(value: &serde_json::Value) -> Option<HelperEvent> {
     Some(
         match value.get("event").and_then(serde_json::Value::as_str)? {
             "state" => HelperEvent::State {
-                state: value
-                    .get("state")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                state: serde_json::from_value(value.get("state").cloned().unwrap_or_default())
+                    .ok()?,
                 pid: decode("pid"),
             },
             "log" => HelperEvent::Log(decode_helper_log(value)),
@@ -3115,9 +3137,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES, ParentIdentity,
-        STAGED_CONFIG, SecureRuntimeStage, config_from_wire, current_process_user_sid,
-        dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
+        ChildPhase, HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES,
+        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, config_from_wire,
+        current_process_user_sid, dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
         ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
         path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
         stage_config_bytes_at, stage_entry_allowed, start_wire_message, to_wide, token_matches,
@@ -3451,6 +3473,44 @@ mod tests {
             panic!("a cleaned record must decode to the cleanup terminal");
         };
         assert_eq!((dns_adapters, adapters_removed), (3, 1));
+    }
+
+    #[test]
+    fn a_state_record_carries_the_phase_spelling_both_ends_share() {
+        // The phase vocabulary is a wire vocabulary: the helper writes one
+        // word per phase and the runtime reads that same word back, so the
+        // three spellings are pinned here instead of inside the two ends.
+        for (word, phase) in [
+            ("starting", ChildPhase::Starting),
+            ("running", ChildPhase::Running),
+            ("stopped", ChildPhase::Stopped),
+        ] {
+            assert_eq!(
+                serde_json::to_value(phase).expect("a phase has a wire spelling"),
+                serde_json::json!(word),
+                "the helper writes this word for {phase:?}"
+            );
+            let value = serde_json::json!({"event": "state", "state": word, "pid": 7});
+            let Some(HelperEvent::State { state, pid }) = decode_helper_event(&value) else {
+                panic!("a state record must decode to the state event: {word}");
+            };
+            assert_eq!((state, pid), (phase, 7), "the runtime reads {word}");
+        }
+    }
+
+    #[test]
+    fn a_state_record_with_an_unknown_spelling_decodes_to_nothing() {
+        // No phase outside the vocabulary has an effect on the runtime — an
+        // unrecognized report arms no clock and records no pid — so the
+        // record is skipped instead of being read as a real phase.
+        assert!(
+            decode_helper_event(&serde_json::json!({
+                "event": "state",
+                "state": "promoted",
+                "pid": 7,
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -4006,14 +4066,20 @@ mod tests {
         let wait_deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < wait_deadline {
             if let Ok(event) = events.try_recv()
-                && matches!(event, super::HelperEvent::State { state, .. } if state == "stopped")
+                && matches!(
+                    event,
+                    super::HelperEvent::State {
+                        state: ChildPhase::Stopped,
+                        ..
+                    }
+                )
             {
                 got_state = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(got_state, "helper must answer status with state=stopped");
+        assert!(got_state, "helper must answer status with a stopped state");
 
         // Drive the full production flow: the GUI sends the exact active
         // config content it validated, the helper stages the
@@ -4038,9 +4104,10 @@ mod tests {
         while Instant::now() < start_deadline {
             if let Ok(event) = events.try_recv() {
                 match &event {
-                    super::HelperEvent::State { state, .. }
-                        if state == "starting" || state == "running" =>
-                    {
+                    super::HelperEvent::State {
+                        state: ChildPhase::Starting | ChildPhase::Running,
+                        ..
+                    } => {
                         saw_starting = true;
                     }
                     super::HelperEvent::Log(super::HelperLog::Message(error))
@@ -4117,7 +4184,13 @@ mod tests {
         let wait_deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < wait_deadline {
             if let Ok(event) = events.try_recv()
-                && matches!(event, super::HelperEvent::State { state, .. } if state == "stopped")
+                && matches!(
+                    event,
+                    super::HelperEvent::State {
+                        state: ChildPhase::Stopped,
+                        ..
+                    }
+                )
             {
                 got_state = true;
                 break;
@@ -4584,7 +4657,7 @@ mod tests {
         let current = Arc::new(Mutex::new(Some(HelperChild {
             child,
             job,
-            state: "starting".to_string(),
+            state: ChildPhase::Starting,
             api_port: 0,
             _stage: stage,
         })));

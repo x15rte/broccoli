@@ -16,6 +16,8 @@
 
 use std::time::{Duration, Instant};
 
+use super::helper::ChildPhase;
+
 /// Cold-start readiness deadline.
 pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Readiness deadline for a start that carries a freshly applied config.
@@ -171,12 +173,13 @@ pub(super) fn readiness_timeout(applied_candidate_pending: bool, tun_owned: bool
     }
 }
 
-/// Whether one helper state report may start the readiness clock. `starting`
-/// is the spawn confirmation (the xray child was spawned and attached to its
-/// kill-on-close job); it arms only an unarmed clock. Every other state is
-/// informational — readiness itself comes from the gRPC poll.
-pub(super) fn helper_state_arms_readiness(state: &str, deadline_armed: bool) -> bool {
-    state == "starting" && !deadline_armed
+/// Whether one helper phase report may start the readiness clock.
+/// [`ChildPhase::Starting`] is the spawn confirmation (the xray child was
+/// spawned and attached to its kill-on-close job); it arms only an unarmed
+/// clock. Every other phase is informational — readiness itself comes from
+/// the gRPC poll.
+pub(super) fn helper_state_arms_readiness(phase: ChildPhase, deadline_armed: bool) -> bool {
+    matches!(phase, ChildPhase::Starting) && !deadline_armed
 }
 
 /// Whether an armed readiness deadline has fired. The boundary counts as
@@ -507,13 +510,13 @@ mod tests {
 
     #[test]
     fn helper_state_arms_only_starting_and_only_unarmed() {
-        assert!(helper_state_arms_readiness("starting", false));
+        assert!(helper_state_arms_readiness(ChildPhase::Starting, false));
         assert!(
-            !helper_state_arms_readiness("starting", true),
+            !helper_state_arms_readiness(ChildPhase::Starting, true),
             "a repeated report must not re-arm the clock"
         );
-        assert!(!helper_state_arms_readiness("running", false));
-        assert!(!helper_state_arms_readiness("stopped", false));
+        assert!(!helper_state_arms_readiness(ChildPhase::Running, false));
+        assert!(!helper_state_arms_readiness(ChildPhase::Stopped, false));
     }
 
     #[test]

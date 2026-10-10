@@ -1584,7 +1584,7 @@ impl Runtime {
                             self.on_core_exit(Some(code)).await;
                         }
                         Some(helper::HelperEvent::State { state, pid }) => {
-                            self.lifecycle.on_helper_state(&state, pid);
+                            self.lifecycle.on_helper_state(state, pid);
                         }
                         Some(helper::HelperEvent::Cleaned {
                             dns_adapters,
@@ -3951,8 +3951,9 @@ mod tests {
         LatencyProbeResult, NO_PROGRESS_EMITTED, OutboundStatusView, PhaseError, ProbeFailure,
         ProfileValidationOrigin, ProfileValidationRequest, READY_TIMEOUT, READY_TIMEOUT_APPLIED,
         Runtime, STOP_TIMEOUT, TUN_BIND_RACE_RETRIES, TUN_STOP_WINDOW, connect_after_helper_launch,
-        policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE, policy::LEAK_INSTALL_LINE,
-        should_emit_download_progress, spawn_runtime, state::BackendState,
+        helper::ChildPhase, policy::DNS_IN_ADD_ATTEMPTS, policy::DNS_IN_BIND_RACE_LINE,
+        policy::LEAK_INSTALL_LINE, should_emit_download_progress, spawn_runtime,
+        state::BackendState,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t};
@@ -4588,7 +4589,9 @@ mod tests {
         // The helper reports the child spawned; the clock starts here, never
         // earlier than the confirmation instant.
         let confirmation = Instant::now();
-        runtime.lifecycle.on_helper_state("starting", 4242);
+        runtime
+            .lifecycle
+            .on_helper_state(ChildPhase::Starting, 4242);
         assert!(runtime.lifecycle.readiness.armed());
         let ahead = runtime
             .lifecycle
@@ -4610,7 +4613,7 @@ mod tests {
 
         // A later informational state must not re-arm (or extend) the clock.
         let armed = runtime.lifecycle.readiness.deadline();
-        runtime.lifecycle.on_helper_state("running", 4242);
+        runtime.lifecycle.on_helper_state(ChildPhase::Running, 4242);
         assert_eq!(runtime.lifecycle.readiness.deadline(), armed);
     }
 
@@ -4622,7 +4625,9 @@ mod tests {
 
         runtime.lifecycle.readiness.defer();
         let confirmation = Instant::now();
-        runtime.lifecycle.on_helper_state("starting", 4242);
+        runtime
+            .lifecycle
+            .on_helper_state(ChildPhase::Starting, 4242);
         assert!(runtime.lifecycle.readiness.armed());
         let ahead = runtime
             .lifecycle
@@ -4665,7 +4670,9 @@ mod tests {
 
         // The helper finally confirms the spawn: the clock starts now, and a
         // genuine post-confirmation timeout still queues exactly one rollback.
-        runtime.lifecycle.on_helper_state("starting", 4242);
+        runtime
+            .lifecycle
+            .on_helper_state(ChildPhase::Starting, 4242);
         assert!(runtime.lifecycle.readiness.armed());
         runtime
             .lifecycle
