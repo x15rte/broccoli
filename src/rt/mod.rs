@@ -76,7 +76,7 @@ const RUNTIME_JOIN_BOUND: Duration =
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::rt::jobs::{Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry};
+use crate::rt::jobs::{Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry, declared_kind};
 
 pub use grpc::{
     BalancerInfoView, GrpcClient, HealthPingView, OutboundStatusView, RuntimeEntryView, StatsTick,
@@ -1692,9 +1692,14 @@ impl Runtime {
     // -- command handling ----------------------------------------------------
 
     async fn handle_cmd(&mut self, cmd: CoreCmd) {
+        // The command's declared kind, read once from the one table the shell
+        // mirrors its own sends with: the arms below take it instead of naming
+        // a kind themselves, so an arm and the table cannot disagree.
+        let kind = cmd.job_kind();
         match cmd {
             CoreCmd::Start => {
-                let Some(_id) = self.begin_exclusive(JobKind::Start, BusyAnswer::Nowhere) else {
+                let Some(_id) = self.begin_exclusive(declared_kind(kind), BusyAnswer::Nowhere)
+                else {
                     return;
                 };
                 self.lifecycle.pending_restart = None;
@@ -1737,7 +1742,7 @@ impl Runtime {
                     // worker-owned record is kept out by the guard above and
                     // every abortable one was cancelled and released before
                     // it.
-                    let _ = self.begin_exclusive(JobKind::Stop, BusyAnswer::Nowhere);
+                    let _ = self.begin_exclusive(declared_kind(kind), BusyAnswer::Nowhere);
                 } else if !cancelled_operation {
                     // No exclusive record existed for the release to clear,
                     // but the GUI marks Stop optimistically after send.
@@ -1749,8 +1754,7 @@ impl Runtime {
                     self.lifecycle.core_update.clear();
                 }
                 if self.lifecycle.backend.tun_owned_or_alive() {
-                    self.lifecycle.exit_policy.begin_stop(Instant::now());
-                    self.kill_backend().await;
+                    self.stop_backend().await;
                 } else {
                     self.lifecycle.exit_policy.finish();
                     self.lifecycle.backend.force_release();
@@ -1763,19 +1767,20 @@ impl Runtime {
                 }
             }
             CoreCmd::Restart => {
-                let Some(_id) = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere) else {
+                let Some(_id) = self.begin_exclusive(declared_kind(kind), BusyAnswer::Nowhere)
+                else {
                     return;
                 };
                 self.lifecycle.pending_restart = None;
                 if self.lifecycle.backend.tun_owned_or_alive() {
-                    self.lifecycle.exit_policy.begin_restart(Instant::now());
-                    self.kill_backend().await;
+                    self.restart_backend().await;
                 } else {
                     self.start_backend().await;
                 }
             }
             CoreCmd::CleanUp { adapter_name } => {
-                let Some(_id) = self.begin_exclusive(JobKind::CleanUp, BusyAnswer::Nowhere) else {
+                let Some(_id) = self.begin_exclusive(declared_kind(kind), BusyAnswer::Nowhere)
+                else {
                     return;
                 };
                 // A running core is stopped first, through the teardown the
@@ -1785,8 +1790,7 @@ impl Runtime {
                 if self.lifecycle.backend.tun_owned_or_alive() {
                     self.lifecycle.pending_restart = None;
                     self.lifecycle.pending_transition.clear();
-                    self.lifecycle.exit_policy.begin_stop(Instant::now());
-                    self.kill_backend().await;
+                    self.stop_backend().await;
                 }
                 self.command_cleanup(adapter_name);
             }
@@ -1795,22 +1799,16 @@ impl Runtime {
                 intent,
                 revision,
             } => {
-                self.dispatch_apply(value, intent, revision).await;
+                self.dispatch_apply(declared_kind(kind), value, intent, revision)
+                    .await;
             }
             CoreCmd::TestConfig { config, reply } => {
                 if self.lifecycle.exit_policy.stopping() {
-                    // The runtime is tearing down and will not run the
-                    // validation; reject on the request's own channel and
-                    // poke the repaint so the requester's poll wakes
-                    // (mirror the reply commands' stopping terminal).
-                    if reply.send(Err(seat::runtime_stopping())).is_err() {
-                        // Receiver vanished; nothing further is delivered.
-                    }
-                    self.events.repaint_now();
+                    self.reject_while_stopping(reply);
                     return;
                 }
                 let Some(_id) =
-                    self.begin_exclusive(JobKind::TestConfig, BusyAnswer::TestReply(reply))
+                    self.begin_exclusive(declared_kind(kind), BusyAnswer::TestReply(reply))
                 else {
                     return;
                 };
@@ -1818,26 +1816,21 @@ impl Runtime {
             }
             CoreCmd::ValidateProfiles { request, reply } => {
                 if self.lifecycle.exit_policy.stopping() {
-                    // The runtime is tearing down and will not run the
-                    // validation; reject on the request's own channel and
-                    // poke the repaint so the requester's poll wakes
-                    // (mirror the reply commands' stopping terminal).
-                    if reply.send(Err(seat::runtime_stopping())).is_err() {
-                        // Receiver vanished; nothing further is delivered.
-                    }
-                    self.events.repaint_now();
+                    self.reject_while_stopping(reply);
                     return;
                 }
-                let Some(_id) = self
-                    .begin_exclusive(JobKind::ValidateProfiles, BusyAnswer::ProfileReply(reply))
+                let Some(_id) =
+                    self.begin_exclusive(declared_kind(kind), BusyAnswer::ProfileReply(reply))
                 else {
                     return;
                 };
                 self.begin_profile_validation_work(*request);
             }
-            CoreCmd::UpdateCore => self.update_core(CoreUpdateSource::PinnedDownload),
+            CoreCmd::UpdateCore => {
+                self.update_core(declared_kind(kind), CoreUpdateSource::PinnedDownload)
+            }
             CoreCmd::ImportCoreArchive(path) => {
-                self.update_core(CoreUpdateSource::LocalArchive(path))
+                self.update_core(declared_kind(kind), CoreUpdateSource::LocalArchive(path))
             }
             CoreCmd::CheckUpdate => self.check_update(),
             CoreCmd::SetTunMode(on) => {
@@ -1850,7 +1843,7 @@ impl Runtime {
                     // the answer are one synchronous section, so the occupant
                     // cannot change between them.
                     if let Some(occupant) = self.jobs.busy_kind() {
-                        self.answer_busy(JobKind::Restart, occupant, BusyAnswer::Nowhere);
+                        self.answer_busy(declared_kind(kind), occupant, BusyAnswer::Nowhere);
                     }
                     return;
                 }
@@ -1863,17 +1856,17 @@ impl Runtime {
                 // window answers the toggle with the Restart kind's declared
                 // log-only flavour, whether or not this toggle would restart
                 // the core.
-                let Some(_id) = self.begin_exclusive(JobKind::Restart, BusyAnswer::Nowhere) else {
+                let Some(_id) = self.begin_exclusive(declared_kind(kind), BusyAnswer::Nowhere)
+                else {
                     return;
                 };
                 if active {
                     self.app_log(Diag::new(Key::RtLogTransportChangeRestart));
                     self.lifecycle.pending_restart = None;
                     if self.lifecycle.backend.tun_owned_or_alive() {
-                        self.lifecycle.exit_policy.begin_restart(Instant::now());
                         // `kill_backend` consults current ownership. Do not flip
                         // the requested next mode until TUN close was attempted.
-                        self.kill_backend().await;
+                        self.restart_backend().await;
                         self.lifecycle.requested_tun_mode = on;
                     } else {
                         self.lifecycle.requested_tun_mode = on;
@@ -1910,8 +1903,8 @@ impl Runtime {
                 tun_outbound_interface,
                 tun_adapter_name,
             } => {
-                let Some(_id) = self
-                    .begin_exclusive(JobKind::LatencyProbe, BusyAnswer::ProbeProfiles(&profiles))
+                let Some(_id) =
+                    self.begin_exclusive(declared_kind(kind), BusyAnswer::ProbeProfiles(&profiles))
                 else {
                     return;
                 };
@@ -1994,13 +1987,12 @@ impl Runtime {
     /// verdict, and the work below runs with the exclusive record held.
     async fn dispatch_apply(
         &mut self,
+        kind: JobKind,
         value: serde_json::Value,
         intent: ApplyIntent,
         revision: u64,
     ) {
-        let Some(_id) =
-            self.begin_exclusive(JobKind::ApplyConfig, BusyAnswer::ApplyRevision(revision))
-        else {
+        let Some(_id) = self.begin_exclusive(kind, BusyAnswer::ApplyRevision(revision)) else {
             return;
         };
         self.begin_apply_work(value, intent).await;
@@ -2180,7 +2172,7 @@ impl Runtime {
                             self.release_exclusive();
                             return;
                         };
-                        self.fail_tun_start(PhaseError::new(
+                        self.settle_error(PhaseError::new(
                             DiagError::new(Diag::new(Key::RtPhaseHelperUnavailable))
                                 .caused_by(error),
                         ));
@@ -2193,7 +2185,7 @@ impl Runtime {
                         self.lifecycle.backend.attach_tun(pipe, events);
                         self.publish_tun_start();
                     }
-                    Err(error) => self.fail_tun_start(error),
+                    Err(error) => self.settle_error(error),
                 }
             }
             ExclusiveOutcome::ApplyValidated {
@@ -2348,11 +2340,10 @@ impl Runtime {
         if active {
             self.lifecycle.pending_restart = None;
             if self.lifecycle.backend.tun_owned_or_alive() {
-                self.lifecycle.exit_policy.begin_restart(Instant::now());
                 // Cleanup and stop polling still use the old API endpoint and
                 // old TUN ownership. Commit next-backend state only after the
                 // graceful close request has been issued.
-                self.kill_backend().await;
+                self.restart_backend().await;
             }
             self.commit_requested_backend(intent.tun_mode(), api_port);
             if !self.lifecycle.backend.tun_owned_or_alive() {
@@ -2443,8 +2434,7 @@ impl Runtime {
                     .arg_message(failure.message.headline().clone()),
             );
         }
-        self.set_phase(CorePhase::Error(failure));
-        self.release_exclusive();
+        self.settle_error(failure);
     }
 
     async fn start_backend(&mut self) {
@@ -2464,17 +2454,15 @@ impl Runtime {
             // without a confirmed exit, spawning on the same ports is unsafe.
             self.cleanup_tun().await;
             self.lifecycle.backend.force_release();
-            self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
+            self.settle_error(PhaseError::new(Diag::new(
                 Key::RtPhaseBackendReplacementCancelled,
-            ))));
-            self.release_exclusive();
+            )));
             return;
         }
         if let Err(error) = crate::sys::core_dl::recover_installation() {
-            self.set_phase(CorePhase::Error(PhaseError::new(
+            self.settle_error(PhaseError::new(
                 DiagError::new(Diag::new(Key::RtPhaseUpdateRecoveryFailed)).caused_by(error),
-            )));
-            self.release_exclusive();
+            ));
             return;
         }
         // An update with no prior core has no durable `core.bak` marker, but
@@ -2656,8 +2644,7 @@ impl Runtime {
                                 DiagError::new(Diag::new(Key::RtFrameUpdatedCoreSpawnNoLastGood))
                                     .caused_by(error),
                             ))));
-                            self.set_phase(CorePhase::Stopped);
-                            self.release_exclusive();
+                            self.settle_stopped();
                         }
                         Err(rollback_error) => {
                             let rollback_message = rollback_error.diag().clone();
@@ -2668,15 +2655,13 @@ impl Runtime {
                                 )
                                 .caused_by(error),
                             ))));
-                            self.set_phase(CorePhase::Stopped);
-                            self.release_exclusive();
+                            self.settle_stopped();
                         }
                     }
                 } else {
-                    self.set_phase(CorePhase::Error(PhaseError::new(
+                    self.settle_error(PhaseError::new(
                         DiagError::new(Diag::new(Key::RtPhaseCoreSpawnFailed)).caused_by(error),
-                    )));
-                    self.release_exclusive();
+                    ));
                 }
             }
         }
@@ -2686,7 +2671,7 @@ impl Runtime {
     /// call that turns a connected helper into a starting core, shared by the
     /// fresh connect and the restart over the live pipe. The caller settles
     /// the outcome with [`Self::publish_tun_start`] or
-    /// [`Self::fail_tun_start`].
+    /// [`Self::settle_error`].
     ///
     /// A missing capture is an invariant break — the launch path guaranteed the
     /// bytes before the pipe existed — and must fail loudly, never fall back to
@@ -2718,11 +2703,38 @@ impl Runtime {
         self.app_log(Diag::new(Key::RtLogCoreStartedHelper));
     }
 
-    /// Settle a TUN start that never reached `Starting`: publish the failure
-    /// and give up the busy window.
-    fn fail_tun_start(&mut self, error: PhaseError) {
+    /// Settle a failure that ends the runtime's busy window: publish the
+    /// phase and give the window back. Every failure path that owns a record
+    /// ends here, so a new one cannot publish the phase and forget the
+    /// release.
+    fn settle_error(&mut self, error: PhaseError) {
         self.set_phase(CorePhase::Error(error));
         self.release_exclusive();
+    }
+
+    /// Stop the backend: the exit window opens first — it is what tells the
+    /// exit that follows which policy owns it — and the kill lands inside it.
+    /// Every stop, restart and silenced-stop caller runs this one sequence.
+    async fn stop_backend(&mut self) {
+        self.lifecycle.exit_policy.begin_stop(Instant::now());
+        self.kill_backend().await;
+    }
+
+    /// The same for a restart: the replacement follows the confirmed exit.
+    async fn restart_backend(&mut self) {
+        self.lifecycle.exit_policy.begin_restart(Instant::now());
+        self.kill_backend().await;
+    }
+
+    /// Reject a request the runtime will not run because it is tearing down:
+    /// the terminal goes back on the requester's own channel, and the repaint
+    /// wakes its poll. The reply commands' stopping path sends the same
+    /// terminal.
+    fn reject_while_stopping<T>(&self, reply: oneshot::Sender<Result<T, DiagError>>) {
+        if reply.send(Err(seat::runtime_stopping())).is_err() {
+            // Receiver vanished; nothing further is delivered.
+        }
+        self.events.repaint_now();
     }
 
     fn start_via_helper(&mut self) {
@@ -2737,7 +2749,7 @@ impl Runtime {
             let result = self.start_helper_pipe(pipe);
             match result {
                 Ok(()) => self.publish_tun_start(),
-                Err(error) => self.fail_tun_start(error),
+                Err(error) => self.settle_error(error),
             }
             return;
         }
@@ -3097,13 +3109,12 @@ impl Runtime {
 
         if !self.lifecycle.shutting_down {
             if explicit_stop {
-                self.set_phase(CorePhase::Stopped);
+                self.settle_stopped();
             } else {
-                self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
+                self.settle_error(PhaseError::new(Diag::new(
                     Key::RtPhaseHelperExitUnconfirmed,
-                ))));
+                )));
             }
-            self.release_exclusive();
         }
     }
 
@@ -3383,8 +3394,7 @@ impl Runtime {
                             Diag::new(Key::RtFrameCandidateReadyTimeout)
                                 .arg(READY_TIMEOUT_APPLIED.as_secs()),
                         );
-                        self.lifecycle.exit_policy.begin_stop(Instant::now());
-                        self.kill_backend().await;
+                        self.stop_backend().await;
                     }
                     ReadinessTimeout::UpdatedCore => {
                         // The last readiness miss is its own keyed sentence,
@@ -3397,8 +3407,7 @@ impl Runtime {
                                 .arg(READY_TIMEOUT.as_secs()),
                         };
                         if self.lifecycle.core_update.arm_rollback(reason) {
-                            self.lifecycle.exit_policy.begin_stop(Instant::now());
-                            self.kill_backend().await;
+                            self.stop_backend().await;
                         } else {
                             self.silence_readiness_timeout().await;
                         }
@@ -3520,8 +3529,7 @@ impl Runtime {
             // through the next apply.
             self.app_log(Diag::new(Key::RtLogHealthGateCompleted));
             self.lifecycle.gate_backend_alive = false;
-            self.lifecycle.exit_policy.begin_stop(Instant::now());
-            self.kill_backend().await;
+            self.stop_backend().await;
             return;
         }
         self.set_phase(CorePhase::Running);
@@ -3775,10 +3783,7 @@ impl Runtime {
             self.emit(CoreEvt::Download(DownloadState::Failed(output)));
             self.settle_stopped();
         } else if wanted_restart {
-            self.set_phase(CorePhase::Error(PhaseError::new(Diag::new(
-                Key::RtPhaseRestartCancelled,
-            ))));
-            self.release_exclusive();
+            self.settle_error(PhaseError::new(Diag::new(Key::RtPhaseRestartCancelled)));
         } else if !self.lifecycle.shutting_down {
             self.settle_stopped();
         }
@@ -3803,7 +3808,7 @@ impl Runtime {
     /// dropped with the runtime and the detached swap completes on disk; the
     /// marker-first swap plus `recover_interrupted_swap` keep the managed
     /// core directory consistent for the next launch.
-    fn update_core(&mut self, source: CoreUpdateSource) {
+    fn update_core(&mut self, kind: JobKind, source: CoreUpdateSource) {
         if !matches!(
             self.lifecycle.phase,
             CorePhase::Stopped | CorePhase::Error(_)
@@ -3826,7 +3831,7 @@ impl Runtime {
             self.emit(CoreEvt::Operation(None));
             return;
         }
-        let Some(_id) = self.begin_exclusive(JobKind::UpdateCore, BusyAnswer::Nowhere) else {
+        let Some(_id) = self.begin_exclusive(kind, BusyAnswer::Nowhere) else {
             return;
         };
         let initial_stage = match &source {

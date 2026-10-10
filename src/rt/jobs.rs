@@ -191,6 +191,15 @@ impl super::CoreCmd {
     }
 }
 
+/// The kind a window-opening site opens its record with: the command's own row
+/// above, so no arm of the dispatcher names a kind the runtime does not occupy
+/// as and the table the shell mirrors its own sends with is the only name.
+/// Only the arms whose command declares a kind call this; the table is
+/// exhaustive, so a `None` here is a broken row, not a reachable state.
+pub(crate) fn declared_kind(kind: Option<JobKind>) -> JobKind {
+    kind.expect("a window-opening command declares its kind")
+}
+
 /// Terminal payload of one exclusive job's task. Each variant is produced by
 /// exactly one kind's worker and consumed by that kind's completion
 /// handler, so the per-kind dispatch cannot mismatch.
