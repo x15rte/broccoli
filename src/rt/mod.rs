@@ -4317,13 +4317,13 @@ mod tests {
     /// channel capacity are counted and later coalesced into one summary.
     #[test]
     fn log_gate_coalesces_lines_when_channel_is_full() {
-        use super::events::{LogGate, suppressed_summary};
+        use super::events::{Forward, LogGate, suppressed_summary};
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
         let mut gate = LogGate::new();
         let mut queued = 0;
         for _ in 0..5 {
-            if gate.forward("line".to_string(), &sender) {
+            if gate.forward("line".to_string(), &sender) == Forward::Queued {
                 queued += 1;
             }
         }
@@ -4333,7 +4333,7 @@ mod tests {
         // The GUI catches up (drains the queue); the next line emits the
         // summary of the 3 suppressed lines followed by the line itself.
         while receiver.try_recv().is_ok() {}
-        assert!(gate.forward("fresh".to_string(), &sender));
+        assert_eq!(gate.forward("fresh".to_string(), &sender), Forward::Queued);
         let mut drained = Vec::new();
         while let Ok(evt) = receiver.try_recv() {
             drained.push(evt);

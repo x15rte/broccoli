@@ -60,6 +60,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
+use super::events::{Forward, HandOff, LogGate, LogHop, hand_within};
 use crate::model::inbound::TUN_INBOUND_TAG;
 use crate::rt::supervisor::CREATE_NO_WINDOW;
 use crate::sys::elevation::is_hex_secret;
@@ -77,9 +78,9 @@ const PIPE_POLL: Duration = Duration::from_millis(50);
 /// Capacity of the bounded helper→runtime event channel: one TUN flood
 /// window of lines, drained in bulk by the
 /// runtime select loop between bounded commands. Mirrors the 2048-slot GUI
-/// event channel (`rt::EVT_CHANNEL_CAPACITY`), whose LogGate already sets
+/// event channel (`rt::EVT_CHANNEL_CAPACITY`), whose gate already sets
 /// the drop-and-coalesce precedent this hop follows. Lines beyond the cap
-/// are never queued — `HopLogGate` counts them and delivers one summary.
+/// are never queued — the shared gate counts them and delivers one summary.
 const HELPER_EVT_CHANNEL_CAPACITY: usize = super::EVT_CHANNEL_CAPACITY;
 /// Upper bound for one wire message on the helper pipe. A decoded line is
 /// capped at
@@ -2734,69 +2735,29 @@ fn decode_diag(value: &serde_json::Value) -> Option<Diag> {
 // -- helper→runtime event hop -----------------------------------
 //
 // The reader thread forwards parsed events over a bounded channel drained by
-// the runtime select loop. Log lines are drop-coalesced by `HopLogGate` when
-// the channel is full (a flooding core must not grow the queue while the
-// runtime is inside a bounded command); lifecycle events are never counted
-// away — they wait one bounded drain window for a slot.
+// the runtime select loop. Log lines go through the shared coalescing gate
+// (see `rt::events`), which counts them while the channel is full and
+// delivers one summary once it accepts again; lifecycle events are never
+// counted away — they wait one bounded drain window for a slot.
 
-/// Drop/coalesce accounting for core log lines crossing the bounded
-/// helper→runtime channel. Once the channel
-/// rejects a log line, later lines are counted instead of queued, and the
-/// count is delivered as one summary line as soon as the channel accepts
-/// again — the same semantics as the GUI-side `LogGate` (rt/mod.rs), which
-/// already bounds the direct-mode path. The reader never blocks
-/// on a full channel, so the named pipe keeps draining and the elevated
-/// helper's synchronous log writer is never backpressured.
-struct HopLogGate {
-    /// Lines dropped since the last delivered summary.
-    suppressed: u64,
-}
+impl LogHop<HelperLog> for mpsc::Sender<HelperEvent> {
+    type Value = HelperEvent;
 
-/// Outcome of [`HopLogGate::forward`] for one core log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HopForward {
-    /// A pending summary and/or the line itself was queued.
-    Queued,
-    /// The line was dropped because the channel is full; counted toward the
-    /// next summary.
-    Suppressed,
-    /// The runtime receiver is gone; the reader thread must stop.
-    Disconnected,
-}
-
-impl HopLogGate {
-    fn new() -> Self {
-        Self { suppressed: 0 }
+    fn line(&self, line: HelperLog) -> HelperEvent {
+        HelperEvent::Log(line)
     }
 
-    /// Forward one core log line over the bounded hop. When earlier lines
-    /// were suppressed, their count is delivered first as the shared keyed
-    /// summary; only once the channel accepts the summary is the counter
-    /// reset and the triggering line queued. A full channel drops the line
-    /// instead of blocking.
-    fn forward(&mut self, line: HelperLog, sender: &mpsc::Sender<HelperEvent>) -> HopForward {
-        if self.suppressed > 0 {
-            // Deliver the summary of previously suppressed lines first; if
-            // the channel still rejects it, suppress this line too.
-            let summary = HelperLog::Message(DiagError::from(super::events::suppressed_summary(
-                self.suppressed,
-            )));
-            match sender.try_send(HelperEvent::Log(summary)) {
-                Ok(()) => self.suppressed = 0,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.suppressed += 1;
-                    return HopForward::Suppressed;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return HopForward::Disconnected,
-            }
-        }
-        match sender.try_send(HelperEvent::Log(line)) {
-            Ok(()) => HopForward::Queued,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.suppressed = 1;
-                HopForward::Suppressed
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => HopForward::Disconnected,
+    fn summary(&self, suppressed: u64) -> HelperEvent {
+        HelperEvent::Log(HelperLog::Message(DiagError::from(
+            super::events::suppressed_summary(suppressed),
+        )))
+    }
+
+    fn try_hand(&self, value: HelperEvent) -> HandOff<HelperEvent> {
+        match self.try_send(value) {
+            Ok(()) => HandOff::Delivered,
+            Err(mpsc::error::TrySendError::Full(value)) => HandOff::Full(value),
+            Err(mpsc::error::TrySendError::Closed(value)) => HandOff::Closed(value),
         }
     }
 }
@@ -2813,23 +2774,11 @@ impl HopLogGate {
 /// that window (wedged or gone, where no event is observable anyway).
 /// Returns false when the runtime receiver is gone (the reader thread must
 /// stop then).
-fn send_helper_lifecycle_event(mut event: HelperEvent, sender: &mpsc::Sender<HelperEvent>) -> bool {
-    let deadline = Instant::now() + LIFECYCLE_SEND_WINDOW;
-    loop {
-        match sender.try_send(event) {
-            Ok(()) => return true,
-            Err(mpsc::error::TrySendError::Full(pending)) => {
-                event = pending;
-                if Instant::now() >= deadline {
-                    // The runtime has not drained for a whole window; drop
-                    // rather than wedge the reader thread against it.
-                    return true;
-                }
-                std::thread::sleep(super::events::EVENT_SEND_RETRY);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-        }
-    }
+fn send_helper_lifecycle_event(event: HelperEvent, sender: &mpsc::Sender<HelperEvent>) -> bool {
+    !matches!(
+        hand_within(event, LIFECYCLE_SEND_WINDOW, |event| sender.try_hand(event)),
+        HandOff::Closed(_)
+    )
 }
 
 /// Build the wire `start` command for the exact core source and config
@@ -2994,7 +2943,7 @@ impl HelperPipe {
                 // kill this reader (which would tear down a running TUN
                 // backend).
                 let pipe_handle = HANDLE(reader_file.as_raw_handle());
-                let mut log_gate = HopLogGate::new();
+                let mut log_gate = LogGate::new();
                 while !thread_cancel.load(Ordering::Acquire) {
                     match read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES) {
                         Ok(Some(bytes)) => {
@@ -3015,7 +2964,7 @@ impl HelperPipe {
                                 HelperEvent::Log(line) => {
                                     if matches!(
                                         log_gate.forward(line, &sender),
-                                        HopForward::Disconnected
+                                        Forward::Disconnected
                                     ) {
                                         break;
                                     }
@@ -4370,21 +4319,22 @@ mod tests {
 
     /// A flooding core must not grow the bounded helper→runtime
     /// queue; lines beyond capacity are counted, then coalesced into exactly
-    /// one summary on the next successful send (LogGate semantics, now on
-    /// the TUN hop). Without the bounded channel this test cannot pass: an
-    /// unbounded queue never rejects, so nothing is suppressed and no
-    /// summary exists to deliver.
+    /// one summary on the next successful send (the shared gate's semantics,
+    /// now on the TUN hop). Without the bounded channel this test cannot
+    /// pass: an unbounded queue never rejects, so nothing is suppressed and
+    /// no summary exists to deliver.
     #[test]
     fn hop_log_gate_coalesces_lines_when_channel_is_full() {
         use tokio::sync::mpsc;
 
-        use super::{HelperEvent, HelperLog, HopForward, HopLogGate};
+        use super::super::events::{Forward, LogGate};
+        use super::{HelperEvent, HelperLog};
 
         let (sender, mut receiver) = mpsc::channel(2);
-        let mut gate = HopLogGate::new();
+        let mut gate = LogGate::new();
         let mut queued = 0;
         for _ in 0..5 {
-            if gate.forward(HelperLog::Raw("line".to_string()), &sender) == HopForward::Queued {
+            if gate.forward(HelperLog::Raw("line".to_string()), &sender) == Forward::Queued {
                 queued += 1;
             }
         }
@@ -4396,7 +4346,7 @@ mod tests {
         while receiver.try_recv().is_ok() {}
         assert_eq!(
             gate.forward(HelperLog::Raw("fresh".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         let mut drained = Vec::new();
         while let Ok(evt) = receiver.try_recv() {
@@ -4427,29 +4377,29 @@ mod tests {
     fn hop_log_gate_resets_after_summary_and_recoalesces() {
         use tokio::sync::mpsc;
 
-        use super::{HelperEvent, HelperLog, HopForward, HopLogGate};
+        use super::super::events::{Forward, LogGate};
+        use super::{HelperEvent, HelperLog};
 
         let (sender, mut receiver) = mpsc::channel(2);
-        let mut gate = HopLogGate::new();
+        let mut gate = LogGate::new();
         assert_eq!(
             gate.forward(HelperLog::Raw("first".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         assert_eq!(
             gate.forward(HelperLog::Raw("second".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         assert_eq!(
             gate.forward(HelperLog::Raw("third".to_string()), &sender),
-            HopForward::Suppressed
+            Forward::Suppressed
         );
-        assert_eq!(gate.suppressed, 1, "one line counted, not queued");
         while receiver.try_recv().is_ok() {}
 
         // Next success delivers the singular summary first, then the line.
         assert_eq!(
             gate.forward(HelperLog::Raw("fourth".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         let mut drained = Vec::new();
         while let Ok(evt) = receiver.try_recv() {
@@ -4463,30 +4413,28 @@ mod tests {
             ),
             other => panic!("expected singular suppression summary, got {other:?}"),
         }
-        assert_eq!(gate.suppressed, 0, "summary delivery resets the counter");
 
         // A second flood after the summary restarts the count from zero.
         assert_eq!(
             gate.forward(HelperLog::Raw("fifth".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         assert_eq!(
             gate.forward(HelperLog::Raw("sixth".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         assert_eq!(
             gate.forward(HelperLog::Raw("seventh".to_string()), &sender),
-            HopForward::Suppressed
+            Forward::Suppressed
         );
         assert_eq!(
             gate.forward(HelperLog::Raw("eighth".to_string()), &sender),
-            HopForward::Suppressed
+            Forward::Suppressed
         );
-        assert_eq!(gate.suppressed, 2, "second flood counts from zero");
         while receiver.try_recv().is_ok() {}
         assert_eq!(
             gate.forward(HelperLog::Raw("ninth".to_string()), &sender),
-            HopForward::Queued
+            Forward::Queued
         );
         let mut drained = Vec::new();
         while let Ok(evt) = receiver.try_recv() {
