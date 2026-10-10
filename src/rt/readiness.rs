@@ -4,7 +4,7 @@
 //! The clock bounds the wait between "a start was accepted" and "the core
 //! answers the control-plane RPCs". A direct start arms it right after the
 //! child spawns. A TUN start does not: the elevated helper may still be
-//! staging, validating the configuration (up to `CONFIG_TEST_TIMEOUT`) and
+//! staging, validating the configuration (up to `apply::VALIDATE_TIMEOUT`) and
 //! copying payloads before the xray child exists, so the clock stays disarmed
 //! until the helper reports the spawn. The arming and firing decisions
 //! themselves live in [`super::policy`]; this type owns the state they act on.

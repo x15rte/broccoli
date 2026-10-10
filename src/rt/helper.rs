@@ -62,7 +62,7 @@ use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use super::events::{Forward, HandOff, LogGate, LogHop, hand_within};
 use crate::model::inbound::TUN_INBOUND_TAG;
-use crate::rt::supervisor::CREATE_NO_WINDOW;
+use crate::rt::supervisor::CoreInvocation;
 use crate::sys::elevation::is_hex_secret;
 use crate::sys::security::{
     Sid, TokenHandle, is_invalid_owner_error, with_protected_attributes, with_protected_descriptor,
@@ -124,7 +124,6 @@ const STAGE_PREFIX: &str = "stage-";
 const STAGE_MARKER: &str = ".broccoli-secure-stage";
 const STAGE_MARKER_CONTENT: &[u8] = b"broccoli-secure-stage-v1";
 const STAGED_CONFIG: &str = "config.json";
-const CONFIG_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STAGE_ENTRIES: &[&str] = &[
     "xray.exe",
     "wintun.dll",
@@ -1780,20 +1779,17 @@ fn finish_line_sync(mut line: Vec<u8>) -> String {
     String::from_utf8_lossy(&line).into_owned()
 }
 
+/// The staged core's command line: the staged `xray.exe` run against the
+/// staged config, in the stage directory, through the launch contract the
+/// GUI's own spawns use ([`CoreInvocation`]).
 fn staged_xray_command(stage: &Path, test_only: bool) -> std::process::Command {
-    let mut command = std::process::Command::new(stage.join("xray.exe"));
-    command.arg("run");
-    if test_only {
-        command.arg("-test");
-    }
-    command
-        .arg("-config")
-        .arg(stage.join(STAGED_CONFIG))
-        .current_dir(stage)
-        .env("XRAY_LOCATION_ASSET", stage)
-        .stdin(std::process::Stdio::null());
-    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
-    command
+    let config = stage.join(STAGED_CONFIG);
+    let invocation = if test_only {
+        CoreInvocation::test(stage, &config)
+    } else {
+        CoreInvocation::run(stage, &config)
+    };
+    invocation.std_command()
 }
 
 fn validate_staged_config(stage: &Path) -> Result<(), DiagError> {
@@ -1816,7 +1812,7 @@ fn validate_staged_config(stage: &Path) -> Result<(), DiagError> {
             return Err(error).diag(Key::HelperStagedValidationIsolateFailed);
         }
     };
-    let deadline = Instant::now() + CONFIG_TEST_TIMEOUT;
+    let deadline = Instant::now() + super::apply::VALIDATE_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),

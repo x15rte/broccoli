@@ -4583,7 +4583,8 @@ mod tests {
         runtime.lifecycle.backend = BackendState::for_test(true, true);
 
         // `pipe.start()` has been accepted, but the elevated helper is still
-        // staging/validating (up to CONFIG_TEST_TIMEOUT plus the payload copy)
+        // staging/validating (up to the configuration-test deadline plus the
+        // payload copy)
         // — the xray child does not exist yet, so no deadline may be armed.
         runtime.lifecycle.readiness.defer();
         assert!(

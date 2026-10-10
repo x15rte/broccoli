@@ -2,7 +2,7 @@
 //! pinned to a kill-on-close Job Object so no orphan xray.exe can outlive the
 //! GUI.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +38,83 @@ pub(crate) const TRUNCATED_MARKER: &str = " [truncated]";
 
 /// `CREATE_NO_WINDOW` — the core must never pop a console.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The core executable's file name inside whichever directory holds it (the
+/// managed tree for the runtime, the protected stage for the elevated helper).
+pub(crate) const XRAY_EXE: &str = "xray.exe";
+/// The environment variable that tells the core where its payloads live
+/// (`XRAY_LOCATION_ASSET`): geoip.dat, geosite.dat and wintun.dll are resolved
+/// through it, so a launch without it fails at load.
+pub(crate) const XRAY_LOCATION_ASSET: &str = "XRAY_LOCATION_ASSET";
+
+/// How this app invokes the core: `xray.exe run [-test] -config <config>` in
+/// the directory the executable lives in, with the asset environment pointing
+/// there, hidden. Every launch builds from this — the runtime's main core and
+/// one-shot latency probe, the runtime's configuration validation, and the
+/// elevated helper's staged validation and core start — so the flag
+/// vocabulary, the working directory and the asset variable have one home.
+///
+/// Data rather than a `Command`: the launches differ in process model (tokio
+/// in the GUI, blocking `std` in the elevated helper), in their pipes and in
+/// the job object that pins them, and each of those stays with its own site.
+pub(crate) struct CoreInvocation {
+    program: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    dir: PathBuf,
+}
+
+impl CoreInvocation {
+    /// The traffic-carrying launch: `xray run -config <config>`.
+    pub(crate) fn run(dir: &Path, config: &Path) -> Self {
+        Self::new(dir, config, false)
+    }
+
+    /// The validation launch: `xray run -test -config <config>` parses and
+    /// builds the configuration without starting anything.
+    pub(crate) fn test(dir: &Path, config: &Path) -> Self {
+        Self::new(dir, config, true)
+    }
+
+    fn new(dir: &Path, config: &Path, test_only: bool) -> Self {
+        let mut args = vec![std::ffi::OsString::from("run")];
+        if test_only {
+            args.push(std::ffi::OsString::from("-test"));
+        }
+        args.push(std::ffi::OsString::from("-config"));
+        args.push(config.as_os_str().to_os_string());
+        Self {
+            program: dir.join(XRAY_EXE),
+            args,
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// A blocking process object for this launch: program, arguments, working
+    /// directory, asset environment, closed stdin and no console window. The
+    /// caller still chooses its pipes and the job object that pins the child.
+    pub(crate) fn std_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .current_dir(&self.dir)
+            .env(XRAY_LOCATION_ASSET, &self.dir)
+            .stdin(Stdio::null());
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+        command
+    }
+
+    /// The same for a tokio process object (see [`Self::std_command`]).
+    pub(crate) fn tokio_command(&self) -> tokio::process::Command {
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.args)
+            .current_dir(&self.dir)
+            .env(XRAY_LOCATION_ASSET, &self.dir)
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+}
 
 /// Owned Job Object handle. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means closing
 /// the last handle terminates every process in the job, so dropping this is a
@@ -230,9 +307,10 @@ pub(crate) fn verified_payloads_notice(scope: VerifyScope) -> Diag {
     Diag::new(Key::RtLogPayloadsVerified).arg(names)
 }
 
-/// Spawn `xray run -config <config_path>` for the main core:
-/// - hidden (`CREATE_NO_WINDOW`), cwd = core dir, `XRAY_LOCATION_ASSET` = core
-///   dir so geoip.dat/geosite.dat/wintun.dll resolve;
+/// Spawn `xray run -config <config_path>` for the main core
+/// ([`CoreInvocation`] carries the command line):
+/// - hidden, cwd = core dir, `XRAY_LOCATION_ASSET` = core dir so
+///   geoip.dat/geosite.dat/wintun.dll resolve;
 /// - stdout/stderr piped for [`Child::pump_output`];
 /// - tokio `kill_on_drop` + Job Object `KILL_ON_JOB_CLOSE` (belt and braces:
 ///   even a GUI crash closes the handle, and the kernel kills the core).
@@ -317,17 +395,10 @@ async fn spawn_for(
     if flavor.narrates_verify() {
         log.log(verified_payloads_notice(scope));
     }
-    let mut cmd = Command::new(core.join("xray.exe"));
-    cmd.arg("run")
-        .arg("-config")
-        .arg(config_path)
-        .current_dir(&core)
-        .env("XRAY_LOCATION_ASSET", &core)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+    let mut cmd = CoreInvocation::run(&core, config_path).tokio_command();
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .creation_flags(CREATE_NO_WINDOW);
+        .kill_on_drop(true);
     let child = cmd.spawn().diag(Key::SupervisorSpawnFailed)?;
     // CreateProcess has consumed the verified paths; release the deny-write/
     // delete locks so the core's geodata updater can swap the DAT files.
@@ -446,11 +517,56 @@ fn finish_line(mut line: Vec<u8>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREATE_NO_WINDOW, Child, Job, MAX_LINE_BYTES, SpawnFlavor, TRUNCATED_MARKER,
-        read_capped_line,
+        CREATE_NO_WINDOW, Child, CoreInvocation, Job, MAX_LINE_BYTES, SpawnFlavor,
+        TRUNCATED_MARKER, XRAY_LOCATION_ASSET, read_capped_line,
     };
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncWriteExt as _, BufReader};
+
+    /// Every launch carries the flags the core needs: the `run` subcommand,
+    /// `-test` only for a validation, the config path, the core's own
+    /// directory as both the working directory and the asset location (the
+    /// geo data files and wintun.dll resolve through that variable), and no
+    /// console window.
+    #[test]
+    fn the_launch_contract_spells_the_core_command_line_once() {
+        let dir = std::path::Path::new(r"C:\core");
+        let config = dir.join("config.json");
+
+        let run = CoreInvocation::run(dir, &config).std_command();
+        assert_eq!(run.get_program(), dir.join("xray.exe"));
+        assert_eq!(
+            run.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("run"),
+                std::ffi::OsStr::new("-config"),
+                config.as_os_str()
+            ]
+        );
+        assert_eq!(run.get_current_dir(), Some(dir));
+
+        let test = CoreInvocation::test(dir, &config).std_command();
+        assert_eq!(
+            test.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("run"),
+                std::ffi::OsStr::new("-test"),
+                std::ffi::OsStr::new("-config"),
+                config.as_os_str()
+            ]
+        );
+        let env: Vec<_> = test
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        assert_eq!(
+            env,
+            vec![(
+                std::ffi::OsString::from(XRAY_LOCATION_ASSET),
+                Some(dir.into())
+            )]
+        );
+    }
 
     /// The converted spawn failure renders its keyed frame with the keyed
     /// verify chain below it.

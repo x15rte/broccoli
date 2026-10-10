@@ -24,7 +24,7 @@ use tokio::process::Command;
 use windows::Win32::Foundation::HANDLE;
 
 use super::{AppMessage, ApplyOutput};
-use crate::rt::supervisor::{CREATE_NO_WINDOW, Job, OutputSink, pump_stream};
+use crate::rt::supervisor::{CoreInvocation, Job, OutputSink, pump_stream};
 use crate::sys::paths::{config_dir, core_dir};
 
 /// Sidecar stamp written with the active configuration it describes.
@@ -358,22 +358,20 @@ impl Drop for ValidationChild {
     }
 }
 
-/// Spawn one hidden, piped, job-pinned validation child from `command`
-/// (program, args, cwd and env already configured by the caller) and start
-/// pumping its stdout/stderr through the supervisor's capped reader into
-/// `tail`. Both pipes are drained from the moment the child exists, so a
-/// flooding child can neither back up into a full pipe nor grow retained
-/// memory.
+/// Spawn one piped, job-pinned validation child from `command` ([`CoreInvocation`]
+/// already set its program, arguments, working directory, asset environment,
+/// closed stdin and hidden window) and start pumping its stdout/stderr through
+/// the supervisor's capped reader into `tail`. Both pipes are drained from the
+/// moment the child exists, so a flooding child can neither back up into a
+/// full pipe nor grow retained memory.
 async fn spawn_validation_child(
     mut command: Command,
     tail: Arc<Mutex<TailRing>>,
 ) -> Result<ValidationChild, DiagError> {
     command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .creation_flags(CREATE_NO_WINDOW);
+        .kill_on_drop(true);
     let mut child = command.spawn().diag(Key::ApplyValidationSpawnFailed)?;
     let raw = child
         .raw_handle()
@@ -530,14 +528,7 @@ pub async fn validate(candidate_path: &Path) -> (bool, ApplyOutput) {
         }
     };
     let core = core_dir();
-    let mut command = Command::new(core.join("xray.exe"));
-    command
-        .arg("run")
-        .arg("-test")
-        .arg("-config")
-        .arg(candidate_path)
-        .current_dir(&core)
-        .env("XRAY_LOCATION_ASSET", &core);
+    let command = CoreInvocation::test(&core, candidate_path).tokio_command();
     let tail = Arc::new(Mutex::new(TailRing::new(OUTPUT_TAIL)));
     let mut child = match spawn_validation_child(command, Arc::clone(&tail)).await {
         Ok(child) => child,
