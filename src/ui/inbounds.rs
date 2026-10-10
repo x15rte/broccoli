@@ -4,14 +4,15 @@
 //! supports UNIX sockets.
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
+use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DokodemoNetwork, TUN_INBOUND_TAG,
     is_wildcard_listen, listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{
-    ValidationCode, inbound_auth_trap, normalize_windows_socket_path, validate_listen_address,
-    validate_sniffing,
+    local_inbound_auth_verdict, normalize_windows_socket_path, sniffing_row_verdict,
+    validate_listen_address,
 };
 use crate::model::{
     Account, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Settings, Sniffing,
@@ -102,14 +103,15 @@ impl InboundsScreen {
                     .collect(),
                 local_auth_errors: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
-                        local_inbound_auth_error(lang, &ctx.settings.local_inbounds[index])
+                        local_inbound_auth_verdict(&ctx.settings.local_inbounds[index])
+                            .map(|code| validation_message(&code, lang))
                     })
                     .collect(),
                 local_sniffing_errors: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
                         sniffing_row_error(
                             lang,
-                            ctx.settings.local_inbounds[index].enabled,
+                            emit::local_inbound_emitted(&ctx.settings.local_inbounds[index]),
                             &ctx.settings.local_inbounds[index].sniffing,
                             &format!("localInbounds[{index}].sniffing"),
                         )
@@ -131,7 +133,7 @@ impl InboundsScreen {
                     .map(|index| {
                         sniffing_row_error(
                             lang,
-                            ctx.settings.dokodemo[index].enabled,
+                            emit::dokodemo_emitted(&ctx.settings.dokodemo[index]),
                             &ctx.settings.dokodemo[index].sniffing,
                             &format!("dokodemo[{index}].sniffing"),
                         )
@@ -793,40 +795,17 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
     None
 }
 
-/// The inline validation error for one local endpoint row, or `None` when
-/// the row is appliable. The rule and its text are the model pass's
-/// (`validate_settings` emits the same code — Apply/Connect are blocked
-/// through `config_error`); this screen only renders that code's message
-/// under the accounts editor.
-fn local_inbound_auth_error(lang: Language, entry: &LocalInboundCfg) -> Option<String> {
-    if entry.enabled && inbound_auth_trap(entry) {
-        Some(validation_message(
-            &ValidationCode::LocalInboundAuthRequiresAccounts,
-            lang,
-        ))
-    } else {
-        None
-    }
-}
-
 /// The inline validation error for one row's sniffing block, or `None` when
-/// the row is appliable. Mirrors the model pass's `validate_sniffing`
-/// verdict exactly (the same codes through the same i18n key); disabled
-/// rows never block, so nothing renders for them (they are not emitted to
-/// the wire and Xray never sees their state).
+/// the row is appliable: the model's own verdict for that row, rendered.
+/// `sniffing_row_verdict` owns the vocabulary and the emission gate, so the
+/// row and the Apply/Connect gate cannot disagree about it.
 fn sniffing_row_error(
     lang: Language,
-    enabled: bool,
+    emitted: bool,
     sniffing: &Sniffing,
     prefix: &str,
 ) -> Option<String> {
-    if !enabled {
-        return None;
-    }
-    validate_sniffing(sniffing, prefix)
-        .into_iter()
-        .next()
-        .map(|issue| validation_message(&issue.code, lang))
+    sniffing_row_verdict(emitted, sniffing, prefix).map(|code| validation_message(&code, lang))
 }
 
 fn inline_error(ui: &mut egui::Ui, error: Option<&str>) {
@@ -938,12 +917,12 @@ pub(crate) fn sniffing_editor(
 mod listener_validation_tests {
     use super::{
         InboundsScreen, ListenerKey, dokodemo_tag_error, listener_collision, listeners,
-        local_inbound_auth_error, normalize_windows_socket_path,
+        normalize_windows_socket_path,
     };
     use crate::i18n::validation_message;
     use crate::model::settings::Language;
     use crate::model::validation::ValidationCode;
-    use crate::model::{Account, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Settings};
+    use crate::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Settings};
     use crate::ui::test_rig::UiTestRig;
     use egui_kittest::{Harness, kittest::Queryable as _};
     use std::cell::RefCell;
@@ -1291,59 +1270,6 @@ mod listener_validation_tests {
                 .is_some(),
             "an empty list must render the empty-state hint"
         );
-    }
-
-    /// The row verdict mirrors the generator gate: an enabled password-mode
-    /// HTTP inbound with zero accounts errors at any bind; a disabled row
-    /// (never emitted, never gated), noauth HTTP, HTTP with accounts, and
-    /// SOCKS password mode with an empty list (deny-all on the wire — a
-    /// separate non-security behavior) all stay clean. The English text is
-    /// the generator's shared const by contract, so the inline row and the
-    /// Apply/Connect gate can never disagree.
-    #[test]
-    fn local_auth_error_matches_the_generator_gate_message() {
-        let lang = Language::En;
-        let http = |enabled: bool, auth: &str, accounts: usize| LocalInboundCfg {
-            protocol: LocalInboundProtocol::Http,
-            tag: "in-http".into(),
-            enabled,
-            listen: "127.0.0.1".into(),
-            auth: auth.into(),
-            accounts: vec![Account::default(); accounts],
-            ..Default::default()
-        };
-        for listen in ["127.0.0.1", "0.0.0.0"] {
-            let trapped = LocalInboundCfg {
-                listen: listen.into(),
-                ..http(true, "password", 0)
-            };
-            let error = local_inbound_auth_error(lang, &trapped)
-                .expect("password-mode HTTP with zero accounts must error");
-            assert_eq!(
-                error,
-                auth_requires_accounts_error(),
-                "the row error must be the generator gate's message (bind {listen})"
-            );
-        }
-        assert!(
-            local_inbound_auth_error(lang, &http(false, "password", 0)).is_none(),
-            "a disabled row never reaches the wire, so it must not error"
-        );
-        for (auth, accounts) in [("password", 1), ("noauth", 0)] {
-            assert!(
-                local_inbound_auth_error(lang, &http(true, auth, accounts)).is_none(),
-                "{auth:?} with {accounts} account(s) must stay appliable"
-            );
-        }
-        // SOCKS password mode with an empty list denies every connection on
-        // the wire — genuinely safe, never the auth trap.
-        let socks = LocalInboundCfg {
-            tag: "in-socks".into(),
-            enabled: true,
-            auth: "password".into(),
-            ..Default::default()
-        };
-        assert!(local_inbound_auth_error(lang, &socks).is_none());
     }
 
     /// The password-mode HTTP row with zero accounts renders the shared

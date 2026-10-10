@@ -2,9 +2,8 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
-use crate::model::settings::Language;
-use crate::model::validation::{ValidationCode, tun_ipv4_gateway, tun_leak_misconfig_tun_off};
-use crate::model::{Mode, TunCfg, fold_eq};
+use crate::model::validation::{ValidationCode, tun_gateway_verdict, tun_leak_misconfig_tun_off};
+use crate::model::{Mode, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
 use crate::ui::UiCtx;
@@ -45,16 +44,6 @@ struct ValidationCache {
     tun_warning: Option<String>,
     gateway_error: Option<String>,
     leak_warning: Option<String>,
-}
-
-/// The inline validation error for the gateways editor, or `None` when the
-/// list is valid. The rule lives in the model verdict pass (TUN mode + no
-/// IPv4 gateway → invalid): Apply/Connect are blocked through
-/// `config_error`, and this screen renders that code's message under the
-/// gateway list.
-fn tun_gateway_error(lang: Language, mode: Mode, tun: &TunCfg) -> Option<String> {
-    (mode == Mode::Tun && tun_ipv4_gateway(tun).is_none())
-        .then(|| validation_message(&ValidationCode::TunIpv4GatewayRequired, lang))
 }
 
 /// Write one leak-block half into the stored list: the core's canonical
@@ -140,7 +129,8 @@ impl TunScreen {
                 tun_warning: findings
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
-                gateway_error: tun_gateway_error(lang, ctx.settings.mode, &ctx.settings.tun),
+                gateway_error: tun_gateway_verdict(ctx.settings)
+                    .map(|code| validation_message(&code, lang)),
                 leak_warning: tun_leak_misconfig_tun_off(ctx.settings)
                     .then(|| validation_message(&ValidationCode::TunLeakMisconfigTunOff, lang)),
             });

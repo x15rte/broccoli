@@ -1905,6 +1905,27 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Verdict {
     Verdict::from_issues(issues)
 }
 
+/// The verdict one row's sniffing editor renders, or `None` when the row is
+/// appliable: the first item [`validate_sniffing`] refuses, from the same
+/// vocabulary the walk records in full. Every finding of that vocabulary
+/// shares one code, so a row shows the same message whichever item is
+/// refused. `emitted` is the row's own gate
+/// ([`emit::local_inbound_emitted`], [`emit::dokodemo_emitted`]): a row that
+/// never reaches the wire is judged by nothing.
+pub fn sniffing_row_verdict(
+    emitted: bool,
+    sniffing: &Sniffing,
+    prefix: &str,
+) -> Option<ValidationCode> {
+    if !emitted {
+        return None;
+    }
+    validate_sniffing(sniffing, prefix)
+        .into_iter()
+        .next()
+        .map(|finding| finding.code)
+}
+
 /// True when a freedom `settings.fragment` block cannot load.
 ///
 /// `Fragment.Build` (`infra/conf/freedom.go`) folds `packets` with
@@ -5017,6 +5038,17 @@ pub fn inbound_auth_trap(entry: &LocalInboundCfg) -> bool {
     entry.auth == "password" && !entry.authenticates()
 }
 
+/// The verdict one local endpoint's authentication editor renders, or `None`
+/// when the row is appliable: an emitted row that requires authentication but
+/// whose wire form authenticates nobody — HTTP's accounts are its only
+/// authentication, so an empty list serves everyone at any bind. The settings
+/// walk reports this same finding from here, so the row the user edits and the
+/// Apply gate cannot disagree about it.
+pub fn local_inbound_auth_verdict(entry: &LocalInboundCfg) -> Option<ValidationCode> {
+    (emit::local_inbound_emitted(entry) && inbound_auth_trap(entry))
+        .then_some(ValidationCode::LocalInboundAuthRequiresAccounts)
+}
+
 /// The gateway list's IPv4 address: the first entry whose CIDR prefix is an
 /// IPv4 literal. `None` for an empty or IPv6-only list — TUN then has no
 /// adapter address and no in-subnet address for the in-tun DNS listeners
@@ -5026,6 +5058,16 @@ pub fn tun_ipv4_gateway(tun: &TunCfg) -> Option<&str> {
     tun.gateway
         .iter()
         .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains('.')))
+}
+
+/// The verdict the TUN gateway editor renders, or `None` when the tunnel can
+/// come up: a TUN-mode document without an IPv4 gateway has no adapter address
+/// and no in-subnet address for the in-tun DNS listeners. The settings walk
+/// reports this same finding from here, so the editor and the Apply gate
+/// cannot disagree about it.
+pub fn tun_gateway_verdict(settings: &Settings) -> Option<ValidationCode> {
+    (emit::tun_inbound_emitted(settings) && tun_ipv4_gateway(&settings.tun).is_none())
+        .then_some(ValidationCode::TunIpv4GatewayRequired)
 }
 
 /// The gateway list's IPv6 address: the first entry whose CIDR prefix is an
@@ -5401,15 +5443,8 @@ impl<'a> SettingsWalk<'a> {
             if !emit::local_inbound_emitted(entry) {
                 continue;
             }
-            // "Require authentication" ticked with zero accounts is a lie at
-            // any bind: the wire projection drops the empty list and Xray's
-            // HTTP inbound then serves everyone. SOCKS password mode with an
-            // empty list denies all and never traps.
-            if inbound_auth_trap(entry) {
-                self.issues.push(issue(
-                    ValidationCode::LocalInboundAuthRequiresAccounts,
-                    None,
-                ));
+            if let Some(code) = local_inbound_auth_verdict(entry) {
+                self.issues.push(issue(code, None));
             }
             if entry.port == 0 {
                 self.issues.push(issue(
@@ -5576,10 +5611,8 @@ impl<'a> SettingsWalk<'a> {
     /// An empty list is refused with it: nothing would own the address the
     /// adapter DNS pins.
     fn tun(&mut self) {
-        let tun_on = emit::tun_inbound_emitted(self.settings);
-        if tun_on && self.tun_gateway.is_none() {
-            self.issues
-                .push(issue(ValidationCode::TunIpv4GatewayRequired, None));
+        if let Some(code) = tun_gateway_verdict(self.settings) {
+            self.issues.push(issue(code, None));
         }
         // The generator writes the leak key exactly while the TUN inbound and
         // the DNS module are both present (`emit::dns_inbound_emitted`, the model
@@ -5812,7 +5845,9 @@ impl<'a> SettingsWalk<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::inbound::{Account, LocalInboundProtocol};
     use crate::model::outbound::{OutboundModel, Protocol, ProtocolSettings};
+    use crate::model::settings::Mode;
     use crate::model::stream::{
         CustomSockopt, GrpcSettings, HttpupgradeSettings, HysteriaTransport, KcpSettings,
         MasqueTransport, Security, SockoptModel, WsSettings, XdriveTemplate, XdriveTemplateOp,
@@ -8335,6 +8370,109 @@ mod tests {
         let issues = validate_sniffing(&junk, "dokodemo[3].sniffing");
         assert_eq!(issues.len(), 2, "{issues:#?}");
         assert!(validate_sniffing(&Sniffing::default(), "localInbounds[0].sniffing").is_empty());
+    }
+
+    /// The verdict one row's sniffing editor renders: the vocabulary's first
+    /// finding, and only for a row that reaches the wire. Every finding of
+    /// that vocabulary shares one code, so the row's message does not depend
+    /// on which item is refused.
+    #[test]
+    fn sniffing_row_verdict_names_the_first_finding_of_an_emitted_row() {
+        let junk = Sniffing {
+            dest_override: vec!["tcp".into(), "nope".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            sniffing_row_verdict(true, &junk, "localInbounds[0].sniffing"),
+            Some(ValidationCode::SniffingDestOverrideInvalid)
+        );
+        // A row that never reaches the wire is judged by nothing.
+        assert_eq!(
+            sniffing_row_verdict(false, &junk, "localInbounds[0].sniffing"),
+            None
+        );
+        assert_eq!(
+            sniffing_row_verdict(true, &Sniffing::default(), "localInbounds[0].sniffing"),
+            None
+        );
+    }
+
+    /// The verdict one local endpoint's authentication editor renders, and
+    /// with it the walk's rule: "require authentication" ticked on an emitted
+    /// row whose wire form authenticates nobody. HTTP's accounts are its only
+    /// authentication, so an empty list serves everyone at any bind; a
+    /// disabled row never reaches the wire, and SOCKS password mode with an
+    /// empty list denies every connection (never the trap).
+    #[test]
+    fn local_endpoint_auth_verdict_follows_the_wire_form() {
+        let http = |enabled: bool, auth: &str, accounts: usize| LocalInboundCfg {
+            protocol: LocalInboundProtocol::Http,
+            tag: "in-http".into(),
+            enabled,
+            listen: "0.0.0.0".into(),
+            auth: auth.into(),
+            accounts: vec![Account::default(); accounts],
+            ..Default::default()
+        };
+        for listen in ["127.0.0.1", "0.0.0.0"] {
+            let entry = LocalInboundCfg {
+                listen: listen.into(),
+                ..http(true, "password", 0)
+            };
+            assert_eq!(
+                local_inbound_auth_verdict(&entry),
+                Some(ValidationCode::LocalInboundAuthRequiresAccounts),
+                "password mode with no account authenticates nobody (bind {listen})"
+            );
+        }
+        assert_eq!(
+            local_inbound_auth_verdict(&http(false, "password", 0)),
+            None
+        );
+        for (auth, accounts) in [("password", 1), ("noauth", 0)] {
+            assert_eq!(
+                local_inbound_auth_verdict(&http(true, auth, accounts)),
+                None,
+                "{auth:?} with {accounts} account(s) authenticates"
+            );
+        }
+        let socks = LocalInboundCfg {
+            protocol: LocalInboundProtocol::Socks,
+            tag: "in-socks".into(),
+            enabled: true,
+            auth: "password".into(),
+            ..Default::default()
+        };
+        assert_eq!(local_inbound_auth_verdict(&socks), None);
+    }
+
+    /// The verdict the TUN gateway editor renders, and with it the walk's
+    /// rule: a TUN-mode document whose gateway list carries no IPv4 address
+    /// has no adapter address and no in-subnet address for the in-tun DNS
+    /// listeners. Every other mode, and a tunnel with an IPv4 gateway, is
+    /// clean.
+    #[test]
+    fn tun_gateway_verdict_requires_an_ipv4_gateway_in_tun_mode() {
+        let tun = |mode: Mode, gateway: &[&str]| Settings {
+            mode,
+            tun: TunCfg {
+                gateway: gateway.iter().map(|entry| (*entry).to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for gateway in [&[][..], &["fd00::1/64"][..]] {
+            assert_eq!(
+                tun_gateway_verdict(&tun(Mode::Tun, gateway)),
+                Some(ValidationCode::TunIpv4GatewayRequired),
+                "{gateway:?} carries no IPv4 address"
+            );
+        }
+        assert_eq!(
+            tun_gateway_verdict(&tun(Mode::Tun, &["10.255.0.1/30"])),
+            None
+        );
+        assert_eq!(tun_gateway_verdict(&tun(Mode::Off, &[])), None);
     }
 
     #[test]
