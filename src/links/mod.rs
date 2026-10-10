@@ -85,7 +85,7 @@ use crate::model::stream::{
     FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskSalamander, FinalmaskUdpHop,
     FinalmaskUdpMask, GrpcSettings, HttpCamouflageRequest, HttpupgradeSettings, HysteriaTransport,
     KcpSettings, Network, RawHeader, RawSettings, RealityModel, Security, StreamModel, TlsModel,
-    WsSettings, XhttpSettings,
+    WsSettings, XhttpSettings, transport_settings_path,
 };
 use crate::model::validation::{
     ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
@@ -1046,10 +1046,6 @@ struct Refused {
 /// refused facts and the settings block's presence.
 struct TransportSpec {
     network: Network,
-    /// The transport's settings block as the model names it
-    /// (`streamSettings.kcpSettings`); every diagnostic about the block uses
-    /// this one path.
-    path: &'static str,
     /// The `type` query value; `None` for a transport the grammar cannot spell
     /// at all (hysteria), which import reports as an unknown transport and
     /// export refuses through [`unshareable_transport`].
@@ -1075,6 +1071,14 @@ impl TransportSpec {
     /// This transport's field for `key`, when the grammar carries it.
     fn field(&self, key: &str) -> Option<&'static Field> {
         self.fields.iter().find(|field| field.key == key)
+    }
+
+    /// The transport's settings block as the document names it
+    /// (`streamSettings.kcpSettings`); every diagnostic about that block uses
+    /// this one path, derived from the network→block map the model owns
+    /// instead of being spelled again here.
+    fn path(&self) -> &'static str {
+        transport_settings_path(self.network)
     }
 
     /// The `type` value, or the refusal for a transport the grammar cannot
@@ -1194,7 +1198,7 @@ fn raw_settings_present(stream: &StreamModel) -> bool {
 fn raw_camouflage_get(stream: &StreamModel) -> Result<Option<String>, LinkError> {
     if raw_settings_present(stream) {
         Err(lossy(
-            "streamSettings.rawSettings",
+            transport_settings_path(Network::Raw),
             Key::LinkLossyRawCamouflage,
         ))
     } else {
@@ -1302,7 +1306,6 @@ const RAW_PATH_FIELD: Field = Field {
 
 const RAW: TransportSpec = TransportSpec {
     network: Network::Raw,
-    path: "streamSettings.rawSettings",
     type_string: Some(DEFAULT_TYPE),
     type_aliases: &["raw"],
     fields: &[RAW_HEADER_TYPE, RAW_HOST, RAW_PATH_FIELD],
@@ -1317,7 +1320,6 @@ const RAW: TransportSpec = TransportSpec {
 
 const KCP: TransportSpec = TransportSpec {
     network: Network::Kcp,
-    path: "streamSettings.kcpSettings",
     type_string: Some("kcp"),
     type_aliases: &["mkcp"],
     fields: &[
@@ -1378,7 +1380,6 @@ const KCP: TransportSpec = TransportSpec {
 
 const WS: TransportSpec = TransportSpec {
     network: Network::Ws,
-    path: "streamSettings.wsSettings",
     type_string: Some("ws"),
     type_aliases: &["websocket"],
     fields: &[
@@ -1444,7 +1445,6 @@ fn validate_grpc_mode(value: &str) -> Result<(), LinkError> {
 
 const GRPC: TransportSpec = TransportSpec {
     network: Network::Grpc,
-    path: "streamSettings.grpcSettings",
     type_string: Some("grpc"),
     type_aliases: &[],
     fields: &[
@@ -1532,7 +1532,6 @@ const GRPC: TransportSpec = TransportSpec {
 
 const HTTPUPGRADE: TransportSpec = TransportSpec {
     network: Network::Httpupgrade,
-    path: "streamSettings.httpupgradeSettings",
     type_string: Some("httpupgrade"),
     type_aliases: &[],
     fields: &[
@@ -1603,7 +1602,6 @@ fn validate_xhttp_mode(value: &str) -> Result<(), LinkError> {
 
 const XHTTP: TransportSpec = TransportSpec {
     network: Network::Xhttp,
-    path: "streamSettings.xhttpSettings",
     type_string: Some("xhttp"),
     type_aliases: &["splithttp"],
     fields: &[
@@ -1675,7 +1673,7 @@ const XHTTP: TransportSpec = TransportSpec {
                 let mut value = serde_json::to_value(xhttp).map_err(|error| {
                     LinkError::Lossy(
                         Diag::new(Key::LinkLossyXhttpSerialize)
-                            .arg("streamSettings.xhttpSettings")
+                            .arg(transport_settings_path(Network::Xhttp))
                             .arg(error),
                     )
                 })?;
@@ -1690,7 +1688,7 @@ const XHTTP: TransportSpec = TransportSpec {
                 let json = serde_json::to_string(&value).map_err(|error| {
                     LinkError::Lossy(
                         Diag::new(Key::LinkLossyXhttpEncode)
-                            .arg("streamSettings.xhttpSettings")
+                            .arg(transport_settings_path(Network::Xhttp))
                             .arg(error),
                     )
                 })?;
@@ -1746,7 +1744,6 @@ const XHTTP: TransportSpec = TransportSpec {
 /// under the unselected-transport rule.
 const HYSTERIA: TransportSpec = TransportSpec {
     network: Network::Hysteria,
-    path: "streamSettings.hysteriaSettings",
     type_string: None,
     type_aliases: &[],
     fields: &[],
@@ -1760,7 +1757,6 @@ const HYSTERIA: TransportSpec = TransportSpec {
 /// exhaustive over `Network`.
 const MASQUE: TransportSpec = TransportSpec {
     network: Network::Masque,
-    path: "streamSettings.masqueSettings",
     type_string: None,
     type_aliases: &[],
     fields: &[],
@@ -1774,7 +1770,6 @@ const MASQUE: TransportSpec = TransportSpec {
 /// exhaustive over `Network`.
 const XDRIVE: TransportSpec = TransportSpec {
     network: Network::Xdrive,
-    path: "streamSettings.xdriveSettings",
     type_string: None,
     type_aliases: &[],
     fields: &[],
@@ -3799,12 +3794,12 @@ fn validate_url_stream_exportable(stream: &StreamModel) -> Result<(), LinkError>
     selected.spelling()?;
     for refused in selected.refused {
         if (refused.is_set)(stream) {
-            return Err(lossy(selected.path, refused.key));
+            return Err(lossy(selected.path(), refused.key));
         }
     }
     for spec in TRANSPORTS {
         if spec.network != stream.network && (spec.is_present)(stream) {
-            return Err(lossy(spec.path, Key::LinkLossyTransportUnselected));
+            return Err(lossy(spec.path(), Key::LinkLossyTransportUnselected));
         }
     }
     Ok(())
@@ -4954,7 +4949,7 @@ mod tests {
                     Network::parse(token),
                     Some(spec.network),
                     "the grammar accepts {token:?} for {}",
-                    spec.path
+                    spec.path()
                 );
             }
         }
@@ -6141,7 +6136,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        expect_lossy(&profile, "rawSettings");
+        expect_lossy(&profile, "streamSettings.tcpSettings");
 
         let mut profile =
             parse_link(&format!("vless://{UUID}@ws.local:443?type=ws&path=%2Fws")).unwrap();

@@ -2195,7 +2195,7 @@ impl FinalmaskModel {
 /// transport configured". The rows are the one place the correspondence is
 /// written, so a new transport is one row and no caller can be forgotten.
 macro_rules! transport_blocks {
-    ($($variant:ident : $field:ident, $settings:ty => $wire:expr;)*) => {
+    ($($variant:ident : $field:ident, $settings:ty => $requirement:ident $block:literal;)*) => {
         /// The selected transport's block, borrowed mutably: what an editor
         /// tab or a transport selector edits, without a take-and-put-back
         /// around a local copy.
@@ -2261,22 +2261,34 @@ macro_rules! transport_blocks {
         /// one the core refuses.
         pub fn transport_settings_key(network: Network) -> Option<&'static str> {
             match network {
-                $(Network::$variant => $wire,)*
+                $(Network::$variant => transport_blocks!(@key $requirement $block),)*
+            }
+        }
+
+        /// The wire path of the transport's settings block
+        /// (`streamSettings.<block>`), whether or not the transport may omit
+        /// it: the block's canonical name in the document, which is what a
+        /// diagnostic about that block has to name.
+        pub const fn transport_settings_path(network: Network) -> &'static str {
+            match network {
+                $(Network::$variant => concat!("streamSettings.", $block),)*
             }
         }
     };
+    (@key required $block:literal) => { Some($block) };
+    (@key optional $block:literal) => { None };
 }
 
 transport_blocks! {
-    Raw: raw_settings, RawSettings => None;
-    Xhttp: xhttp_settings, XhttpSettings => Some("xhttpSettings");
-    Kcp: kcp_settings, KcpSettings => Some("kcpSettings");
-    Grpc: grpc_settings, GrpcSettings => Some("grpcSettings");
-    Ws: ws_settings, WsSettings => Some("wsSettings");
-    Httpupgrade: httpupgrade_settings, HttpupgradeSettings => Some("httpupgradeSettings");
-    Hysteria: hysteria_settings, HysteriaTransport => Some("hysteriaSettings");
-    Masque: masque_settings, MasqueTransport => Some("masqueSettings");
-    Xdrive: xdrive_settings, Box<XdriveTransport> => Some("xdriveSettings");
+    Raw: raw_settings, RawSettings => optional "tcpSettings";
+    Xhttp: xhttp_settings, XhttpSettings => required "xhttpSettings";
+    Kcp: kcp_settings, KcpSettings => required "kcpSettings";
+    Grpc: grpc_settings, GrpcSettings => required "grpcSettings";
+    Ws: ws_settings, WsSettings => required "wsSettings";
+    Httpupgrade: httpupgrade_settings, HttpupgradeSettings => required "httpupgradeSettings";
+    Hysteria: hysteria_settings, HysteriaTransport => required "hysteriaSettings";
+    Masque: masque_settings, MasqueTransport => required "masqueSettings";
+    Xdrive: xdrive_settings, Box<XdriveTransport> => required "xdriveSettings";
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2578,7 +2590,7 @@ mod tests {
         Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
         StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
         XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings,
-        transport_settings_key,
+        transport_settings_key, transport_settings_path,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -2669,6 +2681,44 @@ mod tests {
                 stream.ws_settings.is_some(),
                 network == Network::Ws,
                 "{network:?}: only the selected transport's block reaches the wire"
+            );
+        }
+    }
+
+    /// Every transport's diagnostic path names the block its own wire form
+    /// carries, under the section the document writes it into: a serde rename
+    /// or a stale row fails here instead of pointing a diagnostic at a block
+    /// the document does not have.
+    #[test]
+    fn every_transport_path_names_the_block_its_wire_form_carries() {
+        for network in [
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+            Network::Masque,
+            Network::Xdrive,
+        ] {
+            let mut outbound = OutboundModel::new(Protocol::Freedom);
+            outbound.stream.network = network;
+            // Materialize the selected block, exactly as selecting the
+            // transport does.
+            let _materialized = outbound.stream.transport_or_default_mut();
+
+            let wire = outbound.to_wire("direct");
+            let stream = wire
+                .get(crate::r#gen::keys::STREAM_SETTINGS)
+                .and_then(serde_json::Value::as_object)
+                .expect("a freedom outbound carries its stream settings");
+            let block = transport_settings_path(network)
+                .strip_prefix("streamSettings.")
+                .expect("every transport path is a streamSettings block");
+            assert!(
+                stream.contains_key(block),
+                "{network:?}: the wire must carry {block}"
             );
         }
     }
