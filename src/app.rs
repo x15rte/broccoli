@@ -7,7 +7,7 @@ use crate::i18n::{Key, LogLevel, t, t_fmt};
 use crate::icon::{IconAssets, IconPresentation, classify};
 use crate::links::excerpt;
 use crate::model::inbound::API_INBOUND_TAG;
-use crate::model::safety::SafetyFinding;
+use crate::model::safety::{SafetyFinding, SafetyVerdicts};
 use crate::model::settings::{Language, Mode};
 use crate::model::validation::ValidationIssue;
 use crate::model::{ServersFile, Settings};
@@ -398,6 +398,11 @@ pub struct BroccoliApp {
     /// modal is the response to a gated apply; the origin records which
     /// commit path the confirm button must resume.
     pending_safety_ack: Option<(PendingApplyOrigin, Vec<SafetyFinding>)>,
+    /// The whole-model safety verdict, memoized per model generation: the
+    /// shell's own gates and every screen read this one instance, so the
+    /// assessment runs once per edit generation instead of once per consumer.
+    /// `None` until the first refresh.
+    safety_cache: Option<SafetyCache>,
     /// A state file (settings.json / servers.json) held valid JSON that
     /// could not be loaded — an unknown `security`/`network` value, a field
     /// of the wrong type, etc. The file is left intact for the user to fix.
@@ -896,6 +901,7 @@ impl BroccoliApp {
             persist_pending: None,
             raw_override_verdict: None,
             connect_block_cache: None,
+            safety_cache: None,
             pending_safety_ack: None,
             state_error,
             persistence_error,
@@ -1502,6 +1508,24 @@ impl BroccoliApp {
         None
     }
 
+    /// Rebuild the memoized whole-model safety verdict when the model
+    /// generation moved — the same cadence as the connect-block texts, and
+    /// never on idle repaint frames. The memoized value is what the shell's
+    /// gates read and what every screen borrows through [`cached_safety`].
+    fn refresh_safety_verdicts(&mut self) {
+        if self
+            .safety_cache
+            .as_ref()
+            .is_some_and(|cache| cache.generation == self.model_generation)
+        {
+            return;
+        }
+        self.safety_cache = Some(SafetyCache {
+            generation: self.model_generation,
+            verdicts: SafetyVerdicts::of(&self.servers, &self.settings),
+        });
+    }
+
     /// Refresh the memoized connect-block texts: while any
     /// blocking state is set — persistence/config error, in-flight
     /// operation, raw-override verdict, missing core — the reason text used
@@ -1679,7 +1703,10 @@ impl BroccoliApp {
         // dialog is explicitly acknowledged. The dialog is the response —
         // not an error (no LogConnectBlocked push, no Err), so callers keep
         // their normal control flow.
-        if let Some(findings) = hazard_gate_findings(&self.servers, &self.settings) {
+        self.refresh_safety_verdicts();
+        if let Some(findings) =
+            hazard_gate_findings(&self.settings, cached_safety(&self.safety_cache))
+        {
             self.pending_safety_ack = Some((PendingApplyOrigin::Connect, findings));
             return Ok(());
         }
@@ -1936,7 +1963,10 @@ impl BroccoliApp {
         // Hazardous settings must not commit until the summary
         // dialog is explicitly acknowledged. The dialog is the response —
         // not an error (no apply_result, no log line).
-        if let Some(findings) = hazard_gate_findings(&self.servers, &self.settings) {
+        self.refresh_safety_verdicts();
+        if let Some(findings) =
+            hazard_gate_findings(&self.settings, cached_safety(&self.safety_cache))
+        {
             self.pending_safety_ack = Some((PendingApplyOrigin::ApplyNow, findings));
             return;
         }
@@ -2106,6 +2136,7 @@ impl eframe::App for BroccoliApp {
         // pass that skips `logic` — defensive, like the fallback recompute
         // the old frame slot documented.
         self.refresh_connect_block_cache();
+        self.refresh_safety_verdicts();
 
         let mut requests = ui::FrameRequests::default();
 
@@ -2217,6 +2248,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
+                    safety: cached_safety(&self.safety_cache),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2264,6 +2296,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
+                    safety: cached_safety(&self.safety_cache),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2300,6 +2333,7 @@ impl eframe::App for BroccoliApp {
                     probe_feedback: &mut self.probe_feedback,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
+                    safety: cached_safety(&self.safety_cache),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2543,12 +2577,39 @@ enum PendingApplyOrigin {
 /// with the findings when the apply must wait for explicit acknowledgment,
 /// `None` when it may proceed. The whole-config raw override stays
 /// unrestricted — it never triggers the gate.
-fn hazard_gate_findings(servers: &ServersFile, settings: &Settings) -> Option<Vec<SafetyFinding>> {
+fn hazard_gate_findings(
+    settings: &Settings,
+    verdicts: &SafetyVerdicts,
+) -> Option<Vec<SafetyFinding>> {
     if settings.raw_override.is_some() {
         return None;
     }
-    let verdicts = crate::model::safety::SafetyVerdicts::of(servers, settings);
-    (!verdicts.is_empty()).then(|| verdicts.into_findings())
+    // The copy is the acknowledgment dialog's own list, held for as long as
+    // the modal is up; the assessment behind it is the shell's one
+    // per-generation verdict.
+    (!verdicts.is_empty()).then(|| verdicts.to_vec())
+}
+
+/// One generation of the whole-model safety verdict: the shell computes it
+/// when the model generation moves and hands the same instance to its gates
+/// and to every screen, so one edit yields one assessment.
+struct SafetyCache {
+    generation: u64,
+    verdicts: SafetyVerdicts,
+}
+
+/// `None` fallback for [`cached_safety`] before the first refresh.
+static NO_SAFETY: SafetyVerdicts = SafetyVerdicts::EMPTY;
+
+/// Project the memoized safety verdict out of the field. A free function over
+/// it (like [`cached_block_reason`], not a `&self` method): the frame's
+/// `UiCtxParts` literal borrows it side by side with `&mut` model borrows,
+/// which only compile while the borrow stays field-disjoint.
+fn cached_safety(cache: &Option<SafetyCache>) -> &SafetyVerdicts {
+    cache
+        .as_ref()
+        .map(|cache| &cache.verdicts)
+        .unwrap_or(&NO_SAFETY)
 }
 
 /// Render the hazard-acknowledgment modal: every finding's
@@ -4119,7 +4180,7 @@ mod safety_ack_tests {
     use crate::i18n::{Key, t};
     use crate::model::Settings;
     use crate::model::inbound::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol};
-    use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+    use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding, SafetyVerdicts};
     use crate::model::servers::ServersFile;
 
     /// One finding per exposure rule: unauthenticated SOCKS + HTTP endpoints
@@ -4150,9 +4211,15 @@ mod safety_ack_tests {
         }
     }
 
+    /// The gate as a commit path meets it: the shell's per-generation verdict
+    /// over the model, then the gate over that verdict.
+    fn gate(servers: &ServersFile, settings: &Settings) -> Option<Vec<SafetyFinding>> {
+        hazard_gate_findings(settings, &SafetyVerdicts::of(servers, settings))
+    }
+
     #[test]
     fn hazardous_settings_gate_the_apply_with_every_finding() {
-        let findings = hazard_gate_findings(&ServersFile::default(), &hazardous_settings())
+        let findings = gate(&ServersFile::default(), &hazardous_settings())
             .expect("hazardous settings must gate the apply");
         let paths: Vec<&str> = findings
             .iter()
@@ -4181,7 +4248,7 @@ mod safety_ack_tests {
     #[test]
     fn clean_settings_never_gate() {
         assert!(
-            hazard_gate_findings(&ServersFile::default(), &Settings::default()).is_none(),
+            gate(&ServersFile::default(), &Settings::default()).is_none(),
             "a configuration without hazards must not gate the apply"
         );
     }
@@ -4198,7 +4265,7 @@ mod safety_ack_tests {
             }],
             ..Default::default()
         };
-        assert!(hazard_gate_findings(&ServersFile::default(), &disabled).is_none());
+        assert!(gate(&ServersFile::default(), &disabled).is_none());
         // Enabled but loopback-only.
         let loopback = Settings {
             local_inbounds: vec![LocalInboundCfg {
@@ -4208,7 +4275,7 @@ mod safety_ack_tests {
             }],
             ..Default::default()
         };
-        assert!(hazard_gate_findings(&ServersFile::default(), &loopback).is_none());
+        assert!(gate(&ServersFile::default(), &loopback).is_none());
     }
 
     #[test]
@@ -4220,7 +4287,7 @@ mod safety_ack_tests {
             ..hazardous_settings()
         };
         assert!(
-            hazard_gate_findings(&ServersFile::default(), &settings).is_none(),
+            gate(&ServersFile::default(), &settings).is_none(),
             "the raw override path must bypass the hazard gate"
         );
     }

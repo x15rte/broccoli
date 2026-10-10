@@ -50,6 +50,11 @@ pub(crate) struct UiTestRig {
     /// renders inline under Connect, excerpt-bounded by the shell's
     /// generation boundary.
     pub(crate) config_error: Option<String>,
+    /// The whole-model safety verdict the frame publishes. The shell memoizes
+    /// one per generation; the rig recomputes it in [`UiTestRig::ctx`] so a
+    /// test may seed the model directly — without the shell's dirty hook —
+    /// and still have the screen read the verdict for what it seeded.
+    pub(crate) safety: crate::model::safety::SafetyVerdicts,
     /// The frame's requests, as the shell owns them: the rig hands the same
     /// bundle to every `ctx()` and tests read the fields a screen set.
     pub(crate) requests: crate::ui::FrameRequests,
@@ -108,6 +113,7 @@ impl Default for UiTestRig {
             transport: None,
             connect_blocked_reason: None,
             config_error: None,
+            safety: Default::default(),
             requests: crate::ui::FrameRequests::default(),
             probe_feedback: Default::default(),
             stats: None,
@@ -271,6 +277,7 @@ impl UiTestRig {
             stats_generation: self.stats_generation,
             latency_generation: self.latency_generation,
         };
+        self.safety = crate::model::safety::SafetyVerdicts::of(&self.servers, &self.settings);
         UiCtx::new(
             UiCtxParts {
                 servers: &mut self.servers,
@@ -282,6 +289,7 @@ impl UiTestRig {
                 probe_feedback: &mut self.probe_feedback,
                 requests: &mut self.requests,
                 model_generation: &mut self.model_generation,
+                safety: &self.safety,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
                 operation: self.operation,

@@ -8,7 +8,6 @@ use crate::model::inbound::{
     API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DokodemoNetwork, TUN_INBOUND_TAG,
     is_wildcard_listen, listen_endpoints_conflict, new_dokodemo_tag, next_local_tag,
 };
-use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{
     ValidationCode, inbound_auth_trap, normalize_windows_socket_path, validate_listen_address,
@@ -56,10 +55,10 @@ struct ValidationCache {
     /// One sniffing-vocabulary verdict per dokodemo entry, in list order
     /// (same shared gate/message as `local_sniffing_errors`).
     doko_sniffing_errors: Vec<Option<String>>,
-    /// i18n'd exposure warnings from [`assess`], pre-rendered at the same
-    /// generation cadence as the collisions. Each listen field renders its
-    /// own entry as the amber warning channel; the paths mirror the wire
-    /// paths `assess` emits ("localInbounds[i].listen",
+    /// i18n'd exposure warnings from the shell's verdict, pre-rendered at
+    /// the same generation cadence as the collisions. Each listen field
+    /// renders its own entry as the amber warning channel; the paths mirror
+    /// the wire paths the assessment emits ("localInbounds[i].listen",
     /// "dokodemo[i].listen").
     local_warnings: Vec<Option<String>>,
     doko_warnings: Vec<Option<String>>,
@@ -91,10 +90,10 @@ impl InboundsScreen {
         let generation = *ctx.model_generation;
         if !matches!(&self.validation, Some(cache) if cache.is_current(generation, ctx.settings)) {
             let snapshot = listeners(ctx.settings, lang);
-            // One `assess` per model generation, in the same rebuild as the
-            // collision references — never a second recomputation pattern
-            // and never per-frame.
-            let findings = SafetyVerdicts::of(ctx.servers, ctx.settings);
+            // The shell's verdict for this generation: the exposure warnings
+            // below are the one slice of it this screen renders, and the
+            // assessment itself runs once per generation in the shell.
+            let findings = ctx.safety;
             self.validation = Some(ValidationCache {
                 generation,
                 non_loopback: any_non_loopback_listen(ctx.settings),

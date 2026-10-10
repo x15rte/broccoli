@@ -522,6 +522,25 @@ pub struct RoutingScreen {
     view_cache: Option<RoutingViewCache>,
 }
 
+#[cfg(test)]
+impl RoutingScreen {
+    /// Rebuild the view cache the way a frame does: with the whole-model
+    /// safety verdict the shell publishes for that generation. Only tests
+    /// drive the cache directly, to see its rebuild cadence, and the screen no
+    /// longer runs the assessment itself — so they supply the projection their
+    /// subject reads.
+    fn refresh_view_cache_from_model(
+        &mut self,
+        generation: u64,
+        lang: Language,
+        servers: &ServersFile,
+        settings: &Settings,
+    ) {
+        let safety = SafetyVerdicts::of(servers, settings);
+        self.refresh_view_cache(generation, lang, servers, settings, &safety);
+    }
+}
+
 impl RoutingScreen {
     pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
@@ -530,7 +549,13 @@ impl RoutingScreen {
 
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
         // rebuilt only when the routing model changed, never per frame.
-        self.refresh_view_cache(*ctx.model_generation, lang, ctx.servers, ctx.settings);
+        self.refresh_view_cache(
+            *ctx.model_generation,
+            lang,
+            ctx.servers,
+            ctx.settings,
+            ctx.safety,
+        );
 
         self.consume_balancer_results(lang);
         self.consume_trial_results(ctx, lang);
@@ -1204,6 +1229,7 @@ impl RoutingScreen {
         lang: Language,
         servers: &ServersFile,
         settings: &Settings,
+        safety: &SafetyVerdicts,
     ) {
         let generation = (generation, lang);
         if matches!(&self.view_cache, Some(cache) if cache.generation == generation) {
@@ -1343,15 +1369,13 @@ impl RoutingScreen {
                     .map(|entry| entry.tag.clone()),
             )
             .collect();
-        // One `assess` per model generation, in the same rebuild as the
-        // reference counts — never a second recomputation pattern and never
-        // per frame (the inbounds ValidationCache precedent). Only the
-        // balancer breakage paths are consumed here; the other screens own
-        // their own paths.
-        let findings = SafetyVerdicts::of(servers, settings);
+        // The shell's verdict for this generation: the balancer breakage
+        // paths are the one slice of it this screen renders (the other
+        // screens render their own), and the assessment itself runs once per
+        // generation in the shell.
         let balancer_warnings: Vec<Option<String>> = (0..settings.routing.balancers.len())
             .map(|index| {
-                findings
+                safety
                     .balancer_breakage(index)
                     .map(|finding| safety_message(&finding.code, lang))
             })
@@ -3724,7 +3748,7 @@ mod view_cache_tests {
         let mut generation = 0;
         // First frame: one rebuild, one format pass, keyed on the live
         // generation.
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         let first_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
@@ -3738,8 +3762,8 @@ mod view_cache_tests {
 
         // Idle frames with the same generation rebuild nothing: the cache
         // keeps its generation key and its own allocations.
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
@@ -3754,13 +3778,13 @@ mod view_cache_tests {
         // one format pass, independent of persist timing.
         settings.routing.rules[0].port = "443".into();
         generation += 1;
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         let edited_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
@@ -3771,14 +3795,14 @@ mod view_cache_tests {
         // rebuild signal, whatever moved it), and the frame after it reuses
         // that build.
         generation += 1;
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         let next_rows = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
             assert_eq!(cache.rule_rows.len(), 1, "the rebuild covers every rule");
             cache.rule_rows.as_ptr()
         };
-        screen.refresh_view_cache(generation, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(generation, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.generation, (generation, Language::En));
@@ -3809,7 +3833,7 @@ mod view_cache_tests {
             ..Rule::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         let rows = &screen.view_cache.as_ref().unwrap().rule_rows;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short_tag, "rule-one");
@@ -3856,7 +3880,7 @@ mod view_cache_tests {
             .balancers
             .push(Balancer::new("b1".into(), "srv-".into()));
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         let cache = screen.view_cache.as_ref().unwrap();
 
         assert_eq!(cache.out_tags.len(), 3, "one profile + direct + block");
@@ -3870,7 +3894,7 @@ mod view_cache_tests {
         servers
             .profiles
             .push(ServerProfile::new("beta", OutboundModel::default()));
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert_eq!(screen.view_cache.as_ref().unwrap().out_tags.len(), 4);
     }
 
@@ -3882,7 +3906,7 @@ mod view_cache_tests {
     fn cached_server_outbound_fact_follows_the_profiles() {
         let mut screen = RoutingScreen::default();
         let settings = Settings::default();
-        screen.refresh_view_cache(0, Language::En, &ServersFile::default(), &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &ServersFile::default(), &settings);
         assert!(
             !screen.view_cache.as_ref().unwrap().server_outbound_emitted,
             "a model without profiles emits no server outbound"
@@ -3892,7 +3916,7 @@ mod view_cache_tests {
         servers
             .profiles
             .push(ServerProfile::new("alpha", OutboundModel::default()));
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().server_outbound_emitted,
             "a profile is a server outbound"
@@ -3927,7 +3951,7 @@ mod view_cache_tests {
             ..Rule::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         let counts = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(
@@ -3945,7 +3969,7 @@ mod view_cache_tests {
 
         // Idle frames reuse the same generation's counts: the retained
         // vector survives, so no scan ran.
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [2, 0]);
@@ -3958,13 +3982,13 @@ mod view_cache_tests {
 
         // One rule edit (generation bump) → exactly one rebuild, one scan.
         settings.routing.rules[1].balancer_tag = "b2".into();
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         let edited = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
             cache.reference_counts.as_ptr()
         };
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.reference_counts, [1, 1]);
@@ -4000,7 +4024,7 @@ mod view_cache_tests {
             ..Default::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         let headers = &screen.view_cache.as_ref().unwrap().balancer_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(
@@ -4042,8 +4066,8 @@ mod view_cache_tests {
             .unwrap()
             .balancer_headers
             .as_ptr();
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(cache.balancer_headers[0].strategy, "strategy: random");
@@ -4057,7 +4081,7 @@ mod view_cache_tests {
         // A generation bump after a selector edit rebuilds the header text
         // exactly once, in the same pass as the tag vectors.
         settings.routing.balancers[0].selector = vec!["srv-a".into(), "srv-c".into()];
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         let rebuilt = {
             let cache = screen.view_cache.as_ref().unwrap();
             assert_eq!(
@@ -4067,7 +4091,7 @@ mod view_cache_tests {
             );
             cache.balancer_headers.as_ptr()
         };
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert_eq!(
             screen
                 .view_cache
@@ -4097,7 +4121,7 @@ mod view_cache_tests {
             ..DokodemoCfg::default()
         });
 
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -4114,7 +4138,7 @@ mod view_cache_tests {
 
         // A dokodemo change persisted from another screen refreshes the list.
         settings.dokodemo[1].tag = "in-doko-c".into();
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -4136,7 +4160,7 @@ mod view_cache_tests {
             protocol: LocalInboundProtocol::Http,
             ..Default::default()
         });
-        screen.refresh_view_cache(2, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(2, Language::En, &servers, &settings);
         assert_eq!(
             screen.view_cache.as_ref().unwrap().known_inbounds,
             [
@@ -4314,7 +4338,7 @@ mod routing_grammar_tests {
             .push(Balancer::new("bal-a".into(), "srv-".into()));
 
         // No profiles: "srv-" matches nothing among [direct, block].
-        screen.refresh_view_cache(0, Language::En, &ServersFile::default(), &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &ServersFile::default(), &settings);
         let cache = screen.view_cache.as_ref().unwrap();
         assert!(
             cache.balancer_warnings[0].is_some(),
@@ -4328,7 +4352,7 @@ mod routing_grammar_tests {
             .profiles
             .push(ServerProfile::new("alpha", OutboundModel::default()));
         settings.routing.balancers[0].selector = vec![servers.profiles[0].tag()];
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().balancer_warnings[0].is_none(),
             "a selector matching a seeded profile must not warn"
@@ -4404,7 +4428,7 @@ mod balancer_runtime_eviction_tests {
         // One model change: "accel" is deleted (the edit frame's bump),
         // then the generation-gated pass evicts its entry.
         settings.routing.balancers.remove(1);
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4465,7 +4489,7 @@ mod balancer_runtime_eviction_tests {
         // model; rule-reference rewrites are the model's concern, not the
         // map's).
         settings.routing.balancers[0].tag = "edge-2".into();
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
 
         assert!(
             !screen.balancer_runtime.contains_key("edge"),
@@ -4528,7 +4552,7 @@ mod balancer_runtime_eviction_tests {
                 "tag-0" | "tag-1" | "tag-2" | "tag-3" | "tag-4"
             )
         });
-        screen.refresh_view_cache(1, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4551,7 +4575,7 @@ mod balancer_runtime_eviction_tests {
             .routing
             .balancers
             .retain(|b| b.tag == "tag-1" || b.tag == "tag-3");
-        screen.refresh_view_cache(2, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(2, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
 
         // Grow the model: added tags have no runtime entry until their
@@ -4562,7 +4586,7 @@ mod balancer_runtime_eviction_tests {
                 .balancers
                 .push(balancer(&format!("tag-{i}")));
         }
-        screen.refresh_view_cache(3, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(3, Language::En, &servers, &settings);
         assert_eq!(screen.balancer_runtime.len(), 2);
         assert!(screen.balancer_runtime.len() <= settings.routing.balancers.len());
 
@@ -4595,7 +4619,7 @@ mod balancer_runtime_eviction_tests {
                 RoutingScreen::balancer_runtime_state(&mut screen.balancer_runtime, "tunnel");
             tunnel.pending_request = Some(pending());
         }
-        screen.refresh_view_cache(0, Language::En, &servers, &settings);
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
 
         assert_eq!(
             screen.balancer_runtime.len(),
@@ -4605,7 +4629,7 @@ mod balancer_runtime_eviction_tests {
         let before_tags: Vec<String> = screen.balancer_runtime.keys().cloned().collect();
 
         for _ in 0..10 {
-            screen.refresh_view_cache(0, Language::En, &servers, &settings);
+            screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
         }
 
         assert_eq!(

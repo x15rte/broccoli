@@ -2,7 +2,6 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
-use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{ValidationCode, tun_ipv4_gateway, tun_leak_misconfig_tun_off};
 use crate::model::{Mode, TunCfg, fold_eq};
@@ -36,8 +35,8 @@ pub struct TunScreen {
 }
 
 /// One generation of the TUN screen's per-generation verdicts: the
-/// pre-rendered privacy-warning message for the "tun" finding from
-/// [`assess`] ("TUN mode with no DNS configuration"), the inline validation
+/// pre-rendered privacy-warning message for the "tun" finding of the shell's
+/// assessment ("TUN mode with no DNS configuration"), the inline validation
 /// error for a gateway list without an IPv4 entry, and the unrouted-family
 /// advisory rendered under the leak-block switch — all computed once per
 /// model generation.
@@ -133,8 +132,9 @@ impl TunScreen {
         let lang = ctx.settings.language;
         let generation = *ctx.model_generation;
         if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
-            // One `assess` per model generation — never per-frame.
-            let findings = SafetyVerdicts::of(ctx.servers, ctx.settings);
+            // The shell's verdict for this generation: the privacy finding
+            // is the one slice of it this screen renders.
+            let findings = ctx.safety;
             self.validation = Some(ValidationCache {
                 generation,
                 tun_warning: findings

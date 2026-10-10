@@ -101,6 +101,12 @@ pub struct SafetyVerdicts {
 }
 
 impl SafetyVerdicts {
+    /// No findings, for the frame sites that borrow the shell's projection
+    /// before its first refresh.
+    pub const EMPTY: Self = Self {
+        findings: Vec::new(),
+    };
+
     /// Assess one settings + servers model. One projection per model
     /// generation: the findings are pure functions of the model, so a caller
     /// that caches this value per generation computes them exactly once.
@@ -108,13 +114,6 @@ impl SafetyVerdicts {
         Self {
             findings: assess(servers, settings),
         }
-    }
-
-    /// The findings, in pass order (local endpoints, dokodemo listeners, TUN
-    /// privacy, balancer breakage, local transport writes), for the callers
-    /// that store the list.
-    pub fn into_findings(self) -> Vec<SafetyFinding> {
-        self.findings
     }
 
     /// The exposure finding of the local endpoint at `index`, if it is
@@ -138,12 +137,6 @@ impl SafetyVerdicts {
     /// match no emitted outbound.
     pub fn balancer_breakage(&self, index: usize) -> Option<&SafetyFinding> {
         self.at_path(&format!("routing.balancers[{index}]"))
-    }
-
-    /// The local-write finding of the profile at `index`, if its xdrive
-    /// transport writes to a path on this machine.
-    pub fn xdrive_local_folder(&self, index: usize) -> Option<&SafetyFinding> {
-        self.at_path(&xdrive_path(index))
     }
 
     fn at_path(&self, path: &str) -> Option<&SafetyFinding> {
@@ -1038,11 +1031,5 @@ mod tests {
             findings[0].code,
             SafetyCode::XdriveLocalFolder("U:/store".into())
         );
-        assert!(
-            findings
-                .xdrive_local_folder(0)
-                .is_some_and(|finding| finding.class == HazardClass::LocalWrite)
-        );
-        assert!(findings.xdrive_local_folder(1).is_none());
     }
 }

@@ -21,6 +21,7 @@ pub mod wizard;
 pub(crate) mod test_rig;
 
 use crate::i18n::{Key, t, t_fmt};
+use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
@@ -129,6 +130,8 @@ pub struct UiCtx<'a> {
     /// Persistent reason Connect is disabled. Screens must use this instead of
     /// deriving capability from `phase` or managed-core presence alone.
     pub connect_blocked_reason: &'a Option<String>,
+    /// The shell's per-generation safety verdict (see [`UiCtxParts`]).
+    pub safety: &'a SafetyVerdicts,
     /// The shell's stored config-generation error for the current model
     /// revision — its generator text is excerpt-bounded by the generation
     /// boundary before any label or log can see it, and its raw-override
@@ -229,6 +232,10 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) requests: &'a mut FrameRequests,
     pub(crate) model_generation: &'a mut u64,
     pub(crate) connect_blocked_reason: &'a Option<String>,
+    /// The shell's whole-model safety verdict for this frame's model
+    /// generation: one instance every screen reads its own slice of, instead
+    /// of each running the assessment itself.
+    pub(crate) safety: &'a SafetyVerdicts,
     /// The shell's stored config-generation error (the same value the
     /// top-bar config chip renders), projected into [`UiCtx::config_error`].
     pub(crate) config_error: &'a Option<String>,
@@ -285,6 +292,7 @@ impl<'a> UiCtx<'a> {
             probe_feedback,
             requests,
             model_generation,
+            safety,
             connect_blocked_reason,
             config_error,
             operation,
@@ -344,6 +352,7 @@ impl<'a> UiCtx<'a> {
             requests,
             model_generation,
             busy: gate::BusyWindow::from_operation(operation),
+            safety,
             connect_blocked_reason,
             config_error,
             is_elevated,
