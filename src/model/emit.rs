@@ -16,8 +16,8 @@
 use std::collections::BTreeSet;
 
 use super::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
-    DNS_OUTBOUND_TAG, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
+    BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG,
+    DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
 use super::servers::{ServerProfile, ServersFile};
 use super::settings::{Mode, Settings};
@@ -132,36 +132,11 @@ pub fn appended_inbound_tags(settings: &Settings) -> impl Iterator<Item = &'stat
         .chain(dns_listeners.then_some(DNS_INBOUND_V6_TAG))
 }
 
-/// The inbound tags the running configuration carries: the control-plane
-/// listener, the tags [`appended_inbound_tags`] adds, every local endpoint
-/// [`local_inbound_emitted`] keeps, and every dokodemo listener
-/// [`dokodemo_emitted`] keeps. The same two predicates are what the collision
-/// walk reads, so the readers of this universe can never disagree about which
-/// entries are emitted.
-pub fn inbound_tags(settings: &Settings) -> BTreeSet<String> {
-    let mut tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
-    tags.extend(appended_inbound_tags(settings).map(str::to_string));
-    tags.extend(
-        settings
-            .local_inbounds
-            .iter()
-            .filter(|entry| local_inbound_emitted(entry))
-            .map(|entry| entry.tag.clone()),
-    );
-    tags.extend(
-        settings
-            .dokodemo
-            .iter()
-            .filter(|entry| dokodemo_emitted(entry))
-            .map(|entry| entry.tag.clone()),
-    );
-    tags
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::r#gen::keys;
+    use crate::model::inbound::API_INBOUND_TAG;
     use crate::model::safety::SafetyVerdicts;
     use crate::model::validation::{ValidationCode, validate_settings};
     use crate::model::{
@@ -280,6 +255,35 @@ mod tests {
         tags
     }
 
+    /// The inbound universe the emission predicates answer: the control-plane
+    /// listener, the tags [`appended_inbound_tags`] adds, every local endpoint
+    /// [`local_inbound_emitted`] keeps, and every dokodemo listener
+    /// [`dokodemo_emitted`] keeps.
+    ///
+    /// This is the oracle's side of the comparison below, which is its only
+    /// caller: the settings walk cannot use the composed set, because the
+    /// insert that fails *is* its duplicate rule, so it grows its own universe
+    /// entry by entry and reports the entry that inserted second.
+    fn queried_inbound_tags(settings: &Settings) -> BTreeSet<String> {
+        let mut tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
+        tags.extend(appended_inbound_tags(settings).map(str::to_string));
+        tags.extend(
+            settings
+                .local_inbounds
+                .iter()
+                .filter(|entry| local_inbound_emitted(entry))
+                .map(|entry| entry.tag.clone()),
+        );
+        tags.extend(
+            settings
+                .dokodemo
+                .iter()
+                .filter(|entry| dokodemo_emitted(entry))
+                .map(|entry| entry.tag.clone()),
+        );
+        tags
+    }
+
     /// Every gate the emission universe depends on: the DNS module on and off,
     /// endpoints on and off, dokodemo on and off, TUN mode with and without the
     /// module, and a balancer selector naming a profile tag.
@@ -347,7 +351,7 @@ mod tests {
             );
             assert_eq!(
                 document_inbound_tags(&config, &settings),
-                inbound_tags(&settings),
+                queried_inbound_tags(&settings),
                 "{label}: emitted inbound tags"
             );
             // The in-tun DNS listener's own gate is the runtime's, derived

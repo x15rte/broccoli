@@ -5295,16 +5295,16 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
         outbound_tags: &outbound_tags,
         issues,
         balancer_tags: BTreeSet::new(),
-        // The emitted inbound universe (`emit::inbound_tags`: API, TUN,
+        // The emitted inbound universe: the control-plane listener, TUN,
         // dns-in, the emitted local endpoints, the emitted dokodemo
-        // listeners). It is grown by insertion because the insert that fails
+        // listeners. It is grown by insertion because the insert that fails
         // IS the duplicate rule — the arm that inserts second reports the
         // collision, in emission order, and `run` calls the families in that
         // order so the findings read as their refusal does. Which entries are
         // emitted and which tags the emitter adds itself are `emit`'s answers
         // (`local_inbound_emitted`, `dokodemo_emitted`,
-        // `appended_inbound_tags`), so the two readers of the universe can
-        // never drift apart.
+        // `appended_inbound_tags`), so this universe and the generated
+        // document can never drift apart.
         inbound_tags: BTreeSet::from([API_INBOUND_TAG.to_string()]),
         ip_listeners: vec![("API".to_string(), "127.0.0.1".to_string(), api_port, 1_u8)],
         unix_listeners: BTreeMap::new(),

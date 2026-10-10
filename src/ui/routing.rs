@@ -1302,7 +1302,8 @@ impl RoutingScreen {
         // TestRoute dialog inbound options: every local endpoint tag (all
         // entries, list order) plus the built-in tun/dns listeners (one per
         // gateway family) and api, and every dokodemo tag. A different
-        // question than `emit::inbound_tags`: a trial rule may name a listener
+        // question than the emitted universe the settings verdict walks: a
+        // trial rule may name a listener
         // that is switched off right now — the dialog offers it, and the core
         // answers for the tags it does not know — so disabled entries stay in
         // this list on purpose.
