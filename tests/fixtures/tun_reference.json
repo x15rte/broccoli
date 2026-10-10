@@ -1,0 +1,53 @@
+{
+  "api": {
+    "tag": "api"
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "1.1.1.1"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "protocol": "tun",
+      "tag": "in-tun",
+      "settings": {
+        "dns": [
+          "10.255.0.1"
+        ],
+        "gateway": [
+          "10.255.0.1/30",
+          "fd00::1/64"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "dns-in",
+          "dns-in6"
+        ],
+        "port": "53",
+        "outboundTag": "dns-out"
+      }
+    ]
+  }
+}

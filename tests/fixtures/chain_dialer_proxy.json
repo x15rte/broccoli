@@ -1,0 +1,30 @@
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "srv-01234567",
+      "streamSettings": {
+        "network": "raw",
+        "sockopt": {
+          "dialerProxy": "srv-fedcba98"
+        }
+      }
+    },
+    {
+      "protocol": "vless",
+      "tag": "srv-fedcba98"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ]
+}

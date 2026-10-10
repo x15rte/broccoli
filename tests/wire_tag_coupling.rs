@@ -5,8 +5,8 @@
 //! through the same section and field names. The production sides reference
 //! the canonical consts (`src/model/inbound.rs` for the tags, `src/gen/keys.rs`
 //! for the schema keys); these tests pin the wire-level agreement against the
-//! actual emitted config (and the golden fixtures) so a unilateral literal
-//! re-spelling on either side fails.
+//! actual emitted config and the stored documents under `tests/fixtures/` so a
+//! unilateral literal re-spelling on either side fails.
 
 use broccoli::r#gen::{generate_with_api_port, keys};
 use broccoli::model::inbound::{
@@ -180,28 +180,30 @@ fn emitted_builtin_and_api_tags_match_consts() {
 }
 
 #[test]
-fn golden_tun_tags_match_runtime_consts() {
-    // The in-crate golden test byte-compares this fixture against generator
-    // output, so asserting the fixture's tags equal the consts locks the
-    // emitted artifact (goldens/ untouched) to the
-    // runtime references as well.
-    let config: Value = serde_json::from_str(include_str!("../src/gen/goldens/tun.json"))
-        .expect("golden tun.json must parse");
+fn stored_runtime_config_tags_match_the_consts() {
+    // This fixture is hand-written and no tool rewrites it, unlike the
+    // goldens (which the in-crate golden test byte-compares against generator
+    // output, and which `BROCCOLI_UPDATE_GOLDENS` can regenerate): only a
+    // person editing it changes what this test asserts, so the wire spellings
+    // the runtime references stay pinned to a stored document.
+    let config: Value = serde_json::from_str(include_str!("fixtures/tun_reference.json"))
+        .expect("the runtime fixture must parse");
     assert_eq!(inbound_tag(&config, "tun"), Some(TUN_INBOUND_TAG));
     assert_eq!(
         dns_in_rule_tags(&config),
         vec![DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG]
     );
-    let listener = dns_in::listener_for_config(&config).expect("the golden needs the listeners");
+    let listener =
+        dns_in::listener_for_config(&config).expect("the stored config needs the listeners");
     assert_eq!(
         listener.v4.map(|address| address.to_string()),
         Some("10.255.0.1".to_string()),
-        "the golden must hand the runtime the IPv4 listener's bind address"
+        "the stored config must hand the runtime the IPv4 listener's bind address"
     );
     assert_eq!(
         listener.v6.map(|address| address.to_string()),
         Some("fd00::1".to_string()),
-        "the golden must hand the runtime the IPv6 listener's bind address"
+        "the stored config must hand the runtime the IPv6 listener's bind address"
     );
     assert_eq!(outbound_tag(&config, "dns"), Some(DNS_OUTBOUND_TAG));
     assert_eq!(outbound_tag(&config, "freedom"), Some(DIRECT_OUTBOUND_TAG));
@@ -210,15 +212,14 @@ fn golden_tun_tags_match_runtime_consts() {
 }
 
 #[test]
-fn golden_nested_keys_match_schema_consts() {
-    // These byte-compared fixtures also carry nested keys whose emitting
-    // side is the model's own serialization rather than a generator `json!`
-    // literal: the chain target's `streamSettings.sockopt.dialerProxy`.
-    // Reading them through the schema consts fails if the emitted spelling
-    // drifts from the consts the readers name.
-    let chain_json = include_str!("../src/gen/goldens/chain_dialer_proxy.json");
-    let chain: Value =
-        serde_json::from_str(chain_json).expect("golden chain_dialer_proxy.json must parse");
+fn stored_chain_config_nested_keys_match_schema_consts() {
+    // The stored document carries a nested key whose emitting side is the
+    // model's own serialization rather than a generator `json!` literal: the
+    // chain target's `streamSettings.sockopt.dialerProxy`. Hand-written like
+    // the fixture above, it is read through the same schema consts the
+    // readers name, so a drift in that spelling fails here.
+    let chain: Value = serde_json::from_str(include_str!("fixtures/chain_dialer_proxy.json"))
+        .expect("the chain fixture must parse");
     let outbounds = chain
         .get(keys::OUTBOUNDS)
         .and_then(Value::as_array)
