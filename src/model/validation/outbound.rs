@@ -17,8 +17,9 @@ use crate::model::inbound::Sniffing;
 use crate::model::outbound::{
     Fragment, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
     blackhole_response_is_custom, blackhole_response_type_supported,
-    endpoint_requires_transport_security, is_valid_wireguard_key, masque_remote_dns_supported,
-    vless_encryption_supported, wireguard_remote_dns_supported,
+    endpoint_requires_transport_security, is_valid_wireguard_key,
+    masque_remote_dns_entry_supported, vless_encryption_supported,
+    wireguard_remote_dns_entry_supported,
 };
 use crate::model::stream::{
     Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
@@ -388,13 +389,61 @@ fn validate_masque(o: &OutboundModel, issues: &mut Vec<ValidationIssue>) {
                 Some("settings.port".into()),
             ));
         }
-        if !masque_remote_dns_supported(&settings.remote_dns) {
+        if settings
+            .remote_dns
+            .iter()
+            .any(|entry| masque_remote_dns_verdict(entry).is_some())
+        {
             issues.push(issue(
                 ValidationCode::MasqueRemoteDnsInvalid,
                 Some("settings.remoteDNS".into()),
             ));
         }
     }
+}
+
+/// The verdict of one WireGuard in-network DNS entry: the core parses every
+/// entry with `netip.MustParseAddr` while it builds the outbound, so a single
+/// bad entry is the refusal the list rule reports — which is what the editor's
+/// row renders, entry by entry.
+pub fn wireguard_remote_dns_verdict(entry: &str) -> Option<ValidationCode> {
+    (!wireguard_remote_dns_entry_supported(entry))
+        .then_some(ValidationCode::WireguardRemoteDnsInvalid)
+}
+
+/// The verdict of one MASQUE in-tunnel DNS entry: the core parses every entry
+/// with `netip.ParseAddr` while it builds the outbound and refuses the config
+/// (infra/conf/masque.go:27-30), so one bad entry is the refusal the list rule
+/// reports — which is what the editor's row renders, entry by entry.
+pub fn masque_remote_dns_verdict(entry: &str) -> Option<ValidationCode> {
+    (!masque_remote_dns_entry_supported(entry)).then_some(ValidationCode::MasqueRemoteDnsInvalid)
+}
+
+/// The verdict of the WireGuard `settings.secretKey` field: `WireGuardConfig.Build`
+/// runs it through `ParseWireGuardKey` (infra/conf/wireguard.go), which refuses
+/// the empty string and anything that is neither 64 hexadecimal digits nor the
+/// raw base64 of the same 32 bytes. The pass reports this code and the editor's
+/// field renders its message, so the two readers cannot disagree.
+pub fn wireguard_secret_key_verdict(value: &str) -> Option<ValidationCode> {
+    (!is_valid_wireguard_key(value)).then_some(ValidationCode::WireguardSecretKeyInvalid)
+}
+
+/// The verdict of one WireGuard peer's optional `preSharedKey`: empty is the
+/// core's zero shape, and anything else must be a key it builds (the peer's
+/// `Build` runs it through `ParseWireGuardKey`, infra/conf/wireguard.go). The
+/// editor's field renders this code's message, and the pass reports it for the
+/// peer list.
+pub fn wireguard_preshared_key_verdict(value: &str) -> Option<ValidationCode> {
+    (!value.is_empty() && !is_valid_wireguard_key(value))
+        .then_some(ValidationCode::WireguardPresharedKeyInvalid)
+}
+
+/// The verdict of one WireGuard peer's `publicKey`: an empty key and one the
+/// core cannot parse are the same refusal at config load, so one code covers
+/// both (see [`ValidationCode::WireguardPeerPublicKeyRequired`]). The editor's
+/// field renders this code's message, and the pass reports it for the peer list.
+pub fn wireguard_peer_public_key_verdict(value: &str) -> Option<ValidationCode> {
+    (!is_valid_wireguard_key(value)).then_some(ValidationCode::WireguardPeerPublicKeyRequired)
 }
 
 /// The `masque` transport's own option rules, on the stream where its
@@ -694,7 +743,11 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     // The predicates are the editor's old draft requirements, moved here so
     // one verdict covers the editor, generation, and the importer.
     if let ProtocolSettings::Wireguard(settings) = &o.settings {
-        if !wireguard_remote_dns_supported(&settings.remote_dns) {
+        if settings
+            .remote_dns
+            .iter()
+            .any(|entry| wireguard_remote_dns_verdict(entry).is_some())
+        {
             issues.push(issue(
                 ValidationCode::WireguardRemoteDnsInvalid,
                 Some("settings.remoteDNS".into()),
@@ -706,7 +759,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                 Some("settings.domainStrategy".into()),
             ));
         }
-        if !is_valid_wireguard_key(&settings.secret_key) {
+        if wireguard_secret_key_verdict(&settings.secret_key).is_some() {
             issues.push(issue(
                 ValidationCode::WireguardSecretKeyInvalid,
                 Some("settings.secretKey".into()),
@@ -731,7 +784,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         if settings
             .peers
             .iter()
-            .any(|peer| !is_valid_wireguard_key(&peer.public_key))
+            .any(|peer| wireguard_peer_public_key_verdict(&peer.public_key).is_some())
         {
             issues.push(issue(
                 ValidationCode::WireguardPeerPublicKeyRequired,
@@ -748,9 +801,11 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                 Some("settings.peers[].endpoint".into()),
             ));
         }
-        if settings.peers.iter().any(|peer| {
-            !peer.pre_shared_key.is_empty() && !is_valid_wireguard_key(&peer.pre_shared_key)
-        }) {
+        if settings
+            .peers
+            .iter()
+            .any(|peer| wireguard_preshared_key_verdict(&peer.pre_shared_key).is_some())
+        {
             issues.push(issue(
                 ValidationCode::WireguardPresharedKeyInvalid,
                 Some("settings.peers[].preSharedKey".into()),

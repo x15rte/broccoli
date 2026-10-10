@@ -1232,8 +1232,10 @@ mod stream;
 
 pub use outbound::{
     DNS_OUT_ACTIONS, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
-    freedom_final_rule_supported, mux_conflicts_with_vision_flow, send_through_supported,
-    sniffing_dest_override_supported, validate_outbound, validate_sniffing,
+    freedom_final_rule_supported, masque_remote_dns_verdict, mux_conflicts_with_vision_flow,
+    send_through_supported, sniffing_dest_override_supported, validate_outbound, validate_sniffing,
+    wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
+    wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{

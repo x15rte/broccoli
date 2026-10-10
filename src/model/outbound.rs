@@ -317,9 +317,8 @@ pub struct WireguardSettings {
     /// `netip.MustParseAddr` while it creates the outbound client and panics
     /// the whole process on anything else (proxy/wireguard/client.go:102-108).
     /// The retired `local` sentinel is gone upstream and is refused like
-    /// every other non-address entry, so
-    /// [`wireguard_remote_dns_supported`] is the validity predicate for this
-    /// field.
+    /// every other non-address entry
+    /// ([`wireguard_remote_dns_entry_supported`]).
     #[serde(rename = "remoteDNS", skip_serializing_if = "skip_empty_vec")]
     pub remote_dns: Vec<String>,
     #[serde(flatten)]
@@ -365,27 +364,10 @@ fn parses_as_remote_dns_address(entry: &str) -> bool {
     }
 }
 
-/// True when a whole `remoteDNS` list is one the pinned core can build:
-/// every entry is an address literal.
-pub fn wireguard_remote_dns_supported(entries: &[String]) -> bool {
-    entries
-        .iter()
-        .all(|entry| wireguard_remote_dns_entry_supported(entry))
-}
-
 /// True when one MASQUE `remoteDNS` entry parses as an address literal
 /// through the core's `netip.ParseAddr` (infra/conf/masque.go:27-30).
 pub fn masque_remote_dns_entry_supported(entry: &str) -> bool {
     parses_as_remote_dns_address(entry)
-}
-
-/// True when a whole MASQUE `remoteDNS` list is one the pinned core can
-/// build: every entry parses as an address literal. Empty is legal — the core
-/// substitutes its own four-server default (proxy/masque/client.go:73-75).
-pub fn masque_remote_dns_supported(entries: &[String]) -> bool {
-    entries
-        .iter()
-        .all(|entry| masque_remote_dns_entry_supported(entry))
 }
 
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key

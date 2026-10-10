@@ -73,7 +73,8 @@ use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
 use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
 use validators::{
     v_masque_remote_dns_entry, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
-    v_vless_encryption, v_vless_encryption_required, v_wg_key, v_wg_remote_dns_entry,
+    v_vless_encryption, v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry,
+    v_wg_secret_key,
 };
 use xray_tool::XrayToolKind;
 
@@ -2571,7 +2572,7 @@ impl ServersScreen {
                 None => Err(t(lang, Key::SrvVlessencNoValue).into()),
             },
             XrayToolKind::WireguardSecret => match keygen_value(&output, PRIV_PREFIXES) {
-                Some(value) if v_wg_key(lang, &value).is_none() => {
+                Some(value) if v_wg_secret_key(lang, &value).is_none() => {
                     if let Some(profile) = self.profile_for_target_mut(target) {
                         if let ProtocolSettings::Wireguard(settings) =
                             &mut profile.outbound.settings
@@ -4253,7 +4254,7 @@ impl ServersScreen {
                     t(lang, Key::SrvSecretKey),
                     &mut settings.secret_key,
                     t(lang, Key::SrvSecretKeyHint),
-                    |v| v_wg_key(lang, v),
+                    |v| v_wg_secret_key(lang, v),
                     &KeygenButton {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateWgHint),
@@ -4359,7 +4360,7 @@ impl ServersScreen {
                                 t(lang, Key::SrvPublicKey),
                                 &mut peer.public_key,
                                 t(lang, Key::SrvWgPeerPublicKeyHint),
-                                |v| v_wg_key(lang, v),
+                                |v| v_wg_public_key(lang, v),
                             );
                             ui.small(t(lang, Key::SrvWgPeerPublicKeyNote));
                             changed |= widgets::validated_field(
@@ -14059,7 +14060,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsInvalid))
                 .is_some(),
             "the bad entry must report inline under its row"
         );
@@ -14083,7 +14084,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsInvalid))
                 .is_none(),
             "the repaired entry must not report"
         );
@@ -14135,7 +14136,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsInvalid))
                 .is_some(),
             "the sentinel row must report its own verdict"
         );
@@ -14153,7 +14154,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsInvalid))
                 .is_none(),
             "address literals must not report"
         );
@@ -14171,7 +14172,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsEntryInvalid))
+                .query_by_label(t(Language::En, Key::SrvWgRemoteDnsInvalid))
                 .is_some(),
             "the empty new row must report its own verdict"
         );

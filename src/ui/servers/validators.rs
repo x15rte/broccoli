@@ -20,12 +20,14 @@
 //! the model's one definition (`is_canonical_uuid` /
 //! `vless_encryption_supported`).
 
-use crate::i18n::{Key, t};
-use crate::model::outbound::{
-    is_valid_wireguard_key, vless_encryption_supported, wireguard_remote_dns_entry_supported,
-};
+use crate::i18n::{Key, t, validation_message};
+use crate::model::outbound::vless_encryption_supported;
 use crate::model::settings::Language;
-use crate::model::validation::is_canonical_uuid;
+use crate::model::validation::{
+    ValidationCode, is_canonical_uuid, masque_remote_dns_verdict,
+    wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
+    wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
+};
 
 // ---------- validators ----------
 
@@ -69,47 +71,45 @@ pub(super) fn v_vless_encryption_required(lang: Language, v: &str) -> Option<Str
     }
 }
 
-pub(super) fn v_wg_key(lang: Language, v: &str) -> Option<String> {
-    if is_valid_wireguard_key(v) {
-        None
-    } else {
-        Some(t(lang, Key::SrvWgKey).into())
-    }
+/// Render one model verdict as the row's inline error: the code's message in
+/// the active language. The rule and its text are the model's; a row only
+/// shows them.
+fn verdict_error(lang: Language, verdict: Option<ValidationCode>) -> Option<String> {
+    verdict.map(|code| validation_message(&code, lang))
 }
 
+/// The WireGuard `secretKey` field's verdict: the model refuses an empty key
+/// and one it cannot parse with the same code the pass reports.
+pub(super) fn v_wg_secret_key(lang: Language, v: &str) -> Option<String> {
+    verdict_error(lang, wireguard_secret_key_verdict(v))
+}
+
+/// One WireGuard peer's `publicKey` verdict (see [`v_wg_secret_key`]).
+pub(super) fn v_wg_public_key(lang: Language, v: &str) -> Option<String> {
+    verdict_error(lang, wireguard_peer_public_key_verdict(v))
+}
+
+/// The same for a peer's optional pre-shared key: empty is the core's zero
+/// shape, and anything else must be a key it builds.
 pub(super) fn v_optional_wg_key(lang: Language, v: &str) -> Option<String> {
-    if v.is_empty() {
-        None
-    } else {
-        v_wg_key(lang, v)
-    }
+    verdict_error(lang, wireguard_preshared_key_verdict(v))
 }
 
 /// Per-entry verdict for the WireGuard in-network DNS list: the entry must be
 /// an address literal (an IPv6 literal may carry a zone), because the core
 /// parses every entry with `netip.MustParseAddr` and a bad one crashes the
 /// process. The retired `local` sentinel is refused like any other non-address
-/// entry.
+/// entry. The model's list rule reads the same verdict.
 pub(super) fn v_wg_remote_dns_entry(lang: Language, entry: &str) -> Option<String> {
-    if wireguard_remote_dns_entry_supported(entry) {
-        return None;
-    }
-    Some(t(lang, Key::SrvWgRemoteDnsEntryInvalid).to_string())
+    verdict_error(lang, wireguard_remote_dns_verdict(entry))
 }
 
 /// Per-entry verdict for the MASQUE in-tunnel DNS list: the entry must be an
 /// address literal, because the core parses every entry with `netip.ParseAddr`
 /// while it builds the outbound and refuses the config
-/// (infra/conf/masque.go:27-30). The message is the model's own
-/// `MasqueRemoteDnsInvalid` text — one message channel per rule.
+/// (infra/conf/masque.go:27-30).
 pub(super) fn v_masque_remote_dns_entry(lang: Language, entry: &str) -> Option<String> {
-    if crate::model::outbound::masque_remote_dns_entry_supported(entry) {
-        return None;
-    }
-    Some(crate::i18n::validation_message(
-        &crate::model::validation::ValidationCode::MasqueRemoteDnsInvalid,
-        lang,
-    ))
+    verdict_error(lang, masque_remote_dns_verdict(entry))
 }
 
 /// The tool-output guard for a generated encryption value. Delegates to the

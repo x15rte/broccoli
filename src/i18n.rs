@@ -984,7 +984,6 @@ keys! {
     SrvRequired 0,
     SrvUuidRequired 0,
     SrvMustBeUuid 0,
-    SrvWgKey 0,
     SrvCertPinHex 0,
     SrvVlessEncryptionRequired 0,
     SrvVlessEncryptionFormat 0,
@@ -1280,7 +1279,6 @@ keys! {
     SrvWgPresharedInvalid 0,
     SrvWgRemoteDnsInvalid 0,
     SrvWgDomainStrategyRetired 0,
-    SrvWgRemoteDnsEntryInvalid 0,
     SrvFreedomFragmentInvalid 0,
     SrvFreedomNoiseInvalid 0,
     SrvFreedomFinalRuleInvalid 0,
@@ -3891,10 +3889,6 @@ mod en {
             Key::SrvRequired => "required by Xray",
             Key::SrvUuidRequired => "UUID is required by Xray",
             Key::SrvMustBeUuid => "must be a UUID",
-            Key::SrvWgKey => {
-                "required: 64 hex digits or a 32-byte standard/URL-safe base64 key \
-                 with at most one trailing '='"
-            }
             Key::SrvCertPinHex => "each certificate pin must be exactly 32 bytes of hex",
             Key::SrvVlessEncryptionRequired => {
                 "required by Xray. Use \"none\" when encryption is disabled"
@@ -4278,7 +4272,6 @@ mod en {
                 "Every WireGuard remote DNS entry must be an IP address. A bad entry crashes the \
                  core at startup."
             }
-            Key::SrvWgRemoteDnsEntryInvalid => "Enter an IP address.",
             Key::SrvWgDomainStrategyRetired => {
                 "WireGuard domainStrategy is retired. Xray ignores it. Use the stream sockopt \
                  domainStrategy instead."
