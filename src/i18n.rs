@@ -440,13 +440,13 @@ keys! {
     // First-run wizard.
     WizardWelcome 0,
     // About screen.
-    AboutBroccoliVersion 1,
     AboutTagline 0,
-    AboutCoreVersion 1,
-    AboutCoreNotInstalled 0,
+    AboutComponents 0,
+    AboutXrayCore 0,
+    AboutCoreMissing 0,
+    AboutCoreMissingHint 0,
     AboutUpstreamLink 0,
     AboutRepoLink 0,
-    AboutLicenses 0,
     AboutLicenseXray 0,
     AboutLicenseWintun 0,
     AboutLicenseTexts 1,
@@ -3132,21 +3132,15 @@ mod en {
             // First-run wizard.
             Key::WizardWelcome => "Welcome to broccoli",
             // About screen.
-            Key::AboutBroccoliVersion => "broccoli {}",
             Key::AboutTagline => "A Windows GUI client for Xray core.",
-            Key::AboutCoreVersion => "Xray core: {}",
-            Key::AboutCoreNotInstalled => {
-                "Xray core: not installed. Use Settings → Updates to download it."
-            }
-            Key::AboutUpstreamLink => "Xray core upstream — github.com/XTLS/Xray-core",
-            Key::AboutRepoLink => "broccoli repository and releases",
-            Key::AboutLicenses => "Licenses",
-            Key::AboutLicenseXray => {
-                "• Xray core is licensed under the Mozilla Public License 2.0 (MPL-2.0)."
-            }
-            Key::AboutLicenseWintun => {
-                "• wintun.dll is © WireGuard LLC and distributed under its own license."
-            }
+            Key::AboutComponents => "Components",
+            Key::AboutXrayCore => "Xray core",
+            Key::AboutCoreMissing => "Not installed",
+            Key::AboutCoreMissingHint => "Use Settings → Core setup to download it.",
+            Key::AboutUpstreamLink => "github.com/XTLS/Xray-core",
+            Key::AboutRepoLink => "Repository and releases",
+            Key::AboutLicenseXray => "Mozilla Public License 2.0 (MPL-2.0)",
+            Key::AboutLicenseWintun => "© WireGuard LLC, distributed under its own license.",
             Key::AboutLicenseTexts => {
                 "License texts (LICENSE, LICENSE-Wintun) ship in the core directory: {}"
             }

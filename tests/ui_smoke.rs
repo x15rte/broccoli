@@ -46,11 +46,7 @@ fn screen_rendered_label(screen: Screen) -> String {
         Screen::Tun => t(Language::En, Key::TunSectionIdentity).to_string(),
         Screen::Logs => t(Language::En, Key::LogsCopyAll).to_string(),
         Screen::Settings => t(Language::En, Key::SettingsAppearance).to_string(),
-        Screen::About => t_fmt(
-            Language::En,
-            Key::AboutBroccoliVersion,
-            &[&env!("CARGO_PKG_VERSION")],
-        ),
+        Screen::About => t(Language::En, Key::AboutTagline).to_string(),
     }
 }
 

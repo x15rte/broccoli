@@ -958,6 +958,48 @@ pub fn kv_table(
     changed
 }
 
+/// Width of a ledger row's label column, so the columns line up from row to
+/// row and from screen to screen. Only [`ledger_label`] reads it: every screen
+/// reaches the width through the two row functions below.
+const LEDGER_LABEL_WIDTH: f32 = 128.0;
+
+/// A ledger row whose body takes one line: the label shares that line, so
+/// both sit against the same baseline. A body that stacks lines or wraps onto
+/// several lines takes [`ledger_row_multiline`] instead.
+pub fn ledger_row(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ledger_label(ui, label);
+        body(ui);
+    });
+}
+
+/// A ledger row whose body stacks lines or wraps: the label stays on the
+/// body's first line, where the row's subject belongs, instead of drifting to
+/// the middle of the stack.
+pub fn ledger_row_multiline(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal_top(|ui| {
+        ledger_label(ui, label);
+        body(ui);
+    });
+}
+
+/// The label column both ledger rows share: the label with the column's width
+/// reserved, so the body starts at the same x on every row.
+fn ledger_label(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) {
+    ui.vertical(|ui| {
+        ui.set_width(LEDGER_LABEL_WIDTH);
+        ui.label(label);
+    });
+}
+
 /// Styled collapsing section, open by default.
 pub fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong())

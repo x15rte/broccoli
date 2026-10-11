@@ -9,6 +9,7 @@ use crate::ui::inbounds::protocol_label;
 use crate::ui::status::{
     PhaseBadgeWording, StatusColors, phase_badge_color, phase_badge_text, status_colors_of,
 };
+use crate::ui::widgets;
 use crate::ui::{PhaseAction, TerminalErrorView, UiCtx};
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
@@ -61,6 +62,7 @@ struct LatencyRow {
 }
 
 /// The latency display resolution for one profile row.
+#[derive(Debug)]
 enum LatencyCell {
     /// Observatory entry alive: show its live delay.
     Alive { delay_ms: i64, text: String },
@@ -72,6 +74,49 @@ enum LatencyCell {
     DeadStale,
     /// No observatory entry and no recorded delay.
     Unknown,
+}
+
+/// One latency cell's presentation: the delay its bar fills to, that bar's
+/// color, and the text beside it.
+struct LatencyPresentation<'a> {
+    delay_ms: Option<i64>,
+    color: egui::Color32,
+    text: &'a str,
+}
+
+impl LatencyCell {
+    /// What this cell shows: one row per variant, so a new variant cannot
+    /// render without stating all three channels. `neutral` colors a cell
+    /// that has no delay to judge.
+    fn presentation<'a>(
+        &'a self,
+        colors: StatusColors,
+        neutral: egui::Color32,
+        lang: Language,
+    ) -> LatencyPresentation<'a> {
+        match self {
+            Self::Alive { delay_ms, text } => LatencyPresentation {
+                delay_ms: Some(*delay_ms),
+                color: latency_color(*delay_ms, colors),
+                text,
+            },
+            Self::Stale { ms, text } => LatencyPresentation {
+                delay_ms: Some(*ms),
+                color: latency_color(*ms, colors),
+                text,
+            },
+            Self::DeadObservatory | Self::DeadStale => LatencyPresentation {
+                delay_ms: None,
+                color: colors.err,
+                text: t(lang, Key::Dead),
+            },
+            Self::Unknown => LatencyPresentation {
+                delay_ms: None,
+                color: neutral,
+                text: t(lang, Key::EmDash),
+            },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -330,11 +375,11 @@ impl DashboardScreen {
                 }
 
                 // State + connect row.
+                let lang = ctx.settings.language;
                 ui.horizontal(|ui| {
-                    let lang = ctx.settings.language;
                     // The badge caption is memoized with the other
-                    // header-row labels; the dot color is a
-                    // cheap per-phase lookup.
+                    // header-row labels; the dot color is a cheap per-phase
+                    // lookup.
                     ui.colored_label(phase_badge_color(ctx.phase, status_colors_of(ui)), "●");
                     ui.heading(&self.header_cache(ctx).badge);
                     let action = PhaseAction::for_phase(ctx.phase);
@@ -390,140 +435,144 @@ impl DashboardScreen {
                         );
                     }
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
 
-                // Mode radio.
-                ui.horizontal(|ui| {
-                    let lang = ctx.settings.language;
-                    ui.label(t(lang, Key::DashboardNetworkMode));
-                    let mode = ctx.settings.mode;
-                    if ui
-                        .selectable_label(mode == Mode::Off, t(lang, Key::Off))
-                        .clicked()
-                        && ctx.settings.set_mode(Mode::Off)
-                    {
-                        ctx.mark_dirty();
-                    }
-                    let tun = ui
-                        .selectable_label(mode == Mode::Tun, t(lang, Key::Tun))
-                        .on_hover_text(if ctx.is_elevated {
-                            t(lang, Key::DashboardTunHoverElevated)
-                        } else {
-                            t(lang, Key::DashboardTunHoverNotElevated)
-                        });
-                    if tun.clicked() && ctx.settings.set_mode(Mode::Tun) {
-                        ctx.mark_dirty();
-                    }
-                });
-                ui.add_space(4.0);
-
-                // Local-endpoint status row: the managed
-                // SOCKS/HTTP inbounds remain loopback endpoints other
-                // applications can point at. Status is derived from the
-                // core phase and settings only — never probed.
-                ui.label(
-                    egui::RichText::new(t(ctx.settings.language, Key::DashboardLocalEndpoints))
-                        .weak()
-                        .small(),
+                // Controls: one ledger row per decision.
+                widgets::ledger_row(
+                    ui,
+                    egui::RichText::new(t(lang, Key::DashboardNetworkMode)).weak(),
+                    |ui| {
+                        let mode = ctx.settings.mode;
+                        if ui
+                            .selectable_label(mode == Mode::Off, t(lang, Key::Off))
+                            .clicked()
+                            && ctx.settings.set_mode(Mode::Off)
+                        {
+                            ctx.mark_dirty();
+                        }
+                        let tun = ui
+                            .selectable_label(mode == Mode::Tun, t(lang, Key::Tun))
+                            .on_hover_text(if ctx.is_elevated {
+                                t(lang, Key::DashboardTunHoverElevated)
+                            } else {
+                                t(lang, Key::DashboardTunHoverNotElevated)
+                            });
+                        if tun.clicked() && ctx.settings.set_mode(Mode::Tun) {
+                            ctx.mark_dirty();
+                        }
+                    },
                 );
-                // The status chips must wrap onto new lines when the window
-                // is narrow — a plain horizontal row overflows and widens the
-                // whole scroll content, which also clips the stats row below
-                // (user report: the uptime/goroutines/mem info vanished on a
-                // narrow window).
-                ui.horizontal_wrapped(|ui| {
-                    let lang = ctx.settings.language;
-                    let colors = status_colors_of(ui);
-                    let tun = tun_status(
-                        ctx.phase,
-                        (ctx.settings.mode, ctx.transport, ctx.is_elevated),
-                    );
-                    let tun_word = match tun {
-                        TunStatus::Active => t(lang, Key::TunStatusActive),
-                        TunStatus::Elevation => t(lang, Key::TunStatusElevation),
-                        TunStatus::Off => t(lang, Key::TunStatusOff),
-                        TunStatus::Starting => t(lang, Key::LocalStatusStarting),
-                        TunStatus::Down => t(lang, Key::LocalStatusDown),
-                    };
-                    let tun_color = match tun {
-                        TunStatus::Active => colors.ok,
-                        TunStatus::Elevation | TunStatus::Starting => colors.warn,
-                        TunStatus::Off => ui.visuals().weak_text_color(),
-                        TunStatus::Down => colors.err,
-                    };
-                    // Elevation is the one status whose label needs its
-                    // reason explained; every other item carries the row
-                    // hint.
-                    let tun_hint = match tun {
-                        TunStatus::Elevation => t(lang, Key::DashboardTunHoverNotElevated),
-                        _ => t(lang, Key::DashboardEndpointHint),
-                    };
-                    ui.colored_label(tun_color, t_fmt(lang, Key::TunStatus, &[&tun_word]))
-                        .on_hover_text(tun_hint);
-                    // One status row per local endpoint, in list order.
-                    // The captions are pre-rendered with the
-                    // header cache on the same key (phase + endpoint list),
-                    // so idle frames only re-derive the cheap status color.
-                    let endpoints = &self.header_cache(ctx).endpoints;
-                    for (label, status) in endpoints {
-                        let color = match status {
-                            ListenerStatus::Up => colors.ok,
-                            ListenerStatus::Starting => colors.warn,
-                            ListenerStatus::Down => colors.err,
-                            ListenerStatus::Disabled => ui.visuals().weak_text_color(),
-                        };
-                        ui.colored_label(color, label)
-                            .on_hover_text(t(lang, Key::DashboardEndpointHint));
-                    }
-                });
-                ui.add_space(4.0);
 
                 // Active server. The selected caption is the active
                 // profile's name — an O(n) borrow (no allocation) with the
                 // same fallback as the label always had.
-                ui.horizontal(|ui| {
-                    let lang = ctx.settings.language;
-                    ui.label(t(lang, Key::DashboardActiveServer));
-                    let cur = match ctx.servers.active.as_deref() {
-                        Some(id) => ctx
-                            .servers
-                            .profiles
-                            .iter()
-                            .find(|p| p.id == id)
-                            .map_or(t(lang, Key::NoneSelected), |p| p.name.as_str()),
-                        None => t(lang, Key::NoneSelected),
-                    };
-                    egui::ComboBox::from_id_salt("active-server")
-                        .selected_text(cur)
-                        .show_ui(ui, |ui| {
-                            // The popup reads the profile list and writes
-                            // the selection slot — two disjoint fields of
-                            // the same model borrow — by deferring the
-                            // click to a row index. Only the chosen id is
-                            // cloned, on the click, instead of an
-                            // (id, name) pair per profile per open-popup
-                            // frame.
-                            let mut picked = None;
-                            for (index, profile) in ctx.servers.profiles.iter().enumerate() {
-                                let selected =
-                                    ctx.servers.active.as_deref() == Some(profile.id.as_str());
-                                if ui
-                                    .selectable_label(selected, profile.name.as_str())
-                                    .clicked()
-                                {
-                                    picked = Some(index);
+                widgets::ledger_row(
+                    ui,
+                    egui::RichText::new(t(lang, Key::DashboardActiveServer)).weak(),
+                    |ui| {
+                        let cur = match ctx.servers.active.as_deref() {
+                            Some(id) => ctx
+                                .servers
+                                .profiles
+                                .iter()
+                                .find(|p| p.id == id)
+                                .map_or(t(lang, Key::NoneSelected), |p| p.name.as_str()),
+                            None => t(lang, Key::NoneSelected),
+                        };
+                        egui::ComboBox::from_id_salt("active-server")
+                            .selected_text(cur)
+                            .show_ui(ui, |ui| {
+                                // The popup reads the profile list and writes
+                                // the selection slot — two disjoint fields of
+                                // the same model borrow — by deferring the
+                                // click to a row index. Only the chosen id is
+                                // cloned, on the click, instead of an
+                                // (id, name) pair per profile per open-popup
+                                // frame.
+                                let mut picked = None;
+                                for (index, profile) in ctx.servers.profiles.iter().enumerate() {
+                                    let selected =
+                                        ctx.servers.active.as_deref() == Some(profile.id.as_str());
+                                    if ui
+                                        .selectable_label(selected, profile.name.as_str())
+                                        .clicked()
+                                    {
+                                        picked = Some(index);
+                                    }
                                 }
-                            }
-                            if let Some(index) = picked {
-                                // The active profile is the list's first row
-                                // (the config's default route), so picking it
-                                // moves it there.
-                                let id = ctx.servers.profiles[index].id.clone();
-                                ctx.servers.activate(&id);
-                                ctx.mark_dirty();
+                                if let Some(index) = picked {
+                                    // The active profile is the list's first row
+                                    // (the config's default route), so picking it
+                                    // moves it there.
+                                    let id = ctx.servers.profiles[index].id.clone();
+                                    ctx.servers.activate(&id);
+                                    ctx.mark_dirty();
+                                }
+                            });
+                    },
+                );
+
+                // Local-endpoint status: the managed SOCKS/HTTP inbounds
+                // remain loopback endpoints other applications can point at.
+                // Status is derived from the core phase and settings only —
+                // never probed. The chips wrap onto new lines when the
+                // window is narrow: a plain horizontal row overflows and
+                // widens the whole scroll content, which also clips the
+                // stats row below (user report: the uptime/goroutines/mem
+                // info vanished on a narrow window).
+                widgets::ledger_row_multiline(
+                    ui,
+                    egui::RichText::new(t(lang, Key::DashboardLocalEndpoints)).weak(),
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let colors = status_colors_of(ui);
+                            let tun = tun_status(
+                                ctx.phase,
+                                (ctx.settings.mode, ctx.transport, ctx.is_elevated),
+                            );
+                            let tun_word = match tun {
+                                TunStatus::Active => t(lang, Key::TunStatusActive),
+                                TunStatus::Elevation => t(lang, Key::TunStatusElevation),
+                                TunStatus::Off => t(lang, Key::TunStatusOff),
+                                TunStatus::Starting => t(lang, Key::LocalStatusStarting),
+                                TunStatus::Down => t(lang, Key::LocalStatusDown),
+                            };
+                            let tun_color = match tun {
+                                TunStatus::Active => colors.ok,
+                                TunStatus::Elevation | TunStatus::Starting => colors.warn,
+                                TunStatus::Off => ui.visuals().weak_text_color(),
+                                TunStatus::Down => colors.err,
+                            };
+                            // Elevation is the one status whose label needs its
+                            // reason explained; every other item carries the row
+                            // hint.
+                            let tun_hint = match tun {
+                                TunStatus::Elevation => t(lang, Key::DashboardTunHoverNotElevated),
+                                _ => t(lang, Key::DashboardEndpointHint),
+                            };
+                            ui.colored_label(tun_color, t_fmt(lang, Key::TunStatus, &[&tun_word]))
+                                .on_hover_text(tun_hint);
+                            // One status row per local endpoint, in list order.
+                            // The captions are pre-rendered with the header cache
+                            // on the same key (phase + endpoint list), so idle
+                            // frames only re-derive the cheap status color.
+                            let endpoints = &self.header_cache(ctx).endpoints;
+                            for (label, status) in endpoints {
+                                let color = match status {
+                                    ListenerStatus::Up => colors.ok,
+                                    ListenerStatus::Starting => colors.warn,
+                                    ListenerStatus::Down => colors.err,
+                                    ListenerStatus::Disabled => ui.visuals().weak_text_color(),
+                                };
+                                ui.colored_label(color, label)
+                                    .on_hover_text(t(lang, Key::DashboardEndpointHint));
                             }
                         });
-                });
+                    },
+                );
+                ui.add_space(6.0);
                 ui.separator();
 
                 // Live stats + plot. The stats captions must wrap onto new
@@ -654,20 +703,7 @@ impl DashboardScreen {
                             for row in &grid.rows {
                                 ui.label(&row.name);
                                 ui.monospace(&row.tag);
-                                match &row.cell {
-                                    LatencyCell::Alive { delay_ms, text } => {
-                                        ui.colored_label(latency_color(*delay_ms, colors), text);
-                                    }
-                                    LatencyCell::DeadObservatory | LatencyCell::DeadStale => {
-                                        ui.colored_label(colors.err, t(lang, Key::Dead));
-                                    }
-                                    LatencyCell::Stale { ms, text } => {
-                                        ui.colored_label(latency_color(*ms, colors), text);
-                                    }
-                                    LatencyCell::Unknown => {
-                                        ui.label(t(lang, Key::EmDash));
-                                    }
-                                }
+                                latency_cell(ui, &row.cell, colors, lang);
                                 let response = ui.label(&row.detail_short);
                                 if row.detail_truncated {
                                     response.on_hover_text(&row.detail_full);
@@ -716,6 +752,34 @@ impl DashboardScreen {
                 }
             });
     }
+}
+
+const LATENCY_BAR_SIZE: egui::Vec2 = egui::Vec2::new(56.0, 5.0);
+/// The delay at which a latency bar is full: the same point the latency
+/// color turns red.
+const LATENCY_BAR_FULL_MS: f32 = 1000.0;
+/// Shortest fill, so a fast server still shows a bar.
+const LATENCY_BAR_MIN_FRACTION: f32 = 0.06;
+
+/// A latency cell: a short bar scaled to the delay beside its text. A cell
+/// with no delay shows the empty track.
+fn latency_cell(ui: &mut egui::Ui, cell: &LatencyCell, colors: StatusColors, lang: Language) {
+    let presentation = cell.presentation(colors, ui.visuals().text_color(), lang);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(LATENCY_BAR_SIZE, egui::Sense::hover());
+        let radius = LATENCY_BAR_SIZE.y / 2.0;
+        ui.painter()
+            .rect_filled(rect, radius, ui.visuals().widgets.inactive.bg_fill);
+        if let Some(ms) = presentation.delay_ms {
+            let fraction = (ms as f32 / LATENCY_BAR_FULL_MS).clamp(LATENCY_BAR_MIN_FRACTION, 1.0);
+            let filled = egui::Rect::from_min_size(
+                rect.min,
+                egui::vec2(rect.width() * fraction, rect.height()),
+            );
+            ui.painter().rect_filled(filled, radius, presentation.color);
+        }
+        ui.colored_label(presentation.color, presentation.text);
+    });
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -2200,6 +2264,50 @@ mod tests {
             !rows[0].detail_short.is_empty(),
             "the statistics must be visible without hovering"
         );
+    }
+
+    /// Every latency cell states the bar it draws: how far the bar fills and
+    /// in which colour. The colours are the dark palette's, so a threshold
+    /// moves only with `latency_color`; the text beside the bar is the row's
+    /// own measurement, which the cell passes through untouched.
+    #[test]
+    fn latency_cells_state_their_own_bar() {
+        let colors = crate::ui::status::status_colors(true);
+        let neutral = egui::Color32::WHITE;
+        let cases = [
+            (
+                LatencyCell::Alive {
+                    delay_ms: 120,
+                    text: "120 ms".to_string(),
+                },
+                Some(120),
+                colors.ok,
+            ),
+            (
+                LatencyCell::Alive {
+                    delay_ms: 1500,
+                    text: "1500 ms".to_string(),
+                },
+                Some(1500),
+                colors.err,
+            ),
+            (
+                LatencyCell::Stale {
+                    ms: 400,
+                    text: "400 ms".to_string(),
+                },
+                Some(400),
+                colors.warn,
+            ),
+            (LatencyCell::DeadObservatory, None, colors.err),
+            (LatencyCell::DeadStale, None, colors.err),
+            (LatencyCell::Unknown, None, neutral),
+        ];
+        for (cell, delay_ms, color) in cases {
+            let presentation = cell.presentation(colors, neutral, Language::En);
+            assert_eq!(presentation.delay_ms, delay_ms, "{cell:?}");
+            assert_eq!(presentation.color, color, "{cell:?}");
+        }
     }
 
     /// The local-endpoint derivation: a disabled inbound always wins
