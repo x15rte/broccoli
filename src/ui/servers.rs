@@ -1347,7 +1347,7 @@ impl ToolTarget {
 /// selected profile's editor draft, or the in-progress add-server draft. Both
 /// hold one [`ProfileDraft`]; this is the only thing that distinguishes their
 /// slots.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DraftKind {
     Existing,
     Add,
@@ -1465,6 +1465,84 @@ impl ProfileDraft {
             generation: self.generation,
         }
     }
+
+    /// A content edit, a tool application or a dismissal landed in this draft:
+    /// its generation moves, so the memoized validation stops covering it and a
+    /// verdict that arrives for the older generation is dropped. Every edit path
+    /// runs this before the frame's [`Self::refresh`], which is what keeps a
+    /// stale verdict from being rendered for a generation.
+    ///
+    /// The screen's reported validation output is not touched here: the add
+    /// dialog keeps its report until the next attempt, because that output is
+    /// why its window is still open, while the selected profile's editor drops
+    /// it with the edit (see `ServersScreen::draft_edited`).
+    fn edited(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Bring this draft's memoized validation up to date: sweep the profile only
+    /// when the memo does not cover the draft's generation, render the findings
+    /// it holds only when the generation or the language moved. A language
+    /// change therefore re-renders without re-validating, and an idle frame does
+    /// neither. The changed-from-source baseline is the draft's own baseline
+    /// (the persisted snapshot, or the empty template of an add draft), compared
+    /// once per sweep.
+    fn refresh(&mut self, lang: Language) {
+        let covered = self
+            .validation
+            .as_ref()
+            .is_some_and(|cached| cached.generation == self.generation);
+        if !covered {
+            let findings = editor_validation_findings(&self.profile);
+            let rendered = findings.render(lang);
+            self.validation = Some(EditorValidationCache {
+                generation: self.generation,
+                findings,
+                rendered_language: lang,
+                rendered,
+                changed_from_source: profile_differs_from_baseline(&self.profile, &self.baseline),
+            });
+            return;
+        }
+        if let Some(cached) = self.validation.as_mut()
+            && cached.rendered_language != lang
+        {
+            let rendered = cached.findings.render(lang);
+            cached.rendered = rendered;
+            cached.rendered_language = lang;
+        }
+    }
+
+    /// Whether this draft differs from the baseline it is compared against: the
+    /// memoized answer while the memo covers the draft's generation, a fresh
+    /// comparison when it is stale (a tool-applied edit can land after the
+    /// refresh, and the topbar chip reads this before the editor renders), and
+    /// "unchanged" while there is no memo — a draft whose editor has not swept
+    /// once, exactly as the pre-sweep state always has: every render path sweeps
+    /// before it reads this.
+    fn changed_from_source(&self) -> bool {
+        match self.validation.as_ref() {
+            Some(cached) if cached.generation == self.generation => cached.changed_from_source,
+            Some(_) => profile_differs_from_baseline(&self.profile, &self.baseline),
+            None => false,
+        }
+    }
+
+    /// The facts every control of this draft reads this frame: the draft's own
+    /// facts as the validation refresh left them, plus the seeded-buffer scan
+    /// and the frame's validation/busy facts.
+    fn gate(&self, buffers: &SeededBuffers, validating: bool, busy: bool) -> DraftGate {
+        DraftGate {
+            changed_from_source: self.changed_from_source(),
+            raw_buffers_dirty: buffers.holds_uncommitted(&self.id),
+            blocking: self
+                .validation
+                .as_ref()
+                .is_some_and(|cached| !cached.findings.blocking.is_empty()),
+            validating,
+            busy,
+        }
+    }
 }
 
 /// Memoized editor validation for one draft: the findings (swept once per
@@ -1485,7 +1563,8 @@ struct EditorValidationCache {
     /// verdicts show — the same sweep, rendered once per (generation,
     /// language).
     rendered: EditorValidationRender,
-    /// The draft differs from its baseline (see [`draft_gate`]). For an
+    /// The draft differs from its baseline (see
+    /// [`ProfileDraft::changed_from_source`]). For an
     /// existing draft that is the persisted profile; for an add draft, which
     /// has no committed source, the empty template it was created against.
     changed_from_source: bool,
@@ -1497,7 +1576,7 @@ struct XrayToolJob {
     request: Request<Result<String, String>>,
 }
 
-/// The facts every draft control reads, built by [`draft_gate`] where the
+/// The facts every draft control reads, built by [`ProfileDraft::gate`] where the
 /// draft's findings are. The two memoized facts — whether the draft differs
 /// from its baseline, and whether an error-severity finding blocks it — come
 /// from the validation memo the sweep produced, so a generation bump updates
@@ -1552,11 +1631,125 @@ struct DialerProxyOptions {
     options: Vec<String>,
 }
 
+/// The TLS probe's state for one editor: what the user asked to probe, what
+/// the probe produced, and whether its output window is open. All of it
+/// describes the draft the probe was started from, so it lives with that
+/// draft's slot — a pin is only meaningful for the profile it came from
+/// (`profile`), and the window that shows it belongs to that profile's dialog.
+#[derive(Default)]
+struct TlsProbe {
+    /// The host the user typed to probe.
+    domain: String,
+    /// The address the probe is pointed at, prefilled from the draft's
+    /// endpoint and editable.
+    ip: String,
+    /// The probe's raw output, shown in its own window.
+    output: Option<String>,
+    /// What the last probe (or the request that could not be staged) reported.
+    error: Option<String>,
+    /// Leaf SHA256 pin parsed from the last successful probe output.
+    leaf_pin: Option<String>,
+    /// CA (name, pin) rows parsed from the last successful probe output.
+    ca_pins: Vec<(String, String)>,
+    /// Whether the last probe completed a handshake; gates the pin panel.
+    /// Cleared when a new probe starts or fails; pins render only for the
+    /// profile that produced them (see `profile`).
+    handshake_ok: bool,
+    /// Profile id whose probe produced `leaf_pin`; the pin panel renders and
+    /// Apply is reachable only while the editor targets that same profile, so
+    /// a pin can never be applied to a different node.
+    profile: Option<String>,
+    /// Whether the raw probe output window is open (drawn in `show_dialogs`).
+    show_output: bool,
+}
+
+impl TlsProbe {
+    /// Drop what the probe produced — its output, the pins parsed from it and
+    /// the window showing them — keeping the address the user typed. The pins
+    /// describe the profile that produced them, so they never outlive its
+    /// draft; the address is a starting point for the next probe.
+    fn discard_result(&mut self) {
+        self.output = None;
+        self.error = None;
+        self.leaf_pin = None;
+        self.ca_pins.clear();
+        self.handshake_ok = false;
+        self.profile = None;
+        self.show_output = false;
+    }
+}
+
+/// One editor slot: the draft it holds and the state that describes that draft
+/// alone — the chain-target picker's option memo and the TLS probe's output.
+/// The screen holds one slot per editor (the selected profile's editor and the
+/// add-server dialog), so a draft's keep-alive state has one owner and dies
+/// with the draft instead of outliving it on the screen.
+///
+/// The seeded raw-JSON/PEM buffer store is deliberately not here: it is keyed
+/// by field identity and records its owner's profile id, and the tab functions
+/// that render its editors (including the nested-settings recursion) reach it
+/// through the screen, so it stays one store for the screen: closing a slot
+/// evicts the buffers of its own draft, while reverting clears every buffer
+/// (no editor may keep showing text of a draft that reverted).
+///
+/// A draft is taken out for the frame that renders it ([`Self::take`] and
+/// [`Self::hold`]), because the render body mutates the screen around the draft
+/// (the tabs' context, the seeded buffers, the validation request) while it
+/// edits the profile.
+#[derive(Default)]
+struct DraftSlot {
+    draft: Option<ProfileDraft>,
+    /// The chain-target picker's option memo for this slot's editor (see
+    /// [`DialerProxyOptions`]).
+    chain_options: Option<DialerProxyOptions>,
+    /// The TLS probe state for this slot's draft.
+    probe: TlsProbe,
+}
+
+impl DraftSlot {
+    /// The draft this slot holds, if any.
+    fn draft(&self) -> Option<&ProfileDraft> {
+        self.draft.as_ref()
+    }
+
+    /// The draft this slot holds, mutably, if any.
+    fn draft_mut(&mut self) -> Option<&mut ProfileDraft> {
+        self.draft.as_mut()
+    }
+
+    /// Take the draft out for the frame that renders it; [`Self::hold`] puts it
+    /// back when the render returns, including the paths that gave up early.
+    fn take(&mut self) -> Option<ProfileDraft> {
+        self.draft.take()
+    }
+
+    /// Put a taken draft back into this slot.
+    fn hold(&mut self, draft: ProfileDraft) {
+        self.draft = Some(draft);
+    }
+
+    /// Close this slot's draft without committing: the draft goes away and the
+    /// buffers seeded for it are dead weight. Click-time only.
+    fn close(&mut self, buffers: &mut SeededBuffers) {
+        if let Some(draft) = self.draft.take() {
+            buffers.evict_owned(&draft.id);
+        }
+    }
+
+    /// Revert this slot's draft: the screen shows the persisted profile again,
+    /// so the draft, the probe result that described it and every seeded buffer
+    /// go together — otherwise an editor would keep showing the discarded
+    /// draft's text. Click-time only.
+    fn revert(&mut self, buffers: &mut SeededBuffers) {
+        self.draft = None;
+        self.probe.discard_result();
+        buffers.clear();
+    }
+}
+
 /// Refresh `slot` when its signal moved and hand back the options it holds.
-/// Each editor keeps its own slot: the existing-draft editor and the
-/// add-server dialog may render in one frame, and they exclude different
-/// profiles. The cached slot's generation is the rebuild key — idle frames
-/// reuse the options it holds.
+/// The cached slot's generation is the rebuild key — idle frames reuse the
+/// options it holds.
 fn refresh_dialer_proxy_options<'a>(
     slot: &'a mut Option<DialerProxyOptions>,
     set_key: (u64, usize),
@@ -1671,71 +1864,6 @@ fn profile_differs_from_baseline(profile: &ServerProfile, baseline: &serde_json:
     serde_json::to_value(profile)
         .map(|current| current != *baseline)
         .unwrap_or(true)
-}
-
-/// Bring the draft's memoized validation up to date: sweep the profile only
-/// when the memo does not cover the draft's generation, render the findings
-/// it holds only when the generation or the language moved. A language change
-/// therefore re-renders without re-validating, and an idle frame does
-/// neither. The changed-from-source baseline is the draft's own baseline
-/// (the persisted snapshot, or the empty template of an add draft), compared
-/// once per sweep.
-fn refresh_editor_validation(draft: &mut ProfileDraft, lang: Language) {
-    let covered = draft
-        .validation
-        .as_ref()
-        .is_some_and(|cached| cached.generation == draft.generation);
-    if !covered {
-        let findings = editor_validation_findings(&draft.profile);
-        let rendered = findings.render(lang);
-        draft.validation = Some(EditorValidationCache {
-            generation: draft.generation,
-            findings,
-            rendered_language: lang,
-            rendered,
-            changed_from_source: profile_differs_from_baseline(&draft.profile, &draft.baseline),
-        });
-        return;
-    }
-    if let Some(cached) = draft.validation.as_mut()
-        && cached.rendered_language != lang
-    {
-        let rendered = cached.findings.render(lang);
-        cached.rendered = rendered;
-        cached.rendered_language = lang;
-    }
-}
-
-/// The facts every control of `draft` reads this frame: the draft's own facts
-/// as the validation refresh left them (recomputed inline when the memo does
-/// not cover the draft's generation — a tool-applied edit can land after the
-/// refresh, and the topbar chip reads this before the editor renders), plus
-/// the seeded-buffer scan and the frame's validation/busy facts. A memo that
-/// is absent or stale answers `changed_from_source` from the baseline
-/// comparison; an absent one — a draft whose editor has not rendered once —
-/// has no swept verdicts, so it reads as unchanged, exactly as the pre-sweep
-/// state always has: every render path sweeps before it reads the gate.
-fn draft_gate(
-    draft: &ProfileDraft,
-    buffers: &SeededBuffers,
-    validating: bool,
-    busy: bool,
-) -> DraftGate {
-    let changed_from_source = match draft.validation.as_ref() {
-        Some(cached) if cached.generation == draft.generation => cached.changed_from_source,
-        Some(_) => profile_differs_from_baseline(&draft.profile, &draft.baseline),
-        None => false,
-    };
-    DraftGate {
-        changed_from_source,
-        raw_buffers_dirty: buffers.holds_uncommitted(&draft.id),
-        blocking: draft
-            .validation
-            .as_ref()
-            .is_some_and(|cached| !cached.findings.blocking.is_empty()),
-        validating,
-        busy,
-    }
 }
 
 struct QrDialog {
@@ -1889,18 +2017,12 @@ pub struct ServersScreen {
     latency_badges: std::collections::HashMap<String, LatencyBadge>,
     tab: EditorTab,
     draft_tab: EditorTab,
-    /// The two open drafts, one per slot: the selected profile's editor draft
-    /// and the in-progress add-server draft. Each carries its own validation
-    /// memo, so neither can read the other's verdicts while both render in
-    /// one frame.
-    existing_draft: Option<ProfileDraft>,
-    add_draft: Option<ProfileDraft>,
-    /// The chain-target picker's option memo for the existing-draft editor
-    /// and the add-server dialog — one slot each, since both may render in
-    /// one frame and they exclude different profiles (see
-    /// [`DialerProxyOptions`]).
-    dialer_proxy_options: Option<DialerProxyOptions>,
-    add_dialer_proxy_options: Option<DialerProxyOptions>,
+    /// The two editor slots: the selected profile's editor and the in-progress
+    /// add-server dialog. Each holds its own draft, chain-target memo and probe
+    /// state, so neither can read the other's verdicts, options or pins while
+    /// both render in one frame.
+    existing: DraftSlot,
+    add: DraftSlot,
     import_open: bool,
     import_text: String,
     import_parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
@@ -1934,24 +2056,6 @@ pub struct ServersScreen {
     /// When the current status toast was set; the toast auto-clears once
     /// [`STATUS_TOAST_AUTO_CLEAR`] has elapsed (see `show_status_toast`).
     status_set_at: Option<Instant>,
-    tls_probe_domain: String,
-    tls_probe_ip: String,
-    tls_tool_output: Option<String>,
-    tls_tool_error: Option<String>,
-    /// Leaf SHA256 pin parsed from the last successful TLS probe output.
-    tls_probe_leaf_pin: Option<String>,
-    /// CA (name, pin) rows parsed from the last successful TLS probe output.
-    tls_probe_ca_pins: Vec<(String, String)>,
-    /// Whether the last TLS probe completed a handshake; gates the pin panel.
-    /// Cleared when a new probe starts or fails; pins render only for the
-    /// profile that produced them (see `tls_probe_profile`).
-    tls_probe_handshake_ok: bool,
-    /// Profile id whose probe produced `tls_probe_leaf_pin`; the pin panel
-    /// renders and Apply is reachable only while the editor targets that same
-    /// profile, so a pin can never be applied to a different node.
-    tls_probe_profile: Option<String>,
-    /// Whether the raw probe output window is open (drawn in `show_dialogs`).
-    show_tls_probe_output: bool,
     tool_job: Option<XrayToolJob>,
     /// The seeded text buffers the raw-JSON and PEM editors render from,
     /// keyed by the field's egui `Id` (per-field buffer identity, stable
@@ -2270,7 +2374,7 @@ impl ServersScreen {
                 match target.draft_kind() {
                     DraftKind::Add => {
                         let id = profile.id.clone();
-                        self.add_draft = None;
+                        self.add.draft = None;
                         uictx.servers.profiles.push(profile);
                         if uictx.servers.active.is_none() {
                             // No choice yet: the first row is the default
@@ -2334,7 +2438,7 @@ impl ServersScreen {
                             return;
                         };
                         uictx.servers.profiles[index] = profile;
-                        self.existing_draft = None;
+                        self.existing.draft = None;
                         self.profile_validation_report = None;
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndSaved)));
                         uictx.mark_dirty();
@@ -2447,19 +2551,41 @@ impl ServersScreen {
         Ok(())
     }
 
+    /// The editor slot `kind` names.
+    fn slot(&self, kind: DraftKind) -> &DraftSlot {
+        match kind {
+            DraftKind::Existing => &self.existing,
+            DraftKind::Add => &self.add,
+        }
+    }
+
+    /// The editor slot `kind` names, mutably.
+    fn slot_mut(&mut self, kind: DraftKind) -> &mut DraftSlot {
+        match kind {
+            DraftKind::Existing => &mut self.existing,
+            DraftKind::Add => &mut self.add,
+        }
+    }
+
     /// The open draft in `kind`'s slot, if any.
     fn draft(&self, kind: DraftKind) -> Option<&ProfileDraft> {
-        match kind {
-            DraftKind::Existing => self.existing_draft.as_ref(),
-            DraftKind::Add => self.add_draft.as_ref(),
-        }
+        self.slot(kind).draft()
     }
 
     /// The open draft in `kind`'s slot, mutably, if any.
     fn draft_mut(&mut self, kind: DraftKind) -> Option<&mut ProfileDraft> {
-        match kind {
-            DraftKind::Existing => self.existing_draft.as_mut(),
-            DraftKind::Add => self.add_draft.as_mut(),
+        self.slot_mut(kind).draft_mut()
+    }
+
+    /// The TLS probe state the Security tab renders for `target`: the slot that
+    /// target names, or the editor slot's when the stream carries no draft
+    /// identity of its own (a nested or read-only settings block shows the
+    /// editor's panel, and its own probe request is refused for want of an
+    /// identity).
+    fn probe_for_target(&mut self, target: Option<DraftTarget<'_>>) -> &mut TlsProbe {
+        match target {
+            Some(target) => &mut self.slot_mut(target.kind).probe,
+            None => &mut self.existing.probe,
         }
     }
 
@@ -2476,13 +2602,26 @@ impl ServersScreen {
     /// caller with no frame (the topbar chip's per-frame check) passes
     /// `false` and reads only a composition that ignores it.
     fn gate(&self, kind: DraftKind, busy: bool) -> Option<DraftGate> {
-        let draft = self.draft(kind)?;
-        Some(draft_gate(
-            draft,
-            &self.seeded_buffers,
-            self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
-            busy,
-        ))
+        self.draft(kind).map(|draft| {
+            draft.gate(
+                &self.seeded_buffers,
+                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
+                busy,
+            )
+        })
+    }
+
+    /// The change protocol for the selected profile's draft: an edit, a tool
+    /// application or a dismissal landed, so the draft's memoized validation no
+    /// longer covers it and the reported validation output — which described the
+    /// content before the edit — is dropped with it. Nothing then renders a
+    /// stale verdict or a stale log beside the edited profile; Validate-and-save
+    /// recomputes both. The add dialog keeps its report until its next attempt,
+    /// because that output is why its window is still open (see
+    /// [`ProfileDraft::edited`]).
+    fn draft_edited(&mut self, draft: &mut ProfileDraft) {
+        draft.edited();
+        self.profile_validation_report = None;
     }
 
     /// The profile a tool verdict writes into: the draft `target` names, at
@@ -2494,25 +2633,33 @@ impl ServersScreen {
             .map(|draft| &mut draft.profile)
     }
 
-    /// Advance the generation of the draft `target` names, so the memoized
-    /// validation sweeps the mutated profile on the next refresh and any
-    /// in-flight request for the older generation is dropped.
+    /// A tool verdict landed in the draft `target` names, so the draft's change
+    /// protocol runs: the memoized validation sweeps the mutated profile on the
+    /// next refresh and any in-flight request for the older generation is
+    /// dropped. The screen's validation report is left alone — it belongs to the
+    /// last Validate, not to a tool.
     fn advance_target_generation(&mut self, target: &ToolTarget) {
         if let Some(draft) = self.draft_mut(target.draft_kind())
             && draft.id == target.profile_id()
         {
-            draft.generation = draft.generation.wrapping_add(1);
+            draft.edited();
         }
     }
 
-    fn report_tool_error(&mut self, kind: XrayToolKind, error: String) {
+    /// Report a tool's failure where its own control renders: the probe's panel
+    /// for the TLS probe kinds, the derive dialog for the REALITY key, and the
+    /// status line otherwise.
+    fn report_tool_error(&mut self, target: &ToolTarget, kind: XrayToolKind, error: String) {
         match kind {
-            XrayToolKind::TlsPin => self.tls_tool_error = Some(error),
+            XrayToolKind::TlsPin => {
+                self.slot_mut(target.draft_kind()).probe.error = Some(error);
+            }
             XrayToolKind::TlsPing | XrayToolKind::TlsPingQuic => {
-                self.tls_tool_error = Some(error);
+                let probe = &mut self.slot_mut(target.draft_kind()).probe;
+                probe.error = Some(error);
                 // A failed probe leaves no current handshake to pin.
-                self.tls_probe_handshake_ok = false;
-                self.tls_probe_profile = None;
+                probe.handshake_ok = false;
+                probe.profile = None;
             }
             XrayToolKind::RealityPublicKey => {
                 if let Some(dialog) = &mut self.derive_dialog {
@@ -2542,8 +2689,11 @@ impl ServersScreen {
                         ProtocolSettings::Vless(settings) => settings.id = value.to_owned(),
                         ProtocolSettings::Vmess(settings) => settings.id = value.to_owned(),
                         _ => {
-                            return self
-                                .report_tool_error(kind, t(lang, Key::SrvUuidTargetNoId).into());
+                            return self.report_tool_error(
+                                target,
+                                kind,
+                                t(lang, Key::SrvUuidTargetNoId).into(),
+                            );
                         }
                     }
                     applied = true;
@@ -2612,9 +2762,9 @@ impl ServersScreen {
                     if let Some(profile) = self.profile_for_target_mut(target) {
                         if let Some(tls) = profile.outbound.stream.tls_settings.as_mut() {
                             tls.pinned_peer_cert_sha256 = value.clone();
-                            self.tls_tool_output =
-                                Some(t_fmt(lang, Key::SrvTlsPinComputedLeaf, &[&value]));
-                            self.tls_tool_error = None;
+                            let probe = &mut self.slot_mut(target.draft_kind()).probe;
+                            probe.output = Some(t_fmt(lang, Key::SrvTlsPinComputedLeaf, &[&value]));
+                            probe.error = None;
                             applied = true;
                             Ok(t(lang, Key::SrvTlsPinComputed).to_string())
                         } else {
@@ -2629,15 +2779,16 @@ impl ServersScreen {
             },
             XrayToolKind::TlsPing | XrayToolKind::TlsPingQuic => {
                 if output.contains("Handshake succeeded") {
-                    self.tls_probe_leaf_pin = leaf_pin_from_probe_output(&output);
-                    self.tls_probe_ca_pins = ca_pins_from_probe_output(&output);
-                    self.tls_probe_profile = Some(target.profile_id().to_owned());
-                    self.tls_probe_handshake_ok = true;
-                    self.tls_tool_output = Some(output);
-                    self.tls_tool_error = None;
+                    let probe = &mut self.slot_mut(target.draft_kind()).probe;
+                    probe.leaf_pin = leaf_pin_from_probe_output(&output);
+                    probe.ca_pins = ca_pins_from_probe_output(&output);
+                    probe.profile = Some(target.profile_id().to_owned());
+                    probe.handshake_ok = true;
+                    probe.output = Some(output);
+                    probe.error = None;
                     Ok(t(lang, Key::SrvTlsHandshakeSucceeded).to_string())
                 } else {
-                    self.tls_probe_handshake_ok = false;
+                    self.slot_mut(target.draft_kind()).probe.handshake_ok = false;
                     Err(t_fmt(lang, Key::SrvTlsProbeNoHandshake, &[&output.trim()]))
                 }
             }
@@ -2677,7 +2828,7 @@ impl ServersScreen {
                     self.set_status(StatusLine::ok(message));
                 }
             }
-            Err(error) => self.report_tool_error(kind, error),
+            Err(error) => self.report_tool_error(target, kind, error),
         }
     }
 
@@ -2699,10 +2850,12 @@ impl ServersScreen {
             Terminal::Answered(Ok(output)) => {
                 self.apply_tool_output(lang, &job.target, job.kind, output)
             }
-            Terminal::Answered(Err(error)) => self.report_tool_error(job.kind, error),
-            Terminal::Exited => {
-                self.report_tool_error(job.kind, t(lang, Key::SrvToolStoppedWithoutResult).into())
-            }
+            Terminal::Answered(Err(error)) => self.report_tool_error(&job.target, job.kind, error),
+            Terminal::Exited => self.report_tool_error(
+                &job.target,
+                job.kind,
+                t(lang, Key::SrvToolStoppedWithoutResult).into(),
+            ),
         }
     }
 
@@ -2717,7 +2870,7 @@ impl ServersScreen {
             && !ctx.servers.profiles.iter().any(|profile| &profile.id == id)
         {
             self.selected = None;
-            self.existing_draft = None;
+            self.existing.draft = None;
         }
         if self.selected.is_none() {
             self.selected = ctx
@@ -2990,7 +3143,7 @@ impl ServersScreen {
         }
         ui.separator();
         let mut add_proto: Option<Protocol> = None;
-        ui.add_enabled_ui(self.add_draft.is_none(), |ui| {
+        ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
             ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
                 for protocol in Protocol::ALL {
                     if ui.button(protocol.as_str()).clicked() {
@@ -3002,7 +3155,7 @@ impl ServersScreen {
         });
         if let Some(protocol) = add_proto {
             self.draft_tab = EditorTab::Basic;
-            self.add_draft = Some(ProfileDraft::add(ServerProfile::new(
+            self.add.draft = Some(ProfileDraft::add(ServerProfile::new(
                 t_fmt(lang, Key::SrvNewDraftName, &[&protocol.as_str()]),
                 OutboundModel::new(protocol),
             )));
@@ -3266,42 +3419,28 @@ impl ServersScreen {
         }) {
             self.derive_dialog = None;
         }
+        self.add.hold(draft);
         if self.delete_pending.is_none()
-            && draft_gate(
-                &draft,
-                &self.seeded_buffers,
-                self.profile_validation_in_progress(ProfileValidationOrigin::Draft),
-                false,
-            )
-            .changed_from_source
+            && self
+                .add
+                .draft()
+                .is_some_and(ProfileDraft::changed_from_source)
         {
             self.stage_leave(LeaveAction::CloseAdd);
-            self.add_draft = Some(draft);
         } else {
-            self.seeded_buffers.evict_owned(&draft.id);
+            self.add.close(&mut self.seeded_buffers);
         }
     }
 
-    /// Revert the existing editor draft to its persisted profile: drop the
-    /// draft, the seeded raw-JSON/PEM editor buffers, and the transient
-    /// TLS-probe state tied to it (the cleanup the editor's Discard button
-    /// performs).
+    /// Revert the existing editor draft to its persisted profile: the draft, the
+    /// probe result tied to it and the seeded raw-JSON/PEM editor buffers all go
+    /// together (the cleanup the editor's Discard button performs), so nothing
+    /// keeps showing the discarded draft. The derive dialog goes with it — its
+    /// apply would reference a draft that no longer exists.
     fn discard_existing_draft(&mut self) {
-        self.existing_draft = None;
+        self.existing.revert(&mut self.seeded_buffers);
         self.derive_dialog = None;
-        self.tls_tool_error = None;
-        self.tls_tool_output = None;
-        self.tls_probe_handshake_ok = false;
-        self.tls_probe_leaf_pin = None;
-        self.tls_probe_ca_pins.clear();
-        self.tls_probe_profile = None;
-        self.show_tls_probe_output = false;
         self.profile_validation_report = None;
-        // The draft reverts to the persisted profile, so seeded editor
-        // buffers (keyed by profile id) would show the discarded text; drop
-        // them so the editors re-seed from the reverted draft. Click-time
-        // only.
-        self.seeded_buffers.clear();
     }
 
     /// Discard resolution of the leave modal: drop the staged action's
@@ -3313,16 +3452,10 @@ impl ServersScreen {
                 self.discard_existing_draft();
                 self.selected = Some(id);
             }
-            LeaveAction::CloseAdd => {
-                if let Some(draft) = self.add_draft.take() {
-                    self.seeded_buffers.evict_owned(&draft.id);
-                }
-            }
+            LeaveAction::CloseAdd => self.add.close(&mut self.seeded_buffers),
             LeaveAction::Quit => {
                 self.discard_existing_draft();
-                if let Some(draft) = self.add_draft.take() {
-                    self.seeded_buffers.evict_owned(&draft.id);
-                }
+                self.add.close(&mut self.seeded_buffers);
                 self.quit_resume = true;
             }
         }
@@ -3668,8 +3801,8 @@ impl ServersScreen {
         };
 
         if self
-            .existing_draft
-            .as_ref()
+            .existing
+            .draft()
             .is_none_or(|draft| draft.profile.id != id)
         {
             let Some(persisted) = ctx.servers.profiles.iter().find(|profile| profile.id == id)
@@ -3677,7 +3810,7 @@ impl ServersScreen {
                 return;
             };
             match ProfileDraft::existing(persisted) {
-                Ok(draft) => self.existing_draft = Some(draft),
+                Ok(draft) => self.existing.hold(draft),
                 Err(error) => {
                     self.set_status(StatusLine::err(t_fmt(
                         lang,
@@ -3693,7 +3826,7 @@ impl ServersScreen {
             self.profile_validation_report = None;
         }
 
-        let Some(mut draft) = self.existing_draft.take() else {
+        let Some(mut draft) = self.existing.take() else {
             return;
         };
         // The validation blocks below — the dot, the Advanced tab's inline
@@ -3704,7 +3837,7 @@ impl ServersScreen {
         // anything renders. Content edits bump the generation after the tab
         // content and refresh again below; idle frames hit only the cheap
         // freshness check here and there.
-        refresh_editor_validation(&mut draft, lang);
+        draft.refresh(lang);
         // The two gate facts that move without a draft edit: the profile
         // validation job (read here so the dot, the tabs' gates and the
         // action row all see one value) and the busy window.
@@ -3723,7 +3856,7 @@ impl ServersScreen {
             // raw-JSON buffer holds uncommitted text (the same condition that
             // enables Discard). Only the existing draft gets the dot — an add
             // draft is unsaved by definition.
-            if draft_gate(&draft, &self.seeded_buffers, validating, busy).dirty() {
+            if draft.gate(&self.seeded_buffers, validating, busy).dirty() {
                 ui.add(
                     egui::Label::new(RichText::new("●").color(status_colors_of(ui).warn))
                         .selectable(false),
@@ -3849,7 +3982,7 @@ impl ServersScreen {
                                 set_key: (*ctx.model_generation, ctx.servers.profiles.len()),
                                 finalmask_errors,
                                 stream_sockopt_errors,
-                                dialer_proxy_options: &mut self.dialer_proxy_options,
+                                dialer_proxy_options: &mut self.existing.chain_options,
                                 buffers: &mut self.seeded_buffers,
                             },
                         )
@@ -3881,19 +4014,18 @@ impl ServersScreen {
             {
                 quic.retired_udp_hop = None;
             }
-            draft.generation = draft.generation.wrapping_add(1);
-            self.profile_validation_report = None;
+            self.draft_edited(&mut draft);
         }
-        // Content edits bumped the generation above; refresh the draft's
+        // Content edits ran the change protocol above; refresh the draft's
         // memoized verdicts (validation errors, finalmask issues,
         // changed-from-source) once for the new generation. Idle frames hit
         // the cheap freshness check only.
-        refresh_editor_validation(&mut draft, lang);
+        draft.refresh(lang);
         let Some(cached) = draft.validation.as_ref() else {
             // The refresh above leaves a memo for the generation it was
             // handed; keep the draft so an impossible miss cannot lose the
             // editor's state, and render nothing further.
-            self.existing_draft = Some(draft);
+            self.existing.hold(draft);
             return;
         };
         let validation_errors = &cached.rendered.blocking;
@@ -3969,7 +4101,7 @@ impl ServersScreen {
         // available while a raw buffer of this profile holds text that never
         // parsed into the draft, or the user would be stuck with the error
         // text.
-        let gate = draft_gate(&draft, &self.seeded_buffers, validating, busy);
+        let gate = draft.gate(&self.seeded_buffers, validating, busy);
         let mut validate_clicked = false;
         let mut discard_clicked = false;
         ui.horizontal(|ui| {
@@ -3996,8 +4128,7 @@ impl ServersScreen {
         // writes the profile without the key.
         if dismissed_retired_key {
             draft.profile.outbound.retired_proxy_settings = None;
-            draft.generation = draft.generation.wrapping_add(1);
-            self.profile_validation_report = None;
+            self.draft_edited(&mut draft);
         }
         if dismissed_retired_hop
             && let Some(quic) = draft
@@ -4009,14 +4140,13 @@ impl ServersScreen {
                 .and_then(|finalmask| finalmask.quic_params.as_mut())
         {
             quic.retired_udp_hop = None;
-            draft.generation = draft.generation.wrapping_add(1);
-            self.profile_validation_report = None;
+            self.draft_edited(&mut draft);
         }
         // The whole-profile snapshot is needed only when the user actually
         // clicks "Validate and save", not on every repaint.
         let validation_profile = validate_clicked.then(|| draft.profile.clone());
         let validation_target = validate_clicked.then(|| draft.target());
-        self.existing_draft = Some(draft);
+        self.existing.hold(draft);
         if validate_clicked
             && let (Some(validation_profile), Some(validation_target)) =
                 (validation_profile, validation_target)
@@ -6047,13 +6177,13 @@ impl ServersScreen {
                         let _ = widgets::text_field(
                             ui,
                             "domain",
-                            &mut self.tls_probe_domain,
+                            &mut self.probe_for_target(target).domain,
                             t(lang, Key::SrvTlsProbeDomainHint),
                         );
                         let _ = widgets::text_field(
                             ui,
                             t(lang, Key::SrvTlsProbeIpOverride),
-                            &mut self.tls_probe_ip,
+                            &mut self.probe_for_target(target).ip,
                             "optional",
                         );
                         ui.horizontal(|ui| {
@@ -6066,7 +6196,7 @@ impl ServersScreen {
                                 // while the server name is the SNI. Clearing
                                 // it would wipe a paired override on every
                                 // SNI fill.
-                                self.tls_probe_domain = s.server_name.clone();
+                                self.probe_for_target(target).domain = s.server_name.clone();
                             }
                             if let Some(address) = server_address
                                 && ui.small_button(t(lang, Key::SrvUseServerAddress)).clicked()
@@ -6074,8 +6204,9 @@ impl ServersScreen {
                                 // A fill re-targets the probe: replace the
                                 // domain and drop a stale IP override so the
                                 // next handshake dials exactly this address.
-                                self.tls_probe_domain = address.to_owned();
-                                self.tls_probe_ip.clear();
+                                let probe = self.probe_for_target(target);
+                                probe.domain = address.to_owned();
+                                probe.ip.clear();
                             }
                         });
                         if ui
@@ -6088,15 +6219,16 @@ impl ServersScreen {
                         {
                             // A fresh probe invalidates any previous pin
                             // panel until its result lands.
-                            self.tls_probe_handshake_ok = false;
-                            self.tls_probe_profile = None;
-                            let domain = self.tls_probe_domain.trim().to_string();
-                            let ip = self.tls_probe_ip.trim().to_string();
+                            let probe = self.probe_for_target(target);
+                            probe.handshake_ok = false;
+                            probe.profile = None;
+                            let domain = probe.domain.trim().to_string();
+                            let ip = probe.ip.trim().to_string();
                             if domain.is_empty() {
-                                self.tls_tool_error =
+                                self.probe_for_target(target).error =
                                     Some(t(lang, Key::SrvTlsProbeDomainRequired).into());
                             } else if !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_err() {
-                                self.tls_tool_error =
+                                self.probe_for_target(target).error =
                                     Some(t(lang, Key::SrvTlsProbeIpInvalid).into());
                             } else {
                                 let mut args = vec!["tls".into(), "ping".into()];
@@ -6120,15 +6252,16 @@ impl ServersScreen {
                             .on_hover_text(t(lang, Key::SrvProbeQuicHint))
                             .clicked()
                         {
-                            self.tls_probe_handshake_ok = false;
-                            self.tls_probe_profile = None;
-                            let domain = self.tls_probe_domain.trim().to_string();
-                            let ip = self.tls_probe_ip.trim().to_string();
+                            let probe = self.probe_for_target(target);
+                            probe.handshake_ok = false;
+                            probe.profile = None;
+                            let domain = probe.domain.trim().to_string();
+                            let ip = probe.ip.trim().to_string();
                             if domain.is_empty() {
-                                self.tls_tool_error =
+                                self.probe_for_target(target).error =
                                     Some(t(lang, Key::SrvTlsProbeDomainRequired).into());
                             } else if !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_err() {
-                                self.tls_tool_error =
+                                self.probe_for_target(target).error =
                                     Some(t(lang, Key::SrvTlsProbeIpInvalid).into());
                             } else {
                                 self.request_tool(
@@ -6140,18 +6273,22 @@ impl ServersScreen {
                                 );
                             }
                         }
-                        let probe_is_for_target = self
-                            .tls_probe_profile
-                            .as_deref()
-                            .is_some_and(|id| target.is_some_and(|target| target.profile_id == id));
-                        if self.tls_probe_handshake_ok && probe_is_for_target {
-                            match &self.tls_probe_leaf_pin {
+                        // The pins belong to the draft whose own probe produced
+                        // them: a nested or read-only rendering of this tab has
+                        // no draft of its own, so it never shows a pin.
+                        let probe = &self
+                            .slot(target.map_or(DraftKind::Existing, |target| target.kind))
+                            .probe;
+                        let pins_are_this_draft = probe.handshake_ok
+                            && probe.profile.as_deref() == target.map(|target| target.profile_id);
+                        if pins_are_this_draft {
+                            match probe.leaf_pin.as_deref() {
                                 Some(pin) => {
                                     let mut apply_clicked = false;
                                     ui.horizontal(|ui| {
                                         ui.label(t(lang, Key::SrvLeafPin));
                                         if ui.small_button(t(lang, Key::SrvCopyPin)).clicked() {
-                                            ui.ctx().copy_text(pin.clone());
+                                            ui.ctx().copy_text(pin.to_owned());
                                         }
                                         apply_clicked = ui
                                             .add_enabled(
@@ -6164,9 +6301,9 @@ impl ServersScreen {
                                     // the 64-hex value never collides with the
                                     // row controls.
                                     ui.monospace(pin);
-                                    if !self.tls_probe_ca_pins.is_empty() {
+                                    if !probe.ca_pins.is_empty() {
                                         ui.label(t(lang, Key::SrvCaPins));
-                                        for (name, ca_pin) in &self.tls_probe_ca_pins {
+                                        for (name, ca_pin) in &probe.ca_pins {
                                             ui.horizontal(|ui| {
                                                 ui.label(name);
                                                 if ui
@@ -6187,7 +6324,7 @@ impl ServersScreen {
                                         // Owned on the click path only, so the
                                         // &mut self calls below do not overlap
                                         // the borrow of the pinned string.
-                                        let pin = pin.clone();
+                                        let pin = pin.to_owned();
                                         if !pinned_peer_cert_sha256_valid(&pin) {
                                             self.set_status(StatusLine::err(t(
                                                 lang,
@@ -6223,13 +6360,13 @@ impl ServersScreen {
                         ui.weak(t(lang, Key::SrvTlsProbeRunning));
                     });
                 }
-                if let Some(error) = &self.tls_tool_error {
+                if let Some(error) = &self.probe_for_target(target).error {
                     ui.colored_label(status_colors_of(ui).err, error);
                 }
-                if self.tls_tool_output.is_some()
+                if self.probe_for_target(target).output.is_some()
                     && ui.small_button(t(lang, Key::SrvShowProbeOutput)).clicked()
                 {
-                    self.show_tls_probe_output = true;
+                    self.probe_for_target(target).show_output = true;
                 }
                 changed |= widgets::text_field(
                     ui,
@@ -6761,7 +6898,7 @@ impl ServersScreen {
     // ---------- dialogs ----------
 
     fn show_add_draft(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
-        let Some(mut draft) = self.add_draft.take() else {
+        let Some(mut draft) = self.add.take() else {
             return;
         };
         let lang = uictx.settings.language;
@@ -6782,10 +6919,10 @@ impl ServersScreen {
         };
         window.show(ctx, |ui| {
             // The validation blocks inside render from the draft's memoized
-            // verdicts (mirrors show_editor): refresh before the content so a
-            // fresh dialog, a tool application, or a language switch renders
-            // same-frame accurate verdicts.
-            refresh_editor_validation(&mut draft, lang);
+            // verdicts, so refresh before the content: a fresh dialog, a tool
+            // application, or a language switch renders same-frame accurate
+            // verdicts.
+            draft.refresh(lang);
             ui.add_enabled_ui(!validating, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(t(lang, Key::SrvName));
@@ -6803,17 +6940,20 @@ impl ServersScreen {
                     }
                 });
                 ui.separator();
-                // The borrowed identity the three tabs below take, built once
-                // per frame from the draft's own fields (see [`DraftTarget`]).
-                let target = DraftTarget {
-                    kind: DraftKind::Add,
-                    profile_id: draft.id.as_str(),
-                    generation: draft.generation,
-                };
                 egui::ScrollArea::vertical()
                     .id_salt("servers.add-draft.scroll")
                     .max_height(430.0)
                     .show(ui, |ui| {
+                        // The borrowed identity the tabs below take, built from
+                        // the draft's own fields (see [`DraftTarget`]) inside
+                        // the frame that renders them: the change protocol after
+                        // the tabs mutates the draft as a whole, so the borrow
+                        // of its id ends with the tab that reads it.
+                        let target = DraftTarget {
+                            kind: DraftKind::Add,
+                            profile_id: draft.id.as_str(),
+                            generation: draft.generation,
+                        };
                         let changed = match self.draft_tab {
                             EditorTab::Basic => {
                                 let inline_errors: &[String] = draft
@@ -6890,30 +7030,30 @@ impl ServersScreen {
                                         ),
                                         finalmask_errors,
                                         stream_sockopt_errors,
-                                        dialer_proxy_options: &mut self.add_dialer_proxy_options,
+                                        dialer_proxy_options: &mut self.add.chain_options,
                                         buffers: &mut self.seeded_buffers,
                                     },
                                 )
                             }
                         };
-                        // The draft changed this frame; bump its generation so
-                        // the memoized validation below recomputes (mirrors
-                        // show_editor).
+                        // The draft changed this frame: its change protocol runs
+                        // so the memoized validation below recomputes. The
+                        // reported validation output stays until the next
+                        // attempt — it is why this dialog is still open.
                         if changed {
-                            draft.generation = draft.generation.wrapping_add(1);
+                            draft.edited();
                         }
                     });
 
-                // Content edits bumped the generation above; refresh the
-                // memoized verdicts once for the new generation (mirrors the
-                // editor path).
-                refresh_editor_validation(&mut draft, lang);
+                // Content edits ran the change protocol above; refresh the
+                // memoized verdicts once for the new generation.
+                draft.refresh(lang);
                 let Some(cached) = draft.validation.as_ref() else {
                     return;
                 };
                 let errors = &cached.rendered.blocking;
                 let warnings = &cached.rendered.advisory;
-                let gate = draft_gate(&draft, &self.seeded_buffers, validating, core_busy);
+                let gate = draft.gate(&self.seeded_buffers, validating, core_busy);
                 if !errors.is_empty() {
                     ui.separator();
                     ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvCompleteRequired));
@@ -6994,15 +7134,15 @@ impl ServersScreen {
                 Some(draft.target()),
                 uictx,
             ) {
-                Ok(()) => self.add_draft = Some(draft),
+                Ok(()) => self.add.hold(draft),
                 Err(error) => {
                     self.profile_validation_report = Some(error.clone());
                     self.set_status(StatusLine::err(error));
-                    self.add_draft = Some(draft);
+                    self.add.hold(draft);
                 }
             }
         } else if validating || (open && !cancel) {
-            self.add_draft = Some(draft);
+            self.add.hold(draft);
         } else {
             // The draft was closed or cancelled without commit: the close
             // guard clears a derive dialog targeting it, stages the leave
@@ -7022,20 +7162,26 @@ impl ServersScreen {
     /// allocation on the Servers screen's idle path. While the
     /// window is open the transcript is only borrowed for painting, and the
     /// copy button clones it at click time.
-    fn probe_output_window(&mut self, ctx: &egui::Context, lang: Language) {
-        if !self.show_tls_probe_output {
+    /// The probe output window of `kind`'s slot: each slot's own panel opens
+    /// its own window, so both editors can show a transcript in one frame. The
+    /// window's egui id carries the slot, or the two would share open/close
+    /// state.
+    fn probe_output_window(&mut self, ctx: &egui::Context, lang: Language, kind: DraftKind) {
+        let probe = &mut self.slot_mut(kind).probe;
+        if !probe.show_output {
             return;
         }
         // No transcript to show (e.g. a discard cleared it while the window
         // was open): clear the flag so this branch stops running — the
         // open/close gate above keeps idle frames off the transcript.
-        let Some(output) = &self.tls_tool_output else {
-            self.show_tls_probe_output = false;
+        let Some(output) = &probe.output else {
+            probe.show_output = false;
             return;
         };
         let mut open = true;
         let mut close_clicked = false;
         egui::Window::new(t(lang, Key::SrvProbeOutputTitle))
+            .id(egui::Id::new(("servers.tls-probe-output", kind)))
             .collapsible(false)
             .resizable(true)
             .default_size([560.0, 380.0])
@@ -7059,12 +7205,14 @@ impl ServersScreen {
         if close_clicked {
             open = false;
         }
-        self.show_tls_probe_output = open;
+        self.slot_mut(kind).probe.show_output = open;
     }
 
     fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
         let lang = uictx.settings.language;
-        self.probe_output_window(ctx, lang);
+        for kind in [DraftKind::Existing, DraftKind::Add] {
+            self.probe_output_window(ctx, lang, kind);
+        }
         self.show_add_draft(ctx, uictx);
         // Import links.
         if self.import_open {
@@ -7613,11 +7761,10 @@ mod tests {
         EditorValidationCache, EditorValidationFindings, EditorValidationRender, FINGERPRINTS,
         FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft, RawField,
         Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
-        ServersScreen, SockoptUsage, StatusLine, basic_tab_inline_verdict, drag_scroll_delta,
-        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor,
-        refresh_editor_validation, reorder_target, server_list_row, sockopt_findings,
-        status_colors_of, status_toast_expired,
+        ServersScreen, SockoptUsage, StatusLine, TlsProbe, basic_tab_inline_verdict,
+        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
+        server_list_row, sockopt_findings, status_colors_of, status_toast_expired,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -7702,7 +7849,8 @@ mod tests {
     /// The editor's open draft.
     fn open_draft(screen: &ServersScreen) -> &ProfileDraft {
         screen
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor holds a draft")
     }
@@ -10337,7 +10485,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         set_key: (0, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
-                        dialer_proxy_options: &mut screen.dialer_proxy_options,
+                        dialer_proxy_options: &mut screen.existing.chain_options,
                         buffers: &mut screen.seeded_buffers,
                     },
                 );
@@ -10429,14 +10577,15 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         }));
         let stream_for_ui = Rc::clone(&stream);
-        let screen = Rc::new(RefCell::new(ServersScreen {
-            tls_probe_leaf_pin: Some(leaf.to_owned()),
-            tls_tool_output: Some(
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        screen.borrow_mut().existing.probe = TlsProbe {
+            leaf_pin: Some(leaf.to_owned()),
+            output: Some(
                 "TLS ping:  example.com:443\nPinging without SNI\nHandshake succeeded\n\
                  TLS Version:  TLS 1.3\nCert's leaf SHA256:\t7f9c2b3d4e5f60718293a4b5c6d7e8f9"
                     .to_owned(),
             ),
-            tls_probe_ca_pins: vec![
+            ca_pins: vec![
                 (
                     "DigiCert TLS RSA SHA256 2020 CA1".to_owned(),
                     "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
@@ -10446,10 +10595,10 @@ Authentication: ML-KEM-768, Post-Quantum
                     "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2".to_owned(),
                 ),
             ],
-            tls_probe_handshake_ok: true,
-            tls_probe_profile: Some("profile-1".to_owned()),
+            handshake_ok: true,
+            profile: Some("profile-1".to_owned()),
             ..Default::default()
-        }));
+        };
         let screen_for_ui = Rc::clone(&screen);
         // The TLS-arm informational hint rows push the probe
         // panel's lower buttons past the default 800x600 kittest viewport;
@@ -10465,9 +10614,11 @@ Authentication: ML-KEM-768, Post-Quantum
                     None,
                     &[],
                 );
-                screen_for_ui
-                    .borrow_mut()
-                    .probe_output_window(ui.ctx(), Language::En);
+                screen_for_ui.borrow_mut().probe_output_window(
+                    ui.ctx(),
+                    Language::En,
+                    DraftKind::Existing,
+                );
             });
 
         harness.get_by_label("Probe TLS certificate").click();
@@ -10511,11 +10662,12 @@ Authentication: ML-KEM-768, Post-Quantum
 
     #[test]
     fn probe_pin_panel_reports_when_a_successful_handshake_has_no_pin() {
-        let screen = Rc::new(RefCell::new(ServersScreen {
-            tls_probe_handshake_ok: true,
-            tls_probe_profile: Some("profile-1".to_owned()),
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        screen.borrow_mut().existing.probe = TlsProbe {
+            handshake_ok: true,
+            profile: Some("profile-1".to_owned()),
             ..Default::default()
-        }));
+        };
         let screen_for_ui = Rc::clone(&screen);
         let mut stream = StreamModel {
             security: Security::Tls,
@@ -10540,12 +10692,13 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn probe_pin_panel_hides_pins_for_another_profile() {
         let leaf = "7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9";
-        let screen = Rc::new(RefCell::new(ServersScreen {
-            tls_probe_leaf_pin: Some(leaf.to_owned()),
-            tls_probe_handshake_ok: true,
-            tls_probe_profile: Some("profile-1".to_owned()),
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        screen.borrow_mut().existing.probe = TlsProbe {
+            leaf_pin: Some(leaf.to_owned()),
+            handshake_ok: true,
+            profile: Some("profile-1".to_owned()),
             ..Default::default()
-        }));
+        };
         let screen_for_ui = Rc::clone(&screen);
         let stream = Rc::new(RefCell::new(StreamModel {
             security: Security::Tls,
@@ -10594,12 +10747,13 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         }));
         let stream_for_ui = Rc::clone(&stream);
-        let screen = Rc::new(RefCell::new(ServersScreen {
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        screen.borrow_mut().existing.probe = TlsProbe {
             // A stale override from an earlier probe must not survive the
             // fill: the next handshake would dial the old IP otherwise.
-            tls_probe_ip: "9.9.9.9".into(),
+            ip: "9.9.9.9".into(),
             ..Default::default()
-        }));
+        };
         let screen_for_ui = Rc::clone(&screen);
         let mut harness = Harness::new_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
@@ -10617,8 +10771,8 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.get_by_label("Use server address:port").click();
         harness.run();
 
-        assert_eq!(screen.borrow().tls_probe_domain, "1.2.3.4:8443");
-        assert!(screen.borrow().tls_probe_ip.is_empty());
+        assert_eq!(screen.borrow().existing.probe.domain, "1.2.3.4:8443");
+        assert!(screen.borrow().existing.probe.ip.is_empty());
     }
 
     #[test]
@@ -11219,7 +11373,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     set_key: (0, 0),
                     finalmask_errors: &[],
                     stream_sockopt_errors: &[],
-                    dialer_proxy_options: &mut screen.dialer_proxy_options,
+                    dialer_proxy_options: &mut screen.existing.chain_options,
                     buffers: &mut screen.seeded_buffers,
                 },
             );
@@ -11248,7 +11402,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         set_key: (0, 0),
                         finalmask_errors: &[],
                         stream_sockopt_errors: &[],
-                        dialer_proxy_options: &mut screen.dialer_proxy_options,
+                        dialer_proxy_options: &mut screen.existing.chain_options,
                         buffers: &mut screen.seeded_buffers,
                     },
                 );
@@ -11480,7 +11634,7 @@ Authentication: ML-KEM-768, Post-Quantum
     /// mutate the profile and bump the generation so the memoized
     /// validation recomputes on the next frame.
     fn edit_existing_draft(screen: &mut ServersScreen) {
-        let draft = screen.existing_draft.as_mut().unwrap();
+        let draft = screen.existing.draft.as_mut().unwrap();
         draft.profile.name.push('-');
         draft.generation = draft.generation.wrapping_add(1);
     }
@@ -11515,11 +11669,11 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         let state = harness.state();
         assert!(
-            state.0.existing_draft.is_some(),
+            state.0.existing.draft.is_some(),
             "Discard must keep the editor open with a fresh draft"
         );
         assert_eq!(
-            state.0.existing_draft.as_ref().unwrap().profile.name,
+            state.0.existing.draft.as_ref().unwrap().profile.name,
             tokyo.name,
             "the draft must revert to the persisted profile"
         );
@@ -11551,7 +11705,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the selection must not switch while the modal is staged"
         );
         assert!(
-            state.0.existing_draft.is_some(),
+            state.0.existing.draft.is_some(),
             "the draft must survive staging"
         );
         assert!(
@@ -11574,7 +11728,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Cancel must not switch the selection"
         );
         assert!(
-            state.0.existing_draft.is_some(),
+            state.0.existing.draft.is_some(),
             "Cancel must keep the draft"
         );
         assert!(
@@ -11616,7 +11770,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Discard must switch the selection"
         );
         assert_eq!(
-            state.0.existing_draft.as_ref().unwrap().profile.id,
+            state.0.existing.draft.as_ref().unwrap().profile.id,
             osaka.id,
             "the editor must reopen on the newly selected profile"
         );
@@ -11639,7 +11793,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // the list stays clickable behind it — a row click staged a Select
         // while the modal's Save must target the add draft.
         let added = ServerProfile::new("Added", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(rendered_add_draft(&added, true));
+        screen.add.draft = Some(rendered_add_draft(&added, true));
         screen.leave_pending = Some(LeaveAction::Select(osaka.id));
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11758,7 +11912,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "closing the add dialog with a dirty draft must stage CloseAdd"
         );
         assert_eq!(
-            screen.add_draft.as_ref().map(|d| d.id.as_str()),
+            screen.add.draft.as_ref().map(|d| d.id.as_str()),
             Some(draft.id.as_str()),
             "the staged draft must stay in the dialog"
         );
@@ -11777,7 +11931,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a clean add draft must not stage the leave modal"
         );
         assert!(
-            screen.add_draft.is_none(),
+            screen.add.draft.is_none(),
             "a clean add draft must be dropped on close"
         );
     }
@@ -11808,7 +11962,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "closing the add window with a dirty draft must stage CloseAdd"
         );
         assert_eq!(
-            screen.add_draft.as_ref().map(|d| d.id.as_str()),
+            screen.add.draft.as_ref().map(|d| d.id.as_str()),
             Some(draft.id.as_str()),
             "the staged draft must stay in the dialog until the modal resolves"
         );
@@ -11823,22 +11977,22 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut draft = draft_for(&tokyo);
         draft.profile = edited;
         draft.generation = 3;
-        screen.existing_draft = Some(draft);
+        screen.existing.draft = Some(draft);
         assert!(
             !screen.unsaved_changes(),
             "a fresh draft carries no memo and is never dirty"
         );
-        screen.existing_draft.as_mut().unwrap().validation = Some(clean_memo(3, false));
+        screen.existing.draft.as_mut().unwrap().validation = Some(clean_memo(3, false));
         assert!(
             !screen.unsaved_changes(),
             "a fresh memo must be authoritative"
         );
-        screen.existing_draft.as_mut().unwrap().generation = 4;
+        screen.existing.draft.as_mut().unwrap().generation = 4;
         assert!(
             screen.unsaved_changes(),
             "a stale memo must recompute the flag inline (same-frame accuracy)"
         );
-        screen.existing_draft.as_mut().unwrap().validation = Some(clean_memo(4, false));
+        screen.existing.draft.as_mut().unwrap().validation = Some(clean_memo(4, false));
         screen.seeded_buffers.json_mut().insert(
             egui::Id::new("raw-field"),
             JsonBuf {
@@ -11857,7 +12011,7 @@ Authentication: ML-KEM-768, Post-Quantum
         screen.seeded_buffers.clear();
         let new_profile =
             ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(rendered_add_draft(&new_profile, true));
+        screen.add.draft = Some(rendered_add_draft(&new_profile, true));
         assert!(
             screen.unsaved_changes(),
             "a dirty add draft must count as unsaved"
@@ -11872,7 +12026,7 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo.clone());
         let mut draft = draft_for(&tokyo);
         draft.generation = 7;
-        screen.existing_draft = Some(draft);
+        screen.existing.draft = Some(draft);
         screen.leave_pending = Some(LeaveAction::Select("some-other-id".into()));
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11894,7 +12048,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a rejected validation must cancel the staged leave action"
         );
         assert!(
-            screen.existing_draft.is_some(),
+            screen.existing.draft.is_some(),
             "the editor must stay open with the draft on rejection"
         );
         assert_eq!(
@@ -11917,11 +12071,11 @@ Authentication: ML-KEM-768, Post-Quantum
         draft.profile = edited.clone();
         draft.generation = 3;
         draft.validation = Some(clean_memo(3, true));
-        screen.existing_draft = Some(draft);
+        screen.existing.draft = Some(draft);
         // The add draft stays dirty after the existing draft commits: the
         // quit must remain staged for a second Save.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(rendered_add_draft(&add, true));
+        screen.add.draft = Some(rendered_add_draft(&add, true));
         screen.leave_pending = Some(LeaveAction::Quit);
         let (tx, rx) = tokio::sync::oneshot::channel();
         screen.profile_validation_request = Request::reply(rx);
@@ -11945,7 +12099,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         assert!(!screen.take_quit_resume(), "the quit must not resume yet");
         assert!(
-            screen.existing_draft.is_none(),
+            screen.existing.draft.is_none(),
             "the existing draft must be committed"
         );
         // The add draft commits next: no dirty draft remains, so the quit
@@ -11992,16 +12146,16 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo.clone());
         let mut draft = draft_for(&tokyo);
         draft.validation = Some(clean_memo(0, true));
-        screen.existing_draft = Some(draft);
+        screen.existing.draft = Some(draft);
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(rendered_add_draft(&add, true));
+        screen.add.draft = Some(rendered_add_draft(&add, true));
         screen.discard_leave_action(LeaveAction::Quit);
         assert!(
-            screen.existing_draft.is_none(),
+            screen.existing.draft.is_none(),
             "Quit discard must drop the existing draft"
         );
         assert!(
-            screen.add_draft.is_none(),
+            screen.add.draft.is_none(),
             "Quit discard must drop the add draft"
         );
         assert!(
@@ -12018,18 +12172,18 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo.clone());
         let mut draft = draft_for(&tokyo);
         draft.validation = Some(clean_memo(0, true));
-        screen.existing_draft = Some(draft);
+        screen.existing.draft = Some(draft);
         // An open add dialog is independent of the selection switch: the
         // Select discard reverts the existing draft but keeps the add draft.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
-        screen.add_draft = Some(ProfileDraft::add(add.clone()));
+        screen.add.draft = Some(ProfileDraft::add(add.clone()));
         screen.discard_leave_action(LeaveAction::Select("osaka-target-id".into()));
         assert!(
-            screen.existing_draft.is_none(),
+            screen.existing.draft.is_none(),
             "Select discard must drop the existing draft"
         );
         assert_eq!(
-            screen.add_draft.as_ref().map(|d| d.id.as_str()),
+            screen.add.draft.as_ref().map(|d| d.id.as_str()),
             Some(add.id.as_str()),
             "Select discard must keep the add draft"
         );
@@ -12084,7 +12238,8 @@ Authentication: ML-KEM-768, Post-Quantum
     fn editor_action_row_renders_the_gate_fact_combinations() {
         fn install(screen: &mut ServersScreen, profile: &ServerProfile, source: serde_json::Value) {
             let generation = screen
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .map_or(1, |draft| draft.generation.wrapping_add(1));
             let mut draft = draft_for(profile);
@@ -12092,7 +12247,7 @@ Authentication: ML-KEM-768, Post-Quantum
             draft.generation = generation;
             // Installed behind the editor's back: no memo covers the new
             // generation, so the next frame sweeps it.
-            screen.existing_draft = Some(draft);
+            screen.existing.draft = Some(draft);
         }
 
         let clean = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
@@ -12235,7 +12390,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut draft = draft_for(&profile);
         draft.generation = 1;
 
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let swept = draft
             .validation
             .as_ref()
@@ -12253,7 +12408,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // keeps the sweep it made, and the strings it renders stay the ones
         // those findings produce (no re-validation, no re-render).
         draft.profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let reused = draft.validation.as_ref().expect("the memo stays populated");
         assert_eq!(
             codes_of(&reused.findings.blocking),
@@ -12269,7 +12424,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // A moved generation sweeps the profile as it is now and renders it.
         draft.baseline = serde_json::to_value(&draft.profile).expect("the fixture serializes");
         draft.generation = 2;
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let reswept = draft.validation.as_ref().expect("the memo stays populated");
         assert!(
             reswept.findings.blocking.is_empty(),
@@ -12318,7 +12473,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // One edit that adds a second invalid item: the next sweep carries
         // both verdicts in model order, and the second renders inline.
         let state = harness.state_mut();
-        let draft = state.0.existing_draft.as_mut().unwrap();
+        let draft = state.0.existing.draft.as_mut().unwrap();
         let FinalmaskTcpMask::HeaderCustom { settings, .. } = &mut draft
             .profile
             .outbound
@@ -12339,7 +12494,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let generation = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor keeps the edited draft")
             .generation;
@@ -12401,7 +12557,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = unsaved_harness(rig);
         harness.run();
         assert!(
-            harness.state().0.existing_draft.is_some(),
+            harness.state().0.existing.draft.is_some(),
             "a profile with the retired key must stay editable"
         );
         assert!(
@@ -12444,7 +12600,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             state
                 .0
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .expect("the editor stays open")
                 .profile
@@ -12511,7 +12668,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let state = harness.state();
         let draft = state
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open");
         assert_eq!(
@@ -12580,7 +12738,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -12627,7 +12786,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .expect("the editor stays open")
                 .profile
@@ -12660,7 +12820,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let built_for = harness
             .state()
             .0
-            .dialer_proxy_options
+            .existing
+            .chain_options
             .as_ref()
             .expect("the first Advanced frame builds the chain-target options once")
             .generation;
@@ -12671,7 +12832,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let options = harness
             .state()
             .0
-            .dialer_proxy_options
+            .existing
+            .chain_options
             .as_ref()
             .expect("the options memo stays warm")
             .options
@@ -12682,7 +12844,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .dialer_proxy_options
+                .existing
+                .chain_options
                 .as_ref()
                 .expect("the options memo stays warm")
                 .options
@@ -12699,7 +12862,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let rebuilt = harness
             .state()
             .0
-            .dialer_proxy_options
+            .existing
+            .chain_options
             .as_ref()
             .expect("the set change must rebuild the chain-target options exactly once");
         assert_ne!(
@@ -12717,7 +12881,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .dialer_proxy_options
+                .existing
+                .chain_options
                 .as_ref()
                 .expect("the options memo stays warm")
                 .options
@@ -12738,7 +12903,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let before = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the draft opens")
             .profile
@@ -12761,7 +12927,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let state = harness.state();
         let draft = state
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open");
         assert!(
@@ -12828,7 +12995,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let state = harness.state();
         let draft = state
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open");
         assert!(
@@ -12866,7 +13034,8 @@ Authentication: ML-KEM-768, Post-Quantum
         harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -12883,7 +13052,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = &harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile;
@@ -12910,7 +13080,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = wide_servers_harness(retired_hop_rig());
         harness.run();
         assert!(
-            harness.state().0.existing_draft.is_some(),
+            harness.state().0.existing.draft.is_some(),
             "a profile with the retired key must stay editable"
         );
         let hop = finding(
@@ -12936,7 +13106,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let renamed = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .unwrap()
             .profile
@@ -12974,7 +13145,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "{:#?}",
             editor_advisory(&harness)
         );
-        let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
+        let draft = &harness.state().0.existing.draft.as_ref().unwrap().profile;
         assert_eq!(
             draft.outbound.stream.finalmask.as_ref().unwrap().udp.len(),
             1,
@@ -13003,7 +13174,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let before = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the draft opens")
             .profile
@@ -13023,7 +13195,7 @@ Authentication: ML-KEM-768, Post-Quantum
             draft_quic_params(&harness).retired_udp_hop.is_none(),
             "the dismissal must clear the retired key"
         );
-        let draft = &harness.state().0.existing_draft.as_ref().unwrap().profile;
+        let draft = &harness.state().0.existing.draft.as_ref().unwrap().profile;
         assert_eq!(
             draft.name, before.name,
             "the dismissal must not touch other fields"
@@ -13143,7 +13315,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -13254,7 +13427,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -13376,7 +13550,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let unset = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -13415,7 +13590,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open")
             .profile
@@ -13536,7 +13712,7 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn add_draft_memo_reuses_findings_until_the_generation_moves() {
         let mut draft = ProfileDraft::add(profile_with_bad_finalmask());
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let swept = draft
             .validation
             .as_ref()
@@ -13553,7 +13729,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // answers with the sweep it made (the dialog bumps the generation on
         // every content edit, so this is the idle-frame path).
         draft.profile.name = "edited".into();
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let reused = draft.validation.as_ref().expect("the memo stays populated");
         assert_eq!(
             codes_of(&reused.findings.finalmask),
@@ -13566,7 +13742,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // A moved generation sweeps the clean profile the draft now carries.
         draft.profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
         draft.generation = 1;
-        refresh_editor_validation(&mut draft, Language::En);
+        draft.refresh(Language::En);
         let reswept = draft.validation.as_ref().expect("the memo stays populated");
         assert!(reswept.findings.finalmask.is_empty());
         assert!(reswept.rendered.finalmask.is_empty());
@@ -13607,7 +13783,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .unwrap()
                 .profile
@@ -13632,7 +13809,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let generation = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor keeps the converted draft")
             .generation;
@@ -13650,7 +13828,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .expect("the editor keeps the converted draft")
                 .generation,
@@ -13661,7 +13840,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .state()
                 .0
-                .existing_draft
+                .existing
+                .draft
                 .as_ref()
                 .unwrap()
                 .profile
@@ -13995,7 +14175,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open");
         let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
@@ -14098,7 +14279,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = harness
             .state()
             .0
-            .existing_draft
+            .existing
+            .draft
             .as_ref()
             .expect("the editor stays open");
         let ProtocolSettings::Wireguard(settings) = &draft.profile.outbound.settings else {
