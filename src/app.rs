@@ -2268,6 +2268,15 @@ impl eframe::App for BroccoliApp {
                 Screen::Settings => scroll(ui, |ui| self.settings_ui.show(ui, &mut uictx)),
                 Screen::About => scroll(ui, |ui| self.about.show(ui, &mut uictx)),
             }
+            // The reveal is transient by contract: the screen the user left hides
+            // its values again before it is next entered.
+            if self.screen != Screen::Servers {
+                self.servers_ui.mask_secrets();
+            }
+            if self.screen != Screen::Inbounds {
+                self.inbounds.mask_secrets();
+            }
+
             // The servers screen takes the probe-feedback slot each frame
             // (the probe outcome parked by the drain).
         });

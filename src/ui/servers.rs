@@ -941,7 +941,9 @@ struct KeygenButton<'a> {
 }
 
 /// Validated text field with a trailing action button on the same row.
-/// Returns (value_changed, button_clicked).
+/// Returns (value_changed, button_clicked). While `masked` is set the value
+/// renders as the masked stand-in; the keygen button stays live, because it
+/// produces a value instead of reading one.
 fn keygen_field(
     ui: &mut egui::Ui,
     label: &str,
@@ -949,6 +951,7 @@ fn keygen_field(
     hint: &str,
     validate: impl Fn(&str) -> Option<String>,
     button: &KeygenButton<'_>,
+    masked: bool,
 ) -> (bool, bool) {
     let error = validate(value);
     let mut clicked = false;
@@ -957,11 +960,15 @@ fn keygen_field(
             ui.label(label);
             let btn_w = 72.0 + ui.spacing().item_spacing.x;
             let w = (ui.available_width() - btn_w).max(100.0);
-            let r = ui.add(
-                egui::TextEdit::singleline(value)
-                    .hint_text(hint)
-                    .desired_width(w),
-            );
+            let r = if masked {
+                widgets::masked_stand_in(ui, !value.is_empty(), hint)
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .desired_width(w),
+                )
+            };
             let r = match &error {
                 Some(m) => r.on_hover_text(m),
                 None => r,
@@ -1772,6 +1779,17 @@ fn refresh_dialer_proxy_options<'a>(
         .map_or(&[], |cached| cached.options.as_slice())
 }
 
+/// Trailing context for [`ServersScreen::transport_tab`]: the draft identity
+/// its requests are staged against, and whether the reveal control masks its
+/// credentials. Both belong to the editor frame that renders the tab, and
+/// bundling them keeps the tab under clippy's argument-count ceiling without a
+/// lint suppression (zero-suppression repo contract).
+#[derive(Clone, Copy)]
+struct TransportTabCtx<'a> {
+    target: Option<DraftTarget<'a>>,
+    masked: bool,
+}
+
 /// Trailing context for [`ServersScreen::advanced_tab`]:
 /// the model generation and profile count the chain-target options memoize
 /// on, the memoized
@@ -1787,6 +1805,9 @@ struct AdvancedTabCtx<'a> {
     /// tab (see [`DialerProxyOptions`]).
     dialer_proxy_options: &'a mut Option<DialerProxyOptions>,
     buffers: &'a mut SeededBuffers,
+    /// Whether the tab's credentials (the finalmask passwords) render masked
+    /// (the reveal control).
+    masked: bool,
 }
 
 /// The chain target the draft was loaded with: the dial-through tag the
@@ -2023,6 +2044,16 @@ pub struct ServersScreen {
     /// both render in one frame.
     existing: DraftSlot,
     add: DraftSlot,
+    /// The selected profile editor's reveal control: `true` while the user
+    /// asked to see the credentials this screen hides. Transient — leaving the
+    /// screen or selecting another profile hides them again.
+    revealed_existing: bool,
+    /// The add-draft dialog's reveal control. It opens revealed and keeps that
+    /// state for the dialog's lifetime: an empty form hides no credential, and
+    /// the user opened it to type one — masking it on a screen round-trip
+    /// would demand a click mid-entry. It is not the editor's reveal, which
+    /// dies with the screen.
+    revealed_add: bool,
     import_open: bool,
     import_text: String,
     import_parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
@@ -2859,6 +2890,14 @@ impl ServersScreen {
         }
     }
 
+    /// Hide the editor's values again. The shell calls this when the user
+    /// leaves the screen, so a reveal never outlives the visit. The add-server
+    /// dialog's reveal is not the editor's: it belongs to the dialog's own
+    /// lifetime, which starts revealed (see `revealed_add`).
+    pub(crate) fn mask_secrets(&mut self) {
+        self.revealed_existing = false;
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
         self.poll_profile_validation(lang, ctx);
@@ -3162,6 +3201,9 @@ impl ServersScreen {
             // A fresh draft starts with no memoized verdicts, so this is a
             // fresh validation subject whatever the previous draft left.
             self.profile_validation_report = None;
+            // An empty form hides no credential, and the user opened it to
+            // type one.
+            self.revealed_add = true;
         }
         if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
             self.import_open = true;
@@ -3824,6 +3866,7 @@ impl ServersScreen {
             // memoized verdicts of its own, so the sweep its editor runs
             // below is the first one.
             self.profile_validation_report = None;
+            self.revealed_existing = false;
         }
 
         let Some(mut draft) = self.existing.take() else {
@@ -3888,7 +3931,18 @@ impl ServersScreen {
             for &tab in TABS {
                 ui.selectable_value(&mut self.tab, tab, tab.label(lang));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                widgets::reveal_toggle(ui, lang, &mut self.revealed_existing);
+            });
         });
+        // What the tabs below mask: the credentials, and the server
+        // information only while the setting asks for it. One value for the
+        // whole screen, derived after the control ran, so a click applies the
+        // same frame.
+        let mask = widgets::Mask {
+            secrets: !self.revealed_existing,
+            server_info: !self.revealed_existing && ctx.settings.hide_server_info,
+        };
         ui.separator();
         // The action row below (validation block + Validate/Discard buttons)
         // is laid out after the tab content; reserve its worst-case height
@@ -3924,6 +3978,7 @@ impl ServersScreen {
                             &mut draft.profile,
                             Some(target),
                             inline_errors,
+                            mask,
                         )
                     }
                     EditorTab::Transport => {
@@ -3934,7 +3989,10 @@ impl ServersScreen {
                             &mut draft.profile.outbound.stream,
                             masque_outbound,
                             0,
-                            Some(target),
+                            TransportTabCtx {
+                                target: Some(target),
+                                masked: mask.secrets,
+                            },
                         )
                     }
                     EditorTab::Security => {
@@ -3984,6 +4042,7 @@ impl ServersScreen {
                                 stream_sockopt_errors,
                                 dialer_proxy_options: &mut self.existing.chain_options,
                                 buffers: &mut self.seeded_buffers,
+                                masked: mask.secrets,
                             },
                         )
                     }
@@ -4189,11 +4248,14 @@ impl ServersScreen {
         // public-endpoint TLS rules and the freedom blocks), rendered under
         // the protocol fields.
         inline_errors: &[String],
+        // What the fields below mask: the credentials, and the server
+        // information only while the settings ask for it.
+        mask: widgets::Mask,
     ) -> bool {
         let mut changed = false;
         match &mut profile.outbound.settings {
             ProtocolSettings::Vless(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
                 let (field_changed, generate) = keygen_field(
                     ui,
                     t(lang, Key::SrvIdUuid),
@@ -4204,6 +4266,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateUuidHint),
                     },
+                    mask.secrets,
                 );
                 changed |= field_changed;
                 if generate {
@@ -4245,6 +4308,9 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateVlessencHint),
                     },
+                    // The generated encryption string configures the protocol
+                    // variant; it is no credential.
+                    false,
                 );
                 changed |= field_changed;
                 if generate {
@@ -4287,7 +4353,7 @@ impl ServersScreen {
                 }
             }
             ProtocolSettings::Vmess(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
                 let (field_changed, generate) = keygen_field(
                     ui,
                     t(lang, Key::SrvIdUuid),
@@ -4298,6 +4364,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateUuidHint),
                     },
+                    mask.secrets,
                 );
                 changed |= field_changed;
                 if generate {
@@ -4320,15 +4387,19 @@ impl ServersScreen {
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
             ProtocolSettings::Trojan(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
-                changed |=
-                    widgets::validated_field(ui, "password", &mut settings.password, "", |v| {
-                        v_required(lang, v)
-                    });
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
+                changed |= widgets::masked_validated_field(
+                    ui,
+                    "password",
+                    &mut settings.password,
+                    "",
+                    |v| v_required(lang, v),
+                    mask.secrets,
+                );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
             ProtocolSettings::Shadowsocks(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
                 changed |= widgets::combo_str_labeled(
                     ui,
                     "method",
@@ -4343,12 +4414,13 @@ impl ServersScreen {
                         t(lang, Key::SrvShadowsocksMethodRequired),
                     );
                 }
-                changed |= widgets::validated_field(
+                changed |= widgets::masked_validated_field(
                     ui,
                     "password",
                     &mut settings.password,
                     t(lang, Key::SrvShadowsocksPasswordHint),
                     |v| v_required(lang, v),
+                    mask.secrets,
                 );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u8::MAX.into());
                 if settings.level.is_some_and(|level| level > u8::MAX.into()) {
@@ -4359,15 +4431,19 @@ impl ServersScreen {
                 }
             }
             ProtocolSettings::Socks(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
-                changed |= widgets::text_field(ui, "user", &mut settings.user, "");
-                changed |= widgets::text_field(ui, "pass", &mut settings.pass, "");
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
+                changed |=
+                    widgets::masked_text_field(ui, "user", &mut settings.user, "", mask.secrets);
+                changed |=
+                    widgets::masked_text_field(ui, "pass", &mut settings.pass, "", mask.secrets);
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
             ProtocolSettings::Http(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
-                changed |= widgets::text_field(ui, "user", &mut settings.user, "");
-                changed |= widgets::text_field(ui, "pass", &mut settings.pass, "");
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
+                changed |=
+                    widgets::masked_text_field(ui, "user", &mut settings.user, "", mask.secrets);
+                changed |=
+                    widgets::masked_text_field(ui, "pass", &mut settings.pass, "", mask.secrets);
                 changed |= json_map_kv(
                     ui,
                     lang,
@@ -4389,6 +4465,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateWgHint),
                     },
+                    mask.secrets,
                 );
                 changed |= field_changed;
                 if generate {
@@ -4493,19 +4570,21 @@ impl ServersScreen {
                                 |v| v_wg_public_key(lang, v),
                             );
                             ui.small(t(lang, Key::SrvWgPeerPublicKeyNote));
-                            changed |= widgets::validated_field(
+                            changed |= widgets::masked_validated_field(
                                 ui,
                                 "endpoint",
                                 &mut peer.endpoint,
                                 "host:51820",
                                 |v| v_required(lang, v),
+                                mask.server_info,
                             );
-                            changed |= widgets::validated_field(
+                            changed |= widgets::masked_validated_field(
                                 ui,
                                 t(lang, Key::SrvPreSharedKey),
                                 &mut peer.pre_shared_key,
                                 "(optional)",
                                 |v| v_optional_wg_key(lang, v),
+                                mask.secrets,
                             );
                             changed |= widgets::string_list(
                                 ui,
@@ -4735,10 +4814,10 @@ impl ServersScreen {
                 }
             }
             ProtocolSettings::Hysteria(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
             }
             ProtocolSettings::Masque(settings) => {
-                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port);
+                changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
                 // Every entry is an address literal; a bad one refuses the
                 // config at load (the model's `MasqueRemoteDnsInvalid`).
                 changed |= widgets::validated_string_list(
@@ -4841,8 +4920,9 @@ impl ServersScreen {
         // for one, so both mismatches the model reports are unreachable here.
         masque_outbound: bool,
         depth: u32,
-        target: Option<DraftTarget<'_>>,
+        ctx: TransportTabCtx<'_>,
     ) -> bool {
+        let TransportTabCtx { target, masked } = ctx;
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvNetwork));
@@ -5326,7 +5406,7 @@ impl ServersScreen {
                                         download,
                                         masque_outbound,
                                         depth + 1,
-                                        target,
+                                        TransportTabCtx { target, masked },
                                     );
                                     changed |= self.security_tab_readonly(ui, lang, download);
                                 });
@@ -5462,7 +5542,13 @@ impl ServersScreen {
                         }
                     });
                 }
-                changed |= widgets::text_field(ui, t(lang, Key::SrvAuthPassword), &mut s.auth, "");
+                changed |= widgets::masked_text_field(
+                    ui,
+                    t(lang, Key::SrvAuthPassword),
+                    &mut s.auth,
+                    "",
+                    masked,
+                );
                 changed |= widgets::opt_num(
                     ui,
                     t(lang, Key::SrvUdpIdleTimeoutS),
@@ -5541,8 +5627,8 @@ impl ServersScreen {
                     &mut s.path,
                     crate::model::stream::MASQUE_DEFAULT_PATH,
                 );
-                changed |= widgets::text_field(ui, "user", &mut s.user, "");
-                changed |= widgets::text_field(ui, "pass", &mut s.pass, "");
+                changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
+                changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
                 if had_settings || changed {
                     st.masque_settings = Some(s);
@@ -5598,12 +5684,13 @@ impl ServersScreen {
                     folder_validate,
                     folder_picker,
                 );
-                changed |= widgets::string_list(
+                changed |= widgets::masked_string_list(
                     ui,
                     lang,
                     t(lang, Key::SrvXdriveSecrets),
                     &mut s.secrets,
                     "",
+                    masked,
                 );
                 if s.service == XDRIVE_SERVICE_DRIVE {
                     ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
@@ -5705,7 +5792,8 @@ impl ServersScreen {
                 if s.service == XDRIVE_SERVICE_TEMPLATE {
                     let had_template = s.template.is_some();
                     let mut template = s.template.take().unwrap_or_default();
-                    if self.xdrive_template_editor(ui, lang, &mut template, s.secrets.len()) {
+                    if self.xdrive_template_editor(ui, lang, &mut template, s.secrets.len(), masked)
+                    {
                         changed = true;
                     }
                     if had_template || changed {
@@ -5731,6 +5819,9 @@ impl ServersScreen {
         lang: Language,
         template: &mut XdriveTemplate,
         secret_count: usize,
+        // Whether the template's credentials render masked (the reveal
+        // control).
+        masked: bool,
     ) -> bool {
         let mut changed = false;
         widgets::section(ui, t(lang, Key::SrvXdriveTemplate), |ui| {
@@ -5747,7 +5838,7 @@ impl ServersScreen {
             );
         });
         widgets::section(ui, t(lang, Key::SrvXdriveAuth), |ui| {
-            changed |= self.xdrive_auth_editor(ui, lang, &mut template.auth, secret_count);
+            changed |= self.xdrive_auth_editor(ui, lang, &mut template.auth, secret_count, masked);
         });
         for op in XdriveOperation::ALL {
             let title = match op {
@@ -5853,6 +5944,10 @@ impl ServersScreen {
         lang: Language,
         auth: &mut XdriveTemplateAuth,
         secret_count: usize,
+        // Whether the authorization's username and password render masked
+        // (the reveal control). The token URL stays visible: it names its host,
+        // and masking a URL would hide the host with the token.
+        masked: bool,
     ) -> bool {
         let mut changed = false;
         changed |= widgets::combo_str_labeled(
@@ -5920,17 +6015,19 @@ impl ServersScreen {
                 }
             }
             "basic" => {
-                changed |= widgets::text_field(
+                changed |= widgets::masked_text_field(
                     ui,
                     t(lang, Key::SrvXdriveUsername),
                     &mut auth.username,
                     "",
+                    masked,
                 );
-                changed |= widgets::text_field(
+                changed |= widgets::masked_text_field(
                     ui,
                     t(lang, Key::SrvXdrivePassword),
                     &mut auth.password,
                     "",
+                    masked,
                 );
             }
             _ => {}
@@ -6536,6 +6633,9 @@ impl ServersScreen {
                         label: t(lang, Key::SrvDerive),
                         hover: "xray x25519 -i <private key>",
                     },
+                    // The REALITY key fields are public identifiers the
+                    // handshake exchanges in the clear; they are no credential.
+                    false,
                 );
                 changed |= c;
                 if g {
@@ -6563,6 +6663,8 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvRandomHexHint),
                     },
+                    // A REALITY key field: public, not a credential.
+                    false,
                 );
                 changed |= c;
                 if g {
@@ -6580,6 +6682,8 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateMldsa65Hint),
                     },
+                    // A REALITY key field: public, not a credential.
+                    false,
                 );
                 changed |= field_changed;
                 if generate {
@@ -6632,6 +6736,7 @@ impl ServersScreen {
             stream_sockopt_errors,
             dialer_proxy_options,
             buffers,
+            masked,
         } = ctx;
         let mut changed = false;
         let o = &mut p.outbound;
@@ -6752,6 +6857,7 @@ impl ServersScreen {
                                 },
                                 buffers: &mut *buffers,
                             },
+                            masked,
                         );
                     });
                 });
@@ -6844,6 +6950,7 @@ impl ServersScreen {
                                 },
                                 buffers: &mut *buffers,
                             },
+                            masked,
                         );
                     });
                 });
@@ -6938,7 +7045,16 @@ impl ServersScreen {
                     for &tab in TABS {
                         ui.selectable_value(&mut self.draft_tab, tab, tab.label(lang));
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        widgets::reveal_toggle(ui, lang, &mut self.revealed_add);
+                    });
                 });
+                // The dialog opens revealed (an empty form hides nothing), so
+                // this is what the dialog masks while the user hides it again.
+                let mask = widgets::Mask {
+                    secrets: !self.revealed_add,
+                    server_info: !self.revealed_add && uictx.settings.hide_server_info,
+                };
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("servers.add-draft.scroll")
@@ -6967,6 +7083,7 @@ impl ServersScreen {
                                     &mut draft.profile,
                                     Some(target),
                                     inline_errors,
+                                    mask,
                                 )
                             }
                             EditorTab::Transport => {
@@ -6978,7 +7095,10 @@ impl ServersScreen {
                                     &mut draft.profile.outbound.stream,
                                     masque_outbound,
                                     0,
-                                    Some(target),
+                                    TransportTabCtx {
+                                        target: Some(target),
+                                        masked: mask.secrets,
+                                    },
                                 )
                             }
                             EditorTab::Security => {
@@ -7032,6 +7152,7 @@ impl ServersScreen {
                                         stream_sockopt_errors,
                                         dialer_proxy_options: &mut self.add.chain_options,
                                         buffers: &mut self.seeded_buffers,
+                                        masked: mask.secrets,
                                     },
                                 )
                             }
@@ -7592,18 +7713,27 @@ impl ServersScreen {
 
 // ---------- editor free helpers ----------
 
-fn addr_port(ui: &mut egui::Ui, lang: Language, address: &mut String, port: &mut u16) -> bool {
-    let mut changed = widgets::validated_field(
+fn addr_port(
+    ui: &mut egui::Ui,
+    lang: Language,
+    address: &mut String,
+    port: &mut u16,
+    mask: widgets::Mask,
+) -> bool {
+    // Both halves are server information, so one flag hides the pair: the
+    // address and the port a bystander reads together.
+    let mut changed = widgets::masked_validated_field(
         ui,
         t(lang, Key::AddressLower),
         address,
         "example.com",
         |v| v_required(lang, v),
+        mask.server_info,
     );
     // Port 0 is enforced by the model (SettingsPortZero /
     // TrojanSettingsIncomplete / ShadowsocksSettingsIncomplete) and
     // rendered once through the shared i18n seam — no inline duplicate.
-    changed |= widgets::port_field(ui, "port", port);
+    changed |= widgets::masked_port_field(ui, "port", port, mask.server_info);
     changed
 }
 
@@ -7761,10 +7891,11 @@ mod tests {
         EditorValidationCache, EditorValidationFindings, EditorValidationRender, FINGERPRINTS,
         FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft, RawField,
         Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
-        ServersScreen, SockoptUsage, StatusLine, TlsProbe, basic_tab_inline_verdict,
-        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
-        server_list_row, sockopt_findings, status_colors_of, status_toast_expired,
+        ServersScreen, SockoptUsage, StatusLine, TlsProbe, TransportTabCtx,
+        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
+        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
+        fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
+        sockopt_findings, status_colors_of, status_toast_expired,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -7822,6 +7953,16 @@ mod tests {
             profile_id,
             generation,
         })
+    }
+
+    /// The reveal state the render tests drive a tab under: nothing masked, so
+    /// the fields they query by label render their editable controls. The
+    /// masked state has its own coverage at the screen level.
+    fn revealed() -> crate::ui::widgets::Mask {
+        crate::ui::widgets::Mask {
+            secrets: false,
+            server_info: false,
+        }
     }
 
     /// An add-server draft for `profile` carrying the memo a rendered dialog
@@ -9805,7 +9946,8 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut profile = vision_mux_profile();
         let mut screen = ServersScreen::default();
         let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+            let _ =
+                screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[], revealed());
         });
         harness.run();
         assert!(
@@ -9816,7 +9958,8 @@ Authentication: ML-KEM-768, Post-Quantum
         // Flipping the mux escape hatch off the conflict clears it live.
         profile.outbound.mux.concurrency = Some(-1);
         let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+            let _ =
+                screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[], revealed());
         });
         harness.run();
         assert!(harness.query_by_label(warning).is_none());
@@ -9860,7 +10003,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut screen = ServersScreen::default();
         {
             let mut harness = Harness::new_ui(|ui| {
-                let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &inline);
+                let _ = screen.basic_tab_for_target(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    None,
+                    &inline,
+                    revealed(),
+                );
             });
             harness.run();
             for message in &inline {
@@ -9875,7 +10025,14 @@ Authentication: ML-KEM-768, Post-Quantum
         // the profile's own finding.
         let sentinel = vec!["sentinel verdict".to_string()];
         let mut harness = Harness::new_ui(|ui| {
-            let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &sentinel);
+            let _ = screen.basic_tab_for_target(
+                ui,
+                Language::En,
+                &mut profile,
+                None,
+                &sentinel,
+                revealed(),
+            );
         });
         harness.run();
         assert!(harness.query_by_label("sentinel verdict").is_some());
@@ -10059,8 +10216,14 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut reported_changed = false;
             {
                 let _harness = Harness::new_ui(|ui| {
-                    reported_changed |=
-                        screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+                    reported_changed |= screen.basic_tab_for_target(
+                        ui,
+                        Language::En,
+                        &mut profile,
+                        None,
+                        &[],
+                        revealed(),
+                    );
                 });
             }
             assert_eq!(
@@ -10201,7 +10364,10 @@ Authentication: ML-KEM-768, Post-Quantum
                         &mut stream,
                         false,
                         0,
-                        draft_target(DraftKind::Existing, "0123456789abcdef", 1),
+                        TransportTabCtx {
+                            target: draft_target(DraftKind::Existing, "0123456789abcdef", 1),
+                            masked: false,
+                        },
                     );
                 },
                 ServersScreen::default(),
@@ -10232,7 +10398,17 @@ Authentication: ML-KEM-768, Post-Quantum
             };
             let mut screen = ServersScreen::default();
             let harness = Harness::new_ui(|ui| {
-                let _ = screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+                let _ = screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    false,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                    },
+                );
             });
             assert!(
                 harness
@@ -10257,7 +10433,17 @@ Authentication: ML-KEM-768, Post-Quantum
             };
             let mut screen = ServersScreen::default();
             let harness = Harness::new_ui(|ui| {
-                let _ = screen.transport_tab(ui, Language::En, &mut stream, true, 0, None);
+                let _ = screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    true,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                    },
+                );
             });
             assert!(
                 harness
@@ -10294,7 +10480,17 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         let mut screen = ServersScreen::default();
         let harness = Harness::new_ui(|ui| {
-            let _ = screen.transport_tab(ui, Language::En, &mut stream, true, 0, None);
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                true,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                },
+            );
         });
         for label in ["host", "path", "user", "pass"] {
             assert!(
@@ -10322,7 +10518,17 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         let mut screen = ServersScreen::default();
         let harness = Harness::new_ui(|ui| {
-            let _ = screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                false,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                },
+            );
         });
         for label in [
             "Service",
@@ -10403,8 +10609,17 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut reported_changed = false;
         {
             let _harness = Harness::new_ui(|ui| {
-                reported_changed |=
-                    screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+                reported_changed |= screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    false,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                    },
+                );
             });
         }
         assert!(!reported_changed);
@@ -10439,7 +10654,10 @@ Authentication: ML-KEM-768, Post-Quantum
                         &mut stream,
                         network == Network::Masque,
                         0,
-                        None,
+                        TransportTabCtx {
+                            target: None,
+                            masked: false,
+                        },
                     );
                 });
             }
@@ -10487,6 +10705,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.existing.chain_options,
                         buffers: &mut screen.seeded_buffers,
+                        masked: false,
                     },
                 );
             });
@@ -10788,7 +11007,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut screen = ServersScreen::default();
         {
             let _harness = Harness::new_ui(|ui| {
-                let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+                let _ = screen.basic_tab_for_target(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    None,
+                    &[],
+                    revealed(),
+                );
             });
         }
         let ProtocolSettings::Http(settings) = &profile.outbound.settings else {
@@ -10831,6 +11057,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 &mut profile_for_ui.borrow_mut(),
                 None,
                 &[],
+                revealed(),
             );
         });
         fragment_harness.get_by_label("TCP fragmentation").click();
@@ -10973,7 +11200,14 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut profile = blackhole_profile(kind, data);
             let mut screen = ServersScreen::default();
             let mut harness = Harness::new_ui(|ui| {
-                let _ = screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[]);
+                let _ = screen.basic_tab_for_target(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    None,
+                    &[],
+                    revealed(),
+                );
             });
             harness.run();
             assert_eq!(
@@ -11028,6 +11262,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 &mut profile_for_ui.borrow_mut(),
                 None,
                 &[],
+                revealed(),
             );
         });
         harness.run();
@@ -11196,8 +11431,17 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut reported_changed = false;
         {
             let _harness = Harness::new_ui(|ui| {
-                reported_changed |=
-                    screen.transport_tab(ui, Language::En, &mut stream, false, 0, None);
+                reported_changed |= screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    false,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                    },
+                );
             });
         }
         assert!(!reported_changed);
@@ -11375,6 +11619,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     stream_sockopt_errors: &[],
                     dialer_proxy_options: &mut screen.existing.chain_options,
                     buffers: &mut screen.seeded_buffers,
+                    masked: false,
                 },
             );
         });
@@ -11404,6 +11649,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         stream_sockopt_errors: &[],
                         dialer_proxy_options: &mut screen.existing.chain_options,
                         buffers: &mut screen.seeded_buffers,
+                        masked: false,
                     },
                 );
             });
@@ -14193,8 +14439,11 @@ Authentication: ML-KEM-768, Post-Quantum
             "the test leaves the peer's pre-shared key empty"
         );
 
+        // By its accessible name, not by its role: the editor masks the
+        // credential rows, so this one renders the masked stand-in while the
+        // peer's public key and endpoint stay editable.
         let psk = harness
-            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, "pre-shared key")
+            .query_all_by_label("pre-shared key")
             .next()
             .expect("the pre-shared key row renders");
         // The row's paint area: from the field's own line down to the header of
@@ -14401,6 +14650,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
+                false,
             );
         });
         harness.run();
@@ -14505,6 +14755,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
+                false,
             );
         });
         harness.run();
@@ -14569,6 +14820,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
+                false,
             );
         });
         harness.run();
@@ -14668,6 +14920,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
+                false,
             );
         });
         harness.run();
@@ -14741,7 +14994,10 @@ Authentication: ML-KEM-768, Post-Quantum
                 &mut stream_for_ui.borrow_mut(),
                 false,
                 0,
-                None,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                },
             );
         });
         harness.run();

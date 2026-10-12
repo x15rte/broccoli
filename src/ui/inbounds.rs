@@ -28,6 +28,10 @@ pub struct InboundsScreen {
     /// generation moves — never on idle repaint frames. `None` until the
     /// first frame.
     validation: Option<ValidationCache>,
+    /// The reveal control's state: `true` while the user asked to see the
+    /// account credentials this screen hides. Transient — leaving the screen
+    /// hides them again.
+    revealed: bool,
 }
 
 /// One generation of the inbounds validation references: the listener
@@ -83,6 +87,12 @@ impl ValidationCache {
 }
 
 impl InboundsScreen {
+    /// Hide the account credentials again. The shell calls this when the user
+    /// leaves the screen, so a reveal never outlives the visit.
+    pub(crate) fn mask_secrets(&mut self) {
+        self.revealed = false;
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
         // The validation references are rebuilt when the model generation
@@ -174,6 +184,16 @@ impl InboundsScreen {
         });
         ui.add_space(4.0);
 
+        // The reveal control: the screen's account credentials render masked
+        // until the user asks to see them, and the local listen addresses stay
+        // visible — they are loopback literals, not server information.
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                widgets::reveal_toggle(ui, lang, &mut self.revealed);
+            });
+        });
+        let masked = !self.revealed;
+
         // ---- Local listeners: one row per user-managed
         // SOCKS/HTTP endpoint, in list order. Tags are GUI-owned and hidden;
         // the allocator assigns them once and they persist with the entry.
@@ -256,7 +276,7 @@ impl InboundsScreen {
                         changed = true;
                     }
                     if auth_pw {
-                        changed |= accounts_editor(ui, lang, &mut entry.accounts);
+                        changed |= accounts_editor(ui, lang, &mut entry.accounts, masked);
                     }
                     // The shared gate verdict, rendered under the accounts
                     // editor it qualifies: password-mode HTTP with zero
@@ -818,13 +838,24 @@ fn inline_error(ui: &mut egui::Ui, error: Option<&str>) {
     }
 }
 
-fn accounts_editor(ui: &mut egui::Ui, lang: Language, accounts: &mut Vec<Account>) -> bool {
+fn accounts_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    accounts: &mut Vec<Account>,
+    // Whether the account credentials render masked (the reveal control).
+    masked: bool,
+) -> bool {
     let mut changed = false;
     ui.label(t(lang, Key::Accounts));
     let mut del: Option<usize> = None;
     for (i, a) in accounts.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            if ui
+            if masked {
+                // The stand-in carries the field's own hint, so a row with no
+                // credential looks the same masked and revealed.
+                widgets::masked_stand_in(ui, !a.user.is_empty(), t(lang, Key::AccountUserHint));
+                widgets::masked_stand_in(ui, !a.pass.is_empty(), t(lang, Key::AccountPasswordHint));
+            } else if ui
                 .add(
                     egui::TextEdit::singleline(&mut a.user)
                         .desired_width(110.0)

@@ -400,6 +400,7 @@ impl SettingsScreen {
     pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
         // The shell already wraps this screen in a vertical ScrollArea.
         self.appearance_section(ui, ctx);
+        self.privacy_section(ui, ctx);
         self.core_section(ui, ctx);
         self.core_setup_section(ui, ctx);
         self.updates_section(ui, ctx);
@@ -618,6 +619,27 @@ impl SettingsScreen {
                     }
                 }
             });
+        });
+    }
+
+    /// The Privacy group: what the Servers screen hides on its own. The
+    /// credentials are always masked until revealed; this switch decides
+    /// whether the server information takes part in that masking too.
+    fn privacy_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+        let lang = ctx.settings.language;
+        widgets::section(ui, t(lang, Key::SettingsPrivacy), |ui| {
+            if ui
+                .checkbox(
+                    &mut ctx.settings.hide_server_info,
+                    t(lang, Key::SettingsHideServerInfo),
+                )
+                .on_hover_text(t(lang, Key::SettingsHideServerInfoNote))
+                .changed()
+            {
+                // Display preference: persisted, but never raises the Apply
+                // gate — the value never reaches the generated configuration.
+                ctx.mark_ui_dirty();
+            }
         });
     }
 

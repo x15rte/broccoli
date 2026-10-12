@@ -287,6 +287,13 @@ pub struct Settings {
     /// `serde(skip)`); it is re-applied at startup and on picker change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accent_color: Option<u32>,
+    /// Masks a profile's server information — its address, port, and a
+    /// WireGuard peer endpoint — behind the servers editor's reveal control.
+    /// A display preference: the value never reaches the generated
+    /// configuration, so an edit neither regenerates the candidate nor
+    /// raises the Apply gate.
+    #[serde(skip_serializing_if = "skip_false")]
+    pub hide_server_info: bool,
     pub policy: PolicyCfg,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub env: Vec<(String, String)>,
@@ -323,6 +330,7 @@ impl Default for Settings {
             language: Language::default(),
             traffic_unit: TrafficUnit::default(),
             accent_color: None,
+            hide_server_info: false,
             policy: PolicyCfg::default(),
             env: Vec::new(),
             geodata: GeodataCfg::default(),

@@ -660,8 +660,11 @@ fn finalmask_sudoku_editor(
     ui: &mut egui::Ui,
     lang: Language,
     settings: &mut FinalmaskSudoku,
+    // Whether the mask's password renders masked (the reveal control).
+    masked: bool,
 ) -> bool {
-    let mut changed = widgets::text_field(ui, "password", &mut settings.password, "");
+    let mut changed =
+        widgets::masked_text_field(ui, "password", &mut settings.password, "", masked);
     changed |= widgets::text_field(ui, "ascii", &mut settings.ascii, "");
     changed |= widgets::text_field(ui, "customTable", &mut settings.custom_table, "");
     changed |= widgets::text_field(
@@ -709,14 +712,23 @@ fn finalmask_sudoku_editor(
     changed
 }
 
-fn finalmask_xmc_editor(ui: &mut egui::Ui, lang: Language, settings: &mut FinalmaskXmc) -> bool {
+fn finalmask_xmc_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    settings: &mut FinalmaskXmc,
+    // Whether the mask's password renders masked (the reveal control). The
+    // login username is masked with it: a leaked username and a leaked
+    // password together are worse than either alone.
+    masked: bool,
+) -> bool {
     let mut changed =
         widgets::text_field(ui, "hostname", &mut settings.hostname, "play.example.com");
-    changed |= widgets::text_field(
+    changed |= widgets::masked_text_field(
         ui,
         "password",
         &mut settings.password,
         t(lang, Key::SrvXmcPasswordHint),
+        masked,
     );
     let mut remove = None;
     for (index, profile) in settings.profiles.iter_mut().enumerate() {
@@ -728,7 +740,13 @@ fn finalmask_xmc_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Finalm
                         remove = Some(index);
                     }
                 });
-                changed |= widgets::text_field(ui, "username", &mut profile.username, "Player_1");
+                changed |= widgets::masked_text_field(
+                    ui,
+                    "username",
+                    &mut profile.username,
+                    "Player_1",
+                    masked,
+                );
                 changed |= widgets::text_field(
                     ui,
                     "uuid",
@@ -923,6 +941,8 @@ pub(super) fn finalmask_tcp_settings_editor(
     lang: Language,
     mask: &mut FinalmaskTcpMask,
     mut field: RawField<'_>,
+    // Whether the mask's credentials render masked (the reveal control).
+    masked: bool,
 ) -> bool {
     match mask {
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
@@ -975,8 +995,10 @@ pub(super) fn finalmask_tcp_settings_editor(
             changed |= range_editor(ui, "maxSplit", &mut settings.max_split, i32::MIN..=i32::MAX);
             changed
         }
-        FinalmaskTcpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
-        FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings),
+        FinalmaskTcpMask::Sudoku { settings, .. } => {
+            finalmask_sudoku_editor(ui, lang, settings, masked)
+        }
+        FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings, masked),
         FinalmaskTcpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }
@@ -1170,6 +1192,8 @@ pub(super) fn finalmask_udp_settings_editor(
     lang: Language,
     mask: &mut FinalmaskUdpMask,
     mut field: RawField<'_>,
+    // Whether the mask's credentials render masked (the reveal control).
+    masked: bool,
 ) -> bool {
     match mask {
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
@@ -1250,11 +1274,14 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Salamander { settings, .. } => {
-            let mut changed = widgets::text_field(ui, "password", &mut settings.password, "");
+            let mut changed =
+                widgets::masked_text_field(ui, "password", &mut settings.password, "", masked);
             changed |= range_editor(ui, "packetSize", &mut settings.packet_size, 0..=2048);
             changed
         }
-        FinalmaskUdpMask::Sudoku { settings, .. } => finalmask_sudoku_editor(ui, lang, settings),
+        FinalmaskUdpMask::Sudoku { settings, .. } => {
+            finalmask_sudoku_editor(ui, lang, settings, masked)
+        }
         FinalmaskUdpMask::Xdns { settings, .. } => finalmask_xdns_editor(ui, lang, settings),
         FinalmaskUdpMask::Xicmp { settings, .. } => {
             let mut changed = ui.checkbox(&mut settings.dgram, "dgram").changed();

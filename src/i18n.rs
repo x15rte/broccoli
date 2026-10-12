@@ -123,6 +123,7 @@
 //! | Save, Discard | commit or drop server-editor edits | submit, revert |
 //! | Remove | take an item out of a list (row, rule, header, listener) | delete |
 //! | Delete | destroy a saved server | remove |
+//! | Reveal, Hide | the per-screen control that shows the secret fields and the server information, and the one that hides them again | show, unmask, unhide |
 //! | Test latency | the button that starts an on-demand latency probe; prose calls the action a latency test | probe test |
 //! | Ping test | the Settings group that configures that probe | — |
 //!
@@ -892,6 +893,9 @@ keys! {
     RuleTargetBalancer 1,
     // Settings screen.
     SettingsAppearance 0,
+    SettingsPrivacy 0,
+    SettingsHideServerInfo 0,
+    SettingsHideServerInfoNote 0,
     SettingsUiScale 0,
     SettingsScaleHint 0,
     SettingsCore 0,
@@ -1071,6 +1075,10 @@ keys! {
     SrvValidateAndSave 0,
     SrvValidateAndSaveHint 0,
     SrvDiscardChanges 0,
+    SrvRevealSecrets 0,
+    SrvHideSecrets 0,
+    SrvRevealSecretsNote 0,
+    SrvHideSecretsNote 0,
     SrvUnsavedChanges 0,
     SrvUnsavedLeaveSave 0,
     SrvValidatingXrayTest 0,
@@ -3721,6 +3729,11 @@ mod en {
             Key::RuleTargetBalancer => "⚖ {}",
             // Settings screen.
             Key::SettingsAppearance => "Appearance",
+            Key::SettingsPrivacy => "Privacy",
+            Key::SettingsHideServerInfo => "Hide server information",
+            Key::SettingsHideServerInfoNote => {
+                "Hides the address and port of every server, and a WireGuard peer endpoint."
+            }
             Key::SettingsUiScale => "UI scale",
             Key::SettingsScaleHint => {
                 "Scales the whole interface in addition to Windows display scaling. The app saves \
@@ -3999,6 +4012,13 @@ mod en {
                 "Runs xray run -test on an isolated candidate before saving"
             }
             Key::SrvDiscardChanges => "Discard changes",
+            Key::SrvRevealSecrets => "Reveal",
+            Key::SrvHideSecrets => "Hide",
+            Key::SrvRevealSecretsNote => {
+                "Reveals the credentials on this screen, and the server address and port while \
+                 Hide server information is on. The screen hides them when you leave it."
+            }
+            Key::SrvHideSecretsNote => "Hides the credentials on this screen again.",
             Key::SrvUnsavedChanges => "Unsaved changes",
             Key::SrvUnsavedLeaveSave => "Save",
             Key::SrvValidatingXrayTest => "Validating with xray run -test…",

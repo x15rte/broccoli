@@ -186,6 +186,55 @@ pub fn context_revision(value: impl std::hash::Hash) -> u64 {
     hasher.finish()
 }
 
+/// The two visibility classes one screen can mask this frame. A screen derives
+/// it once from its own reveal control and passes the class a field belongs to,
+/// so a field cannot disagree with the control about what it hides.
+#[derive(Clone, Copy)]
+pub struct Mask {
+    /// Secret field values: the credentials a profile dials with.
+    pub secrets: bool,
+    /// Server information: a profile's address, its port, and a WireGuard peer
+    /// endpoint.
+    pub server_info: bool,
+}
+
+/// The per-screen reveal control: one toggle that shows what the screen hides —
+/// its secret fields, and its server information while the setting asks for it
+/// — and hides it again. `revealed` is the screen's own transient state, so the
+/// caller decides when it dies.
+pub fn reveal_toggle(ui: &mut egui::Ui, lang: Language, revealed: &mut bool) {
+    let (label, note) = if *revealed {
+        (Key::SrvHideSecrets, Key::SrvHideSecretsNote)
+    } else {
+        (Key::SrvRevealSecrets, Key::SrvRevealSecretsNote)
+    };
+    if ui
+        .button(t(lang, label))
+        .on_hover_text(t(lang, note))
+        .clicked()
+    {
+        *revealed = !*revealed;
+    }
+}
+
+/// The run that stands in for a masked value. Fixed width: the run never
+/// reports the hidden value's length.
+const MASKED_RUN: &str = "••••••••";
+
+/// The stand-in a masked field renders in place of its control: the masked run
+/// when a value stands behind the field, the field's own hint in the weak style
+/// when none does. The stand-in is a label, so the value stays out of reach —
+/// not editable, not focusable, not copyable, and absent from the
+/// accessibility tree.
+pub fn masked_stand_in(ui: &mut egui::Ui, has_value: bool, hint: &str) -> egui::Response {
+    let text = if has_value {
+        RichText::new(MASKED_RUN).monospace()
+    } else {
+        RichText::new(hint).weak()
+    };
+    ui.add(egui::Label::new(text).selectable(false))
+}
+
 /// Label + single-line text field with a hint. Grows to fill the row.
 pub fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.horizontal(|ui| {
@@ -220,6 +269,26 @@ struct FieldContext {
 /// yields is how a control writes to the field.
 pub type Trailing<'a> = &'a mut dyn FnMut(&mut egui::Ui) -> Option<String>;
 
+/// [`text_field`] whose value is masked while `masked` is set: the row renders
+/// the label and the masked stand-in instead of an editable box, and reports no
+/// change.
+pub fn masked_text_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    masked: bool,
+) -> bool {
+    if !masked {
+        return text_field(ui, label, value, hint);
+    }
+    ui.horizontal(|ui| {
+        let label_response = ui.label(label);
+        masked_stand_in(ui, !value.is_empty(), hint).labelled_by(label_response.id);
+    });
+    false
+}
+
 /// Label + validated single-line text field. When `validate` returns
 /// `Some(msg)` the field gets a red border, a hover tooltip, and the message
 /// in red under the field. `validate` is a pure parse of the text and runs
@@ -235,6 +304,31 @@ pub fn validated_field(
     validate: impl Fn(&str) -> Option<String>,
 ) -> bool {
     validated_field_with_trailing(ui, label, value, hint, validate, None)
+}
+
+/// [`validated_field`] whose value is masked while `masked` is set. The verdict
+/// renders unchanged: masking hides the value, never the field's verdict, so a
+/// hidden field still shows the red border and the message under it.
+pub fn masked_validated_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    validate: impl Fn(&str) -> Option<String>,
+    masked: bool,
+) -> bool {
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext::default(),
+        validate,
+        FieldExtras {
+            masked,
+            ..FieldExtras::default()
+        },
+    )
 }
 
 /// [`validated_field`] whose row also carries one [`Trailing`] control after
@@ -469,6 +563,9 @@ fn paint_validation(
 struct FieldExtras<'a> {
     warning: Option<&'a str>,
     trailing: Option<Trailing<'a>>,
+    /// Whether the field's value renders as the masked stand-in
+    /// ([`masked_validated_field`]).
+    masked: bool,
 }
 
 /// Shared body of the [`validated_field`] family: renders the labelled field,
@@ -486,7 +583,11 @@ fn validated_field_impl(
     validate: impl Fn(&str) -> Option<String>,
     extras: FieldExtras<'_>,
 ) -> bool {
-    let FieldExtras { warning, trailing } = extras;
+    let FieldExtras {
+        warning,
+        trailing,
+        masked,
+    } = extras;
     let (changed, rect, error) = ui
         .horizontal(|ui| {
             // One row body for both shapes: the label, the text box, and the
@@ -494,11 +595,18 @@ fn validated_field_impl(
             // with one it is the row's left side.
             let mut row = |ui: &mut egui::Ui| {
                 let label_response = ui.label(label);
-                let mut r = ui.add(
-                    egui::TextEdit::singleline(value)
-                        .hint_text(hint)
-                        .desired_width(f32::INFINITY),
-                );
+                // A masked field renders the stand-in where the text box would
+                // be: the row still adds exactly one widget for the field, so
+                // revealing it moves no auto id below.
+                let mut r = if masked {
+                    masked_stand_in(ui, !value.is_empty(), hint)
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .hint_text(hint)
+                            .desired_width(f32::INFINITY),
+                    )
+                };
                 // The group caption (when the caller rendered one) reads before
                 // the field's own label, so the name of a field that repeats once
                 // per group distinguishes the instances: "Pool 1 IP pool".
@@ -544,6 +652,18 @@ pub fn port_field(ui: &mut egui::Ui, label: &str, value: &mut u16) -> bool {
             .changed()
     })
     .inner
+}
+
+/// [`port_field`] whose number is masked while `masked` is set.
+pub fn masked_port_field(ui: &mut egui::Ui, label: &str, value: &mut u16, masked: bool) -> bool {
+    if !masked {
+        return port_field(ui, label, value);
+    }
+    ui.horizontal(|ui| {
+        ui.label(label);
+        masked_stand_in(ui, true, "");
+    });
+    false
 }
 
 /// Optional number: "set" checkbox + DragValue constrained to `range`.
@@ -811,6 +931,48 @@ pub fn string_list(
                     None => field,
                 };
                 changed |= field.changed();
+            });
+        });
+    }
+    if let Some(i) = remove {
+        items.remove(i);
+        changed = true;
+    }
+    if ui.button(t(lang, Key::AddRow)).clicked() {
+        items.push(String::new());
+        changed = true;
+    }
+    changed
+}
+
+/// [`string_list`] whose rows render masked while `masked` is set: each row
+/// shows the masked stand-in in place of its text box, so the values stay out
+/// of the frame, while the remove and Add buttons keep their meaning — a
+/// masked list still says how many entries it holds.
+pub fn masked_string_list(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    items: &mut Vec<String>,
+    hint: &str,
+    masked: bool,
+) -> bool {
+    if !masked {
+        return string_list(ui, lang, label, items, hint);
+    }
+    let mut changed = false;
+    let label_id = (!label.is_empty()).then(|| ui.label(label).id);
+    let mut remove = None;
+    for (i, item) in items.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                    remove = Some(i);
+                }
+                let row = masked_stand_in(ui, !item.is_empty(), hint);
+                if let Some(label_id) = label_id {
+                    row.labelled_by(label_id);
+                }
             });
         });
     }
