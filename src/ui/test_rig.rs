@@ -224,7 +224,8 @@ where
     Harness::builder().with_size(size).build_ui_state(
         move |ui, state: &mut (crate::ui::servers::ServersScreen, UiTestRig)| {
             state.0.show(ui, &mut state.1.ctx());
-            state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx());
+            // The screen just rendered, so its dialogs own their questions.
+            state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx(), true);
             tail(&mut state.0, &mut state.1, ui);
         },
         (crate::ui::servers::ServersScreen::default(), rig),

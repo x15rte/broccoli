@@ -2316,16 +2316,17 @@ impl eframe::App for BroccoliApp {
             self.wizard.show(&ctx, &mut uictx);
         }
 
-        // Hazard acknowledgment modal: rendered over everything
-        // while a gated Connect/Apply awaits confirmation.
+        // Hazard acknowledgment confirmation: rendered in the main window,
+        // which it dims and blocks, while a gated Connect/Apply awaits the
+        // answer.
         if self.pending_safety_ack.is_some() {
             self.show_safety_ack_modal(&ctx);
         }
 
-        // Unsaved-changes leave modal (server editor): rendered over
-        // everything every frame while a leave action is staged (selection
-        // switch, Add-dialog close, deferred quit) — same overlay role as
-        // the safety-ack modal. A staged Quit resolved through the modal
+        // Unsaved-changes leave confirmation (server editor): rendered in the
+        // main window every frame while a leave action is staged (selection
+        // switch, Add-dialog close, deferred quit) — the same confirmation the
+        // safety-ack is. A staged Quit resolved through it
         // (drafts saved or discarded) resumes the deferred quit from
         // `quit()`; the `quitting` guard keeps a quit already in flight
         // from re-entering.
@@ -2350,7 +2351,8 @@ impl eframe::App for BroccoliApp {
                 },
                 UiCtxView::Live { snapshot },
             );
-            self.servers_ui.show_leave_modal(&ctx, &mut uictx);
+            self.servers_ui
+                .show_leave_modal(&ctx, &mut uictx, self.screen == Screen::Servers);
         }
         if quit_resume_ready(&mut self.servers_ui, self.quitting) {
             self.quit_impl(&ctx, None);
@@ -2621,43 +2623,51 @@ fn cached_safety(cache: &Option<SafetyCache>) -> &SafetyVerdicts {
         .unwrap_or(&NO_SAFETY)
 }
 
-/// Render the hazard-acknowledgment modal: every finding's
+/// Render the hazard-acknowledgment confirmation: every finding's
 /// path, hazard-class label, and rendered message, with exactly two
-/// actions — Apply anyway resumes the gated apply, Cancel aborts it.
-/// Free-standing over callbacks so unit tests can drive it without a full
-/// app (the Settings Cleanup modal's `egui::Modal` pattern).
+/// actions — Apply anyway resumes the gated apply, Cancel aborts it. A
+/// dismissal — a click on the dimmed main window, Escape — is the same as
+/// Cancel. Free-standing over callbacks so unit tests can drive it without a
+/// full app.
 fn show_safety_ack_modal(
     ctx: &egui::Context,
     lang: Language,
     findings: &[SafetyFinding],
     mut on_decision: impl FnMut(bool),
 ) {
-    egui::Modal::new(egui::Id::new("broccoli-safety-ack")).show(ctx, |ui| {
-        ui.set_max_width(560.0);
-        ui.heading(t(lang, Key::SafetyAckTitle));
-        ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(egui::RichText::new(t(lang, Key::SafetyAckExplanation)).weak()).wrap(),
-        );
-        ui.add_space(10.0);
-        for finding in findings {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(&finding.path);
-                ui.label(crate::i18n::hazard_class_label(finding.class.clone(), lang));
-            });
-            ui.add(egui::Label::new(crate::i18n::safety_finding_message(finding, lang)).wrap());
+    let declined = crate::ui::popup::modal(
+        ctx,
+        "app.safety-ack",
+        t(lang, Key::SafetyAckTitle),
+        560.0,
+        |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(t(lang, Key::SafetyAckExplanation)).weak())
+                    .wrap(),
+            );
+            ui.add_space(10.0);
+            for finding in findings {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&finding.path);
+                    ui.label(crate::i18n::hazard_class_label(finding.class.clone(), lang));
+                });
+                ui.add(egui::Label::new(crate::i18n::safety_finding_message(finding, lang)).wrap());
+                ui.add_space(6.0);
+            }
             ui.add_space(6.0);
-        }
-        ui.add_space(6.0);
-        ui.separator();
-        if ui.button(t(lang, Key::SafetyAckApplyAnyway)).clicked() {
-            on_decision(true);
-        }
-        ui.add_space(4.0);
-        if ui.button(t(lang, Key::Cancel)).clicked() {
-            on_decision(false);
-        }
-    });
+            ui.separator();
+            if ui.button(t(lang, Key::SafetyAckApplyAnyway)).clicked() {
+                on_decision(true);
+            }
+            ui.add_space(4.0);
+            if ui.button(t(lang, Key::Cancel)).clicked() {
+                on_decision(false);
+            }
+        },
+    );
+    if declined {
+        on_decision(false);
+    }
 }
 
 /// The index of the first raw-override outbound that carries a non-null

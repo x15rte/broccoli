@@ -17,6 +17,7 @@ use crate::model::{
 use crate::rt::{BalancerInfoView, CoreCmd, CorePhase, RuntimeStateView, TrialRuleAddOutcome};
 use crate::sys::geodata::{GeodataCatalog, GeodataError, GeodataSnapshot};
 use crate::ui::gate::{Rung, verdict};
+use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
 use crate::ui::{UiCtx, widgets};
@@ -1046,11 +1047,13 @@ impl RoutingScreen {
         let (gate_open, disabled_reason) = self.trial_gate(ctx, lang);
         let mut close = false;
         let mut inject = false;
-        egui::Window::new(t(lang, Key::TrialRulesWindow))
-            .open(&mut self.trial.open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
+        let close_requested = popup::show(
+            ui.ctx(),
+            "routing.trial-rule",
+            t(lang, Key::TrialRulesWindow),
+            [360.0, 420.0],
+            false,
+            |ui| {
                 let draft = &mut self.trial.draft;
                 if let Some(error) = &self.trial.draft_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1144,7 +1147,8 @@ impl RoutingScreen {
                         close = true;
                     }
                 });
-            });
+            },
+        );
         if inject {
             match self.build_trial_rule(lang) {
                 Err(error) => self.trial.draft_error = Some(error),
@@ -1180,9 +1184,9 @@ impl RoutingScreen {
                 }
             }
         }
-        if close {
-            self.trial.open = false;
-        }
+        // The dialog's own Close button and the platform's close on its window
+        // are the same decision: the rule stays open only when neither asked.
+        self.trial.open = !close_requested && !close;
     }
 
     /// Borrow (creating on demand) the live runtime UI state for one
@@ -3176,17 +3180,23 @@ impl RoutingScreen {
         self.poll_test_route_result();
 
         let lang = ctx.settings.language;
-        let mut open = self.test_open;
         let mut close = false;
-        egui::Window::new(t(lang, Key::TestRouteWindow))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(540.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
+        let close_requested = popup::show(
+            ui.ctx(),
+            "routing.test-route",
+            t(lang, Key::TestRouteWindow),
+            [560.0, 620.0],
+            true,
+            |ui| {
                 ui.label(t(lang, Key::TestRouteExplain));
-                let max_height = (ui.ctx().content_rect().height() - 180.0).max(260.0);
+                // The blocks under the field area — the status or validation
+                // line, the result transcript (its own 160-point cap), and the
+                // button row, with the spacings between them — come to roughly
+                // 260 points of the window; the field area reserves 300 for
+                // them, so the buttons stay inside the window instead of falling
+                // under its bottom edge.
+                const BELOW_FIELDS: f32 = 300.0;
+                let max_height = (ui.ctx().content_rect().height() - BELOW_FIELDS).max(260.0);
                 let mut changed = false;
                 egui::ScrollArea::vertical()
                     .id_salt("test-route-fields")
@@ -3406,8 +3416,9 @@ impl RoutingScreen {
                         close = true;
                     }
                 });
-            });
-        self.test_open = open && !close;
+            },
+        );
+        self.test_open = !close_requested && !close;
     }
 }
 

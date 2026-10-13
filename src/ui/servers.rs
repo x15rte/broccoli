@@ -52,6 +52,7 @@ use crate::rt::{
 use crate::tls_ping::{ca_pins_from_probe_output, leaf_pin_from_probe_output};
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
+use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::{StatusColors, status_colors_of};
 use crate::ui::widgets;
@@ -3553,14 +3554,77 @@ impl ServersScreen {
         }
     }
 
-    /// Render the leave modal if an action is staged; no-op otherwise. Safe
-    /// to call every frame from `App::ui` (overlays every screen, like the
-    /// safety-ack modal). Backdrop click or Escape dismisses it like
-    /// Cancel: the staged action is cleared without performing it.
-    pub fn show_leave_modal(&mut self, egui_ctx: &egui::Context, uictx: &mut UiCtx) {
+    /// Render the leave confirmation if an action is staged; no-op otherwise.
+    /// Safe to call every frame from `App::ui`: the question renders in the
+    /// main window, which it dims and blocks, like the safety-ack confirmation.
+    /// Dismissing it — a click on the dimmed window, Escape — is Cancel: the
+    /// staged action is cleared without performing it.
+    ///
+    /// The one staged action that came from a window — closing the add-server
+    /// editor — is that window's own: while `servers_screen_rendered` says the
+    /// servers screen drew its windows this frame, `show_add_draft` renders the
+    /// question inside the editor, and this call renders nothing, so the user
+    /// answers the window they just closed instead of a question floating over
+    /// the main window. Off the servers screen the editor is gone with its
+    /// window, and the question falls back to the main window so it stays
+    /// answerable.
+    pub fn show_leave_modal(
+        &mut self,
+        egui_ctx: &egui::Context,
+        uictx: &mut UiCtx,
+        servers_screen_rendered: bool,
+    ) {
         if self.leave_pending.is_none() {
             return;
         }
+        if servers_screen_rendered && self.add_close_is_staged() && self.add.draft.is_some() {
+            return;
+        }
+        let lang = uictx.settings.language;
+        let mut decision: Option<LeaveDecision> = None;
+        let declined = popup::modal(
+            egui_ctx,
+            "servers.leave",
+            t(lang, Key::SrvUnsavedChanges),
+            520.0,
+            |ui| {
+                decision = self.leave_confirmation(ui, uictx, None);
+            },
+        );
+        if decision.is_none() && declined {
+            // The confirmation's own dismissal — a click on the dimmed main
+            // window, Escape — is Cancel: the staged action is cleared without
+            // performing it.
+            decision = Some(LeaveDecision::Cancel);
+        }
+        if let Some(decision) = decision {
+            self.resolve_leave(decision, uictx);
+        }
+    }
+
+    /// Whether closing the add-server editor is the staged leave action. That
+    /// editor's own question is the one about the draft it holds, so it renders
+    /// that question inside itself and the main window's home leaves it alone;
+    /// a staged action is exclusive, so at most one home asks it.
+    fn add_close_is_staged(&self) -> bool {
+        matches!(self.leave_pending, Some(LeaveAction::CloseAdd))
+    }
+
+    /// The leave confirmation's content: what the staged action would do to the
+    /// dirty draft, and the three answers. Returns this frame's answer, which
+    /// the caller resolves through [`Self::resolve_leave`].
+    ///
+    /// Both homes of the question render this: the main window, through
+    /// [`Self::show_leave_modal`], and the add-server editor inside itself.
+    /// That editor passes its draft's gate — it holds the draft out of its
+    /// slot until the end of the frame, so the slot alone cannot answer for
+    /// it.
+    fn leave_confirmation(
+        &mut self,
+        ui: &mut egui::Ui,
+        uictx: &mut UiCtx,
+        add_gate: Option<DraftGate>,
+    ) -> Option<LeaveDecision> {
         let lang = uictx.settings.language;
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
         // Each draft's Save reads the same gate as its editor's own commit
@@ -3570,64 +3634,63 @@ impl ServersScreen {
         let existing_saveable = self
             .gate(DraftKind::Existing, busy)
             .is_some_and(DraftGate::committable);
-        let add_saveable = self
-            .gate(DraftKind::Add, busy)
-            .is_some_and(DraftGate::committable);
+        let add_saveable = match add_gate {
+            Some(gate) => gate.committable(),
+            None => self
+                .gate(DraftKind::Add, busy)
+                .is_some_and(DraftGate::committable),
+        };
         let saveable = existing_saveable || add_saveable;
-        let mut decision: Option<LeaveDecision> = None;
-        let modal =
-            egui::Modal::new(egui::Id::new("broccoli-unsaved-leave")).show(egui_ctx, |ui| {
-                ui.set_max_width(520.0);
-                ui.heading(t(lang, Key::SrvUnsavedChanges));
-                ui.add_space(10.0);
-                if validating {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(t(lang, Key::SrvValidatingXrayTest));
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        saveable && !validating && !busy,
-                        egui::Button::new(t(lang, Key::SrvUnsavedLeaveSave)),
-                    )
-                    .clicked()
-                {
-                    decision = Some(LeaveDecision::Save);
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(t(lang, Key::SrvDiscardChanges)).clicked() {
-                        decision = Some(LeaveDecision::Discard);
-                    }
-                    if ui.button(t(lang, Key::Cancel)).clicked() {
-                        decision = Some(LeaveDecision::Cancel);
-                    }
-                });
+        let mut decision = None;
+        if validating {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(t(lang, Key::SrvValidatingXrayTest));
             });
-        if let Some(decision) = decision {
-            // The action resolves only through the modal's buttons; the
-            // backdrop/Escape dismissal below clears it without performing
-            // it. The modal renders only while an action is staged, so the
-            // take never comes up empty here.
-            let action = self.leave_pending.take();
-            match decision {
-                LeaveDecision::Save => {
-                    if let Some(action) = action {
-                        self.save_leave_action(action, lang, uictx);
-                    }
-                }
-                LeaveDecision::Discard => {
-                    if let Some(action) = action {
-                        self.discard_leave_action(action);
-                    }
-                }
-                // Cancel: change nothing beyond clearing the staged action.
-                LeaveDecision::Cancel => {}
+        }
+        if ui
+            .add_enabled(
+                saveable && !validating && !busy,
+                egui::Button::new(t(lang, Key::SrvUnsavedLeaveSave)),
+            )
+            .clicked()
+        {
+            decision = Some(LeaveDecision::Save);
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(t(lang, Key::SrvDiscardChanges)).clicked() {
+                decision = Some(LeaveDecision::Discard);
             }
-        } else if modal.should_close() {
-            self.leave_pending = None;
+            if ui.button(t(lang, Key::Cancel)).clicked() {
+                decision = Some(LeaveDecision::Cancel);
+            }
+        });
+        decision
+    }
+
+    /// Resolve the staged action with the answer the question got. The action
+    /// resolves only through the question's buttons; a dismissal reaches this
+    /// as Cancel, which clears it without performing it.
+    fn resolve_leave(&mut self, decision: LeaveDecision, uictx: &mut UiCtx) {
+        let lang = uictx.settings.language;
+        // The question renders only while an action is staged, so the take
+        // never comes up empty here.
+        let action = self.leave_pending.take();
+        match decision {
+            LeaveDecision::Save => {
+                if let Some(action) = action {
+                    self.save_leave_action(action, lang, uictx);
+                }
+            }
+            LeaveDecision::Discard => {
+                if let Some(action) = action {
+                    self.discard_leave_action(action);
+                }
+            }
+            // Cancel: change nothing beyond clearing the staged action.
+            LeaveDecision::Cancel => {}
         }
     }
 }
@@ -7011,265 +7074,321 @@ impl ServersScreen {
         let lang = uictx.settings.language;
         let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
         let core_busy = uictx.busy.is_held();
-        let mut open = true;
         let mut validate_clicked = false;
         let mut cancel = false;
-        let window = egui::Window::new(t(lang, Key::SrvAddServerWindow))
-            .id(egui::Id::new("servers.add-draft"))
-            .collapsible(false)
-            .resizable(true)
-            .default_size([680.0, 600.0]);
-        let window = if validating {
-            window
-        } else {
-            window.open(&mut open)
-        };
-        window.show(ctx, |ui| {
-            // The validation blocks inside render from the draft's memoized
-            // verdicts, so refresh before the content: a fresh dialog, a tool
-            // application, or a language switch renders same-frame accurate
-            // verdicts.
-            draft.refresh(lang);
-            ui.add_enabled_ui(!validating, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(t(lang, Key::SrvName));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.profile.name).desired_width(260.0),
-                    );
-                    ui.separator();
-                    ui.label(t(lang, Key::SrvProtocol));
-                    ui.monospace(draft.profile.outbound.protocol.as_str());
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    for &tab in TABS {
-                        ui.selectable_value(&mut self.draft_tab, tab, tab.label(lang));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        widgets::reveal_toggle(ui, lang, &mut self.revealed_add);
-                    });
-                });
-                // The dialog opens revealed (an empty form hides nothing), so
-                // this is what the dialog masks while the user hides it again.
-                let mask = widgets::Mask {
-                    secrets: !self.revealed_add,
-                    server_info: !self.revealed_add && uictx.settings.hide_server_info,
-                };
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("servers.add-draft.scroll")
-                    .max_height(430.0)
-                    .show(ui, |ui| {
-                        // The borrowed identity the tabs below take, built from
-                        // the draft's own fields (see [`DraftTarget`]) inside
-                        // the frame that renders them: the change protocol after
-                        // the tabs mutates the draft as a whole, so the borrow
-                        // of its id ends with the tab that reads it.
-                        let target = DraftTarget {
-                            kind: DraftKind::Add,
-                            profile_id: draft.id.as_str(),
-                            generation: draft.generation,
-                        };
-                        let changed = match self.draft_tab {
-                            EditorTab::Basic => {
-                                let inline_errors: &[String] = draft
-                                    .validation
-                                    .as_ref()
-                                    .map(|cached| cached.rendered.basic_inline.as_slice())
-                                    .unwrap_or(&[]);
-                                self.basic_tab_for_target(
-                                    ui,
-                                    lang,
-                                    &mut draft.profile,
-                                    Some(target),
-                                    inline_errors,
-                                    mask,
-                                )
-                            }
-                            EditorTab::Transport => {
-                                let masque_outbound =
-                                    draft.profile.outbound.protocol == Protocol::Masque;
-                                self.transport_tab(
-                                    ui,
-                                    lang,
-                                    &mut draft.profile.outbound.stream,
-                                    masque_outbound,
-                                    0,
-                                    TransportTabCtx {
-                                        target: Some(target),
-                                        masked: mask.secrets,
-                                    },
-                                )
-                            }
-                            EditorTab::Security => {
-                                let address = draft.profile.server_address();
-                                let ech_sockopt_errors: &[String] = draft
-                                    .validation
-                                    .as_ref()
-                                    .map(|cached| cached.rendered.ech_sockopt.as_slice())
-                                    .unwrap_or(&[]);
-                                self.security_tab_for_target(
-                                    ui,
-                                    lang,
-                                    Some(target),
-                                    &mut draft.profile.outbound.stream,
-                                    address.as_deref(),
-                                    ech_sockopt_errors,
-                                )
-                            }
-                            EditorTab::Mux => {
-                                let flow = vless_flow(&draft.profile.outbound.settings);
-                                mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
-                            }
-                            EditorTab::Advanced => {
-                                // The inline finalmask and sockopt verdicts
-                                // ride the draft's memoized validation
-                                // (refreshed above whenever the draft
-                                // generation or language moved): identical
-                                // messages, zero re-validation on idle
-                                // frames.
-                                let finalmask_errors: &[String] = draft
-                                    .validation
-                                    .as_ref()
-                                    .map(|cached| cached.rendered.finalmask.as_slice())
-                                    .unwrap_or(&[]);
-                                let stream_sockopt_errors: &[String] = draft
-                                    .validation
-                                    .as_ref()
-                                    .map(|cached| cached.rendered.stream_sockopt.as_slice())
-                                    .unwrap_or(&[]);
-                                ServersScreen::advanced_tab(
-                                    ui,
-                                    lang,
-                                    &mut draft.profile,
-                                    &uictx.servers.profiles,
-                                    AdvancedTabCtx {
-                                        set_key: (
-                                            *uictx.model_generation,
-                                            uictx.servers.profiles.len(),
-                                        ),
-                                        finalmask_errors,
-                                        stream_sockopt_errors,
-                                        dialer_proxy_options: &mut self.add.chain_options,
-                                        buffers: &mut self.seeded_buffers,
-                                        masked: mask.secrets,
-                                    },
-                                )
-                            }
-                        };
-                        // The draft changed this frame: its change protocol runs
-                        // so the memoized validation below recomputes. The
-                        // reported validation output stays until the next
-                        // attempt — it is why this dialog is still open.
-                        if changed {
-                            draft.edited();
-                        }
-                    });
-
-                // Content edits ran the change protocol above; refresh the
-                // memoized verdicts once for the new generation.
+        let mut leave_decision: Option<LeaveDecision> = None;
+        // The question this window asks about itself is still a question about
+        // the app's state, so the main window stays behind it the way it is
+        // behind any other confirmation: this window is a sibling of the main
+        // window, so the question's own modal cannot reach across to it. A
+        // backend with no windows to give renders both in one context, where
+        // the question's own modal already covers the window it dims.
+        let backdrop_dismissed = self.add_close_is_staged()
+            && !ctx.embed_viewports()
+            && popup::backdrop(ctx, "servers.leave.add-draft");
+        let close_requested = popup::show(
+            ctx,
+            "servers.add-draft",
+            t(lang, Key::SrvAddServerWindow),
+            [680.0, 600.0],
+            true,
+            |ui| {
+                // The validation blocks inside render from the draft's memoized
+                // verdicts, so refresh before the content: a fresh dialog, a tool
+                // application, or a language switch renders same-frame accurate
+                // verdicts.
                 draft.refresh(lang);
-                let Some(cached) = draft.validation.as_ref() else {
-                    return;
-                };
-                let errors = &cached.rendered.blocking;
-                let warnings = &cached.rendered.advisory;
-                let gate = draft.gate(&self.seeded_buffers, validating, core_busy);
-                if !errors.is_empty() {
+                ui.add_enabled_ui(!validating, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(t(lang, Key::SrvName));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.profile.name)
+                                .desired_width(260.0),
+                        );
+                        ui.separator();
+                        ui.label(t(lang, Key::SrvProtocol));
+                        ui.monospace(draft.profile.outbound.protocol.as_str());
+                    });
                     ui.separator();
-                    ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvCompleteRequired));
-                    for error in errors {
+                    ui.horizontal(|ui| {
+                        for &tab in TABS {
+                            ui.selectable_value(&mut self.draft_tab, tab, tab.label(lang));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            widgets::reveal_toggle(ui, lang, &mut self.revealed_add);
+                        });
+                    });
+                    // The dialog opens revealed (an empty form hides nothing), so
+                    // this is what the dialog masks while the user hides it again.
+                    let mask = widgets::Mask {
+                        secrets: !self.revealed_add,
+                        server_info: !self.revealed_add && uictx.settings.hide_server_info,
+                    };
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("servers.add-draft.scroll")
+                        .max_height(430.0)
+                        .show(ui, |ui| {
+                            // The borrowed identity the tabs below take, built from
+                            // the draft's own fields (see [`DraftTarget`]) inside
+                            // the frame that renders them: the change protocol after
+                            // the tabs mutates the draft as a whole, so the borrow
+                            // of its id ends with the tab that reads it.
+                            let target = DraftTarget {
+                                kind: DraftKind::Add,
+                                profile_id: draft.id.as_str(),
+                                generation: draft.generation,
+                            };
+                            let changed = match self.draft_tab {
+                                EditorTab::Basic => {
+                                    let inline_errors: &[String] = draft
+                                        .validation
+                                        .as_ref()
+                                        .map(|cached| cached.rendered.basic_inline.as_slice())
+                                        .unwrap_or(&[]);
+                                    self.basic_tab_for_target(
+                                        ui,
+                                        lang,
+                                        &mut draft.profile,
+                                        Some(target),
+                                        inline_errors,
+                                        mask,
+                                    )
+                                }
+                                EditorTab::Transport => {
+                                    let masque_outbound =
+                                        draft.profile.outbound.protocol == Protocol::Masque;
+                                    self.transport_tab(
+                                        ui,
+                                        lang,
+                                        &mut draft.profile.outbound.stream,
+                                        masque_outbound,
+                                        0,
+                                        TransportTabCtx {
+                                            target: Some(target),
+                                            masked: mask.secrets,
+                                        },
+                                    )
+                                }
+                                EditorTab::Security => {
+                                    let address = draft.profile.server_address();
+                                    let ech_sockopt_errors: &[String] = draft
+                                        .validation
+                                        .as_ref()
+                                        .map(|cached| cached.rendered.ech_sockopt.as_slice())
+                                        .unwrap_or(&[]);
+                                    self.security_tab_for_target(
+                                        ui,
+                                        lang,
+                                        Some(target),
+                                        &mut draft.profile.outbound.stream,
+                                        address.as_deref(),
+                                        ech_sockopt_errors,
+                                    )
+                                }
+                                EditorTab::Mux => {
+                                    let flow = vless_flow(&draft.profile.outbound.settings);
+                                    mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
+                                }
+                                EditorTab::Advanced => {
+                                    // The inline finalmask and sockopt verdicts
+                                    // ride the draft's memoized validation
+                                    // (refreshed above whenever the draft
+                                    // generation or language moved): identical
+                                    // messages, zero re-validation on idle
+                                    // frames.
+                                    let finalmask_errors: &[String] = draft
+                                        .validation
+                                        .as_ref()
+                                        .map(|cached| cached.rendered.finalmask.as_slice())
+                                        .unwrap_or(&[]);
+                                    let stream_sockopt_errors: &[String] = draft
+                                        .validation
+                                        .as_ref()
+                                        .map(|cached| cached.rendered.stream_sockopt.as_slice())
+                                        .unwrap_or(&[]);
+                                    ServersScreen::advanced_tab(
+                                        ui,
+                                        lang,
+                                        &mut draft.profile,
+                                        &uictx.servers.profiles,
+                                        AdvancedTabCtx {
+                                            set_key: (
+                                                *uictx.model_generation,
+                                                uictx.servers.profiles.len(),
+                                            ),
+                                            finalmask_errors,
+                                            stream_sockopt_errors,
+                                            dialer_proxy_options: &mut self.add.chain_options,
+                                            buffers: &mut self.seeded_buffers,
+                                            masked: mask.secrets,
+                                        },
+                                    )
+                                }
+                            };
+                            // The draft changed this frame: its change protocol runs
+                            // so the memoized validation below recomputes. The
+                            // reported validation output stays until the next
+                            // attempt — it is why this dialog is still open.
+                            if changed {
+                                draft.edited();
+                            }
+                        });
+
+                    // Content edits ran the change protocol above; refresh the
+                    // memoized verdicts once for the new generation.
+                    draft.refresh(lang);
+                    let Some(cached) = draft.validation.as_ref() else {
+                        return;
+                    };
+                    let errors = &cached.rendered.blocking;
+                    let warnings = &cached.rendered.advisory;
+                    let gate = draft.gate(&self.seeded_buffers, validating, core_busy);
+                    if !errors.is_empty() {
+                        ui.separator();
                         ui.colored_label(
                             status_colors_of(ui).err,
-                            t_fmt(lang, Key::ErrorBullet, &[&error]),
+                            t(lang, Key::SrvCompleteRequired),
                         );
+                        for error in errors {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                t_fmt(lang, Key::ErrorBullet, &[&error]),
+                            );
+                        }
                     }
-                }
-                // Configuration warnings never gate Validate-and-add;
-                // they render amber under their own header.
-                if !warnings.is_empty() {
-                    ui.separator();
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        t(lang, Key::SrvConfigurationWarningsHeader),
-                    );
-                    for warning in warnings {
+                    // Configuration warnings never gate Validate-and-add;
+                    // they render amber under their own header.
+                    if !warnings.is_empty() {
+                        ui.separator();
                         ui.colored_label(
                             status_colors_of(ui).warn,
-                            t_fmt(lang, Key::ErrorBullet, &[&warning]),
+                            t(lang, Key::SrvConfigurationWarningsHeader),
+                        );
+                        for warning in warnings {
+                            ui.colored_label(
+                                status_colors_of(ui).warn,
+                                t_fmt(lang, Key::ErrorBullet, &[&warning]),
+                            );
+                        }
+                    }
+                    if core_busy {
+                        ui.colored_label(
+                            status_colors_of(ui).warn,
+                            t(lang, Key::SrvWaitCoreOperation),
                         );
                     }
-                }
-                if core_busy {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        t(lang, Key::SrvWaitCoreOperation),
-                    );
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    // Validate-and-add gates on the blocking half alone: an
-                    // add draft is unsaved by definition, so there is nothing
-                    // for a changed-from-source test to refuse.
-                    if ui
-                        .add_enabled(
-                            !gate.blocking && !gate.busy,
-                            egui::Button::new(t(lang, Key::SrvValidateAndAdd)),
-                        )
-                        .on_hover_text(t(lang, Key::SrvValidateAndAddHint))
-                        .clicked()
-                    {
-                        validate_clicked = true;
-                    }
-                    if ui.button(t(lang, Key::Cancel)).clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-            if validating {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(t(lang, Key::SrvValidatingXrayTest));
-                });
-            }
-            if let Some(report) = &self.profile_validation_report {
-                ui.separator();
-                ui.colored_label(
-                    status_colors_of(ui).err,
-                    t(lang, Key::SrvValidationFailedColon),
-                );
-                egui::ScrollArea::vertical()
-                    .id_salt("servers.add-draft.validation-output")
-                    .max_height(140.0)
-                    .show(ui, |ui| {
-                        ui.monospace(report);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        // Validate-and-add gates on the blocking half alone: an
+                        // add draft is unsaved by definition, so there is nothing
+                        // for a changed-from-source test to refuse.
+                        if ui
+                            .add_enabled(
+                                !gate.blocking && !gate.busy,
+                                egui::Button::new(t(lang, Key::SrvValidateAndAdd)),
+                            )
+                            .on_hover_text(t(lang, Key::SrvValidateAndAddHint))
+                            .clicked()
+                        {
+                            validate_clicked = true;
+                        }
+                        if ui.button(t(lang, Key::Cancel)).clicked() {
+                            cancel = true;
+                        }
                     });
-            }
-        });
-
-        if validate_clicked {
-            match self.start_profile_validation(
-                lang,
-                ProfileValidationOrigin::Draft,
-                vec![draft.profile.clone()],
-                Some(draft.target()),
-                uictx,
-            ) {
-                Ok(()) => self.add.hold(draft),
-                Err(error) => {
-                    self.profile_validation_report = Some(error.clone());
-                    self.set_status(StatusLine::err(error));
-                    self.add.hold(draft);
+                });
+                if validating {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t(lang, Key::SrvValidatingXrayTest));
+                    });
                 }
+                if let Some(report) = &self.profile_validation_report {
+                    ui.separator();
+                    ui.colored_label(
+                        status_colors_of(ui).err,
+                        t(lang, Key::SrvValidationFailedColon),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("servers.add-draft.validation-output")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.monospace(report);
+                        });
+                }
+                // The question about this window's own draft is this window's:
+                // the user closed it, so it renders here, dimming the draft it
+                // asks about, instead of in a second window on top of it.
+                // `show_leave_modal` leaves it here for as long as this window
+                // is on screen (see its doc).
+                if self.add_close_is_staged() {
+                    let dismissed = popup::modal(
+                        ui.ctx(),
+                        "servers.leave.add-draft",
+                        t(lang, Key::SrvUnsavedChanges),
+                        520.0,
+                        |ui| {
+                            let gate = draft.gate(&self.seeded_buffers, validating, core_busy);
+                            leave_decision = self.leave_confirmation(ui, uictx, Some(gate));
+                        },
+                    );
+                    if leave_decision.is_none() && (dismissed || backdrop_dismissed) {
+                        // A dismissal of the question — a click on the dimmed
+                        // draft, Escape, or a click on the dimmed main window —
+                        // is Cancel, as it is in the main window; a button's
+                        // answer wins the frame it lands in.
+                        leave_decision = Some(LeaveDecision::Cancel);
+                    }
+                }
+            },
+        );
+
+        // Only Discard drops the draft with the window it closed; every other
+        // answer — Save holding it for the verdict it starts, Cancel leaving
+        // the editor as it was — is what the gate below does with an untouched
+        // window.
+        // Discard already dropped the draft with the window it closed; every
+        // other answer — Save holding it for the verdict it starts, Cancel
+        // leaving the editor as it was — is what this gate does with an
+        // untouched window.
+        let discarded = matches!(leave_decision, Some(LeaveDecision::Discard));
+        if !discarded {
+            if validate_clicked {
+                match self.start_profile_validation(
+                    lang,
+                    ProfileValidationOrigin::Draft,
+                    vec![draft.profile.clone()],
+                    Some(draft.target()),
+                    uictx,
+                ) {
+                    Ok(()) => self.add.hold(draft),
+                    Err(error) => {
+                        self.profile_validation_report = Some(error.clone());
+                        self.set_status(StatusLine::err(error));
+                        self.add.hold(draft);
+                    }
+                }
+            } else if validating || (!close_requested && !cancel) {
+                // A validation in flight holds the dialog: the platform's close
+                // on its window is refused with Cancel until the verdict lands,
+                // because the draft and the report it will render are what the
+                // dialog is open for.
+                self.add.hold(draft);
+            } else {
+                // The draft was closed or cancelled without commit: the close
+                // guard clears a derive dialog targeting it, stages the leave
+                // modal when the draft is dirty, and otherwise drops the draft
+                // with its seeded raw buffers.
+                self.close_add_draft(draft);
             }
-        } else if validating || (open && !cancel) {
-            self.add.hold(draft);
-        } else {
-            // The draft was closed or cancelled without commit: the close
-            // guard clears a derive dialog targeting it, stages the leave
-            // modal when the draft is dirty, and otherwise drops the draft
-            // with its seeded raw buffers.
-            self.close_add_draft(draft);
+        }
+
+        // The answer resolves last, with the draft back in its slot: Save's
+        // validation reads the slot the same way the editor's own commit does,
+        // and Discard closes the draft the gate above held back.
+        if let Some(decision) = leave_decision {
+            self.resolve_leave(decision, uictx);
         }
     }
 
@@ -7285,8 +7404,7 @@ impl ServersScreen {
     /// copy button clones it at click time.
     /// The probe output window of `kind`'s slot: each slot's own panel opens
     /// its own window, so both editors can show a transcript in one frame. The
-    /// window's egui id carries the slot, or the two would share open/close
-    /// state.
+    /// window's key carries the slot, or the two would share open/close state.
     fn probe_output_window(&mut self, ctx: &egui::Context, lang: Language, kind: DraftKind) {
         let probe = &mut self.slot_mut(kind).probe;
         if !probe.show_output {
@@ -7299,15 +7417,14 @@ impl ServersScreen {
             probe.show_output = false;
             return;
         };
-        let mut open = true;
         let mut close_clicked = false;
-        egui::Window::new(t(lang, Key::SrvProbeOutputTitle))
-            .id(egui::Id::new(("servers.tls-probe-output", kind)))
-            .collapsible(false)
-            .resizable(true)
-            .default_size([560.0, 380.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
+        let close_requested = popup::show(
+            ctx,
+            ("servers.tls-probe-output", kind),
+            t(lang, Key::SrvProbeOutputTitle),
+            [560.0, 400.0],
+            true,
+            |ui| {
                 ui.horizontal(|ui| {
                     if ui.button(t(lang, Key::SrvCopyPin)).clicked() {
                         ui.ctx().copy_text(output.clone());
@@ -7322,11 +7439,9 @@ impl ServersScreen {
                     .show(ui, |ui| {
                         ui.monospace(output.as_str());
                     });
-            });
-        if close_clicked {
-            open = false;
-        }
-        self.slot_mut(kind).probe.show_output = open;
+            },
+        );
+        self.slot_mut(kind).probe.show_output = !close_requested && !close_clicked;
     }
 
     fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
@@ -7339,146 +7454,148 @@ impl ServersScreen {
         if self.import_open {
             let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Import);
             let core_busy = uictx.busy.is_held();
-            let mut open = self.import_open;
             let mut validate_profiles: Option<Vec<ServerProfile>> = None;
-            let window = egui::Window::new(t(lang, Key::SrvImportShareLinks))
-                .collapsible(false)
-                .resizable(true)
-                .default_size([520.0, 420.0]);
-            let window = if validating {
-                window
-            } else {
-                window.open(&mut open)
-            };
-            window.show(ctx, |ui| {
-                ui.add_enabled_ui(!validating, |ui| {
-                    ui.label(t(lang, Key::SrvImportHint));
-                    let source_changed = ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.import_text)
-                                .desired_rows(6)
-                                .desired_width(f32::INFINITY)
-                                .hint_text(t(lang, Key::SrvImportPasteHint)),
-                        )
-                        .on_hover_text(t(lang, Key::SrvPasteCtrlV))
-                        .changed();
-                    if source_changed {
-                        self.invalidate_import_preview();
-                        self.profile_validation_report = None;
-                        self.import_parse_error = None;
-                        self.cancel_import_parse();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.import_parse_job.is_pending() && !self.import_text.is_empty(),
-                            egui::Button::new(t(lang, Key::SrvParse)),
-                        )
-                        .clicked()
-                    {
-                        self.start_import_parse(lang, ui.ctx().clone());
-                    }
-                    if self.import_parse_job.is_pending() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(t(lang, Key::SrvParsingLinks));
-                            if ui.button(t(lang, Key::Cancel)).clicked() {
-                                self.cancel_import_parse();
-                            }
-                        });
-                    }
-                    if let Some(message) = &self.import_parse_error {
-                        ui.colored_label(status_colors_of(ui).err, message);
-                    }
-                    if self.import_preview_is_current() && !self.import_parsed.is_empty() {
-                        self.refresh_import_preview(lang);
-                        let preview = self
-                            .import_preview
-                            .as_ref()
-                            .expect("the preview was built for this frame");
-                        let ok = preview.ok;
-                        ui.label(t_fmt(lang, Key::SrvOkTotal, &[&ok, &preview.rows.len()]));
-                        // One truncated line per entry, laid out only for the
-                        // rows the scroll viewport shows: a subscription
-                        // paste can hold tens of thousands of links, and egui
-                        // lays out every child of a plain `show`. The full
-                        // error text stays reachable as the row's tooltip.
-                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                        egui::ScrollArea::vertical().max_height(140.0).show_rows(
-                            ui,
-                            row_height,
-                            preview.rows.len(),
-                            |ui, rows| {
-                                let colors = status_colors_of(ui);
-                                for row in &preview.rows[rows] {
-                                    let text = match row.kind {
-                                        ImportPreviewKind::Ok => RichText::new(row.text.as_str()),
-                                        ImportPreviewKind::Warn => {
-                                            RichText::new(row.text.as_str()).color(colors.warn)
-                                        }
-                                        ImportPreviewKind::Err => {
-                                            RichText::new(row.text.as_str()).color(colors.err)
-                                        }
-                                    };
-                                    let response = ui.add(egui::Label::new(text).truncate());
-                                    if row.kind != ImportPreviewKind::Ok {
-                                        response.on_hover_text(row.text.as_str());
-                                    }
-                                }
-                            },
-                        );
-                        if core_busy {
-                            ui.colored_label(
-                                status_colors_of(ui).warn,
-                                t(lang, Key::SrvWaitCoreOperationImports),
-                            );
+            let close_requested = popup::show(
+                ctx,
+                "servers.import-links",
+                t(lang, Key::SrvImportShareLinks),
+                [520.0, 420.0],
+                true,
+                |ui| {
+                    ui.add_enabled_ui(!validating, |ui| {
+                        ui.label(t(lang, Key::SrvImportHint));
+                        let source_changed = ui
+                            .add(
+                                egui::TextEdit::multiline(&mut self.import_text)
+                                    .desired_rows(6)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(t(lang, Key::SrvImportPasteHint)),
+                            )
+                            .on_hover_text(t(lang, Key::SrvPasteCtrlV))
+                            .changed();
+                        if source_changed {
+                            self.invalidate_import_preview();
+                            self.profile_validation_report = None;
+                            self.import_parse_error = None;
+                            self.cancel_import_parse();
                         }
                         if ui
                             .add_enabled(
-                                ok > 0 && !core_busy,
-                                egui::Button::new(t_fmt(
-                                    lang,
-                                    Key::SrvValidateAndAddServers,
-                                    &[&ok],
-                                )),
+                                !self.import_parse_job.is_pending() && !self.import_text.is_empty(),
+                                egui::Button::new(t(lang, Key::SrvParse)),
                             )
-                            .on_hover_text(t(lang, Key::SrvValidateAndAddServersHint))
                             .clicked()
                         {
-                            validate_profiles = Some(
-                                self.import_parsed
-                                    .iter()
-                                    .filter_map(|result| {
-                                        result.as_ref().ok().map(|parsed| parsed.profile.clone())
-                                    })
-                                    .collect(),
-                            );
+                            self.start_import_parse(lang, ui.ctx().clone());
                         }
-                    }
-                });
-                if validating {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(t_fmt(
-                            lang,
-                            Key::SrvValidatingProfiles,
-                            &[&self.profile_validation_count],
-                        ));
+                        if self.import_parse_job.is_pending() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(t(lang, Key::SrvParsingLinks));
+                                if ui.button(t(lang, Key::Cancel)).clicked() {
+                                    self.cancel_import_parse();
+                                }
+                            });
+                        }
+                        if let Some(message) = &self.import_parse_error {
+                            ui.colored_label(status_colors_of(ui).err, message);
+                        }
+                        if self.import_preview_is_current() && !self.import_parsed.is_empty() {
+                            self.refresh_import_preview(lang);
+                            let preview = self
+                                .import_preview
+                                .as_ref()
+                                .expect("the preview was built for this frame");
+                            let ok = preview.ok;
+                            ui.label(t_fmt(lang, Key::SrvOkTotal, &[&ok, &preview.rows.len()]));
+                            // One truncated line per entry, laid out only for the
+                            // rows the scroll viewport shows: a subscription
+                            // paste can hold tens of thousands of links, and egui
+                            // lays out every child of a plain `show`. The full
+                            // error text stays reachable as the row's tooltip.
+                            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                            egui::ScrollArea::vertical().max_height(140.0).show_rows(
+                                ui,
+                                row_height,
+                                preview.rows.len(),
+                                |ui, rows| {
+                                    let colors = status_colors_of(ui);
+                                    for row in &preview.rows[rows] {
+                                        let text = match row.kind {
+                                            ImportPreviewKind::Ok => {
+                                                RichText::new(row.text.as_str())
+                                            }
+                                            ImportPreviewKind::Warn => {
+                                                RichText::new(row.text.as_str()).color(colors.warn)
+                                            }
+                                            ImportPreviewKind::Err => {
+                                                RichText::new(row.text.as_str()).color(colors.err)
+                                            }
+                                        };
+                                        let response = ui.add(egui::Label::new(text).truncate());
+                                        if row.kind != ImportPreviewKind::Ok {
+                                            response.on_hover_text(row.text.as_str());
+                                        }
+                                    }
+                                },
+                            );
+                            if core_busy {
+                                ui.colored_label(
+                                    status_colors_of(ui).warn,
+                                    t(lang, Key::SrvWaitCoreOperationImports),
+                                );
+                            }
+                            if ui
+                                .add_enabled(
+                                    ok > 0 && !core_busy,
+                                    egui::Button::new(t_fmt(
+                                        lang,
+                                        Key::SrvValidateAndAddServers,
+                                        &[&ok],
+                                    )),
+                                )
+                                .on_hover_text(t(lang, Key::SrvValidateAndAddServersHint))
+                                .clicked()
+                            {
+                                validate_profiles = Some(
+                                    self.import_parsed
+                                        .iter()
+                                        .filter_map(|result| {
+                                            result
+                                                .as_ref()
+                                                .ok()
+                                                .map(|parsed| parsed.profile.clone())
+                                        })
+                                        .collect(),
+                                );
+                            }
+                        }
                     });
-                }
-                if let Some(report) = &self.profile_validation_report {
-                    ui.separator();
-                    ui.colored_label(
-                        status_colors_of(ui).err,
-                        t(lang, Key::SrvRejectedProfileDetails),
-                    );
-                    egui::ScrollArea::vertical()
-                        .id_salt("servers.import.validation-output")
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            ui.monospace(report);
+                    if validating {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(t_fmt(
+                                lang,
+                                Key::SrvValidatingProfiles,
+                                &[&self.profile_validation_count],
+                            ));
                         });
-                }
-            });
+                    }
+                    if let Some(report) = &self.profile_validation_report {
+                        ui.separator();
+                        ui.colored_label(
+                            status_colors_of(ui).err,
+                            t(lang, Key::SrvRejectedProfileDetails),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("servers.import.validation-output")
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.monospace(report);
+                            });
+                    }
+                },
+            );
             if let Some(profiles) = validate_profiles
                 && let Err(error) = self.start_profile_validation(
                     lang,
@@ -7491,7 +7608,10 @@ impl ServersScreen {
                 self.profile_validation_report = Some(error.clone());
                 self.set_status(StatusLine::err(error));
             }
-            self.import_open = (open
+            // A validation in flight keeps the dialog up, and the platform's
+            // close on its window is refused with it: the report the dialog
+            // will render is the reason it is still open.
+            self.import_open = (!close_requested
                 || validating
                 || self.profile_validation_in_progress(ProfileValidationOrigin::Import))
                 && self.import_open;
@@ -7502,13 +7622,14 @@ impl ServersScreen {
 
         // QR export.
         if let Some(qr) = &mut self.qr_dialog {
-            let mut open = true;
             let mut close_clicked = false;
-            egui::Window::new(t_fmt(lang, Key::SrvShareTitle, &[&qr.name]))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
+            let close_requested = popup::show(
+                ctx,
+                "servers.share",
+                t_fmt(lang, Key::SrvShareTitle, &[&qr.name]).as_str(),
+                [340.0, 480.0],
+                false,
+                |ui| {
                     if qr.tex.is_none() {
                         qr.tex = links::qr_color_image(&qr.link).map(|img| {
                             ui.ctx()
@@ -7533,8 +7654,9 @@ impl ServersScreen {
                             close_clicked = true;
                         }
                     });
-                });
-            if !open || close_clicked {
+                },
+            );
+            if close_requested || close_clicked {
                 self.qr_dialog = None;
             }
         }
@@ -7550,14 +7672,13 @@ impl ServersScreen {
             self.delete_pending = None;
         }
         if let Some(dialog) = &self.delete_pending {
-            let mut open = true;
             let mut decision: Option<bool> = None;
-            egui::Window::new(t(lang, Key::DeleteServer))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .open(&mut open)
-                .show(ctx, |ui| {
+            let declined = popup::modal(
+                ctx,
+                "servers.delete-confirm",
+                t(lang, Key::DeleteServer),
+                460.0,
+                |ui| {
                     if dialog.references.is_empty() {
                         ui.label(t_fmt(lang, Key::SrvDeleteCannotUndone, &[&dialog.name]));
                         ui.horizontal(|ui| {
@@ -7584,7 +7705,8 @@ impl ServersScreen {
                             decision = Some(false);
                         }
                     }
-                });
+                },
+            );
             if decision == Some(true) {
                 // Owned copy: the confirm block also mutates `self`
                 // (eviction), which the `dialog` borrow would otherwise block.
@@ -7603,7 +7725,7 @@ impl ServersScreen {
                 self.latency_badges.remove(&deleted_id);
                 uictx.mark_dirty();
             }
-            if !open || decision.is_some() {
+            if declined || decision.is_some() {
                 self.delete_pending = None;
             }
         }
@@ -7614,14 +7736,15 @@ impl ServersScreen {
         // REALITY x25519 public-key derivation. The private key stays in this
         // transient dialog; the result is applied only to its still-current draft.
         if let Some(mut dialog) = self.derive_dialog.take() {
-            let mut open = true;
             let mut close_clicked = false;
             let mut derive_clicked = false;
-            egui::Window::new(t(lang, Key::SrvDerivePublicKey))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
+            let close_requested = popup::show(
+                ctx,
+                "servers.derive-public-key",
+                t(lang, Key::SrvDerivePublicKey),
+                [420.0, 210.0],
+                false,
+                |ui| {
                     ui.label(t(lang, Key::SrvPrivateKeyLabel));
                     ui.add(
                         egui::TextEdit::singleline(&mut dialog.private_key)
@@ -7651,7 +7774,8 @@ impl ServersScreen {
                             ui.weak(t(lang, Key::SrvDerivingXray));
                         });
                     }
-                });
+                },
+            );
             if derive_clicked {
                 let private_key = dialog.private_key.trim().to_string();
                 if private_key.is_empty() {
@@ -7669,7 +7793,7 @@ impl ServersScreen {
                     dialog.error = None;
                 }
             }
-            if open && !close_clicked {
+            if !close_requested && !close_clicked {
                 self.derive_dialog = Some(dialog);
             }
         }
@@ -7689,6 +7813,10 @@ impl ServersScreen {
     /// [`STATUS_TOAST_AUTO_CLEAR`] after it was set; once the window elapses
     /// the toast is cleared, so a stale message can never linger over the
     /// screen (the window used to render forever after the first status).
+    ///
+    /// The toast is an overlay inside the main window: it is anchored to that
+    /// window's own corner, so a window of its own would only lose the anchor
+    /// that places it.
     fn show_status_toast(&mut self, ctx: &egui::Context) {
         let expired = self.status_set_at.is_none_or(|shown_at| {
             status_toast_expired(shown_at, Instant::now(), STATUS_TOAST_AUTO_CLEAR)
@@ -12211,6 +12339,155 @@ Authentication: ML-KEM-768, Post-Quantum
             screen.add.draft.as_ref().map(|d| d.id.as_str()),
             Some(draft.id.as_str()),
             "the staged draft must stay in the dialog until the modal resolves"
+        );
+    }
+
+    /// The question about a dirty add draft belongs to the editor window: while
+    /// that window is on screen the shell's tail renders nothing, so the frame
+    /// holds one copy of the question — the one inside the editor — and not a
+    /// second window on top of it.
+    #[test]
+    fn the_add_windows_leave_question_renders_in_the_editor_alone() {
+        let mut harness = unsaved_harness(UiTestRig::default());
+        let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.add.draft = Some(rendered_add_draft(&draft, true));
+            screen.leave_pending = Some(LeaveAction::CloseAdd);
+        }
+        harness.run();
+        assert_eq!(
+            harness
+                .get_all_by_label(t(Language::En, Key::SrvDiscardChanges))
+                .count(),
+            1,
+            "the editor window owns the question about its own draft"
+        );
+    }
+
+    /// Discard in the question inside the editor closes the draft with the
+    /// window the user asked to close: the editor does not come back empty.
+    #[test]
+    fn discard_in_the_add_windows_leave_question_closes_the_draft() {
+        let mut harness = unsaved_harness(UiTestRig::default());
+        let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.add.draft = Some(rendered_add_draft(&draft, true));
+            screen.leave_pending = Some(LeaveAction::CloseAdd);
+        }
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvDiscardChanges))
+            .last()
+            .expect("the question must render inside the editor")
+            .click();
+        harness.run();
+        let state = harness.state();
+        assert!(
+            state.0.add.draft.is_none(),
+            "Discard must drop the draft with the window it closed"
+        );
+        assert!(
+            state.0.leave_pending.is_none(),
+            "Discard must clear the staged close"
+        );
+    }
+
+    /// Save in the question inside the editor keeps the editor open: the
+    /// question renders again with the verdict's spinner, over the draft it is
+    /// waiting on.
+    #[test]
+    fn save_in_the_add_windows_leave_question_keeps_the_editor_open() {
+        let mut harness = unsaved_harness(UiTestRig::default());
+        let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.add.draft = Some(rendered_add_draft(&draft, true));
+            screen.leave_pending = Some(LeaveAction::CloseAdd);
+        }
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvUnsavedLeaveSave))
+            .last()
+            .expect("the question must render its Save button")
+            .click();
+        // The verdict it starts renders a spinner, so the frame keeps asking
+        // for repaints: step rather than run to a settled frame.
+        harness.run_steps(2);
+        let state = harness.state();
+        assert!(
+            state.0.profile_validation_request.is_pending(),
+            "Save must start the draft's validation"
+        );
+        assert!(
+            state.0.add.draft.is_some(),
+            "Save must hold the draft for the verdict it starts"
+        );
+        assert_eq!(
+            state.0.leave_pending,
+            Some(LeaveAction::CloseAdd),
+            "the staged close must stay staged until the verdict lands"
+        );
+    }
+
+    /// A dismissal of the question inside the editor is its Cancel: the staged
+    /// close is cleared and the editor stays open, the way it was before the
+    /// user closed it.
+    #[test]
+    fn dismissing_the_add_windows_leave_question_keeps_the_editor_open() {
+        let mut harness = unsaved_harness(UiTestRig::default());
+        let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.add.draft = Some(rendered_add_draft(&draft, true));
+            screen.leave_pending = Some(LeaveAction::CloseAdd);
+        }
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        let state = harness.state();
+        assert!(
+            state.0.leave_pending.is_none(),
+            "a dismissal must clear the staged close"
+        );
+        assert!(
+            state.0.add.draft.is_some(),
+            "a dismissal must leave the editor open"
+        );
+    }
+
+    /// Off the servers screen the editor window is gone with the screen: the
+    /// question falls back to the main window, so a staged close stays
+    /// answerable instead of waiting for the user to come back.
+    #[test]
+    fn the_leave_question_falls_back_to_the_main_window_off_screen() {
+        let rig = UiTestRig::default();
+        let mut harness = Harness::builder()
+            .with_size(DEFAULT_TEST_VIEWPORT)
+            .build_ui_state(
+                |ui, state: &mut (ServersScreen, UiTestRig)| {
+                    // The shell's tail alone: the screen, and with it the editor
+                    // window, is not rendered this frame.
+                    state
+                        .0
+                        .show_leave_modal(ui.ctx(), &mut state.1.ctx(), false);
+                },
+                (ServersScreen::default(), rig),
+            );
+        let draft = ServerProfile::new("New Freedom server", OutboundModel::new(Protocol::Freedom));
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.add.draft = Some(rendered_add_draft(&draft, true));
+            screen.leave_pending = Some(LeaveAction::CloseAdd);
+        }
+        harness.run();
+        assert_eq!(
+            harness
+                .get_all_by_label(t(Language::En, Key::SrvDiscardChanges))
+                .count(),
+            1,
+            "the question must render its own window when the editor is not on screen"
         );
     }
 

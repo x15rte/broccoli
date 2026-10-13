@@ -16,6 +16,7 @@ use crate::model::settings::{Language, geodata_cron_error, geodata_url_error};
 use crate::rt::{CoreCmd, JobKind, TestConfigReply};
 use crate::sys;
 use crate::sys::selfupd::UpdateCheckState;
+use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 
 const LOG_LEVELS: [&str; 5] = ["debug", "info", "warning", "error", "none"];
@@ -901,90 +902,112 @@ impl SettingsScreen {
     /// The network-state cleanup confirmation: one action, because the repair
     /// itself is reversible — it restores what a session took over and
     /// removes only what that session left behind. Returns whether the user
-    /// confirmed; Cancel closes the modal without a command.
+    /// confirmed; Cancel closes it without a command.
     fn show_network_cleanup_modal(&mut self, ctx: &egui::Context, lang: Language) -> bool {
         let mut confirmed = false;
-        let mut cancelled = false;
-        egui::Modal::new(egui::Id::new("broccoli-network-cleanup-modal")).show(ctx, |ui| {
-            ui.set_max_width(520.0);
-            ui.heading(t(lang, Key::SettingsCleanUpNetworkTitle));
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanUpNetworkNote)).weak())
+        let mut resolved = false;
+        let declined = popup::modal(
+            ctx,
+            "settings.network-cleanup",
+            t(lang, Key::SettingsCleanUpNetworkTitle),
+            520.0,
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(t(lang, Key::SettingsCleanUpNetworkNote)).weak(),
+                    )
                     .wrap(),
-            )
-            .on_hover_text(t(lang, Key::SettingsCleanUpNetworkDetail));
-            ui.add_space(10.0);
-            if ui
-                .button(t(lang, Key::SettingsCleanUpNetworkConfirm))
-                .clicked()
-            {
-                confirmed = true;
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            if ui.button(t(lang, Key::Cancel)).clicked() {
-                cancelled = true;
-            }
-        });
-        if cancelled {
+                )
+                .on_hover_text(t(lang, Key::SettingsCleanUpNetworkDetail));
+                ui.add_space(10.0);
+                if ui
+                    .button(t(lang, Key::SettingsCleanUpNetworkConfirm))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                if ui.button(t(lang, Key::Cancel)).clicked() {
+                    resolved = true;
+                }
+            },
+        );
+        if declined || resolved {
             self.network_cleanup_modal = false;
         }
         confirmed
     }
 
-    /// The cleanup confirmation modal — the `egui::Modal` pattern of the
-    /// first-run wizard — with exactly two actions. Choosing full cleanup
-    /// records the request and closes the modal; Cancel just closes it.
+    /// The cleanup confirmation — rendered in the main window, which it dims
+    /// and blocks — with exactly two actions. Choosing full cleanup
+    /// records the request and closes it; Cancel just closes it.
     fn show_cleanup_modal(&mut self, ctx: &egui::Context, lang: Language) {
-        egui::Modal::new(egui::Id::new("broccoli-cleanup-modal")).show(ctx, |ui| {
-            ui.set_max_width(520.0);
-            ui.heading(t(lang, Key::SettingsCleanupTitle));
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(RichText::new(t(lang, Key::SettingsCleanupNote)).weak()).wrap(),
-            )
-            .on_hover_text(t(lang, Key::SettingsCleanupDetail));
-            ui.add_space(10.0);
-            if ui
-                .button(t(lang, Key::SettingsCleanupFull))
-                .on_hover_text(t(lang, Key::SettingsCleanupFullHint))
-                .clicked()
-            {
-                self.cleanup_request = true;
-                self.cleanup_modal = false;
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            if ui.button(t(lang, Key::Cancel)).clicked() {
-                self.cleanup_modal = false;
-            }
-        });
+        let mut resolved = false;
+        let declined = popup::modal(
+            ctx,
+            "settings.cleanup",
+            t(lang, Key::SettingsCleanupTitle),
+            520.0,
+            |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(t(lang, Key::SettingsCleanupNote)).weak())
+                        .wrap(),
+                )
+                .on_hover_text(t(lang, Key::SettingsCleanupDetail));
+                ui.add_space(10.0);
+                if ui
+                    .button(t(lang, Key::SettingsCleanupFull))
+                    .on_hover_text(t(lang, Key::SettingsCleanupFullHint))
+                    .clicked()
+                {
+                    self.cleanup_request = true;
+                    resolved = true;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                if ui.button(t(lang, Key::Cancel)).clicked() {
+                    resolved = true;
+                }
+            },
+        );
+        if declined || resolved {
+            self.cleanup_modal = false;
+        }
     }
 
-    /// The reset confirmation modal — the `egui::Modal` pattern of the
-    /// first-run wizard — with exactly two actions. Confirming records the
-    /// request and closes the modal; Cancel just closes it. Reset keeps the
+    /// The reset confirmation — rendered in the main window, which it dims and
+    /// blocks — with exactly two actions. Confirming records the
+    /// request and closes it; Cancel just closes it. Reset keeps the
     /// server list: the exit wipe clears generated configs and
     /// logs but preserves servers and the core.
     fn show_reset_modal(&mut self, ctx: &egui::Context, lang: Language) {
-        egui::Modal::new(egui::Id::new("broccoli-reset-modal")).show(ctx, |ui| {
-            ui.set_max_width(520.0);
-            ui.heading(t(lang, Key::SettingsResetTitle));
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(t(lang, Key::SettingsResetNote)).weak()).wrap())
+        let mut resolved = false;
+        let declined = popup::modal(
+            ctx,
+            "settings.reset",
+            t(lang, Key::SettingsResetTitle),
+            520.0,
+            |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(t(lang, Key::SettingsResetNote)).weak()).wrap(),
+                )
                 .on_hover_text(t(lang, Key::SettingsResetDetail));
-            ui.add_space(10.0);
-            if ui.button(t(lang, Key::SettingsResetConfirm)).clicked() {
-                self.reset_request = true;
-                self.reset_modal = false;
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            if ui.button(t(lang, Key::Cancel)).clicked() {
-                self.reset_modal = false;
-            }
-        });
+                ui.add_space(10.0);
+                if ui.button(t(lang, Key::SettingsResetConfirm)).clicked() {
+                    self.reset_request = true;
+                    resolved = true;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                if ui.button(t(lang, Key::Cancel)).clicked() {
+                    resolved = true;
+                }
+            },
+        );
+        if declined || resolved {
+            self.reset_modal = false;
+        }
     }
 
     /// Consume a confirmed full-cleanup request, if any. The shell calls
