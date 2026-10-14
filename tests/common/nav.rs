@@ -47,9 +47,9 @@ pub fn boot_screen(
     (lock, tmp, h)
 }
 
-/// Navigate the booted app to `screen` through the sidebar.
+/// Navigate the booted app to `screen` through the nav rail.
 ///
-/// The sidebar's labels collide with controls the dashboard renders (its mode
+/// The nav rail's labels collide with controls the dashboard renders (its mode
 /// selector carries "TUN" with the same role), so the path stages through a
 /// screen whose label is unique — one workaround, in one place, instead of one
 /// per test file. The label is the shell's own (`Screen::label`), so a renamed

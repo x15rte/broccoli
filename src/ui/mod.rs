@@ -6,6 +6,7 @@ pub mod dns;
 pub(crate) mod gate;
 pub mod inbounds;
 pub mod logs;
+pub(crate) mod nav;
 pub(crate) mod popup;
 pub mod profile_preview;
 pub(crate) mod request;

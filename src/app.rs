@@ -414,6 +414,10 @@ pub struct BroccoliApp {
     /// opaque to the shell, which only hands the value back each frame
     /// ([`ui::topbar::show_row`]).
     topbar: ui::topbar::TopbarMemos,
+    /// The nav rail's own memos (the speed readout's generation): opaque to
+    /// the shell, which only hands the value back each frame
+    /// ([`ui::nav::show_rail`]).
+    nav: ui::nav::NavRailMemos,
     /// Generator/parsing failure for the current persisted model. Unlike a
     /// runtime verdict, this blocks sending any candidate until an edit fixes it.
     config_error: Option<String>,
@@ -908,6 +912,7 @@ impl BroccoliApp {
             config_error,
             state_error_save_logged: false,
             topbar: ui::topbar::TopbarMemos::default(),
+            nav: ui::nav::NavRailMemos::default(),
             logs_ui: Default::default(),
             settings_ui: Default::default(),
             profile_preview: Default::default(),
@@ -2179,9 +2184,6 @@ impl eframe::App for BroccoliApp {
                         config_error: self.config_error.as_deref(),
                         state_error: self.state_error.as_deref(),
                         persistence_error: self.persistence_error.as_deref(),
-                        stats_generation: self.ui_ctx_snapshot.stats_generation,
-                        unit: self.settings.traffic_unit,
-                        stats: self.ui_ctx_snapshot.stats.as_ref(),
                     },
                     &mut self.topbar,
                 )
@@ -2217,20 +2219,21 @@ impl eframe::App for BroccoliApp {
             );
         }
 
-        // Sidebar navigation. The live speed readout and the session totals
-        // now live in the top bar and the dashboard table; the
-        // rail carries nav only.
-        egui::Panel::left("nav")
-            .resizable(false)
-            .default_size(140.0)
-            .show(ui, |ui| {
-                ui.add_space(8.0);
-                let lang = self.settings.language;
-                for s in Screen::ALL {
-                    ui.selectable_value(&mut self.screen, s, s.label(lang));
-                    ui.add_space(2.0);
-                }
-            });
+        // Nav rail: the screen selectors with the speed readout at its foot.
+        // The nav rail owns its panel and its own memo for the readout; the
+        // shell supplies the frame's facts and hands the screen it owns back
+        // to be written.
+        ui::nav::show_nav_panel(
+            ui,
+            &ui::nav::NavRailState {
+                lang: self.settings.language,
+                stats: self.ui_ctx_snapshot.stats.as_ref(),
+                stats_generation: self.ui_ctx_snapshot.stats_generation,
+                unit: self.settings.traffic_unit,
+            },
+            &mut self.screen,
+            &mut self.nav,
+        );
 
         // Central screen dispatch. Scroll ownership: dashboard/servers/logs
         // manage their own scrolling; the rest get an outer ScrollArea.
@@ -4468,9 +4471,6 @@ mod unsaved_changes_tests {
                                 config_error: None,
                                 state_error: None,
                                 persistence_error: None,
-                                stats_generation: 0,
-                                unit: crate::model::settings::TrafficUnit::Auto,
-                                stats: None,
                             },
                             memos,
                         );

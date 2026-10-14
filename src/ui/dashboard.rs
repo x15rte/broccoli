@@ -890,8 +890,8 @@ fn iec_scale(v: f64) -> (f64, &'static str) {
 
 /// A byte count rendered in the selected unit: the IEC ladder under
 /// [`TrafficUnit::Auto`], or an unconditional division by the unit's base
-/// under a fixed unit. One decimal, always. Also used by the top-bar speed
-/// readout (ui::topbar), which must show the same numbers the dashboard
+/// under a fixed unit. One decimal, always. Also used by the nav rail's speed
+/// readout (ui::nav), which must show the same numbers the dashboard
 /// does under the same global unit.
 pub(crate) fn format_bytes(v: u64, unit: TrafficUnit) -> String {
     match unit {

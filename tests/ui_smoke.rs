@@ -30,7 +30,7 @@ fn logs_filter<'a>(h: &'a Harness<'a, BroccoliApp>) -> egui_kittest::Node<'a> {
 }
 
 /// Unique label rendered by the visited screen's own body, used to prove a
-/// nav click actually switched screens. The sidebar always exposes every
+/// nav click actually switched screens. The nav rail always exposes every
 /// screen's label, so the asserted label must never collide with a nav label:
 /// headings that share text with the nav item (e.g. the Servers heading, which
 /// the Dashboard also renders) are matched through their screen-specific
@@ -62,7 +62,7 @@ fn app_boots_and_every_screen_renders() {
     common::dismiss_wizard(&mut h);
 
     for screen in Screen::ALL {
-        // Sidebar items are buttons; scope the click by role so a
+        // Nav rail items are buttons; scope the click by role so a
         // same-labeled heading in the central panel is never clicked instead.
         h.get_by_role_and_label(egui::accesskit::Role::Button, screen.label(Language::En))
             .click();
@@ -91,12 +91,11 @@ fn dashboard_shows_core_state_badge() {
     );
 }
 
-/// Session traffic is a session fact: the top bar carries the
-/// live rate pair and the dashboard's inbound table the core's cumulative
-/// session totals while a tick from the running core exists — and a phase
-/// change (restart / config commit) drops both, because the last tick of a
-/// dead session must not masquerade as live state. The sidebar rail this
-/// contract used to be pinned on was emptied (nav only).
+/// Session traffic is a session fact: the nav rail's readout carries the live
+/// rate pair and the dashboard's inbound table the core's cumulative session
+/// totals while a tick from the running core exists — and a phase change
+/// (restart / config commit) drops both, because the last tick of a dead
+/// session must not masquerade as live state.
 #[test]
 fn dashboard_session_totals_drop_on_phase_change() {
     let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
@@ -109,9 +108,11 @@ fn dashboard_session_totals_drop_on_phase_change() {
     common::dismiss_wizard(&mut h);
 
     // The exhibition shape: an idle-but-live core carrying session volume.
+    // The aggregate rates are their own numbers — no inbound row repeats them,
+    // so the nav rail's readout is the only surface that can show them.
     h.state().inject_event(CoreEvt::Stats(StatsTick {
-        up: 0,
-        down: 0,
+        up: 1_048_576,   // 1.0 MiB/s
+        down: 2_097_152, // 2.0 MiB/s
         per_inbound: vec![("socks".to_string(), 0, 0)],
         per_inbound_totals: vec![("socks".to_string(), 251_133_952, 1_073_741_824)],
         total_up: 251_133_952,     // 239.5 MiB
@@ -120,9 +121,11 @@ fn dashboard_session_totals_drop_on_phase_change() {
     }));
     h.run();
 
-    h.get_all_by_label("↑ 0.0 B/s · ↓ 0.0 B/s")
-        .next()
-        .expect("the top bar must pin the live rate pair once a stats tick lands");
+    for label in ["↑ 1.0 MiB/s", "↓ 2.0 MiB/s"] {
+        h.get_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("the nav rail must show the live rate {label:?}"));
+    }
     h.get_all_by_label("↑ 239.5 MiB")
         .next()
         .expect("the inbound table must carry the uplink session total");
@@ -143,12 +146,12 @@ fn dashboard_session_totals_drop_on_phase_change() {
         h.query_all_by_label("↓ 1.0 GiB").next().is_none(),
         "the downlink total must drop with the uplink total"
     );
-    assert!(
-        h.query_all_by_label("↑ 0.0 B/s · ↓ 0.0 B/s")
-            .next()
-            .is_none(),
-        "the rate readout must drop with the dead session"
-    );
+    for label in ["↑ 1.0 MiB/s", "↓ 2.0 MiB/s"] {
+        assert!(
+            h.query_all_by_label(label).next().is_none(),
+            "the rate readout {label:?} must drop with the dead session"
+        );
+    }
 }
 
 #[test]

@@ -318,7 +318,7 @@ keys! {
     Dead 0,
     LatencyTimeout 0,
     NotInstalled 0,
-    // Screen labels (nav sidebar + headings).
+    // Screen labels (nav rail + headings).
     ScreenDashboard 0,
     ScreenServers 0,
     ScreenProfilePreview 0,
@@ -1717,8 +1717,10 @@ keys! {
     TrafficUnitGiBps 0,
     GridUpTotal 0,
     GridDownTotal 0,
-    // Top-bar speed readout (ui::topbar): one label with both directions.
-    TopbarSpeed 2,
+    // Nav-rail speed readout (ui::nav): one label per direction, each with
+    // its own `/s` suffix.
+    NavSpeedUp 1,
+    NavSpeedDown 1,
     // Extra-passthrough scan messages (removed/inert extra keys).
     OutboundTrojanFlowRemoved 0,
     KcpSeedHeaderRemoved 0,
@@ -2981,7 +2983,7 @@ mod en {
             Key::Dead => "dead",
             Key::LatencyTimeout => "timeout",
             Key::NotInstalled => "not installed",
-            // Screen labels (nav sidebar + headings).
+            // Screen labels (nav rail + headings).
             Key::ScreenDashboard => "Dashboard",
             Key::ScreenServers => "Servers",
             Key::ScreenProfilePreview => "Preview",
@@ -5002,10 +5004,10 @@ mod en {
             Key::TrafficUnitGiBps => "GiB/s",
             Key::GridUpTotal => "↑ total",
             Key::GridDownTotal => "↓ total",
-            // Top-bar speed readout: both rate args carry their own `/s`
-            // suffix (the dashboard's rate labels fold it into the
-            // template) — "↑ 1.0 MiB/s · ↓ 2.0 MiB/s".
-            Key::TopbarSpeed => "↑ {}/s · ↓ {}/s",
+            // Nav-rail speed readout: each label carries its own `/s` suffix
+            // — "↑ 1.0 MiB/s" over "↓ 2.0 MiB/s".
+            Key::NavSpeedUp => "↑ {}/s",
+            Key::NavSpeedDown => "↓ {}/s",
             Key::OutboundTrojanFlowRemoved => {
                 "flow was removed from Xray's Trojan. The outbound is refused at load. Use VLESS and \
                  set the vision flow there"

@@ -1,8 +1,6 @@
-//! Top-bar status surface: the live speed readout (`↑ rate/s · ↓ rate/s`),
-//! shown at the row's right edge immediately left of the version caption,
-//! and the dynamic status/error chip zone whose width is capped so the
-//! chips can never cover the right edge — the "dynamic status covers the
-//! speed/version info" bug.
+//! Top-bar status surface: the version caption at the row's right edge, and
+//! the dynamic status/error chip zone whose width is capped so the chips can
+//! never cover it — the "dynamic status covers the version info" bug.
 //!
 //! [`show_row`] is the row's whole interface: the shell fills
 //! [`TopbarRowState`] with the frame's facts and dispatches the clicks it
@@ -16,106 +14,51 @@
 
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::Mode;
-use crate::model::settings::{Language, TrafficUnit};
-use crate::rt::{CorePhase, StatsTick};
+use crate::model::settings::Language;
+use crate::rt::CorePhase;
 use crate::ui::PhaseAction;
-use crate::ui::dashboard::format_bytes;
 use crate::ui::status::{PhaseBadgeWording, phase_badge_color, phase_badge_text, status_colors_of};
 
-/// The speed readout for one stats tick: one label with both directions,
-/// each rate formatted in the global unit (the unit selection is
-/// global). `↑ 1.0 MiB/s · ↓ 2.0 MiB/s`.
-fn build_speed_label(stats: &StatsTick, unit: TrafficUnit, lang: Language) -> String {
-    t_fmt(
-        lang,
-        Key::TopbarSpeed,
-        &[
-            &format_bytes(stats.up, unit),
-            &format_bytes(stats.down, unit),
-        ],
-    )
-}
-
 /// Width the right-edge cluster reserves on the row: the version caption
-/// (weak, body text) plus the speed readout (small) and the inter-item
-/// spacing. The row subtracts this from the row width before sizing the chip
-/// zone, so the chips yield instead of ever covering the version/speed info.
-fn cluster_width(ui: &egui::Ui, version: &str, speed: Option<&str>) -> f32 {
-    let text_width = |text: &str, style: egui::TextStyle| {
-        let font_id = egui::FontId::proportional(ui.text_style_height(&style));
-        ui.painter()
-            .layout_no_wrap(text.to_owned(), font_id, egui::Color32::WHITE)
-            .size()
-            .x
-    };
-    let version_w = text_width(version, egui::TextStyle::Body);
-    let speed_w = speed
-        .map(|text| text_width(text, egui::TextStyle::Small))
-        .unwrap_or(0.0);
-    version_w + speed_w + ui.spacing().item_spacing.x
+/// (weak, body text). The row subtracts this from the row width before sizing
+/// the chip zone, so the chips yield instead of ever covering the caption.
+fn caption_width(ui: &egui::Ui, version: &str) -> f32 {
+    let font_id = egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body));
+    ui.painter()
+        .layout_no_wrap(version.to_owned(), font_id, egui::Color32::WHITE)
+        .size()
+        .x
 }
 
-/// The app-shell memo for the right cluster: the speed
-/// readout text and the width it plus the version caption reserve, keyed by
-/// everything that moves them — stats tick, traffic unit, language, core
-/// version (the version caption's other input), viewport width. `speed` is
-/// empty while no stats tick exists (the cluster then reserves the version
-/// caption only).
+/// The app-shell memo for the right cluster: the width the version caption
+/// reserves, keyed by everything that moves it — the core version and the
+/// language (the caption's two text inputs) and the viewport width.
 #[derive(Default)]
 pub(crate) struct TopbarRightCache {
-    key: (u64, TrafficUnit, Language, Option<String>, f32),
-    /// The speed readout text; empty while no stats tick exists.
-    pub(crate) speed: String,
-    /// The width the cluster (version + speed) reserves on the row.
+    key: (Option<String>, Language, f32),
+    /// The width the cluster (the version caption) reserves on the row.
     pub(crate) width: f32,
 }
 
-/// The inputs the right cluster depends on, bundled so the refresh fn
-/// stays under clippy's argument-count ceiling (the same pattern as the
-/// servers editor's `AdvancedTabContext`).
-pub(crate) struct TopbarRightInputs<'a> {
-    pub stats_generation: u64,
-    pub unit: TrafficUnit,
-    pub lang: Language,
-    pub stats: Option<&'a StatsTick>,
-    pub version_caption: &'a str,
-    pub core_version: Option<&'a str>,
-}
-
 /// Refresh the right-cluster memo and return the width it reserves. Never
-/// allocates on the
-/// repaint path: the staleness check compares by value, and only a key
-/// change rebuilds the strings — the cached speed text's identity across an
-/// idle frame and the cache key after a change are the rebuild checks the
-/// tests pin.
+/// allocates on the repaint path: the staleness check compares by value, and
+/// only a key change re-measures the caption — the memo surviving an idle
+/// frame and the key it rebuilds on are the checks the tests pin.
 fn refresh_topbar_right(
     ui: &egui::Ui,
-    inputs: &TopbarRightInputs<'_>,
+    lang: Language,
+    version_caption: &str,
+    core_version: Option<&str>,
     cache: &mut Option<TopbarRightCache>,
 ) -> f32 {
     let view_w = (ui.max_rect().width() * 2.0).round() / 2.0;
-    let stale = cache.as_ref().is_none_or(|c| {
-        c.key.0 != inputs.stats_generation
-            || c.key.1 != inputs.unit
-            || c.key.2 != inputs.lang
-            || c.key.3.as_deref() != inputs.core_version
-            || c.key.4 != view_w
-    });
+    let stale = cache
+        .as_ref()
+        .is_none_or(|c| c.key.0.as_deref() != core_version || c.key.1 != lang || c.key.2 != view_w);
     if stale {
-        let speed = inputs
-            .stats
-            .map(|s| build_speed_label(s, inputs.unit, inputs.lang));
-        let width = cluster_width(ui, inputs.version_caption, speed.as_deref());
         *cache = Some(TopbarRightCache {
-            key: (
-                inputs.stats_generation,
-                inputs.unit,
-                inputs.lang,
-                inputs.core_version.map(str::to_owned),
-                view_w,
-            ),
-            speed: speed.unwrap_or_default(),
-            width,
+            key: (core_version.map(str::to_owned), lang, view_w),
+            width: caption_width(ui, version_caption),
         });
     }
     cache
@@ -124,15 +67,11 @@ fn refresh_topbar_right(
         .width
 }
 
-/// Render the right-edge cluster: version caption at the far right with the
-/// speed readout immediately left of it (right-to-left flow — the first
-/// widget lands rightmost). `speed` is `None` until the first stats tick.
-fn show_right_cluster(ui: &mut egui::Ui, version: &str, speed: Option<&str>) {
+/// Render the right-edge cluster: the version caption anchored at the row's
+/// far right (right-to-left flow — the first widget lands rightmost).
+fn show_right_cluster(ui: &mut egui::Ui, version: &str) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.weak(version);
-        if let Some(speed) = speed {
-            ui.add(egui::Label::new(egui::RichText::new(speed).small()));
-        }
     });
 }
 
@@ -140,8 +79,8 @@ fn show_right_cluster(ui: &mut egui::Ui, version: &str, speed: Option<&str>) {
 /// runtime reads the row paints, plus the chip texts the shell already
 /// memoizes for its other readers (the tray item, the Apply-now gate).
 /// Everything else is the row's: the caption memoization, the width budget,
-/// the clip that keeps the chips off the version/speed cluster, and the
-/// click outcomes.
+/// the clip that keeps the chips off the version caption, and the click
+/// outcomes.
 pub(crate) struct TopbarRowState<'a> {
     pub(crate) lang: Language,
     pub(crate) phase: &'a CorePhase,
@@ -170,10 +109,6 @@ pub(crate) struct TopbarRowState<'a> {
     pub(crate) config_error: Option<&'a str>,
     pub(crate) state_error: Option<&'a str>,
     pub(crate) persistence_error: Option<&'a str>,
-    // ---- right cluster ----
-    pub(crate) stats_generation: u64,
-    pub(crate) unit: TrafficUnit,
-    pub(crate) stats: Option<&'a StatsTick>,
 }
 
 /// The row's memo state: the caption generation and the right-cluster
@@ -244,10 +179,10 @@ impl TopbarRowClicks {
 }
 
 /// Render the whole top bar row — phase badge, lifecycle action, the
-/// capped-and-clipped chip zone, and the right-edge version/speed cluster —
+/// capped-and-clipped chip zone, and the right-edge version cluster —
 /// refreshing the row's own memos, and return the clicks the shell must
 /// dispatch. The one place the row's layout lives, so the "chips yield,
-/// never cover the version/speed info" invariant cannot be forgotten by a
+/// never cover the version info" invariant cannot be forgotten by a
 /// caller that builds the row by hand.
 pub(crate) fn show_row(
     ui: &mut egui::Ui,
@@ -257,20 +192,15 @@ pub(crate) fn show_row(
     let TopbarMemos { labels, right } = memos;
     ui.horizontal(|ui| {
         let labels = refresh_labels(labels, state);
-        // Measure the right cluster first: its width is memoized on the
-        // stats generation / unit / language / core version / viewport
-        // width, never formatted per frame, and the zone below is capped to
-        // the row minus this reservation so the chips can never cover it.
+        // Measure the right cluster first: its width is memoized on the core
+        // version / language / viewport width, never measured per frame, and
+        // the zone below is capped to the row minus this reservation so the
+        // chips can never cover the caption.
         let right_width = refresh_topbar_right(
             ui,
-            &TopbarRightInputs {
-                stats_generation: state.stats_generation,
-                unit: state.unit,
-                lang: state.lang,
-                stats: state.stats,
-                version_caption: &labels.version_caption,
-                core_version: state.core_version,
-            },
+            state.lang,
+            &labels.version_caption,
+            state.core_version,
             right,
         );
         let mut clicks = TopbarRowClicks::default();
@@ -340,10 +270,7 @@ pub(crate) fn show_row(
 
         // The cluster last: right-to-left, anchored at the row's far right,
         // painting into whatever the zone above yielded.
-        let speed = right
-            .as_ref()
-            .and_then(|cache| (!cache.speed.is_empty()).then_some(cache.speed.as_str()));
-        show_right_cluster(ui, &labels.version_caption, speed);
+        show_right_cluster(ui, &labels.version_caption);
         clicks
     })
     .inner
@@ -593,15 +520,6 @@ mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable as _};
 
-    /// A 1 Hz sample with distinctive rates.
-    fn tick() -> StatsTick {
-        StatsTick {
-            up: 1_048_576,   // 1.0 MiB/s under Auto
-            down: 2_097_152, // 2.0 MiB/s under Auto
-            ..Default::default()
-        }
-    }
-
     /// A status exercising every chip: all errors set, a long server name,
     /// a dirty config with an apply block and a stored apply result.
     fn heavy_status() -> TopbarStatus<'static> {
@@ -638,7 +556,7 @@ mod tests {
     /// One frame's row facts, built from the case and the row's own memos.
     struct RowFixture {
         phase: CorePhase,
-        stats: Option<StatsTick>,
+        /// The model's edit generation, which the caption memo rebuilds on.
         generation: u64,
         /// The row width this frame lays the bar out in. kittest's harness
         /// floors the window width, so the budget under test is imposed on
@@ -653,7 +571,6 @@ mod tests {
         fn new(width: f32, case: RowCase) -> Self {
             Self {
                 phase: CorePhase::Running,
-                stats: Some(tick()),
                 generation: 1,
                 width,
                 case,
@@ -712,9 +629,6 @@ mod tests {
                             state_error: heavy.then_some("load failure detail"),
                             persistence_error: (fixture.case == RowCase::PersistenceOnly)
                                 .then_some("save failure detail"),
-                            stats_generation: 1,
-                            unit: TrafficUnit::Auto,
-                            stats: fixture.stats.as_ref(),
                         },
                         &mut fixture.memos,
                     );
@@ -804,9 +718,6 @@ mod tests {
         h.get_all_by_label(version_caption().as_str())
             .next()
             .expect("the version caption renders");
-        h.get_all_by_label("↑ 1.0 MiB/s · ↓ 2.0 MiB/s")
-            .next()
-            .expect("the speed readout renders");
 
         // An unwritable state adds its own chips and the two buttons.
         let mut h = row_harness(1400.0, RowCase::PersistenceOnly);
@@ -866,150 +777,75 @@ mod tests {
     }
 
     #[test]
-    fn speed_label_follows_the_global_unit_ladder() {
-        assert_eq!(
-            build_speed_label(&tick(), TrafficUnit::Auto, Language::En),
-            "↑ 1.0 MiB/s · ↓ 2.0 MiB/s"
-        );
-        assert_eq!(
-            build_speed_label(&tick(), TrafficUnit::KiBps, Language::En),
-            "↑ 1024.0 KiB/s · ↓ 2048.0 KiB/s"
-        );
-        assert_eq!(
-            build_speed_label(&tick(), TrafficUnit::Bps, Language::En),
-            "↑ 1048576.0 B/s · ↓ 2097152.0 B/s"
-        );
-    }
-
-    #[test]
-    fn speed_label_renders_the_idle_session_shape() {
-        assert_eq!(
-            build_speed_label(
-                &StatsTick {
-                    up: 0,
-                    down: 0,
-                    ..Default::default()
-                },
-                TrafficUnit::Auto,
-                Language::En,
-            ),
-            "↑ 0.0 B/s · ↓ 0.0 B/s"
-        );
-    }
-
-    #[test]
     fn right_cluster_refresh_memoizes_on_key_changes() {
         // The inputs the right cluster depends on — a state struct because
         // kittest drives the closure per frame and the app-shell pattern is
         // build_ui_state + state mutation.
         struct RightState {
-            generation: u64,
-            stats: Option<StatsTick>,
-            unit: TrafficUnit,
             lang: Language,
             version: String,
+            core_version: Option<String>,
             cache: Option<TopbarRightCache>,
         }
         let state = RightState {
-            generation: 7,
-            stats: Some(tick()),
-            unit: TrafficUnit::Auto,
             lang: Language::En,
             version: "xray v1 · app 0.1".to_owned(),
+            core_version: Some("v1".to_owned()),
             cache: None,
         };
         let mut h = Harness::builder().build_ui_state(
             move |ui, state: &mut RightState| {
-                let inputs = TopbarRightInputs {
-                    stats_generation: state.generation,
-                    unit: state.unit,
-                    lang: state.lang,
-                    stats: state.stats.as_ref(),
-                    version_caption: &state.version,
-                    core_version: Some("v1"),
-                };
-                refresh_topbar_right(ui, &inputs, &mut state.cache);
+                refresh_topbar_right(
+                    ui,
+                    state.lang,
+                    &state.version,
+                    state.core_version.as_deref(),
+                    &mut state.cache,
+                );
             },
             state,
         );
         h.run();
-        let speed = h
+        let seeded = h
             .state()
             .cache
             .as_ref()
-            .expect("the first call seeds the cache")
-            .speed
-            .clone();
-        assert_eq!(speed, "↑ 1.0 MiB/s · ↓ 2.0 MiB/s");
+            .expect("the first call seeds the cache");
         assert!(
-            h.state().cache.as_ref().is_some_and(|c| c.width > 0.0),
-            "the cluster must reserve row width for the version + speed"
+            seeded.width > 0.0,
+            "the cluster must reserve row width for the version caption"
         );
-        // A stats tick (generation bump) rebuilds exactly once: the memo
-        // carries the tick's generation.
-        h.state_mut().generation = 8;
+        let viewport = seeded.key.2;
+
+        // A core version change (an install) re-measures exactly once: the
+        // memo carries the version it was built for.
+        h.state_mut().core_version = Some("v2".to_owned());
         h.step();
-        let rebuilt = h.state().cache.as_ref().expect("cache populated");
-        assert_eq!(rebuilt.key.0, 8, "a generation bump rebuilds exactly once");
-        let rebuilt_speed = rebuilt.speed.as_ptr();
+        assert_eq!(
+            h.state().cache.as_ref().expect("cache populated").key,
+            (Some("v2".to_owned()), Language::En, viewport),
+            "a core-version change rebuilds exactly once"
+        );
 
         // Idle frames with unchanged inputs must not rebuild: the memo keeps
-        // its key and the same speed-text allocation.
+        // the very allocation it built, not merely its value.
+        let core_version_ptr = |h: &Harness<'_, RightState>| {
+            h.state()
+                .cache
+                .as_ref()
+                .expect("cache populated")
+                .key
+                .0
+                .as_ref()
+                .map(|version| version.as_ptr())
+        };
+        let rebuilt = core_version_ptr(&h);
         h.run_steps(5);
-        let idle = h.state().cache.as_ref().expect("cache populated");
-        assert_eq!(idle.key.0, 8, "unchanged inputs keep the memo's key");
         assert_eq!(
-            idle.speed.as_ptr(),
-            rebuilt_speed,
-            "unchanged inputs must not rebuild the speed readout"
+            core_version_ptr(&h),
+            rebuilt,
+            "unchanged inputs must not rebuild the caption memo"
         );
-        assert_eq!(idle.speed, "↑ 1.0 MiB/s · ↓ 2.0 MiB/s");
-    }
-
-    #[test]
-    fn right_cluster_without_stats_reserves_only_the_version_caption() {
-        let mut cache: Option<TopbarRightCache> = None;
-        {
-            let mut h = Harness::new_ui(|ui| {
-                let inputs = TopbarRightInputs {
-                    stats_generation: 0,
-                    unit: TrafficUnit::Auto,
-                    lang: Language::En,
-                    stats: None,
-                    version_caption: "xray v1 · app 0.1",
-                    core_version: Some("v1"),
-                };
-                refresh_topbar_right(ui, &inputs, &mut cache);
-                assert!(
-                    cache.as_ref().is_some_and(|c| c.speed.is_empty()),
-                    "no stats tick -> no speed text"
-                );
-            });
-            h.run();
-        } // drop the harness: the closure's `&mut cache` borrow ends here
-        let (speed, width) = cache
-            .as_ref()
-            .map(|c| (c.speed.clone(), c.width))
-            .expect("cache populated");
-        assert_eq!(speed, "", "no stats tick -> no speed text");
-        assert!(
-            width > 0.0,
-            "without stats the cluster still reserves the version caption"
-        );
-    }
-
-    #[test]
-    fn right_cluster_renders_version_with_speed_to_its_left() {
-        let mut h = Harness::new_ui(|ui| {
-            show_right_cluster(ui, "xray v1 · app 0.1", Some("↑ 1.0 MiB/s · ↓ 2.0 MiB/s"));
-        });
-        h.run();
-        h.get_all_by_label("xray v1 · app 0.1")
-            .next()
-            .expect("version caption renders at the right edge");
-        h.get_all_by_label("↑ 1.0 MiB/s · ↓ 2.0 MiB/s")
-            .next()
-            .expect("speed readout renders left of the version caption");
     }
 
     #[test]
@@ -1061,8 +897,8 @@ mod tests {
         );
     }
 
-    /// The width the row reserves for the version/speed cluster this frame.
-    /// Read straight off the row's memo: the budget assertion below is the
+    /// The width the row reserves for the version cluster this frame. Read
+    /// straight off the row's memo: the budget assertion below is the
     /// invariant, and this is the reservation it is measured against.
     fn reserved_width(h: &Harness<'_, RowFixture>) -> f32 {
         h.state()
@@ -1076,7 +912,7 @@ mod tests {
     /// A chip past the row's budget is clipped to a degenerate ellipsis: it
     /// can never carry a word of text into the cluster's reservation, which
     /// is the whole point of the cap. `reserved` is the width the row set
-    /// aside this frame for the version/speed cluster.
+    /// aside this frame for the version cluster.
     fn assert_chips_yield_to_the_cluster(h: &Harness<'_, RowFixture>, width: f32, reserved: f32) {
         let budget_edge = 8.0 + width - reserved;
         for label in [
@@ -1103,10 +939,9 @@ mod tests {
     #[test]
     fn full_row_keeps_the_right_cluster_visible_and_uncovered() {
         // The coverage invariant, through the row's own interface: the
-        // version+speed cluster anchors at the row's far right, the speed
-        // readout sits immediately left of the version caption, and the chip
-        // zone yields to the width the cluster reserved — with every error
-        // chip live.
+        // version caption anchors at the row's far right and the chip zone
+        // yields to the width the caption reserved — with every error chip
+        // live.
         let width = 900.0f32;
         let mut h = row_harness(width, RowCase::Heavy);
         h.run();
@@ -1115,32 +950,22 @@ mod tests {
             .get_all_by_label(caption.as_str())
             .next()
             .expect("version caption renders");
-        let speed = h
-            .get_all_by_label("↑ 1.0 MiB/s · ↓ 2.0 MiB/s")
-            .next()
-            .expect("speed readout renders");
         assert!(
             version.rect().max.x >= 8.0 + width - 20.0,
             "version must anchor at the row's right edge, rect {:?}",
             version.rect()
         );
-        assert!(
-            speed.rect().max.x <= version.rect().min.x + 2.0,
-            "speed must render left of the version, speed {:?} vs version {:?}",
-            speed.rect(),
-            version.rect()
-        );
         let reserved = reserved_width(&h);
-        assert!(reserved > 0.0, "the row must reserve width for the cluster");
+        assert!(reserved > 0.0, "the row must reserve width for the caption");
         assert_chips_yield_to_the_cluster(&h, width, reserved);
     }
 
     #[test]
     fn status_zone_stays_inside_a_narrow_budget() {
         // The coverage bug: an unbounded chip zone overflowed the row and
-        // painted over the version/speed cluster. At a width where the chips
+        // painted over the version cluster. At a width where the chips
         // cannot all fit, the zone still yields — no chip carries text past
-        // the reservation — and the cluster itself still renders.
+        // the reservation — and the caption itself still renders.
         let width = 620.0f32;
         let mut h = row_harness(width, RowCase::Heavy);
         h.run();
@@ -1151,7 +976,7 @@ mod tests {
             "the cluster must render at a tight width"
         );
         let reserved = reserved_width(&h);
-        assert!(reserved > 0.0, "the row must reserve width for the cluster");
+        assert!(reserved > 0.0, "the row must reserve width for the caption");
         assert_chips_yield_to_the_cluster(&h, width, reserved);
     }
 }
