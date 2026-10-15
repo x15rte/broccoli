@@ -140,7 +140,9 @@ mod tests {
     use crate::rt::PhaseError;
     use std::path::{Path, PathBuf};
 
-    const SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 96, 256];
+    /// The runtime's own frame ladder, not a copy of it: regenerating the
+    /// assets against a different ladder has to fail here rather than ship.
+    const SIZES: [u32; 9] = ICON_FRAME_SIZES;
     const SLUGS: [&str; 5] = ["neutral", "core-running", "tun", "error", "stopped"];
 
     fn assets() -> PathBuf {

@@ -22,11 +22,11 @@ const COLUMN_WIDTH: f32 = 600.0;
 /// Height of the brand mark, in points.
 const MARK_SIZE: f32 = 104.0;
 /// The part of the 256 px icon canvas that holds the artwork: the icon is
-/// drawn left-aligned in its canvas, so showing the whole texture would leave
-/// a blank strip between the mark and the wordmark.
-const MARK_UV: Rect = Rect::from_min_max(pos2(0.0, 0.04), pos2(0.78, 0.85));
+/// centred in its canvas rather than filling it, so showing the whole texture
+/// would leave margins around the mark.
+const MARK_UV: Rect = Rect::from_min_max(pos2(0.143, 0.073), pos2(0.853, 0.923));
 /// Width over height of [`MARK_UV`]'s region.
-const MARK_ASPECT: f32 = 0.78 / 0.81;
+const MARK_ASPECT: f32 = 0.710 / 0.850;
 /// Wordmark size; the version shares its text line, so egui sets both on a
 /// common baseline.
 const WORDMARK_SIZE: f32 = 44.0;
@@ -206,4 +206,53 @@ fn wordmark_job(strong: Color32, weak: Color32) -> LayoutJob {
         TextFormat::simple(FontId::proportional(VERSION_SIZE), weak),
     );
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`MARK_UV`] is the region the screen draws, so the mark's artwork has to
+    /// sit inside it and that region has to carry [`MARK_ASPECT`]: regenerating
+    /// the icon with different framing clips the mark on About, or stretches it,
+    /// while every other check stays green.
+    #[test]
+    fn the_crop_holds_the_whole_mark_at_its_own_aspect() {
+        let rgba = image::load_from_memory(MARK_PNG)
+            .expect("the compiled-in mark decodes")
+            .into_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut ink = (width, height, 0, 0);
+        for (x, y, pixel) in rgba.enumerate_pixels() {
+            if pixel.0[3] > 8 {
+                ink = (
+                    ink.0.min(x),
+                    ink.1.min(y),
+                    ink.2.max(x + 1),
+                    ink.3.max(y + 1),
+                );
+            }
+        }
+        let crop = (
+            MARK_UV.min.x * width as f32,
+            MARK_UV.min.y * height as f32,
+            MARK_UV.max.x * width as f32,
+            MARK_UV.max.y * height as f32,
+        );
+        assert!(
+            crop.0 <= ink.0 as f32
+                && crop.1 <= ink.1 as f32
+                && crop.2 >= ink.2 as f32
+                && crop.3 >= ink.3 as f32,
+            "the mark's ink {ink:?} leaves the drawn region {crop:?}"
+        );
+        let region = (
+            MARK_UV.width() * width as f32,
+            MARK_UV.height() * height as f32,
+        );
+        assert!(
+            (region.0 / region.1 - MARK_ASPECT).abs() < 0.01,
+            "the drawn region {region:?} does not carry MARK_ASPECT {MARK_ASPECT}"
+        );
+    }
 }
