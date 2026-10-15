@@ -114,7 +114,8 @@ const STAGE_BASE: &str = ".broccoli-secure-runtime";
 /// it reads that command — a report that counted only the command's own step
 /// would tell the user nothing needed cleaning right after the helper restored
 /// them, while an unreset total would overstate a cleanup served by a helper
-/// that already ran sessions.
+/// that already ran sessions. Every restore runs through
+/// [`release_dns_takeover`], which is what keeps the count from missing one.
 static DNS_SERVERS_RESTORED: AtomicUsize = AtomicUsize::new(0);
 /// Record file of the system-DNS takeover (`sys::dns_takeover`), inside
 /// [`STAGE_BASE`] so it lives beside the stage directories and under the same
@@ -1583,18 +1584,10 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // session on disk and the adapters pointed at a tunnel address that no
     // longer exists. The record is that session's repair instruction, and
     // this is the first moment a repair may run: authenticated, before any
-    // command stages a core. Best-effort.
-    match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
-        Ok(Some(0)) | Ok(None) => {}
-        Ok(Some(adapters)) => send_log(
-            &writer,
-            Diag::new(Key::HelperDnsTakeoverRepaired).arg(adapters),
-        ),
-        Err(error) => send_log_record(
-            &writer,
-            &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
-        ),
-    }
+    // command stages a core. Best-effort, and through the one restore every
+    // path shares, so a cleanup command served later by this helper counts
+    // what this repair put back.
+    release_dns_takeover(&writer, TakeoverOrigin::PreviousSession);
     loop {
         match wait_for_message(handle, None, Some(parent.0)) {
             Ok(true) => {}
@@ -1701,7 +1694,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // child's job object dies with this process, so the session is over now:
     // hand the captured servers back before returning. A failure keeps the
     // record for the next helper's startup repair.
-    release_dns_takeover(&writer);
+    release_dns_takeover(&writer, TakeoverOrigin::OwnSession);
     Ok(())
 }
 
@@ -2161,7 +2154,7 @@ fn helper_start(
                 && finished.is_some()
                 && slot.is_none()
             {
-                release_dns_takeover(&writer);
+                release_dns_takeover(&writer, TakeoverOrigin::OwnSession);
             }
             // Dropping the exact exited child removes only the allowlisted
             // non-reparse secure-stage entries (payload locks were released
@@ -2176,29 +2169,46 @@ fn helper_start(
     }
 }
 
-/// Undo this session's system-DNS takeover and delete its record. Runs at
+/// Which restore a log line reports. Both origins run the same restore through
+/// [`release_dns_takeover`], so the cleanup terminal counts the servers back
+/// however they went back; the origin picks the line and the level it carries —
+/// repairing a record a dead helper left behind warns, this helper's own
+/// restore reports at info.
+#[derive(Clone, Copy)]
+enum TakeoverOrigin {
+    /// A record a helper that died hard left behind, read at startup.
+    PreviousSession,
+    /// This helper's own takeover: a teardown path or the manual cleanup.
+    OwnSession,
+}
+
+/// Undo this helper's system-DNS takeover and delete its record. Runs at
 /// every teardown path — the reaper, the parent-death exit, the manual
 /// cleanup and the startup repair — so a machine never stays pointed at a
 /// tunnel that is gone. Best-effort — a failure keeps the record, and the
-/// next helper start repairs from it. Returns the number of adapters whose
-/// captured servers were restored.
-fn release_dns_takeover(writer: &Arc<Mutex<File>>) -> usize {
+/// next helper start repairs from it. `origin` names the restore in the line
+/// this logs.
+///
+/// Every restore goes through here, and it adds what it restored to
+/// [`DNS_SERVERS_RESTORED`]: a cleanup command served later by this helper
+/// reports what any earlier path put back — including the startup repair,
+/// whose record is gone by the time the command is read.
+fn release_dns_takeover(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin) {
+    let key = match origin {
+        TakeoverOrigin::PreviousSession => Key::HelperDnsTakeoverRepaired,
+        TakeoverOrigin::OwnSession => Key::HelperDnsTakeoverRestored,
+    };
     match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
-        Ok(Some(0)) | Ok(None) => 0,
+        Ok(Some(0)) | Ok(None) => {}
         Ok(Some(adapters)) => {
             DNS_SERVERS_RESTORED.fetch_add(adapters, Ordering::Relaxed);
-            send_log(
-                writer,
-                Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
-            );
-            adapters
+            send_log(writer, Diag::new(key).arg(adapters));
         }
         Err(error) => {
             send_log_record(
                 writer,
                 &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed)).caused_by(error),
             );
-            0
         }
     }
 }
@@ -2259,11 +2269,13 @@ fn helper_cleanup(
     {
         child.kill();
     }
-    release_dns_takeover(writer);
-    // The startup repair restores captured servers before this command is
-    // read, so the report is everything restored since the last report —
-    // never a zero that would tell the user nothing needed cleaning, and
-    // never a helper-lifetime total a second cleanup would overstate.
+    release_dns_takeover(writer, TakeoverOrigin::OwnSession);
+    // Every path that restores — the startup repair included, before this
+    // command was read — tallies inside `release_dns_takeover`, so the report
+    // is everything this helper restored since the last report: never a zero
+    // that would tell the user nothing needed cleaning right after the
+    // servers went back, and never a helper-lifetime total a second cleanup
+    // would overstate.
     let dns_adapters = DNS_SERVERS_RESTORED.swap(0, Ordering::Relaxed);
     let (_, adapters_removed) = clean_leftover_adapters(adapter_name, writer);
     send_event(
