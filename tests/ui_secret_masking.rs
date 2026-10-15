@@ -18,7 +18,8 @@ use broccoli::app::BroccoliApp;
 use broccoli::i18n::{Key, t};
 use broccoli::model::settings::Language;
 use broccoli::model::{
-    OutboundModel, Protocol, ProtocolSettings, ServerProfile, ServersFile, Settings,
+    Account, LocalInboundCfg, LocalInboundProtocol, OutboundModel, Protocol, ProtocolSettings,
+    ServerProfile, ServersFile, Settings,
 };
 use broccoli::ui::Screen;
 use egui::accesskit::Role;
@@ -102,6 +103,55 @@ fn reveal_control(h: &Harness<'_, BroccoliApp>, revealed: bool) -> bool {
     };
     h.query_by_role_and_label(Role::Button, t(Language::En, key))
         .is_some()
+}
+
+/// The credential an inbound account carries, masked like a profile's.
+const SENTINEL_USER: &str = "account-sentinel-user";
+const SENTINEL_PASS: &str = "account-sentinel-pass";
+
+/// Boot the real app with one password-mode HTTP listener bound to every
+/// interface, carrying one account, and open the Inbounds screen. The
+/// non-loopback bind renders the screen's exposure warning on the row the
+/// reveal control rides.
+fn boot_inbounds() -> (
+    MutexGuard<'static, ()>,
+    common::TempEnvironment,
+    Harness<'static, BroccoliApp>,
+) {
+    let mut settings = Settings::default();
+    settings.routing.observatory.enabled = false;
+    settings.routing.burst_observatory.enabled = false;
+    settings.local_inbounds = vec![LocalInboundCfg {
+        protocol: LocalInboundProtocol::Http,
+        tag: "in-http-1".into(),
+        enabled: true,
+        port: 10809,
+        listen: "0.0.0.0".into(),
+        auth: "password".into(),
+        accounts: vec![Account {
+            user: SENTINEL_USER.into(),
+            pass: SENTINEL_PASS.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let (lock, tmp, mut h) = screen::boot_state(screen::BootState {
+        settings,
+        servers: ServersFile {
+            version: 1,
+            active: None,
+            profiles: Vec::new(),
+            extra: Map::new(),
+        },
+    });
+
+    h.set_size(egui::Vec2::new(1100.0, 720.0));
+    h.run();
+    common::dismiss_wizard(&mut h);
+    h.get_by_role_and_label(Role::Button, Screen::Inbounds.label(Language::En))
+        .click();
+    h.run();
+    (lock, tmp, h)
 }
 
 #[test]
@@ -195,5 +245,77 @@ fn hiding_server_information_masks_the_endpoint_and_keeps_the_verdict() {
     assert!(
         tree_contains(&h, SENTINEL_ADDRESS),
         "the reveal control must render the endpoint the setting masks"
+    );
+}
+
+#[test]
+fn inbound_accounts_mask_and_the_reveal_rides_the_listeners_header() {
+    let (_lock, _tmp, mut h) = boot_inbounds();
+
+    // Positive render evidence: the listener's accounts editor renders, so the
+    // absence checks below cannot pass on a blank or stale screen.
+    assert!(
+        h.query_by_label(t(Language::En, Key::Accounts)).is_some(),
+        "the listener's accounts editor must render"
+    );
+    assert!(
+        !tree_contains(&h, SENTINEL_USER) && !tree_contains(&h, SENTINEL_PASS),
+        "the account credentials must not render while they are masked"
+    );
+    assert!(
+        tree_contains(&h, "\u{2022}"),
+        "the masked rows must render the stand-in"
+    );
+    assert!(
+        tree_contains(&h, "0.0.0.0"),
+        "a local listen address is not server information and stays visible"
+    );
+
+    // The listeners section's title and the reveal control share one row: the
+    // control overlaps the title vertically instead of taking a line of its
+    // own. The title carries its text in the frame's value channel, like any
+    // static label, so the lookup reads both channels.
+    let title = t(Language::En, Key::LocalListeners);
+    let title = h
+        .query_all_by(|node| {
+            node.label().as_deref() == Some(title) || node.value().as_deref() == Some(title)
+        })
+        .next()
+        .expect("the listeners section renders its title")
+        .rect();
+    let toggle = h
+        .get_by_role_and_label(Role::Button, t(Language::En, Key::SrvRevealSecrets))
+        .rect();
+    assert!(
+        toggle.top() < title.bottom() && title.top() < toggle.bottom(),
+        "the reveal control must ride the section header, not a row of its own: \
+         control {toggle:?} against title {title:?}"
+    );
+
+    // Clicking the control reveals; it must not also collapse the section,
+    // whose body carries the row the click was aimed at.
+    h.get_by_role_and_label(Role::Button, t(Language::En, Key::SrvRevealSecrets))
+        .click();
+    h.run();
+    assert!(
+        tree_contains(&h, SENTINEL_PASS),
+        "the reveal control must render the account password"
+    );
+
+    // Both parts of the header toggle the section — the title's words and the
+    // arrow — while the control beside them reveals instead (above).
+    h.get_by_role_and_label(Role::Label, t(Language::En, Key::LocalListeners))
+        .click();
+    h.run();
+    assert!(
+        h.query_by_label(t(Language::En, Key::Accounts)).is_none(),
+        "a click on the section title must collapse the section"
+    );
+    h.get_by_role_and_label(Role::Button, t(Language::En, Key::LocalListeners))
+        .click();
+    h.run();
+    assert!(
+        h.query_by_label(t(Language::En, Key::Accounts)).is_some(),
+        "a click on the disclosure arrow must open the section again"
     );
 }

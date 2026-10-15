@@ -184,136 +184,144 @@ impl InboundsScreen {
         });
         ui.add_space(4.0);
 
-        // The reveal control: the screen's account credentials render masked
-        // until the user asks to see them, and the local listen addresses stay
-        // visible — they are loopback literals, not server information.
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                widgets::reveal_toggle(ui, lang, &mut self.revealed);
-            });
-        });
-        let masked = !self.revealed;
-
         // ---- Local listeners: one row per user-managed
         // SOCKS/HTTP endpoint, in list order. Tags are GUI-owned and hidden;
-        // the allocator assigns them once and they persist with the entry.
+        // the allocator assigns them once and they persist with the entry. The
+        // section header carries the reveal control its account credentials
+        // answer to, so the screen spends no row on a control of its own; the
+        // local listen addresses stay visible — they are loopback literals, not
+        // server information.
         let fakedns_on = ctx.settings.dns.fakedns.enabled;
         let mut remove: Option<usize> = None;
         let mut changed = false;
-        widgets::section(ui, t(lang, Key::LocalListeners), |ui| {
-            if ctx.settings.local_inbounds.is_empty() {
-                ui.label(
-                    egui::RichText::new(t(lang, Key::EmptyLocalListeners))
-                        .small()
-                        .weak(),
-                );
-            }
-            for (i, entry) in ctx.settings.local_inbounds.iter_mut().enumerate() {
-                ui.push_id(&entry.tag, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.monospace(protocol_label(lang, entry.protocol));
-                        changed |= ui
-                            .checkbox(&mut entry.enabled, t(lang, Key::Enabled))
-                            .changed();
-                        if ui.button(t(lang, Key::RemoveEndpoint)).clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                    changed |= widgets::port_field(ui, t(lang, Key::PortLower), &mut entry.port);
-                    changed |= widgets::validated_field_with_warning(
-                        ui,
-                        t(lang, Key::InboundsListenAddress),
-                        &mut entry.listen,
-                        "127.0.0.1",
-                        |listen| {
-                            validate_listen_address(listen)
-                                .err()
-                                .map(|code| validation_message(&code, lang))
-                        },
-                        validation.local_warnings[i].as_deref(),
+        widgets::section_with_reveal(
+            ui,
+            t(lang, Key::LocalListeners),
+            lang,
+            &mut self.revealed,
+            |ui, masked| {
+                if ctx.settings.local_inbounds.is_empty() {
+                    ui.label(
+                        egui::RichText::new(t(lang, Key::EmptyLocalListeners))
+                            .small()
+                            .weak(),
                     );
-                    match entry.protocol {
-                        LocalInboundProtocol::Socks => {
+                }
+                for (i, entry) in ctx.settings.local_inbounds.iter_mut().enumerate() {
+                    ui.push_id(&entry.tag, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.monospace(protocol_label(lang, entry.protocol));
                             changed |= ui
-                                .checkbox(&mut entry.udp, t(lang, Key::InboundsUdpSupport))
+                                .checkbox(&mut entry.enabled, t(lang, Key::Enabled))
                                 .changed();
-                            if entry.udp {
-                                changed |= widgets::text_field(
-                                    ui,
-                                    t(lang, Key::InboundsUdpRelayIp),
-                                    &mut entry.ip,
-                                    t(lang, Key::InboundsUdpRelayIpHint),
-                                );
-                                if is_wildcard_listen(&entry.listen) {
-                                    ui.label(
-                                        egui::RichText::new(t(lang, Key::InboundsUdpWildcardHint))
+                            if ui.button(t(lang, Key::RemoveEndpoint)).clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        changed |=
+                            widgets::port_field(ui, t(lang, Key::PortLower), &mut entry.port);
+                        changed |= widgets::validated_field_with_warning(
+                            ui,
+                            t(lang, Key::InboundsListenAddress),
+                            &mut entry.listen,
+                            "127.0.0.1",
+                            |listen| {
+                                validate_listen_address(listen)
+                                    .err()
+                                    .map(|code| validation_message(&code, lang))
+                            },
+                            validation.local_warnings[i].as_deref(),
+                        );
+                        match entry.protocol {
+                            LocalInboundProtocol::Socks => {
+                                changed |= ui
+                                    .checkbox(&mut entry.udp, t(lang, Key::InboundsUdpSupport))
+                                    .changed();
+                                if entry.udp {
+                                    changed |= widgets::text_field(
+                                        ui,
+                                        t(lang, Key::InboundsUdpRelayIp),
+                                        &mut entry.ip,
+                                        t(lang, Key::InboundsUdpRelayIpHint),
+                                    );
+                                    if is_wildcard_listen(&entry.listen) {
+                                        ui.label(
+                                            egui::RichText::new(t(
+                                                lang,
+                                                Key::InboundsUdpWildcardHint,
+                                            ))
                                             .small()
                                             .weak(),
-                                    );
+                                        );
+                                    }
                                 }
                             }
+                            // allowTransparent is intentionally not editable:
+                            // values still round-trip through import/saved settings.
+                            LocalInboundProtocol::Http => {}
                         }
-                        // allowTransparent is intentionally not editable:
-                        // values still round-trip through import/saved settings.
-                        LocalInboundProtocol::Http => {}
-                    }
-                    let mut user_level = (entry.user_level != 0).then_some(entry.user_level);
-                    if widgets::opt_u32(ui, t(lang, Key::UserLevel), &mut user_level, 0..=u32::MAX)
-                    {
-                        entry.user_level = user_level.unwrap_or(0);
+                        let mut user_level = (entry.user_level != 0).then_some(entry.user_level);
+                        if widgets::opt_u32(
+                            ui,
+                            t(lang, Key::UserLevel),
+                            &mut user_level,
+                            0..=u32::MAX,
+                        ) {
+                            entry.user_level = user_level.unwrap_or(0);
+                            changed = true;
+                        }
+                        let mut auth_pw = entry.auth == "password";
+                        if ui
+                            .checkbox(&mut auth_pw, t(lang, Key::InboundsRequireAuth))
+                            .changed()
+                        {
+                            entry.auth = if auth_pw {
+                                "password".into()
+                            } else {
+                                "noauth".into()
+                            };
+                            changed = true;
+                        }
+                        if auth_pw {
+                            changed |= accounts_editor(ui, lang, &mut entry.accounts, masked);
+                        }
+                        // The shared gate verdict, rendered under the accounts
+                        // editor it qualifies: password-mode HTTP with zero
+                        // accounts authenticates nobody on the wire, so the row
+                        // cannot apply at any bind (the model auth-trap rule).
+                        inline_error(ui, validation.local_auth_errors[i].as_deref());
+                        changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
+                        inline_error(ui, validation.local_sniffing_errors[i].as_deref());
+                        inline_error(ui, validation.local_collisions[i].as_deref());
+                    });
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(t(lang, Key::AddSocks)).clicked() {
+                        let tag = next_local_tag(
+                            &ctx.settings.local_inbounds,
+                            LocalInboundProtocol::Socks,
+                            &mut ctx.settings.socks_tag_seq,
+                        );
+                        ctx.settings
+                            .local_inbounds
+                            .push(LocalInboundCfg::socks_default(&tag));
                         changed = true;
                     }
-                    let mut auth_pw = entry.auth == "password";
-                    if ui
-                        .checkbox(&mut auth_pw, t(lang, Key::InboundsRequireAuth))
-                        .changed()
-                    {
-                        entry.auth = if auth_pw {
-                            "password".into()
-                        } else {
-                            "noauth".into()
-                        };
+                    if ui.button(t(lang, Key::AddHttp)).clicked() {
+                        let tag = next_local_tag(
+                            &ctx.settings.local_inbounds,
+                            LocalInboundProtocol::Http,
+                            &mut ctx.settings.http_tag_seq,
+                        );
+                        ctx.settings
+                            .local_inbounds
+                            .push(LocalInboundCfg::http_default(&tag));
                         changed = true;
                     }
-                    if auth_pw {
-                        changed |= accounts_editor(ui, lang, &mut entry.accounts, masked);
-                    }
-                    // The shared gate verdict, rendered under the accounts
-                    // editor it qualifies: password-mode HTTP with zero
-                    // accounts authenticates nobody on the wire, so the row
-                    // cannot apply at any bind (the model auth-trap rule).
-                    inline_error(ui, validation.local_auth_errors[i].as_deref());
-                    changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
-                    inline_error(ui, validation.local_sniffing_errors[i].as_deref());
-                    inline_error(ui, validation.local_collisions[i].as_deref());
                 });
-                ui.separator();
-            }
-            ui.horizontal(|ui| {
-                if ui.button(t(lang, Key::AddSocks)).clicked() {
-                    let tag = next_local_tag(
-                        &ctx.settings.local_inbounds,
-                        LocalInboundProtocol::Socks,
-                        &mut ctx.settings.socks_tag_seq,
-                    );
-                    ctx.settings
-                        .local_inbounds
-                        .push(LocalInboundCfg::socks_default(&tag));
-                    changed = true;
-                }
-                if ui.button(t(lang, Key::AddHttp)).clicked() {
-                    let tag = next_local_tag(
-                        &ctx.settings.local_inbounds,
-                        LocalInboundProtocol::Http,
-                        &mut ctx.settings.http_tag_seq,
-                    );
-                    ctx.settings
-                        .local_inbounds
-                        .push(LocalInboundCfg::http_default(&tag));
-                    changed = true;
-                }
-            });
-        });
+            },
+        );
         if let Some(i) = remove {
             ctx.settings.local_inbounds.remove(i);
             changed = true;

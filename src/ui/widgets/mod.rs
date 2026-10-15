@@ -1173,6 +1173,57 @@ pub fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) 
         });
 }
 
+/// Styled collapsing section, open by default, whose header row also carries
+/// the reveal control at its right edge. The header keeps every part the plain
+/// [`section`] header has — the disclosure arrow, the title, and the section's
+/// own node for assistive technology — and adds the control beside them: a
+/// click on the title or the arrow collapses the section, a click on the
+/// control never does. `add` receives the mask the header left behind, so a
+/// click applies to the body in the same frame. The section's id is derived
+/// from the title exactly as [`section`] derives it, so its open state survives
+/// the change.
+pub fn section_with_reveal(
+    ui: &mut egui::Ui,
+    title: &str,
+    lang: Language,
+    revealed: &mut bool,
+    add: impl FnOnce(&mut egui::Ui, bool),
+) {
+    let id = ui.make_persistent_id(egui::IdSalt::new(title));
+    let mut shown = *revealed;
+    let mut title_clicked = false;
+    let mut header =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+            .show_header(ui, |ui| {
+                // The title keeps the header's click target: a click on the
+                // words collapses the section, as it does under [`section`].
+                let title_response = ui.add(
+                    egui::Label::new(RichText::new(title).strong())
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                title_clicked = title_response.clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    reveal_toggle(ui, lang, &mut shown);
+                });
+            });
+    if title_clicked {
+        // Before the body runs, so the collapse lands on this frame.
+        header.toggle();
+    }
+    let (collapser, _, _) = header.body(|ui| {
+        ui.add_space(2.0);
+        add(ui, !shown);
+        ui.add_space(4.0);
+    });
+    // The arrow carries the section's own node, exactly as the plain header
+    // does, so assistive technology reads the section and toggles it here.
+    collapser.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, ui.is_enabled(), title)
+    });
+    *revealed = shown;
+}
+
 /// Draw one control row whose explanation rides its hover: `add` renders the
 /// control, and the row's rect carries `note` as a tooltip, so a note the
 /// user does not need for the decision at hand costs no permanent line. The
