@@ -130,8 +130,8 @@ fn generate_on_defaults() {
         cfg["dns"],
         json!({
             "servers": [
-                { "address": "1.1.1.1" },
-                { "address": "8.8.8.8" }
+                { "address": "1.1.1.1", "timeoutMs": 8000 },
+                { "address": "8.8.8.8", "timeoutMs": 8000 }
             ],
             "enableParallelQuery": true,
             "serveStale": true,
@@ -1990,13 +1990,9 @@ fn dns_and_dokodemo_use_exact_core_wire_types() {
     assert_eq!(generated["dns"]["serveExpiredTTL"], json!(30));
     // The pushed server lands after the two seeded entries.
     assert_eq!(generated["dns"]["servers"][2]["serveExpiredTTL"], json!(60));
-    // A non-default timeout survives the skip threshold and reaches the wire.
+    // Both a changed timeout and the app's own default reach the wire.
     assert_eq!(generated["dns"]["servers"][2]["timeoutMs"], json!(3000));
-    assert_eq!(
-        generated["dns"]["servers"][0].get("timeoutMs"),
-        None,
-        "the 8000 default must stay off the wire"
-    );
+    assert_eq!(generated["dns"]["servers"][0]["timeoutMs"], json!(8000));
     assert_eq!(
         generated["inbounds"][2]["settings"]["portMap"]["5353"],
         json!("8.8.4.4:53")
@@ -2804,7 +2800,7 @@ fn domain_addressed_outbound_gets_bootstrap_dns_and_useip() {
     assert_eq!(
         cfg["dns"]["servers"],
         json!([
-            { "address": "https://1.1.1.1/dns-query" },
+            { "address": "https://1.1.1.1/dns-query", "timeoutMs": 8000 },
             {
                 "address": "https+local://1.1.1.1/dns-query",
                 "domains": ["domain:srv.example.com"],
@@ -2865,8 +2861,8 @@ fn bootstrap_dns_localhost_default_resolves_proxy_domains_via_os() {
     assert_eq!(
         cfg["dns"]["servers"],
         json!([
-            { "address": "1.1.1.1" },
-            { "address": "8.8.8.8" },
+            { "address": "1.1.1.1", "timeoutMs": 8000 },
+            { "address": "8.8.8.8", "timeoutMs": 8000 },
             {
                 "address": "localhost",
                 "domains": ["domain:srv.example.com"],
@@ -3065,8 +3061,8 @@ fn chained_outbound_defers_the_bootstrap_scope_to_its_direct_dial_outbound() {
     assert_eq!(
         cfg["dns"]["servers"],
         json!([
-            { "address": "1.1.1.1" },
-            { "address": "8.8.8.8" },
+            { "address": "1.1.1.1", "timeoutMs": 8000 },
+            { "address": "8.8.8.8", "timeoutMs": 8000 },
             {
                 "address": "localhost",
                 "domains": ["domain:exit.example.com"],
@@ -3370,7 +3366,10 @@ fn chain_to_an_ip_literal_outbound_closes_the_bootstrap_gate() {
 
     assert_eq!(
         cfg["dns"]["servers"],
-        json!([{ "address": "1.1.1.1" }, { "address": "8.8.8.8" }]),
+        json!([
+            { "address": "1.1.1.1", "timeoutMs": 8000 },
+            { "address": "8.8.8.8", "timeoutMs": 8000 }
+        ]),
         "no scoped entry without a domain-addressed direct-dial outbound"
     );
     for index in 0..2 {

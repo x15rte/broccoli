@@ -526,7 +526,10 @@ fn roundtrip_dns() {
         "timeoutMs": 3000, "finalQuery": true
     }));
     check::<DnsCfg>(json!({
-        "servers": [{"address": "1.1.1.1"}, {"address": "fakedns"}],
+        "servers": [
+            {"address": "1.1.1.1", "timeoutMs": 8000},
+            {"address": "fakedns", "timeoutMs": 8000}
+        ],
         "hosts": {"example.com": "1.2.3.4", "multi": ["1.1.1.1", "2.2.2.2"]},
         "clientIp": "203.0.113.1", "tag": "dns", "queryStrategy": "useip4",
         "disableCache": true, "serveStale": true, "serveExpiredTTL": 3600,

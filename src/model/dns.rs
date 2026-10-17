@@ -7,11 +7,11 @@ use super::{skip_empty_map, skip_empty_str, skip_empty_vec, skip_false};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
+/// The app's own default for one DNS server's query wait. It reaches the file
+/// and the generated configuration alike, so the editor shows the value the
+/// core is given.
 pub fn default_timeout_ms() -> u64 {
     8000
-}
-fn skip_default_timeout(v: &u64) -> bool {
-    *v == 8000
 }
 fn skip_default_query_strategy(s: &str) -> bool {
     s == DEFAULT_QUERY_STRATEGY
@@ -41,7 +41,6 @@ pub struct DnsServer {
     pub query_strategy: String,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub tag: String,
-    #[serde(skip_serializing_if = "skip_default_timeout")]
     pub timeout_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_cache: Option<bool>,
@@ -616,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_boundaries_and_default_omission_are_stable() {
+    fn timeout_boundaries_round_trip_exactly() {
         for value in [0, default_timeout_ms(), u64::MAX] {
             let server: DnsServer = serde_json::from_value(json!({
                 "address": "1.1.1.1",
@@ -626,11 +625,7 @@ mod tests {
             assert_eq!(server.timeout_ms, value);
 
             let output = serde_json::to_value(server).unwrap();
-            if value == default_timeout_ms() {
-                assert!(output.get("timeoutMs").is_none());
-            } else {
-                assert_eq!(output["timeoutMs"], json!(value));
-            }
+            assert_eq!(output["timeoutMs"], json!(value));
         }
     }
 
@@ -718,7 +713,7 @@ mod tests {
         assert_eq!(server.timeout_ms, default_timeout_ms());
         assert_eq!(
             serde_json::to_value(server).unwrap(),
-            json!({"address": "1.1.1.1"})
+            json!({"address": "1.1.1.1", "timeoutMs": 8000})
         );
 
         let error = serde_json::from_value::<DnsServer>(json!(["1.1.1.1"]))

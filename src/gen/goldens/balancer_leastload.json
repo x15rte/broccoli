@@ -17,10 +17,12 @@
     "serveStale": true,
     "servers": [
       {
-        "address": "1.1.1.1"
+        "address": "1.1.1.1",
+        "timeoutMs": 8000
       },
       {
-        "address": "8.8.8.8"
+        "address": "8.8.8.8",
+        "timeoutMs": 8000
       }
     ]
   },
