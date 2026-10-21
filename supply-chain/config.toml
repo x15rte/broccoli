@@ -19,6 +19,11 @@ audit-as-crates-io = false
 [policy.wgpu-hal]
 audit-as-crates-io = false
 
+[[exemptions.nix]]
+version = "0.31.3"
+criteria = "safe-to-deploy"
+notes = "Unix-only dependency of zip 9; absent from the Windows-target graph this project ships and checks in deny.toml."
+
 [[exemptions.quinn-udp]]
 version = "0.5.15"
 criteria = "safe-to-deploy"

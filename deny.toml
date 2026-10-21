@@ -71,7 +71,7 @@ unused-allowed-license = "warn"
 
 [bans]
 # Duplicate-version policy. The lockfile intentionally contains several
-# version families (windows-sys x4, syn x3, getrandom x3, toml_edit x3).
+# version families (windows-sys x3, syn x3, getrandom x3, toml_edit x3).
 # Those are normal Rust
 # ecosystem splits; they must not be "fixed" by forcing dependency upgrades.
 #
@@ -85,17 +85,17 @@ unused-allowed-license = "warn"
 #
 # Duplicates present on the current tree (windows-target graph, from cargo-deny
 # output); each set is an independent cross-crate version split:
+#   - base64 0.22.1 / 0.23.1        - hyper-util/reqwest/tonic vs our direct 0.23
 #   - foldhash 0.1.5 / 0.2.0        - hashbrown 0.15 vs 0.16+ (foldhash >= 0.2)
 #   - hashbrown 0.15.5 / 0.16.1 / 0.17.1 - major-version split (indexmap/ahash/egui)
 #   - itertools 0.14.0 / 0.15.0    - major-version split
 #   - rustc-hash 1.1.0 / 2.1.3     - major-version split
 #   - syn 2.0.119 / 3.0.3          - proc-macro ecosystem split (syn 1.x stays
 #                                    below the windows-target graph line)
-#   - windows-sys 0.52.0 / 0.59.0 / 0.60.2 / 0.61.2 - windows-rs release pins
+#   - windows-sys 0.52.0 / 0.60.2 / 0.61.2 - windows-rs release pins
 #                                    (documented Key Decision)
 #   - windows-targets 0.52.6 / 0.53.5 - windows-sys companion crate
 #   - windows_x86_64_msvc 0.52.6 / 0.53.1 - windows-sys companion crate
-#   - winreg 0.55.0 / 0.56.0       - our direct 0.56 vs transitive 0.55
 multiple-versions = "warn"
 
 # No crate may require a bare `*` version. Verified clean on the current tree;

@@ -263,7 +263,7 @@ end = "2027-09-16"
 [[wildcard-audits.axum]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -305,7 +305,7 @@ end = "2027-09-16"
 [[wildcard-audits.bitflags]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 3204
+user-id = 3204 # Ashley Mannix (KodrAus)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -354,7 +354,7 @@ end = "2027-09-16"
 [[wildcard-audits.bytes]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1257,7 +1257,7 @@ end = "2027-09-16"
 [[wildcard-audits.log]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 3204
+user-id = 3204 # Ashley Mannix (KodrAus)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1327,7 +1327,7 @@ end = "2027-09-16"
 [[wildcard-audits.muda]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 95389
+user-id = 95389 # tauri (tauri-bot)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2027,7 +2027,7 @@ end = "2027-09-16"
 [[wildcard-audits.slab]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2181,28 +2181,28 @@ end = "2027-09-16"
 [[wildcard-audits.tokio]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.tokio-macros]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.tokio-stream]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.tokio-util]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6741
+user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2349,7 +2349,7 @@ end = "2027-09-16"
 [[wildcard-audits.tray-icon]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 95389
+user-id = 95389 # tauri (tauri-bot)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2447,7 +2447,7 @@ end = "2027-09-16"
 [[wildcard-audits.uuid]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 3204
+user-id = 3204 # Ashley Mannix (KodrAus)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -3520,6 +3520,12 @@ version = "0.36.2"
 criteria = "safe-to-deploy"
 version = "3.0.11"
 
+[[audits.embed-resource]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "3.0.12"
+notes = "3.0.11 -> 3.0.12: code changes are confined to non-MSVC RC compiler detection (the variant is read from the first line of `-V /?` output; aarch64-gnullvm prefers `windres` unless it is llvm-windres), plus a winreg 0.55 -> 0.56 bump and an author entry. Used only by build scripts; no unsafe, no new dependency, and its Windows/MSVC path is untouched."
+
 [[audits.endi]]
 criteria = "safe-to-deploy"
 version = "1.1.1"
@@ -4546,6 +4552,12 @@ version = "1.1.4"
 criteria = "safe-to-deploy"
 version = "0.23.45"
 
+[[audits.rustls]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.23.46"
+notes = "0.23.45 -> 0.23.46: the four RUSTSEC-2026-0346..0349 fixes (session Debug redaction, ECH rejection enforced before traffic starts, brotli window bound, key-exchange hint stored only after Finished), plus strict zlib decompression (all input consumed, exact output), HPKE sequence numbers incremented only after a successful AEAD open, a LimitedCache eviction off-by-one, and a TLS 1.3 key update requested before the last sequence number is used. Tests accompany each. No new dependency, no unsafe, build script unchanged."
+
 [[audits.rustls-pki-types]]
 criteria = "safe-to-deploy"
 version = "1.15.1"
@@ -4553,6 +4565,12 @@ version = "1.15.1"
 [[audits.rustls-webpki]]
 criteria = "safe-to-deploy"
 version = "0.103.15"
+
+[[audits.rustls-webpki]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.103.16"
+notes = "0.103.15 -> 0.103.16: adds a table of eight distrusted emSign intermediate SPKIs and rejects any path containing one with the new `Error::CertDistrusted` (RUSTSEC-2026-0382), with tests covering cross-signing. No unsafe, no dependency or build-script change."
 
 [[audits.rustversion]]
 criteria = "safe-to-deploy"
@@ -4625,6 +4643,12 @@ version = "0.10.9"
 [[audits.sha2]]
 criteria = "safe-to-deploy"
 version = "0.11.0"
+
+[[audits.sha2]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.11.1"
+notes = "0.11.0 -> 0.11.1: backend load/store helpers now take slices of the exact length (AArch64 round constants load through `rk`, satisfying Stacked Borrows), `compress` is a safe fn with `#[target_feature]` helpers and contained unsafe intrinsics, the x86 SHA-NI backend is rewritten around `rounds4`/`schedule_rounds16` with unchanged round-constant order, riscv-zknh loses its unaligned-load workaround and zbb/zbkb requirement, MSRV 1.88. No new dependency, no build script, no I/O."
 
 [[audits.sharded-slab]]
 criteria = "safe-to-deploy"
@@ -5112,6 +5136,12 @@ version = "1.2.4"
 criteria = "safe-to-deploy"
 version = "1.0.9"
 
+[[audits.webpki-roots]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "1.0.10"
+notes = "1.0.9 -> 1.0.10: removes the emSign ECC Root CA - G3 trust anchor (RUSTSEC-2026-0381) and raises rust-version to 1.71. Data-only change, no code."
+
 [[audits.weezl]]
 criteria = "safe-to-deploy"
 version = "0.1.12"
@@ -5455,3 +5485,10 @@ version = "5.13.1"
 [[audits.zvariant_utils]]
 criteria = "safe-to-deploy"
 version = "3.5.0"
+
+[[trusted.zip]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zip-rs/zip2"
+start = "2025-07-09"
+end = "2027-10-21"
+notes = "zip releases are published through GitHub OIDC from the zip-rs/zip2 repository; the crate is used only to read whitelisted entries out of the pinned core archive."

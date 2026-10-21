@@ -71,7 +71,7 @@ vendored-protoc = ["dep:protobuf-src"]
 eframe = { version = "0.36", features = ["persistence"] } # default renderer (wgpu)
 egui = "0.36"
 egui_plot = "0.37"
-tray-icon = "0.25"
+tray-icon = "0.26"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "sync", "macros", "net"] }
 tempfile = "3"
 windows = { version = "0.62", features = [
@@ -115,7 +115,7 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc
 # mirrors `xray tls ping` output line-for-line.
 x509-parser = "0.18"
 sha2 = "0.11"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
