@@ -1108,7 +1108,7 @@ fn right_click_never_offers_copy() {
     h.state_mut().push_log(false, LINE.to_owned());
     h.run();
     let row_rect = h
-        .query_all_by_label(LINE)
+        .query_all_by(|node| node.value().is_some_and(|value| value.contains(LINE)))
         .next()
         .expect("pushed log line must render as a row label")
         .rect();
@@ -1178,8 +1178,8 @@ fn idle_frames_keep_the_app_rendering() {
 }
 
 /// Runtime-authored log lines travel as `CoreEvt::AppLog` and are rendered by
-/// the app in the active language, in the severity-and-source gutter the row
-/// carries.
+/// the app in the active language, behind an `app.log`-shaped UTC timestamp
+/// and the severity-and-source gutter the row carries.
 #[test]
 fn app_log_events_render_in_the_active_language_with_the_gutter() {
     let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
@@ -1187,26 +1187,53 @@ fn app_log_events_render_in_the_active_language_with_the_gutter() {
     common::dismiss_wizard(&mut h);
 
     h.state()
-        .inject_event(CoreEvt::AppLog(Diag::new(Key::RtLogCoreReady).into()));
+        .inject_event(CoreEvt::AppLog(Diag::new(Key::RtLogConnected).into()));
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Logs")
         .click();
     h.run_steps(2);
 
-    let level = Key::RtLogCoreReady
+    let level = Key::RtLogConnected
         .level()
         .expect("a log-class key declares its level");
-    let text = t(Language::En, Key::RtLogCoreReady);
+    let text = t(Language::En, Key::RtLogConnected);
     let rendered = h
         .query_all_by(|node| {
             node.value().is_some_and(|value| {
                 value.contains(text) && value.contains("broccoli:") && value.contains(level.tag())
             })
         })
-        .next();
+        .next()
+        .unwrap_or_else(|| {
+            panic!(
+                "the Logs screen must render the runtime line in the active language \
+                 under its level and source: {} {text}",
+                level.tag()
+            )
+        });
+    let value = rendered.value().expect("row label text");
+    let (stamp, rest) = value.split_once(' ').expect("timestamp before the gutter");
+    assert_eq!(
+        stamp.len(),
+        27,
+        "an app row opens with the app.log UTC stamp: {value}"
+    );
+    let (date, time) = stamp.split_once('T').expect("date and time separator");
     assert!(
-        rendered.is_some(),
-        "the Logs screen must render the runtime line in the active language \
-         under its level and source: {} {text}",
-        level.tag()
+        date.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        }),
+        "YYYY-MM-DD date: {value}"
+    );
+    assert!(
+        time.len() == 16 && time.ends_with('Z'),
+        "HH:MM:SS.ffffffZ time: {value}"
+    );
+    assert!(
+        rest.starts_with(&format!("{:>5} broccoli: ", level.tag())),
+        "the gutter follows the timestamp: {value}"
     );
 }

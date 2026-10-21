@@ -188,9 +188,9 @@ fn the_prose_profile_still_applies_to_a_ui_key() {
 
 #[test]
 fn a_log_key_declares_its_level() {
-    assert_eq!(Key::RtLogCoreReady.class(), broccoli::i18n::TextClass::Log);
+    assert_eq!(Key::RtLogConnected.class(), broccoli::i18n::TextClass::Log);
     assert_eq!(
-        Key::RtLogCoreReady.level(),
+        Key::RtLogConnected.level(),
         Some(broccoli::i18n::LogLevel::Info)
     );
 }

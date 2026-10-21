@@ -1798,7 +1798,8 @@ keys! {
     RtLogTunCoreExited (Log, Info, 0),
     RtLogTunCoreAlive (Log, Warn, 0),
     RtLogDnsFlushExit (Log, Warn, 0),
-    RtLogCoreReady (Log, Info, 0),
+    RtLogConnected (Log, Info, 0),
+    RtLogDisconnected (Log, Info, 0),
     RtLogExitNotReported (Log, Warn, 0),
     RtLogSuppressedOne (Log, Warn, 0),
     RtLogSuppressedMany (Log, Warn, 1),
@@ -3370,7 +3371,9 @@ mod en {
             Key::DnsTimeoutInteger => "Timeout must be a decimal integer.",
             Key::DnsTimeoutRange => "Timeout must not exceed 18446744073709551615.",
             Key::DnsTimeoutMs => "Timeout (ms)",
-            Key::DnsTimeoutHint => "0..=18446744073709551615 (default 8000)",
+            Key::DnsTimeoutHint => {
+                "Milliseconds to wait for a reply. 0 falls back to the core default of 4000 ms."
+            }
             Key::DnsTimeoutDefault => "default 8000",
             Key::DnsSchemeDefault => "(scheme default)",
             Key::Inherit => "(inherit)",
@@ -5175,7 +5178,8 @@ mod en {
                 "TUN core alive after the wintun create window; stopping it now"
             }
             Key::RtLogDnsFlushExit => "ipconfig exited non-zero during the DNS cache flush",
-            Key::RtLogCoreReady => "core ready",
+            Key::RtLogConnected => "connected",
+            Key::RtLogDisconnected => "disconnected",
             Key::RtLogExitNotReported => {
                 "core did not report its exit in time; forcing the final termination"
             }

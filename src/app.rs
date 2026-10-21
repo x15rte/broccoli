@@ -969,10 +969,10 @@ impl BroccoliApp {
     /// the caller resolved.
     fn push_entry(&mut self, from_core: bool, level: Option<LogLevel>, line: String) {
         mirror_line(from_core, level, &line);
-        self.logs.push(LogLine {
-            text: line,
-            from_core,
-            level,
+        self.logs.push(if from_core {
+            LogLine::core(line)
+        } else {
+            LogLine::app(line, level)
         });
     }
 
@@ -4914,6 +4914,7 @@ mod tests {
                 text: format!("{:0width$}", i, width = MAX_LINE_BYTES),
                 from_core: true,
                 level: None,
+                timestamp: None,
             });
             assert!(buf.bytes <= LOG_BYTE_CAP, "push {i} left the byte cap");
         }
@@ -4940,6 +4941,7 @@ mod tests {
                 text: format!("{short} {i}"),
                 from_core: i % 2 == 0,
                 level: None,
+                timestamp: None,
             });
         }
         assert_eq!(buf.len(), LOG_CAP);
@@ -4973,11 +4975,13 @@ mod tests {
             text: "hello".to_string(),
             from_core: false,
             level: None,
+            timestamp: None,
         });
         buf.push(LogLine {
             text: "world".to_string(),
             from_core: false,
             level: None,
+            timestamp: None,
         });
         assert_eq!(buf.bytes, 10);
 
@@ -4988,6 +4992,7 @@ mod tests {
                 text: max_line.clone(),
                 from_core: true,
                 level: None,
+                timestamp: None,
             });
             assert!(buf.bytes <= LOG_BYTE_CAP);
         }

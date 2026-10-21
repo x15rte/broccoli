@@ -1759,7 +1759,11 @@ impl Runtime {
                     self.lifecycle.exit_policy.finish();
                     self.lifecycle.backend.force_release();
                     if !matches!(self.lifecycle.phase, CorePhase::Stopped) {
+                        let was_running = matches!(self.lifecycle.phase, CorePhase::Running);
                         self.set_phase(CorePhase::Stopped);
+                        if was_running {
+                            self.app_log(Diag::new(Key::RtLogDisconnected));
+                        }
                     }
                     if !update_landing {
                         self.release_exclusive();
@@ -2549,6 +2553,7 @@ impl Runtime {
         // gateways the listeners bind.
         self.lifecycle.dns_in_pending.clear();
         self.lifecycle.dns_in_attempts = 0;
+        self.lifecycle.connected_logged = false;
 
         // TUN always runs behind the authenticated helper, even when the GUI
         // itself happens to be elevated. That independent owner observes pipe
@@ -3167,6 +3172,7 @@ impl Runtime {
             ExitBranch::StopSettled => {
                 self.lifecycle.exit_policy.finish();
                 if !self.lifecycle.shutting_down {
+                    let was_running = matches!(self.lifecycle.phase, CorePhase::Running);
                     if self.jobs.busy_kind() == Some(JobKind::CleanUp) {
                         // A cleanup owns this window, and the core's exit is
                         // the stop it asked for: settle the phase here and
@@ -3178,6 +3184,11 @@ impl Runtime {
                         self.lifecycle.backend.force_release();
                         self.set_phase(CorePhase::Stopped);
                         self.release_exclusive();
+                    }
+                    // After the exit, the TUN close and the resolver-cache
+                    // flush have all run: the session is over.
+                    if was_running {
+                        self.app_log(Diag::new(Key::RtLogDisconnected));
                     }
                 }
             }
@@ -3286,7 +3297,11 @@ impl Runtime {
     /// end here when their replacement cannot come up, and so does an exit
     /// that ran out its stop window with no restart wanted.
     fn settle_stopped(&mut self) {
+        let was_running = matches!(self.lifecycle.phase, CorePhase::Running);
         self.set_phase(CorePhase::Stopped);
+        if was_running && !self.lifecycle.shutting_down {
+            self.app_log(Diag::new(Key::RtLogDisconnected));
+        }
         self.release_exclusive();
     }
 
@@ -3460,12 +3475,16 @@ impl Runtime {
             }
         }
         if failed.is_empty() {
+            self.announce_connected();
             return;
         }
         if spend_retry_attempt(&mut self.lifecycle.dns_in_attempts, DNS_IN_ADD_ATTEMPTS).is_none() {
             for (_, error) in failed {
                 self.app_log(Diag::new(Key::RtLogDnsInListenerNotAdded).arg(error));
             }
+            // The budget is spent: no listener add remains, so this was the
+            // last start step and the connection is announced now.
+            self.announce_connected();
             return;
         }
         // The addresses that did land stay off the list: the retry only
@@ -3536,8 +3555,25 @@ impl Runtime {
         self.lifecycle.backoff.mark_ready(Instant::now());
         self.lifecycle.pending_transition.clear_candidate();
         self.lifecycle.candidate_boot_retries = 0;
-        self.app_log(Diag::new(Key::RtLogCoreReady));
+        // A direct child has no pending in-tun DNS listener, so readiness is
+        // the last start step and the marker lands here. A TUN start still
+        // owes its listener add; `dns_in_poll` announces when that settles.
+        self.announce_connected();
         self.release_exclusive();
+    }
+
+    /// Emit the `connected` line once this start's last step has settled:
+    /// readiness for a direct child, and the in-tun DNS listener add (or its
+    /// spent attempt budget) for TUN. Idempotent per start.
+    fn announce_connected(&mut self) {
+        if self.lifecycle.connected_logged
+            || !matches!(self.lifecycle.phase, CorePhase::Running)
+            || !self.lifecycle.dns_in_pending.is_empty()
+        {
+            return;
+        }
+        self.lifecycle.connected_logged = true;
+        self.app_log(Diag::new(Key::RtLogConnected));
     }
 
     /// Fold one `query_traffic` response into the per-tag baseline, evicting
@@ -4015,6 +4051,44 @@ mod tests {
         assert_eq!(TUN_STOP_WINDOW, Duration::from_secs(20));
         assert!(TUN_STOP_WINDOW > Duration::from_secs(15));
         assert!(STOP_TIMEOUT < Duration::from_secs(15));
+    }
+
+    /// A stopped running core records the disconnect: the log pairs with the
+    /// `connected` line the readiness path emits, so the user can see when the
+    /// session ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_running_core_logs_disconnected() {
+        let (mut runtime, events) = runtime_with_events();
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.exit_policy.begin_stop(Instant::now());
+
+        runtime.on_core_exit(Some(0)).await;
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            app_log_texts(&emitted).contains(&t(Language::En, Key::RtLogDisconnected).to_string()),
+            "a stopped running core must log the disconnect: {:?}",
+            app_log_texts(&emitted)
+        );
+        assert!(matches!(runtime.lifecycle.phase, super::CorePhase::Stopped));
+    }
+
+    /// A stop from a phase that never reached `Running` (a cancelled connect,
+    /// an error, an already-stopped core) is not a disconnect and logs none.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_without_a_running_core_logs_no_disconnect() {
+        let (mut runtime, events) = runtime_with_events();
+        runtime.lifecycle.phase = super::CorePhase::Stopped;
+        runtime.lifecycle.backend = BackendState::for_test(false, false);
+
+        runtime.handle_cmd(CoreCmd::Stop).await;
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            !app_log_texts(&emitted).contains(&t(Language::En, Key::RtLogDisconnected).to_string()),
+            "a stop with nothing connected must not log a disconnect"
+        );
     }
 
     /// Deliver any busy-window bookends the registry sink queued during a
@@ -4572,6 +4646,53 @@ mod tests {
         assert!(
             !runtime.lifecycle.core_update.is_candidate_pending(),
             "a no-op ack must stay a no-op"
+        );
+    }
+
+    /// A direct child has no post-readiness start step: readiness itself
+    /// announces the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_readiness_announces_connected() {
+        let (mut runtime, events) = runtime_with_events();
+        runtime.lifecycle.backend = BackendState::for_test(true, false);
+        runtime.lifecycle.backend.set_child_pid(4242);
+
+        runtime.complete_readiness_probe(true).await;
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            app_log_texts(&emitted),
+            vec![t(Language::En, Key::RtLogConnected)]
+        );
+    }
+
+    /// A TUN start still owes its in-tun DNS listener add after readiness, so
+    /// the connection is announced only once that step settles — and only
+    /// once per start.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_waits_for_the_in_tun_listener_step() {
+        let (mut runtime, events) = runtime_with_events();
+        runtime.lifecycle.phase = super::CorePhase::Running;
+        runtime.lifecycle.dns_in_pending = vec!["10.255.0.1".parse().expect("gateway")];
+
+        runtime.announce_connected();
+        assert!(
+            events.try_iter().next().is_none(),
+            "the pending listener step must keep the connection unannounced"
+        );
+
+        runtime.lifecycle.dns_in_pending.clear();
+        runtime.announce_connected();
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            app_log_texts(&emitted),
+            vec![t(Language::En, Key::RtLogConnected)]
+        );
+
+        runtime.announce_connected();
+        assert!(
+            events.try_iter().next().is_none(),
+            "one start announces its connection once"
         );
     }
 

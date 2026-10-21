@@ -74,6 +74,10 @@ pub(super) struct Lifecycle {
     /// Add attempts spent for `dns_in_pending`, capped through the shared
     /// [`spend_retry_attempt`] rule ([`DNS_IN_ADD_ATTEMPTS`]).
     pub(super) dns_in_attempts: u8,
+    /// This start has emitted its `connected` line: readiness settled and,
+    /// for TUN, the in-tun DNS listener add finished (or spent its budget).
+    /// Reset on every start, so a restart announces its own connection once.
+    pub(super) connected_logged: bool,
     /// The readiness clock of this start: armed after the child is
     /// confirmed alive, disarmed while a TUN start is still staging in the
     /// elevated helper.
@@ -99,6 +103,7 @@ impl Lifecycle {
             pending_restart: None,
             dns_in_pending: Vec::new(),
             dns_in_attempts: 0,
+            connected_logged: false,
             readiness: Readiness::new(),
         }
     }

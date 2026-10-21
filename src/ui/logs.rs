@@ -47,33 +47,80 @@ impl LevelFilter {
     }
 }
 
-/// One line in the app's log ring: the text, its author, and its severity.
+/// One line in the app's log ring: the text, its author, its severity, and —
+/// for a line the app recorded — the wall-clock time.
 ///
 /// The app declares the level of a line it authors — the key's own `keys!`
 /// row — and sniffs a passthrough line, which it does not author. The
-/// display form is [`display_line`]: this severity and the source in a
+/// display form is [`display_line`]: the timestamp, severity, and source in a
 /// fixed-width gutter, then the text, the same shape `app.log` records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogLine {
-    /// The line text, with no severity or source prefix.
+    /// The line text, with no timestamp, severity, or source prefix.
     pub text: String,
     /// Whether the core produced the line (passthrough) rather than the app.
     pub from_core: bool,
     /// The level the line's key declares. Passthrough text has no key, so it
     /// carries `None` here and the screen reads its severity from the text.
     pub level: Option<LogLevel>,
+    /// When the app recorded the line, in the UTC RFC 3339 form
+    /// [`timestamp_now`] writes — the same form `app.log` opens each record
+    /// with, so a pasted selection and the file agree. `None` for passthrough
+    /// core output, whose text carries the core's own timestamp, and for a
+    /// line no clock has stamped (tests that pin the gutter alone).
+    pub timestamp: Option<String>,
 }
 
-/// The display text of one ring line: a line with a known severity shows that
-/// severity and the source in a fixed-width gutter — the same shape `app.log`
+impl LogLine {
+    /// One line the app author-recorded: stamped with the current UTC time.
+    pub fn app(text: String, level: Option<LogLevel>) -> Self {
+        Self {
+            text,
+            from_core: false,
+            level,
+            timestamp: Some(timestamp_now()),
+        }
+    }
+
+    /// One passthrough line from the core: kept verbatim, because the core
+    /// wrote its own timestamp and level.
+    pub fn core(text: String) -> Self {
+        Self {
+            text,
+            from_core: true,
+            level: None,
+            timestamp: None,
+        }
+    }
+}
+
+/// The current UTC time in the RFC 3339 form `app.log` records:
+/// `2026-10-20T16:15:00.123456Z`. The tracing subscriber's own formatter
+/// writes both, so the Logs screen and the file cannot drift in precision or
+/// punctuation.
+fn timestamp_now() -> String {
+    use tracing_subscriber::fmt::time::FormatTime as _;
+    let mut stamp = String::new();
+    let mut writer = tracing_subscriber::fmt::format::Writer::new(&mut stamp);
+    // Writing into a String is infallible; the formatter cannot fail.
+    let _ = tracing_subscriber::fmt::time::SystemTime.format_time(&mut writer);
+    stamp
+}
+
+/// The display text of one ring line: an app line shows its timestamp,
+/// severity, and source in a fixed-width gutter — the same shape `app.log`
 /// records, so a pasted selection and the file agree. Core output shows
 /// verbatim, because it carries its own timestamp and level and the ring must
-/// not rewrite what the core said, and so does a line whose severity is
-/// unknown: there is nothing to show in the gutter.
+/// not rewrite what the core said, and so does a line no clock stamped.
 fn display_line(line: &LogLine) -> String {
-    match line.level {
-        Some(level) if !line.from_core => format!("{:<5} broccoli: {}", level.tag(), line.text),
-        _ => line.text.clone(),
+    if line.from_core {
+        return line.text.clone();
+    }
+    match (line.timestamp.as_deref(), line.level) {
+        (Some(stamp), Some(level)) => format!("{stamp} {:>5} broccoli: {}", level.tag(), line.text),
+        (Some(stamp), None) => format!("{stamp} {}", line.text),
+        (None, Some(level)) => format!("{:>5} broccoli: {}", level.tag(), line.text),
+        (None, None) => line.text.clone(),
     }
 }
 
@@ -674,6 +721,11 @@ pub struct LogsScreen {
     /// Custom log-row selection (see [`RowSelection`]); cleared when the
     /// filtered view rebuilds, because the row indices shift.
     rows_selection: RowSelection,
+    /// The row widget that owns the in-flight primary drag, when that drag
+    /// started on a row. Only that interaction may extend the selection: a
+    /// drag on the floating scrollbar or on a popup owns the pointer without
+    /// selecting rows, and must leave the selection alone.
+    selection_drag: Option<egui::Id>,
     /// Memoized "N of M lines" caption: `t_fmt` runs only when
     /// the visible/total counts or the language moved — never per painted
     /// frame.
@@ -795,6 +847,7 @@ impl Default for LogsScreen {
             logger_restart_feedback: None,
             view: FilteredView::default(),
             rows_selection: RowSelection::default(),
+            selection_drag: None,
             line_count: None,
             pending_refit: None,
             last_refresh: RefreshOutcome::Reused,
@@ -976,6 +1029,7 @@ impl LogsScreen {
         );
         if !outcome.selection_survives() {
             self.rows_selection = RowSelection::default();
+            self.selection_drag = None;
         }
         if matches!(outcome, RefreshOutcome::Rebuilt { .. }) {
             self.pending_refit = None;
@@ -1126,6 +1180,7 @@ impl LogsScreen {
             // the field at the end keeps the updates visible to later
             // frames (a plain local captured by value would be a dead copy).
             let mut selection = self.rows_selection;
+            let mut selection_drag = self.selection_drag;
             // A primary press that lands on no row clears the selection —
             // but not while a popup is open: the copy menu's own click must
             // preserve the selection it is about to copy. Secondary presses
@@ -1137,6 +1192,7 @@ impl LogsScreen {
                 && !rects.iter().any(|r| r.contains(pointer))
             {
                 selection = RowSelection::default();
+                selection_drag = None;
             }
             // Copy funnel for the two triggers below: the row context menu
             // ("Copy selection") and the platform copy chord. The menu
@@ -1153,21 +1209,29 @@ impl LogsScreen {
                         .iter()
                         .any(|event| matches!(event, egui::Event::Copy))
                 });
+            // A drag that leaves its anchor row cannot rely on the hovered
+            // row's response: egui clears `hovered` and `interact_pointer_pos`
+            // on every widget while another one owns the drag, so only the
+            // anchor row would ever extend the selection. The pointer's
+            // position decides the row instead, gated on the drag owner: a
+            // drag on the floating scrollbar or on a popup owns the pointer
+            // without selecting rows, and must leave the selection alone.
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            let primary_down = ui.input(|i| i.pointer.primary_down());
             for (slot, index) in band.enumerate() {
                 let row = &plan.rows()[index];
                 let row_rect = rects[slot];
                 let galley = &plan.galleys()[index];
                 let color = line_color(row.from_core, row.level, dark);
-                // Selection highlight, painted under the label.
+                // Selection highlight, painted under the label, one rect
+                // per visual line.
                 if let Some((start, end)) = Self::selection_range(selection, index, &row.line) {
-                    let a = galley.pos_from_cursor(start);
-                    let b = galley.pos_from_cursor(end);
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_max(
-                            row_rect.min + a.min.to_vec2(),
-                            row_rect.min + b.max.to_vec2(),
-                        ),
-                        0.0,
+                    Self::paint_selection(
+                        ui.painter(),
+                        row_rect,
+                        galley,
+                        start,
+                        end,
                         ui.visuals().selection.bg_fill,
                     );
                 }
@@ -1202,6 +1266,7 @@ impl LogsScreen {
                     if let Some(pointer) = response.interact_pointer_pos() {
                         let ccursor = galley.cursor_from_pos(pointer - row_rect.min);
                         let (lo, hi) = Self::word_bounds_at(&row.line, ccursor.index.0);
+                        selection_drag = Some(response.id);
                         selection = RowSelection {
                             anchor: Some(RowCursor {
                                 row: index,
@@ -1224,27 +1289,27 @@ impl LogsScreen {
                             row: index,
                             ccursor: galley.cursor_from_pos(pointer - row_rect.min),
                         };
+                        selection_drag = Some(response.id);
                         selection = RowSelection {
                             anchor: Some(cursor),
                             active: Some(cursor),
                         };
                     }
-                } else if response.dragged_by(egui::PointerButton::Primary)
-                    || (ui.input(|i| i.pointer.primary_down())
-                        && selection.anchor.is_some()
-                        && response.hovered())
+                } else if primary_down
+                    && selection_drag.is_some_and(|id| ui.ctx().is_being_dragged(id))
+                    && let Some(pointer) = pointer
+                    && row_rect.contains(pointer)
                 {
-                    // Drag within the anchor row, or over another row while
-                    // the primary button is down: extend the active end.
-                    if let Some(pointer) = response.interact_pointer_pos() {
-                        selection.active = Some(RowCursor {
-                            row: index,
-                            ccursor: galley.cursor_from_pos(pointer - row_rect.min),
-                        });
-                    }
+                    // Drag over another row while the primary button is
+                    // down: extend the active end to this row.
+                    selection.active = Some(RowCursor {
+                        row: index,
+                        ccursor: galley.cursor_from_pos(pointer - row_rect.min),
+                    });
                 }
             }
             self.rows_selection = selection;
+            self.selection_drag = selection_drag;
             if copy_requested {
                 let text = Self::selection_text(selection, plan.rows());
                 if !text.is_empty() {
@@ -1282,6 +1347,69 @@ impl LogsScreen {
             egui::text::CCursor::new(line.chars().count())
         };
         (start != end).then_some((start, end))
+    }
+
+    /// Paint one row's selection slice, one rectangle per visual line: a
+    /// wrapped row must highlight each line to its own text end. A single
+    /// bounding rectangle would take the width of the shortest visual line
+    /// (usually the last), leaving the rest of the earlier lines unhighlighted
+    /// while the clipboard still carried their text.
+    fn paint_selection(
+        painter: &egui::Painter,
+        row_rect: egui::Rect,
+        galley: &egui::text::Galley,
+        start: egui::text::CCursor,
+        end: egui::text::CCursor,
+        fill: Color32,
+    ) {
+        let start = galley.layout_from_cursor(start);
+        let end = galley.layout_from_cursor(end);
+        for index in start.row..=end.row {
+            let Some(bounds) = Self::selection_line_bounds(galley, start, end, index) else {
+                continue;
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    row_rect.min + egui::vec2(bounds.min.x, bounds.min.y),
+                    row_rect.min + egui::vec2(bounds.max.x, bounds.max.y),
+                ),
+                0.0,
+                fill,
+            );
+        }
+    }
+
+    /// The selection's bounds on one visual line of `galley`, in galley
+    /// coordinates: the cursor x on the first and last lines, the full line
+    /// width on every line between them, and the line's own vertical extent.
+    fn selection_line_bounds(
+        galley: &egui::text::Galley,
+        start: egui::epaint::text::cursor::LayoutCursor,
+        end: egui::epaint::text::cursor::LayoutCursor,
+        index: usize,
+    ) -> Option<egui::Rect> {
+        let line = galley.rows.get(index)?;
+        if index < start.row || index > end.row {
+            return None;
+        }
+        let left = if index == start.row {
+            line.pos.x + line.x_offset(start.column)
+        } else {
+            line.pos.x
+        };
+        let right = if index == end.row {
+            line.pos.x + line.x_offset(end.column)
+        } else {
+            line.pos.x + line.size.x
+        };
+        if right <= left {
+            return None;
+        }
+        let rect = line.rect();
+        Some(egui::Rect::from_min_max(
+            egui::pos2(left, rect.top()),
+            egui::pos2(right, rect.bottom()),
+        ))
     }
 
     /// Clipboard text for `selection` over the whole memoized view: the
@@ -1394,13 +1522,16 @@ mod tests {
     /// every push advances the ring's monotonic generation — the identity
     /// the memoized view is keyed on. Direct-ring tests below must route
     /// their pushes through this helper, or the view's `refresh` would see
-    /// an unchanged ring and keep a stale view.
+    /// an unchanged ring and keep a stale view. The app's wall-clock stamp
+    /// is omitted so row text stays deterministic; the display test builds
+    /// a stamped entry explicitly.
     fn push_line(logs: &mut VecDeque<LogLine>, generation: &mut u64, from_core: bool, line: &str) {
         *generation += 1;
         logs.push_back(LogLine {
             text: line.to_string(),
             from_core,
             level: None,
+            timestamp: None,
         });
     }
 
@@ -1419,6 +1550,7 @@ mod tests {
             text: line.to_string(),
             from_core,
             level,
+            timestamp: None,
         });
     }
 
@@ -2422,6 +2554,36 @@ mod tests {
         }
     }
 
+    /// A wrapped row's highlight follows each visual line to its own text
+    /// end. One bounding rectangle clipped every visual line to the shortest
+    /// line's width — usually the last — so the tab showed only part of a
+    /// wrapped row as selected while the clipboard carried all of it.
+    #[test]
+    fn wrapped_row_selection_highlights_each_line_to_its_own_end() {
+        let ctx = warmed_ctx();
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet \
+                    kilo lima mike november oscar papa quebec";
+        let galley = galley_of(&ctx, text);
+        assert!(galley.rows.len() > 1, "the fixture must wrap");
+        let start = galley.layout_from_cursor(egui::text::CCursor::new(0));
+        let end = galley.layout_from_cursor(egui::text::CCursor::new(text.chars().count()));
+
+        for (index, line) in galley.rows.iter().enumerate() {
+            let bounds = LogsScreen::selection_line_bounds(&galley, start, end, index)
+                .unwrap_or_else(|| panic!("visual line {index} must be selected"));
+            assert!(
+                (bounds.left() - line.pos.x).abs() < 0.01,
+                "line {index} starts at its own left edge"
+            );
+            assert!(
+                (bounds.right() - (line.pos.x + line.size.x)).abs() < 0.01,
+                "line {index} must reach its own text end, not the last line's"
+            );
+            assert!((bounds.top() - line.rect().top()).abs() < 0.01);
+            assert!((bounds.bottom() - line.rect().bottom()).abs() < 0.01);
+        }
+    }
+
     /// The copy text spans the selection across rows: the first row from
     /// the lower cursor, every row between in full, the last row up to the
     /// upper cursor — and a drag upward copies the same slice as the same
@@ -2601,31 +2763,86 @@ mod tests {
         );
     }
 
-    /// The display form of a row: an app-authored line whose key declares a
-    /// level carries that level and the source in a fixed-width gutter — the
-    /// same shape `app.log` records and that the copy actions hand to the
-    /// clipboard — while passthrough core output shows verbatim, because the
-    /// core wrote its own timestamp and level and the ring must not rewrite
-    /// it.
+    /// A press-drag that leaves the anchor row selects through the row under
+    /// the pointer. egui clears `hovered` and `interact_pointer_pos` on every
+    /// other row while one widget owns the drag, so a selection that read the
+    /// hovered row's response could only ever cover the anchor row.
     #[test]
-    fn app_lines_show_their_level_and_source_in_a_fixed_gutter() {
+    fn dragging_over_another_row_selects_through_it() {
+        let mut rig = UiTestRig::default();
+        for line in ["alpha line", "bravo line", "charlie line"] {
+            rig.push_log(false, line.to_string());
+        }
+        let mut harness = screen_harness(rig, LogsScreen::default());
+        harness.run();
+
+        let alpha = harness.get_by_label("alpha line").rect().center();
+        let charlie = harness.get_by_label("charlie line").rect().center();
+
+        // Press on the first row, move while the button stays down, release.
+        harness.drag_at(alpha);
+        harness.step();
+        harness.hover_at(charlie);
+        harness.step();
+        harness.drop_at(charlie);
+        harness.step();
+
+        let selection = harness.state().0.rows_selection;
+        assert_eq!(selection.anchor.expect("anchor row").row, 0);
+        assert_eq!(
+            selection.active.expect("active row").row,
+            2,
+            "the drag must extend to the row under the pointer"
+        );
+
+        // The selection copies as one slice spanning all three rows.
+        harness.event(egui::Event::Copy);
+        harness.step();
+        let copied: Vec<String> = harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied.len(), 1, "one copy command");
+        assert!(
+            copied[0].contains("\nbravo line\n"),
+            "the copy must span the rows between the drag ends: {:?}",
+            copied[0]
+        );
+    }
+
+    /// The display form of a row: an app-authored line carries its timestamp,
+    /// level, and source in the same fixed-width gutter `app.log` records —
+    /// the text the copy actions hand to the clipboard — while passthrough
+    /// core output shows verbatim, because the core wrote its own timestamp
+    /// and level and the ring must not rewrite it.
+    #[test]
+    fn app_lines_show_their_timestamp_level_and_source_in_a_fixed_gutter() {
+        const STAMP: &str = "2026-10-20T16:15:00.123456Z";
         let app = LogLine {
             text: "connect rejected: a core stop is in progress".to_string(),
             from_core: false,
             level: Some(LogLevel::Warn),
+            timestamp: Some(STAMP.to_string()),
         };
         assert_eq!(
             display_line(&app),
-            "WARN  broccoli: connect rejected: a core stop is in progress"
+            "2026-10-20T16:15:00.123456Z  WARN broccoli: connect rejected: a core stop is in progress"
         );
-        // A line with no declared level has no severity to show.
+        // A line with no declared level keeps the timestamp and the text.
         assert_eq!(
             display_line(&LogLine {
                 level: None,
                 ..app.clone()
             }),
-            "connect rejected: a core stop is in progress"
+            "2026-10-20T16:15:00.123456Z connect rejected: a core stop is in progress"
         );
+        // Core output stays verbatim even when a clock stamped the entry.
         assert_eq!(
             display_line(&LogLine {
                 from_core: true,
@@ -2696,7 +2913,7 @@ mod tests {
         assert_eq!(warning_plus.len(), 3);
         assert_eq!(
             warning_plus[0].line,
-            "WARN  broccoli: connect ignored: the core is already running"
+            " WARN broccoli: connect ignored: the core is already running"
         );
         assert_eq!(
             warning_plus[1].line,
@@ -2739,7 +2956,7 @@ mod tests {
         assert_eq!(after_marker.len(), 4);
         assert_eq!(
             after_marker[0].line,
-            "WARN  broccoli: connect ignored: the core is already running"
+            " WARN broccoli: connect ignored: the core is already running"
         );
     }
 
@@ -3125,6 +3342,7 @@ mod tests {
                 text: String::new(),
                 from_core: false,
                 level: None,
+                timestamp: None,
             });
             if logs.len() > CAP {
                 logs.pop_front();

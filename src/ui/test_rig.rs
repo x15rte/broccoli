@@ -238,13 +238,15 @@ impl UiTestRig {
     /// Every rig test that appends to `logs` between frames must go
     /// through this method — the Logs screen's memoized view is keyed on
     /// `logs_generation`, so a bare `logs.push_back` would leave the view
-    /// stale.
+    /// stale. The wall-clock stamp the app adds is left off so row text
+    /// stays deterministic; tests that assert the stamp build it explicitly.
     pub(crate) fn push_log(&mut self, from_core: bool, line: String) {
         self.logs_generation += 1;
         self.logs.push_back(LogLine {
             text: line,
             from_core,
             level: None,
+            timestamp: None,
         });
     }
 
