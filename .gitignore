@@ -1,7 +1,9 @@
+# Build outputs
 /target/
 /dist/
 
+# Local-only workflow material: untracked by design, never cited in shipped text
 /.scratch/
 /docs/
-/CONTEXT.md
+/GLOSSARY.md
 /AGENTS.md
