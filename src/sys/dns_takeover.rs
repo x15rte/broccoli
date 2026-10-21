@@ -50,6 +50,12 @@ const TCPIP4_INTERFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parame
 /// Registry path of the IPv6 interface configuration.
 const TCPIP6_INTERFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces";
 
+/// The two registry roots that hold every adapter's DNS configuration. The
+/// network watcher subscribes to both: `NotifyIpInterfaceChange` does not
+/// report a DNS server change, but a DHCP renewal or a manual change writes
+/// these keys.
+pub(crate) const REGISTRY_PATHS: [&str; 2] = [TCPIP4_INTERFACES, TCPIP6_INTERFACES];
+
 /// What one write hands a family: a server list, or the revert to whatever
 /// source configured it before (DHCP or router advertisement). The interface
 /// settings API has no third form — an empty string is a no-op — so "no
@@ -150,7 +156,12 @@ fn static_servers(adapter: &str, ipv6: bool) -> Option<Vec<String>> {
 
 /// Split the enumerated servers into the per-family capture. `None` means the
 /// adapter listed no server of that family, so the family is left alone.
-fn family_state(adapter: &str, servers: &[IpAddr], ipv6: bool) -> Option<FamilyState> {
+fn family_state(
+    adapter: &str,
+    servers: &[IpAddr],
+    ipv6: bool,
+    target: IpAddr,
+) -> Option<FamilyState> {
     let matching: Vec<String> = servers
         .iter()
         .filter(|ip| ip.is_ipv6() == ipv6)
@@ -159,6 +170,20 @@ fn family_state(adapter: &str, servers: &[IpAddr], ipv6: bool) -> Option<FamilyS
     if matching.is_empty() {
         return None;
     }
+    // A fresh capture that already lists the takeover address cannot know the
+    // original servers: another session, or a record lost with its helper,
+    // may have written it. Recording it as the original would restore the
+    // dead tunnel address forever, so treat the family as dynamic and let the
+    // restore revert it to DHCP.
+    if matching
+        .iter()
+        .any(|server| server.parse::<IpAddr>().ok() == Some(target))
+    {
+        return Some(FamilyState {
+            servers: Vec::new(),
+            static_servers: false,
+        });
+    }
     Some(FamilyState {
         servers: matching,
         static_servers: static_servers(adapter, ipv6).is_some(),
@@ -166,24 +191,37 @@ fn family_state(adapter: &str, servers: &[IpAddr], ipv6: bool) -> Option<FamilyS
 }
 
 /// The entries to take over from an enumeration. Skips the loopback adapters
-/// and the tunnel adapter itself, and captures a family only when `targets`
-/// carries an address for it — the tunnel address that family's queries will
-/// be pointed at. A family the tunnel does not serve is left exactly as it is:
+/// and the tunnel adapter itself — by friendly name when the caller knows it,
+/// otherwise by the captured index — and captures a family only when `targets`
+/// carries an address for it, the tunnel address that family's queries will be
+/// pointed at. A family the tunnel does not serve is left exactly as it is:
 /// an empty server list is not expressible through the interface settings API,
 /// and a family left out of the record is a family the restore must not
 /// rewrite.
-fn plan(views: &[AdapterView], tun_if_index: u32, targets: Targets) -> Record {
+fn plan(
+    views: &[AdapterView],
+    tun_if_index: u32,
+    tun_name: Option<&str>,
+    targets: Targets,
+) -> Record {
     let mut entries = Vec::new();
     for view in views {
-        if view.if_type == IF_TYPE_SOFTWARE_LOOPBACK || view.if_index == tun_if_index {
+        // The friendly name is the stable identity the staged config names.
+        // When it is present, prefer it over the captured index: a recreated
+        // wintun adapter can reuse an index that now belongs to another NIC.
+        let is_tun = tun_name.is_some_and(|name| view.alias.eq_ignore_ascii_case(name));
+        if view.if_type == IF_TYPE_SOFTWARE_LOOPBACK || is_tun {
+            continue;
+        }
+        if tun_name.is_none() && view.if_index == tun_if_index {
             continue;
         }
         let v4 = targets
             .v4
-            .and_then(|_| family_state(&view.adapter, &view.dns, false));
+            .and_then(|target| family_state(&view.adapter, &view.dns, false, IpAddr::V4(target)));
         let v6 = targets
             .v6
-            .and_then(|_| family_state(&view.adapter, &view.dns, true));
+            .and_then(|target| family_state(&view.adapter, &view.dns, true, IpAddr::V6(target)));
         if v4.is_none() && v6.is_none() {
             continue;
         }
@@ -323,6 +361,79 @@ fn set_servers(guid: GUID, ipv6: bool, servers: Servers<'_>, alias: &str) -> Res
     Ok(())
 }
 
+/// Compare a family's effective servers with the list the takeover wants to
+/// see. The order is not significant, and an IPv6 address may be spelled in
+/// several equivalent forms.
+fn servers_match(current: &[IpAddr], ipv6: bool, desired: &[String]) -> bool {
+    let mut current: Vec<IpAddr> = current
+        .iter()
+        .copied()
+        .filter(|server| server.is_ipv6() == ipv6)
+        .collect();
+    current.sort_unstable();
+    sorted_ip_addrs(desired).is_some_and(|desired| current == desired)
+}
+
+/// Parse and sort a list of textual servers. `None` means at least one entry
+/// was not an IP address, which falls back to a textual comparison.
+fn sorted_ip_addrs(servers: &[String]) -> Option<Vec<IpAddr>> {
+    let mut parsed: Vec<IpAddr> = servers
+        .iter()
+        .map(|server| server.parse::<IpAddr>().ok())
+        .collect::<Option<_>>()?;
+    parsed.sort_unstable();
+    Some(parsed)
+}
+
+/// Whether the persisted static list is the state the restore wrote: an
+/// absent list for a DHCP revert, or the exact static list.
+fn static_matches(actual: Option<&[String]>, desired: Servers<'_>) -> bool {
+    match desired {
+        Servers::Revert => actual.is_none(),
+        Servers::List(list) => actual.is_some_and(|actual| same_servers(actual, list)),
+    }
+}
+
+fn same_servers(left: &[String], right: &[String]) -> bool {
+    match (sorted_ip_addrs(left), sorted_ip_addrs(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => {
+            let mut left: Vec<&str> = left.iter().map(String::as_str).collect();
+            let mut right: Vec<&str> = right.iter().map(String::as_str).collect();
+            left.sort_unstable();
+            right.sort_unstable();
+            left == right
+        }
+    }
+}
+
+/// Read the static list back after a write. `SetInterfaceDnsSettings` can
+/// return success without applying the intended change, and a restore that
+/// silently missed would delete the record and strand the adapter, so a
+/// mismatch is an error and keeps the record.
+fn verify_static(
+    adapter: &str,
+    alias: &str,
+    ipv6: bool,
+    desired: Servers<'_>,
+) -> Result<(), DiagError> {
+    let mut attempts = 0;
+    loop {
+        let actual = static_servers(adapter, ipv6);
+        if static_matches(actual.as_deref(), desired) {
+            return Ok(());
+        }
+        attempts += 1;
+        if attempts >= 3 {
+            return Err(
+                DiagError::new(Diag::new(Key::DnsTakeoverRegisterFailed).arg(alias))
+                    .caused_by(DiagError::new(Diag::new(Key::DnsTakeoverVerifyFailed))),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The enumerated view of the adapter an entry names. The comparison is
 /// case-insensitive because `GetAdaptersAddresses` and the registry disagree
 /// on the letter case of the same interface GUID.
@@ -334,8 +445,9 @@ fn find_view<'a>(views: &'a [AdapterView], entry: &Entry) -> Option<&'a AdapterV
 
 /// Apply the takeover: point every captured adapter's DNS at the tunnel
 /// address of its family.
-fn apply(record: &Record, targets: Targets) -> Result<(), DiagError> {
+fn apply(record: &Record, targets: Targets) -> Result<usize, DiagError> {
     let views = enumerate()?;
+    let mut applied = 0;
     for entry in &record.entries {
         let Some(view) = find_view(&views, entry) else {
             continue; // the adapter is gone since the capture
@@ -343,16 +455,36 @@ fn apply(record: &Record, targets: Targets) -> Result<(), DiagError> {
         let Some(guid) = interface_guid(&view.luid) else {
             continue;
         };
+        let mut changed = false;
         if let (Some(state), Some(target)) = (&entry.v4, targets.v4) {
             let servers = state.takeover_servers(IpAddr::V4(target));
-            set_servers(guid, false, Servers::List(&servers), &entry.alias)?;
+            let already = static_matches(
+                static_servers(&entry.adapter, false).as_deref(),
+                Servers::List(&servers),
+            ) || servers_match(&view.dns, false, &servers);
+            if !already {
+                set_servers(guid, false, Servers::List(&servers), &entry.alias)?;
+                verify_static(&entry.adapter, &entry.alias, false, Servers::List(&servers))?;
+                changed = true;
+            }
         }
         if let (Some(state), Some(target)) = (&entry.v6, targets.v6) {
             let servers = state.takeover_servers(IpAddr::V6(target));
-            set_servers(guid, true, Servers::List(&servers), &entry.alias)?;
+            let already = static_matches(
+                static_servers(&entry.adapter, true).as_deref(),
+                Servers::List(&servers),
+            ) || servers_match(&view.dns, true, &servers);
+            if !already {
+                set_servers(guid, true, Servers::List(&servers), &entry.alias)?;
+                verify_static(&entry.adapter, &entry.alias, true, Servers::List(&servers))?;
+                changed = true;
+            }
+        }
+        if changed {
+            applied += 1;
         }
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// Restore the captured state of every adapter the record names. Returns the
@@ -375,10 +507,14 @@ fn restore(record: &Record) -> Result<(usize, Vec<Entry>), DiagError> {
             continue;
         };
         if let Some(state) = &entry.v4 {
-            set_servers(guid, false, state.restore_write(), &entry.alias)?;
+            let write = state.restore_write();
+            set_servers(guid, false, write, &entry.alias)?;
+            verify_static(&entry.adapter, &entry.alias, false, write)?;
         }
         if let Some(state) = &entry.v6 {
-            set_servers(guid, true, state.restore_write(), &entry.alias)?;
+            let write = state.restore_write();
+            set_servers(guid, true, write, &entry.alias)?;
+            verify_static(&entry.adapter, &entry.alias, true, write)?;
         }
         restored += 1;
     }
@@ -454,7 +590,8 @@ fn merge(existing: Option<Record>, fresh: Record) -> Record {
 
 /// Take the system DNS over for this TUN session: capture every other
 /// adapter's servers, persist the capture as the record, then point those
-/// adapters at the tunnel. Returns the number of adapters the session owns.
+/// adapters at the tunnel. Returns the number of adapters whose DNS list this
+/// call changed.
 ///
 /// The record is written before the first change, so a crash between the two
 /// leaves a repair behind rather than an unrecoverable machine.
@@ -465,16 +602,44 @@ fn merge(existing: Option<Record>, fresh: Record) -> Record {
 pub(crate) fn engage(
     record_path: &Path,
     tun_if_index: u32,
+    tun_name: Option<&str>,
     targets: Targets,
 ) -> Result<usize, DiagError> {
-    let fresh = plan(&enumerate()?, tun_if_index, targets);
+    let fresh = plan(&enumerate()?, tun_if_index, tun_name, targets);
     let record = merge(read_record(record_path)?, fresh);
     if record.entries.is_empty() {
         return Ok(0);
     }
     write_record(record_path, &record)?;
-    apply(&record, targets)?;
-    Ok(record.entries.len())
+    apply(&record, targets)
+}
+
+/// Reconcile an active session with the adapters that are present now.
+/// Returns the number of adapters whose DNS list this pass changed.
+///
+/// The capture is merged with the existing record, so an adapter that
+/// appeared after the session started is captured and pointed at the tunnel
+/// without changing the originals of the adapters already in the record. The
+/// record is rewritten only when the merge changed it, and a server list that
+/// already carries the target is not written again. A network monitor calls
+/// this both on change notifications and on a periodic backstop, so it must
+/// stay idempotent.
+pub(crate) fn reconcile(
+    record_path: &Path,
+    tun_if_index: u32,
+    tun_name: Option<&str>,
+    targets: Targets,
+) -> Result<usize, DiagError> {
+    let existing = read_record(record_path)?;
+    let fresh = plan(&enumerate()?, tun_if_index, tun_name, targets);
+    let record = merge(existing.clone(), fresh);
+    if record.entries.is_empty() {
+        return Ok(0);
+    }
+    if existing.as_ref() != Some(&record) {
+        write_record(record_path, &record)?;
+    }
+    apply(&record, targets)
 }
 
 /// Restore the DNS servers a session took over and drop the record. Returns
@@ -576,6 +741,7 @@ mod tests {
         let record = plan(
             &views,
             9,
+            None,
             Targets {
                 v4: Some(Ipv4Addr::new(10, 255, 0, 1)),
                 v6: None,
@@ -602,7 +768,7 @@ mod tests {
             view("{wired}", 4, 6, &["192.168.124.1"]),
             view("{quiet}", 5, 6, &[]),
         ];
-        let record = plan(&views, 9, both_families());
+        let record = plan(&views, 9, None, both_families());
         assert_eq!(
             record.entries.len(),
             1,
@@ -628,7 +794,7 @@ mod tests {
             view("{tun}", 9, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["192.168.124.1", "fd00:124::1"]),
         ];
-        let record = plan(&views, 9, both_families());
+        let record = plan(&views, 9, None, both_families());
         assert_eq!(
             record.entries[0]
                 .v6
@@ -636,6 +802,75 @@ mod tests {
                 .map(|state| state.servers.clone()),
             Some(vec!["fd00:124::1".to_string()])
         );
+    }
+
+    #[test]
+    fn the_plan_does_not_record_the_tunnel_address_as_an_original() {
+        // A fresh capture that already lists the takeover address cannot know
+        // the original servers: another session, or a lost record, may have
+        // written it. Recording it would restore the dead tunnel address
+        // forever, so the family is captured as dynamic and reverts to DHCP.
+        let views = [
+            view("{tun}", 9, 53, &["10.255.0.1"]),
+            view("{wired}", 4, 6, &["10.255.0.1", "fd00::1"]),
+        ];
+        let record = plan(&views, 9, None, both_families());
+        let entry = &record.entries[0];
+        let v4 = entry.v4.as_ref().expect("the v4 family is captured");
+        assert_eq!(v4.servers, Vec::<String>::new());
+        assert!(!v4.static_servers, "a target-only capture must revert");
+        let v6 = entry.v6.as_ref().expect("the v6 family is captured");
+        assert_eq!(v6.servers, Vec::<String>::new());
+        assert!(!v6.static_servers, "a target-only capture must revert");
+    }
+
+    #[test]
+    fn the_plan_skips_the_tun_adapter_by_name_when_its_index_changed() {
+        // Wintun can recreate the adapter with a new index; matching only the
+        // captured index would capture the new TUN adapter as a normal one.
+        let views = [
+            view("{tun}", 42, 53, &["10.255.0.1"]),
+            view("{wired}", 4, 6, &["192.168.124.1"]),
+        ];
+        let record = plan(&views, 9, Some("alias-{tun}"), both_families());
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].adapter, "{wired}");
+    }
+
+    #[test]
+    fn server_comparison_ignores_order_and_ipv6_spelling() {
+        let current: Vec<IpAddr> = ["1.1.1.1", "8.8.8.8"]
+            .iter()
+            .map(|server| server.parse().expect("ip"))
+            .collect();
+        assert!(servers_match(
+            &current,
+            false,
+            &["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        ));
+        assert!(!servers_match(&current, false, &["1.1.1.1".to_string()]));
+        let v6: Vec<IpAddr> = ["FD00:0:0:0:0:0:0:1"]
+            .iter()
+            .map(|server| server.parse().expect("ip"))
+            .collect();
+        assert!(servers_match(&v6, true, &["fd00::1".to_string()]));
+    }
+
+    #[test]
+    fn verification_requires_the_written_list_or_no_list_for_a_revert() {
+        assert!(static_matches(None, Servers::Revert));
+        assert!(!static_matches(
+            Some(&["10.0.0.1".to_string()]),
+            Servers::Revert
+        ));
+        assert!(static_matches(
+            Some(&["1.1.1.1".to_string()]),
+            Servers::List(&["1.1.1.1".to_string()])
+        ));
+        assert!(!static_matches(
+            Some(&["1.1.1.1".to_string()]),
+            Servers::List(&["8.8.8.8".to_string()])
+        ));
     }
 
     #[test]

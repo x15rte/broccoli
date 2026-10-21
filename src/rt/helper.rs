@@ -29,8 +29,14 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HWND,
+    LPARAM, LRESULT, NO_ERROR, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
+use windows::Win32::NetworkManagement::IpHelper::{
+    CancelMibChangeNotify2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    NotifyIpInterfaceChange, NotifyRouteChange2,
+};
+use windows::Win32::Networking::WinSock::AF_UNSPEC;
 use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
@@ -48,17 +54,27 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, NAMED_PIPE_MODE, PIPE_NOWAIT,
     PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState,
     WaitNamedPipeW,
 };
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
+    REG_NOTIFY_FILTER, RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW,
+};
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    CreateEventW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows::core::{BOOL, HRESULT, PCWSTR};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostQuitMessage,
+    RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ENDSESSION,
+    WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+};
+use windows::core::{BOOL, HRESULT, PCWSTR, w};
 
 use super::events::{Forward, HandOff, LogGate, LogHop, hand_within};
 use crate::model::inbound::TUN_INBOUND_TAG;
@@ -106,6 +122,16 @@ const LIFECYCLE_SEND_WINDOW: Duration = Duration::from_millis(4000);
 /// Upper bound for settling a previous TUN session's wintun teardown before
 /// spawning the replacement core (see `clean_leftover_tun_adapter`).
 const TUN_CLEAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Periodic backstop for the network watcher. Interface, route, and registry
+/// notifications cover the usual changes; the timeout catches a change no
+/// notification reports.
+const NETWORK_WATCH_TIMEOUT_MS: u32 = 10_000;
+/// Coalesce a burst of interface, route, and registry notifications into one
+/// reconcile pass.
+const NETWORK_WATCH_DEBOUNCE: Duration = Duration::from_secs(1);
+/// Report a failing reconcile at most this often. A broken record would
+/// otherwise log every pass.
+const NETWORK_ERROR_REPORT: Duration = Duration::from_secs(60);
 const STAGE_BASE: &str = ".broccoli-secure-runtime";
 /// Captured DNS servers this helper process restored, wherever the restore ran:
 /// the startup repair, a session teardown, or a cleanup command. A cleanup's
@@ -117,6 +143,34 @@ const STAGE_BASE: &str = ".broccoli-secure-runtime";
 /// that already ran sessions. Every restore runs through
 /// [`release_dns_takeover`], which is what keeps the count from missing one.
 static DNS_SERVERS_RESTORED: AtomicUsize = AtomicUsize::new(0);
+/// Serializes the two places that change the takeover: a start's `engage`
+/// and every `release`. The shutdown window restores from its own thread, so
+/// without this an exit-time restore could interleave with a start that is
+/// still staging a core.
+static TAKEOVER_LOCK: Mutex<()> = Mutex::new(());
+/// Set when a committed session end is being handled. A start that raced it
+/// must not engage a takeover after the restore has run.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// What the shutdown window needs to restore: the pipe writer for the one
+/// log line the shared restore path emits. The window procedure has no
+/// user-data parameter, so this is the process-wide context it reads.
+struct ShutdownContext {
+    writer: Arc<Mutex<File>>,
+    restored: bool,
+}
+static SHUTDOWN_CONTEXT: Mutex<Option<ShutdownContext>> = Mutex::new(None);
+/// The live session whose DNS the helper holds. The network watcher reads it
+/// to decide between reconciling an active takeover and retrying a residual
+/// restore. A release clears it before the record is touched, so a watcher
+/// pass can never re-engage a session that is already ending.
+#[derive(Clone)]
+struct EngagedSession {
+    pid: u32,
+    tun_name: String,
+    tun_if_index: u32,
+    targets: crate::sys::dns_takeover::Targets,
+}
+static ENGAGED_SESSION: Mutex<Option<EngagedSession>> = Mutex::new(None);
 /// Record file of the system-DNS takeover (`sys::dns_takeover`), inside
 /// [`STAGE_BASE`] so it lives beside the stage directories and under the same
 /// protected DACL.
@@ -1588,6 +1642,13 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // path shares, so a cleanup command served later by this helper counts
     // what this repair put back.
     release_dns_takeover(&writer, TakeoverOrigin::PreviousSession);
+    // The helper owns the takeover but has no window of its own; without
+    // this, a machine shutdown terminates it before any restore runs.
+    start_shutdown_window(Arc::clone(&writer));
+    // Reconcile the takeover on interface, route, and DNS registry changes:
+    // a new NIC or a DHCP renewal otherwise leaves servers the leak block
+    // drops in the resolver's set.
+    start_network_watcher(Arc::clone(&current), Arc::clone(&writer));
     loop {
         match wait_for_message(handle, None, Some(parent.0)) {
             Ok(true) => {}
@@ -2006,7 +2067,7 @@ fn helper_start(
     let needs = config
         .as_ref()
         .is_some_and(crate::model::inbound::config_runs_tun_dns);
-    let takeover_error = if needs {
+    let takeover_error = if needs && !SHUTTING_DOWN.load(Ordering::SeqCst) {
         match config_text
             .as_deref()
             .and_then(crate::sys::wintun::staged_tun_adapter_name)
@@ -2038,29 +2099,54 @@ fn helper_start(
                     // derived from the same staged config; its capture is
                     // written before the first change, so a failure here
                     // still leaves a repair behind.
-                    let outcome = (|| -> Result<usize, DiagError> {
+                    let outcome = (|| -> Result<Option<usize>, DiagError> {
                         let path = dns_takeover_record_path()?;
                         let in_tun = crate::rt::dns_in::listener_for_bytes(config_bytes)
                             .ok_or_else(|| {
                                 DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))
                             })?;
-                        crate::sys::dns_takeover::engage(
-                            &path,
-                            ifindex,
-                            crate::sys::dns_takeover::Targets {
-                                v4: in_tun.v4,
-                                v6: in_tun.v6,
-                            },
-                        )
+                        // A committed session end may have started while the
+                        // adapter index was resolving; the restore takes the
+                        // same lock, so re-check inside it. A start that loses
+                        // this race must not re-engage after the restore.
+                        let _takeover = TAKEOVER_LOCK
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                            return Ok(None);
+                        }
+                        let targets = crate::sys::dns_takeover::Targets {
+                            v4: in_tun.v4,
+                            v6: in_tun.v6,
+                        };
+                        // Publish the session before the first write. If
+                        // `engage` fails, the watcher must retry it as a
+                        // reconcile, not mistake the record for a previous
+                        // session's leftover and release a partial takeover.
+                        {
+                            let mut engaged = ENGAGED_SESSION
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *engaged = Some(EngagedSession {
+                                pid,
+                                tun_name: name.clone(),
+                                tun_if_index: ifindex,
+                                targets,
+                            });
+                        }
+                        let applied =
+                            crate::sys::dns_takeover::engage(&path, ifindex, Some(&name), targets)?;
+                        Ok(Some(applied))
                     })();
                     match outcome {
-                        Ok(adapters) => {
+                        Ok(Some(adapters)) => {
                             send_log(
                                 writer,
                                 Diag::new(Key::HelperDnsTakeoverApplied).arg(adapters),
                             );
                             None
                         }
+                        Ok(None) => None,
                         Err(error) => Some(
                             DiagError::new(Diag::new(Key::HelperDnsTakeoverNotEngaged))
                                 .caused_by(error),
@@ -2194,14 +2280,32 @@ enum TakeoverOrigin {
 /// reports what any earlier path put back — including the startup repair,
 /// whose record is gone by the time the command is read.
 fn release_dns_takeover(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin) {
+    // The shutdown window and the network watcher run this from their own
+    // threads. A start's `engage` takes the same lock, so a restore can never
+    // interleave with an engage that is writing the same record.
+    let _takeover = TAKEOVER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    release_dns_takeover_locked(writer, origin);
+}
+
+/// The body of [`release_dns_takeover`] for a caller that already holds
+/// [`TAKEOVER_LOCK`]. The watcher uses it to check "no session is engaged"
+/// and restore under the same lock, so a start cannot slip a new session
+/// between the check and the restore.
+fn release_dns_takeover_locked(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin) {
+    *ENGAGED_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let key = match origin {
         TakeoverOrigin::PreviousSession => Key::HelperDnsTakeoverRepaired,
         TakeoverOrigin::OwnSession => Key::HelperDnsTakeoverRestored,
     };
-    match dns_takeover_record_path().and_then(|path| crate::sys::dns_takeover::release(&path)) {
+    match dns_takeover_record_path().and_then(|path| restore_dns_takeover_locked(&path)) {
         Ok(Some(0)) | Ok(None) => {}
         Ok(Some(adapters)) => {
             DNS_SERVERS_RESTORED.fetch_add(adapters, Ordering::Relaxed);
+            flush_resolver_cache();
             send_log(writer, Diag::new(key).arg(adapters));
         }
         Err(error) => {
@@ -2211,6 +2315,595 @@ fn release_dns_takeover(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin) {
             );
         }
     }
+}
+
+/// The restore itself, for a caller that already holds [`TAKEOVER_LOCK`].
+/// The caller decides how to log the result, which lets the watcher's
+/// periodic retry share the same error throttle as its reconcile passes.
+fn restore_dns_takeover_locked(record_path: &Path) -> Result<Option<usize>, DiagError> {
+    crate::sys::dns_takeover::release(record_path)
+}
+
+/// Drop the resolver cache after a restore. The cache can hold answers
+/// resolved through the tunnel, and the helper restores on paths where the
+/// GUI's transition flush does not run. Best-effort, like that flush.
+fn flush_resolver_cache() {
+    let _ = crate::sys::hidden_command("ipconfig")
+        .arg("/flushdns")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// What a session-end message asks the helper to do. Kept separate from the
+/// window procedure so the policy is testable without a real shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownAction {
+    Ready,
+    None,
+    Restore,
+}
+
+fn shutdown_action(message: u32, wparam: usize) -> ShutdownAction {
+    match message {
+        WM_QUERYENDSESSION => ShutdownAction::Ready,
+        WM_ENDSESSION if wparam != 0 => ShutdownAction::Restore,
+        _ => ShutdownAction::None,
+    }
+}
+
+/// Start the hidden window that receives the session-end messages. The
+/// helper is a GUI-subsystem process with no window of its own, so without
+/// this Windows terminates it on shutdown without running any restore.
+fn start_shutdown_window(writer: Arc<Mutex<File>>) {
+    {
+        let mut context = SHUTDOWN_CONTEXT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *context = Some(ShutdownContext {
+            writer: Arc::clone(&writer),
+            restored: false,
+        });
+    }
+    let log_writer = Arc::clone(&writer);
+    if let Err(error) = std::thread::Builder::new()
+        .name("helper-shutdown".into())
+        .spawn(move || run_shutdown_window(log_writer))
+    {
+        send_event(
+            &writer,
+            &serde_json::json!({
+                "event": "log",
+                "line": format!("{HELPER_LINE_PREFIX}shutdown window thread failed: {error}"),
+            }),
+        );
+    }
+}
+
+/// Create the hidden top-level window and pump its messages. A message-only
+/// window would not receive the broadcast session-end messages, so this is a
+/// normal top-level window that is never shown.
+fn run_shutdown_window(writer: Arc<Mutex<File>>) {
+    run_shutdown_window_with_class(writer, w!("broccoli-shutdown-window"));
+}
+
+/// The same window as [`run_shutdown_window`] under a caller-supplied class
+/// name. The test uses a unique class so it can find its own window without
+/// matching another helper process's window. The name must outlive the
+/// message loop.
+fn run_shutdown_window_with_class(writer: Arc<Mutex<File>>, class_name: PCWSTR) {
+    // SAFETY: `GetModuleHandleW(None)` asks for this process's module handle,
+    // which every process has; the returned handle is only used as the
+    // `HINSTANCE` shared by `RegisterClassW` and `CreateWindowExW` below.
+    let instance = match unsafe { GetModuleHandleW(None) } {
+        Ok(module) => HINSTANCE(module.0),
+        Err(error) => {
+            send_event(
+                &writer,
+                &serde_json::json!({
+                    "event": "log",
+                    "line": format!(
+                        "{HELPER_LINE_PREFIX}shutdown window instance unavailable: {error}"
+                    ),
+                }),
+            );
+            return;
+        }
+    };
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(shutdown_window_proc),
+        hInstance: instance,
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    // SAFETY: `class` is a fully initialized `WNDCLASSW` whose class name is
+    // a static NUL-terminated wide string and whose instance is this
+    // process's module handle; the call reads the struct synchronously and
+    // the class stays registered for the process lifetime.
+    if unsafe { RegisterClassW(&class) } == 0 {
+        send_event(
+            &writer,
+            &serde_json::json!({
+                "event": "log",
+                "line": format!("{HELPER_LINE_PREFIX}shutdown window class registration failed"),
+            }),
+        );
+        return;
+    }
+    // SAFETY: the class name is the one just registered, `hInstance` is the
+    // same module handle, and every other argument is the documented
+    // hidden-top-level-window shape (no parent, no menu, zero size, no
+    // `WS_VISIBLE`); the returned handle is checked before the message loop.
+    let _window = match unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            w!("broccoli"),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+    } {
+        Ok(window) => window,
+        Err(error) => {
+            send_event(
+                &writer,
+                &serde_json::json!({
+                    "event": "log",
+                    "line": format!("{HELPER_LINE_PREFIX}shutdown window creation failed: {error}"),
+                }),
+            );
+            return;
+        }
+    };
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: `message` is a live, writable `MSG`; a null `hwnd` retrieves
+        // this thread's messages (including the window's session-end
+        // messages), and the result distinguishes WM_QUIT (0), an error (-1),
+        // and a message.
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+        if result.0 == 0 || result.0 == -1 {
+            break;
+        }
+        // SAFETY: `message` was filled by `GetMessageW` above and is valid
+        // for both calls, which only read it.
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+/// The hidden window's procedure. Session-end policy lives in
+/// [`shutdown_action`]; this only performs the restore the policy requests.
+unsafe extern "system" fn shutdown_window_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_DESTROY => {
+            // SAFETY: `PostQuitMessage` posts to the current thread's queue;
+            // this procedure runs on the window's thread, which is the
+            // thread that owns the message loop above.
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => match shutdown_action(message, wparam.0) {
+            ShutdownAction::Ready => LRESULT(1),
+            ShutdownAction::Restore => {
+                SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                let mut context = SHUTDOWN_CONTEXT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(context) = context.as_mut()
+                    && !context.restored
+                {
+                    context.restored = true;
+                    // `engage` holds TAKEOVER_LOCK only after the TUN-index
+                    // poll, and its critical section is bounded by the
+                    // adapter count, so this wait fits the session-end
+                    // budget. The flag above stops a start that has not
+                    // entered the lock yet from engaging afterwards.
+                    release_dns_takeover(&context.writer, TakeoverOrigin::OwnSession);
+                }
+                LRESULT(0)
+            }
+            // SAFETY: the default procedure is the documented handler for
+            // every message this window does not own; `window`, `message`,
+            // `wparam`, and `lparam` are the values Windows passed in.
+            ShutdownAction::None => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        },
+    }
+}
+
+/// The two DNS registry roots watched below. `NotifyIpInterfaceChange` and
+/// `NotifyRouteChange2` report interface and route changes, but not a DNS
+/// server change: a DHCP renewal or a manual edit writes these keys.
+struct RegistryWatch {
+    keys: Vec<HKEY>,
+    events: Vec<HANDLE>,
+    filter: REG_NOTIFY_FILTER,
+}
+
+impl RegistryWatch {
+    fn open(writer: &Arc<Mutex<File>>) -> Self {
+        let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
+        let mut watch = Self {
+            keys: Vec::new(),
+            events: Vec::new(),
+            filter,
+        };
+        for path in crate::sys::dns_takeover::REGISTRY_PATHS {
+            let wide = to_wide(path);
+            let mut key = HKEY(std::ptr::null_mut());
+            // SAFETY: `wide` is a NUL-terminated wide path that outlives the
+            // call, `HKEY_LOCAL_MACHINE` is a predefined root, and `key` is a
+            // live out-parameter the API writes on success.
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    PCWSTR(wide.as_ptr()),
+                    None,
+                    KEY_NOTIFY,
+                    &mut key,
+                )
+            };
+            if status != NO_ERROR {
+                log_network_watch(
+                    writer,
+                    &format!("network watcher could not open {path}: {}", status.0),
+                );
+                continue;
+            }
+            // SAFETY: no security attributes or name are requested, and the
+            // unsignaled auto-reset event is owned by this watch on success.
+            let event = match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
+                Ok(event) => event,
+                Err(error) => {
+                    log_network_watch(
+                        writer,
+                        &format!("network watcher could not create an event: {error}"),
+                    );
+                    // SAFETY: `key` was opened successfully above and is
+                    // owned by this branch, so it is closed exactly once.
+                    unsafe {
+                        let _ = RegCloseKey(key);
+                    }
+                    continue;
+                }
+            };
+            // SAFETY: `key` is a live KEY_NOTIFY handle, `event` is a live
+            // auto-reset event, and `filter` names the value and subkey
+            // changes the watcher reacts to. The asynchronous call only
+            // stores the handles until the event signals.
+            let status = unsafe { RegNotifyChangeKeyValue(key, true, filter, Some(event), true) };
+            if status != NO_ERROR {
+                log_network_watch(
+                    writer,
+                    &format!("network watcher could not watch {path}: {}", status.0),
+                );
+                // SAFETY: both handles are live and owned by this branch;
+                // each is closed exactly once.
+                unsafe {
+                    let _ = RegCloseKey(key);
+                    let _ = CloseHandle(event);
+                }
+                continue;
+            }
+            watch.keys.push(key);
+            watch.events.push(event);
+        }
+        watch
+    }
+
+    /// Re-arm the asynchronous notification after its event signaled.
+    fn rearm(&self, index: usize, writer: &Arc<Mutex<File>>) {
+        let (Some(key), Some(event)) = (self.keys.get(index), self.events.get(index)) else {
+            return;
+        };
+        // SAFETY: `key` and `event` are the live pair registered by `open`,
+        // and the event has been consumed by the wait that led here.
+        let status =
+            unsafe { RegNotifyChangeKeyValue(*key, true, self.filter, Some(*event), true) };
+        if status != NO_ERROR {
+            log_network_watch(
+                writer,
+                &format!(
+                    "network watcher could not re-arm a registry watch: {}",
+                    status.0
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for RegistryWatch {
+    fn drop(&mut self) {
+        for key in self.keys.drain(..) {
+            // SAFETY: `key` came from a successful `RegOpenKeyExW` and is
+            // owned by this watch, so it is closed exactly once.
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+        }
+        for event in self.events.drain(..) {
+            // SAFETY: `event` came from a successful `CreateEventW` and is
+            // owned by this watch, so it is closed exactly once.
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+        }
+    }
+}
+
+fn log_network_watch(writer: &Arc<Mutex<File>>, message: &str) {
+    send_event(
+        writer,
+        &serde_json::json!({
+            "event": "log",
+            "line": format!("{HELPER_LINE_PREFIX}{message}"),
+        }),
+    );
+}
+
+/// Start the network watcher for the life of this helper. It re-applies the
+/// takeover after an interface, route, or DNS change, which keeps the
+/// resolver from falling back to servers the leak block drops.
+fn start_network_watcher(current: Arc<Mutex<Option<HelperChild>>>, writer: Arc<Mutex<File>>) {
+    let log_writer = Arc::clone(&writer);
+    if let Err(error) = std::thread::Builder::new()
+        .name("helper-net-watch".into())
+        .spawn(move || run_network_watcher(current, writer))
+    {
+        log_network_watch(
+            &log_writer,
+            &format!("network watcher thread failed: {error}"),
+        );
+    }
+}
+
+fn run_network_watcher(current: Arc<Mutex<Option<HelperChild>>>, writer: Arc<Mutex<File>>) {
+    // SAFETY: no security attributes or name are requested, and the
+    // unsignaled auto-reset event is owned by this thread on success.
+    let wake = match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
+        Ok(wake) => wake,
+        Err(error) => {
+            log_network_watch(
+                &writer,
+                &format!("network watcher could not create its wake event: {error}"),
+            );
+            return;
+        }
+    };
+    // The callbacks receive this handle as their caller context. The event
+    // stays open until after both registrations are cancelled below.
+    let context = wake.0 as *const core::ffi::c_void;
+    let mut interface_handle = HANDLE::default();
+    let mut route_handle = HANDLE::default();
+    // SAFETY: `context` points at the live wake event handle, the callback
+    // only calls `SetEvent` on it, and `interface_handle` is a live
+    // out-parameter.
+    let status = unsafe {
+        NotifyIpInterfaceChange(
+            AF_UNSPEC,
+            Some(network_interface_changed),
+            Some(context),
+            false,
+            &mut interface_handle,
+        )
+    };
+    if status != NO_ERROR {
+        log_network_watch(
+            &writer,
+            &format!(
+                "network watcher interface registration failed: {}",
+                status.0
+            ),
+        );
+    }
+    // SAFETY: the same live wake event is the caller context, the callback
+    // only signals it, and `route_handle` is a live out-parameter.
+    let status = unsafe {
+        NotifyRouteChange2(
+            AF_UNSPEC,
+            Some(network_route_changed),
+            context,
+            false,
+            &mut route_handle,
+        )
+    };
+    if status != NO_ERROR {
+        log_network_watch(
+            &writer,
+            &format!("network watcher route registration failed: {}", status.0),
+        );
+    }
+    let registry = RegistryWatch::open(&writer);
+    let mut handles = Vec::with_capacity(1 + registry.events.len());
+    handles.push(wake);
+    handles.extend(registry.events.iter().copied());
+    let mut last_error: Option<Instant> = None;
+    loop {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            break;
+        }
+        // SAFETY: every handle in `handles` is live and owned by this
+        // thread: the wake event above and the registry events in `registry`.
+        let event = unsafe { WaitForMultipleObjects(&handles, false, NETWORK_WATCH_TIMEOUT_MS) };
+        if event.0 == WAIT_FAILED.0 {
+            log_network_watch(&writer, "network watcher wait failed");
+            break;
+        }
+        if event.0 == WAIT_TIMEOUT.0 {
+            // Periodic backstop; fall through to the reconcile.
+        } else if (event.0 as usize) < handles.len() {
+            let index = event.0 as usize;
+            if index > 0 {
+                registry.rearm(index - 1, &writer);
+            }
+            // A switch produces several notifications; one pass after the
+            // burst is enough and avoids rewriting the same lists.
+            std::thread::sleep(NETWORK_WATCH_DEBOUNCE);
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                break;
+            }
+        } else {
+            continue;
+        }
+        if let Err(error) = reconcile_network_state(&current, &writer) {
+            let now = Instant::now();
+            let report = match last_error {
+                None => true,
+                Some(last) => now.duration_since(last) >= NETWORK_ERROR_REPORT,
+            };
+            if report {
+                last_error = Some(now);
+                send_log_record(
+                    &writer,
+                    &DiagError::new(Diag::new(Key::HelperDnsTakeoverReconcileFailed))
+                        .caused_by(error),
+                );
+            }
+        }
+    }
+    if !interface_handle.is_invalid() {
+        // SAFETY: `interface_handle` is the live registration returned above;
+        // this thread is not the callback thread, so cancellation cannot
+        // deadlock.
+        unsafe {
+            let _ = CancelMibChangeNotify2(interface_handle);
+        }
+    }
+    if !route_handle.is_invalid() {
+        // SAFETY: as for the interface registration: live handle, cancelled
+        // from the watcher thread rather than from a callback.
+        unsafe {
+            let _ = CancelMibChangeNotify2(route_handle);
+        }
+    }
+    // SAFETY: the registrations are cancelled, and `wake` is owned by this
+    // thread, so it is closed exactly once.
+    unsafe {
+        let _ = CloseHandle(wake);
+    }
+}
+
+unsafe extern "system" fn network_interface_changed(
+    context: *const core::ffi::c_void,
+    _row: *const MIB_IPINTERFACE_ROW,
+    _notification: MIB_NOTIFICATION_TYPE,
+) {
+    signal_network_event(context);
+}
+
+unsafe extern "system" fn network_route_changed(
+    context: *const core::ffi::c_void,
+    _row: *const MIB_IPFORWARD_ROW2,
+    _notification: MIB_NOTIFICATION_TYPE,
+) {
+    signal_network_event(context);
+}
+
+fn signal_network_event(context: *const core::ffi::c_void) {
+    if context.is_null() {
+        return;
+    }
+    let event = HANDLE(context as *mut core::ffi::c_void);
+    // SAFETY: the caller context is the live wake event created by
+    // `run_network_watcher`, and `SetEvent` accepts it from any thread.
+    let _ = unsafe { SetEvent(event) };
+}
+
+/// One watcher pass: reconcile the active session, or retry a residual
+/// restore when no session is engaged.
+fn reconcile_network_state(
+    current: &Arc<Mutex<Option<HelperChild>>>,
+    writer: &Arc<Mutex<File>>,
+) -> Result<(), DiagError> {
+    let session = ENGAGED_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(session) = session else {
+        // No live session: retry adapters that were absent at release and
+        // have since returned. The lock is re-checked so a start cannot slip
+        // a new session between the empty read and the restore.
+        let path = dns_takeover_record_path()?;
+        let _takeover = TAKEOVER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ENGAGED_SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+            && path.exists()
+        {
+            match restore_dns_takeover_locked(&path) {
+                Ok(Some(0)) | Ok(None) => {}
+                Ok(Some(adapters)) => {
+                    DNS_SERVERS_RESTORED.fetch_add(adapters, Ordering::Relaxed);
+                    flush_resolver_cache();
+                    send_log(
+                        writer,
+                        Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(());
+    };
+    // The child check happens before the takeover lock: the child reaper
+    // holds the slot lock while it releases, so taking the slot lock under
+    // the takeover lock would invert the two locks.
+    if !child_is_live_current(current, session.pid) {
+        return Ok(());
+    }
+    let path = dns_takeover_record_path()?;
+    let applied = {
+        let _takeover = TAKEOVER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !session_is_engaged(&session) {
+            return Ok(());
+        }
+        crate::sys::dns_takeover::reconcile(
+            &path,
+            session.tun_if_index,
+            Some(&session.tun_name),
+            session.targets,
+        )?
+    };
+    if applied > 0 {
+        send_log(
+            writer,
+            Diag::new(Key::HelperDnsTakeoverApplied).arg(applied),
+        );
+    }
+    Ok(())
+}
+
+/// Whether `session` is still the current engagement. The caller holds
+/// [`TAKEOVER_LOCK`].
+fn session_is_engaged(session: &EngagedSession) -> bool {
+    ENGAGED_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|current| {
+            current.pid == session.pid
+                && current.tun_name == session.tun_name
+                && current.tun_if_index == session.tun_if_index
+        })
 }
 
 /// Remove leftover wintun devnodes for `name` and wait (bounded) until the
@@ -2452,6 +3145,7 @@ wire_keys!(
     HelperDirectoryNotOrdinary,
     HelperDnsTakeoverApplied,
     HelperDnsTakeoverNotEngaged,
+    HelperDnsTakeoverReconcileFailed,
     HelperDnsTakeoverRepaired,
     HelperDnsTakeoverRestoreFailed,
     HelperDnsTakeoverRestored,
@@ -3091,16 +3785,18 @@ mod tests {
     use std::io::Write as _;
     use std::os::windows::io::FromRawHandle as _;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
         ChildPhase, HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES,
-        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, config_from_wire,
+        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction, config_from_wire,
         current_process_user_sid, dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
         ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
         path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
-        stage_config_bytes_at, stage_entry_allowed, start_wire_message, to_wide, token_matches,
-        validated_ace, validated_pipe_name, verify_protected_directory,
+        run_shutdown_window_with_class, shutdown_action, stage_config_bytes_at,
+        stage_entry_allowed, start_wire_message, to_wide, token_matches, validated_ace,
+        validated_pipe_name, verify_protected_directory,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -3121,7 +3817,58 @@ mod tests {
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SendMessageW, WM_CLOSE, WM_ENDSESSION, WM_QUERYENDSESSION,
+    };
     use windows::core::{HRESULT, PCWSTR};
+
+    #[test]
+    fn a_committed_session_end_restores_but_a_canceled_one_does_not() {
+        assert_eq!(
+            shutdown_action(WM_QUERYENDSESSION, 0),
+            ShutdownAction::Ready
+        );
+        assert_eq!(shutdown_action(WM_ENDSESSION, 0), ShutdownAction::None);
+        assert_eq!(shutdown_action(WM_ENDSESSION, 1), ShutdownAction::Restore);
+    }
+
+    #[test]
+    fn the_shutdown_window_receives_the_query_message() {
+        let class = "broccoli-shutdown-window-test";
+        let wide = to_wide(class);
+        let class_name = PCWSTR(wide.as_ptr());
+        let file = tempfile::tempfile().expect("temp file");
+        let writer = Arc::new(Mutex::new(file));
+        let thread = std::thread::spawn(move || {
+            // The class-name buffer lives in this closure for the whole
+            // message loop; a unique class keeps the lookup from matching a
+            // different helper process's window.
+            let wide = to_wide(class);
+            run_shutdown_window_with_class(writer, PCWSTR(wide.as_ptr()));
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let window = loop {
+            // SAFETY: `class_name` points at the live wide buffer above, and
+            // a null window name asks for any window of that class.
+            match unsafe { FindWindowW(class_name, PCWSTR::null()) } {
+                Ok(window) => break window,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => panic!("the shutdown window did not appear"),
+            }
+        };
+        // SAFETY: `window` is the live hidden window found above; the message
+        // carries no parameters.
+        let answer = unsafe { SendMessageW(window, WM_QUERYENDSESSION, None, None) };
+        assert_eq!(answer.0, 1, "a session query must report ready");
+        // SAFETY: `window` is live; WM_CLOSE is the documented way to destroy
+        // a window, which ends the message loop this test owns.
+        unsafe {
+            SendMessageW(window, WM_CLOSE, None, None);
+        }
+        thread.join().expect("the shutdown window thread must end");
+    }
 
     #[test]
     fn helper_credentials_are_fixed_width_hex() {
@@ -3385,6 +4132,7 @@ mod tests {
         for key in [
             Key::HelperDnsTakeoverApplied,
             Key::HelperDnsTakeoverNotEngaged,
+            Key::HelperDnsTakeoverReconcileFailed,
             Key::HelperDnsTakeoverRepaired,
             Key::HelperDnsTakeoverRestored,
             Key::HelperDnsTakeoverRestoreFailed,

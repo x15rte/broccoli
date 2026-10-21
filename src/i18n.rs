@@ -2241,11 +2241,13 @@ keys! {
     HelperJobSetupFailed (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
+    HelperDnsTakeoverReconcileFailed (Log, Warn, 0),
     HelperDnsTakeoverRestored (Log, Info, 1),
     HelperDnsTakeoverRestoreFailed (Log, Error, 0),
     HelperDnsTakeoverRepaired (Log, Warn, 1),
     DnsTakeoverEnumerateFailed 0,
     DnsTakeoverRegisterFailed 1,
+    DnsTakeoverVerifyFailed 0,
     DnsTakeoverWin32Code 1,
     DnsTakeoverRecordFailed 0,
     HelperTunAdapterMissing (Log, Error, 1),
@@ -6021,6 +6023,9 @@ mod en {
             Key::HelperDnsTakeoverNotEngaged => {
                 "elevated helper could not take the system DNS over"
             }
+            Key::HelperDnsTakeoverReconcileFailed => {
+                "helper could not re-apply the system DNS takeover"
+            }
             Key::HelperDnsTakeoverRestored => {
                 "elevated helper restored the DNS servers of {} adapters"
             }
@@ -6035,6 +6040,9 @@ mod en {
             }
             Key::DnsTakeoverRegisterFailed => {
                 "The elevated helper could not change the DNS servers of adapter {}"
+            }
+            Key::DnsTakeoverVerifyFailed => {
+                "The adapter still reports different DNS servers after the write."
             }
             Key::DnsTakeoverWin32Code => "Windows reports error code {}.",
             Key::DnsTakeoverRecordFailed => {
