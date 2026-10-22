@@ -1781,14 +1781,20 @@ fn refresh_dialer_proxy_options<'a>(
 }
 
 /// Trailing context for [`ServersScreen::transport_tab`]: the draft identity
-/// its requests are staged against, and whether the reveal control masks its
-/// credentials. Both belong to the editor frame that renders the tab, and
-/// bundling them keeps the tab under clippy's argument-count ceiling without a
-/// lint suppression (zero-suppression repo contract).
-#[derive(Clone, Copy)]
+/// its requests are staged against, whether the reveal control masks its
+/// credentials, the outbound protocol that decides which transports are
+/// offered, and the outbound's mux block an xdrive selection seeds. All
+/// belong to the editor frame that renders the tab, and bundling them keeps
+/// the tab under clippy's argument-count ceiling without a lint suppression
+/// (zero-suppression repo contract).
 struct TransportTabCtx<'a> {
     target: Option<DraftTarget<'a>>,
     masked: bool,
+    protocol: Protocol,
+    /// `Some` only for the top-level outbound stream: mux is an outbound
+    /// field, and selecting xdrive enables it there. A nested XHTTP
+    /// `downloadSettings` stream has no mux of its own.
+    mux: Option<&'a mut MuxModel>,
 }
 
 /// Trailing context for [`ServersScreen::advanced_tab`]:
@@ -2597,6 +2603,25 @@ impl ServersScreen {
             DraftKind::Existing => &mut self.existing,
             DraftKind::Add => &mut self.add,
         }
+    }
+
+    /// Switch the draft's protocol and surface the transport reset xdrive
+    /// forces when the profile leaves VLESS. The status carries the note;
+    /// the switch reports whether anything changed.
+    fn switch_draft_protocol(
+        &mut self,
+        profile: &mut ServerProfile,
+        protocol: Protocol,
+        lang: Language,
+    ) -> bool {
+        if profile.outbound.protocol == protocol {
+            return false;
+        }
+        let switched = profile.outbound.select_protocol(protocol);
+        if switched == crate::model::outbound::ProtocolSwitch::XdriveReset {
+            self.set_status(StatusLine::ok(t(lang, Key::SrvXdriveResetToRaw)));
+        }
+        true
     }
 
     /// The open draft in `kind`'s slot, if any.
@@ -3983,8 +4008,8 @@ impl ServersScreen {
                             .clicked()
                             && draft.profile.outbound.protocol != protocol
                         {
-                            draft.profile.outbound.select_protocol(protocol);
-                            changed = true;
+                            changed |=
+                                self.switch_draft_protocol(&mut draft.profile, protocol, lang);
                         }
                     }
                 });
@@ -4045,16 +4070,22 @@ impl ServersScreen {
                         )
                     }
                     EditorTab::Transport => {
-                        let masque_outbound = draft.profile.outbound.protocol == Protocol::Masque;
+                        let OutboundModel {
+                            protocol,
+                            stream,
+                            mux,
+                            ..
+                        } = &mut draft.profile.outbound;
                         self.transport_tab(
                             ui,
                             lang,
-                            &mut draft.profile.outbound.stream,
-                            masque_outbound,
+                            stream,
                             0,
                             TransportTabCtx {
                                 target: Some(target),
                                 masked: mask.secrets,
+                                protocol: *protocol,
+                                mux: Some(mux),
                             },
                         )
                     }
@@ -4978,30 +5009,47 @@ impl ServersScreen {
         ui: &mut egui::Ui,
         lang: Language,
         st: &mut StreamModel,
-        // Whether the outbound in scope is MASQUE. The transport selector
-        // offers the masque transport only for a masque outbound and only it
-        // for one, so both mismatches the model reports are unreachable here.
-        masque_outbound: bool,
         depth: u32,
         ctx: TransportTabCtx<'_>,
     ) -> bool {
-        let TransportTabCtx { target, masked } = ctx;
+        let TransportTabCtx {
+            target,
+            masked,
+            protocol,
+            mut mux,
+        } = ctx;
+        // The transport selector offers the masque transport only for a
+        // masque outbound and only it for one, and xdrive only for a VLESS
+        // outbound; the mismatches the model reports are unreachable here.
+        const WITHOUT_XDRIVE: &[Network] = &[
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+        ];
+        const WITH_XDRIVE: &[Network] = &[
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+            Network::Xdrive,
+        ];
+        let masque_outbound = protocol == Protocol::Masque;
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvNetwork));
             let networks: &[Network] = if masque_outbound {
                 &[Network::Masque]
+            } else if protocol == Protocol::Vless {
+                WITH_XDRIVE
             } else {
-                &[
-                    Network::Raw,
-                    Network::Xhttp,
-                    Network::Kcp,
-                    Network::Grpc,
-                    Network::Ws,
-                    Network::Httpupgrade,
-                    Network::Hysteria,
-                    Network::Xdrive,
-                ]
+                WITHOUT_XDRIVE
             };
             for &n in networks {
                 let allowed = st.security != Security::Reality
@@ -5035,6 +5083,13 @@ impl ServersScreen {
                     // pair the model would refuse.
                     if n == Network::Masque {
                         let _ = st.select_security(Security::Tls);
+                    }
+                    // xdrive needs one mux connection; seeding the switch
+                    // leaves the rest of the mux knobs editable.
+                    if n == Network::Xdrive
+                        && let Some(mux) = mux.as_deref_mut()
+                    {
+                        mux.enabled = true;
                     }
                     changed = true;
                 }
@@ -5467,9 +5522,13 @@ impl ServersScreen {
                                         ui,
                                         lang,
                                         download,
-                                        masque_outbound,
                                         depth + 1,
-                                        TransportTabCtx { target, masked },
+                                        TransportTabCtx {
+                                            target,
+                                            masked,
+                                            protocol,
+                                            mux: None,
+                                        },
                                     );
                                     changed |= self.security_tab_readonly(ui, lang, download);
                                 });
@@ -7156,17 +7215,22 @@ impl ServersScreen {
                                     )
                                 }
                                 EditorTab::Transport => {
-                                    let masque_outbound =
-                                        draft.profile.outbound.protocol == Protocol::Masque;
+                                    let OutboundModel {
+                                        protocol,
+                                        stream,
+                                        mux,
+                                        ..
+                                    } = &mut draft.profile.outbound;
                                     self.transport_tab(
                                         ui,
                                         lang,
-                                        &mut draft.profile.outbound.stream,
-                                        masque_outbound,
+                                        stream,
                                         0,
                                         TransportTabCtx {
                                             target: Some(target),
                                             masked: mask.secrets,
+                                            protocol: *protocol,
+                                            mux: Some(mux),
                                         },
                                     )
                                 }
@@ -10490,11 +10554,12 @@ Authentication: ML-KEM-768, Post-Quantum
                         ui,
                         Language::En,
                         &mut stream,
-                        false,
                         0,
                         TransportTabCtx {
                             target: draft_target(DraftKind::Existing, "0123456789abcdef", 1),
                             masked: false,
+                            protocol: Protocol::Vless,
+                            mux: None,
                         },
                     );
                 },
@@ -10530,11 +10595,12 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     &mut stream,
-                    false,
                     0,
                     TransportTabCtx {
                         target: None,
                         masked: false,
+                        protocol: Protocol::Vless,
+                        mux: None,
                     },
                 );
             });
@@ -10565,11 +10631,12 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     &mut stream,
-                    true,
                     0,
                     TransportTabCtx {
                         target: None,
                         masked: false,
+                        protocol: Protocol::Masque,
+                        mux: None,
                     },
                 );
             });
@@ -10588,6 +10655,91 @@ Authentication: ML-KEM-768, Post-Quantum
                 "a masque outbound must offer no other transport"
             );
         }
+    }
+
+    /// The transport selector offers xdrive only while the outbound protocol
+    /// is VLESS: every other protocol stays on the transport list the core
+    /// accepts for it.
+    #[test]
+    fn transport_selector_offers_xdrive_only_for_a_vless_outbound() {
+        for (protocol, offered) in [(Protocol::Vless, true), (Protocol::Trojan, false)] {
+            let mut stream = StreamModel {
+                network: Network::Raw,
+                ..Default::default()
+            };
+            let mut screen = ServersScreen::default();
+            let harness = Harness::new_ui(|ui| {
+                let _ = screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                        protocol,
+                        mux: None,
+                    },
+                );
+            });
+            assert_eq!(
+                harness
+                    .query_all_by_label_contains("xdrive")
+                    .next()
+                    .is_some(),
+                offered,
+                "{protocol:?}"
+            );
+        }
+    }
+
+    /// Selecting xdrive seeds Mux.Cool for the outbound, and the mux switch
+    /// stays the user's to change.
+    #[test]
+    fn selecting_xdrive_enables_the_outbound_mux() {
+        let mut stream = StreamModel::default();
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Vless,
+                    mux: Some(&mut mux),
+                },
+            );
+        });
+        harness.run();
+        harness.get_by_label("xdrive").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(stream.network, Network::Xdrive);
+        assert!(mux.enabled, "selecting xdrive seeds the mux switch");
+    }
+
+    /// Leaving VLESS while xdrive is selected resets the transport to raw and
+    /// tells the user why; the stored transport is only reset by this switch.
+    #[test]
+    fn leaving_vless_with_xdrive_resets_the_transport_with_a_note() {
+        let mut profile = ServerProfile::new("xdrive", OutboundModel::new(Protocol::Vless));
+        profile
+            .outbound
+            .stream
+            .select_network(Network::Xdrive)
+            .expect("xdrive needs no security mode");
+        profile.outbound.mux.enabled = true;
+        let mut screen = ServersScreen::default();
+        assert!(screen.switch_draft_protocol(&mut profile, Protocol::Freedom, Language::En));
+        assert_eq!(profile.outbound.protocol, Protocol::Freedom);
+        assert_eq!(profile.outbound.stream.network, Network::Raw);
+        let status = screen.status.as_ref().expect("the reset note must show");
+        assert_eq!(status.text, t(Language::En, Key::SrvXdriveResetToRaw));
+        assert!(!status.is_error);
     }
 
     /// The masque transport's options render as real widgets — host, path,
@@ -10612,11 +10764,12 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 &mut stream,
-                true,
                 0,
                 TransportTabCtx {
                     target: None,
                     masked: false,
+                    protocol: Protocol::Masque,
+                    mux: None,
                 },
             );
         });
@@ -10650,11 +10803,12 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 &mut stream,
-                false,
                 0,
                 TransportTabCtx {
                     target: None,
                     masked: false,
+                    protocol: Protocol::Vless,
+                    mux: None,
                 },
             );
         });
@@ -10741,11 +10895,12 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     &mut stream,
-                    false,
                     0,
                     TransportTabCtx {
                         target: None,
                         masked: false,
+                        protocol: Protocol::Vless,
+                        mux: None,
                     },
                 );
             });
@@ -10780,11 +10935,16 @@ Authentication: ML-KEM-768, Post-Quantum
                         ui,
                         Language::En,
                         &mut stream,
-                        network == Network::Masque,
                         0,
                         TransportTabCtx {
                             target: None,
                             masked: false,
+                            protocol: if network == Network::Masque {
+                                Protocol::Masque
+                            } else {
+                                Protocol::Vless
+                            },
+                            mux: None,
                         },
                     );
                 });
@@ -11563,11 +11723,12 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     &mut stream,
-                    false,
                     0,
                     TransportTabCtx {
                         target: None,
                         masked: false,
+                        protocol: Protocol::Vless,
+                        mux: None,
                     },
                 );
             });
@@ -15269,11 +15430,12 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 &mut stream_for_ui.borrow_mut(),
-                false,
                 0,
                 TransportTabCtx {
                     target: None,
                     masked: false,
+                    protocol: Protocol::Vless,
+                    mux: None,
                 },
             );
         });

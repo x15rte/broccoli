@@ -1365,6 +1365,15 @@ keys! {
     SrvXdriveTokenUrlRequired 0,
     SrvXdriveHeaderValues 0,
     SrvXdriveScalarClamped 0,
+    SrvXdriveRequiresVless 0,
+    SrvXdriveVlessFlow 0,
+    SrvXdriveVlessEncryption 0,
+    SrvXdriveMuxRequired 0,
+    SrvXdriveMuxConcurrencyNegative 0,
+    SrvXdriveMuxXudpSkip 0,
+    SrvXdriveTestpre 0,
+    SrvXdriveDriveRenamed 0,
+    SrvXdriveResetToRaw 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
     SrvMasterKeyLogNotSupported 0,
@@ -2517,6 +2526,14 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XdriveTemplateTokenUrlRequired => t(lang, Key::SrvXdriveTokenUrlRequired),
         XdriveTemplateHeaderValuesNotStrings => t(lang, Key::SrvXdriveHeaderValues),
         XdriveScalarClamped => t(lang, Key::SrvXdriveScalarClamped),
+        XdriveRequiresVless => t(lang, Key::SrvXdriveRequiresVless),
+        XdriveVlessFlowUnsupported => t(lang, Key::SrvXdriveVlessFlow),
+        XdriveVlessEncryptionRequired => t(lang, Key::SrvXdriveVlessEncryption),
+        XdriveMuxRequired => t(lang, Key::SrvXdriveMuxRequired),
+        XdriveMuxConcurrencyNegative => t(lang, Key::SrvXdriveMuxConcurrencyNegative),
+        XdriveMuxXudpProxyUdp443Skip => t(lang, Key::SrvXdriveMuxXudpSkip),
+        XdriveVlessTestpreUnsupported => t(lang, Key::SrvXdriveTestpre),
+        XdriveDriveServiceRenamed => t(lang, Key::SrvXdriveDriveRenamed),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -4395,6 +4412,25 @@ mod en {
             Key::SrvXdriveHeaderValues => "Template header and form values must be strings",
             Key::SrvXdriveScalarClamped => {
                 "The core overrides this value while it builds the transport"
+            }
+            Key::SrvXdriveRequiresVless => "The xdrive transport can only be used by VLESS",
+            Key::SrvXdriveVlessFlow => "The xdrive transport does not support a VLESS flow",
+            Key::SrvXdriveVlessEncryption => {
+                "The xdrive transport needs VLESS encryption. Use Generate in the VLESS settings."
+            }
+            Key::SrvXdriveMuxRequired => "The xdrive transport needs mux enabled",
+            Key::SrvXdriveMuxConcurrencyNegative => {
+                "The xdrive transport needs mux and XUDP concurrency of zero or more"
+            }
+            Key::SrvXdriveMuxXudpSkip => {
+                "The xdrive transport does not support xudpProxyUDP443 \"skip\""
+            }
+            Key::SrvXdriveTestpre => "The xdrive transport does not support VLESS testpre",
+            Key::SrvXdriveDriveRenamed => {
+                "The \"Google Drive\" service was renamed. The profile is saved as \"google-drive\"."
+            }
+            Key::SrvXdriveResetToRaw => {
+                "The xdrive transport is VLESS-only. Switching protocol reset the transport to raw."
             }
             Key::SrvStreamOneNoDownload => "stream-one cannot use downloadSettings",
             Key::SrvDownloadNestingExceeds => {

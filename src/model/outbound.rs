@@ -976,6 +976,18 @@ fn vless_encryption_padding_supported(tokens: &[&str]) -> bool {
     total <= 65553
 }
 
+/// What a protocol switch did to the transport beyond the protocol field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProtocolSwitch {
+    /// The transport stays as it was.
+    #[default]
+    None,
+    /// The profile left VLESS while xdrive was selected. xdrive is VLESS-only,
+    /// so the transport was reset to the raw default; the editor surfaces the
+    /// note this value stands for.
+    XdriveReset,
+}
+
 impl OutboundModel {
     pub fn new(p: Protocol) -> Self {
         let mut model = Self {
@@ -1009,15 +1021,21 @@ impl OutboundModel {
         self.stream.sockopt = Some(sockopt);
     }
 
-    /// Switch protocol and normalize the transport state that Hysteria2 and
-    /// MASQUE own.
-    pub fn select_protocol(&mut self, protocol: Protocol) {
+    /// Switch protocol and normalize the transport state that Hysteria2,
+    /// MASQUE and xdrive own. The transport is never rewritten on load: only
+    /// this explicit switch resets xdrive, and only when the profile leaves
+    /// VLESS.
+    #[must_use = "the switch reports an xdrive reset the editor must surface"]
+    pub fn select_protocol(&mut self, protocol: Protocol) -> ProtocolSwitch {
         let leaving_hysteria = self.protocol == Protocol::Hysteria
             || self.stream.network == super::stream::Network::Hysteria;
         let leaving_masque = self.protocol == Protocol::Masque
             || self.stream.network == super::stream::Network::Masque;
+        let leaving_vless_with_xdrive = self.protocol == Protocol::Vless
+            && self.stream.network == super::stream::Network::Xdrive;
         self.protocol = protocol;
         self.settings = ProtocolSettings::default_for(protocol);
+        let mut switched = ProtocolSwitch::None;
         if protocol == Protocol::Hysteria {
             let _ = self.stream.select_network(super::stream::Network::Hysteria);
         } else if protocol == Protocol::Masque {
@@ -1030,8 +1048,14 @@ impl OutboundModel {
             self.stream.network = super::stream::Network::Raw;
             self.stream.raw_settings = None;
             self.stream.masque_settings = None;
+        } else if leaving_vless_with_xdrive && protocol != Protocol::Vless {
+            self.stream.network = super::stream::Network::Raw;
+            self.stream.raw_settings = None;
+            self.stream.xdrive_settings = None;
+            switched = ProtocolSwitch::XdriveReset;
         }
         self.enforce_invariants();
+        switched
     }
 
     /// Keep protocol/transport/security combinations executable by Xray.
@@ -1452,7 +1476,7 @@ mod tests {
     #[test]
     fn protocol_transition_enters_and_leaves_hysteria_consistently() {
         let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.select_protocol(Protocol::Hysteria);
+        let _ = outbound.select_protocol(Protocol::Hysteria);
         assert_eq!(outbound.protocol, Protocol::Hysteria);
         assert_eq!(outbound.stream.network, Network::Hysteria);
         assert_eq!(outbound.stream.security, Security::Tls);
@@ -1465,7 +1489,7 @@ mod tests {
             Some(2)
         );
 
-        outbound.select_protocol(Protocol::Trojan);
+        let _ = outbound.select_protocol(Protocol::Trojan);
         assert_eq!(outbound.protocol, Protocol::Trojan);
         assert_eq!(outbound.stream.network, Network::Raw);
         assert_eq!(outbound.stream.security, Security::Tls);
@@ -1537,14 +1561,50 @@ mod tests {
     #[test]
     fn masque_protocol_transition_arms_and_leaves_the_transport() {
         let mut outbound = OutboundModel::new(Protocol::Vless);
-        outbound.select_protocol(Protocol::Masque);
+        let _ = outbound.select_protocol(Protocol::Masque);
         assert_eq!(outbound.stream.network, Network::Masque);
         assert_eq!(outbound.stream.security, Security::Tls);
         assert!(outbound.stream.masque_settings.is_some());
 
-        outbound.select_protocol(Protocol::Vless);
+        let _ = outbound.select_protocol(Protocol::Vless);
         assert_eq!(outbound.stream.network, Network::Raw);
         assert!(outbound.stream.masque_settings.is_none());
+    }
+
+    /// Leaving VLESS with xdrive selected resets the transport to the raw
+    /// default and reports the note; switching between two other protocols
+    /// leaves a stored xdrive block exactly as loaded.
+    #[test]
+    fn protocol_switch_resets_xdrive_only_when_leaving_vless() {
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        let _ = outbound
+            .stream
+            .select_network(crate::model::stream::Network::Xdrive);
+        assert_eq!(
+            outbound.select_protocol(Protocol::Trojan),
+            super::ProtocolSwitch::XdriveReset
+        );
+        assert_eq!(outbound.protocol, Protocol::Trojan);
+        assert_eq!(outbound.stream.network, Network::Raw);
+        assert!(outbound.stream.raw_settings.is_none());
+        assert!(outbound.stream.xdrive_settings.is_none());
+
+        // A stored freedom+xdrive profile keeps its transport when the
+        // protocol moves to another non-VLESS one: only leaving VLESS resets.
+        let mut stored: OutboundModel = serde_json::from_value(json!({
+            "protocol": "freedom",
+            "streamSettings": {
+                "network": "xdrive",
+                "xdriveSettings": {"service": "local", "remoteFolder": "C:/store"}
+            }
+        }))
+        .expect("the stored profile loads");
+        assert_eq!(
+            stored.select_protocol(Protocol::Trojan),
+            super::ProtocolSwitch::None
+        );
+        assert_eq!(stored.stream.network, crate::model::stream::Network::Xdrive);
+        assert!(stored.stream.xdrive_settings.is_some());
     }
 
     /// The masque transport refuses a nont-TLS security mode through the
@@ -2535,5 +2595,67 @@ mod tests {
                 "{carried:?} must be stripped from the wire"
             );
         }
+    }
+
+    /// The retired Drive service spelling loads, warns once naming the
+    /// replacement, and is saved in the current spelling.
+    #[test]
+    fn retired_drive_service_migrates_on_load_and_saves_the_current_spelling() {
+        use crate::model::stream::{XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED};
+        use crate::model::validation::{ValidationCode, validate_outbound};
+
+        assert_eq!(XDRIVE_SERVICE_DRIVE_RETIRED, "Google Drive");
+        let stored = json!({
+            "protocol": "vless",
+            "settings": {
+                "address": "drive.example.com",
+                "port": 443,
+                "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                "encryption": "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+            },
+            "mux": {"enabled": true},
+            "streamSettings": {
+                "network": "xdrive",
+                "xdriveSettings": {
+                    "service": "Google Drive",
+                    "remoteFolder": "drive-folder-id",
+                    "secrets": ["client-id", "client-secret", "refresh-token"]
+                }
+            }
+        });
+        let outbound: OutboundModel =
+            serde_json::from_value(stored).expect("the stored profile still loads");
+        let xdrive = outbound
+            .stream
+            .xdrive_settings
+            .as_ref()
+            .expect("the profile carries its xdrive block");
+        assert_eq!(xdrive.service, XDRIVE_SERVICE_DRIVE);
+
+        let issues = validate_outbound(&outbound);
+        let issue = issues
+            .iter()
+            .find(|issue| issue.code == ValidationCode::XdriveDriveServiceRenamed)
+            .unwrap_or_else(|| panic!("the migration must warn: {issues:#?}"));
+        assert_eq!(issue.severity, crate::model::validation::Severity::Warning);
+        assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.service"));
+        assert!(!issues.has_blocking(), "{issues:#?}");
+
+        let saved = serde_json::to_value(&outbound).expect("the profile serializes");
+        assert_eq!(
+            saved["streamSettings"]["xdriveSettings"]["service"],
+            XDRIVE_SERVICE_DRIVE
+        );
+        assert!(
+            saved["streamSettings"]["xdriveSettings"]
+                .get("retiredDriveService")
+                .is_none(),
+            "the migration marker never reaches the file: {saved}"
+        );
+        let wire = outbound.to_wire("srv-01234567");
+        assert_eq!(
+            wire["streamSettings"]["xdriveSettings"]["service"], XDRIVE_SERVICE_DRIVE,
+            "the generated document carries the current spelling"
+        );
     }
 }

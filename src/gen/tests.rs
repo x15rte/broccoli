@@ -1301,15 +1301,31 @@ fn golden_masque() {
     );
 }
 
+/// The outbound shape the core's xdrive gate accepts: a VLESS account with
+/// encryption and Mux.Cool, which the transport needs for every connection.
+fn xdrive_vless_outbound() -> OutboundModel {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    let ProtocolSettings::Vless(account) = &mut ob.settings else {
+        unreachable!("a VLESS outbound carries VLESS settings");
+    };
+    account.address = "xdrive.example.com".into();
+    account.port = 443;
+    account.id = "11111111-2222-3333-4444-555555555555".into();
+    account.encryption =
+        "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
+    ob.mux.enabled = true;
+    ob.stream
+        .select_network(Network::Xdrive)
+        .expect("xdrive needs no security mode");
+    ob
+}
+
 /// An xdrive transport over the local backend: the service discriminator,
 /// the folder the runtime writes to on this machine, and the scalars it
 /// reads, as the pinned core accepts the document.
 #[test]
 fn golden_xdrive_local() {
-    let mut ob = OutboundModel::new(Protocol::Freedom);
-    ob.stream
-        .select_network(Network::Xdrive)
-        .expect("xdrive needs no security mode");
+    let mut ob = xdrive_vless_outbound();
     {
         let xdrive = ob
             .stream
@@ -1335,19 +1351,19 @@ fn golden_xdrive_local() {
 
 /// An xdrive transport over Google Drive: the three secrets in their
 /// documented order and the Drive folder id, as the pinned core accepts them.
+/// The fixture states the retired spelling because older cores accept only
+/// that one; the model migrates a stored spelling on load and saves the
+/// current one.
 #[test]
 fn golden_xdrive_drive() {
-    let mut ob = OutboundModel::new(Protocol::Freedom);
-    ob.stream
-        .select_network(Network::Xdrive)
-        .expect("xdrive needs no security mode");
+    let mut ob = xdrive_vless_outbound();
     {
         let xdrive = ob
             .stream
             .xdrive_settings
             .as_mut()
             .expect("selecting xdrive materializes its block");
-        xdrive.service = "Google Drive".into();
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE_RETIRED.into();
         xdrive.remote_folder = "drive-folder-id".into();
         xdrive.secrets = vec![
             "client-id".into(),
@@ -1366,10 +1382,7 @@ fn golden_xdrive_drive() {
 /// runtime unmarshals, and the pinned core accepts the document.
 #[test]
 fn golden_xdrive_template() {
-    let mut ob = OutboundModel::new(Protocol::Freedom);
-    ob.stream
-        .select_network(Network::Xdrive)
-        .expect("xdrive needs no security mode");
+    let mut ob = xdrive_vless_outbound();
     {
         let xdrive = ob
             .stream

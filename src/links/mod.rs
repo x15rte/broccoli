@@ -6454,6 +6454,14 @@ mod tests {
             .stream
             .select_network(Network::Xdrive)
             .expect("xdrive needs no security mode");
+        if let crate::model::ProtocolSettings::Vless(settings) = &mut xdrive.outbound.settings {
+            settings.encryption =
+                "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
+        }
+        // The xdrive gate requires mux, and mux is local-only: export meets
+        // that loss before the transport row's own refusal, which the
+        // unshareable-transport table pins directly.
+        xdrive.outbound.mux.enabled = true;
         {
             let xdrive = xdrive
                 .outbound
@@ -6465,19 +6473,25 @@ mod tests {
             xdrive.remote_folder = "xdrive-store".into();
         }
 
-        for (profile, key) in [
-            (hysteria.profile, Key::LinkUnsupportedHysteria),
-            (xdrive.profile, Key::LinkUnsupportedXdrive),
-        ] {
-            match to_link(&profile) {
-                Err(LinkError::Unsupported(message)) => {
-                    assert_eq!(message.text(Language::En), t_fmt(Language::En, key, &[]));
-                }
-                other => panic!(
-                    "expected Unsupported({key:?}), got {}",
-                    outcome_shape(&other)
-                ),
-            }
+        match to_link(&hysteria.profile) {
+            Err(LinkError::Unsupported(message)) => assert_eq!(
+                message.text(Language::En),
+                t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[])
+            ),
+            other => panic!(
+                "expected Unsupported(LinkUnsupportedHysteria), got {}",
+                outcome_shape(&other)
+            ),
+        }
+        match to_link(&xdrive.profile) {
+            Err(LinkError::Lossy(message)) => assert_eq!(
+                message.text(Language::En),
+                t_fmt(Language::En, Key::LinkLossyMux, &[&"mux"])
+            ),
+            other => panic!(
+                "expected Lossy(LinkLossyMux), got {}",
+                outcome_shape(&other)
+            ),
         }
 
         // MASQUE carries no share format either, but a masque profile is

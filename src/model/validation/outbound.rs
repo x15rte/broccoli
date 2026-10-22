@@ -24,9 +24,9 @@ use crate::model::outbound::{
 use crate::model::stream::{
     Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
-    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_TEMPLATE,
-    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, xdrive_names_regex_supported,
-    xdrive_service_supported, xdrive_template_auth_type_supported,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL,
+    XDRIVE_SERVICE_TEMPLATE, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate,
+    xdrive_names_regex_supported, xdrive_service_supported, xdrive_template_auth_type_supported,
 };
 use crate::model::{fold_eq, go_std_base64_decodes, parse_range_go, vocabulary_holds};
 use base64::Engine as _;
@@ -542,9 +542,19 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
     let Some(xdrive) = stream.xdrive_settings.as_ref() else {
         return;
     };
+    let retired_drive_service =
+        xdrive.retired_drive_service || xdrive.service == XDRIVE_SERVICE_DRIVE_RETIRED;
     if xdrive.service.is_empty() {
         issues.push(issue(
             ValidationCode::XdriveServiceMissing,
+            Some("stream.xdriveSettings.service".into()),
+        ));
+    } else if retired_drive_service {
+        // A stored profile reaches this point already migrated; a block built
+        // in memory still names the old spelling. Both warn and are emitted
+        // (or saved) in the current spelling.
+        issues.push(warning(
+            ValidationCode::XdriveDriveServiceRenamed,
             Some("stream.xdriveSettings.service".into()),
         ));
     } else if !xdrive_service_supported(&xdrive.service) {
@@ -554,7 +564,7 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
         ));
     }
     match xdrive.service.as_str() {
-        XDRIVE_SERVICE_DRIVE => {
+        XDRIVE_SERVICE_DRIVE | XDRIVE_SERVICE_DRIVE_RETIRED => {
             if xdrive.secrets.len() != 3 || xdrive.secrets.iter().any(String::is_empty) {
                 issues.push(issue(
                     ValidationCode::XdriveDriveSecretsInvalid,
@@ -667,6 +677,79 @@ fn validate_xdrive_template(template: &XdriveTemplate, issues: &mut Vec<Validati
         issues.push(warning(
             ValidationCode::XdriveScalarClamped,
             Some("stream.xdriveSettings.template.concurrency".into()),
+        ));
+    }
+}
+
+/// The core's outbound gate for the `xdrive` transport
+/// (`validateXDrive`, infra/conf/xray.go:272-316, called from the outbound
+/// build at :398): the account must be VLESS without `flow` or `testpre`,
+/// with an `encryption` value, and — unless it is a reverse-proxy account,
+/// which opens its own mux — Mux.Cool enabled with non-negative knobs and
+/// `xudpProxyUDP443` other than `skip`. Each violation is its own finding so
+/// the editor can name the field to fix.
+pub(super) fn validate_xdrive_outbound(o: &OutboundModel, issues: &mut Vec<ValidationIssue>) {
+    if o.stream.network != Network::Xdrive {
+        return;
+    }
+    let ProtocolSettings::Vless(settings) = &o.settings else {
+        issues.push(issue(
+            ValidationCode::XdriveRequiresVless,
+            Some("protocol".into()),
+        ));
+        return;
+    };
+    if !settings.flow.is_empty() {
+        issues.push(issue(
+            ValidationCode::XdriveVlessFlowUnsupported,
+            Some("settings.flow".into()),
+        ));
+    }
+    if matches!(settings.encryption.as_str(), "" | "none") {
+        issues.push(issue(
+            ValidationCode::XdriveVlessEncryptionRequired,
+            Some("settings.encryption".into()),
+        ));
+    }
+    // `reverse` is the core's own exemption: the reverse connection opens a
+    // mux of its own, so the mux knobs are not the transport's.
+    if settings.reverse.is_none() {
+        if !o.mux.enabled {
+            issues.push(issue(
+                ValidationCode::XdriveMuxRequired,
+                Some("mux.enabled".into()),
+            ));
+        }
+        if o.mux.concurrency.is_some_and(|value| value < 0) {
+            issues.push(issue(
+                ValidationCode::XdriveMuxConcurrencyNegative,
+                Some("mux.concurrency".into()),
+            ));
+        }
+        if o.mux.xudp_concurrency.is_some_and(|value| value < 0) {
+            issues.push(issue(
+                ValidationCode::XdriveMuxConcurrencyNegative,
+                Some("mux.xudpConcurrency".into()),
+            ));
+        }
+        if o.mux.xudp_proxy_udp443.as_deref() == Some("skip") {
+            issues.push(issue(
+                ValidationCode::XdriveMuxXudpProxyUdp443Skip,
+                Some("mux.xudpProxyUDP443".into()),
+            ));
+        }
+    }
+    // `testpre` has no editor and no model field: only a hand-edited or
+    // imported `settings` object can carry it. Go binds it as a `uint32`, so
+    // `null` is the zero a missing key leaves and `0` is the allowed value;
+    // any other shape is either non-zero or a load error the core refuses.
+    let testpre_set = settings.extra.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("testpre") && !value.is_null() && value.as_u64() != Some(0)
+    });
+    if testpre_set {
+        issues.push(issue(
+            ValidationCode::XdriveVlessTestpreUnsupported,
+            Some("settings.testpre".into()),
         ));
     }
 }
@@ -1222,6 +1305,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     }
 
     validate_masque(o, &mut issues);
+    validate_xdrive_outbound(o, &mut issues);
     issues.extend(validate_stream(&o.stream));
     Verdict::from_issues(issues)
 }
@@ -1671,10 +1755,20 @@ mod tests {
         );
     }
 
-    /// An xdrive outbound on the given settings, over a protocol with no
-    /// required fields of its own so the transport findings stand alone.
+    /// An xdrive outbound on the given settings, in the one protocol and
+    /// account shape the core's gate accepts, so the transport findings
+    /// stand alone.
     fn xdrive_outbound(settings: XdriveTransport) -> OutboundModel {
-        let mut outbound = OutboundModel::new(Protocol::Freedom);
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        let ProtocolSettings::Vless(account) = &mut outbound.settings else {
+            unreachable!("a VLESS outbound carries VLESS settings");
+        };
+        account.address = "xdrive.example.com".into();
+        account.port = 443;
+        account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+        account.encryption =
+            "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
+        outbound.mux.enabled = true;
         outbound.stream.network = Network::Xdrive;
         outbound.stream.xdrive_settings = Some(Box::new(settings));
         outbound
@@ -1913,6 +2007,157 @@ mod tests {
             ..Default::default()
         }));
         assert!(paths.is_empty(), "{paths:#?}");
+    }
+
+    /// A stored freedom outbound carrying xdrive is refused by the core's
+    /// gate, and the load leaves the stored protocol and transport exactly as
+    /// written: the user decides how to change the protocol.
+    #[test]
+    fn xdrive_transport_requires_vless_and_never_rewrites_a_stored_profile() {
+        let stored = json!({
+            "protocol": "freedom",
+            "settings": {},
+            "streamSettings": {
+                "network": "xdrive",
+                "xdriveSettings": {
+                    "service": "local",
+                    "remoteFolder": "C:/store"
+                }
+            }
+        });
+        let outbound: OutboundModel = serde_json::from_value(stored.clone())
+            .expect("a stored freedom+xdrive profile still loads");
+        let verdict = validate_outbound(&outbound);
+        let issue = finding(&verdict, &ValidationCode::XdriveRequiresVless)
+            .expect("the core's non-VLESS refusal must gate the profile");
+        assert_eq!(issue.severity, Severity::Error);
+        assert_eq!(issue.path.as_deref(), Some("protocol"));
+        assert_eq!(
+            serde_json::to_value(&outbound).expect("the profile serializes"),
+            stored,
+            "the stored protocol and transport must not be rewritten"
+        );
+    }
+
+    /// The gate's account rules: a flow, an empty or `none` encryption, and a
+    /// non-zero testpre are each refused by the field the core names.
+    #[test]
+    fn xdrive_vless_account_rules_gate_flow_encryption_and_testpre() {
+        let mut flow = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            remote_folder: "C:/store".into(),
+            ..Default::default()
+        });
+        let ProtocolSettings::Vless(account) = &mut flow.settings else {
+            unreachable!();
+        };
+        account.flow = "xtls-rprx-vision".into();
+        let verdict = validate_outbound(&flow);
+        let issue = finding(&verdict, &ValidationCode::XdriveVlessFlowUnsupported)
+            .expect("a VLESS flow is refused");
+        assert_eq!(issue.path.as_deref(), Some("settings.flow"));
+
+        for encryption in ["", "none"] {
+            let mut outbound = xdrive_outbound(XdriveTransport {
+                service: super::XDRIVE_SERVICE_LOCAL.into(),
+                remote_folder: "C:/store".into(),
+                ..Default::default()
+            });
+            let ProtocolSettings::Vless(account) = &mut outbound.settings else {
+                unreachable!();
+            };
+            account.encryption = encryption.into();
+            let verdict = validate_outbound(&outbound);
+            let issue = finding(&verdict, &ValidationCode::XdriveVlessEncryptionRequired)
+                .unwrap_or_else(|| panic!("encryption {encryption:?} must be refused"));
+            assert_eq!(issue.path.as_deref(), Some("settings.encryption"));
+        }
+
+        let mut testpre = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            remote_folder: "C:/store".into(),
+            ..Default::default()
+        });
+        let ProtocolSettings::Vless(account) = &mut testpre.settings else {
+            unreachable!();
+        };
+        account.extra.insert("testpre".into(), json!(1));
+        let verdict = validate_outbound(&testpre);
+        let issue = finding(&verdict, &ValidationCode::XdriveVlessTestpreUnsupported)
+            .expect("a non-zero testpre is refused");
+        assert_eq!(issue.path.as_deref(), Some("settings.testpre"));
+
+        // Zero and an absent key are the core's own default.
+        let ProtocolSettings::Vless(account) = &mut testpre.settings else {
+            unreachable!();
+        };
+        account.extra.insert("testpre".into(), json!(0));
+        let verdict = validate_outbound(&testpre);
+        assert!(finding(&verdict, &ValidationCode::XdriveVlessTestpreUnsupported).is_none());
+    }
+
+    /// Mux.Cool is required for the transport unless the account is a
+    /// reverse-proxy account, and the three knob refusals are each reported
+    /// against the field that carries the value.
+    #[test]
+    fn xdrive_mux_gate_requires_enabled_non_negative_knobs_without_skip() {
+        let local = || XdriveTransport {
+            service: super::XDRIVE_SERVICE_LOCAL.into(),
+            remote_folder: "C:/store".into(),
+            ..Default::default()
+        };
+
+        let mut disabled = xdrive_outbound(local());
+        disabled.mux.enabled = false;
+        let verdict = validate_outbound(&disabled);
+        let issue =
+            finding(&verdict, &ValidationCode::XdriveMuxRequired).expect("disabled mux is refused");
+        assert_eq!(issue.path.as_deref(), Some("mux.enabled"));
+
+        let mut reverse = xdrive_outbound(local());
+        reverse.mux.enabled = false;
+        let ProtocolSettings::Vless(account) = &mut reverse.settings else {
+            unreachable!();
+        };
+        account.reverse = Some(crate::model::outbound::VlessReverse {
+            tag: "reverse".into(),
+            ..Default::default()
+        });
+        let verdict = validate_outbound(&reverse);
+        assert!(
+            finding(&verdict, &ValidationCode::XdriveMuxRequired).is_none(),
+            "a reverse account opens its own mux"
+        );
+
+        let mut negative = xdrive_outbound(local());
+        negative.mux.concurrency = Some(-1);
+        negative.mux.xudp_concurrency = Some(-1);
+        let issues = validate_outbound(&negative);
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.code == ValidationCode::XdriveMuxConcurrencyNegative)
+                .count(),
+            2,
+            "{issues:#?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.path.as_deref() == Some("mux.concurrency"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.path.as_deref() == Some("mux.xudpConcurrency"))
+        );
+
+        let mut skip = xdrive_outbound(local());
+        skip.mux.xudp_proxy_udp443 = Some("skip".into());
+        let verdict = validate_outbound(&skip);
+        let issue = finding(&verdict, &ValidationCode::XdriveMuxXudpProxyUdp443Skip)
+            .expect("the skip mode is refused");
+        assert_eq!(issue.path.as_deref(), Some("mux.xudpProxyUDP443"));
     }
 
     /// An interval hop mode moves the outbound's socket, so only a transport

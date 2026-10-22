@@ -527,10 +527,13 @@ impl MasqueTransport {
 /// `xdriveSettings.service` — the transport's discriminator; the value is
 /// matched exactly by the core's conf build (`infra/conf/transport_method.go:
 /// 876-887`) and decides what `remoteFolder` means and which backend rules
-/// apply. `Google Drive` keeps its space and capitalization: the core
-/// compares the literal string.
+/// apply. The current spelling has no space; the core still reads the retired
+/// `Google Drive` spelling with a deprecation warning, and the persisted
+/// model migrates it on load (see [`XdriveTransport::migrate_retired_drive_service`]).
 pub const XDRIVE_SERVICE_LOCAL: &str = "local";
-pub const XDRIVE_SERVICE_DRIVE: &str = "Google Drive";
+pub const XDRIVE_SERVICE_DRIVE: &str = "google-drive";
+/// The retired `Google Drive` spelling the core still accepts.
+pub const XDRIVE_SERVICE_DRIVE_RETIRED: &str = "Google Drive";
 pub const XDRIVE_SERVICE_TEMPLATE: &str = "template";
 pub const XDRIVE_SERVICES: &[&str] = &[
     XDRIVE_SERVICE_LOCAL,
@@ -871,8 +874,42 @@ pub struct XdriveTransport {
     /// the service without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<XdriveTemplate>,
+    /// True when a stored profile carried the retired `Google Drive`
+    /// spelling and the load migrated it in memory. Never serialized: the
+    /// save writes the current spelling.
+    #[serde(skip)]
+    pub retired_drive_service: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl XdriveTransport {
+    /// Migrate a stored `Google Drive` service to the current spelling at the
+    /// persisted model's load boundary and remember that it happened, so the
+    /// validation pass can warn once. A profile that already carries the
+    /// current spelling is untouched.
+    pub(crate) fn migrate_retired_drive_service(&mut self) {
+        if self.service == XDRIVE_SERVICE_DRIVE_RETIRED {
+            self.service = XDRIVE_SERVICE_DRIVE.to_string();
+            self.retired_drive_service = true;
+        }
+    }
+}
+
+/// Load an xdrive block through the retired-spelling migration: the settings
+/// file is the only surface that carries it, and the saved value is the
+/// current one.
+fn deserialize_xdrive_settings<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<XdriveTransport>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let settings = Option::<XdriveTransport>::deserialize(deserializer)?;
+    Ok(settings.map(|mut settings| {
+        settings.migrate_retired_drive_service();
+        Box::new(settings)
+    }))
 }
 
 // ---------- TLS (transport_security.go:300-329) — allowInsecure is REMOVED ----------
@@ -2324,7 +2361,10 @@ pub struct StreamModel {
     /// template with four operations), and `StreamModel` is embedded in every
     /// profile and future, so the block lives on the heap; the model type and
     /// the wire shape are unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_xdrive_settings"
+    )]
     pub xdrive_settings: Option<Box<XdriveTransport>>,
     #[serde(skip_serializing_if = "Security::is_none")]
     pub security: Security,
@@ -4161,6 +4201,7 @@ mod tests {
                 extra: Map::new(),
             }),
             extra: Map::new(),
+            ..Default::default()
         };
         let wire = serde_json::to_value(&settings).expect("the block serializes");
         assert_eq!(wire["remoteFolder"], json!("folder"));

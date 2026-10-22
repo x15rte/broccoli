@@ -1002,6 +1002,46 @@ pub enum ValidationCode {
     /// (params.go:65-67). The value is legal and the core silently rewrites
     /// it, so the rule advises instead of gating.
     XdriveScalarClamped,
+    /// The `xdrive` transport on any outbound whose protocol is not VLESS:
+    /// the core's outbound build refuses every other account type
+    /// (`the xdrive transport can only be used by VLESS`,
+    /// infra/conf/xray.go:315). Error tier.
+    XdriveRequiresVless,
+    /// An xdrive VLESS outbound with a non-empty `flow`: the core refuses it
+    /// (`the xdrive transport doesn't support VLESS "flow"`,
+    /// infra/conf/xray.go:284-286). Error tier.
+    XdriveVlessFlowUnsupported,
+    /// An xdrive VLESS outbound without a usable `encryption`: the core
+    /// refuses the empty and `none` spellings and points at `xray vlessenc`
+    /// (`the xdrive transport needs VLESS "encryption"`,
+    /// infra/conf/xray.go:287-289). The editor's Generate action runs that
+    /// command. Error tier.
+    XdriveVlessEncryptionRequired,
+    /// An xdrive VLESS outbound with Mux.Cool disabled: the core refuses it
+    /// because the transport needs one mux connection
+    /// (`the xdrive transport needs "mux" enabled`, infra/conf/xray.go:
+    /// 290-293). A reverse-proxy account is exempt because it opens its own
+    /// mux (the core's `account.Reverse == nil` guard). Error tier.
+    XdriveMuxRequired,
+    /// An xdrive VLESS outbound with a negative `mux.concurrency` or
+    /// `mux.xudpConcurrency`: the core refuses both (infra/conf/xray.go:
+    /// 290-293). One rule; the path names the offending field. Error tier.
+    XdriveMuxConcurrencyNegative,
+    /// An xdrive VLESS outbound with `mux.xudpProxyUDP443` set to `skip`:
+    /// the core refuses that mode for the transport
+    /// (infra/conf/xray.go:290-293). Error tier.
+    XdriveMuxXudpProxyUdp443Skip,
+    /// An xdrive VLESS outbound with a non-zero `testpre`: the core refuses
+    /// it (`the xdrive transport doesn't support VLESS "testpre"`,
+    /// infra/conf/xray.go:294-296). The field is not modeled and survives
+    /// only in a hand-edited `settings.extra`. Error tier.
+    XdriveVlessTestpreUnsupported,
+    /// Configuration warning (Severity::Warning): the stored profile carries
+    /// the retired `Google Drive` service spelling. It is migrated to
+    /// `google-drive` on load and saved in the current spelling; the warning
+    /// names the replacement for the one session that still sees the stored
+    /// value.
+    XdriveDriveServiceRenamed,
 
     // ---- draft requirements ----
     //
