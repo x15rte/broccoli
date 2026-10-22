@@ -596,6 +596,8 @@ keys! {
     DnsAddress 0,
     DnsAddressHint 0,
     DnsAddressRequired 0,
+    DnsId 0,
+    DnsIdHint 0,
     DnsPort 0,
     DnsDomains 0,
     DnsDomainsHint 0,
@@ -766,6 +768,7 @@ keys! {
     GeodataModifiedUnavailable 0,
     GeodataSearch 0,
     GeodataNoMatches 0,
+    RoutingGeoTagAbsent 1,
     RuntimeStateRefreshed 0,
     RuntimeOverrideTitle 0,
     RuntimeOverrideEphemeral 0,
@@ -3394,6 +3397,8 @@ mod en {
                 "1.1.1.1, https://dns.google/dns-query, quic+local://, tcp://, hosts path, fakedns"
             }
             Key::DnsAddressRequired => "DNS server address is required",
+            Key::DnsId => "ID",
+            Key::DnsIdHint => "name this server for a DNS script",
             Key::DnsPort => "Port",
             Key::DnsDomains => "Domains",
             Key::DnsDomainsHint => "route matching domains to this server",
@@ -3605,6 +3610,9 @@ mod en {
             Key::GeodataModifiedUnavailable => "unavailable",
             Key::GeodataSearch => "Search codes…",
             Key::GeodataNoMatches => "No matching codes.",
+            Key::RoutingGeoTagAbsent => {
+                "The loaded geo data does not carry {}. This condition matches nothing."
+            }
             Key::RuntimeStateRefreshed => "Runtime state refreshed.",
             Key::RuntimeOverrideTitle => "Runtime override",
             Key::RuntimeOverrideEphemeral => {

@@ -397,6 +397,13 @@ fn server_editor(ui: &mut Ui, lang: Language, srv: &mut DnsServer, idx: usize) -
         .num_columns(2)
         .spacing([16.0, 4.0])
         .show(ui, |ui| {
+            changed |= widgets::text_field(
+                ui,
+                t(lang, Key::DnsId),
+                &mut srv.id,
+                t(lang, Key::DnsIdHint),
+            );
+            ui.end_row();
             changed |= widgets::validated_field(
                 ui,
                 t(lang, Key::DnsAddress),
@@ -658,8 +665,8 @@ fn opt_u16(ui: &mut Ui, lang: Language, label: &str, v: &mut Option<u16>) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        DnsScreen, Language, new_dns_server, new_pool_suggestion, parse_timeout_ms,
-        remap_swapped_index, row_caption, timeout_editor,
+        DnsScreen, DnsServer, Language, new_dns_server, new_pool_suggestion, parse_timeout_ms,
+        remap_swapped_index, row_caption, server_editor, timeout_editor,
     };
     use crate::model::FakeDnsCfg;
     use crate::ui::test_rig::UiTestRig;
@@ -705,6 +712,25 @@ mod tests {
     #[test]
     fn added_dns_server_has_a_core_valid_address() {
         assert_eq!(new_dns_server().address, "1.1.1.1");
+    }
+
+    #[test]
+    fn server_editor_exposes_the_optional_id() {
+        let srv = new_dns_server();
+        let mut harness = Harness::new_ui_state(
+            |ui, srv: &mut DnsServer| {
+                let _ = server_editor(ui, Language::En, srv, 0);
+            },
+            srv,
+        );
+        harness.run();
+        assert_eq!(harness.state().id, "", "a new server starts without an id");
+
+        harness.get_by_label("ID").focus();
+        harness.run();
+        harness.get_by_label("ID").type_text("resolver-a");
+        harness.run();
+        assert_eq!(harness.state().id, "resolver-a");
     }
 
     #[test]
