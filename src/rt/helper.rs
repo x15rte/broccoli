@@ -19,7 +19,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,14 +65,15 @@ use windows::Win32::System::Registry::{
     REG_NOTIFY_FILTER, RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostQuitMessage,
-    RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ENDSESSION,
-    WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+    PostThreadMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY,
+    WM_ENDSESSION, WM_QUERYENDSESSION, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, w};
 
@@ -159,6 +160,9 @@ struct ShutdownContext {
     restored: bool,
 }
 static SHUTDOWN_CONTEXT: Mutex<Option<ShutdownContext>> = Mutex::new(None);
+/// The hidden window's message-thread id, so the helper can stop it on exit.
+/// Zero until the thread starts.
+static SHUTDOWN_THREAD: AtomicU32 = AtomicU32::new(0);
 /// The live session whose DNS the helper holds. The network watcher reads it
 /// to decide between reconciling an active takeover and retrying a residual
 /// restore. A release clears it before the record is touched, so a watcher
@@ -168,6 +172,9 @@ struct EngagedSession {
     pid: u32,
     tun_name: String,
     tun_if_index: u32,
+    /// The staged config's `autoOutboundsInterface`; `None` means `auto`.
+    /// Kept as the setting so a config change is noticed.
+    outbound_setting: Option<String>,
     targets: crate::sys::dns_takeover::Targets,
 }
 static ENGAGED_SESSION: Mutex<Option<EngagedSession>> = Mutex::new(None);
@@ -1058,6 +1065,23 @@ fn dns_takeover_record_path() -> Result<PathBuf, DiagError> {
     Ok(secure_stage_base()?.join(DNS_TAKEOVER_RECORD))
 }
 
+/// The staged TUN inbound's `autoOutboundsInterface` value. `None` when the
+/// inbound or the key is absent; the takeover then applies the `auto`
+/// heuristic, which is the value the app writes by default.
+fn auto_outbounds_interface(config: &serde_json::Value) -> Option<String> {
+    config
+        .get("inbounds")?
+        .as_array()?
+        .iter()
+        .find(|inbound| {
+            inbound.get("tag").and_then(serde_json::Value::as_str) == Some(TUN_INBOUND_TAG)
+        })?
+        .get("settings")?
+        .get("autoOutboundsInterface")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn stage_entry_allowed(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| STAGE_ENTRIES.contains(&name))
@@ -1756,6 +1780,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // hand the captured servers back before returning. A failure keeps the
     // record for the next helper's startup repair.
     release_dns_takeover(&writer, TakeoverOrigin::OwnSession);
+    stop_shutdown_window();
     Ok(())
 }
 
@@ -2099,7 +2124,10 @@ fn helper_start(
                     // derived from the same staged config; its capture is
                     // written before the first change, so a failure here
                     // still leaves a repair behind.
-                    let outcome = (|| -> Result<Option<usize>, DiagError> {
+                    let outcome = (|| -> Result<
+                        Option<crate::sys::dns_takeover::TakeoverCounts>,
+                        DiagError,
+                    > {
                         let path = dns_takeover_record_path()?;
                         let in_tun = crate::rt::dns_in::listener_for_bytes(config_bytes)
                             .ok_or_else(|| {
@@ -2119,6 +2147,8 @@ fn helper_start(
                             v4: in_tun.v4,
                             v6: in_tun.v6,
                         };
+                        let outbound_setting =
+                            config.as_ref().and_then(auto_outbounds_interface);
                         // Publish the session before the first write. If
                         // `engage` fails, the watcher must retry it as a
                         // reconcile, not mistake the record for a previous
@@ -2131,19 +2161,34 @@ fn helper_start(
                                 pid,
                                 tun_name: name.clone(),
                                 tun_if_index: ifindex,
+                                outbound_setting: outbound_setting.clone(),
                                 targets,
                             });
                         }
-                        let applied =
-                            crate::sys::dns_takeover::engage(&path, ifindex, Some(&name), targets)?;
-                        Ok(Some(applied))
+                        let counts = crate::sys::dns_takeover::engage(
+                            &path,
+                            ifindex,
+                            Some(&name),
+                            outbound_setting.as_deref(),
+                            targets,
+                        )?;
+                        Ok(Some(counts))
                     })();
                     match outcome {
-                        Ok(Some(adapters)) => {
-                            send_log(
+                        Ok(Some(counts)) => {
+                            report_takeover(
                                 writer,
-                                Diag::new(Key::HelperDnsTakeoverApplied).arg(adapters),
+                                &counts,
+                                Key::HelperDnsTakeoverApplied,
+                                Key::HelperDnsTakeoverRestored,
                             );
+                            if let Some(error) = counts.restore_error {
+                                send_log_record(
+                                    writer,
+                                    &DiagError::new(Diag::new(Key::HelperDnsTakeoverRestoreFailed))
+                                        .caused_by(error),
+                                );
+                            }
                             None
                         }
                         Ok(None) => None,
@@ -2264,8 +2309,12 @@ fn helper_start(
 enum TakeoverOrigin {
     /// A record a helper that died hard left behind, read at startup.
     PreviousSession,
-    /// This helper's own takeover: a teardown path or the manual cleanup.
+    /// A core teardown or this helper's own exit.
     OwnSession,
+    /// The session-end message from Windows.
+    Shutdown,
+    /// The manual network cleanup command.
+    Cleanup,
 }
 
 /// Undo this helper's system-DNS takeover and delete its record. Runs at
@@ -2275,7 +2324,8 @@ enum TakeoverOrigin {
 /// next helper start repairs from it. `origin` names the restore in the line
 /// this logs.
 ///
-/// Every restore goes through here, and it adds what it restored to
+/// Every teardown restore goes through here; a network move reports through
+/// [`report_takeover`]. Both add what they restored to
 /// [`DNS_SERVERS_RESTORED`]: a cleanup command served later by this helper
 /// reports what any earlier path put back — including the startup repair,
 /// whose record is gone by the time the command is read.
@@ -2289,6 +2339,25 @@ fn release_dns_takeover(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin) {
     release_dns_takeover_locked(writer, origin);
 }
 
+/// Report the adapters an engage or reconcile pass changed. The restore count
+/// also feeds the manual cleanup's tally and flushes the resolver cache;
+/// `applied_key` and `restored_key` name the two actions in the log.
+fn report_takeover(
+    writer: &Arc<Mutex<File>>,
+    counts: &crate::sys::dns_takeover::TakeoverCounts,
+    applied_key: Key,
+    restored_key: Key,
+) {
+    if counts.restored > 0 {
+        DNS_SERVERS_RESTORED.fetch_add(counts.restored, Ordering::Relaxed);
+        flush_resolver_cache();
+        send_log(writer, Diag::new(restored_key).arg(counts.restored));
+    }
+    if counts.applied > 0 {
+        send_log(writer, Diag::new(applied_key).arg(counts.applied));
+    }
+}
+
 /// The body of [`release_dns_takeover`] for a caller that already holds
 /// [`TAKEOVER_LOCK`]. The watcher uses it to check "no session is engaged"
 /// and restore under the same lock, so a start cannot slip a new session
@@ -2300,6 +2369,8 @@ fn release_dns_takeover_locked(writer: &Arc<Mutex<File>>, origin: TakeoverOrigin
     let key = match origin {
         TakeoverOrigin::PreviousSession => Key::HelperDnsTakeoverRepaired,
         TakeoverOrigin::OwnSession => Key::HelperDnsTakeoverRestored,
+        TakeoverOrigin::Shutdown => Key::HelperDnsTakeoverShutdownRestored,
+        TakeoverOrigin::Cleanup => Key::HelperDnsTakeoverCleanupRestored,
     };
     match dns_takeover_record_path().and_then(|path| restore_dns_takeover_locked(&path)) {
         Ok(Some(0)) | Ok(None) => {}
@@ -2368,7 +2439,12 @@ fn start_shutdown_window(writer: Arc<Mutex<File>>) {
     let log_writer = Arc::clone(&writer);
     if let Err(error) = std::thread::Builder::new()
         .name("helper-shutdown".into())
-        .spawn(move || run_shutdown_window(log_writer))
+        .spawn(move || {
+            // SAFETY: `GetCurrentThreadId` has no preconditions and returns
+            // the calling thread's id.
+            SHUTDOWN_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+            run_shutdown_window(log_writer);
+        })
     {
         send_event(
             &writer,
@@ -2377,6 +2453,20 @@ fn start_shutdown_window(writer: Arc<Mutex<File>>) {
                 "line": format!("{HELPER_LINE_PREFIX}shutdown window thread failed: {error}"),
             }),
         );
+    }
+}
+
+/// Stop the hidden window's message thread. Best-effort: a thread that has
+/// already exited ignores the message, and the process exit would end it
+/// anyway.
+fn stop_shutdown_window() {
+    let thread = SHUTDOWN_THREAD.swap(0, Ordering::SeqCst);
+    if thread != 0 {
+        // SAFETY: the id was stored by the helper's own window thread;
+        // `PostThreadMessageW` only enqueues WM_QUIT and touches no memory.
+        unsafe {
+            let _ = PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -2513,7 +2603,7 @@ unsafe extern "system" fn shutdown_window_proc(
                     // adapter count, so this wait fits the session-end
                     // budget. The flag above stops a start that has not
                     // entered the lock yet from engaging afterwards.
-                    release_dns_takeover(&context.writer, TakeoverOrigin::OwnSession);
+                    release_dns_takeover(&context.writer, TakeoverOrigin::Shutdown);
                 }
                 LRESULT(0)
             }
@@ -2854,7 +2944,7 @@ fn reconcile_network_state(
                     flush_resolver_cache();
                     send_log(
                         writer,
-                        Diag::new(Key::HelperDnsTakeoverRestored).arg(adapters),
+                        Diag::new(Key::HelperDnsTakeoverResidualRestored).arg(adapters),
                     );
                 }
                 Err(error) => return Err(error),
@@ -2869,7 +2959,7 @@ fn reconcile_network_state(
         return Ok(());
     }
     let path = dns_takeover_record_path()?;
-    let applied = {
+    let counts = {
         let _takeover = TAKEOVER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2880,14 +2970,18 @@ fn reconcile_network_state(
             &path,
             session.tun_if_index,
             Some(&session.tun_name),
+            session.outbound_setting.as_deref(),
             session.targets,
         )?
     };
-    if applied > 0 {
-        send_log(
-            writer,
-            Diag::new(Key::HelperDnsTakeoverApplied).arg(applied),
-        );
+    report_takeover(
+        writer,
+        &counts,
+        Key::HelperDnsTakeoverReapplied,
+        Key::HelperDnsTakeoverNetworkRestored,
+    );
+    if let Some(error) = counts.restore_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -2962,7 +3056,7 @@ fn helper_cleanup(
     {
         child.kill();
     }
-    release_dns_takeover(writer, TakeoverOrigin::OwnSession);
+    release_dns_takeover(writer, TakeoverOrigin::Cleanup);
     // Every path that restores — the startup repair included, before this
     // command was read — tallies inside `release_dns_takeover`, so the report
     // is everything this helper restored since the last report: never a zero
@@ -3144,11 +3238,16 @@ wire_keys!(
     HelperDirectoryInspectFailed,
     HelperDirectoryNotOrdinary,
     HelperDnsTakeoverApplied,
+    HelperDnsTakeoverReapplied,
     HelperDnsTakeoverNotEngaged,
     HelperDnsTakeoverReconcileFailed,
     HelperDnsTakeoverRepaired,
     HelperDnsTakeoverRestoreFailed,
     HelperDnsTakeoverRestored,
+    HelperDnsTakeoverNetworkRestored,
+    HelperDnsTakeoverShutdownRestored,
+    HelperDnsTakeoverCleanupRestored,
+    HelperDnsTakeoverResidualRestored,
     HelperHashReadFailed,
     HelperHashRewindFailed,
     HelperJobSetupFailed,
@@ -3790,8 +3889,9 @@ mod tests {
 
     use super::{
         ChildPhase, HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES,
-        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction, config_from_wire,
-        current_process_user_sid, dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
+        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction,
+        auto_outbounds_interface, config_from_wire, current_process_user_sid,
+        dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
         ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
         path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
         run_shutdown_window_with_class, shutdown_action, stage_config_bytes_at,
@@ -4125,16 +4225,49 @@ mod tests {
     }
 
     #[test]
+    fn the_tun_outbound_setting_comes_from_the_staged_inbound() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {"tag": "in-socks", "settings": {"autoOutboundsInterface": "wrong"}},
+                {
+                    "tag": crate::model::inbound::TUN_INBOUND_TAG,
+                    "settings": {"autoOutboundsInterface": "auto"},
+                },
+            ],
+        });
+        assert_eq!(
+            auto_outbounds_interface(&config),
+            Some("auto".to_string()),
+            "the TUN inbound's value wins over another inbound's"
+        );
+        assert_eq!(
+            auto_outbounds_interface(&serde_json::json!({
+                "inbounds": [{
+                    "tag": crate::model::inbound::TUN_INBOUND_TAG,
+                    "settings": {},
+                }],
+            })),
+            None,
+            "an absent key leaves the auto heuristic to apply"
+        );
+    }
+
+    #[test]
     fn cleanup_messages_name_keys_the_pipe_carries() {
         // Every key a cleanup can log must resolve in the pipe vocabulary: an
         // unlisted key degrades its line to the English fallback instead of
         // the language the user reads.
         for key in [
             Key::HelperDnsTakeoverApplied,
+            Key::HelperDnsTakeoverReapplied,
             Key::HelperDnsTakeoverNotEngaged,
             Key::HelperDnsTakeoverReconcileFailed,
             Key::HelperDnsTakeoverRepaired,
             Key::HelperDnsTakeoverRestored,
+            Key::HelperDnsTakeoverNetworkRestored,
+            Key::HelperDnsTakeoverShutdownRestored,
+            Key::HelperDnsTakeoverCleanupRestored,
+            Key::HelperDnsTakeoverResidualRestored,
             Key::HelperDnsTakeoverRestoreFailed,
             Key::HelperTunCleanupConfigReadFailed,
             Key::HelperTunCleanupTimeout,

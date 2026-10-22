@@ -102,7 +102,7 @@ impl Drop for AdapterBuffer {
 /// List non-loopback, non-tunnel interfaces with their unicast IPs.
 /// Returns an empty vec on any API failure (best-effort enumeration).
 pub fn list() -> Vec<NetIf> {
-    enumerate(true)
+    enumerate(true).unwrap_or_default()
 }
 
 /// List non-loopback interfaces with their unicast IPs, including tunnel
@@ -111,6 +111,13 @@ pub fn list() -> Vec<NetIf> {
 /// heuristic skips it by flag — outcome identical).
 /// Returns an empty vec on any API failure (best-effort enumeration).
 pub fn list_all() -> Vec<NetIf> {
+    enumerate(false).unwrap_or_default()
+}
+
+/// [`list_all`] with the API failure kept distinct from a successful
+/// enumeration that found no adapters. A caller that must not mistake a
+/// read failure for "the network disappeared" uses this.
+pub(crate) fn list_all_result() -> Option<Vec<NetIf>> {
     enumerate(false)
 }
 
@@ -129,7 +136,7 @@ pub fn interface_index_by_name(name: &str) -> Option<u32> {
 /// `exclude_tunnel` is true for `list` (physical outbound interfaces only)
 /// and false for `list_all` (the Xray heuristic's view). Loopback is always
 /// excluded.
-fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
+fn enumerate(exclude_tunnel: bool) -> Option<Vec<NetIf>> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     // SAFETY: the family argument is 0 (`AF_UNSPEC`, every family), `flags`
     // is a valid flag set, and the adapter buffer argument is null with
@@ -147,19 +154,17 @@ fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
         let mut size: u32 = 0;
         let rc = GetAdaptersAddresses(0, flags, None, None, &mut size);
         if rc != ERROR_BUFFER_OVERFLOW.0 || size == 0 {
-            return Vec::new();
+            return None;
         }
         // Aligned heap buffer (not `Vec<u8>`): the adapter structs contain
         // 8-byte fields, and the walk must not rely on allocator
         // over-alignment. `AdapterBuffer` deallocs with the same layout on
         // every exit path (early returns, error branches, and the loop).
-        let Some(buf) = AdapterBuffer::allocate(size as usize) else {
-            return Vec::new();
-        };
+        let buf = AdapterBuffer::allocate(size as usize)?;
         let head = buf.head();
         let rc = GetAdaptersAddresses(0, flags, None, Some(head), &mut size);
         if rc != 0 {
-            return Vec::new();
+            return None;
         }
         let mut out = Vec::new();
         let mut cur = head;
@@ -217,7 +222,7 @@ fn enumerate(exclude_tunnel: bool) -> Vec<NetIf> {
             }
             cur = adapter.Next;
         }
-        out
+        Some(out)
     }
 }
 
@@ -345,6 +350,14 @@ fn pick_outbound_interface<'a>(
 /// qualifies — the probe then dials unbound, mirroring Go's nil-interface
 /// fallback.
 fn xray_outbound_heuristic(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Option<&str> {
+    auto_outbound_interface(ifaces, tun_self_index).flatten()
+}
+
+/// The auto heuristic split into its read failure and its no-candidate
+/// result: `None` when the route table cannot be read, `Some(None)` when it
+/// can be read but no interface qualifies, and `Some(Some(name))` for the
+/// winner.
+fn auto_outbound_interface(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Option<Option<&str>> {
     let rows = default_route_rows()?;
     let candidates = rows.into_iter().filter_map(|row| {
         let iface = ifaces.iter().find(|iface| iface.index == row.index)?;
@@ -357,7 +370,41 @@ fn xray_outbound_heuristic(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Opt
             metric: row.metric.saturating_add(metric),
         })
     });
-    pick_outbound_interface(candidates, tun_self_index)
+    Some(pick_outbound_interface(candidates, tun_self_index))
+}
+
+/// The TUN outbound's adapter for a caller that must distinguish "no adapter
+/// qualifies" from "the network state could not be read". `None` is a read
+/// failure (keep the caller's state and retry); `Some(None)` means no
+/// outbound; `Some(Some(name))` is the selected adapter.
+///
+/// `setting` is the config's `autoOutboundsInterface`: absent, empty, or
+/// `auto` runs Xray's `findOutboundInterface` heuristic, while a fixed name
+/// must exist. `tun_adapter_name` is matched against the
+/// enumeration so a renamed or recreated TUN is excluded by its current
+/// index; `tun_if_index` is the fallback while the name is not present.
+pub(crate) fn resolved_outbound_interface(
+    setting: Option<&str>,
+    tun_adapter_name: Option<&str>,
+    tun_if_index: u32,
+    ifaces: Option<&[NetIf]>,
+) -> Option<Option<String>> {
+    let ifaces = ifaces?;
+    let tun_self_index = tun_adapter_name
+        .and_then(|name| ifaces.iter().find(|iface| iface.name == name))
+        .map(|iface| iface.index)
+        .or(Some(tun_if_index));
+    let setting = setting.unwrap_or("auto").trim();
+    if setting.is_empty() || setting == "auto" {
+        return auto_outbound_interface(ifaces, tun_self_index).map(|name| name.map(str::to_owned));
+    }
+    Some(
+        ifaces
+            .iter()
+            .find(|iface| iface.name == setting)
+            .filter(|iface| Some(iface.index) != tun_self_index)
+            .map(|iface| iface.name.clone()),
+    )
 }
 
 /// The verdict for a configured fixed TUN uplink name, checked against an
@@ -648,6 +695,38 @@ mod tests {
     #[test]
     fn picker_without_candidates_returns_none() {
         assert_eq!(pick_outbound_interface(Vec::new(), None), None);
+    }
+
+    #[test]
+    fn resolved_outbound_distinguishes_unknown_from_absent() {
+        // A failed enumeration is `None`: the caller must keep its record
+        // instead of restoring a working takeover. A successful empty
+        // enumeration is `Some(None)`: the network really has no outbound.
+        assert_eq!(
+            resolved_outbound_interface(Some("wired"), None, 9, None),
+            None
+        );
+        assert_eq!(
+            resolved_outbound_interface(Some("wired"), None, 9, Some(&[])),
+            Some(None)
+        );
+        let tun = test_iface("broccoli0", 9, false, true, &[]);
+        let wired = test_iface("wired", 2, false, true, &[]);
+        let ifaces = [tun, wired];
+        assert_eq!(
+            resolved_outbound_interface(Some("ghost"), Some("broccoli0"), 9, Some(&ifaces)),
+            Some(None),
+            "a fixed name that is absent selects nothing"
+        );
+        assert_eq!(
+            resolved_outbound_interface(Some("broccoli0"), Some("broccoli0"), 9, Some(&ifaces)),
+            Some(None),
+            "the TUN itself is not an outbound"
+        );
+        assert_eq!(
+            resolved_outbound_interface(Some("wired"), Some("broccoli0"), 9, Some(&ifaces)),
+            Some(Some("wired".to_string()))
+        );
     }
 
     #[test]

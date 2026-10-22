@@ -2240,9 +2240,14 @@ keys! {
     HelperCoreSpawnFailed (Log, Error, 0),
     HelperJobSetupFailed (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
+    HelperDnsTakeoverReapplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
     HelperDnsTakeoverReconcileFailed (Log, Warn, 0),
     HelperDnsTakeoverRestored (Log, Info, 1),
+    HelperDnsTakeoverNetworkRestored (Log, Info, 1),
+    HelperDnsTakeoverShutdownRestored (Log, Info, 1),
+    HelperDnsTakeoverCleanupRestored (Log, Info, 1),
+    HelperDnsTakeoverResidualRestored (Log, Info, 1),
     HelperDnsTakeoverRestoreFailed (Log, Error, 0),
     HelperDnsTakeoverRepaired (Log, Warn, 1),
     DnsTakeoverEnumerateFailed 0,
@@ -6020,6 +6025,9 @@ mod en {
             Key::HelperDnsTakeoverApplied => {
                 "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
             }
+            Key::HelperDnsTakeoverReapplied => {
+                "elevated helper re-applied the DNS takeover to {} adapters"
+            }
             Key::HelperDnsTakeoverNotEngaged => {
                 "elevated helper could not take the system DNS over"
             }
@@ -6028,6 +6036,18 @@ mod en {
             }
             Key::HelperDnsTakeoverRestored => {
                 "elevated helper restored the DNS servers of {} adapters"
+            }
+            Key::HelperDnsTakeoverNetworkRestored => {
+                "elevated helper restored the DNS of {} adapters after the outbound adapter changed"
+            }
+            Key::HelperDnsTakeoverShutdownRestored => {
+                "elevated helper restored the DNS servers of {} adapters for shutdown"
+            }
+            Key::HelperDnsTakeoverCleanupRestored => {
+                "elevated helper restored the DNS of {} adapters for the network cleanup"
+            }
+            Key::HelperDnsTakeoverResidualRestored => {
+                "elevated helper restored the DNS of {} adapters from an earlier session"
             }
             Key::HelperDnsTakeoverRestoreFailed => {
                 "elevated helper could not restore the system DNS servers"
