@@ -596,6 +596,8 @@ keys! {
     DnsAddress 0,
     DnsAddressHint 0,
     DnsAddressRequired 0,
+    DnsId 0,
+    DnsIdHint 0,
     DnsPort 0,
     DnsDomains 0,
     DnsDomainsHint 0,
@@ -3380,6 +3382,8 @@ mod en {
                 "1.1.1.1, https://dns.google/dns-query, quic+local://, tcp://, hosts path, fakedns"
             }
             Key::DnsAddressRequired => "DNS server address is required",
+            Key::DnsId => "ID",
+            Key::DnsIdHint => "name this server for a DNS script",
             Key::DnsPort => "Port",
             Key::DnsDomains => "Domains",
             Key::DnsDomainsHint => "route matching domains to this server",
