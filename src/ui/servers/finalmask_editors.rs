@@ -1041,6 +1041,9 @@ fn finalmask_realm_tls_editor(
         &mut tls.disable_system_root,
         t(lang, Key::SrvUnset),
     );
+    changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
+        ui.checkbox(&mut tls.use_system_ca, "useSystemCA").changed()
+    });
     changed |= widgets::combo_str_labeled(
         ui,
         "minVersion",

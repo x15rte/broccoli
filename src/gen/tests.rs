@@ -1086,6 +1086,32 @@ fn golden_vless_xhttp_tls() {
     );
 }
 
+/// The trust switch on an outbound TLS profile: the generated document
+/// carries `useSystemCA` when the profile opts into the certificate store of
+/// the operating system. Every other TLS golden leaves it off, which is the
+/// bundled-roots default and writes no key.
+#[test]
+fn golden_vless_raw_tls_system_ca() {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    ob.settings = ProtocolSettings::Vless(VlessSettings {
+        address: "vless.example.com".into(),
+        port: 443,
+        id: "11111111-2222-3333-4444-555555555555".into(),
+        encryption: "none".into(),
+        ..Default::default()
+    });
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "vless.example.com".into(),
+        use_system_ca: true,
+        ..Default::default()
+    });
+    golden!(
+        "goldens/vless_raw_tls_system_ca.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_vmess_ws_tls() {
     let mut ob = OutboundModel::new(Protocol::Vmess);
