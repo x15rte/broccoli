@@ -235,8 +235,9 @@ pub enum ValidationCode {
     FinalmaskQuicBandwidthUnitInvalid(String),
     FinalmaskQuicForceBrutalNeedsUp,
     /// A profile's `quicParams` carried the retired `udpHop` key: the hop
-    /// moved to the `udphop` UDP mask (`infra/conf/transport_finalmask.go:88`
-    /// at v26.9.30) and the core ignores the old key silently, so the config
+    /// moved to the `udphop` UDP mask, the core's `QuicParamsConfig`
+    /// (`infra/conf/transport_finalmask.go`) no longer declares it, and the
+    /// core ignores the unknown key silently, so the config
     /// applies without the hop until the user rebuilds it as a mask. The key
     /// is kept for the settings file (JSON `null` is the Go zero shape and
     /// counts as absent), never serialized to the wire, and never migrated.

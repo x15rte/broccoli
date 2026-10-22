@@ -2783,7 +2783,7 @@ mod tests {
     /// Go's `hex.DecodeString`, and `base64` Go's non-strict `StdEncoding`.
     /// The decoder's own quirks (`=` padding, trailing bits, `\r`/`\n`) are
     /// pinned by `go_std_base64_decodes_matches_the_cores_decoder`, and the
-    /// pinned v26.9.30 binary loads every accepted row below (`xray run -test`
+    /// pinned v26.10.21 binary loads every accepted row below (`xray run -test`
     /// exits 0) while it exits 23 on every gated one.
     #[test]
     fn finalmask_byte_encodings_route_each_encoding_to_its_shape_check() {
@@ -2931,7 +2931,7 @@ mod tests {
     /// The realm `echServerKeys` decode is the same Go `StdEncoding` the mask
     /// byte encodings use — `infra/conf/transport_security.go` reads the field
     /// with `base64.StdEncoding.DecodeString` — so a payload with non-zero
-    /// trailing bits or interior `\r`/`\n` loads on the pinned v26.9.30 binary
+    /// trailing bits or interior `\r`/`\n` loads on the pinned v26.10.21 binary
     /// while a padding violation exits 23. The decoder's own rows live in
     /// `go_std_base64_decodes_matches_the_cores_decoder`; this pins that the
     /// rule routes through it.
@@ -2968,8 +2968,8 @@ mod tests {
     }
 
     /// The nested mask vocabularies fold like the core: it lowercases the mKCP
-    /// `header` (`transport_finalmask.go:611`) and the QUIC `bbrProfile`
-    /// (`transport_internet.go:219`) before matching, and the pinned v26.9.30
+    /// `header` (`infra/conf/transport_finalmask.go:746`) and the QUIC
+    /// `bbrProfile` (`:1219`) before matching, and the pinned v26.10.21
     /// binary loads each folded spelling below (`run -test` exits 0) — so
     /// neither may gate.
     #[test]
@@ -2999,7 +2999,7 @@ mod tests {
     }
 
     /// The fold the vocabularies use is Go's, not ASCII case-insensitivity:
-    /// the pinned v26.9.30 binary accepts each dotted-`İ`/Kelvin spelling below
+    /// the pinned v26.10.21 binary accepts each dotted-`İ`/Kelvin spelling below
     /// (`run -test` exits 0), so a predicate that refuses one gates a profile
     /// the core runs. The point the ASCII fold misses is that `İ` folds to
     /// the same `i` an ASCII `I` does.
@@ -3008,7 +3008,7 @@ mod tests {
         type Predicate = fn(&str) -> bool;
         // One row per predicate and the spelling only Go's fold reaches: `İ`
         // (U+0130) folds to `i`, the Kelvin sign (U+212A) to `k`. The pinned
-        // v26.9.30 binary loads every value below (`run -test` exits 0).
+        // v26.10.21 binary loads every value below (`run -test` exits 0).
         let rows: &[(Predicate, &str)] = &[
             (target_strategy_supported, "Force\u{130}P"),
             (sockopt_domain_strategy_supported, "Use\u{130}P"),
@@ -3445,7 +3445,7 @@ mod tests {
     }
 
     /// The `noise` `type: "exp"` packet mini-language, row by row from the
-    /// pinned v26.9.30 binary: every accepted expression loads there and every
+    /// pinned v26.10.21 binary: every accepted expression loads there and every
     /// refused row exits with the message the rule names.
     #[test]
     fn noise_exp_packet_grammar_matches_the_core() {

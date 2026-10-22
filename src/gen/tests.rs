@@ -1350,10 +1350,9 @@ fn golden_xdrive_local() {
 }
 
 /// An xdrive transport over Google Drive: the three secrets in their
-/// documented order and the Drive folder id, as the pinned core accepts them.
-/// The fixture states the retired spelling because older cores accept only
-/// that one; the model migrates a stored spelling on load and saves the
-/// current one.
+/// documented order and the Drive folder id, in the service spelling the
+/// pinned core carries. A stored retired spelling is migrated on load and
+/// saved in this one.
 #[test]
 fn golden_xdrive_drive() {
     let mut ob = xdrive_vless_outbound();
@@ -1363,7 +1362,7 @@ fn golden_xdrive_drive() {
             .xdrive_settings
             .as_mut()
             .expect("selecting xdrive materializes its block");
-        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE_RETIRED.into();
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE.into();
         xdrive.remote_folder = "drive-folder-id".into();
         xdrive.secrets = vec![
             "client-id".into(),
@@ -2012,9 +2011,9 @@ fn dns_and_dokodemo_use_exact_core_wire_types() {
     );
 }
 
-const GEOIP_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/geoip.dat";
+const GEOIP_URL: &str = "https://github.com/XTLS/Xray-core/releases/download/v26.10.21/geoip.dat";
 const GEOSITE_URL: &str =
-    "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/geosite.dat";
+    "https://github.com/XTLS/Xray-core/releases/download/v26.10.21/geosite.dat";
 
 #[test]
 fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {

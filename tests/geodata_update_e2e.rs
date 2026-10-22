@@ -93,6 +93,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The guard header the pinned core's geodata downloader writes ahead of every
+/// fetched asset (`app/geodata/download.go`): the geodata reader skips it as an
+/// unknown protobuf field and Lua rejects it. The frozen digest names the
+/// upstream asset alone, so a downloaded file is compared behind this header.
+const GEO_DATA_GUARD_HEADER: &[u8] = b"\x12\x01\x00";
+
+/// SHA-256 of a downloaded geo data file's upstream payload, with the core's
+/// guard header removed when it is present.
+fn downloaded_geo_data_sha(bytes: &[u8]) -> String {
+    sha256_hex(bytes.strip_prefix(GEO_DATA_GUARD_HEADER).unwrap_or(bytes))
+}
+
 /// Parse the runtime's app-log event that announces a direct core start and
 /// return the pid. The needle is built from the runtime's own message key (its
 /// text up to the `{}` placeholder), so a wording change cannot silently make
@@ -781,7 +793,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
             {
                 last_mtime = modified;
                 if let Ok(current) = std::fs::read(&geoip_path) {
-                    if sha256_hex(&current) == SWAPPED_GEOIP_SHA256 {
+                    if downloaded_geo_data_sha(&current) == SWAPPED_GEOIP_SHA256 {
                         stable_swaps += 1;
                     } else {
                         stable_swaps = 0;
@@ -852,7 +864,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     );
     let after_restart = std::fs::read(&geoip_path).expect("read geoip.dat after restart");
     assert_eq!(
-        sha256_hex(&after_restart),
+        downloaded_geo_data_sha(&after_restart),
         SWAPPED_GEOIP_SHA256,
         "the URL-swapped geo data must survive a restart while URLs are configured"
     );

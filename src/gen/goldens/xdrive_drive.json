@@ -95,7 +95,7 @@
             "client-secret",
             "refresh-token"
           ],
-          "service": "Google Drive"
+          "service": "google-drive"
         }
       },
       "tag": "srv-01234567"

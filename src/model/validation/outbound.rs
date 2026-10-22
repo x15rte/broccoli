@@ -193,7 +193,7 @@ pub fn validate_sniffing(sniffing: &Sniffing, prefix: &str) -> Verdict {
 /// as a 0 start on the wire). Bounds that only look backwards still load:
 /// `crypto.RandBetween` swaps an inverted pair (`common/crypto/crypto.go:12`),
 /// so an inverted or negative range is no finding. Every row of that table is
-/// live on the pinned v26.9.30 binary (`xray run -test`: exit 0 accepted,
+/// live on the pinned v26.10.21 binary (`xray run -test`: exit 0 accepted,
 /// exit 23 refused).
 fn freedom_fragment_unrunnable(fragment: &Fragment) -> bool {
     let packets_unrunnable = !fragment.packets.is_empty()
@@ -217,7 +217,7 @@ fn freedom_fragment_unrunnable(fragment: &Fragment) -> bool {
 /// `base64` is normalized (`+`→`-`, `/`→`_`, `=` dropped) and decoded as raw
 /// URL base64. `applyTo` folds with `strings.ToLower` over the empty default
 /// plus `ip`, `all`, `ipv4`, `ipv6`. `delay` is read when present and
-/// constrains nothing. Every row of that table is live on the pinned v26.9.30
+/// constrains nothing. Every row of that table is live on the pinned v26.10.21
 /// binary (`xray run -test`: exit 0 accepted, exit 23 refused).
 fn freedom_noise_unrunnable(noise: &Noise) -> bool {
     let packet = noise.packet.trim();
@@ -3917,7 +3917,7 @@ mod tests {
         // The core parses each colon-separated part through `ParseKey`: it
         // decodes standard base64, falls back to the raw bytes when the decode
         // fails, and requires exactly the method's key size. Every row below
-        // was re-probed on the pinned v26.9.30 binary (`xray run -test`).
+        // was re-probed on the pinned v26.10.21 binary (`xray run -test`).
         //
         // Accepted: a right-length key in base64 or raw form, and the
         // colon-joined multi-psk form under the AES methods.

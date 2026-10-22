@@ -421,7 +421,7 @@ pub struct MasqueradeCfg {
     pub rewrite_host: bool,
     /// `proxy` mode: add the `X-Forwarded-*` request headers. The core calls
     /// `httputil.ProxyRequest.SetXForwarded` when the flag is set
-    /// (`transport/internet/hysteria/hub.go` at v26.9.30).
+    /// (`transport/internet/hysteria/hub.go` at v26.10.21).
     #[serde(skip_serializing_if = "skip_false")]
     pub x_forwarded: bool,
     #[serde(skip_serializing_if = "skip_false")]
@@ -1758,7 +1758,7 @@ pub struct FinalmaskRealm {
 }
 
 /// `portMapping` of the Realm mask (`infra/conf/transport_finalmask.go`
-/// Realm struct at v26.9.30, proto `realm.PortMapping`). While `enabled` is
+/// Realm struct at v26.10.21, proto `realm.PortMapping`). While `enabled` is
 /// true, the mask asks the local gateway over UPnP or NAT-PMP to map its
 /// UDP port. `timeout` and `lifetime` are seconds; the core substitutes its
 /// own defaults (10 and 600) when either is 0, and a negative value fails
@@ -2636,7 +2636,7 @@ mod tests {
     use serde_json::{Map, json};
 
     /// The stream vocabularies fold like the core (Go's `strings.ToLower`):
-    /// `xray run -test` on the pinned v26.9.30 binary loads `SPLİTHTTP`,
+    /// `xray run -test` on the pinned v26.10.21 binary loads `SPLİTHTTP`,
     /// `MΚCP`, `REALİTY` and a Kelvin-spelled mask id, so none of these
     /// parses may refuse them.
     #[test]
