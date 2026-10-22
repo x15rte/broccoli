@@ -1707,6 +1707,20 @@ fn golden_fakedns() {
 }
 
 #[test]
+fn golden_dns_server_id() {
+    let mut settings = base_settings();
+    settings.dns.servers = vec![DnsServer {
+        address: "1.1.1.1".into(),
+        id: "resolver-a".into(),
+        ..Default::default()
+    }];
+    golden!(
+        "goldens/dns_server_id.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+#[test]
 fn golden_balancer_leastload() {
     let mut ob = OutboundModel::new(Protocol::Vless);
     ob.settings = ProtocolSettings::Vless(VlessSettings {
