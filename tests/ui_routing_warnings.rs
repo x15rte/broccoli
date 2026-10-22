@@ -15,7 +15,7 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::{Key, safety_finding_message, t};
+use broccoli::i18n::{Key, safety_finding_message, t, t_fmt};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{Balancer, OutboundModel, RoutingCfg, Rule, ServerProfile, ServersFile};
@@ -46,6 +46,96 @@ fn breakage_message(tag: &str) -> String {
 /// The inline PortList grammar error text, as the field itself renders it.
 fn port_list_error() -> String {
     t(Language::En, Key::RoutingPortListInvalid).to_string()
+}
+
+/// The expected inline advisory for a rule whose condition names geo tags the
+/// loaded catalog does not carry, rendered through the i18n renderer the UI
+/// itself consumes. `entries` is the comma-joined list of absent references.
+fn geo_absent_message(entries: &str) -> String {
+    t_fmt(Language::En, Key::RoutingGeoTagAbsent, &[&entries])
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// A minimal `GeoSiteList`/`GeoIPList` fixture: repeated field 1 entry
+/// messages whose string field 1 is the code. The managed-data reader decodes
+/// only these envelopes, so a fixture needs no domain or CIDR payload.
+fn geo_dat(codes: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for code in codes {
+        let mut entry = Vec::new();
+        entry.push(0x0a);
+        push_varint(&mut entry, code.len() as u64);
+        entry.extend_from_slice(code.as_bytes());
+        out.push(0x0a);
+        push_varint(&mut out, entry.len() as u64);
+        out.extend_from_slice(&entry);
+    }
+    out
+}
+
+/// Boot with `settings` and a managed core directory carrying `geosite.dat`
+/// and `geoip.dat` fixtures, then land on the Routing screen. The screen
+/// starts its catalog load on the first routing frame, so the advisory has
+/// real data to judge the seeded rules against.
+fn boot_routing_with_geo_data(
+    settings: &Settings,
+    geosite: &[&str],
+    geoip: &[&str],
+) -> (
+    MutexGuard<'static, ()>,
+    common::TempEnvironment,
+    Harness<'static, BroccoliApp>,
+) {
+    let settings = settings.clone();
+    let geosite = geo_dat(geosite);
+    let geoip = geo_dat(geoip);
+    let (lock, tmp, mut h) = common::boot(
+        move |root| {
+            settings
+                .save()
+                .expect("seed settings.json through the app's own writer");
+            ServersFile::default()
+                .save()
+                .expect("seed servers.json through the app's own writer");
+            let core = root.join("broccoli").join("core");
+            std::fs::create_dir_all(&core).expect("create the managed core directory");
+            std::fs::write(core.join("geosite.dat"), &geosite).expect("write geosite.dat");
+            std::fs::write(core.join("geoip.dat"), &geoip).expect("write geoip.dat");
+        },
+        None,
+    );
+    h.set_size(Vec2::new(1100.0, 2800.0));
+    h.run();
+    common::dismiss_wizard(&mut h);
+    nav::nav(&mut h, Screen::Routing);
+    (lock, tmp, h)
+}
+
+/// Run frames until `label` renders, bounded so a broken screen fails instead
+/// of hanging. The catalog load runs on a worker thread, so frames need real
+/// time between them.
+fn run_until_rendered(h: &mut Harness<'static, BroccoliApp>, label: &str) -> bool {
+    for _ in 0..200 {
+        h.run();
+        if h.query_by_label(label).is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
 }
 
 /// Boot through the shared fixture against `settings` (and optionally
@@ -383,5 +473,34 @@ fn balancer_tag_duplicate_verdict_follows_the_other_rows() {
     assert!(
         h.query_by_label(duplicate).is_none(),
         "the duplicate verdict must clear with the row that carried the tag"
+    );
+}
+
+/// A rule whose condition names geosite/geoip tags the loaded catalog does not
+/// carry renders the amber advisory on its own row, beside the balancer
+/// breakage warning the same screen shows. The catalog load runs on a worker,
+/// so the frames are bounded rather than counted.
+#[test]
+fn absent_geo_tags_render_inline_beside_the_balancer_warning() {
+    let mut settings = settings_with_balancer("bal-a", "srv-");
+    settings.routing.rules.push(Rule {
+        rule_tag: "r-geo".into(),
+        outbound_tag: "direct".into(),
+        domain: vec!["geosite:gone".into()],
+        ip: vec!["geoip:gone".into()],
+        ..Rule::default()
+    });
+    let (_lock, _tmp, mut h) = boot_routing_with_geo_data(&settings, &["cn"], &["cn"]);
+
+    let warning = geo_absent_message("geosite:gone, geoip:gone");
+    assert!(
+        run_until_rendered(&mut h, &warning),
+        "a rule naming absent geo tags must warn inline: {warning}"
+    );
+
+    let balancer = breakage_message("bal-a");
+    assert!(
+        h.query_by_label(&balancer).is_some(),
+        "the balancer breakage warning must stay rendered beside the geo advisory"
     );
 }

@@ -766,6 +766,7 @@ keys! {
     GeodataModifiedUnavailable 0,
     GeodataSearch 0,
     GeodataNoMatches 0,
+    RoutingGeoTagAbsent 1,
     RuntimeStateRefreshed 0,
     RuntimeOverrideTitle 0,
     RuntimeOverrideEphemeral 0,
@@ -3591,6 +3592,9 @@ mod en {
             Key::GeodataModifiedUnavailable => "unavailable",
             Key::GeodataSearch => "Search codes…",
             Key::GeodataNoMatches => "No matching codes.",
+            Key::RoutingGeoTagAbsent => {
+                "The loaded geo data does not carry {}. This condition matches nothing."
+            }
             Key::RuntimeStateRefreshed => "Runtime state refreshed.",
             Key::RuntimeOverrideTitle => "Runtime override",
             Key::RuntimeOverrideEphemeral => {
