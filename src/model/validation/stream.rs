@@ -430,7 +430,7 @@ pub fn uplink_http_method_mode_supported(method: &str, mode: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") || mode == "packet-up"
 }
 
-/// XHTTP xmux `maxConnections` and `maxConcurrency` are
+/// A transport's xmux `maxConnections` and `maxConcurrency` are
 /// mutually exclusive while both are in use. Xray compares the ranges'
 /// upper bounds (`To > 0`), so a range whose `to` is 0 is the "not in use"
 /// wire shape in both seams.
@@ -988,7 +988,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             }
             if xmux_limits_conflict(xhttp.xmux.as_ref()) {
                 issues.push(issue(
-                    ValidationCode::XhttpXmuxLimitsExclusive,
+                    ValidationCode::XmuxLimitsExclusive,
                     Some("stream.xhttpSettings.xmux".into()),
                 ));
             }
@@ -3813,7 +3813,7 @@ mod tests {
                         | ValidationCode::XhttpSeqPlacementInvalid
                         | ValidationCode::XhttpSessionIdLengthRequired
                         | ValidationCode::XhttpSessionIdTableInvalid
-                        | ValidationCode::XhttpXmuxLimitsExclusive
+                        | ValidationCode::XmuxLimitsExclusive
                         | ValidationCode::StreamOneNoDownload
                 )
             })
@@ -3914,7 +3914,7 @@ mod tests {
             ValidationCode::XhttpUplinkDataPlacementRequiresPacketUp,
             ValidationCode::XhttpUplinkHttpMethodRequiresPacketUp,
             ValidationCode::XhttpSessionIdTableInvalid,
-            ValidationCode::XhttpXmuxLimitsExclusive,
+            ValidationCode::XmuxLimitsExclusive,
         ] {
             assert!(found.contains(&code), "missing {code:?} in {found:#?}");
         }

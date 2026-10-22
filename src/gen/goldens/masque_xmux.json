@@ -1,0 +1,144 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "8.8.8.8",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:masque.example.com"
+        ],
+        "skipFallback": true
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "mux": {
+        "enabled": true
+      },
+      "protocol": "masque",
+      "settings": {
+        "address": "masque.example.com",
+        "port": 443
+      },
+      "streamSettings": {
+        "masqueSettings": {
+          "host": "masque.example.com",
+          "path": "/.well-known/masque/ip/*/*/",
+          "xmux": {
+            "cMaxReuseTimes": 100,
+            "hKeepAlivePeriod": 30,
+            "hMaxRequestTimes": "1000-2000",
+            "hMaxReusableSecs": "1800-3000",
+            "maxConnections": "2-4"
+          }
+        },
+        "network": "masque",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {
+          "alpn": [
+            "h2"
+          ],
+          "serverName": "masque.example.com"
+        }
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      }
+    ]
+  },
+  "stats": {}
+}
