@@ -5823,6 +5823,7 @@ impl ServersScreen {
                         s.template = Some(template);
                     }
                 }
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if had_settings || changed {
                     st.xdrive_settings = Some(s);
                 }
@@ -10751,6 +10752,54 @@ Authentication: ML-KEM-768, Post-Quantum
             5,
             "each substitution site lists the variables it expands"
         );
+    }
+
+    /// The xdrive transport settings carry the shared XMUX section: the enable
+    /// switch, the chosen connection limit, and the reuse knobs every xmux
+    /// transport shows.
+    #[test]
+    fn xdrive_transport_editor_renders_the_xmux_section() {
+        let mut stream = StreamModel {
+            network: Network::Xdrive,
+            xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                service: crate::model::stream::XDRIVE_SERVICE_LOCAL.into(),
+                remote_folder: "store".into(),
+                xmux: Some(XmuxConfig {
+                    max_connections: Some(Int32Range::single(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Vless,
+                    mux: None,
+                },
+            );
+        });
+        for label in [
+            t(Language::En, Key::SrvXmux),
+            t(Language::En, Key::SrvEnableXmux),
+            t(Language::En, Key::SrvConnectionLimit),
+            "maxConnections",
+            "cMaxReuseTimes",
+        ] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the xdrive editor must render its {label:?} xmux control"
+            );
+        }
+        assert!(harness.query_by_label("maxConcurrency").is_none());
     }
 
     /// A transport profile whose settings carry a template the runtime builds
