@@ -495,6 +495,12 @@ pub struct MasqueTransport {
     /// with `user`/`pass`. All three are refused by the core's build.
     #[serde(skip_serializing_if = "skip_empty_map")]
     pub headers: Map<String, Value>,
+    /// The transport's connection-reuse knobs. An absent block leaves the
+    /// core's own defaults (`maxConnections` 1, `hMaxReusableSecs`
+    /// 1800–3000); a present one is emitted verbatim, and the core refuses
+    /// both connection limits at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XmuxConfig>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
