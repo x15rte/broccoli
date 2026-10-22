@@ -43,7 +43,7 @@ use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
     HttpCamouflageResponse, Int32Range, Network, OutboundModel, Protocol, ProtocolSettings,
     RawHeader, Security, ServerProfile, ServersFile, Settings, Sniffing, SockoptModel, StreamModel,
-    TlsCert, WsSettings, XmuxConfig,
+    TlsCert, WsSettings,
 };
 use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
@@ -64,6 +64,7 @@ mod finalmask_editors;
 mod keygen;
 mod raw_editor;
 mod validators;
+mod xmux;
 mod xray_tool;
 
 use finalmask_editors::{
@@ -77,6 +78,7 @@ use validators::{
     v_vless_encryption, v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry,
     v_wg_secret_key,
 };
+use xmux::xmux_section;
 use xray_tool::XrayToolKind;
 
 /// Editor-selectable uTLS fingerprint options for the TLS and realm-TLS
@@ -5320,108 +5322,7 @@ impl ServersScreen {
                         1024..=1_048_576,
                     );
                 });
-                widgets::section(ui, t(lang, Key::SrvXmux), |ui| {
-                    let mut has = s.xmux.is_some();
-                    if ui.checkbox(&mut has, t(lang, Key::SrvEnableXmux)).changed() {
-                        s.xmux = if has {
-                            Some(XmuxConfig::default())
-                        } else {
-                            None
-                        };
-                        changed = true;
-                    }
-                    if let Some(x) = s.xmux.as_mut() {
-                        let original_choice =
-                            match (x.max_concurrency.is_some(), x.max_connections.is_some()) {
-                                (false, false) => 0,
-                                (true, false) => 1,
-                                (false, true) => 2,
-                                (true, true) => 3,
-                            };
-                        let mut choice = original_choice;
-                        let mut choice_changed = false;
-                        ui.horizontal(|ui| {
-                            ui.label(t(lang, Key::SrvConnectionLimit));
-                            choice_changed |= ui
-                                .radio_value(&mut choice, 0, t(lang, Key::SrvCoreDefaults))
-                                .changed();
-                            choice_changed |= ui
-                                .radio_value(&mut choice, 1, t(lang, Key::SrvMaxConcurrency))
-                                .changed();
-                            choice_changed |= ui
-                                .radio_value(&mut choice, 2, t(lang, Key::SrvMaxConnections))
-                                .changed();
-                        });
-                        if choice_changed {
-                            match choice {
-                                0 => {
-                                    x.max_concurrency = None;
-                                    x.max_connections = None;
-                                }
-                                1 => {
-                                    x.max_connections = None;
-                                    x.max_concurrency
-                                        .get_or_insert_with(|| Int32Range::single(1));
-                                }
-                                2 => {
-                                    x.max_concurrency = None;
-                                    x.max_connections
-                                        .get_or_insert_with(|| Int32Range::single(1));
-                                }
-                                _ => unreachable!(),
-                            }
-                            changed = true;
-                        } else if original_choice == 3 {
-                            ui.colored_label(
-                                status_colors_of(ui).err,
-                                t(lang, Key::SrvMutuallyExclusive),
-                            );
-                        }
-                        match choice {
-                            1 => {
-                                changed |= widgets::opt_range(
-                                    ui,
-                                    "maxConcurrency",
-                                    &mut x.max_concurrency,
-                                    1..=1024,
-                                );
-                            }
-                            2 => {
-                                changed |= widgets::opt_range(
-                                    ui,
-                                    "maxConnections",
-                                    &mut x.max_connections,
-                                    1..=1024,
-                                );
-                            }
-                            _ => {}
-                        }
-                        changed |= widgets::opt_range(
-                            ui,
-                            "cMaxReuseTimes",
-                            &mut x.c_max_reuse_times,
-                            1..=10_000,
-                        );
-                        changed |= widgets::opt_range(
-                            ui,
-                            "hMaxRequestTimes",
-                            &mut x.h_max_request_times,
-                            1..=10_000,
-                        );
-                        changed |= widgets::opt_range(
-                            ui,
-                            "hMaxReusableSecs",
-                            &mut x.h_max_reusable_secs,
-                            1..=86_400,
-                        );
-                        changed |= widgets::opt_num(
-                            ui,
-                            t(lang, Key::SrvHKeepAlivePeriodS),
-                            &mut x.h_keep_alive_period,
-                            0..=3600,
-                        );
-                    }
-                });
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if mode_changed && s.mode == "stream-one" {
                     s.download_settings = None;
                 }
@@ -8023,7 +7924,7 @@ mod tests {
         basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
         editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
         fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        sockopt_findings, status_colors_of, status_toast_expired,
+        sockopt_findings, status_colors_of, status_toast_expired, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -8035,9 +7936,9 @@ mod tests {
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule,
-        HysteriaTransport, MasqueTransport, Network, Noise, OutboundModel, Protocol,
+        HysteriaTransport, Int32Range, MasqueTransport, Network, Noise, OutboundModel, Protocol,
         ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-        WireguardPeer, WsSettings, XhttpSettings,
+        WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -15293,6 +15194,171 @@ Authentication: ML-KEM-768, Post-Quantum
             emitted["masquerade"]["xForwarded"],
             json!(true),
             "{emitted}"
+        );
+    }
+
+    /// The XMUX section edits the block it is given: the chosen limit mode
+    /// owns the model, and the fields the mode does not use disappear.
+    #[test]
+    fn xmux_section_writes_the_chosen_limit_mode() {
+        let xmux = Rc::new(RefCell::new(Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(2)),
+            ..Default::default()
+        })));
+        let xmux_for_ui = Rc::clone(&xmux);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
+        });
+        assert!(harness.query_by_label("maxConnections").is_some());
+        assert!(harness.query_by_label("maxConcurrency").is_none());
+
+        harness.get_by_label("max concurrency").click();
+        harness.run();
+
+        let edited = xmux.borrow();
+        let edited = edited.as_ref().expect("the block stays enabled");
+        assert_eq!(edited.max_connections, None);
+        assert_eq!(edited.max_concurrency, Some(Int32Range::single(1)));
+        assert!(harness.query_by_label("maxConcurrency").is_some());
+        assert!(harness.query_by_label("maxConnections").is_none());
+    }
+
+    /// The section renders every control the XHTTP editor carried, with the
+    /// core-defaults choice when the block holds no limit.
+    #[test]
+    fn xmux_section_renders_the_shared_controls() {
+        let xmux = Rc::new(RefCell::new(Some(XmuxConfig::default())));
+        let xmux_for_ui = Rc::clone(&xmux);
+        let harness = Harness::new_ui(move |ui| {
+            let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
+        });
+        for caption in [
+            t(Language::En, Key::SrvXmux),
+            t(Language::En, Key::SrvEnableXmux),
+            t(Language::En, Key::SrvConnectionLimit),
+            t(Language::En, Key::SrvCoreDefaults),
+            t(Language::En, Key::SrvMaxConcurrency),
+            t(Language::En, Key::SrvMaxConnections),
+            "cMaxReuseTimes",
+            "hMaxRequestTimes",
+            "hMaxReusableSecs",
+            t(Language::En, Key::SrvHKeepAlivePeriodS),
+        ] {
+            harness.get_by_label(caption);
+        }
+        assert!(harness.query_by_label("maxConcurrency").is_none());
+        assert!(harness.query_by_label("maxConnections").is_none());
+    }
+
+    /// A block carrying both limits renders the exclusivity finding instead
+    /// of either limit's field, and leaves the stored pair for the user to
+    /// resolve.
+    #[test]
+    fn xmux_section_reports_a_both_set_limit() {
+        let xmux = Rc::new(RefCell::new(Some(XmuxConfig {
+            max_concurrency: Some(Int32Range::single(8)),
+            max_connections: Some(Int32Range::single(2)),
+            ..Default::default()
+        })));
+        let xmux_for_ui = Rc::clone(&xmux);
+        let harness = Harness::new_ui(move |ui| {
+            let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
+        });
+        harness.get_by_label(t(Language::En, Key::SrvMutuallyExclusive));
+        assert!(harness.query_by_label("maxConcurrency").is_none());
+        assert!(harness.query_by_label("maxConnections").is_none());
+        let stored = xmux.borrow();
+        let stored = stored.as_ref().expect("the block stays enabled");
+        assert_eq!(stored.max_concurrency, Some(Int32Range::single(8)));
+        assert_eq!(stored.max_connections, Some(Int32Range::single(2)));
+    }
+
+    /// The enable switch owns the optional block: on seeds the core's
+    /// defaults, off clears it, and both directions report the edit.
+    #[test]
+    fn xmux_section_owns_the_enable_switch() {
+        let xmux: Rc<RefCell<Option<XmuxConfig>>> = Rc::new(RefCell::new(None));
+        let changed = Rc::new(std::cell::Cell::new(false));
+        let xmux_for_ui = Rc::clone(&xmux);
+        let changed_for_ui = Rc::clone(&changed);
+        let mut harness = Harness::new_ui(move |ui| {
+            if xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut()) {
+                changed_for_ui.set(true);
+            }
+        });
+        assert!(!changed.get());
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(changed.get());
+        let enabled = xmux.borrow().clone().expect("enabling seeds the block");
+        assert!(enabled.max_concurrency.is_none());
+        assert!(enabled.max_connections.is_none());
+        assert!(enabled.c_max_reuse_times.is_none());
+        assert!(enabled.h_max_request_times.is_none());
+        assert!(enabled.h_max_reusable_secs.is_none());
+        assert!(enabled.h_keep_alive_period.is_none());
+
+        changed.set(false);
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(changed.get());
+        assert!(xmux.borrow().is_none());
+    }
+
+    /// The XHTTP transport settings mount the shared XMUX control: its
+    /// controls render from the transport's stored block, and its enable
+    /// switch writes that block.
+    #[test]
+    fn xhttp_transport_settings_mount_the_shared_xmux_control() {
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Xhttp,
+            xhttp_settings: Some(XhttpSettings {
+                xmux: Some(XmuxConfig {
+                    c_max_reuse_times: Some(Int32Range::single(100)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 3600.0))
+            .build_ui_state(
+                |ui, screen: &mut ServersScreen| {
+                    let _ = screen.transport_tab(
+                        ui,
+                        Language::En,
+                        &mut stream_for_ui.borrow_mut(),
+                        false,
+                        0,
+                        TransportTabCtx {
+                            target: draft_target(DraftKind::Existing, "profile-1", 0),
+                            masked: false,
+                        },
+                    );
+                },
+                ServersScreen::default(),
+            );
+        harness.get_by_label(t(Language::En, Key::SrvXmux));
+        harness.get_by_label("cMaxReuseTimes");
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(
+            stream
+                .borrow()
+                .xhttp_settings
+                .as_ref()
+                .expect("the transport keeps its settings")
+                .xmux
+                .is_none()
         );
     }
 }
