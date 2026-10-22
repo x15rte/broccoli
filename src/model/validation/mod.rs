@@ -939,6 +939,30 @@ pub enum ValidationCode {
     /// (transport/internet/masque/dialer.go:132-134), so the pair silently
     /// picks HTTP/3; the core accepts the config and runs it.
     MasqueAlpnPrefersHttp3,
+    /// `stream.masqueSettings.warp.privateKey` is empty, or is neither a PEM
+    /// block nor standard base64: the core's WARP key decoder refuses both
+    /// while it builds the transport (`invalid "privateKey" in "warp"`,
+    /// infra/conf/transport_method.go). Error tier.
+    MasqueWarpPrivateKeyInvalid,
+    /// `stream.masqueSettings.warp.publicKey` is empty, or is neither a PEM
+    /// block nor standard base64: refused by the same decode
+    /// (`invalid "publicKey" in "warp"`). Error tier.
+    MasqueWarpPublicKeyInvalid,
+    /// One `stream.masqueSettings.warp.address` entry is not an address or
+    /// `address/prefix-length` pair: the core parses every entry with
+    /// `netip.ParsePrefix` and then `netip.ParseAddr` and refuses the document
+    /// (`invalid "address" in "warp"`). Error tier.
+    MasqueWarpAddressInvalid,
+    /// The `stream.masqueSettings.warp.address` list is empty, or holds more
+    /// than one IPv4 or more than one IPv6 entry: the core refuses both
+    /// (`"address" in "warp" is not set` /
+    /// `"address" in "warp" takes at most one IPv4 and one IPv6 address`).
+    /// Error tier.
+    MasqueWarpAddressShape,
+    /// `stream.masqueSettings.warp` is set beside `user` or `pass`: the core
+    /// refuses the pair (`"user" and "pass" can't be used with "warp"`).
+    /// Error tier.
+    MasqueWarpCredentialsConflict,
     /// `stream.xdriveSettings.service` outside `local`, `Google Drive` and
     /// `template`: the core's conf build refuses the whole document with
     /// `unsupported service` (infra/conf/transport_method.go:876-887). The
@@ -1273,10 +1297,11 @@ mod stream;
 
 pub use outbound::{
     DNS_OUT_ACTIONS, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
-    freedom_final_rule_supported, masque_remote_dns_verdict, mux_conflicts_with_vision_flow,
-    send_through_supported, sniffing_dest_override_supported, validate_outbound, validate_sniffing,
-    wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
-    wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
+    freedom_final_rule_supported, masque_remote_dns_verdict, masque_warp_address_list_verdict,
+    masque_warp_address_verdict, masque_warp_private_key_verdict, masque_warp_public_key_verdict,
+    mux_conflicts_with_vision_flow, send_through_supported, sniffing_dest_override_supported,
+    validate_outbound, validate_sniffing, wireguard_peer_public_key_verdict,
+    wireguard_preshared_key_verdict, wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{

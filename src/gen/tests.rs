@@ -4100,6 +4100,48 @@ fn golden_blackhole_custom_response() {
     );
 }
 
+/// A MASQUE outbound with WARP: the block carries the two keys and the IPv4
+/// and IPv6 local addresses, and the wire carries the WARP host and path the
+/// core would otherwise fill in, so the golden does not depend on that
+/// implicit default. The keys are a P-256 pair the pinned core's config test
+/// accepts.
+#[test]
+fn golden_masque_warp() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        remote_dns: vec!["1.1.1.1".into()],
+        ..Default::default()
+    });
+    {
+        let masque = ob
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound materializes its transport");
+        masque.warp = Some(MasqueWarp {
+            private_key: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2R+yOSXTp/zNykQY/HVbuMQxMoTI2XutpN/4TTX/WpehRANCAARlO6Wtq45ad5jNOWMN4e180wQ58bR0T3MFTbHjCKDOxARmSdqP9JELFvbzaLgN0OsLaJVQ386KTCS42s46zZEb".into(),
+            public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZTulrauOWneYzTljDeHtfNMEOfG0dE9zBU2x4wigzsQEZknaj/SRCxb282i4DdDrC2iVUN/OikwkuNrOOs2RGw==".into(),
+            address: vec!["172.16.0.2".into(), "2606:4700:110:8a36::2/128".into()],
+            ..Default::default()
+        });
+    }
+    {
+        let tls = ob
+            .stream
+            .tls_settings
+            .as_mut()
+            .expect("a masque outbound carries TLS");
+        tls.server_name = "cloudflareaccess.com".into();
+        tls.alpn = vec!["h3".into()];
+    }
+    golden!(
+        "goldens/masque_warp.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_hysteria2_realm_masquerade() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);

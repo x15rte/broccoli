@@ -1,0 +1,145 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10853",
+    "services": [
+      "ReflectionService",
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "dns": {
+    "enableParallelQuery": true,
+    "serveExpiredTTL": 86400,
+    "serveStale": true,
+    "servers": [
+      {
+        "address": "1.1.1.1",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "8.8.8.8",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:masque.example.com"
+        ],
+        "skipFallback": true
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "tag": "in-http"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "masque",
+      "settings": {
+        "address": "masque.example.com",
+        "port": 443,
+        "remoteDNS": [
+          "1.1.1.1"
+        ]
+      },
+      "streamSettings": {
+        "masqueSettings": {
+          "host": "cloudflareaccess.com",
+          "path": "/",
+          "warp": {
+            "address": [
+              "172.16.0.2",
+              "2606:4700:110:8a36::2/128"
+            ],
+            "privateKey": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2R+yOSXTp/zNykQY/HVbuMQxMoTI2XutpN/4TTX/WpehRANCAARlO6Wtq45ad5jNOWMN4e180wQ58bR0T3MFTbHjCKDOxARmSdqP9JELFvbzaLgN0OsLaJVQ386KTCS42s46zZEb",
+            "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZTulrauOWneYzTljDeHtfNMEOfG0dE9zBU2x4wigzsQEZknaj/SRCxb282i4DdDrC2iVUN/OikwkuNrOOs2RGw=="
+          }
+        },
+        "network": "masque",
+        "security": "tls",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "tlsSettings": {
+          "alpn": [
+            "h3"
+          ],
+          "serverName": "cloudflareaccess.com"
+        }
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-socks"
+        ],
+        "network": "udp",
+        "outboundTag": "dns-out",
+        "port": "53"
+      }
+    ]
+  },
+  "stats": {}
+}

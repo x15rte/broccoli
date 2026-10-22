@@ -473,7 +473,32 @@ impl Default for HysteriaTransport {
 /// unset path empty and the wire carries this value.
 pub const MASQUE_DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 
-/// `masqueSettings` (infra/conf/transport_method.go:793-849). `user`/`pass`
+/// The host and path the core substitutes when a `masqueSettings` block
+/// carries WARP and leaves them unset (`transport/internet/masque/warp.go`:
+/// `WarpHost`/`WarpPath`). The wire carries both explicitly, so the document
+/// does not depend on that implicit default.
+pub const MASQUE_WARP_HOST: &str = "cloudflareaccess.com";
+pub const MASQUE_WARP_PATH: &str = "/";
+
+/// `masqueSettings.warp` (infra/conf/transport_method.go:796-805): the WARP
+/// credentials and the local address list. The core parses both keys while it
+/// builds the transport; a PEM or base64 key that is not a P-256 private key
+/// (or a PKIX public key) is refused there, and so is a list that is not one
+/// IPv4 and at most one IPv6 address.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MasqueWarp {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub private_key: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub public_key: String,
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub address: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `masqueSettings` (infra/conf/transport_method.go:806-849). `user`/`pass`
 /// are conf-only keys the core folds into a single `Authorization: Basic`
 /// header while it builds the transport; the wire carries the folded header
 /// alone, so both fields stay here for the editor and round-trip.
@@ -482,10 +507,12 @@ pub const MASQUE_DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 pub struct MasqueTransport {
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub host: String,
-    /// Empty means the core's `DefaultPath`; the wire carries that value.
+    /// Empty means the core's `DefaultPath`, unless `warp` is set; the wire
+    /// carries the effective value.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub path: String,
-    /// Conf-only basic-auth user. A `:` is refused by the core's own build.
+    /// Conf-only basic-auth user. A `:` is refused by the core's own build,
+    /// and so is the field beside a `warp` block.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub user: String,
     /// Conf-only basic-auth password.
@@ -495,16 +522,29 @@ pub struct MasqueTransport {
     /// with `user`/`pass`. All three are refused by the core's build.
     #[serde(skip_serializing_if = "skip_empty_map")]
     pub headers: Map<String, Value>,
+    /// WARP credentials and local addresses. Present only when the user
+    /// turned WARP on; the core applies the WARP host and path defaults only
+    /// while this block exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warp: Option<MasqueWarp>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 impl MasqueTransport {
     /// Rewrite the draft into the document the core receives: fill the
-    /// default path, fold `user`/`pass` into the one `Authorization: Basic`
-    /// header the core's own conf build synthesizes, and drop the conf-only
-    /// keys (infra/conf/transport_method.go:801-844).
+    /// default path (or the WARP pair), fold `user`/`pass` into the one
+    /// `Authorization: Basic` header the core's own conf build synthesizes,
+    /// and drop the conf-only keys (infra/conf/transport_method.go:801-844).
     pub(crate) fn normalize_for_wire(&mut self) {
+        if self.warp.is_some() {
+            if self.host.is_empty() {
+                self.host = MASQUE_WARP_HOST.to_string();
+            }
+            if self.path.is_empty() {
+                self.path = MASQUE_WARP_PATH.to_string();
+            }
+        }
         if self.path.is_empty() {
             self.path = MASQUE_DEFAULT_PATH.to_string();
         }

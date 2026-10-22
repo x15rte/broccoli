@@ -24,7 +24,8 @@ use crate::i18n::{Key, t, validation_message};
 use crate::model::outbound::vless_encryption_supported;
 use crate::model::settings::Language;
 use crate::model::validation::{
-    ValidationCode, is_canonical_uuid, masque_remote_dns_verdict,
+    ValidationCode, is_canonical_uuid, masque_remote_dns_verdict, masque_warp_address_verdict,
+    masque_warp_private_key_verdict, masque_warp_public_key_verdict,
     wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
     wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
 };
@@ -110,6 +111,26 @@ pub(super) fn v_wg_remote_dns_entry(lang: Language, entry: &str) -> Option<Strin
 /// (infra/conf/masque.go:27-30).
 pub(super) fn v_masque_remote_dns_entry(lang: Language, entry: &str) -> Option<String> {
     verdict_error(lang, masque_remote_dns_verdict(entry))
+}
+
+/// The WARP private key row's verdict: the model refuses an empty value and
+/// one that is neither PEM nor base64, with the same code the pass reports.
+/// The decoded key's curve is the core's config-test judgement.
+pub(super) fn v_masque_warp_private_key(lang: Language, value: &str) -> Option<String> {
+    verdict_error(lang, masque_warp_private_key_verdict(value))
+}
+
+/// The WARP public key row's verdict (see [`v_masque_warp_private_key`]).
+pub(super) fn v_masque_warp_public_key(lang: Language, value: &str) -> Option<String> {
+    verdict_error(lang, masque_warp_public_key_verdict(value))
+}
+
+/// Per-entry verdict for the WARP address list: the entry must be an address
+/// literal or an `address/prefix-length` pair. The one-IPv4-and-one-IPv6 rule
+/// reads the whole list, so the editor renders it under the list through
+/// `masque_warp_address_list_verdict`.
+pub(super) fn v_masque_warp_address_entry(lang: Language, entry: &str) -> Option<String> {
+    verdict_error(lang, masque_warp_address_verdict(entry))
 }
 
 /// The tool-output guard for a generated encryption value. Delegates to the

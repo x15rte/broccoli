@@ -1318,6 +1318,15 @@ keys! {
     SrvMasqueUserColon 0,
     SrvMasqueAlpnHttp3 0,
     SrvMasqueHeaderValues 0,
+    SrvMasqueWarp 0,
+    SrvMasqueWarpPrivateKey 0,
+    SrvMasqueWarpPublicKey 0,
+    SrvMasqueWarpAddresses 0,
+    SrvMasqueWarpPrivateKeyInvalid 0,
+    SrvMasqueWarpPublicKeyInvalid 0,
+    SrvMasqueWarpAddressInvalid 0,
+    SrvMasqueWarpAddressShape 0,
+    SrvMasqueWarpCredentialsConflict 0,
     SrvXdriveService 0,
     SrvXdriveServiceUnset 0,
     SrvXdriveRemoteFolder 0,
@@ -2515,6 +2524,11 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         MasqueAuthorizationConflict => t(lang, Key::SrvMasqueAuthorizationConflict),
         MasqueUserColon => t(lang, Key::SrvMasqueUserColon),
         MasqueAlpnPrefersHttp3 => t(lang, Key::SrvMasqueAlpnHttp3),
+        MasqueWarpPrivateKeyInvalid => t(lang, Key::SrvMasqueWarpPrivateKeyInvalid),
+        MasqueWarpPublicKeyInvalid => t(lang, Key::SrvMasqueWarpPublicKeyInvalid),
+        MasqueWarpAddressInvalid => t(lang, Key::SrvMasqueWarpAddressInvalid),
+        MasqueWarpAddressShape => t(lang, Key::SrvMasqueWarpAddressShape),
+        MasqueWarpCredentialsConflict => t(lang, Key::SrvMasqueWarpCredentialsConflict),
         XdriveServiceUnsupported(_) => t(lang, Key::SrvXdriveServiceUnsupported),
         XdriveServiceMissing => t(lang, Key::SrvXdriveServiceMissing),
         XdriveDriveSecretsInvalid => t(lang, Key::SrvXdriveDriveSecrets),
@@ -4361,6 +4375,23 @@ mod en {
             Key::SrvMasqueUserColon => "MASQUE user cannot contain a colon",
             Key::SrvMasqueAlpnHttp3 => "An ALPN list with both h2 and h3 makes MASQUE use HTTP/3",
             Key::SrvMasqueHeaderValues => "MASQUE header values must be strings",
+            Key::SrvMasqueWarp => "WARP",
+            Key::SrvMasqueWarpPrivateKey => "Private key",
+            Key::SrvMasqueWarpPublicKey => "Public key",
+            Key::SrvMasqueWarpAddresses => "Addresses",
+            Key::SrvMasqueWarpPrivateKeyInvalid => {
+                "The WARP private key must be a PEM or base64 key"
+            }
+            Key::SrvMasqueWarpPublicKeyInvalid => "The WARP public key must be a PEM or base64 key",
+            Key::SrvMasqueWarpAddressInvalid => {
+                "Every WARP address must be an IP address or an IP prefix"
+            }
+            Key::SrvMasqueWarpAddressShape => {
+                "A WARP address list must hold one address, or one IPv4 and one IPv6 address"
+            }
+            Key::SrvMasqueWarpCredentialsConflict => {
+                "WARP cannot be used with a MASQUE user or password"
+            }
             Key::SrvXdriveSettingsMissing => "XDRIVE settings are missing",
             Key::SrvXdriveService => "Service",
             Key::SrvXdriveServiceUnset => "(choose a service)",

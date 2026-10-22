@@ -15,11 +15,11 @@ use super::{
 };
 use crate::model::inbound::Sniffing;
 use crate::model::outbound::{
-    Fragment, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
+    Fragment, MasqueWarpAddressFamily, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
     blackhole_response_is_custom, blackhole_response_type_supported,
     endpoint_requires_transport_security, is_valid_wireguard_key,
-    masque_remote_dns_entry_supported, vless_encryption_supported,
-    wireguard_remote_dns_entry_supported,
+    masque_remote_dns_entry_supported, masque_warp_address_family, masque_warp_key_shaped,
+    vless_encryption_supported, wireguard_remote_dns_entry_supported,
 };
 use crate::model::stream::{
     Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
@@ -419,6 +419,61 @@ pub fn masque_remote_dns_verdict(entry: &str) -> Option<ValidationCode> {
     (!masque_remote_dns_entry_supported(entry)).then_some(ValidationCode::MasqueRemoteDnsInvalid)
 }
 
+/// The verdict of one WARP private key: the core's decoder trims the value and
+/// refuses the empty string and anything that is neither PEM nor base64
+/// (`decodeWarpKey`, infra/conf/transport_method.go), so the editor row and
+/// the pass share this one rule. Whether the decoded bytes are a P-256 key is
+/// the core's config-test judgement.
+pub fn masque_warp_private_key_verdict(value: &str) -> Option<ValidationCode> {
+    (!masque_warp_key_shaped(value)).then_some(ValidationCode::MasqueWarpPrivateKeyInvalid)
+}
+
+/// The verdict of one WARP public key, shaped like
+/// [`masque_warp_private_key_verdict`]; whether the bytes are a PKIX key is the
+/// core's config-test judgement.
+pub fn masque_warp_public_key_verdict(value: &str) -> Option<ValidationCode> {
+    (!masque_warp_key_shaped(value)).then_some(ValidationCode::MasqueWarpPublicKeyInvalid)
+}
+
+/// The verdict of one WARP address entry: it must be an address literal or an
+/// `address/prefix-length` pair, which is what the core's
+/// `netip.ParsePrefix`-then-`netip.ParseAddr` parse accepts.
+pub fn masque_warp_address_verdict(entry: &str) -> Option<ValidationCode> {
+    masque_warp_address_family(entry)
+        .is_none()
+        .then_some(ValidationCode::MasqueWarpAddressInvalid)
+}
+
+/// The verdict of the whole WARP address list: at least one entry, and at most
+/// one per family. Entries that are not addresses are left to
+/// [`masque_warp_address_verdict`], so one bad entry does not also report as a
+/// shape finding.
+pub fn masque_warp_address_list_verdict(addresses: &[String]) -> Option<ValidationCode> {
+    if addresses.is_empty() {
+        return Some(ValidationCode::MasqueWarpAddressShape);
+    }
+    let mut seen_v4 = false;
+    let mut seen_v6 = false;
+    for entry in addresses {
+        match masque_warp_address_family(entry) {
+            Some(MasqueWarpAddressFamily::V4) => {
+                if seen_v4 {
+                    return Some(ValidationCode::MasqueWarpAddressShape);
+                }
+                seen_v4 = true;
+            }
+            Some(MasqueWarpAddressFamily::V6) => {
+                if seen_v6 {
+                    return Some(ValidationCode::MasqueWarpAddressShape);
+                }
+                seen_v6 = true;
+            }
+            None => {}
+        }
+    }
+    None
+}
+
 /// The verdict of the WireGuard `settings.secretKey` field: `WireGuardConfig.Build`
 /// runs it through `ParseWireGuardKey` (infra/conf/wireguard.go), which refuses
 /// the empty string and anything that is neither 64 hexadecimal digits nor the
@@ -473,6 +528,44 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
             ));
         }
         let credentials = !masque.user.is_empty() || !masque.pass.is_empty();
+        if let Some(warp) = masque.warp.as_ref() {
+            // The core checks the credential clash before it decodes either
+            // key, so the pass reports it first.
+            if credentials {
+                issues.push(issue(
+                    ValidationCode::MasqueWarpCredentialsConflict,
+                    Some("stream.masqueSettings.warp".into()),
+                ));
+            }
+            if !masque_warp_key_shaped(&warp.private_key) {
+                issues.push(issue(
+                    ValidationCode::MasqueWarpPrivateKeyInvalid,
+                    Some("stream.masqueSettings.warp.privateKey".into()),
+                ));
+            }
+            if !masque_warp_key_shaped(&warp.public_key) {
+                issues.push(issue(
+                    ValidationCode::MasqueWarpPublicKeyInvalid,
+                    Some("stream.masqueSettings.warp.publicKey".into()),
+                ));
+            }
+            if warp
+                .address
+                .iter()
+                .any(|entry| masque_warp_address_family(entry).is_none())
+            {
+                issues.push(issue(
+                    ValidationCode::MasqueWarpAddressInvalid,
+                    Some("stream.masqueSettings.warp.address".into()),
+                ));
+            }
+            if let Some(code) = masque_warp_address_list_verdict(&warp.address) {
+                issues.push(issue(
+                    code,
+                    Some("stream.masqueSettings.warp.address".into()),
+                ));
+            }
+        }
         if credentials && masque.user.contains(':') {
             issues.push(issue(
                 ValidationCode::MasqueUserColon,
@@ -1314,8 +1407,8 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
 mod tests {
     use super::*;
     use crate::model::stream::{
-        FinalmaskModel, HttpupgradeSettings, HysteriaTransport, MasqueTransport, SockoptModel,
-        WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings,
+        FinalmaskModel, HttpupgradeSettings, HysteriaTransport, MasqueTransport, MasqueWarp,
+        SockoptModel, WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings,
     };
     use crate::model::validation::Severity;
     use crate::model::validation::tests::{codes, finding};
@@ -1725,6 +1818,140 @@ mod tests {
         let mut outbound = runnable_masque();
         outbound.stream.tls_settings.as_mut().unwrap().alpn = vec!["h2".into()];
         assert!(validate_outbound(&outbound).advisory().next().is_none());
+    }
+
+    /// The WARP rules: the two keys must be non-empty PEM or base64 strings,
+    /// the address list must hold one entry or one per family, and the block
+    /// cannot stand beside a user or a password. Whether a key is a real
+    /// P-256 key is the core's config-test judgement and stays out of the
+    /// model.
+    #[test]
+    fn masque_warp_rules_gate_keys_addresses_and_credentials() {
+        let with_warp = |warp: MasqueWarp| -> Verdict {
+            let mut outbound = runnable_masque();
+            outbound
+                .stream
+                .masque_settings
+                .as_mut()
+                .expect("a masque outbound materializes its transport")
+                .warp = Some(warp);
+            validate_outbound(&outbound)
+        };
+        let valid = || MasqueWarp {
+            private_key: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg".into(),
+            public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE".into(),
+            address: vec!["172.16.0.2".into(), "2606:4700:110:8a36::2/128".into()],
+            ..Default::default()
+        };
+
+        let verdict = with_warp(valid());
+        assert!(!verdict.has_blocking(), "{verdict:#?}");
+
+        // A PEM block is the other accepted spelling, matching labels and all,
+        // and CR/LF inside a base64 body is what the core's decoder skips.
+        let mut pem = valid();
+        pem.private_key =
+            "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----".into();
+        assert!(!with_warp(pem).has_blocking());
+        let mut wrapped = valid();
+        wrapped.private_key = "MIGHAgEAMBMGByqGSM49\nAgEGCCqGSM49AwEH".into();
+        assert!(!with_warp(wrapped).has_blocking());
+
+        // Empty and unshaped keys carry one rule each, under their own path.
+        for (mut warp, code, path) in [
+            (
+                valid(),
+                ValidationCode::MasqueWarpPrivateKeyInvalid,
+                "stream.masqueSettings.warp.privateKey",
+            ),
+            (
+                valid(),
+                ValidationCode::MasqueWarpPublicKeyInvalid,
+                "stream.masqueSettings.warp.publicKey",
+            ),
+        ] {
+            let code_is_private = code == ValidationCode::MasqueWarpPrivateKeyInvalid;
+            if code_is_private {
+                warp.private_key.clear();
+            } else {
+                warp.public_key = "not a key".into();
+            }
+            let verdict = with_warp(warp);
+            assert!(
+                verdict
+                    .blocking()
+                    .any(|issue| issue.code == code && issue.path.as_deref() == Some(path)),
+                "{code:?}: {verdict:#?}"
+            );
+        }
+
+        // An empty list, two addresses of one family, and a bad entry are the
+        // core's three address refusals; the bad entry does not also report
+        // as a shape finding.
+        for (address, codes_expected) in [
+            (vec![], vec![ValidationCode::MasqueWarpAddressShape]),
+            (
+                vec!["172.16.0.2".into(), "172.16.0.3".into()],
+                vec![ValidationCode::MasqueWarpAddressShape],
+            ),
+            (
+                vec![
+                    "172.16.0.2".into(),
+                    "2606:4700:110:8a36::2".into(),
+                    "2606:4700:110:8a36::3".into(),
+                ],
+                vec![ValidationCode::MasqueWarpAddressShape],
+            ),
+            (
+                vec!["not-an-ip".into()],
+                vec![ValidationCode::MasqueWarpAddressInvalid],
+            ),
+            (
+                vec!["172.16.0.2/33".into()],
+                vec![ValidationCode::MasqueWarpAddressInvalid],
+            ),
+        ] {
+            let mut warp = valid();
+            warp.address = address.clone();
+            let found = codes(&with_warp(warp));
+            for expected in &codes_expected {
+                assert!(found.contains(expected), "{address:?}: {found:#?}");
+            }
+            assert_eq!(
+                found
+                    .iter()
+                    .filter(|code| matches!(
+                        code,
+                        ValidationCode::MasqueWarpAddressShape
+                            | ValidationCode::MasqueWarpAddressInvalid
+                    ))
+                    .count(),
+                codes_expected.len(),
+                "{address:?}: {found:#?}"
+            );
+        }
+
+        // A bare address and a prefix pair are both accepted.
+        let mut prefixed = valid();
+        prefixed.address = vec!["172.16.0.2/32".into(), "2606:4700:110:8a36::2/128".into()];
+        assert!(!with_warp(prefixed).has_blocking());
+
+        // The core refuses WARP beside either credential field.
+        for set_credential in [
+            &(|masque: &mut MasqueTransport| masque.user = "user".into())
+                as &dyn Fn(&mut MasqueTransport),
+            &(|masque: &mut MasqueTransport| masque.pass = "pass".into()),
+        ] {
+            let mut outbound = runnable_masque();
+            let masque = outbound.stream.masque_settings.as_mut().unwrap();
+            masque.warp = Some(valid());
+            set_credential(masque);
+            let found = codes(&validate_outbound(&outbound));
+            assert!(
+                found.contains(&ValidationCode::MasqueWarpCredentialsConflict),
+                "{found:#?}"
+            );
+        }
     }
 
     /// The `masqueSettings` block is required like every other block-carrying

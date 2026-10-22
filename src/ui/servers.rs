@@ -22,7 +22,7 @@ use crate::model::outbound::{
 };
 use crate::model::settings::Language;
 use crate::model::stream::{
-    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
+    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
     XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
     XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
@@ -35,9 +35,10 @@ use crate::model::stream::{
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
     dns_out_action_supported, ech_sockopt_emitted, freedom_final_rule_supported,
-    mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid,
-    reality_public_key_valid, send_through_supported, server_name_implausible, tls_version_rank,
-    validate_finalmask, validate_outbound, validate_sockopt,
+    masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
+    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
+    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
+    validate_outbound, validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -74,7 +75,8 @@ use finalmask_editors::{
 use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
 use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
 use validators::{
-    v_masque_remote_dns_entry, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
+    v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
+    v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
     v_vless_encryption, v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry,
     v_wg_secret_key,
 };
@@ -5640,19 +5642,79 @@ impl ServersScreen {
             Network::Masque => {
                 let had_settings = st.masque_settings.is_some();
                 let mut s = st.masque_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                // WARP changes both defaults the core applies: it replaces the
+                // host with `cloudflareaccess.com` and the path with `/`. The
+                // hints show the values the wire will carry, and the model's
+                // wire pass fills them in.
+                let default_host = if s.warp.is_some() {
+                    crate::model::stream::MASQUE_WARP_HOST
+                } else {
+                    "example.com"
+                };
+                let default_path = if s.warp.is_some() {
+                    crate::model::stream::MASQUE_WARP_PATH
+                } else {
+                    crate::model::stream::MASQUE_DEFAULT_PATH
+                };
+                changed |= widgets::text_field(ui, "host", &mut s.host, default_host);
                 // An unset path leaves the core's own default; the field hint
                 // shows that value, and only the two placeholders survive the
                 // model's `MasquePathInvalid` rule.
-                changed |= widgets::text_field(
-                    ui,
-                    "path",
-                    &mut s.path,
-                    crate::model::stream::MASQUE_DEFAULT_PATH,
-                );
+                changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
                 changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
                 changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                let mut has_warp = s.warp.is_some();
+                if ui
+                    .checkbox(&mut has_warp, t(lang, Key::SrvMasqueWarp))
+                    .changed()
+                {
+                    s.warp = has_warp.then(MasqueWarp::default);
+                    changed = true;
+                }
+                let credentials = !s.user.is_empty() || !s.pass.is_empty();
+                if let Some(warp) = s.warp.as_mut() {
+                    if credentials {
+                        ui.colored_label(
+                            status_colors_of(ui).err,
+                            validation_message(
+                                &ValidationCode::MasqueWarpCredentialsConflict,
+                                lang,
+                            ),
+                        );
+                    }
+                    changed |= widgets::masked_validated_field(
+                        ui,
+                        t(lang, Key::SrvMasqueWarpPrivateKey),
+                        &mut warp.private_key,
+                        "",
+                        |value| v_masque_warp_private_key(lang, value),
+                        masked,
+                    );
+                    changed |= widgets::masked_validated_field(
+                        ui,
+                        t(lang, Key::SrvMasqueWarpPublicKey),
+                        &mut warp.public_key,
+                        "",
+                        |value| v_masque_warp_public_key(lang, value),
+                        masked,
+                    );
+                    // One entry can be IPv4 or IPv6; a second must be the
+                    // other family. The row rule judges one entry, and the
+                    // list rule — the same one the model pass reads — reports
+                    // the count and family rule under the list.
+                    changed |= widgets::validated_string_list(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvMasqueWarpAddresses),
+                        &mut warp.address,
+                        "172.16.0.2",
+                        |entry, _list_len| v_masque_warp_address_entry(lang, entry),
+                    );
+                    if let Some(code) = masque_warp_address_list_verdict(&warp.address) {
+                        ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
+                    }
+                }
                 if had_settings || changed {
                     st.masque_settings = Some(s);
                 }
@@ -8000,9 +8062,9 @@ mod tests {
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule,
-        HysteriaTransport, Int32Range, MasqueTransport, Network, Noise, OutboundModel, Protocol,
-        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-        WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
+        HysteriaTransport, Int32Range, MasqueTransport, MasqueWarp, Network, Noise, OutboundModel,
+        Protocol, ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
+        TlsModel, WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -10655,6 +10717,12 @@ Authentication: ML-KEM-768, Post-Quantum
                 path: crate::model::stream::MASQUE_DEFAULT_PATH.into(),
                 user: "user".into(),
                 pass: "pass".into(),
+                warp: Some(MasqueWarp {
+                    private_key: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH".into(),
+                    public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE".into(),
+                    address: vec!["172.16.0.2".into()],
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -10674,7 +10742,16 @@ Authentication: ML-KEM-768, Post-Quantum
                 },
             );
         });
-        for label in ["host", "path", "user", "pass"] {
+        for label in [
+            "host",
+            "path",
+            "user",
+            "pass",
+            "WARP",
+            "Private key",
+            "Public key",
+            "Addresses",
+        ] {
             assert!(
                 harness.query_all_by_label_contains(label).next().is_some(),
                 "the masque editor must render its {label:?} field"
