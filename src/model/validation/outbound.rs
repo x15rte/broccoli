@@ -1729,7 +1729,7 @@ mod tests {
         // local: a named path is enough.
         let local = xdrive_outbound(XdriveTransport {
             service: super::XDRIVE_SERVICE_LOCAL.into(),
-            remote_folder: "U:/store".into(),
+            remote_folder: "C:/store".into(),
             ..Default::default()
         });
         assert!(!validate_outbound(&local).has_blocking());
@@ -1875,7 +1875,7 @@ mod tests {
 
         let local = |settings: XdriveTransport| XdriveTransport {
             service: super::XDRIVE_SERVICE_LOCAL.into(),
-            remote_folder: "U:/store".into(),
+            remote_folder: "C:/store".into(),
             ..settings
         };
 

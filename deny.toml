@@ -93,7 +93,6 @@ unused-allowed-license = "warn"
 #   - syn 2.0.119 / 3.0.3          - proc-macro ecosystem split (syn 1.x stays
 #                                    below the windows-target graph line)
 #   - windows-sys 0.52.0 / 0.60.2 / 0.61.2 - windows-rs release pins
-#                                    (documented Key Decision)
 #   - windows-targets 0.52.6 / 0.53.5 - windows-sys companion crate
 #   - windows_x86_64_msvc 0.52.6 / 0.53.1 - windows-sys companion crate
 multiple-versions = "warn"

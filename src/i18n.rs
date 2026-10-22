@@ -6979,8 +6979,8 @@ mod tests {
             "Local write"
         );
         assert_eq!(
-            safety_message(&SafetyCode::XdriveLocalFolder("U:/store".into()), lang),
-            "The local XDRIVE service writes to U:/store on this machine"
+            safety_message(&SafetyCode::XdriveLocalFolder("C:/store".into()), lang),
+            "The local XDRIVE service writes to C:/store on this machine"
         );
     }
 

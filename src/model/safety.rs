@@ -1017,7 +1017,7 @@ mod tests {
             version: 1,
             active: Some("0123456789abcdef".into()),
             profiles: vec![
-                profile(XDRIVE_SERVICE_LOCAL, "U:/store"),
+                profile(XDRIVE_SERVICE_LOCAL, "C:/store"),
                 profile(XDRIVE_SERVICE_LOCAL, ""),
                 profile(XDRIVE_SERVICE_DRIVE, "folder-id"),
                 profile(XDRIVE_SERVICE_TEMPLATE, "token"),
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(findings[0].class, HazardClass::LocalWrite);
         assert_eq!(
             findings[0].code,
-            SafetyCode::XdriveLocalFolder("U:/store".into())
+            SafetyCode::XdriveLocalFolder("C:/store".into())
         );
     }
 }
