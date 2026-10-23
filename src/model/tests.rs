@@ -536,11 +536,34 @@ fn roundtrip_dns() {
         "disableFallback": true, "disableFallbackIfMatch": true,
         "enableParallelQuery": true, "useSystemHosts": true,
         "bootstrap": "localhost",
+        "script": "dns.lua",
         "fakedns": {"enabled": true, "pools": [
             {"ipPool": "198.18.0.0/15", "poolSize": 65535}
         ]}
     }));
     check_value(&DnsCfg::default());
+}
+
+#[test]
+fn script_paths_round_trip_through_the_state_files() {
+    // Both script surfaces are one optional string each: a stored path
+    // survives the save/load boundary unchanged, and an absent key means no
+    // script (the core's own `script: ""` state is never stored).
+    let dns = DnsCfg {
+        script: Some("dns.lua".into()),
+        ..Default::default()
+    };
+    check_value(&dns);
+    let routing = RoutingCfg {
+        script: Some("routing.lua".into()),
+        ..Default::default()
+    };
+    let stored = serde_json::to_value(&routing).unwrap();
+    assert_eq!(stored["script"], json!("routing.lua"));
+    check_value(&routing);
+
+    let absent: DnsCfg = serde_json::from_value(json!({"servers": []})).unwrap();
+    assert_eq!(absent.script, None, "an absent key is no script");
 }
 
 #[test]

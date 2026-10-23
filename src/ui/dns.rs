@@ -8,6 +8,7 @@ use crate::model::dns::{
     SECOND_FAKEDNS_POOL_CIDR, SECOND_FAKEDNS_POOL_SIZE, is_valid_cidr,
 };
 use crate::model::settings::Language;
+use crate::model::validation::dns_script_issues;
 use crate::model::{DnsServer, FakeDnsPool};
 use crate::ui::{UiCtx, widgets};
 use egui::{DragValue, RichText, Ui};
@@ -279,13 +280,22 @@ impl DnsScreen {
                 {
                     *changed = true;
                 }
-                if ui
-                    .checkbox(
+                // The core refuses `enableParallelQuery` beside a script
+                // (infra/conf/dns.go:276-278) and the emitter suppresses it,
+                // so the switch is inapplicable while a script is set.
+                let parallel = ui.add_enabled(
+                    dns.script.is_none(),
+                    egui::Checkbox::new(
                         &mut dns.enable_parallel_query,
                         t(lang, Key::DnsParallelQueries),
-                    )
-                    .changed()
-                {
+                    ),
+                );
+                let parallel = if dns.script.is_some() {
+                    parallel.on_hover_text(t(lang, Key::DnsParallelQueriesScriptHint))
+                } else {
+                    parallel
+                };
+                if parallel.changed() {
                     *changed = true;
                 }
                 if ui
@@ -302,6 +312,37 @@ impl DnsScreen {
                 t(lang, Key::DnsServeExpiredTtl),
                 &mut dns.serve_expired_ttl,
                 0..=MAX_SERVE_EXPIRED_TTL,
+            );
+            // The script row's verdict runs the same helper the apply gate
+            // does, so the row and the gate refuse the same states with the
+            // same text. The state it reads beside the path (the fallback
+            // flags and the servers' matchers) changes only through this
+            // screen, so the model generation is the revision the memo needs.
+            let revision = *ctx.model_generation;
+            let servers = &dns.servers;
+            let disable_fallback = dns.disable_fallback;
+            let disable_fallback_if_match = dns.disable_fallback_if_match;
+            let conflict = |script: &str| {
+                dns_script_issues(
+                    Some(script),
+                    servers,
+                    disable_fallback,
+                    disable_fallback_if_match,
+                )
+                .into_iter()
+                .next()
+            };
+            *changed |= widgets::lua_script_field(
+                ui,
+                lang,
+                widgets::LuaScriptLabels {
+                    toggle: t(lang, Key::DnsScriptToggle),
+                    path: t(lang, Key::DnsScriptPath),
+                    hint: t(lang, Key::DnsScriptHint),
+                },
+                &mut dns.script,
+                revision,
+                conflict,
             );
         });
     }

@@ -331,6 +331,12 @@ pub struct DnsCfg {
     pub enable_parallel_query: bool,
     #[serde(skip_serializing_if = "skip_false")]
     pub use_system_hosts: bool,
+    /// Path to a Lua DNS script (`dns.script`, infra/conf/dns.go:166):
+    /// `None` = no script, `Some(path)` = the file the core resolves and
+    /// compiles at load. The app stores the path verbatim and never reads or
+    /// runs the file; the path's structural rules live in the validation pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// GUI-only group; stripped from the dns object by the generator.
     pub fakedns: FakeDnsCfg,
     #[serde(flatten)]
@@ -359,6 +365,7 @@ impl Default for DnsCfg {
             disable_fallback_if_match: false,
             enable_parallel_query: true,
             use_system_hosts: false,
+            script: None,
             fakedns: FakeDnsCfg::default(),
             extra: Map::new(),
         }
@@ -406,6 +413,19 @@ impl DnsCfg {
             .is_none_or(Vec::is_empty)
         {
             obj.remove("servers");
+        }
+        // A script owns query scheduling: the core refuses a script beside
+        // `enableParallelQuery` (infra/conf/dns.go:276-278), so the app-owned
+        // default never reaches the wire next to one. An empty script is the
+        // core's own "no script" spelling and strips like an absent one.
+        if self
+            .script
+            .as_deref()
+            .is_some_and(|script| !script.is_empty())
+        {
+            obj.remove("enableParallelQuery");
+        } else if self.script.as_deref() == Some("") {
+            obj.remove("script");
         }
         if obj.get("enableParallelQuery") == Some(&Value::Bool(false)) {
             obj.remove("enableParallelQuery");
