@@ -7,7 +7,8 @@ use super::stream::{
     finalmask_udp_hop_interval_mode, freedom_domain_strategy_supported,
     hop_transport_migrates_connections, is_canonical_uuid, shadowsocks_2022_key_usable,
     shadowsocks_method_supported, sockopt_address_port_strategy_supported,
-    target_strategy_supported, validate_stream, vless_flow_supported, vmess_security_supported,
+    target_strategy_supported, tls_alpn_is_h3, validate_stream, vless_flow_supported,
+    vmess_security_supported, xmux_limits_conflict,
 };
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, extra_has_key, extra_key_set,
@@ -28,7 +29,7 @@ use crate::model::stream::{
     XDRIVE_SERVICE_TEMPLATE, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate,
     xdrive_names_regex_supported, xdrive_service_supported, xdrive_template_auth_type_supported,
 };
-use crate::model::{fold_eq, go_std_base64_decodes, parse_range_go, vocabulary_holds};
+use crate::model::{fold_eq, fold_lower, go_std_base64_decodes, parse_range_go, vocabulary_holds};
 use base64::Engine as _;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -370,12 +371,6 @@ fn validate_masque(o: &OutboundModel, issues: &mut Vec<ValidationIssue>) {
             Some("stream.network".into()),
         ));
     }
-    if o.protocol == Protocol::Masque && o.mux.enabled {
-        issues.push(issue(
-            ValidationCode::MasqueOutboundMuxUnsupported,
-            Some("mux.enabled".into()),
-        ));
-    }
     if let ProtocolSettings::Masque(settings) = &o.settings {
         if settings.address.is_empty() {
             issues.push(issue(
@@ -472,6 +467,15 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
                 Some("stream.masqueSettings.host".into()),
             ));
         }
+        // The conf build reads the same two limits the other xmux carriers
+        // read and refuses them together
+        // (infra/conf/transport_method.go: the masque settings' `xmux`).
+        if xmux_limits_conflict(masque.xmux.as_ref()) {
+            issues.push(issue(
+                ValidationCode::XmuxLimitsExclusive,
+                Some("stream.masqueSettings.xmux".into()),
+            ));
+        }
         let credentials = !masque.user.is_empty() || !masque.pass.is_empty();
         if credentials && masque.user.contains(':') {
             issues.push(issue(
@@ -525,8 +529,9 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
 
 /// The `xdrive` transport's own rules, on the stream where its settings live:
 /// the service discriminator and its per-service requirements, the template's
-/// four operations and its authorization, and the scalars the runtime
-/// rewrites. Called from `validate_stream`'s visit.
+/// four operations and its authorization, the connection-reuse block, the h3
+/// form's two extra refusals, and the scalars the runtime rewrites. Called
+/// from `validate_stream`'s visit.
 ///
 /// Only the service and the Drive-secret count are refused while the core
 /// loads the document; the folder, the template operations and the
@@ -594,6 +599,53 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
             Some(template) => validate_xdrive_template(template, issues),
         },
         _ => {}
+    }
+    // The XMUX block the transport carries is the same one XHTTP carries, and
+    // the core's build refuses it the same way: the two connection limits are
+    // two spellings of one choice.
+    if xmux_limits_conflict(xdrive.xmux.as_ref()) {
+        issues.push(issue(
+            ValidationCode::XmuxLimitsExclusive,
+            Some("stream.xdriveSettings.xmux".into()),
+        ));
+    }
+    // The h3 form is TLS ALPN exactly `["h3"]` and nothing else. Over h3 the
+    // core builds a QUIC connection, so it refuses a Google Drive outbound
+    // whose UDP masks would rewrite the QUIC datagrams (only noise may run
+    // ahead of them) and a brutal congestion controller, which belongs to
+    // Hysteria (infra/conf/transport_internet.go:266-276).
+    if tls_alpn_is_h3(stream) {
+        let drive_service = matches!(
+            xdrive.service.as_str(),
+            XDRIVE_SERVICE_DRIVE | XDRIVE_SERVICE_DRIVE_RETIRED
+        );
+        if drive_service && let Some(finalmask) = stream.finalmask.as_ref() {
+            for (index, mask) in finalmask.udp.iter().enumerate() {
+                // An unknown mask is already refused by the finalmask pass;
+                // the core stops at that build before it reads the h3 rule.
+                if let Some(kind) = mask.known_type()
+                    && kind != "noise"
+                {
+                    issues.push(issue(
+                        ValidationCode::XdriveH3MaskNotNoise(kind.into()),
+                        Some(format!("finalmask.udp[{index}]")),
+                    ));
+                }
+            }
+        }
+        let brutal = stream
+            .finalmask
+            .as_ref()
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .is_some_and(|quic| {
+                matches!(&*fold_lower(&quic.congestion), "brutal" | "force-brutal")
+            });
+        if brutal {
+            issues.push(issue(
+                ValidationCode::XdriveH3CongestionBrutal,
+                Some("finalmask.quicParams.congestion".into()),
+            ));
+        }
     }
     if xdrive.segment_bytes > XDRIVE_MAX_SEGMENT_BYTES {
         issues.push(warning(
@@ -1313,9 +1365,11 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Int32Range;
     use crate::model::stream::{
-        FinalmaskModel, HttpupgradeSettings, HysteriaTransport, MasqueTransport, SockoptModel,
-        WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings,
+        FinalmaskModel, FinalmaskNoise, FinalmaskQuicParams, FinalmaskSalamander, FinalmaskUdpMask,
+        HttpupgradeSettings, HysteriaTransport, MasqueTransport, Security, SockoptModel, TlsModel,
+        WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings, XmuxConfig,
     };
     use crate::model::validation::Severity;
     use crate::model::validation::tests::{codes, finding};
@@ -1524,9 +1578,74 @@ mod tests {
         outbound
     }
 
+    /// Mux.Cool is legal on a masque outbound: the core builds the outbound
+    /// with the mux settings the document carries, so the model must not
+    /// refuse a document the core runs.
+    #[test]
+    fn masque_outbound_carries_mux_cool() {
+        let mut muxed = runnable_masque();
+        muxed.mux.enabled = true;
+        muxed.mux.concurrency = Some(8);
+        let issues = validate_outbound(&muxed);
+        assert!(!issues.has_blocking(), "{issues:#?}");
+    }
+
+    /// The masque transport's `xmux` refuses both connection limits at once,
+    /// exactly as every transport that carries the block does: the core's
+    /// build answers `maxConnections cannot be specified together with
+    /// maxConcurrency` (infra/conf/transport_method.go).
+    #[test]
+    fn masque_xmux_limits_are_mutually_exclusive() {
+        let mut outbound = runnable_masque();
+        outbound
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound carries its transport")
+            .xmux = Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(2)),
+            max_concurrency: Some(Int32Range::single(8)),
+            ..Default::default()
+        });
+
+        let issues = validate_outbound(&outbound);
+        let exclusive = finding(&issues, &ValidationCode::XmuxLimitsExclusive)
+            .unwrap_or_else(|| panic!("both limits must gate: {issues:#?}"));
+        assert_eq!(
+            exclusive.path.as_deref(),
+            Some("stream.masqueSettings.xmux")
+        );
+        assert_eq!(exclusive.severity, Severity::Error);
+
+        // Either limit alone is what the core accepts.
+        for xmux in [
+            XmuxConfig {
+                max_connections: Some(Int32Range::single(2)),
+                ..Default::default()
+            },
+            XmuxConfig {
+                max_concurrency: Some(Int32Range::single(8)),
+                ..Default::default()
+            },
+        ] {
+            let mut alone = runnable_masque();
+            alone
+                .stream
+                .masque_settings
+                .as_mut()
+                .expect("a masque outbound carries its transport")
+                .xmux = Some(xmux);
+            let issues = validate_outbound(&alone);
+            assert!(
+                finding(&issues, &ValidationCode::XmuxLimitsExclusive).is_none(),
+                "one limit at a time is legal: {issues:#?}"
+            );
+        }
+    }
+
     /// The pinned core refuses the masque transport on another protocol at
-    /// config load and refuses a masque outbound without its transport, with
-    /// mux, or without TLS at instance creation; the model gates each.
+    /// config load and refuses a masque outbound without its transport or
+    /// without TLS at instance creation; the model gates each.
     #[test]
     fn masque_outbound_and_transport_pair_rules_gate_both_directions() {
         assert!(
@@ -1553,12 +1672,6 @@ mod tests {
             found.contains(&ValidationCode::MasqueTransportRequiresMasqueOutbound),
             "{found:#?}"
         );
-
-        // Mux on the masque outbound (a config-load refusal).
-        let mut muxed = runnable_masque();
-        muxed.mux.enabled = true;
-        let found = codes(&validate_outbound(&muxed));
-        assert!(found.contains(&ValidationCode::MasqueOutboundMuxUnsupported));
 
         // No TLS on the masque transport (an instance-creation refusal).
         let mut plain = runnable_masque();
@@ -1780,6 +1893,17 @@ mod tests {
         XdriveTransport {
             service: super::XDRIVE_SERVICE_LOCAL.into(),
             remote_folder: "C:/store".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A complete Google Drive block: the service the core's h3 mask rule
+    /// names, with the three secrets it requires.
+    fn drive_xdrive_settings() -> XdriveTransport {
+        XdriveTransport {
+            service: super::XDRIVE_SERVICE_DRIVE.into(),
+            remote_folder: "folder-id".into(),
+            secrets: vec!["id".into(), "secret".into(), "refresh".into()],
             ..Default::default()
         }
     }
@@ -2017,6 +2141,179 @@ mod tests {
             ..Default::default()
         }));
         assert!(paths.is_empty(), "{paths:#?}");
+    }
+
+    /// The xdrive XMUX block refuses the same pair as the other transports:
+    /// `maxConnections` and `maxConcurrency` are one limit chosen two ways,
+    /// and the core's build refuses both at once.
+    #[test]
+    fn xdrive_xmux_limits_are_exclusive() {
+        let xmux = |max_connections: Option<i32>, max_concurrency: Option<i32>| XmuxConfig {
+            max_connections: max_connections.map(Int32Range::single),
+            max_concurrency: max_concurrency.map(Int32Range::single),
+            ..Default::default()
+        };
+        let with_xmux = |xmux: XmuxConfig| {
+            xdrive_outbound(XdriveTransport {
+                xmux: Some(xmux),
+                ..local_xdrive_settings()
+            })
+        };
+
+        let both = validate_outbound(&with_xmux(xmux(Some(4), Some(8))));
+        let issue = finding(&both, &ValidationCode::XmuxLimitsExclusive)
+            .expect("both connection limits must gate the profile");
+        assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.xmux"));
+        assert_eq!(issue.severity, Severity::Error);
+
+        for limit in [xmux(Some(4), None), xmux(None, Some(8)), xmux(None, None)] {
+            assert!(
+                !validate_outbound(&with_xmux(limit.clone())).has_blocking(),
+                "one limit (or none) is a legal block: {limit:?}"
+            );
+        }
+    }
+
+    /// The h3 form of xdrive is the TLS ALPN list exactly `["h3"]`, and it
+    /// carries the core's two extra refusals: a Google Drive outbound may only
+    /// run the noise UDP mask, and the congestion method may not be a brutal
+    /// variant. Every other spelling stays legal.
+    #[test]
+    fn xdrive_over_h3_restricts_google_drive_masks_and_brutal_congestion() {
+        let with_stream = |settings: XdriveTransport, alter: &dyn Fn(&mut StreamModel)| {
+            let mut outbound = xdrive_outbound(settings);
+            alter(&mut outbound.stream);
+            outbound
+        };
+        let h3 = |stream: &mut StreamModel| {
+            stream.security = Security::Tls;
+            stream.tls_settings = Some(TlsModel {
+                server_name: "www.googleapis.com".into(),
+                alpn: vec!["h3".into()],
+                ..Default::default()
+            });
+        };
+        let h2 = |stream: &mut StreamModel| {
+            stream.security = Security::Tls;
+            stream.tls_settings = Some(TlsModel {
+                server_name: "www.googleapis.com".into(),
+                alpn: vec!["h2".into()],
+                ..Default::default()
+            });
+        };
+        let mask = |mask: FinalmaskUdpMask| FinalmaskModel {
+            udp: vec![mask],
+            ..Default::default()
+        };
+        let noise = || FinalmaskUdpMask::Noise {
+            settings: FinalmaskNoise::default(),
+            extra: Default::default(),
+        };
+        let salamander = || FinalmaskUdpMask::Salamander {
+            settings: FinalmaskSalamander::default(),
+            extra: Default::default(),
+        };
+        let quic = |congestion: &str| FinalmaskModel {
+            quic_params: Some(FinalmaskQuicParams {
+                congestion: congestion.into(),
+                brutal_up: "100 mbps".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Noise plus bbr is the working combination.
+        let outbound = with_stream(drive_xdrive_settings(), &|stream| {
+            h3(stream);
+            stream.finalmask = Some(FinalmaskModel {
+                udp: vec![noise()],
+                quic_params: Some(FinalmaskQuicParams {
+                    congestion: "bbr".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+        assert!(!validate_outbound(&outbound).has_blocking());
+
+        // Google Drive over h3: any other UDP mask is refused by name.
+        let outbound = with_stream(drive_xdrive_settings(), &|stream| {
+            h3(stream);
+            stream.finalmask = Some(mask(salamander()));
+        });
+        let verdict = validate_outbound(&outbound);
+        let issue = finding(
+            &verdict,
+            &ValidationCode::XdriveH3MaskNotNoise("salamander".into()),
+        )
+        .expect("a non-noise mask must gate the Google Drive h3 form");
+        assert_eq!(issue.path.as_deref(), Some("finalmask.udp[0]"));
+        assert_eq!(issue.severity, Severity::Error);
+
+        // A brutal or force-brutal congestion method is refused in the h3
+        // form regardless of the service.
+        for congestion in ["brutal", "force-brutal", "BRUTAL"] {
+            let outbound = with_stream(drive_xdrive_settings(), &|stream| {
+                h3(stream);
+                stream.finalmask = Some(quic(congestion));
+            });
+            let verdict = validate_outbound(&outbound);
+            let issue = finding(&verdict, &ValidationCode::XdriveH3CongestionBrutal)
+                .expect("a brutal congestion method must gate the h3 form");
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("finalmask.quicParams.congestion")
+            );
+            assert_eq!(issue.severity, Severity::Error);
+        }
+
+        // The non-h3 forms keep both values: the core applies the restrictions
+        // only after TLS selected exactly `["h3"]` for xdrive.
+        let outbound = with_stream(drive_xdrive_settings(), &|stream| {
+            h2(stream);
+            stream.finalmask = Some(FinalmaskModel {
+                udp: vec![salamander()],
+                quic_params: Some(FinalmaskQuicParams {
+                    congestion: "brutal".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+        let found = codes(&validate_outbound(&outbound));
+        assert!(
+            !found.contains(&ValidationCode::XdriveH3CongestionBrutal)
+                && !found.contains(&ValidationCode::XdriveH3MaskNotNoise("salamander".into())),
+            "{found:#?}"
+        );
+
+        // The mask rule names Google Drive; another service may run the same
+        // mask over h3.
+        let outbound = with_stream(local_xdrive_settings(), &|stream| {
+            h3(stream);
+            stream.finalmask = Some(mask(salamander()));
+        });
+        let found = codes(&validate_outbound(&outbound));
+        assert!(
+            !found.contains(&ValidationCode::XdriveH3MaskNotNoise("salamander".into())),
+            "{found:#?}"
+        );
+
+        // ALPN must be exactly one `h3`: a longer list leaves xdrive on h2.
+        let outbound = with_stream(drive_xdrive_settings(), &|stream| {
+            stream.security = Security::Tls;
+            stream.tls_settings = Some(TlsModel {
+                server_name: "www.googleapis.com".into(),
+                alpn: vec!["h3".into(), "h2".into()],
+                ..Default::default()
+            });
+            stream.finalmask = Some(mask(salamander()));
+        });
+        let found = codes(&validate_outbound(&outbound));
+        assert!(
+            !found.contains(&ValidationCode::XdriveH3MaskNotNoise("salamander".into())),
+            "{found:#?}"
+        );
     }
 
     /// A stored freedom outbound carrying xdrive is refused by the core's

@@ -520,6 +520,7 @@ fn roundtrip_routing() {
 #[test]
 fn roundtrip_dns() {
     check::<DnsServer>(json!({
+        "id": "d1",
         "address": "https://dns.google/dns-query", "port": 443, "domains": ["geosite:cn"],
         "expectedIPs": ["geoip:cn"], "unexpectedIPs": ["1.2.3.4"], "skipFallback": true,
         "clientIp": "203.0.113.1", "queryStrategy": "useip4", "tag": "d1",

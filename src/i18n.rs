@@ -596,6 +596,8 @@ keys! {
     DnsAddress 0,
     DnsAddressHint 0,
     DnsAddressRequired 0,
+    DnsId 0,
+    DnsIdHint 0,
     DnsPort 0,
     DnsDomains 0,
     DnsDomainsHint 0,
@@ -770,6 +772,7 @@ keys! {
     GeodataModifiedUnavailable 0,
     GeodataSearch 0,
     GeodataNoMatches 0,
+    RoutingGeoTagAbsent 1,
     RuntimeStateRefreshed 0,
     RuntimeOverrideTitle 0,
     RuntimeOverrideEphemeral 0,
@@ -1310,7 +1313,6 @@ keys! {
     SrvMasqueOutboundTransport 0,
     SrvMasqueTransportMissing 0,
     SrvMasqueSettingsMissing 0,
-    SrvMasqueMuxUnsupported 0,
     SrvMasqueTransportTls 0,
     SrvMasqueSettingsIncomplete 0,
     SrvMasqueRemoteDns 0,
@@ -1377,6 +1379,8 @@ keys! {
     SrvXdriveMuxXudpSkip 0,
     SrvXdriveTestpre 0,
     SrvXdriveDriveRenamed 0,
+    SrvXdriveH3MaskNotNoise 1,
+    SrvXdriveH3BrutalCongestion 0,
     SrvXdriveResetToRaw 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
@@ -1496,6 +1500,7 @@ keys! {
     SrvTlsServerNameEmptyNote 0,
     SrvRealityServerNameEmptyNote 0,
     SrvTlsFingerprintNote 0,
+    SrvTlsUseSystemCaNote 0,
     SrvRealityFingerprintNote 0,
     SrvVisionUdp443Note 0,
     SrvXudpProxyUdp443Note 0,
@@ -1580,7 +1585,7 @@ keys! {
     SrvXhttpSeqPlacementInvalid 0,
     SrvXhttpSessionLengthRequired 0,
     SrvXhttpSessionTableInvalid 0,
-    SrvXhttpXmuxExclusive 0,
+    SrvXmuxLimitsExclusive 0,
     XhttpExtraShadowsSettings 1,
     SniffingDestOverrideInvalid 0,
     OutboundTargetStrategyInvalid 0,
@@ -2510,7 +2515,6 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
         MasqueTransportRequiresMasqueOutbound => t(lang, Key::SrvMasqueOutboundTransport),
         MasqueOutboundRequiresMasqueTransport => t(lang, Key::SrvMasqueTransportMissing),
-        MasqueOutboundMuxUnsupported => t(lang, Key::SrvMasqueMuxUnsupported),
         MasqueTransportRequiresTls => t(lang, Key::SrvMasqueTransportTls),
         MasqueSettingsIncomplete => t(lang, Key::SrvMasqueSettingsIncomplete),
         MasqueRemoteDnsInvalid => t(lang, Key::SrvMasqueRemoteDns),
@@ -2540,6 +2544,8 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XdriveMuxXudpProxyUdp443Skip => t(lang, Key::SrvXdriveMuxXudpSkip),
         XdriveVlessTestpreUnsupported => t(lang, Key::SrvXdriveTestpre),
         XdriveDriveServiceRenamed => t(lang, Key::SrvXdriveDriveRenamed),
+        XdriveH3MaskNotNoise(_) => t(lang, Key::SrvXdriveH3MaskNotNoise),
+        XdriveH3CongestionBrutal => t(lang, Key::SrvXdriveH3BrutalCongestion),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -2585,7 +2591,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XhttpSeqPlacementInvalid => t(lang, Key::SrvXhttpSeqPlacementInvalid),
         XhttpSessionIdLengthRequired => t(lang, Key::SrvXhttpSessionLengthRequired),
         XhttpSessionIdTableInvalid => t(lang, Key::SrvXhttpSessionTableInvalid),
-        XhttpXmuxLimitsExclusive => t(lang, Key::SrvXhttpXmuxExclusive),
+        XmuxLimitsExclusive => t(lang, Key::SrvXmuxLimitsExclusive),
         XhttpExtraShadowsSettings(_) => t(lang, Key::XhttpExtraShadowsSettings),
         SniffingDestOverrideInvalid => t(lang, Key::SniffingDestOverrideInvalid),
         OutboundTargetStrategyInvalid => t(lang, Key::OutboundTargetStrategyInvalid),
@@ -2807,6 +2813,7 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
             vec![format!("{arg:?}")]
         }
+        ValidationCode::XdriveH3MaskNotNoise(arg) => vec![arg.clone()],
         ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskFilterIpRuleInvalid(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
@@ -3389,6 +3396,8 @@ mod en {
                 "1.1.1.1, https://dns.google/dns-query, quic+local://, tcp://, hosts path, fakedns"
             }
             Key::DnsAddressRequired => "DNS server address is required",
+            Key::DnsId => "ID",
+            Key::DnsIdHint => "name this server for a DNS script",
             Key::DnsPort => "Port",
             Key::DnsDomains => "Domains",
             Key::DnsDomainsHint => "route matching domains to this server",
@@ -3607,6 +3616,9 @@ mod en {
             Key::GeodataModifiedUnavailable => "unavailable",
             Key::GeodataSearch => "Search codes…",
             Key::GeodataNoMatches => "No matching codes.",
+            Key::RoutingGeoTagAbsent => {
+                "The loaded geo data does not carry {}. This condition matches nothing."
+            }
             Key::RuntimeStateRefreshed => "Runtime state refreshed.",
             Key::RuntimeOverrideTitle => "Runtime override",
             Key::RuntimeOverrideEphemeral => {
@@ -4359,7 +4371,6 @@ mod en {
             Key::SrvMasqueOutboundTransport => "MASQUE transport requires a MASQUE outbound",
             Key::SrvMasqueTransportMissing => "MASQUE outbound requires the MASQUE transport",
             Key::SrvMasqueSettingsMissing => "MASQUE settings are missing",
-            Key::SrvMasqueMuxUnsupported => "MASQUE outbound does not support mux",
             Key::SrvMasqueTransportTls => "MASQUE transport requires TLS",
             Key::SrvMasqueSettingsIncomplete => "MASQUE server address and port are required",
             Key::SrvMasqueRemoteDns => "Every MASQUE remote DNS entry must be an IP address",
@@ -4444,6 +4455,12 @@ mod en {
             Key::SrvXdriveTestpre => "The xdrive transport does not support VLESS testpre",
             Key::SrvXdriveDriveRenamed => {
                 "The \"Google Drive\" service was renamed. The profile is saved as \"google-drive\"."
+            }
+            Key::SrvXdriveH3MaskNotNoise => {
+                "Over h3 to Google Drive the only UDP mask that works is noise, not {}"
+            }
+            Key::SrvXdriveH3BrutalCongestion => {
+                "Over h3 the congestion control is bbr or reno, not brutal or force-brutal"
             }
             Key::SrvXdriveResetToRaw => {
                 "The xdrive transport is VLESS-only. Switching protocol reset the transport to raw."
@@ -4590,6 +4607,12 @@ mod en {
             Key::SrvTlsFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. unsafe = native Go TLS, no imitation"
+            }
+            Key::SrvTlsUseSystemCaNote => {
+                "off (the default) = the root certificates bundled with the core verify the \
+                 server. on = the certificate store of the operating system verifies the server, \
+                 including roots a user installed. Turn it on only when a private certificate \
+                 authority must be trusted"
             }
             Key::SrvRealityFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
@@ -4792,7 +4815,7 @@ mod en {
                 "sessionIDTable must be ASCII and, together with sessionIDLength (from at \
                  least 1), provide at least 2^31 key combinations"
             }
-            Key::SrvXhttpXmuxExclusive => {
+            Key::SrvXmuxLimitsExclusive => {
                 "maxConnections and maxConcurrency are mutually exclusive. Choose one"
             }
             Key::XhttpExtraShadowsSettings => {

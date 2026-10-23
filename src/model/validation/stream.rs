@@ -430,10 +430,10 @@ pub fn uplink_http_method_mode_supported(method: &str, mode: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") || mode == "packet-up"
 }
 
-/// XHTTP xmux `maxConnections` and `maxConcurrency` are
-/// mutually exclusive while both are in use. Xray compares the ranges'
-/// upper bounds (`To > 0`), so a range whose `to` is 0 is the "not in use"
-/// wire shape in both seams.
+/// A transport's xmux `maxConnections` and `maxConcurrency` are mutually
+/// exclusive while both are in use, on every transport whose conf build
+/// reads the block. Xray compares the ranges' upper bounds (`To > 0`), so a
+/// range whose `to` is 0 is the "not in use" wire shape in both seams.
 pub fn xmux_limits_conflict(xmux: Option<&XmuxConfig>) -> bool {
     xmux.is_some_and(|xmux| {
         xmux.max_connections.is_some_and(|range| range.to > 0)
@@ -989,7 +989,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             }
             if xmux_limits_conflict(xhttp.xmux.as_ref()) {
                 issues.push(issue(
-                    ValidationCode::XhttpXmuxLimitsExclusive,
+                    ValidationCode::XmuxLimitsExclusive,
                     Some("stream.xhttpSettings.xmux".into()),
                 ));
             }
@@ -1481,16 +1481,23 @@ pub(super) fn hop_transport_migrates_connections(outbound: &OutboundModel) -> bo
     }
     match outbound.stream.network {
         Network::Hysteria => true,
-        Network::Xhttp => {
-            outbound.stream.security == Security::Tls
-                && outbound
-                    .stream
-                    .tls_settings
-                    .as_ref()
-                    .is_some_and(|tls| tls.alpn.len() == 1 && tls.alpn[0] == "h3")
-        }
+        Network::Xhttp => tls_alpn_is_h3(&outbound.stream),
         _ => false,
     }
+}
+
+/// True when TLS selected the QUIC transport the way the core reads it: the
+/// security mode is `tls` and the ALPN list is exactly `["h3"]`. XHTTP's h3
+/// branch (`transport/internet/splithttp/dialer.go:82-99`) and xdrive's h3
+/// form (`infra/conf/transport_internet.go:108-115`) both detect it this way;
+/// no other spelling — a longer list, a mixed case, a REALITY block — selects
+/// it.
+pub(super) fn tls_alpn_is_h3(stream: &StreamModel) -> bool {
+    stream.security == Security::Tls
+        && stream
+            .tls_settings
+            .as_ref()
+            .is_some_and(|tls| tls.alpn == ["h3"])
 }
 
 fn finalmask_valid_var_name(value: &str) -> bool {
@@ -4052,7 +4059,7 @@ mod tests {
                         | ValidationCode::XhttpSeqPlacementInvalid
                         | ValidationCode::XhttpSessionIdLengthRequired
                         | ValidationCode::XhttpSessionIdTableInvalid
-                        | ValidationCode::XhttpXmuxLimitsExclusive
+                        | ValidationCode::XmuxLimitsExclusive
                         | ValidationCode::StreamOneNoDownload
                 )
             })
@@ -4153,7 +4160,7 @@ mod tests {
             ValidationCode::XhttpUplinkDataPlacementRequiresPacketUp,
             ValidationCode::XhttpUplinkHttpMethodRequiresPacketUp,
             ValidationCode::XhttpSessionIdTableInvalid,
-            ValidationCode::XhttpXmuxLimitsExclusive,
+            ValidationCode::XmuxLimitsExclusive,
         ] {
             assert!(found.contains(&code), "missing {code:?} in {found:#?}");
         }
