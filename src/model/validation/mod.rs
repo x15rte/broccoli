@@ -367,16 +367,17 @@ pub enum ValidationCode {
     /// token name. Error tier.
     FinalmaskNoiseExpArgumentNotAllowed(String),
     FinalmaskSalamanderPacketSize,
-    /// A retired `xdns` spelling: the removed `domain` key, or a string where
-    /// `domains`/`resolvers` now hold objects. The value is retained in the
-    /// settings file and never reaches the wire, so the mask runs without it.
-    /// Advisory (Severity::Warning), never a gate.
+    /// A stored `xdns` mask used a removed spelling: the `domain` key, the
+    /// bare-string domain and resolver entries, or the old domain `name` and
+    /// resolver `type` + `settings.addr` fields. The load migrates every one
+    /// in memory and the save writes the current shape, so the mask runs
+    /// without user action. Advisory (Severity::Warning), never a gate.
     FinalmaskXdnsShapeRetired,
     /// An `xdns` domain `types` list is empty or names a type outside A (1),
     /// CNAME (5), TXT (16), and AAAA (28): the domain build refuses it
     /// (`transport/internet/finalmask/xdns/domain.go:88-98`). Error tier.
     FinalmaskXdnsDomainTypesInvalid,
-    /// An `xdns` domain `name` holds two dots in a row: the domain build
+    /// An `xdns` domain name holds two dots in a row: the domain build
     /// refuses it (`transport/internet/finalmask/xdns/domain.go:83-85`).
     /// Error tier.
     FinalmaskXdnsDomainNameInvalid,
@@ -390,17 +391,29 @@ pub enum ValidationCode {
     /// capacity is below 17 bytes
     /// (`transport/internet/finalmask/xdns/domain.go:112-128`). Error tier.
     FinalmaskXdnsDomainCapacityInvalid,
-    /// An `xdns` resolver `type` folds to neither `tcp` nor `udp`: the loader
-    /// reports an unknown config id
-    /// (`infra/conf/transport_finalmask.go:818-821`). Error tier.
-    FinalmaskXdnsResolverTypeUnknown,
-    /// An `xdns` resolver `settings.addr` is missing or is not the `host:port`
-    /// the mask parses before it dials
-    /// (`transport/internet/finalmask/xdns/resolver_tcp.go:28`,
-    /// `resolver_udp.go:26`). Error tier.
+    /// An `xdns` resolver address carries a scheme the mask build refuses:
+    /// it maps only bare addresses (UDP, port 53), `tcp`, `udp`, and `https`
+    /// onto a resolver (`infra/conf/transport_finalmask.go:903-923`). The
+    /// payload is the scheme. Error tier.
+    FinalmaskXdnsAddrSchemeUnknown(String),
+    /// An `xdns` resolver address is missing or is malformed for its scheme:
+    /// a `tcp`/`udp` address needs a host and, when present, a numeric port,
+    /// and an `https` address needs a URL with a host
+    /// (`infra/conf/transport_finalmask.go:903-923`). Error tier.
     FinalmaskXdnsResolverAddrInvalid,
+    /// An `xdns` resolver addresses DoH over `https://` without a
+    /// `tlsConfig`: the DoH resolver refuses to start without one
+    /// (`transport/internet/finalmask/xdns/resolver_doh.go:46-48`). Error
+    /// tier.
+    FinalmaskXdnsHttpsRequiresTls,
+    /// An `xdns` resolver `worker` is negative: zero takes the core's 32
+    /// default, and a DoH resolver refuses a count below one
+    /// (`infra/conf/transport_finalmask.go:880-883`,
+    /// `transport/internet/finalmask/xdns/resolver_doh.go:42-44`). Error
+    /// tier.
+    FinalmaskXdnsWorkerInvalid,
     /// An `xdns` `extraPoll` is outside 0 through 3: the mask build refuses it
-    /// (`infra/conf/transport_finalmask.go:872-874`). Error tier.
+    /// (`infra/conf/transport_finalmask.go:928-930`). Error tier.
     FinalmaskXdnsExtraPollInvalid,
     FinalmaskXicmpIpInvalid,
     FinalmaskRealmScheme,

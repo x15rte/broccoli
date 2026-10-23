@@ -44,14 +44,13 @@ pub use safety::{HazardClass, SafetyCode, SafetyFinding};
 pub use servers::{ServerProfile, ServersFile};
 pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, Settings};
 pub use stream::{
-    CustomSockopt, FinalmaskFilter, FinalmaskFragment, FinalmaskHeaderCustomTcp,
-    FinalmaskHeaderCustomUdp, FinalmaskMkcpLegacy, FinalmaskModel, FinalmaskNoise,
-    FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
-    FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSalamander, FinalmaskSudoku,
-    FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop,
-    FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain,
-    FinalmaskXdnsDomainEntry, FinalmaskXdnsResolver, FinalmaskXdnsResolverEntry,
-    FinalmaskXdnsResolverSettings, FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings,
+    CustomSockopt, FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskFragment,
+    FinalmaskHeaderCustomTcp, FinalmaskHeaderCustomUdp, FinalmaskMkcpLegacy, FinalmaskModel,
+    FinalmaskNoise, FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
+    FinalmaskRealm, FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSalamander,
+    FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg,
+    FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain,
+    FinalmaskXdnsResolver, FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings,
     HappyEyeballs, HttpCamouflageRequest, HttpCamouflageResponse, HttpupgradeSettings,
     HysteriaTransport, KcpSettings, MasqueTransport, MasqueWarp, Network, RawHeader, RawSettings,
     RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,

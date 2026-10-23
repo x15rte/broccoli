@@ -12,8 +12,8 @@ use crate::model::outbound::{OutboundModel, ProtocolSettings};
 use crate::model::stream::{
     FinalmaskFilter, FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
     FinalmaskSudoku, FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomain,
-    FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH,
-    Network, Security, SockoptModel, StreamModel, XmuxConfig,
+    FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security, SockoptModel, StreamModel,
+    XmuxConfig,
 };
 use crate::model::{
     Int32Range, fold_eq, fold_lower, go_std_base64_decode, go_std_base64_decodes, parse_range_go,
@@ -2278,31 +2278,90 @@ fn finalmask_valid_split_host_port(value: &str) -> bool {
     value.matches(':').count() == 1
 }
 
-/// True for the `host:port` an `xdns` resolver dials. The mask builds its
-/// destination as `net.ParseDestination("<type>:" + addr)`
-/// (`transport/internet/finalmask/xdns/resolver_tcp.go:28`,
-/// `resolver_udp.go:26`): a bracketed IPv6 host or a single colon, then a
-/// numeric port. A missing or malformed address leaves the mask unable to
-/// start.
-fn finalmask_valid_xdns_addr(value: &str) -> bool {
-    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
-        match rest.split_once("]:") {
-            Some((host, port)) => (host, port),
-            None => return false,
+/// The scheme an `xdns` resolver address selects, mirroring the mask build
+/// (`infra/conf/transport_finalmask.go:903-923`): an address without `://` is
+/// read as `udp://<address>` (port 53 when the address carries none), while
+/// a spelled scheme must be `tcp`, `udp`, or `https`. `None` when the core
+/// refuses the address for its scheme.
+fn finalmask_xdns_addr_scheme(value: &str) -> Option<&'static str> {
+    match value.split_once("://") {
+        Some((scheme, authority)) => match &*fold_lower(scheme) {
+            "tcp" => finalmask_xdns_host_authority(authority).then_some("tcp"),
+            "udp" => finalmask_xdns_host_authority(authority).then_some("udp"),
+            "https" => finalmask_xdns_https_authority(authority).then_some("https"),
+            _ => None,
+        },
+        None => finalmask_xdns_host_authority(value).then_some("udp"),
+    }
+}
+
+/// The scheme an address spells when it carries `://` at all, whatever the
+/// core thinks of it.
+fn finalmask_xdns_addr_scheme_word(value: &str) -> Option<&str> {
+    value
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| !scheme.is_empty())
+}
+
+/// True for the authority Go's URL parser hands the mask build: the part
+/// before the first `/`, `?`, `#`, with any userinfo dropped. A bracketed
+/// IPv6 host or a host without a colon may carry a numeric port; a missing
+/// port takes the core's 53.
+fn finalmask_xdns_host_authority(authority: &str) -> bool {
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if host.is_empty() {
+            return false;
         }
-    } else if value.matches(':').count() == 1 {
-        value.split_once(':').expect("exactly one colon")
-    } else {
+        return match tail.strip_prefix(':') {
+            None => tail.is_empty(),
+            Some(port) => port.parse::<u16>().is_ok_and(|port| port != 0),
+        };
+    }
+    match authority.split_once(':') {
+        None => !authority.is_empty() && !authority.contains(['[', ']']),
+        Some((host, port)) => {
+            !host.is_empty()
+                && !host.contains(['[', ']', ':'])
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        }
+    }
+}
+
+/// True for a DoH URL the mask build accepts: a non-empty host after the
+/// scheme, with the path and query passed through to the HTTP client.
+fn finalmask_xdns_https_authority(authority: &str) -> bool {
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
         return false;
-    };
-    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        return !host.is_empty()
+            && match tail.strip_prefix(':') {
+                None => tail.is_empty(),
+                Some(port) => port.parse::<u16>().is_ok_and(|port| port != 0),
+            };
+    }
+    match authority.split_once(':') {
+        None => true,
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0),
+    }
 }
 
 /// Whether one `xdns` domain's limits leave the room its name needs. The
 /// loader substitutes a zero `lenLimit` with 255 and a zero `labelLimit` with
 /// 63 before it builds the domain
-/// (`infra/conf/transport_finalmask.go:838-843`); the build then refuses a
-/// `lenLimit` below the wire length of `name` plus one, and a derived label
+/// (`infra/conf/transport_finalmask.go:858-863`); the build then refuses a
+/// `lenLimit` below the wire length of the name plus one, and a derived label
 /// capacity below 17 bytes
 /// (`transport/internet/finalmask/xdns/domain.go:112-128`). The name's wire
 /// length is its bytes plus the trailing root dot, exactly the `uint8(len)`
@@ -2310,7 +2369,7 @@ fn finalmask_valid_xdns_addr(value: &str) -> bool {
 /// (`transport/internet/finalmask/xdns/domain.go:112-115`). `None` when a
 /// limit is outside its own range: the core refuses that first, and the
 /// caller reports it instead.
-fn finalmask_xdns_capacity_refused(domain: &FinalmaskXdnsDomain) -> bool {
+fn finalmask_xdns_capacity_refused(name: &str, domain: &FinalmaskXdnsDomain) -> bool {
     if !(0..=255).contains(&domain.len_limit) || !(0..=63).contains(&domain.label_limit) {
         return false;
     }
@@ -2324,7 +2383,7 @@ fn finalmask_xdns_capacity_refused(domain: &FinalmaskXdnsDomain) -> bool {
     } else {
         domain.label_limit
     };
-    let name_len = domain.name.len() as i32 + 1;
+    let name_len = name.len() as i32 + 1;
     if len_limit < name_len + 1 {
         return true;
     }
@@ -2437,24 +2496,14 @@ fn finalmask_validate_udp_mask(
             finalmask_validate_sudoku(&format!("{path}.settings"), settings);
         }
         FinalmaskUdpMask::Xdns { settings, .. } => {
-            if !settings.domain.is_absent() {
+            if settings.retired_shape {
                 issues.push(warning(
                     ValidationCode::FinalmaskXdnsShapeRetired,
-                    Some(format!("{path}.settings.domain")),
+                    Some(format!("{path}.settings")),
                 ));
             }
-            for (domain_index, entry) in settings.domains.iter().enumerate() {
+            for (domain_index, domain) in settings.domains.iter().enumerate() {
                 let entry_path = format!("{path}.settings.domains[{domain_index}]");
-                let domain = match entry {
-                    FinalmaskXdnsDomainEntry::Retired(_) => {
-                        issues.push(warning(
-                            ValidationCode::FinalmaskXdnsShapeRetired,
-                            Some(entry_path),
-                        ));
-                        continue;
-                    }
-                    FinalmaskXdnsDomainEntry::Domain(domain) => domain,
-                };
                 if domain.types.is_empty()
                     || domain
                         .types
@@ -2466,11 +2515,19 @@ fn finalmask_validate_udp_mask(
                         Some(format!("{entry_path}.types")),
                     ));
                 }
-                if domain.name.contains("..") {
-                    issues.push(issue(
-                        ValidationCode::FinalmaskXdnsDomainNameInvalid,
-                        Some(format!("{entry_path}.name")),
-                    ));
+                for (name_index, name) in domain.names.iter().enumerate() {
+                    let name_path = format!("{entry_path}.names[{name_index}]");
+                    if name.contains("..") {
+                        issues.push(issue(
+                            ValidationCode::FinalmaskXdnsDomainNameInvalid,
+                            Some(name_path),
+                        ));
+                    } else if finalmask_xdns_capacity_refused(name, domain) {
+                        issues.push(issue(
+                            ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
+                            Some(name_path),
+                        ));
+                    }
                 }
                 if !(0..=255).contains(&domain.len_limit) {
                     issues.push(issue(
@@ -2490,36 +2547,43 @@ fn finalmask_validate_udp_mask(
                         Some(format!("{entry_path}.edns0")),
                     ));
                 }
-                if finalmask_xdns_capacity_refused(domain) {
-                    issues.push(issue(
-                        ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
-                        Some(entry_path),
-                    ));
-                }
             }
-            for (resolver_index, entry) in settings.resolvers.iter().enumerate() {
+            for (resolver_index, resolver) in settings.resolvers.iter().enumerate() {
                 let entry_path = format!("{path}.settings.resolvers[{resolver_index}]");
-                let resolver = match entry {
-                    FinalmaskXdnsResolverEntry::Retired(_) => {
-                        issues.push(warning(
-                            ValidationCode::FinalmaskXdnsShapeRetired,
-                            Some(entry_path),
-                        ));
-                        continue;
+                for (addr_index, addr) in resolver.addrs.iter().enumerate() {
+                    let addr_path = format!("{entry_path}.addrs[{addr_index}]");
+                    match finalmask_xdns_addr_scheme(addr) {
+                        Some("https") if resolver.tls_config.is_none() => {
+                            issues.push(issue(
+                                ValidationCode::FinalmaskXdnsHttpsRequiresTls,
+                                Some(addr_path),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => match finalmask_xdns_addr_scheme_word(addr) {
+                            Some(scheme) => issues.push(issue(
+                                ValidationCode::FinalmaskXdnsAddrSchemeUnknown(scheme.to_string()),
+                                Some(addr_path),
+                            )),
+                            None => issues.push(issue(
+                                ValidationCode::FinalmaskXdnsResolverAddrInvalid,
+                                Some(addr_path),
+                            )),
+                        },
                     }
-                    FinalmaskXdnsResolverEntry::Resolver(resolver) => resolver,
-                };
-                if !matches!(fold_lower(&resolver.resolver_type).as_ref(), "tcp" | "udp") {
+                }
+                if resolver.worker < 0 {
                     issues.push(issue(
-                        ValidationCode::FinalmaskXdnsResolverTypeUnknown,
-                        Some(format!("{entry_path}.type")),
+                        ValidationCode::FinalmaskXdnsWorkerInvalid,
+                        Some(format!("{entry_path}.worker")),
                     ));
                 }
-                if !finalmask_valid_xdns_addr(&resolver.settings.addr) {
-                    issues.push(issue(
-                        ValidationCode::FinalmaskXdnsResolverAddrInvalid,
-                        Some(format!("{entry_path}.settings.addr")),
-                    ));
+                if let Some(quic) = resolver.quic_config.as_ref() {
+                    finalmask_validate_quic_params(
+                        &format!("{entry_path}.quicConfig"),
+                        quic,
+                        issues,
+                    );
                 }
             }
             if !(0..=3).contains(&settings.extra_poll) {
@@ -3332,7 +3396,9 @@ mod tests {
                     "noise": [{"rand": 1, "type": "hex", "packet": "00"}]
                 }},
                 {"type": "salamander", "settings": {"packetSize": "0-2049"}},
-                {"type": "xdns", "settings": {"resolvers": [{"type": "quic", "settings": {"addr": "1.1.1.1:53"}}]}},
+                {"type": "xdns", "settings": {
+                    "resolvers": [{"addrs": ["quic://1.1.1.1:53"]}]
+                }},
                 {"type": "xicmp", "settings": {"ips": ["not-an-ip"]}},
                 {"type": "realm", "settings": {"url": "https://example", "stunServers": []}},
                 {"type": "udphop", "settings": {
@@ -3367,8 +3433,8 @@ mod tests {
                 "finalmask.udp[1].settings.packetSize",
             ),
             (
-                ValidationCode::FinalmaskXdnsResolverTypeUnknown,
-                "finalmask.udp[2].settings.resolvers[0].type",
+                ValidationCode::FinalmaskXdnsAddrSchemeUnknown("quic".into()),
+                "finalmask.udp[2].settings.resolvers[0].addrs[0]",
             ),
             (
                 ValidationCode::FinalmaskXicmpIpInvalid,
@@ -3432,31 +3498,34 @@ mod tests {
     /// entry and field: an empty or unknown record type, a name holding two
     /// dots, a length limit or `edns0` outside its range, limits that leave
     /// too little room for the name and the encoded payload, an unknown
-    /// resolver type, a missing or malformed resolver address, and an
-    /// `extraPoll` outside 0 through 3.
+    /// address scheme, a malformed address, an `https` address without TLS, a
+    /// negative worker, and an `extraPoll` outside 0 through 3.
     #[test]
     fn finalmask_xdns_rules_mirror_the_core() {
         let fm: FinalmaskModel = serde_json::from_value(json!({
             "udp": [{"type": "xdns", "settings": {
                 "domains": [
-                    {"name": "a.example", "types": [], "lenLimit": 256},
-                    {"name": "b.example", "types": [2]},
-                    {"name": "c.example", "types": [1], "labelLimit": 64},
-                    {"name": "d.example", "types": [1], "edns0": 100},
-                    {"name": "ok.example", "types": [1, 5, 16, 28],
+                    {"names": ["a.example"], "types": [], "lenLimit": 256},
+                    {"names": ["b.example"], "types": [2]},
+                    {"names": ["c.example"], "types": [1], "labelLimit": 64},
+                    {"names": ["d.example"], "types": [1], "edns0": 100},
+                    {"names": ["ok.example", "second.example"], "types": [1, 5, 16, 28],
                      "lenLimit": 255, "labelLimit": 63, "edns0": 512},
-                    {"name": "a..b", "types": [1]},
-                    {"name": "tunnel.example.com", "types": [1], "lenLimit": 3},
-                    {"name": "a", "types": [1], "lenLimit": 3},
-                    {"name": "tight.example", "types": [1], "lenLimit": 20, "labelLimit": 63},
-                    {"name": "a", "types": [1], "lenLimit": 32, "labelLimit": 63},
-                    {"name": "a", "types": [1], "lenLimit": 31, "labelLimit": 63}
+                    {"names": ["a..b", "a.example"], "types": [1]},
+                    {"names": ["tunnel.example.com"], "types": [1], "lenLimit": 3},
+                    {"names": ["a"], "types": [1], "lenLimit": 3},
+                    {"names": ["tight.example"], "types": [1], "lenLimit": 20, "labelLimit": 63},
+                    {"names": ["a"], "types": [1], "lenLimit": 32, "labelLimit": 63},
+                    {"names": ["a"], "types": [1], "lenLimit": 31, "labelLimit": 63}
                 ],
                 "resolvers": [
-                    {"type": "quic", "settings": {"addr": "1.1.1.1:53"}},
-                    {"type": "tcp", "settings": {"addr": "not-an-address"}},
-                    {"type": "udp", "settings": {}},
-                    {"type": "UDP", "settings": {"addr": "[2001:db8::1]:53"}}
+                    {"addrs": ["quic://1.1.1.1:53"]},
+                    {"addrs": ["1.1.1.1:notaport"]},
+                    {"addrs": [""]},
+                    {"addrs": ["[2001:db8::1]:53", "h.example", "UDP://1.1.1.1:53"]},
+                    {"addrs": ["https://dns.example/dns-query"]},
+                    {"addrs": ["https://dns.example/dns-query"], "tlsConfig": {}},
+                    {"addrs": ["1.1.1.1"], "worker": -1}
                 ],
                 "extraPoll": 4
             }}]
@@ -3486,35 +3555,43 @@ mod tests {
             ),
             (
                 ValidationCode::FinalmaskXdnsDomainNameInvalid,
-                "finalmask.udp[0].settings.domains[5].name",
+                "finalmask.udp[0].settings.domains[5].names[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
-                "finalmask.udp[0].settings.domains[6]",
+                "finalmask.udp[0].settings.domains[6].names[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
-                "finalmask.udp[0].settings.domains[7]",
+                "finalmask.udp[0].settings.domains[7].names[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
-                "finalmask.udp[0].settings.domains[8]",
+                "finalmask.udp[0].settings.domains[8].names[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsDomainCapacityInvalid,
-                "finalmask.udp[0].settings.domains[10]",
+                "finalmask.udp[0].settings.domains[10].names[0]",
             ),
             (
-                ValidationCode::FinalmaskXdnsResolverTypeUnknown,
-                "finalmask.udp[0].settings.resolvers[0].type",
+                ValidationCode::FinalmaskXdnsAddrSchemeUnknown("quic".into()),
+                "finalmask.udp[0].settings.resolvers[0].addrs[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsResolverAddrInvalid,
-                "finalmask.udp[0].settings.resolvers[1].settings.addr",
+                "finalmask.udp[0].settings.resolvers[1].addrs[0]",
             ),
             (
                 ValidationCode::FinalmaskXdnsResolverAddrInvalid,
-                "finalmask.udp[0].settings.resolvers[2].settings.addr",
+                "finalmask.udp[0].settings.resolvers[2].addrs[0]",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsHttpsRequiresTls,
+                "finalmask.udp[0].settings.resolvers[4].addrs[0]",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsWorkerInvalid,
+                "finalmask.udp[0].settings.resolvers[6].worker",
             ),
             (
                 ValidationCode::FinalmaskXdnsExtraPollInvalid,
@@ -3528,16 +3605,19 @@ mod tests {
                 "missing {code:?} at {path:?} in {issues:#?}"
             );
         }
-        // The in-range domain, the capacity boundary that clears the core's
-        // 17-byte floor, and the folded bracketed-IPv6 resolver report
-        // nothing.
+        // The in-range domains, the capacity boundary that clears the core's
+        // 17-byte floor, the folded bracketed-IPv6 and bare-host addresses,
+        // and the DoH address carrying TLS report nothing.
         assert!(
-            !issues.iter().any(|issue| issue
-                .path
-                .as_deref()
-                .is_some_and(|path| path.contains("domains[4]")
-                    || path.contains("domains[9]")
-                    || path.contains("resolvers[3]"))),
+            !issues
+                .iter()
+                .any(|issue| issue
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("domains[4]")
+                        || path.contains("domains[9]")
+                        || path.contains("resolvers[3]")
+                        || path.contains("resolvers[5]"))),
             "{issues:#?}"
         );
     }

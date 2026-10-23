@@ -89,7 +89,10 @@
                     "edns0": 1232,
                     "labelLimit": 63,
                     "lenLimit": 255,
-                    "name": "tunnel.example.com",
+                    "names": [
+                      "tunnel.example.com",
+                      "alt.example.com"
+                    ],
                     "types": [
                       1,
                       28
@@ -99,10 +102,16 @@
                 "extraPoll": 2,
                 "resolvers": [
                   {
-                    "settings": {
-                      "addr": "1.1.1.1:53"
-                    },
-                    "type": "udp"
+                    "addrs": [
+                      "1.1.1.1",
+                      "udp://8.8.8.8:53"
+                    ]
+                  },
+                  {
+                    "addrs": [
+                      "tcp://9.9.9.9:53"
+                    ],
+                    "worker": 40
                   }
                 ]
               },
