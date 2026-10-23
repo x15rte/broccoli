@@ -700,9 +700,10 @@ pub enum ValidationCode {
     /// 2^31 key space: a non-ASCII table, a `length.from` ≤ 0 (or reversed
     /// range), or simply too few combinations for the table alphabet.
     XhttpSessionIdTableInvalid,
-    /// An `xmux` block with `maxConnections` and `maxConcurrency` both in use
-    /// (`to > 0` each): the core refuses the pair together for every
-    /// transport that carries the block, XHTTP and xdrive today. Error tier.
+    /// A transport's `xmux` `maxConnections` and `maxConcurrency` both in use
+    /// (`to > 0` each): Xray refuses them together on every transport whose
+    /// conf build reads the block (infra/conf/transport_method.go). Error
+    /// tier.
     XmuxLimitsExclusive,
     /// Inbound sniffing `destOverride` item outside {http, tls/https/ssl,
     /// quic, fakedns, fakedns+others} (case-insensitive): Xray's
@@ -884,10 +885,6 @@ pub enum ValidationCode {
     /// config-file check never sees it — the model reports it instead. Error
     /// tier: the profile cannot start.
     MasqueOutboundRequiresMasqueTransport,
-    /// A `masque` outbound with `mux.enabled`: the pinned core refuses the
-    /// outbound at load (``masque outbound does not support "mux"``,
-    /// infra/conf/xray.go:347-350). Error tier.
-    MasqueOutboundMuxUnsupported,
     /// The `masque` transport without `security: tls`. The core loads the
     /// document and refuses the outbound while it creates the handler
     /// (``MASQUE requires "security": "tls"``, proxy/masque/client.go:61-63);

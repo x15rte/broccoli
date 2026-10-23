@@ -430,10 +430,10 @@ pub fn uplink_http_method_mode_supported(method: &str, mode: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") || mode == "packet-up"
 }
 
-/// An `xmux` block's `maxConnections` and `maxConcurrency` are mutually
-/// exclusive while both are in use; XHTTP and xdrive both build the block
-/// this way. Xray compares the ranges' upper bounds (`To > 0`), so a range
-/// whose `to` is 0 is the "not in use" wire shape in both seams.
+/// A transport's xmux `maxConnections` and `maxConcurrency` are mutually
+/// exclusive while both are in use, on every transport whose conf build
+/// reads the block. Xray compares the ranges' upper bounds (`To > 0`), so a
+/// range whose `to` is 0 is the "not in use" wire shape in both seams.
 pub fn xmux_limits_conflict(xmux: Option<&XmuxConfig>) -> bool {
     xmux.is_some_and(|xmux| {
         xmux.max_connections.is_some_and(|range| range.to > 0)
