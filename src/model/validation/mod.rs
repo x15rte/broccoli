@@ -410,6 +410,15 @@ pub enum ValidationCode {
     FinalmaskRealmAlpnFromMitm,
     FinalmaskRealmCertRequired,
     FinalmaskRealmEchKeysBase64,
+    /// A `filter` source-IP rule the mask build refuses
+    /// (`common/geodata/rule_parser.go` via `ParseIPRules`,
+    /// `infra/conf/transport_finalmask.go:105-115`): the whole configuration
+    /// fails to load. The value carries the offending rule. Error tier.
+    FinalmaskFilterIpRuleInvalid(String),
+    /// A `filter` mask on an outbound. The loader builds it, but only a
+    /// listener consults it (`transport/internet/finalmask/filter/config.go`),
+    /// so the dial runs with the mask inert. Warning tier.
+    FinalmaskFilterOnOutbound,
     FinalmaskUnknownUdpMask(Option<String>),
     // ---- editor rules that decide configuration validity
     //      (validate_outbound / validate_settings) ----

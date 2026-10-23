@@ -4029,7 +4029,9 @@ pub fn qr_color_image(s: &str) -> Option<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::FinalmaskTcpMask;
     use crate::model::inbound::DNS_OUTBOUND_TAG;
+    use crate::model::validation::ValidationCode;
 
     const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
@@ -4665,6 +4667,29 @@ mod tests {
         let f = p.outbound.stream.finalmask.as_ref().unwrap();
         assert_eq!(f.udp.len(), 1);
         assert!(canonical.contains("fm="));
+    }
+
+    /// A `filter` mask only reachable on an outbound by import: the envelope
+    /// is known (not an unknown discriminator), it round-trips through the
+    /// `fm` parameter, and the mask registers as an advisory rather than a
+    /// refusal.
+    #[test]
+    fn outbound_filter_mask_round_trips_with_an_advisory() {
+        let fm = pct_encode(
+            r#"{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["geoip:private"],"allowedSourceIPs":["10.0.0.0/8"]}}]}"#,
+        );
+        let link = format!("vless://{UUID}@filter.local:443?encryption=none&fm={fm}#Filter");
+        let (p, canonical) = round_trip(&link);
+        let f = p.outbound.stream.finalmask.as_ref().unwrap();
+        assert!(matches!(f.tcp[0], FinalmaskTcpMask::Filter { .. }));
+        assert!(canonical.contains("fm="));
+        let advisories = profile_advisories(&p).expect("an advisory must not refuse the import");
+        assert!(
+            advisories
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskFilterOnOutbound),
+            "{advisories:#?}"
+        );
     }
 
     // ----- vmess -----

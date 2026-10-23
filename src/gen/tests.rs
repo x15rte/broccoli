@@ -1792,6 +1792,38 @@ fn golden_listen_lan() {
     );
 }
 
+/// A listener's source-IP `filter` mask reaches the wire as
+/// `streamSettings.finalmask`, carrying the blocked and allowed rule lists
+/// the core's IP-rule parser reads. The mask sits on both lists a SOCKS
+/// listener runs — TCP for accepted connections, UDP for the relay — and the
+/// emitted document must pass the pinned core's `run -test`.
+#[test]
+fn golden_inbound_filter_mask() {
+    let mut settings = base_settings();
+    settings.local_inbounds[0].finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["geoip:private".into(), "203.0.113.0/24".into()],
+                allowed_source_ips: vec!["ext:geoip.dat:cn".into(), "192.0.2.1".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        udp: vec![FinalmaskUdpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["2001:db8::/32".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/inbound_filter_mask.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
 #[test]
 fn golden_fakedns() {
     let mut settings = base_settings();

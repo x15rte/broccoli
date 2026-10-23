@@ -6902,15 +6902,12 @@ impl ServersScreen {
                             egui::ComboBox::from_id_salt("type")
                                 .selected_text(selected.as_ref())
                                 .show_ui(ui, |ui| {
-                                    for kind in FinalmaskTcpMask::TYPES {
+                                    for kind in FinalmaskTcpMask::outbound_types() {
                                         if ui
-                                            .selectable_label(
-                                                mask.known_type() == Some(*kind),
-                                                *kind,
-                                            )
+                                            .selectable_label(mask.known_type() == Some(kind), kind)
                                             .clicked()
                                         {
-                                            picked = Some(*kind);
+                                            picked = Some(kind);
                                         }
                                     }
                                     if known.is_none() {
@@ -6995,15 +6992,12 @@ impl ServersScreen {
                             egui::ComboBox::from_id_salt("type")
                                 .selected_text(selected.as_ref())
                                 .show_ui(ui, |ui| {
-                                    for kind in FinalmaskUdpMask::TYPES {
+                                    for kind in FinalmaskUdpMask::outbound_types() {
                                         if ui
-                                            .selectable_label(
-                                                mask.known_type() == Some(*kind),
-                                                *kind,
-                                            )
+                                            .selectable_label(mask.known_type() == Some(kind), kind)
                                             .clicked()
                                         {
-                                            picked = Some(*kind);
+                                            picked = Some(kind);
                                         }
                                     }
                                     if known.is_none() {
