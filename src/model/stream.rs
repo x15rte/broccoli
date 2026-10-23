@@ -920,6 +920,11 @@ pub struct XdriveTransport {
     /// the service without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<XdriveTemplate>,
+    /// Connection reuse, the same block XHTTP and MASQUE carry. Absent keeps
+    /// the core's defaults (one connection, or four for `google-drive` over
+    /// h2); the reloaded editor shows the block only when it was stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XmuxConfig>,
     /// True when a stored profile carried the retired `Google Drive`
     /// spelling and the load migrated it in memory. Never serialized: the
     /// save writes the current spelling.
@@ -2688,7 +2693,7 @@ mod tests {
         HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security,
         SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
         XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings,
-        transport_settings_key, transport_settings_path,
+        XmuxConfig, transport_settings_key, transport_settings_path,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -4294,6 +4299,12 @@ mod tests {
                 },
                 extra: Map::new(),
             }),
+            xmux: Some(XmuxConfig {
+                max_connections: Some(Int32Range::single(4)),
+                c_max_reuse_times: Some(Int32Range::single(128)),
+                h_keep_alive_period: Some(30),
+                ..Default::default()
+            }),
             extra: Map::new(),
             ..Default::default()
         };
@@ -4314,6 +4325,7 @@ mod tests {
             json!("\"name\":\"([^\"]+)\"")
         );
         assert_eq!(wire["template"]["retry"]["status"], json!([429, 503]));
+        assert_eq!(wire["xmux"]["maxConnections"], json!(4));
         let round_tripped: XdriveTransport =
             serde_json::from_value(wire).expect("the block deserializes");
         assert_eq!(

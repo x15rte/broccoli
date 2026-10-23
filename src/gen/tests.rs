@@ -1502,6 +1502,67 @@ fn golden_xdrive_template() {
     );
 }
 
+/// An xdrive transport with its connection-reuse block: the chosen limit and
+/// the H2 reuse knobs, as the pinned core accepts them.
+#[test]
+fn golden_xdrive_xmux() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "local".into();
+        xdrive.remote_folder = "xdrive-store".into();
+        xdrive.xmux = Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(4)),
+            c_max_reuse_times: Some(Int32Range::single(128)),
+            h_max_request_times: Some(Int32Range::single(600)),
+            h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+            h_keep_alive_period: Some(30),
+            ..Default::default()
+        });
+    }
+    golden!(
+        "goldens/xdrive_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport in its h3 form: TLS carries the ALPN list exactly
+/// `["h3"]`, which is the only spelling that reaches the QUIC path, and the
+/// Google Drive backend is the one the core's h3 rules name.
+#[test]
+fn golden_xdrive_h3() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE.into();
+        xdrive.remote_folder = "drive-folder-id".into();
+        xdrive.secrets = vec![
+            "client-id".into(),
+            "client-secret".into(),
+            "refresh-token".into(),
+        ];
+    }
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "www.googleapis.com".into(),
+        alpn: vec!["h3".into()],
+        fingerprint: "chrome".into(),
+        ..Default::default()
+    });
+    golden!(
+        "goldens/xdrive_h3.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_hysteria2_udphop_mask() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);

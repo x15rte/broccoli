@@ -1384,6 +1384,8 @@ keys! {
     SrvXdriveMuxXudpSkip 0,
     SrvXdriveTestpre 0,
     SrvXdriveDriveRenamed 0,
+    SrvXdriveH3MaskNotNoise 1,
+    SrvXdriveH3BrutalCongestion 0,
     SrvXdriveResetToRaw 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
@@ -2550,6 +2552,8 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XdriveMuxXudpProxyUdp443Skip => t(lang, Key::SrvXdriveMuxXudpSkip),
         XdriveVlessTestpreUnsupported => t(lang, Key::SrvXdriveTestpre),
         XdriveDriveServiceRenamed => t(lang, Key::SrvXdriveDriveRenamed),
+        XdriveH3MaskNotNoise(_) => t(lang, Key::SrvXdriveH3MaskNotNoise),
+        XdriveH3CongestionBrutal => t(lang, Key::SrvXdriveH3BrutalCongestion),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -2815,6 +2819,7 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
             vec![format!("{arg:?}")]
         }
+        ValidationCode::XdriveH3MaskNotNoise(arg) => vec![arg.clone()],
         ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
@@ -4465,6 +4470,12 @@ mod en {
             Key::SrvXdriveTestpre => "The xdrive transport does not support VLESS testpre",
             Key::SrvXdriveDriveRenamed => {
                 "The \"Google Drive\" service was renamed. The profile is saved as \"google-drive\"."
+            }
+            Key::SrvXdriveH3MaskNotNoise => {
+                "Over h3 to Google Drive the only UDP mask that works is noise, not {}"
+            }
+            Key::SrvXdriveH3BrutalCongestion => {
+                "Over h3 the congestion control is bbr or reno, not brutal or force-brutal"
             }
             Key::SrvXdriveResetToRaw => {
                 "The xdrive transport is VLESS-only. Switching protocol reset the transport to raw."

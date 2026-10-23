@@ -702,7 +702,8 @@ pub enum ValidationCode {
     XhttpSessionIdTableInvalid,
     /// A transport's `xmux` `maxConnections` and `maxConcurrency` both in use
     /// (`to > 0` each): Xray refuses them together on every transport whose
-    /// conf build reads the block (infra/conf/transport_method.go).
+    /// conf build reads the block (infra/conf/transport_method.go). Error
+    /// tier.
     XmuxLimitsExclusive,
     /// Inbound sniffing `destOverride` item outside {http, tls/https/ssl,
     /// quic, fakedns, fakedns+others} (case-insensitive): Xray's
@@ -1064,6 +1065,17 @@ pub enum ValidationCode {
     /// names the replacement for the one session that still sees the stored
     /// value.
     XdriveDriveServiceRenamed,
+    /// A `google-drive` xdrive outbound in its h3 form — TLS ALPN exactly
+    /// `["h3"]` — carrying a UDP mask other than `noise`: only noise composes
+    /// with the QUIC datagrams the drive transport sends
+    /// (infra/conf/transport_internet.go:266-276). The code carries the
+    /// rejected mask type. Error tier.
+    XdriveH3MaskNotNoise(String),
+    /// An xdrive outbound in its h3 form with `finalmask.quicParams`
+    /// congestion `brutal` or `force-brutal`: brutal is a Hysteria
+    /// controller, and over h3 the core accepts `bbr` or `reno`
+    /// (infra/conf/transport_internet.go:266-276). Error tier.
+    XdriveH3CongestionBrutal,
 
     // ---- draft requirements ----
     //
