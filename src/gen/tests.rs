@@ -4559,6 +4559,41 @@ fn golden_hysteria2_noise_exp() {
     );
 }
 
+/// The noise mask's `script` surface (`NoiseMask.Script`, infra/conf/
+/// transport_finalmask.go): the mask carries the path instead of its item
+/// list, and the core resolves and compiles it at load. The fixture script is
+/// materialized beside the core for the config-test oracle, which compiles but
+/// never runs it; the app itself never reads or runs the file either.
+#[test]
+fn golden_hysteria2_noise_script() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "noise-script.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "noisescriptpassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Noise {
+            settings: FinalmaskNoise {
+                script: Some("broccoli-golden-noise.lua".into()),
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_noise_script.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 /// The reporting entry returns the advisory half of the settings verdict
 /// beside the document: the document itself is unchanged (the warning never
 /// gates) and the blocking half still refuses with no advisory returned.

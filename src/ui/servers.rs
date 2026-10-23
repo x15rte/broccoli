@@ -7035,6 +7035,7 @@ impl ServersScreen {
                                 buffers: &mut *buffers,
                             },
                             masked,
+                            set_key.0,
                         );
                     });
                 });
@@ -15218,6 +15219,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 false,
+                0,
             );
         });
         harness.run();
@@ -15323,6 +15325,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 false,
+                0,
             );
         });
         harness.run();
@@ -15392,6 +15395,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 false,
+                0,
             );
         });
         harness.run();
@@ -15454,6 +15458,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 false,
+                0,
             );
         });
         harness.run();
@@ -15554,6 +15559,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     buffers: &mut buffers_for_ui.borrow_mut(),
                 },
                 false,
+                0,
             );
         });
         harness.run();
@@ -15599,6 +15605,92 @@ Authentication: ML-KEM-768, Post-Quantum
                 ))
                 .is_some(),
             "the exp finding must render inline under the field"
+        );
+    }
+
+    #[test]
+    fn noise_script_row_toggles_the_path_and_reports_the_pair_conflict() {
+        fn noise(mask: &FinalmaskUdpMask) -> &FinalmaskNoise {
+            match mask {
+                FinalmaskUdpMask::Noise { settings, .. } => settings,
+                other => panic!("the harness renders a noise mask, got {other:?}"),
+            }
+        }
+
+        // The mask already owns one item, so turning the script row on makes
+        // the pair the core refuses: the row must show that same finding.
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Noise {
+            settings: FinalmaskNoise {
+                noise: vec![FinalmaskNoiseItem {
+                    encoding: "hex".into(),
+                    packet: FinalmaskRawValue::Present(json!("00")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("noise-script-editor-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+                false,
+                0,
+            );
+        });
+        harness.run();
+        assert!(
+            noise(&mask.borrow()).script.is_none(),
+            "the fixture starts without a script"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvNoiseScriptToggle))
+            .click();
+        harness.run();
+        assert_eq!(
+            noise(&mask.borrow()).script.as_deref(),
+            Some(""),
+            "the switch seeds the empty path its field then judges"
+        );
+
+        // The path goes in through the row's own text field; the shared
+        // structural rule passes and the mask's exclusivity rule fires.
+        let field = harness
+            .query_all_by_role_and_label(
+                egui::accesskit::Role::TextInput,
+                t(Language::En, Key::SrvNoiseScriptPath),
+            )
+            .next()
+            .expect("the script row owns a path field");
+        field.click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the path field takes focus")
+            .type_text("/tmp/noise.lua");
+        harness.run();
+        assert_eq!(
+            noise(&mask.borrow()).script.as_deref(),
+            Some("/tmp/noise.lua")
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::FinalmaskNoiseScriptConflict))
+                .is_some(),
+            "the row renders the same conflict the apply gate refuses"
         );
     }
 

@@ -1485,6 +1485,15 @@ pub struct FinalmaskNoise {
     pub reset: Int32Range,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub noise: Vec<FinalmaskNoiseItem>,
+    /// Path to a Lua noise script (`NoiseMask.Script`,
+    /// infra/conf/transport_finalmask.go): `None` = no script, `Some(path)` =
+    /// the file the core resolves and compiles at load. The app stores the
+    /// path verbatim and never reads or runs the file; the path's structural
+    /// rules and its exclusivity with `noise` live in the validation pass.
+    /// The core treats the empty string as "no script", so a blank path is
+    /// omitted like an absent one.
+    #[serde(skip_serializing_if = "noise_script_absent")]
+    pub script: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1494,9 +1503,17 @@ impl Default for FinalmaskNoise {
         Self {
             reset: Int32Range::single(0),
             noise: Vec::new(),
+            script: None,
             extra: Map::new(),
         }
     }
+}
+
+/// The core's `NoiseMask.Build` reads `Script != ""`; an empty path is its
+/// own "no script" spelling, so neither the wire nor the stored document
+/// carries one.
+fn noise_script_absent(script: &Option<String>) -> bool {
+    script.as_deref().is_none_or(str::is_empty)
 }
 
 /// The listener-only `filter` mask (`infra/conf/transport_finalmask.go:100-115`
