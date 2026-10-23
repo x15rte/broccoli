@@ -6370,27 +6370,24 @@ mod tests {
         // the hysteria2 link existed.
         let cases = [
             (
-                parse_link("socks5://u:p@h.example.com:1080")
-                    .unwrap()
-                    .profile,
+                "socks5://u:p@h.example.com:1080".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"socks"]),
             ),
             (
-                parse_link("http://h.example.com:8080").unwrap().profile,
+                "http://h.example.com:8080".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"http"]),
             ),
             (
-                parse_link("hysteria2://pw@h.example.com:443")
-                    .unwrap()
-                    .profile,
+                "hysteria2://pw@h.example.com:443".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[]),
             ),
             (
-                parse_link(&wireguard_link()).unwrap().profile,
+                wireguard_link(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"wireguard"]),
             ),
         ];
-        for (profile, expected) in cases {
+        for (link, expected) in cases {
+            let profile = parse_link(&link).unwrap().profile;
             match to_link(&profile) {
                 Err(LinkError::Unsupported(message)) => {
                     assert_eq!(message.text(Language::En), expected);
