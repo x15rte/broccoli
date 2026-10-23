@@ -37,24 +37,25 @@ pub use outbound::{
     WireguardPeer, WireguardSettings,
 };
 pub use routing::{
-    Balancer, BurstObservatoryCfg, LeastLoadSettings, ObservatoryCfg, PingConfig, RoutingCfg, Rule,
-    StrategyCfg, StrategyCost, Webhook,
+    Balancer, BurstObservatoryCfg, DEFAULT_DOMAIN_STRATEGY, LeastLoadSettings, ObservatoryCfg,
+    PingConfig, RoutingCfg, Rule, StrategyCfg, StrategyCost, Webhook,
 };
 pub use safety::{HazardClass, SafetyCode, SafetyFinding};
 pub use servers::{ServerProfile, ServersFile};
 pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, Settings};
 pub use stream::{
-    CustomSockopt, FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFragment, FinalmaskHeaderCustomTcp,
-    FinalmaskHeaderCustomUdp, FinalmaskMkcpLegacy, FinalmaskModel, FinalmaskNoise,
-    FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
-    FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSalamander, FinalmaskSudoku,
-    FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop,
-    FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver,
-    FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings, HappyEyeballs,
-    HttpCamouflageRequest, HttpCamouflageResponse, HttpupgradeSettings, HysteriaTransport,
-    KcpSettings, MasqueTransport, Network, RawHeader, RawSettings, RealityModel, Security,
-    SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings, XdriveTemplate, XdriveTemplateAuth,
-    XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings, XmuxConfig,
+    CustomSockopt, FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskFragment,
+    FinalmaskHeaderCustomTcp, FinalmaskHeaderCustomUdp, FinalmaskMkcpLegacy, FinalmaskModel,
+    FinalmaskNoise, FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
+    FinalmaskRealm, FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSalamander,
+    FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg,
+    FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain,
+    FinalmaskXdnsResolver, FinalmaskXicmp, FinalmaskXmc, FinalmaskXmcProfile, GrpcSettings,
+    HappyEyeballs, HttpCamouflageRequest, HttpCamouflageResponse, HttpupgradeSettings,
+    HysteriaTransport, KcpSettings, MasqueTransport, MasqueWarp, Network, RawHeader, RawSettings,
+    RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
+    XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport,
+    XhttpSettings, XmuxConfig,
 };
 pub use validation::{ValidationCode, ValidationIssue};
 

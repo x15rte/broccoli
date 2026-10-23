@@ -54,6 +54,7 @@ fn schema_keys_equal_upstream_literals() {
     assert_eq!(keys::PROTOCOL, "protocol");
     assert_eq!(keys::SETTINGS, "settings");
     assert_eq!(keys::STREAM_SETTINGS, "streamSettings");
+    assert_eq!(keys::FINALMASK, "finalmask");
     assert_eq!(keys::SOCKOPT, "sockopt");
     assert_eq!(keys::DIALER_PROXY, "dialerProxy");
     assert_eq!(keys::INTERFACE, "interface");

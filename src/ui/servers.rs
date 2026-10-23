@@ -22,7 +22,7 @@ use crate::model::outbound::{
 };
 use crate::model::settings::Language;
 use crate::model::stream::{
-    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
+    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
     XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
     XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
@@ -35,9 +35,10 @@ use crate::model::stream::{
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
     dns_out_action_supported, ech_sockopt_emitted, freedom_final_rule_supported,
-    mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid,
-    reality_public_key_valid, send_through_supported, server_name_implausible, tls_version_rank,
-    validate_finalmask, validate_outbound, validate_sockopt,
+    masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
+    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
+    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
+    validate_outbound, validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -74,7 +75,8 @@ use finalmask_editors::{
 use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
 use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
 use validators::{
-    v_masque_remote_dns_entry, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
+    v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
+    v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
     v_vless_encryption, v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry,
     v_wg_secret_key,
 };
@@ -5640,19 +5642,80 @@ impl ServersScreen {
             Network::Masque => {
                 let had_settings = st.masque_settings.is_some();
                 let mut s = st.masque_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                // WARP changes both defaults the core applies: it replaces the
+                // host with `cloudflareaccess.com` and the path with `/`. The
+                // hints show the values the wire will carry, and the model's
+                // wire pass fills them in.
+                let default_host = if s.warp.is_some() {
+                    crate::model::stream::MASQUE_WARP_HOST
+                } else {
+                    "example.com"
+                };
+                let default_path = if s.warp.is_some() {
+                    crate::model::stream::MASQUE_WARP_PATH
+                } else {
+                    crate::model::stream::MASQUE_DEFAULT_PATH
+                };
+                changed |= widgets::text_field(ui, "host", &mut s.host, default_host);
                 // An unset path leaves the core's own default; the field hint
                 // shows that value, and only the two placeholders survive the
                 // model's `MasquePathInvalid` rule.
-                changed |= widgets::text_field(
-                    ui,
-                    "path",
-                    &mut s.path,
-                    crate::model::stream::MASQUE_DEFAULT_PATH,
-                );
+                changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
                 changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
                 changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                changed |= xmux_section(ui, lang, &mut s.xmux);
+                let mut has_warp = s.warp.is_some();
+                if ui
+                    .checkbox(&mut has_warp, t(lang, Key::SrvMasqueWarp))
+                    .changed()
+                {
+                    s.warp = has_warp.then(MasqueWarp::default);
+                    changed = true;
+                }
+                let credentials = !s.user.is_empty() || !s.pass.is_empty();
+                if let Some(warp) = s.warp.as_mut() {
+                    if credentials {
+                        ui.colored_label(
+                            status_colors_of(ui).err,
+                            validation_message(
+                                &ValidationCode::MasqueWarpCredentialsConflict,
+                                lang,
+                            ),
+                        );
+                    }
+                    changed |= widgets::masked_validated_field(
+                        ui,
+                        t(lang, Key::SrvMasqueWarpPrivateKey),
+                        &mut warp.private_key,
+                        "",
+                        |value| v_masque_warp_private_key(lang, value),
+                        masked,
+                    );
+                    changed |= widgets::masked_validated_field(
+                        ui,
+                        t(lang, Key::SrvMasqueWarpPublicKey),
+                        &mut warp.public_key,
+                        "",
+                        |value| v_masque_warp_public_key(lang, value),
+                        masked,
+                    );
+                    // One entry can be IPv4 or IPv6; a second must be the
+                    // other family. The row rule judges one entry, and the
+                    // list rule — the same one the model pass reads — reports
+                    // the count and family rule under the list.
+                    changed |= widgets::validated_string_list(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvMasqueWarpAddresses),
+                        &mut warp.address,
+                        "172.16.0.2",
+                        |entry, _list_len| v_masque_warp_address_entry(lang, entry),
+                    );
+                    if let Some(code) = masque_warp_address_list_verdict(&warp.address) {
+                        ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
+                    }
+                }
                 if had_settings || changed {
                     st.masque_settings = Some(s);
                 }
@@ -5823,6 +5886,7 @@ impl ServersScreen {
                         s.template = Some(template);
                     }
                 }
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if had_settings || changed {
                     st.xdrive_settings = Some(s);
                 }
@@ -6252,6 +6316,9 @@ impl ServersScreen {
                     &mut s.disable_system_root,
                     t(lang, Key::SrvUnset),
                 );
+                changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
+                    ui.checkbox(&mut s.use_system_ca, "useSystemCA").changed()
+                });
                 changed |= widgets::opt_bool(
                     ui,
                     "enableSessionResumption",
@@ -6835,15 +6902,12 @@ impl ServersScreen {
                             egui::ComboBox::from_id_salt("type")
                                 .selected_text(selected.as_ref())
                                 .show_ui(ui, |ui| {
-                                    for kind in FinalmaskTcpMask::TYPES {
+                                    for kind in FinalmaskTcpMask::outbound_types() {
                                         if ui
-                                            .selectable_label(
-                                                mask.known_type() == Some(*kind),
-                                                *kind,
-                                            )
+                                            .selectable_label(mask.known_type() == Some(kind), kind)
                                             .clicked()
                                         {
-                                            picked = Some(*kind);
+                                            picked = Some(kind);
                                         }
                                     }
                                     if known.is_none() {
@@ -6928,15 +6992,12 @@ impl ServersScreen {
                             egui::ComboBox::from_id_salt("type")
                                 .selected_text(selected.as_ref())
                                 .show_ui(ui, |ui| {
-                                    for kind in FinalmaskUdpMask::TYPES {
+                                    for kind in FinalmaskUdpMask::outbound_types() {
                                         if ui
-                                            .selectable_label(
-                                                mask.known_type() == Some(*kind),
-                                                *kind,
-                                            )
+                                            .selectable_label(mask.known_type() == Some(kind), kind)
                                             .clicked()
                                         {
-                                            picked = Some(*kind);
+                                            picked = Some(kind);
                                         }
                                     }
                                     if known.is_none() {
@@ -8000,9 +8061,9 @@ mod tests {
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver, FreedomFinalRule,
-        HysteriaTransport, Int32Range, MasqueTransport, Network, Noise, OutboundModel, Protocol,
-        ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
-        WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
+        HysteriaTransport, Int32Range, MasqueTransport, MasqueWarp, Network, Noise, OutboundModel,
+        Protocol, ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
+        TlsModel, WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
@@ -10655,6 +10716,12 @@ Authentication: ML-KEM-768, Post-Quantum
                 path: crate::model::stream::MASQUE_DEFAULT_PATH.into(),
                 user: "user".into(),
                 pass: "pass".into(),
+                warp: Some(MasqueWarp {
+                    private_key: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH".into(),
+                    public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE".into(),
+                    address: vec!["172.16.0.2".into()],
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -10674,12 +10741,62 @@ Authentication: ML-KEM-768, Post-Quantum
                 },
             );
         });
-        for label in ["host", "path", "user", "pass"] {
+        for label in [
+            "host",
+            "path",
+            "user",
+            "pass",
+            "WARP",
+            "Private key",
+            "Public key",
+            "Addresses",
+        ] {
             assert!(
                 harness.query_all_by_label_contains(label).next().is_some(),
                 "the masque editor must render its {label:?} field"
             );
         }
+    }
+
+    /// The masque transport's settings carry the shared XMUX section, and
+    /// the block the section owns lands on that transport.
+    #[test]
+    fn masque_transport_editor_carries_the_xmux_section() {
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            masque_settings: Some(MasqueTransport::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream_for_ui.borrow_mut(),
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Masque,
+                    mux: None,
+                },
+            );
+        });
+        harness.get_by_label(t(Language::En, Key::SrvXmux));
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(
+            stream
+                .borrow()
+                .masque_settings
+                .as_ref()
+                .is_some_and(|settings| settings.xmux.is_some()),
+            "the masque editor must write the xmux block it renders"
+        );
     }
 
     /// The xdrive editor renders the service choice, the folder and every
@@ -10751,6 +10868,54 @@ Authentication: ML-KEM-768, Post-Quantum
             5,
             "each substitution site lists the variables it expands"
         );
+    }
+
+    /// The xdrive transport settings carry the shared XMUX section: the enable
+    /// switch, the chosen connection limit, and the reuse knobs every xmux
+    /// transport shows.
+    #[test]
+    fn xdrive_transport_editor_renders_the_xmux_section() {
+        let mut stream = StreamModel {
+            network: Network::Xdrive,
+            xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                service: crate::model::stream::XDRIVE_SERVICE_LOCAL.into(),
+                remote_folder: "store".into(),
+                xmux: Some(XmuxConfig {
+                    max_connections: Some(Int32Range::single(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Vless,
+                    mux: None,
+                },
+            );
+        });
+        for label in [
+            t(Language::En, Key::SrvXmux),
+            t(Language::En, Key::SrvEnableXmux),
+            t(Language::En, Key::SrvConnectionLimit),
+            "maxConnections",
+            "cMaxReuseTimes",
+        ] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the xdrive editor must render its {label:?} xmux control"
+            );
+        }
+        assert!(harness.query_by_label("maxConcurrency").is_none());
     }
 
     /// A transport profile whose settings carry a template the runtime builds
@@ -10976,6 +11141,69 @@ Authentication: ML-KEM-768, Post-Quantum
             );
         }
     }
+    #[test]
+    fn tls_trust_switch_edits_the_outbound_tls_settings_only() {
+        // The switch writes the same TLS block the editor already holds, and
+        // its note rides the row's hover. REALITY carries no TLS settings, so
+        // the control disappears with that block.
+        let note = t(Language::En, Key::SrvTlsUseSystemCaNote);
+        let stream = Rc::new(RefCell::new(StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(TlsModel::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().security_tab(
+                ui,
+                Language::En,
+                None,
+                &mut stream_for_ui.borrow_mut(),
+                None,
+                &[],
+            );
+        });
+        harness.run();
+
+        // An untouched frame writes no key: the bundled-roots default.
+        assert!(
+            serde_json::to_value(&*stream.borrow()).unwrap()["tlsSettings"]
+                .get("useSystemCA")
+                .is_none()
+        );
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note is the row's hover, never a rendered line"
+        );
+
+        harness.get_by_label("useSystemCA").scroll_to_me();
+        harness.run();
+        harness.get_by_label("useSystemCA").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the switch's hover must carry the note"
+        );
+
+        harness.get_by_label("useSystemCA").click();
+        harness.run();
+        assert!(stream.borrow().tls_settings.as_ref().unwrap().use_system_ca);
+        assert_eq!(
+            serde_json::to_value(&*stream.borrow()).unwrap()["tlsSettings"]["useSystemCA"],
+            json!(true)
+        );
+
+        harness.get_by_label("reality").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("useSystemCA").is_none(),
+            "REALITY holds no TLS settings, so the trust switch must not render there"
+        );
+    }
+
     #[test]
     fn probe_pin_panel_renders_rows_and_applies_on_click() {
         let leaf = "7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9";
@@ -15122,6 +15350,72 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness.query_by_label_contains(message.as_str()).is_none(),
             "the notice must clear with the value"
+        );
+    }
+
+    #[test]
+    fn realm_tls_trust_switch_edits_the_mask_tls_config() {
+        // The realm mask dials through its own TLS block, so the trust switch
+        // is the same control with the same note as the outbound TLS editor.
+        fn realm_tls(mask: &FinalmaskUdpMask) -> FinalmaskRealmTls {
+            match mask {
+                FinalmaskUdpMask::Realm { settings, .. } => settings
+                    .tls_config
+                    .clone()
+                    .expect("the fixture carries tlsConfig"),
+                other => panic!("the harness renders a realm mask, got {other:?}"),
+            }
+        }
+
+        let note = t(Language::En, Key::SrvTlsUseSystemCaNote);
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Realm {
+            settings: Box::new(FinalmaskRealm {
+                url: "realm://token@realm.example/id".into(),
+                tls_config: Some(FinalmaskRealmTls::default()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("realm-trust-switch-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+                false,
+            );
+        });
+        harness.run();
+
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note is the row's hover, never a rendered line"
+        );
+        harness.get_by_label("useSystemCA").scroll_to_me();
+        harness.run();
+        harness.get_by_label("useSystemCA").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the switch's hover must carry the note"
+        );
+
+        harness.get_by_label("useSystemCA").click();
+        harness.run();
+        assert!(realm_tls(&mask.borrow()).use_system_ca);
+        assert_eq!(
+            serde_json::to_value(&*mask.borrow()).unwrap()["settings"]["tlsConfig"]["useSystemCA"],
+            json!(true)
         );
     }
 

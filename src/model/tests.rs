@@ -6,7 +6,7 @@ use crate::links::excerpt;
 use crate::sys::appdata::with_appdata;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// parse input → re-serialize → must equal input (canonical wire form).
 fn check<T>(input: Value)
@@ -520,6 +520,7 @@ fn roundtrip_routing() {
 #[test]
 fn roundtrip_dns() {
     check::<DnsServer>(json!({
+        "id": "d1",
         "address": "https://dns.google/dns-query", "port": 443, "domains": ["geosite:cn"],
         "expectedIPs": ["geoip:cn"], "unexpectedIPs": ["1.2.3.4"], "skipFallback": true,
         "clientIp": "203.0.113.1", "queryStrategy": "useip4", "tag": "d1",
@@ -536,11 +537,34 @@ fn roundtrip_dns() {
         "disableFallback": true, "disableFallbackIfMatch": true,
         "enableParallelQuery": true, "useSystemHosts": true,
         "bootstrap": "localhost",
+        "script": "dns.lua",
         "fakedns": {"enabled": true, "pools": [
             {"ipPool": "198.18.0.0/15", "poolSize": 65535}
         ]}
     }));
     check_value(&DnsCfg::default());
+}
+
+#[test]
+fn script_paths_round_trip_through_the_state_files() {
+    // Both script surfaces are one optional string each: a stored path
+    // survives the save/load boundary unchanged, and an absent key means no
+    // script (the core's own `script: ""` state is never stored).
+    let dns = DnsCfg {
+        script: Some("dns.lua".into()),
+        ..Default::default()
+    };
+    check_value(&dns);
+    let routing = RoutingCfg {
+        script: Some("routing.lua".into()),
+        ..Default::default()
+    };
+    let stored = serde_json::to_value(&routing).unwrap();
+    assert_eq!(stored["script"], json!("routing.lua"));
+    check_value(&routing);
+
+    let absent: DnsCfg = serde_json::from_value(json!({"servers": []})).unwrap();
+    assert_eq!(absent.script, None, "an absent key is no script");
 }
 
 #[test]
@@ -656,6 +680,39 @@ fn settings_without_inbound_keys_default_to_the_seed_list() {
         seed,
         "the in-memory Default is the same seed list"
     );
+}
+
+#[test]
+fn local_inbound_filter_mask_round_trips_state_and_wire() {
+    let mut settings = Settings::default();
+    settings.local_inbounds[0].finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["geoip:private".into()],
+                allowed_source_ips: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    let value = serde_json::to_value(&settings).unwrap();
+    assert_eq!(
+        value["localInbounds"][0]["finalmask"]["tcp"][0]["type"],
+        "filter"
+    );
+    let reloaded: Settings = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reloaded).unwrap(), value);
+
+    let wire = reloaded.local_inbounds[0].to_wire(false);
+    assert_eq!(
+        wire["streamSettings"]["finalmask"]["tcp"][0]["settings"]["blockedSourceIPs"][0],
+        "geoip:private"
+    );
+    // An inbound with no mask emits no stream settings at all: every golden
+    // and generated document stays byte-identical.
+    let plain = LocalInboundCfg::socks_default("in-socks");
+    assert!(plain.to_wire(false).get("streamSettings").is_none());
 }
 
 #[test]

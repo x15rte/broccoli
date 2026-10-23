@@ -583,6 +583,10 @@ keys! {
     DnsServeStale 0,
     DnsServeStaleHint 0,
     DnsParallelQueries 0,
+    DnsParallelQueriesScriptHint 0,
+    DnsScriptToggle 0,
+    DnsScriptPath 0,
+    DnsScriptHint 0,
     DnsUseSystemHosts 0,
     DnsServeExpiredTtl 0,
     DnsSectionFakedns 0,
@@ -596,6 +600,8 @@ keys! {
     DnsAddress 0,
     DnsAddressHint 0,
     DnsAddressRequired 0,
+    DnsId 0,
+    DnsIdHint 0,
     DnsPort 0,
     DnsDomains 0,
     DnsDomainsHint 0,
@@ -663,6 +669,10 @@ keys! {
     EndpointProtocolSocks 0,
     EndpointProtocolHttp 0,
     EmptyLocalListeners 0,
+    InboundsFilterMask 0,
+    InboundsFilterMaskHint 0,
+    InboundsBlockedSourceIps 0,
+    InboundsAllowedSourceIps 0,
     // Safety warnings (hazard taxonomy).
     SafetySocksListenerExposed 1,
     SafetyHttpListenerExposed 1,
@@ -701,6 +711,10 @@ keys! {
     GeodataAddGeosite 0,
     GeodataAddGeoip 0,
     RoutingRulesSection 0,
+    RoutingScriptSection 0,
+    RoutingScriptToggle 0,
+    RoutingScriptPath 0,
+    RoutingScriptHint 0,
     RoutingMoveUp 0,
     RoutingMoveDown 0,
     RoutingDeleteRule 0,
@@ -766,6 +780,7 @@ keys! {
     GeodataModifiedUnavailable 0,
     GeodataSearch 0,
     GeodataNoMatches 0,
+    RoutingGeoTagAbsent 1,
     RuntimeStateRefreshed 0,
     RuntimeOverrideTitle 0,
     RuntimeOverrideEphemeral 0,
@@ -1306,7 +1321,6 @@ keys! {
     SrvMasqueOutboundTransport 0,
     SrvMasqueTransportMissing 0,
     SrvMasqueSettingsMissing 0,
-    SrvMasqueMuxUnsupported 0,
     SrvMasqueTransportTls 0,
     SrvMasqueSettingsIncomplete 0,
     SrvMasqueRemoteDns 0,
@@ -1318,6 +1332,15 @@ keys! {
     SrvMasqueUserColon 0,
     SrvMasqueAlpnHttp3 0,
     SrvMasqueHeaderValues 0,
+    SrvMasqueWarp 0,
+    SrvMasqueWarpPrivateKey 0,
+    SrvMasqueWarpPublicKey 0,
+    SrvMasqueWarpAddresses 0,
+    SrvMasqueWarpPrivateKeyInvalid 0,
+    SrvMasqueWarpPublicKeyInvalid 0,
+    SrvMasqueWarpAddressInvalid 0,
+    SrvMasqueWarpAddressShape 0,
+    SrvMasqueWarpCredentialsConflict 0,
     SrvXdriveService 0,
     SrvXdriveServiceUnset 0,
     SrvXdriveRemoteFolder 0,
@@ -1373,6 +1396,8 @@ keys! {
     SrvXdriveMuxXudpSkip 0,
     SrvXdriveTestpre 0,
     SrvXdriveDriveRenamed 0,
+    SrvXdriveH3MaskNotNoise 1,
+    SrvXdriveH3BrutalCongestion 0,
     SrvXdriveResetToRaw 0,
     SrvStreamOneNoDownload 0,
     SrvDownloadNestingExceeds 0,
@@ -1494,6 +1519,7 @@ keys! {
     SrvTlsServerNameEmptyNote 0,
     SrvRealityServerNameEmptyNote 0,
     SrvTlsFingerprintNote 0,
+    SrvTlsUseSystemCaNote 0,
     SrvRealityFingerprintNote 0,
     SrvVisionUdp443Note 0,
     SrvXudpProxyUdp443Note 0,
@@ -1578,7 +1604,7 @@ keys! {
     SrvXhttpSeqPlacementInvalid 0,
     SrvXhttpSessionLengthRequired 0,
     SrvXhttpSessionTableInvalid 0,
-    SrvXhttpXmuxExclusive 0,
+    SrvXmuxLimitsExclusive 0,
     XhttpExtraShadowsSettings 1,
     SniffingDestOverrideInvalid 0,
     OutboundTargetStrategyInvalid 0,
@@ -1663,6 +1689,8 @@ keys! {
     FinalmaskXdnsWorkerInvalid 0,
     FinalmaskXdnsExtraPollInvalid 0,
     FinalmaskXicmpIpInvalid 0,
+    FinalmaskFilterIpRuleInvalid 1,
+    FinalmaskFilterOnOutbound 0,
     FinalmaskRealmScheme 0,
     FinalmaskRealmHostRequired 0,
     FinalmaskRealmTokenBeforeAt 0,
@@ -1784,6 +1812,12 @@ keys! {
     SettingsRoutingRuleInboundMissing 2,
     SettingsDnsServerAddressMissing 1,
     SettingsDnsBootstrapNotResolvable 0,
+    SettingsLuaScriptPathRequired 0,
+    SettingsLuaScriptPathNotLua 0,
+    SettingsDnsScriptFallbackConflict 0,
+    SettingsDnsScriptServerConflict 2,
+    SettingsRoutingScriptRulesConflict 0,
+    SettingsRoutingScriptStrategyConflict 0,
     SettingsFakeDnsPoolCidrInvalid 1,
     SettingsFakeDnsPoolSizeInvalid 1,
     SettingsFakeDnsPoolCapacityExceeded 3,
@@ -1859,6 +1893,7 @@ keys! {
     ShellXrayArchiveFilter 0,
     ShellMasterKeyLogFileName 0,
     ShellCertificateFilter 0,
+    ShellLuaScriptFilter 0,
     // Error chains and runtime messages, rendered at the display boundary.
     LinkPercentTruncated 1,
     LinkPercentEscape 1,
@@ -2508,7 +2543,6 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
         MasqueTransportRequiresMasqueOutbound => t(lang, Key::SrvMasqueOutboundTransport),
         MasqueOutboundRequiresMasqueTransport => t(lang, Key::SrvMasqueTransportMissing),
-        MasqueOutboundMuxUnsupported => t(lang, Key::SrvMasqueMuxUnsupported),
         MasqueTransportRequiresTls => t(lang, Key::SrvMasqueTransportTls),
         MasqueSettingsIncomplete => t(lang, Key::SrvMasqueSettingsIncomplete),
         MasqueRemoteDnsInvalid => t(lang, Key::SrvMasqueRemoteDns),
@@ -2519,6 +2553,11 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         MasqueAuthorizationConflict => t(lang, Key::SrvMasqueAuthorizationConflict),
         MasqueUserColon => t(lang, Key::SrvMasqueUserColon),
         MasqueAlpnPrefersHttp3 => t(lang, Key::SrvMasqueAlpnHttp3),
+        MasqueWarpPrivateKeyInvalid => t(lang, Key::SrvMasqueWarpPrivateKeyInvalid),
+        MasqueWarpPublicKeyInvalid => t(lang, Key::SrvMasqueWarpPublicKeyInvalid),
+        MasqueWarpAddressInvalid => t(lang, Key::SrvMasqueWarpAddressInvalid),
+        MasqueWarpAddressShape => t(lang, Key::SrvMasqueWarpAddressShape),
+        MasqueWarpCredentialsConflict => t(lang, Key::SrvMasqueWarpCredentialsConflict),
         XdriveServiceUnsupported(_) => t(lang, Key::SrvXdriveServiceUnsupported),
         XdriveServiceMissing => t(lang, Key::SrvXdriveServiceMissing),
         XdriveDriveSecretsInvalid => t(lang, Key::SrvXdriveDriveSecrets),
@@ -2538,6 +2577,8 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XdriveMuxXudpProxyUdp443Skip => t(lang, Key::SrvXdriveMuxXudpSkip),
         XdriveVlessTestpreUnsupported => t(lang, Key::SrvXdriveTestpre),
         XdriveDriveServiceRenamed => t(lang, Key::SrvXdriveDriveRenamed),
+        XdriveH3MaskNotNoise(_) => t(lang, Key::SrvXdriveH3MaskNotNoise),
+        XdriveH3CongestionBrutal => t(lang, Key::SrvXdriveH3BrutalCongestion),
         RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
         RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
         TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
@@ -2583,7 +2624,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XhttpSeqPlacementInvalid => t(lang, Key::SrvXhttpSeqPlacementInvalid),
         XhttpSessionIdLengthRequired => t(lang, Key::SrvXhttpSessionLengthRequired),
         XhttpSessionIdTableInvalid => t(lang, Key::SrvXhttpSessionTableInvalid),
-        XhttpXmuxLimitsExclusive => t(lang, Key::SrvXhttpXmuxExclusive),
+        XmuxLimitsExclusive => t(lang, Key::SrvXmuxLimitsExclusive),
         XhttpExtraShadowsSettings(_) => t(lang, Key::XhttpExtraShadowsSettings),
         SniffingDestOverrideInvalid => t(lang, Key::SniffingDestOverrideInvalid),
         OutboundTargetStrategyInvalid => t(lang, Key::OutboundTargetStrategyInvalid),
@@ -2684,6 +2725,8 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskXdnsWorkerInvalid => t(lang, Key::FinalmaskXdnsWorkerInvalid),
         FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
         FinalmaskXicmpIpInvalid => t(lang, Key::FinalmaskXicmpIpInvalid),
+        FinalmaskFilterIpRuleInvalid(_) => t(lang, Key::FinalmaskFilterIpRuleInvalid),
+        FinalmaskFilterOnOutbound => t(lang, Key::FinalmaskFilterOnOutbound),
         FinalmaskRealmScheme => t(lang, Key::FinalmaskRealmScheme),
         FinalmaskRealmHostRequired => t(lang, Key::FinalmaskRealmHostRequired),
         FinalmaskRealmTokenBeforeAt => t(lang, Key::FinalmaskRealmTokenBeforeAt),
@@ -2741,6 +2784,12 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         RoutingRuleInboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleInboundMissing),
         DnsServerAddressMissing(_) => t(lang, Key::SettingsDnsServerAddressMissing),
         DnsBootstrapNotResolvable => t(lang, Key::SettingsDnsBootstrapNotResolvable),
+        LuaScriptPathRequired => t(lang, Key::SettingsLuaScriptPathRequired),
+        LuaScriptPathNotLua => t(lang, Key::SettingsLuaScriptPathNotLua),
+        DnsScriptFallbackConflict => t(lang, Key::SettingsDnsScriptFallbackConflict),
+        DnsScriptServerConflict(..) => t(lang, Key::SettingsDnsScriptServerConflict),
+        RoutingScriptRulesConflict => t(lang, Key::SettingsRoutingScriptRulesConflict),
+        RoutingScriptStrategyConflict => t(lang, Key::SettingsRoutingScriptStrategyConflict),
         FakeDnsPoolCidrInvalid(_) => t(lang, Key::SettingsFakeDnsPoolCidrInvalid),
         FakeDnsPoolSizeInvalid(_) => t(lang, Key::SettingsFakeDnsPoolSizeInvalid),
         FakeDnsPoolCapacityExceeded(_, _, _) => t(lang, Key::SettingsFakeDnsPoolCapacityExceeded),
@@ -2806,7 +2855,9 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
             vec![format!("{arg:?}")]
         }
+        ValidationCode::XdriveH3MaskNotNoise(arg) => vec![arg.clone()],
         ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
+        ValidationCode::FinalmaskFilterIpRuleInvalid(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
             arg.as_deref()
@@ -2876,6 +2927,9 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         }
         ValidationCode::FakeDnsPoolCapacityExceeded(index, size, pool) => {
             vec![index.to_string(), size.to_string(), pool.clone()]
+        }
+        ValidationCode::DnsScriptServerConflict(index, field) => {
+            vec![index.to_string(), field.clone()]
         }
         ValidationCode::GeodataUrlInvalid(file) => {
             vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()]
@@ -3370,6 +3424,16 @@ mod en {
             Key::DnsServeStale => "Serve stale",
             Key::DnsServeStaleHint => "Reply with expired cache entries while refreshing",
             Key::DnsParallelQueries => "Parallel queries",
+            Key::DnsParallelQueriesScriptHint => {
+                "A DNS script schedules queries itself. The core refuses parallel queries \
+                 beside a script, so the setting is not emitted while one is set."
+            }
+            Key::DnsScriptToggle => "Use a DNS script",
+            Key::DnsScriptPath => "Script path",
+            Key::DnsScriptHint => {
+                "Absolute path to a .lua file. The core compiles it at load. The app never \
+                 runs it."
+            }
             Key::DnsUseSystemHosts => "Use system hosts file",
             Key::DnsServeExpiredTtl => "Serve expired TTL (s)",
             Key::DnsSectionFakedns => "FakeDNS",
@@ -3387,6 +3451,8 @@ mod en {
                 "1.1.1.1, https://dns.google/dns-query, quic+local://, tcp://, hosts path, fakedns"
             }
             Key::DnsAddressRequired => "DNS server address is required",
+            Key::DnsId => "ID",
+            Key::DnsIdHint => "name this server for a DNS script",
             Key::DnsPort => "Port",
             Key::DnsDomains => "Domains",
             Key::DnsDomainsHint => "route matching domains to this server",
@@ -3502,6 +3568,13 @@ mod en {
             Key::EndpointProtocolSocks => "SOCKS",
             Key::EndpointProtocolHttp => "HTTP",
             Key::EmptyLocalListeners => "No local listeners configured",
+            Key::InboundsFilterMask => "Source IP filter",
+            Key::InboundsFilterMaskHint => {
+                "The core drops a blocked source before the protocol sees it, and an allowed list \
+                 keeps only the sources it matches"
+            }
+            Key::InboundsBlockedSourceIps => "Blocked source IPs",
+            Key::InboundsAllowedSourceIps => "Allowed source IPs",
             Key::CollisionInvalidNetwork => "{} has an invalid listener network: {}",
             Key::CollisionNeedsPort => "{} needs a non-zero listen port",
             Key::CollisionNeedsUnix => "{} needs a UNIX socket path",
@@ -3525,6 +3598,15 @@ mod en {
             Key::GeodataAddGeosite => "Add geosite…",
             Key::GeodataAddGeoip => "Add geoip…",
             Key::RoutingRulesSection => "Rules (first match wins)",
+            // The section's switch and path belong to the script control's
+            // shared label set; keep the two surfaces' wording parallel.
+            Key::RoutingScriptSection => "Routing script",
+            Key::RoutingScriptToggle => "Use a routing script",
+            Key::RoutingScriptPath => "Script path",
+            Key::RoutingScriptHint => {
+                "Absolute path to a .lua file. The core compiles it at load. The app never \
+                 runs it."
+            }
             Key::RoutingMoveUp => "Move up (rules match in order)",
             Key::RoutingMoveDown => "Move down",
             Key::RoutingDeleteRule => "Remove rule",
@@ -3598,6 +3680,9 @@ mod en {
             Key::GeodataModifiedUnavailable => "unavailable",
             Key::GeodataSearch => "Search codes…",
             Key::GeodataNoMatches => "No matching codes.",
+            Key::RoutingGeoTagAbsent => {
+                "The loaded geo data does not carry {}. This condition matches nothing."
+            }
             Key::RuntimeStateRefreshed => "Runtime state refreshed.",
             Key::RuntimeOverrideTitle => "Runtime override",
             Key::RuntimeOverrideEphemeral => {
@@ -4350,7 +4435,6 @@ mod en {
             Key::SrvMasqueOutboundTransport => "MASQUE transport requires a MASQUE outbound",
             Key::SrvMasqueTransportMissing => "MASQUE outbound requires the MASQUE transport",
             Key::SrvMasqueSettingsMissing => "MASQUE settings are missing",
-            Key::SrvMasqueMuxUnsupported => "MASQUE outbound does not support mux",
             Key::SrvMasqueTransportTls => "MASQUE transport requires TLS",
             Key::SrvMasqueSettingsIncomplete => "MASQUE server address and port are required",
             Key::SrvMasqueRemoteDns => "Every MASQUE remote DNS entry must be an IP address",
@@ -4368,6 +4452,23 @@ mod en {
             Key::SrvMasqueUserColon => "MASQUE user cannot contain a colon",
             Key::SrvMasqueAlpnHttp3 => "An ALPN list with both h2 and h3 makes MASQUE use HTTP/3",
             Key::SrvMasqueHeaderValues => "MASQUE header values must be strings",
+            Key::SrvMasqueWarp => "WARP",
+            Key::SrvMasqueWarpPrivateKey => "Private key",
+            Key::SrvMasqueWarpPublicKey => "Public key",
+            Key::SrvMasqueWarpAddresses => "Addresses",
+            Key::SrvMasqueWarpPrivateKeyInvalid => {
+                "The WARP private key must be a PEM or base64 key"
+            }
+            Key::SrvMasqueWarpPublicKeyInvalid => "The WARP public key must be a PEM or base64 key",
+            Key::SrvMasqueWarpAddressInvalid => {
+                "Every WARP address must be an IP address or an IP prefix"
+            }
+            Key::SrvMasqueWarpAddressShape => {
+                "A WARP address list must hold one address, or one IPv4 and one IPv6 address"
+            }
+            Key::SrvMasqueWarpCredentialsConflict => {
+                "WARP cannot be used with a MASQUE user or password"
+            }
             Key::SrvXdriveSettingsMissing => "XDRIVE settings are missing",
             Key::SrvXdriveService => "Service",
             Key::SrvXdriveServiceUnset => "(choose a service)",
@@ -4435,6 +4536,12 @@ mod en {
             Key::SrvXdriveTestpre => "The xdrive transport does not support VLESS testpre",
             Key::SrvXdriveDriveRenamed => {
                 "The \"Google Drive\" service was renamed. The profile is saved as \"google-drive\"."
+            }
+            Key::SrvXdriveH3MaskNotNoise => {
+                "Over h3 to Google Drive the only UDP mask that works is noise, not {}"
+            }
+            Key::SrvXdriveH3BrutalCongestion => {
+                "Over h3 the congestion control is bbr or reno, not brutal or force-brutal"
             }
             Key::SrvXdriveResetToRaw => {
                 "The xdrive transport is VLESS-only. Switching protocol reset the transport to raw."
@@ -4583,6 +4690,12 @@ mod en {
             Key::SrvTlsFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. unsafe = native Go TLS, no imitation"
+            }
+            Key::SrvTlsUseSystemCaNote => {
+                "off (the default) = the root certificates bundled with the core verify the \
+                 server. on = the certificate store of the operating system verifies the server, \
+                 including roots a user installed. Turn it on only when a private certificate \
+                 authority must be trusted"
             }
             Key::SrvRealityFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
@@ -4785,7 +4898,7 @@ mod en {
                 "sessionIDTable must be ASCII and, together with sessionIDLength (from at \
                  least 1), provide at least 2^31 key combinations"
             }
-            Key::SrvXhttpXmuxExclusive => {
+            Key::SrvXmuxLimitsExclusive => {
                 "maxConnections and maxConcurrency are mutually exclusive. Choose one"
             }
             Key::XhttpExtraShadowsSettings => {
@@ -4986,6 +5099,13 @@ mod en {
             }
             Key::FinalmaskXdnsExtraPollInvalid => "use an extraPoll from 0 through 3",
             Key::FinalmaskXicmpIpInvalid => "enter a literal IPv4 or IPv6 address",
+            Key::FinalmaskFilterIpRuleInvalid => {
+                "{} is not an IP address, CIDR prefix, geoip: tag, or ext: rule"
+            }
+            Key::FinalmaskFilterOnOutbound => {
+                "This filter mask has no effect on an outbound: the core builds it, but only a \
+                 listener reads it"
+            }
             Key::FinalmaskRealmScheme => "scheme must be realm or realm+http",
             Key::FinalmaskRealmHostRequired => "host is required",
             Key::FinalmaskRealmTokenBeforeAt => "put the Realm token before @",
@@ -5193,6 +5313,26 @@ mod en {
                 "routing rule {} references missing inbound {}"
             }
             Key::SettingsDnsServerAddressMissing => "DNS server {} has no address",
+            Key::SettingsLuaScriptPathRequired => {
+                "the script path is required once a script is enabled"
+            }
+            Key::SettingsLuaScriptPathNotLua => "the script path must name a .lua file",
+            Key::SettingsDnsScriptFallbackConflict => {
+                "A DNS script cannot be combined with disableFallback or \
+                 disableFallbackIfMatch. Turn the script off or clear those flags."
+            }
+            Key::SettingsDnsScriptServerConflict => {
+                "DNS server {} sets {}. A DNS script cannot be combined with domains, \
+                 skipFallback or finalQuery."
+            }
+            Key::SettingsRoutingScriptRulesConflict => {
+                "A routing script cannot be combined with routing rules. Remove the rules \
+                 or turn the script off. The app never drops them for you."
+            }
+            Key::SettingsRoutingScriptStrategyConflict => {
+                "A routing script cannot be combined with a domain strategy. Set the \
+                 strategy to AsIs or turn the script off."
+            }
             Key::SettingsDnsBootstrapNotResolvable => {
                 "bootstrap resolver: must be an IP literal or localhost, since a domain host \
                  needs the resolution this entry provides"
@@ -5335,6 +5475,7 @@ mod en {
             Key::ShellXrayArchiveFilter => "Xray archive",
             Key::ShellMasterKeyLogFileName => "tls.keys.log",
             Key::ShellCertificateFilter => "Certificate",
+            Key::ShellLuaScriptFilter => "Lua script",
             Key::LinkPercentTruncated => "The share link has truncated percent-encoding in {}.",
             Key::LinkPercentEscape => "The share link has a bad percent escape in {}.",
             Key::LinkPercentUtf8 => "The share link has invalid UTF-8 in percent-encoded {}.",

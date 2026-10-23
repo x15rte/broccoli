@@ -370,6 +370,89 @@ pub fn masque_remote_dns_entry_supported(entry: &str) -> bool {
     parses_as_remote_dns_address(entry)
 }
 
+/// The address family of one WARP address entry, as the core's own
+/// `parseWarpAddress` classifies it (`infra/conf/transport_method.go`):
+/// `netip.ParsePrefix` first, then `netip.ParseAddr` with the address's own
+/// bit length made into a prefix. The entry must therefore be an address
+/// literal or an `address/prefix-length` pair; the core keeps the normalized
+/// prefix string, so this predicate judges shape only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasqueWarpAddressFamily {
+    V4,
+    V6,
+}
+
+/// The family of one WARP address when it is the shape the core accepts.
+pub fn masque_warp_address_family(entry: &str) -> Option<MasqueWarpAddressFamily> {
+    let (address, is_prefix) = match entry.split_once('/') {
+        Some((address, length)) => (address, Some(length)),
+        None => (entry, None),
+    };
+    let family = match address.split_once('%') {
+        // `netip.ParsePrefix` refuses a zone outright, so a zone is only
+        // legal on the bare-address form the core also tries.
+        Some((address, zone)) if is_prefix.is_none() && !zone.is_empty() => {
+            address.parse::<std::net::Ipv6Addr>().ok()?;
+            MasqueWarpAddressFamily::V6
+        }
+        Some(_) => return None,
+        None => match address.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V4(_) => MasqueWarpAddressFamily::V4,
+            std::net::IpAddr::V6(_) => MasqueWarpAddressFamily::V6,
+        },
+    };
+    if let Some(length) = is_prefix {
+        let max = match family {
+            MasqueWarpAddressFamily::V4 => 32,
+            MasqueWarpAddressFamily::V6 => 128,
+        };
+        if length.parse::<u8>().ok().is_none_or(|length| length > max) {
+            return None;
+        }
+    }
+    Some(family)
+}
+
+/// True when one WARP key is the shape the core's WARP key decoder accepts:
+/// after trimming surrounding whitespace, either a PEM block or standard
+/// base64 (the decoder ignores CR and LF inside the base64 text). Whether the
+/// decoded bytes are a valid P-256 private key or a PKIX public key is the
+/// core's config-test judgement, which names the failure.
+pub fn masque_warp_key_shaped(key: &str) -> bool {
+    let key = key.trim();
+    if key.is_empty() {
+        return false;
+    }
+    if pem_block_shaped(key) {
+        return true;
+    }
+    if !key.contains(['\r', '\n']) {
+        return base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .is_ok();
+    }
+    let compact: String = key
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .is_ok()
+}
+
+/// True when `key` carries a PEM block with matching `BEGIN`/`END` labels.
+/// The body is not decoded: `pem.Decode` does that, and a body the core
+/// refuses is the core's config-test failure, not a shape the model can judge.
+fn pem_block_shaped(key: &str) -> bool {
+    let Some((_, after_begin)) = key.split_once("-----BEGIN ") else {
+        return false;
+    };
+    let Some((label, body)) = after_begin.split_once("-----") else {
+        return false;
+    };
+    !label.is_empty() && body.contains(&format!("-----END {label}-----"))
+}
+
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key
 /// size: 64 hexadecimal digits, or raw standard/URL-safe base64 with zero or
 /// one trailing padding character. Go trims one `=` and ignores CR and LF
@@ -1244,7 +1327,7 @@ mod tests {
     };
     use crate::model::settings::Language;
     use crate::model::stream::{
-        FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HysteriaTransport, Network,
+        FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, HysteriaTransport, MasqueWarp, Network,
         RawSettings, Security, XdriveTemplate, XhttpSettings,
     };
     use base64::Engine as _;
@@ -1554,6 +1637,84 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode("user:pass")
             )
         );
+    }
+
+    /// A WARP block round-trips through the settings file unchanged. The wire
+    /// form carries the host and path the core would default to for WARP, so
+    /// the document does not depend on that implicit default.
+    #[test]
+    fn masque_warp_round_trips_and_pins_the_core_warp_defaults_on_wire() {
+        let mut outbound = OutboundModel::new(Protocol::Masque);
+        outbound
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound materializes its transport")
+            .warp = Some(MasqueWarp {
+            private_key: "cHJpdmF0ZQ==".into(),
+            public_key: "cHVibGlj".into(),
+            address: vec!["172.16.0.2".into(), "2606:4700:110:8a36::2/128".into()],
+            ..Default::default()
+        });
+
+        let stored = serde_json::to_value(&outbound).unwrap();
+        let stored_warp = &stored["streamSettings"]["masqueSettings"]["warp"];
+        assert_eq!(stored_warp["privateKey"], "cHJpdmF0ZQ==");
+        assert_eq!(stored_warp["publicKey"], "cHVibGlj");
+        assert_eq!(
+            stored_warp["address"],
+            json!(["172.16.0.2", "2606:4700:110:8a36::2/128"])
+        );
+
+        let restored: OutboundModel = serde_json::from_value(stored).unwrap();
+        let masque = restored
+            .stream
+            .masque_settings
+            .as_ref()
+            .expect("the WARP block survives the settings file");
+        assert!(masque.path.is_empty(), "an unset path stays unset");
+        assert!(masque.host.is_empty(), "an unset host stays unset");
+
+        let wire = restored.to_wire("srv-01234567");
+        let masque = &wire["streamSettings"]["masqueSettings"];
+        assert_eq!(masque["host"], "cloudflareaccess.com");
+        assert_eq!(masque["path"], "/");
+        assert_eq!(
+            masque["warp"]["address"],
+            json!(["172.16.0.2", "2606:4700:110:8a36::2/128"])
+        );
+    }
+
+    /// An explicit host or path beside WARP is what the core runs, so the wire
+    /// keeps it instead of substituting the WARP default.
+    #[test]
+    fn masque_warp_keeps_an_explicit_host_and_path_on_wire() {
+        let mut outbound = OutboundModel::new(Protocol::Masque);
+        let masque = outbound
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound materializes its transport");
+        masque.host = "edge.example.com".into();
+        masque.path = "/warp".into();
+        masque.warp = Some(MasqueWarp::default());
+
+        let wire = outbound.to_wire("srv-01234567");
+        let masque = &wire["streamSettings"]["masqueSettings"];
+        assert_eq!(masque["host"], "edge.example.com");
+        assert_eq!(masque["path"], "/warp");
+    }
+
+    /// A transport without WARP still carries the core's default path and no
+    /// host, exactly as before the block existed.
+    #[test]
+    fn masque_without_warp_keeps_the_default_path_only() {
+        let outbound = OutboundModel::new(Protocol::Masque);
+        let wire = outbound.to_wire("srv-01234567");
+        let masque = &wire["streamSettings"]["masqueSettings"];
+        assert_eq!(masque["path"], crate::model::stream::MASQUE_DEFAULT_PATH);
+        assert_eq!(masque["host"], Value::Null);
+        assert_eq!(masque["warp"], Value::Null);
     }
 
     /// Switching to MASQUE arms its transport and TLS, and leaving it drops

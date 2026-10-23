@@ -423,6 +423,15 @@ pub enum ValidationCode {
     FinalmaskRealmAlpnFromMitm,
     FinalmaskRealmCertRequired,
     FinalmaskRealmEchKeysBase64,
+    /// A `filter` source-IP rule the mask build refuses
+    /// (`common/geodata/rule_parser.go` via `ParseIPRules`,
+    /// `infra/conf/transport_finalmask.go:105-115`): the whole configuration
+    /// fails to load. The value carries the offending rule. Error tier.
+    FinalmaskFilterIpRuleInvalid(String),
+    /// A `filter` mask on an outbound. The loader builds it, but only a
+    /// listener consults it (`transport/internet/finalmask/filter/config.go`),
+    /// so the dial runs with the mask inert. Warning tier.
+    FinalmaskFilterOnOutbound,
     FinalmaskUnknownUdpMask(Option<String>),
     // ---- editor rules that decide configuration validity
     //      (validate_outbound / validate_settings) ----
@@ -623,6 +632,34 @@ pub enum ValidationCode {
     /// warning (Severity::Warning), never a gate; Xray loads and runs the
     /// document with the entry absent.
     DnsBootstrapNotResolvable,
+    /// A Lua script path that is configured but blank: the core's file
+    /// resolver refuses the empty path before reading anything
+    /// (`common/platform/platform.go`, `ResolveLuaFile`), so the whole
+    /// document fails to load. Error tier.
+    LuaScriptPathRequired,
+    /// A Lua script path that does not end in `.lua`: the core's resolver
+    /// refuses every other extension (`resolveLuaTarget`, same file), so the
+    /// document never loads. Error tier; the app stores the path verbatim
+    /// and never reads or runs the file.
+    LuaScriptPathNotLua,
+    /// A DNS script beside `disableFallback` or `disableFallbackIfMatch`:
+    /// Xray's DNS build refuses the combination (infra/conf/dns.go:276-278).
+    /// Error tier.
+    DnsScriptFallbackConflict,
+    /// A DNS script beside a server carrying `domains`, `skipFallback` or
+    /// `finalQuery`: Xray's DNS build refuses the combination and names the
+    /// server (infra/conf/dns.go:279-283). The payload is the 1-based server
+    /// index and the offending field's wire name. Error tier.
+    DnsScriptServerConflict(usize, String),
+    /// A routing script beside routing rules: Xray's router build refuses the
+    /// pair (infra/conf/router.go:94-96), and the app never drops the user's
+    /// rules to make the script fit. Error tier.
+    RoutingScriptRulesConflict,
+    /// A routing script beside a non-default `domainStrategy`: the core
+    /// refuses a script with any `domainStrategy` key
+    /// (infra/conf/router.go:94-96), and the app emits none beside a script.
+    /// Error tier.
+    RoutingScriptStrategyConflict,
     /// A fakeDNS pool whose `ipPool` is not an IP CIDR range (1-based index).
     FakeDnsPoolCidrInvalid(usize),
     /// A fakeDNS pool with a non-positive `poolSize` (1-based index).
@@ -713,9 +750,11 @@ pub enum ValidationCode {
     /// 2^31 key space: a non-ASCII table, a `length.from` ≤ 0 (or reversed
     /// range), or simply too few combinations for the table alphabet.
     XhttpSessionIdTableInvalid,
-    /// XHTTP xmux `maxConnections` and `maxConcurrency` both in use
-    /// (`to > 0` each): Xray refuses them together.
-    XhttpXmuxLimitsExclusive,
+    /// A transport's `xmux` `maxConnections` and `maxConcurrency` both in use
+    /// (`to > 0` each): Xray refuses them together on every transport whose
+    /// conf build reads the block (infra/conf/transport_method.go). Error
+    /// tier.
+    XmuxLimitsExclusive,
     /// Inbound sniffing `destOverride` item outside {http, tls/https/ssl,
     /// quic, fakedns, fakedns+others} (case-insensitive): Xray's
     /// SniffingConfig build rejects unknown protocols (infra/conf/xray.go).
@@ -896,10 +935,6 @@ pub enum ValidationCode {
     /// config-file check never sees it — the model reports it instead. Error
     /// tier: the profile cannot start.
     MasqueOutboundRequiresMasqueTransport,
-    /// A `masque` outbound with `mux.enabled`: the pinned core refuses the
-    /// outbound at load (``masque outbound does not support "mux"``,
-    /// infra/conf/xray.go:347-350). Error tier.
-    MasqueOutboundMuxUnsupported,
     /// The `masque` transport without `security: tls`. The core loads the
     /// document and refuses the outbound while it creates the handler
     /// (``MASQUE requires "security": "tls"``, proxy/masque/client.go:61-63);
@@ -952,6 +987,30 @@ pub enum ValidationCode {
     /// (transport/internet/masque/dialer.go:132-134), so the pair silently
     /// picks HTTP/3; the core accepts the config and runs it.
     MasqueAlpnPrefersHttp3,
+    /// `stream.masqueSettings.warp.privateKey` is empty, or is neither a PEM
+    /// block nor standard base64: the core's WARP key decoder refuses both
+    /// while it builds the transport (`invalid "privateKey" in "warp"`,
+    /// infra/conf/transport_method.go). Error tier.
+    MasqueWarpPrivateKeyInvalid,
+    /// `stream.masqueSettings.warp.publicKey` is empty, or is neither a PEM
+    /// block nor standard base64: refused by the same decode
+    /// (`invalid "publicKey" in "warp"`). Error tier.
+    MasqueWarpPublicKeyInvalid,
+    /// One `stream.masqueSettings.warp.address` entry is not an address or
+    /// `address/prefix-length` pair: the core parses every entry with
+    /// `netip.ParsePrefix` and then `netip.ParseAddr` and refuses the document
+    /// (`invalid "address" in "warp"`). Error tier.
+    MasqueWarpAddressInvalid,
+    /// The `stream.masqueSettings.warp.address` list is empty, or holds more
+    /// than one IPv4 or more than one IPv6 entry: the core refuses both
+    /// (`"address" in "warp" is not set` /
+    /// `"address" in "warp" takes at most one IPv4 and one IPv6 address`).
+    /// Error tier.
+    MasqueWarpAddressShape,
+    /// `stream.masqueSettings.warp` is set beside `user` or `pass`: the core
+    /// refuses the pair (`"user" and "pass" can't be used with "warp"`).
+    /// Error tier.
+    MasqueWarpCredentialsConflict,
     /// `stream.xdriveSettings.service` outside `local`, `Google Drive` and
     /// `template`: the core's conf build refuses the whole document with
     /// `unsupported service` (infra/conf/transport_method.go:876-887). The
@@ -1056,6 +1115,17 @@ pub enum ValidationCode {
     /// names the replacement for the one session that still sees the stored
     /// value.
     XdriveDriveServiceRenamed,
+    /// A `google-drive` xdrive outbound in its h3 form — TLS ALPN exactly
+    /// `["h3"]` — carrying a UDP mask other than `noise`: only noise composes
+    /// with the QUIC datagrams the drive transport sends
+    /// (infra/conf/transport_internet.go:266-276). The code carries the
+    /// rejected mask type. Error tier.
+    XdriveH3MaskNotNoise(String),
+    /// An xdrive outbound in its h3 form with `finalmask.quicParams`
+    /// congestion `brutal` or `force-brutal`: brutal is a Hysteria
+    /// controller, and over h3 the core accepts `bbr` or `reno`
+    /// (infra/conf/transport_internet.go:266-276). Error tier.
+    XdriveH3CongestionBrutal,
 
     // ---- draft requirements ----
     //
@@ -1286,16 +1356,18 @@ mod stream;
 
 pub use outbound::{
     DNS_OUT_ACTIONS, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
-    freedom_final_rule_supported, masque_remote_dns_verdict, mux_conflicts_with_vision_flow,
-    send_through_supported, sniffing_dest_override_supported, validate_outbound, validate_sniffing,
-    wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
-    wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
+    freedom_final_rule_supported, masque_remote_dns_verdict, masque_warp_address_list_verdict,
+    masque_warp_address_verdict, masque_warp_private_key_verdict, masque_warp_public_key_verdict,
+    mux_conflicts_with_vision_flow, send_through_supported, sniffing_dest_override_supported,
+    validate_outbound, validate_sniffing, wireguard_peer_public_key_verdict,
+    wireguard_preshared_key_verdict, wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
-    inbound_auth_trap, local_inbound_auth_verdict, sniffing_row_verdict, tun_gateway_verdict,
-    tun_ipv4_gateway, tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address,
-    validate_profiles, validate_settings,
+    dns_script_issues, inbound_auth_trap, local_inbound_auth_verdict, lua_script_path_issue,
+    routing_script_issues, sniffing_row_verdict, tun_gateway_verdict, tun_ipv4_gateway,
+    tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address, validate_profiles,
+    validate_settings,
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,

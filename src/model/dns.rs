@@ -21,6 +21,11 @@ fn skip_default_query_strategy(s: &str) -> bool {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsServer {
+    /// Optional id the core hands to DNS scripts (dns.go:20; the script
+    /// surface reads it in app/dns/lua.go:48-61). The core enforces no
+    /// uniqueness.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub id: String,
     /// plain IP/domain | localhost | https:// | h2c:// | https+local:// |
     /// quic+local:// | tcp:// | tcp+local:// | fakedns
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -57,6 +62,7 @@ pub struct DnsServer {
 impl Default for DnsServer {
     fn default() -> Self {
         Self {
+            id: String::new(),
             address: String::new(),
             port: None,
             domains: Vec::new(),
@@ -81,6 +87,7 @@ impl<'de> Deserialize<'de> for DnsServer {
         #[derive(Default, Deserialize)]
         #[serde(rename_all = "camelCase", default)]
         struct Object {
+            id: String,
             address: String,
             port: Option<u16>,
             domains: Vec<String>,
@@ -133,6 +140,7 @@ impl<'de> Deserialize<'de> for DnsServer {
                 let wire = serde::de::value::MapAccessDeserializer::new(map);
                 let object = Object::deserialize(wire)?;
                 Ok(DnsServer {
+                    id: object.id,
                     address: object.address,
                     port: object.port,
                     domains: object.domains,
@@ -331,6 +339,12 @@ pub struct DnsCfg {
     pub enable_parallel_query: bool,
     #[serde(skip_serializing_if = "skip_false")]
     pub use_system_hosts: bool,
+    /// Path to a Lua DNS script (`dns.script`, infra/conf/dns.go:166):
+    /// `None` = no script, `Some(path)` = the file the core resolves and
+    /// compiles at load. The app stores the path verbatim and never reads or
+    /// runs the file; the path's structural rules live in the validation pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// GUI-only group; stripped from the dns object by the generator.
     pub fakedns: FakeDnsCfg,
     #[serde(flatten)]
@@ -359,6 +373,7 @@ impl Default for DnsCfg {
             disable_fallback_if_match: false,
             enable_parallel_query: true,
             use_system_hosts: false,
+            script: None,
             fakedns: FakeDnsCfg::default(),
             extra: Map::new(),
         }
@@ -406,6 +421,19 @@ impl DnsCfg {
             .is_none_or(Vec::is_empty)
         {
             obj.remove("servers");
+        }
+        // A script owns query scheduling: the core refuses a script beside
+        // `enableParallelQuery` (infra/conf/dns.go:276-278), so the app-owned
+        // default never reaches the wire next to one. An empty script is the
+        // core's own "no script" spelling and strips like an absent one.
+        if self
+            .script
+            .as_deref()
+            .is_some_and(|script| !script.is_empty())
+        {
+            obj.remove("enableParallelQuery");
+        } else if self.script.as_deref() == Some("") {
+            obj.remove("script");
         }
         if obj.get("enableParallelQuery") == Some(&Value::Bool(false)) {
             obj.remove("enableParallelQuery");
@@ -704,6 +732,62 @@ mod tests {
         assert_eq!(output["disableCache"], json!(false));
         assert_eq!(output["serveStale"], json!(false));
         assert_eq!(output["finalQuery"], json!(false));
+    }
+
+    /// The core hands each server's `id` to DNS scripts (app/dns/lua.go:48-61).
+    /// The field is optional: an empty id stays off both the wire and the
+    /// stored document, so an entry that never set one keeps its old shape.
+    #[test]
+    fn nameserver_id_round_trips_and_omits_empty() {
+        let server: DnsServer = serde_json::from_value(json!({
+            "address": "1.1.1.1",
+            "id": "resolver-a"
+        }))
+        .unwrap();
+        assert_eq!(server.id, "resolver-a");
+        assert_eq!(
+            serde_json::to_value(server).unwrap()["id"],
+            json!("resolver-a")
+        );
+
+        let unset: DnsServer = serde_json::from_value(json!({"address": "1.1.1.1"})).unwrap();
+        assert_eq!(unset.id, "");
+        assert!(
+            serde_json::to_value(&unset).unwrap().get("id").is_none(),
+            "an unset id must not be emitted"
+        );
+
+        let shorthand: DnsServer = serde_json::from_value(json!("1.1.1.1")).unwrap();
+        assert_eq!(shorthand.id, "");
+    }
+
+    /// The id crosses the stored-state boundary and the generated document;
+    /// clearing it returns the entry to the id-less shape on the wire.
+    #[test]
+    fn nameserver_id_survives_state_and_reaches_the_wire() {
+        let mut cfg = DnsCfg {
+            servers: vec![DnsServer {
+                address: "1.1.1.1".into(),
+                id: "resolver-a".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let persisted = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(persisted["servers"][0]["id"], json!("resolver-a"));
+        let restored: DnsCfg = serde_json::from_value(persisted).unwrap();
+        assert_eq!(restored.servers[0].id, "resolver-a");
+
+        let wire = cfg.to_wire(false).expect("dns wire");
+        assert_eq!(wire["servers"][0]["id"], json!("resolver-a"));
+
+        cfg.servers[0].id.clear();
+        let wire = cfg.to_wire(false).expect("dns wire");
+        assert!(
+            wire["servers"][0].get("id").is_none(),
+            "a cleared id must not be emitted"
+        );
     }
 
     #[test]

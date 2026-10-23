@@ -2,8 +2,8 @@
 //! tun — plus the shared sniffing config and TUN settings (tun.go:15-54).
 
 use super::{
-    dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, fold_lower, skip_empty_str, skip_empty_vec,
-    skip_false, skip_zero_u16, skip_zero_u32,
+    FinalmaskModel, dns::DEFAULT_PLAINTEXT_RESOLVERS, fold_eq, fold_lower, skip_empty_str,
+    skip_empty_vec, skip_false, skip_zero_u16, skip_zero_u32,
 };
 use crate::r#gen::keys;
 use serde::{Deserialize, Serialize};
@@ -275,6 +275,13 @@ pub struct LocalInboundCfg {
     #[serde(skip_serializing_if = "skip_false")]
     pub allow_transparent: bool,
     pub sniffing: Sniffing,
+    /// Listener-side `streamSettings.finalmask`, edited only through the
+    /// `filter` mask. The core builds the mask for an inbound's listener
+    /// (`transport/internet/finalmask/filter/config.go`), so a saved value
+    /// here reaches the listener it belongs to; `None` keeps the block out of
+    /// the generated document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalmask: Option<FinalmaskModel>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -294,6 +301,7 @@ impl Default for LocalInboundCfg {
             accounts: Vec::new(),
             allow_transparent: false,
             sniffing: Sniffing::default(),
+            finalmask: None,
             extra: Map::new(),
         }
     }
@@ -346,7 +354,7 @@ impl LocalInboundCfg {
         if self.protocol == LocalInboundProtocol::Http && self.allow_transparent {
             set.insert("allowTransparent".into(), json!(true));
         }
-        base_inbound(
+        let mut wire = base_inbound(
             self.tag.as_str(),
             self.listen.as_str(),
             Some(self.port),
@@ -354,7 +362,16 @@ impl LocalInboundCfg {
             set,
             self.user_level,
             self.sniffing.to_wire(fakedns),
-        )
+        );
+        if let Some(finalmask) = self.finalmask.as_ref().and_then(FinalmaskModel::wire_value)
+            && let Some(object) = wire.as_object_mut()
+        {
+            object.insert(
+                keys::STREAM_SETTINGS.into(),
+                json!({ keys::FINALMASK: finalmask }),
+            );
+        }
+        wire
     }
 
     /// Whether the wire form of this inbound requires valid credentials before

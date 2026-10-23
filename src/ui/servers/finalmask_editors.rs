@@ -11,11 +11,11 @@ use crate::model::validation::{
     ValidationCode, noise_exp_finding, noise_exp_packet_finding, pinned_peer_cert_sha256_valid,
 };
 use crate::model::{
-    FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams,
-    FinalmaskRawValue, FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku,
-    FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop,
-    FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver,
-    FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert, fold_eq,
+    FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskNoiseItem, FinalmaskPortList,
+    FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealmPortMapping, FinalmaskRealmTls,
+    FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg,
+    FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain,
+    FinalmaskXdnsResolver, FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert, fold_eq,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -1028,10 +1028,37 @@ pub(super) fn finalmask_tcp_settings_editor(
             finalmask_sudoku_editor(ui, lang, settings, masked)
         }
         FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings, masked),
+        FinalmaskTcpMask::Filter { settings, .. } => finalmask_filter_editor(ui, lang, settings),
         FinalmaskTcpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }
     }
+}
+
+/// The two source-IP rule lists of a `filter` mask
+/// (`infra/conf/transport_finalmask.go:100-115`). Both accept the routing
+/// IP-rule grammar; the core refuses the configuration on a malformed entry.
+fn finalmask_filter_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    settings: &mut FinalmaskFilter,
+) -> bool {
+    let hint = "IP, CIDR, geoip:TAG, or ext:FILE:CODE";
+    let mut changed = widgets::string_list(
+        ui,
+        lang,
+        "blockedSourceIPs",
+        &mut settings.blocked_source_ips,
+        hint,
+    );
+    changed |= widgets::string_list(
+        ui,
+        lang,
+        "allowedSourceIPs",
+        &mut settings.allowed_source_ips,
+        hint,
+    );
+    changed
 }
 
 fn finalmask_realm_tls_editor(
@@ -1070,6 +1097,9 @@ fn finalmask_realm_tls_editor(
         &mut tls.disable_system_root,
         t(lang, Key::SrvUnset),
     );
+    changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
+        ui.checkbox(&mut tls.use_system_ca, "useSystemCA").changed()
+    });
     changed |= widgets::combo_str_labeled(
         ui,
         "minVersion",
@@ -1388,6 +1418,7 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Udphop { settings, .. } => finalmask_udphop_editor(ui, lang, settings),
+        FinalmaskUdpMask::Filter { settings, .. } => finalmask_filter_editor(ui, lang, settings),
         FinalmaskUdpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }

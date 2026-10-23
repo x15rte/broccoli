@@ -3720,6 +3720,7 @@ fn validate_tls_exportable(tls: &TlsModel) -> Result<(), LinkError> {
         || !tls.curve_preferences.is_empty()
         || !tls.certificates.is_empty()
         || tls.disable_system_root.is_some()
+        || tls.use_system_ca
         || tls.enable_session_resumption.is_some()
         || !tls.master_key_log.is_empty()
         || tls.ech_sockopt.is_some()
@@ -4027,7 +4028,9 @@ pub fn qr_color_image(s: &str) -> Option<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::FinalmaskTcpMask;
     use crate::model::inbound::DNS_OUTBOUND_TAG;
+    use crate::model::validation::ValidationCode;
 
     const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
@@ -4705,6 +4708,29 @@ mod tests {
                 "domains": [{"names": ["tunnel.example.com"], "types": [1, 28]}],
                 "resolvers": [{"addrs": ["udp://1.1.1.1:53"]}]
             })
+        );
+    }
+
+    /// A `filter` mask only reachable on an outbound by import: the envelope
+    /// is known (not an unknown discriminator), it round-trips through the
+    /// `fm` parameter, and the mask registers as an advisory rather than a
+    /// refusal.
+    #[test]
+    fn outbound_filter_mask_round_trips_with_an_advisory() {
+        let fm = pct_encode(
+            r#"{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["geoip:private"],"allowedSourceIPs":["10.0.0.0/8"]}}]}"#,
+        );
+        let link = format!("vless://{UUID}@filter.local:443?encryption=none&fm={fm}#Filter");
+        let (p, canonical) = round_trip(&link);
+        let f = p.outbound.stream.finalmask.as_ref().unwrap();
+        assert!(matches!(f.tcp[0], FinalmaskTcpMask::Filter { .. }));
+        assert!(canonical.contains("fm="));
+        let advisories = profile_advisories(&p).expect("an advisory must not refuse the import");
+        assert!(
+            advisories
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskFilterOnOutbound),
+            "{advisories:#?}"
         );
     }
 
@@ -6216,6 +6242,20 @@ mod tests {
             .min_version = "1.3".into();
         expect_lossy(&profile, "tlsSettings");
 
+        // The share-link grammar has no trust-switch parameter, so a profile
+        // that opted into the certificate store of the operating system
+        // refuses the export instead of dropping the choice.
+        let mut profile =
+            parse_link(&format!("vless://{UUID}@tls.example.com:443?security=tls")).unwrap();
+        profile
+            .outbound
+            .stream
+            .tls_settings
+            .as_mut()
+            .unwrap()
+            .use_system_ca = true;
+        expect_lossy(&profile, "tlsSettings");
+
         let mut profile = base.clone();
         let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
             unreachable!()
@@ -6412,27 +6452,24 @@ mod tests {
         // the hysteria2 link existed.
         let cases = [
             (
-                parse_link("socks5://u:p@h.example.com:1080")
-                    .unwrap()
-                    .profile,
+                "socks5://u:p@h.example.com:1080".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"socks"]),
             ),
             (
-                parse_link("http://h.example.com:8080").unwrap().profile,
+                "http://h.example.com:8080".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"http"]),
             ),
             (
-                parse_link("hysteria2://pw@h.example.com:443")
-                    .unwrap()
-                    .profile,
+                "hysteria2://pw@h.example.com:443".to_string(),
                 t_fmt(Language::En, Key::LinkUnsupportedHysteria, &[]),
             ),
             (
-                parse_link(&wireguard_link()).unwrap().profile,
+                wireguard_link(),
                 t_fmt(Language::En, Key::LinkUnsupportedProtocol, &[&"wireguard"]),
             ),
         ];
-        for (profile, expected) in cases {
+        for (link, expected) in cases {
+            let profile = parse_link(&link).unwrap().profile;
             match to_link(&profile) {
                 Err(LinkError::Unsupported(message)) => {
                     assert_eq!(message.text(Language::En), expected);

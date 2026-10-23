@@ -10,6 +10,7 @@ use crate::model::inbound::{
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
+use crate::model::validation::routing_script_issues;
 use crate::model::{
     Balancer, DurationMs, LeastLoadSettings, Rule, ServerProfile, ServersFile, Settings,
     StrategyCost, Webhook,
@@ -267,6 +268,58 @@ fn geodata_search_matches<'a>(
     }
 }
 
+/// The `geosite:`/`geoip:` references one rule's `domain` and `ip` lists make
+/// that the loaded catalog does not carry, in condition order and spelled with
+/// the kind's prefix (`geosite:gone`). The check is permissive wherever the
+/// catalog cannot judge the entry: no snapshot at all, a side that failed to
+/// load, an `ext:` file reference, or an entry that does not carry the
+/// prefix of its own list. Codes compare case-insensitively, a leading `!`
+/// (the reverse prefix) is stripped first, and an `@attr` suffix is not part
+/// of the code — the same reading the runtime's parser applies. Read-only by
+/// signature: the rule is borrowed, so the advisory can never rewrite it.
+fn absent_geo_tags(rule: &Rule, snapshot: Option<&GeodataSnapshot>) -> Vec<String> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut absent = Vec::new();
+    for (kind, entries) in [
+        (GeodataPickerKind::Geosite, &rule.domain),
+        (GeodataPickerKind::Geoip, &rule.ip),
+    ] {
+        let Ok(catalog) = kind.catalog(snapshot) else {
+            continue;
+        };
+        for entry in entries {
+            // The runtime strips every leading `!` before it reads a code,
+            // so the advisory reads the entry the same way.
+            let entry = entry.trim().trim_start_matches('!');
+            let Some(rest) = entry.strip_prefix(kind.prefix()) else {
+                continue;
+            };
+            if rest.starts_with("ext:") {
+                continue;
+            }
+            let code = rest.split_once('@').map_or(rest, |(code, _)| code);
+            if code.is_empty()
+                || catalog
+                    .codes
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(code))
+            {
+                continue;
+            }
+            let reference = format!("{}{code}", kind.prefix());
+            if !absent
+                .iter()
+                .any(|seen: &String| seen.eq_ignore_ascii_case(&reference))
+            {
+                absent.push(reference);
+            }
+        }
+    }
+    absent
+}
+
 /// One rule's memoized row text: the 8-char tag prefix,
 /// the summary line, and the arrow-wrapped target line (empty = no target).
 /// Computed once per model generation change, never per frame.
@@ -301,12 +354,16 @@ struct BalancerHeaderText {
 /// One generation of the routing screen's derived UI data:
 /// the outbound/balancer tag lists offered by the rule and balancer editors,
 /// the per-rule row text, the per-balancer rule-reference counts, and the
-/// TestRoute dialog's inbound options. Rebuilt only when the model generation
-/// or the language advances — an edit, a cross-screen change, a locale change
-/// — never on idle repaint frames.
+/// TestRoute dialog's inbound options. Rebuilt only when the model generation,
+/// the geodata revision, or the language advances — an edit, a cross-screen
+/// change, a landed catalog, a locale change — never on idle repaint frames.
 #[derive(Debug)]
 struct RoutingViewCache {
     generation: (u64, Language),
+    /// `RoutingScreen::geodata_revision` the geodata advisories were built
+    /// against. A landed snapshot bumps the revision, so the next frame
+    /// recomputes them against the new catalog.
+    geodata_revision: u64,
     out_tags: Vec<String>,
     /// Whether the document carries a server profile's outbound (`srv-…`): the
     /// balancer Add button and the rule editor's "select all servers" shortcut
@@ -335,6 +392,12 @@ struct RoutingViewCache {
     /// warning line. The paths mirror the wire paths `assess` emits
     /// ("routing.balancers[i]").
     balancer_warnings: Vec<Option<String>>,
+    /// i18n'd absent-geo-tag advisories, parallel to
+    /// `settings.routing.rules` and built on the same cache cadence. Each
+    /// entry renders its own rule row's amber line; it is a configuration
+    /// warning, never a blocking finding, and the rules themselves stay
+    /// untouched.
+    rule_geo_warnings: Vec<Option<String>>,
     /// Inbound tags offered by the TestRoute dialog's combo: the three
     /// built-in listeners plus every dokodemo tag. Rebuilt with the cache
     /// generation so an open dialog never clones the list per frame.
@@ -546,6 +609,13 @@ impl RoutingScreen {
     pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
         self.poll_geodata_load(lang);
+        // The absent-geo-tag advisory compares every rule row against the
+        // managed catalog, so the first routing frame starts the load instead
+        // of waiting for a picker to be opened; a picker opened later finds
+        // it ready.
+        if matches!(self.geodata_load_state, GeodataLoadState::Idle) {
+            self.start_geodata_load(lang, ui.ctx().clone());
+        }
         let mut changed = false;
 
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
@@ -562,6 +632,7 @@ impl RoutingScreen {
         self.consume_trial_results(ctx, lang);
         self.poll_live_out_tags();
 
+        self.script_section(ui, ctx, lang, &mut changed);
         self.rules_section(ui, ctx, lang, &mut changed);
         self.balancers_section(ui, ctx, lang, &mut changed);
         self.observability_section(ui, ctx, lang, &mut changed);
@@ -1220,10 +1291,10 @@ impl RoutingScreen {
     }
 
     /// Rebuild the derived UI data (tag vectors, rule-row text, balancer
-    /// reference counts, TestRoute inbound options) only when the model
-    /// generation or the language changed; idle frames reuse the cached
-    /// snapshot, and the cache's own generation key is what the tests pin as
-    /// the rebuild decision.
+    /// reference counts, TestRoute inbound options, geodata advisories) only
+    /// when the model generation, the language, or the geodata revision
+    /// changed; idle frames reuse the cached snapshot, and the cache's own
+    /// keys are what the tests pin as the rebuild decision.
     /// Also evicts balancer-runtime entries absent from the model — the
     /// generation change is the model-change signal, so
     /// the eviction pass runs once per change, never per frame.
@@ -1236,7 +1307,8 @@ impl RoutingScreen {
         safety: &SafetyVerdicts,
     ) {
         let generation = (generation, lang);
-        if matches!(&self.view_cache, Some(cache) if cache.generation == generation) {
+        if matches!(&self.view_cache, Some(cache) if cache.generation == generation && cache.geodata_revision == self.geodata_revision)
+        {
             return;
         }
 
@@ -1384,9 +1456,25 @@ impl RoutingScreen {
                     .map(|finding| safety_message(&finding.code, lang))
             })
             .collect();
+        // The absent-geo-tag advisory: one row per rule whose domain or IP
+        // list names a geosite/geoip code the loaded catalog does not carry.
+        // A missing or failed catalog yields no entry at all, so an
+        // unreadable file cannot manufacture warnings, and the rules are
+        // only read here — the advisory never rewrites them.
+        let rule_geo_warnings: Vec<Option<String>> = settings
+            .routing
+            .rules
+            .iter()
+            .map(|rule| {
+                let absent = absent_geo_tags(rule, self.geodata_snapshot.as_ref());
+                (!absent.is_empty())
+                    .then(|| t_fmt(lang, Key::RoutingGeoTagAbsent, &[&absent.join(", ")]))
+            })
+            .collect();
 
         self.view_cache = Some(RoutingViewCache {
             generation,
+            geodata_revision: self.geodata_revision,
             out_tags,
             server_outbound_emitted,
             bal_tags,
@@ -1395,8 +1483,41 @@ impl RoutingScreen {
             reference_counts,
             balancer_headers,
             balancer_warnings,
+            rule_geo_warnings,
             known_inbounds,
             rule_inbounds,
+        });
+    }
+
+    // ---------- script ----------
+
+    /// The routing script row. The script owns every route, so its verdict is
+    /// the apply gate's own rule: the core refuses a script beside rules or a
+    /// domain strategy (infra/conf/router.go:94-96), and the app never drops
+    /// the user's rules to make the script fit.
+    fn script_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, lang: Language, changed: &mut bool) {
+        widgets::section(ui, t(lang, Key::RoutingScriptSection), |ui| {
+            let revision = *ctx.model_generation;
+            let routing = &mut ctx.settings.routing;
+            let rules = routing.rules.len();
+            let domain_strategy = &routing.domain_strategy;
+            let conflict = |script: &str| {
+                routing_script_issues(Some(script), rules, domain_strategy)
+                    .into_iter()
+                    .next()
+            };
+            *changed |= widgets::lua_script_field(
+                ui,
+                lang,
+                widgets::LuaScriptLabels {
+                    toggle: t(lang, Key::RoutingScriptToggle),
+                    path: t(lang, Key::RoutingScriptPath),
+                    hint: t(lang, Key::RoutingScriptHint),
+                },
+                &mut routing.script,
+                revision,
+                conflict,
+            );
         });
     }
 
@@ -1462,6 +1583,24 @@ impl RoutingScreen {
                                 },
                             );
                         });
+                        // A rule whose condition names a geosite/geoip tag
+                        // the loaded geo data does not carry renders an
+                        // amber advisory on its own row: the condition
+                        // matches nothing, but the rule stays valid and the
+                        // model is never rewritten.
+                        if let Some(warning) = self
+                            .view_cache
+                            .as_ref()
+                            .expect("view cache populated above")
+                            .rule_geo_warnings[i]
+                            .as_deref()
+                        {
+                            ui.label(
+                                RichText::new(warning)
+                                    .small()
+                                    .color(status_colors_of(ui).warn),
+                            );
+                        }
                         if self.edit_rule == Some(i) {
                             *changed |= self.rule_editor(ui, lang, rule);
                         }
@@ -3732,6 +3871,201 @@ mod geodata_picker_search_tests {
         let codes: Vec<String> = (0..65_536u32).map(|i| format!("code-{i}")).collect();
         let indices = geodata_search_indices(&codes, "code-65535");
         assert_eq!(indices, [65_535_u32]);
+    }
+}
+
+/// The routing screen's absent-geo-tag advisory: the pure check against a
+/// catalog fixture (present, absent, unjudgeable, missing or failed catalog,
+/// no mutation) and the view cache's cadence over model and catalog revision.
+#[cfg(test)]
+mod geo_tag_advisory_tests {
+    use super::{Language, RoutingScreen, absent_geo_tags};
+    use crate::i18n::{Key, t_fmt};
+    use crate::model::{Rule, ServersFile, Settings};
+    use crate::sys::geodata::{
+        GeodataCatalog, GeodataError, GeodataFileMetadata, GeodataOperation, GeodataSnapshot,
+    };
+    use std::path::PathBuf;
+
+    fn catalog(codes: &[&str]) -> GeodataCatalog {
+        GeodataCatalog {
+            codes: codes.iter().map(|code| code.to_string()).collect(),
+            metadata: GeodataFileMetadata {
+                path: PathBuf::from("fixture.dat"),
+                byte_len: 0,
+                modified: None,
+            },
+        }
+    }
+
+    fn error(file: &str) -> GeodataError {
+        GeodataError::Io {
+            operation: GeodataOperation::Open,
+            path: file.into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "test"),
+        }
+    }
+
+    fn loaded(geosite: &[&str], geoip: &[&str]) -> GeodataSnapshot {
+        GeodataSnapshot {
+            geosite: Ok(catalog(geosite)),
+            geoip: Ok(catalog(geoip)),
+        }
+    }
+
+    fn failed() -> GeodataSnapshot {
+        GeodataSnapshot {
+            geosite: Err(error("geosite.dat")),
+            geoip: Err(error("geoip.dat")),
+        }
+    }
+
+    fn rule_with(domain: &[&str], ip: &[&str]) -> Rule {
+        Rule {
+            rule_tag: "r-1".into(),
+            outbound_tag: "direct".into(),
+            domain: domain.iter().map(|entry| entry.to_string()).collect(),
+            ip: ip.iter().map(|entry| entry.to_string()).collect(),
+            ..Rule::default()
+        }
+    }
+
+    /// Codes the catalogs carry stay silent, including the `@attr` suffix,
+    /// case differences, and a negated reference.
+    #[test]
+    fn tags_the_catalog_carries_stay_silent() {
+        let rule = rule_with(
+            &[
+                "geosite:cn",
+                "geosite:GOOGLE@cn",
+                "example.com",
+                "full:example.com",
+            ],
+            &["geoip:cn", "!geoip:private", "10.0.0.0/8"],
+        );
+        let snapshot = loaded(&["cn", "google"], &["cn", "private"]);
+
+        assert_eq!(
+            absent_geo_tags(&rule, Some(&snapshot)),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Every absent reference is named once, with the prefix of the list it
+    /// came from; the reverse prefix, the `@attr` suffix, and case do not hide
+    /// it or duplicate it.
+    #[test]
+    fn absent_tags_are_named_once_per_condition_list() {
+        let rule = rule_with(
+            &["geosite:gone", "geosite:GONE@attr", "example.com"],
+            &["!geoip:vanished"],
+        );
+        let snapshot = loaded(&["cn"], &["cn"]);
+
+        assert_eq!(
+            absent_geo_tags(&rule, Some(&snapshot)),
+            ["geosite:gone", "geoip:vanished"]
+        );
+    }
+
+    /// The advisory is permissive wherever the catalog cannot judge: no
+    /// snapshot, a side that failed to load, an `ext:` file reference, or an
+    /// entry without its own list's prefix.
+    #[test]
+    fn a_catalog_that_cannot_judge_an_entry_stays_silent() {
+        let rule = rule_with(
+            &["geosite:gone", "geoip:cn", "ext:other.dat:gone", "geosite:"],
+            &["geoip:gone", "geosite:gone", "ext:other.dat:gone"],
+        );
+
+        assert_eq!(absent_geo_tags(&rule, None), Vec::<String>::new());
+        assert_eq!(
+            absent_geo_tags(&rule, Some(&failed())),
+            Vec::<String>::new()
+        );
+
+        // One side failed: the usable side still reports, the failed side
+        // stays silent for its own list.
+        let half = GeodataSnapshot {
+            geosite: Ok(catalog(&["cn"])),
+            geoip: Err(error("geoip.dat")),
+        };
+        assert_eq!(absent_geo_tags(&rule, Some(&half)), ["geosite:gone"]);
+    }
+
+    /// The check borrows the rule, so the advisory cannot rewrite what it
+    /// reports on.
+    #[test]
+    fn the_advisory_never_mutates_the_rule() {
+        let rule = rule_with(&["geosite:gone"], &["geoip:vanished"]);
+        let before = serde_json::to_value(&rule).expect("the rule serializes");
+
+        let reported = absent_geo_tags(&rule, Some(&loaded(&["cn"], &["cn"])));
+
+        assert_eq!(reported, ["geosite:gone", "geoip:vanished"]);
+        assert_eq!(
+            serde_json::to_value(&rule).expect("the rule serializes"),
+            before,
+            "the rule must be byte-identical after the advisory runs"
+        );
+    }
+
+    /// The cached advisory follows both inputs it is keyed on: a catalog
+    /// revision change and a model generation change each recompute it, and a
+    /// tag that exists again clears it.
+    #[test]
+    fn the_cached_advisory_follows_the_model_and_catalog_revision() {
+        let mut screen = RoutingScreen::default();
+        let servers = ServersFile::default();
+        let mut settings = Settings::default();
+        settings
+            .routing
+            .rules
+            .push(rule_with(&["geosite:gone"], &[]));
+        let expected = t_fmt(Language::En, Key::RoutingGeoTagAbsent, &[&"geosite:gone"]);
+
+        // No catalog yet: the row stays silent.
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
+        assert!(screen.view_cache.as_ref().unwrap().rule_geo_warnings[0].is_none());
+
+        // A landed catalog that lacks the tag warns on that rule's row.
+        screen.geodata_snapshot = Some(loaded(&["cn"], &["cn"]));
+        screen.geodata_revision += 1;
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
+        assert_eq!(
+            screen.view_cache.as_ref().unwrap().rule_geo_warnings[0].as_deref(),
+            Some(expected.as_str())
+        );
+
+        // The tag appears in a refreshed catalog: the same model generation
+        // still recomputes because the revision moved, and the warning clears.
+        screen.geodata_snapshot = Some(loaded(&["cn", "gone"], &["cn"]));
+        screen.geodata_revision += 1;
+        screen.refresh_view_cache_from_model(0, Language::En, &servers, &settings);
+        assert!(
+            screen.view_cache.as_ref().unwrap().rule_geo_warnings[0].is_none(),
+            "a tag the refreshed catalog carries must clear the warning"
+        );
+
+        // A model edit that moves the rule to a different absent tag warns on
+        // the next generation, even though the catalog did not change.
+        let edited_expected = t_fmt(
+            Language::En,
+            Key::RoutingGeoTagAbsent,
+            &[&"geosite:missing"],
+        );
+        settings.routing.rules[0].domain = vec!["geosite:missing".into()];
+        screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
+        assert_eq!(
+            screen.view_cache.as_ref().unwrap().rule_geo_warnings[0].as_deref(),
+            Some(edited_expected.as_str())
+        );
+
+        assert_eq!(
+            settings.routing.rules[0].domain,
+            vec!["geosite:missing".to_string()],
+            "the advisory must never rewrite the stored rule"
+        );
     }
 }
 

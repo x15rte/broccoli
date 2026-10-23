@@ -10,9 +10,10 @@ use super::{
 };
 use crate::model::outbound::{OutboundModel, ProtocolSettings};
 use crate::model::stream::{
-    FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskSudoku,
-    FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomain, FinalmaskXmc,
-    MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security, SockoptModel, StreamModel, XmuxConfig,
+    FinalmaskFilter, FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
+    FinalmaskSudoku, FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomain,
+    FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security, SockoptModel, StreamModel,
+    XmuxConfig,
 };
 use crate::model::{
     Int32Range, fold_eq, fold_lower, go_std_base64_decode, go_std_base64_decodes, parse_range_go,
@@ -429,10 +430,10 @@ pub fn uplink_http_method_mode_supported(method: &str, mode: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") || mode == "packet-up"
 }
 
-/// XHTTP xmux `maxConnections` and `maxConcurrency` are
-/// mutually exclusive while both are in use. Xray compares the ranges'
-/// upper bounds (`To > 0`), so a range whose `to` is 0 is the "not in use"
-/// wire shape in both seams.
+/// A transport's xmux `maxConnections` and `maxConcurrency` are mutually
+/// exclusive while both are in use, on every transport whose conf build
+/// reads the block. Xray compares the ranges' upper bounds (`To > 0`), so a
+/// range whose `to` is 0 is the "not in use" wire shape in both seams.
 pub fn xmux_limits_conflict(xmux: Option<&XmuxConfig>) -> bool {
     xmux.is_some_and(|xmux| {
         xmux.max_connections.is_some_and(|range| range.to > 0)
@@ -905,6 +906,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         }
         if let Some(finalmask) = &stream.finalmask {
             issues.extend(validate_finalmask(finalmask));
+            finalmask_outbound_filter_advisories(finalmask, issues);
         }
         // XHTTP enum vocabularies and cross-field rules: every value below is
         // refused by Xray's SplitHTTPConfig Build at config load
@@ -987,7 +989,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             }
             if xmux_limits_conflict(xhttp.xmux.as_ref()) {
                 issues.push(issue(
-                    ValidationCode::XhttpXmuxLimitsExclusive,
+                    ValidationCode::XmuxLimitsExclusive,
                     Some("stream.xhttpSettings.xmux".into()),
                 ));
             }
@@ -1296,6 +1298,126 @@ pub fn validate_finalmask(fm: &FinalmaskModel) -> Verdict {
     Verdict::from_issues(issues)
 }
 
+/// One finding per `filter` mask an outbound carries: the loader builds it,
+/// but only a listener consults it, so the profile starts with the mask inert.
+/// A warning — the configuration loads and runs exactly as without it.
+fn finalmask_outbound_filter_advisories(fm: &FinalmaskModel, issues: &mut Vec<ValidationIssue>) {
+    for (index, mask) in fm.tcp.iter().enumerate() {
+        if matches!(mask, FinalmaskTcpMask::Filter { .. }) {
+            issues.push(warning(
+                ValidationCode::FinalmaskFilterOnOutbound,
+                Some(format!("finalmask.tcp[{index}]")),
+            ));
+        }
+    }
+    for (index, mask) in fm.udp.iter().enumerate() {
+        if matches!(mask, FinalmaskUdpMask::Filter { .. }) {
+            issues.push(warning(
+                ValidationCode::FinalmaskFilterOnOutbound,
+                Some(format!("finalmask.udp[{index}]")),
+            ));
+        }
+    }
+}
+
+/// Check one `filter` settings object. `ParseIPRules` runs over both lists at
+/// build time (`infra/conf/transport_finalmask.go:105-115`), so one malformed
+/// rule aborts the whole configuration — on a listener and on a dial alike.
+fn finalmask_validate_filter(
+    path: &str,
+    settings: &FinalmaskFilter,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for (key, rules) in [
+        ("blockedSourceIPs", &settings.blocked_source_ips),
+        ("allowedSourceIPs", &settings.allowed_source_ips),
+    ] {
+        for (index, rule) in rules.iter().enumerate() {
+            if !finalmask_ip_rule_valid(rule) {
+                issues.push(issue(
+                    ValidationCode::FinalmaskFilterIpRuleInvalid(excerpt(rule)),
+                    Some(format!("{path}.{key}[{index}]")),
+                ));
+            }
+        }
+    }
+}
+
+/// True for one rule the `filter` build accepts, mirroring
+/// `geodata.ParseIPRules` (`common/geodata/rule_parser.go:25-61`): leading
+/// `!` negations, `geoip:TAG` (read as `ext:geoip.dat:TAG`), an
+/// `ext:`/`ext-ip:` `FILE:CODE` reference, or an IP literal / CIDR range.
+/// Whether a tag exists in its data file is the core's lookup, not this
+/// grammar's rule; the routing editor draws the line in the same place.
+fn finalmask_ip_rule_valid(rule: &str) -> bool {
+    let rule = rule.trim_start_matches('!');
+    if let Some(tag) = rule.strip_prefix("geoip:") {
+        return finalmask_ext_ip_rule_valid(&format!("geoip.dat:{tag}"));
+    }
+    if let Some(reference) = rule
+        .strip_prefix("ext:")
+        .or_else(|| rule.strip_prefix("ext-ip:"))
+    {
+        return finalmask_ext_ip_rule_valid(reference);
+    }
+    finalmask_cidr_rule_valid(rule)
+}
+
+/// The `FILE:CODE` half of a geo rule: `parseGeoIPRule` cuts at the first
+/// colon, refuses an empty file or a code that is empty after its own `!`
+/// prefixes (`common/geodata/rule_parser.go:63-91`).
+fn finalmask_ext_ip_rule_valid(reference: &str) -> bool {
+    match reference.split_once(':') {
+        Some((file, code)) => !file.is_empty() && !code.trim_start_matches('!').is_empty(),
+        None => false,
+    }
+}
+
+/// An IP literal or CIDR range as `parseCIDR` reads it
+/// (`common/geodata/rule_parser.go:113-141`): the address follows
+/// `ParseAddress` (one bracket pair stripped, edges trimmed when
+/// non-alphanumeric — `common/net/address.go:79-96`), the prefix after the
+/// first `/` is decimal digits up to the family width, and an empty or absent
+/// prefix means the full width.
+fn finalmask_cidr_rule_valid(rule: &str) -> bool {
+    let (address, prefix) = match rule.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (rule, None),
+    };
+    let Some(max_prefix) = finalmask_address_width(address) else {
+        return false;
+    };
+    match prefix {
+        None | Some("") => true,
+        Some(prefix) => {
+            prefix.bytes().all(|byte| byte.is_ascii_digit())
+                && prefix.parse::<u32>().is_ok_and(|bits| bits <= max_prefix)
+        }
+    }
+}
+
+/// The family width `net.ParseAddress` produces for an IP literal: 32 for
+/// IPv4, 128 for IPv6, and `None` for everything else (domains included).
+fn finalmask_address_width(address: &str) -> Option<u32> {
+    let mut address = address;
+    if let Some(inner) = address
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        address = inner;
+    }
+    let bytes = address.as_bytes();
+    if let (Some(first), Some(last)) = (bytes.first(), bytes.last())
+        && (!first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric())
+    {
+        address = address.trim();
+    }
+    address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| if ip.is_ipv4() { 32 } else { 128 })
+}
+
 /// Gate the UDP mask positions the wrap refuses. `NewFinalMask` reverses both
 /// mask slices at construction and the wrap then runs forward
 /// (`transport/internet/finalmask/finalmask.go:44-46`), so the JSON list's
@@ -1359,16 +1481,23 @@ pub(super) fn hop_transport_migrates_connections(outbound: &OutboundModel) -> bo
     }
     match outbound.stream.network {
         Network::Hysteria => true,
-        Network::Xhttp => {
-            outbound.stream.security == Security::Tls
-                && outbound
-                    .stream
-                    .tls_settings
-                    .as_ref()
-                    .is_some_and(|tls| tls.alpn.len() == 1 && tls.alpn[0] == "h3")
-        }
+        Network::Xhttp => tls_alpn_is_h3(&outbound.stream),
         _ => false,
     }
+}
+
+/// True when TLS selected the QUIC transport the way the core reads it: the
+/// security mode is `tls` and the ALPN list is exactly `["h3"]`. XHTTP's h3
+/// branch (`transport/internet/splithttp/dialer.go:82-99`) and xdrive's h3
+/// form (`infra/conf/transport_internet.go:108-115`) both detect it this way;
+/// no other spelling — a longer list, a mixed case, a REALITY block — selects
+/// it.
+pub(super) fn tls_alpn_is_h3(stream: &StreamModel) -> bool {
+    stream.security == Security::Tls
+        && stream
+            .tls_settings
+            .as_ref()
+            .is_some_and(|tls| tls.alpn == ["h3"])
 }
 
 fn finalmask_valid_var_name(value: &str) -> bool {
@@ -2080,6 +2209,9 @@ fn finalmask_validate_tcp_mask(
 ) {
     let path = format!("finalmask.tcp[{index}]");
     match mask {
+        FinalmaskTcpMask::Filter { settings, .. } => {
+            finalmask_validate_filter(&format!("{path}.settings"), settings, issues);
+        }
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
             for (group_name, groups) in [
                 ("clients", &settings.clients),
@@ -2275,6 +2407,9 @@ fn finalmask_validate_udp_mask(
 ) {
     let path = format!("finalmask.udp[{index}]");
     match mask {
+        FinalmaskUdpMask::Filter { settings, .. } => {
+            finalmask_validate_filter(&format!("{path}.settings"), settings, issues);
+        }
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
             if !matches!(settings.mode.as_str(), "" | "prefix" | "standalone") {
                 issues.push(issue(
@@ -3058,6 +3193,118 @@ mod tests {
             ],
             "{:#?}",
             validate_finalmask(&outside)
+        );
+    }
+
+    /// The `filter` mask's two rule lists take the routing IP-rule grammar:
+    /// plain addresses, CIDR prefixes, `geoip:` tags, and `ext:` rules pass;
+    /// a malformed entry blocks with its list path.
+    #[test]
+    fn finalmask_filter_rules_mirror_the_core_parser() {
+        fn filter_model(blocked: serde_json::Value, allowed: serde_json::Value) -> FinalmaskModel {
+            serde_json::from_value(json!({
+                "tcp": [{"type": "filter", "settings": {
+                    "blockedSourceIPs": blocked,
+                    "allowedSourceIPs": allowed
+                }}]
+            }))
+            .expect("fixture is valid finalmask JSON")
+        }
+
+        for rule in [
+            "1.2.3.4",
+            " 1.2.3.4 ",
+            "[::1]",
+            "1.2.3.4/",
+            "1.2.3.4/24",
+            "::1/128",
+            "!geoip:private",
+            "geoip:private",
+            "geoip:!private",
+            "ext:geoip.dat:cn",
+            "ext-ip:geoip.dat:cn",
+            "!!10.0.0.0/8",
+        ] {
+            let issues = validate_finalmask(&filter_model(json!([rule]), json!([])));
+            assert!(issues.is_empty(), "{rule:?} must pass: {issues:#?}");
+        }
+
+        for rule in [
+            "",
+            "!",
+            "host.example",
+            "1.2.3.4/33",
+            "::1/129",
+            "1.2.3.4/ 24",
+            "1.2.3.4/24/8",
+            "1.2.3.4%eth0",
+            "10.0.0.0/8 ",
+            "geoip:",
+            "ext:",
+            "ext:geoip.dat",
+            "ext::cn",
+            "ext:geoip.dat:",
+        ] {
+            let issues = validate_finalmask(&filter_model(json!([rule]), json!([])));
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::FinalmaskFilterIpRuleInvalid(excerpt(rule))],
+                "{rule:?} must be refused: {issues:#?}"
+            );
+        }
+
+        let model = filter_model(json!(["nope"]), json!(["also-nope"]));
+        let issues = validate_finalmask(&model);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.code.clone(), issue.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ValidationCode::FinalmaskFilterIpRuleInvalid(excerpt("nope")),
+                    Some("finalmask.tcp[0].settings.blockedSourceIPs[0]".into())
+                ),
+                (
+                    ValidationCode::FinalmaskFilterIpRuleInvalid(excerpt("also-nope")),
+                    Some("finalmask.tcp[0].settings.allowedSourceIPs[0]".into())
+                ),
+            ],
+            "{issues:#?}"
+        );
+    }
+
+    /// A `filter` mask on an outbound builds (so a malformed rule still
+    /// blocks), but no dial reads it: the stream pass turns the mask itself
+    /// into an advisory instead of an unknown discriminator.
+    #[test]
+    fn finalmask_filter_on_an_outbound_is_an_advisory() {
+        let stream: StreamModel = serde_json::from_value(json!({
+            "network": "raw",
+            "finalmask": {
+                "tcp": [{"type": "filter", "settings": {"blockedSourceIPs": ["geoip:private"]}}],
+                "udp": [{"type": "filter", "settings": {"allowedSourceIPs": ["10.0.0.0/8"]}}]
+            }
+        }))
+        .expect("fixture is a valid stream");
+        let verdict = validate_stream(&stream);
+        assert!(!verdict.has_blocking(), "{verdict:#?}");
+        assert_eq!(
+            verdict
+                .advisory()
+                .map(|issue| (issue.code.clone(), issue.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ValidationCode::FinalmaskFilterOnOutbound,
+                    Some("finalmask.tcp[0]".into())
+                ),
+                (
+                    ValidationCode::FinalmaskFilterOnOutbound,
+                    Some("finalmask.udp[0]".into())
+                ),
+            ],
+            "{verdict:#?}"
         );
     }
 
@@ -3892,7 +4139,7 @@ mod tests {
                         | ValidationCode::XhttpSeqPlacementInvalid
                         | ValidationCode::XhttpSessionIdLengthRequired
                         | ValidationCode::XhttpSessionIdTableInvalid
-                        | ValidationCode::XhttpXmuxLimitsExclusive
+                        | ValidationCode::XmuxLimitsExclusive
                         | ValidationCode::StreamOneNoDownload
                 )
             })
@@ -3993,7 +4240,7 @@ mod tests {
             ValidationCode::XhttpUplinkDataPlacementRequiresPacketUp,
             ValidationCode::XhttpUplinkHttpMethodRequiresPacketUp,
             ValidationCode::XhttpSessionIdTableInvalid,
-            ValidationCode::XhttpXmuxLimitsExclusive,
+            ValidationCode::XmuxLimitsExclusive,
         ] {
             assert!(found.contains(&code), "missing {code:?} in {found:#?}");
         }

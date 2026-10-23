@@ -473,7 +473,32 @@ impl Default for HysteriaTransport {
 /// unset path empty and the wire carries this value.
 pub const MASQUE_DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 
-/// `masqueSettings` (infra/conf/transport_method.go:793-849). `user`/`pass`
+/// The host and path the core substitutes when a `masqueSettings` block
+/// carries WARP and leaves them unset (`transport/internet/masque/warp.go`:
+/// `WarpHost`/`WarpPath`). The wire carries both explicitly, so the document
+/// does not depend on that implicit default.
+pub const MASQUE_WARP_HOST: &str = "cloudflareaccess.com";
+pub const MASQUE_WARP_PATH: &str = "/";
+
+/// `masqueSettings.warp` (infra/conf/transport_method.go:796-805): the WARP
+/// credentials and the local address list. The core parses both keys while it
+/// builds the transport; a PEM or base64 key that is not a P-256 private key
+/// (or a PKIX public key) is refused there, and so is a list that is not one
+/// IPv4 and at most one IPv6 address.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MasqueWarp {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub private_key: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub public_key: String,
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub address: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `masqueSettings` (infra/conf/transport_method.go:806-849). `user`/`pass`
 /// are conf-only keys the core folds into a single `Authorization: Basic`
 /// header while it builds the transport; the wire carries the folded header
 /// alone, so both fields stay here for the editor and round-trip.
@@ -482,10 +507,12 @@ pub const MASQUE_DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 pub struct MasqueTransport {
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub host: String,
-    /// Empty means the core's `DefaultPath`; the wire carries that value.
+    /// Empty means the core's `DefaultPath`, unless `warp` is set; the wire
+    /// carries the effective value.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub path: String,
-    /// Conf-only basic-auth user. A `:` is refused by the core's own build.
+    /// Conf-only basic-auth user. A `:` is refused by the core's own build,
+    /// and so is the field beside a `warp` block.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub user: String,
     /// Conf-only basic-auth password.
@@ -495,16 +522,35 @@ pub struct MasqueTransport {
     /// with `user`/`pass`. All three are refused by the core's build.
     #[serde(skip_serializing_if = "skip_empty_map")]
     pub headers: Map<String, Value>,
+    /// WARP credentials and local addresses. Present only when the user
+    /// turned WARP on; the core applies the WARP host and path defaults only
+    /// while this block exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warp: Option<MasqueWarp>,
+    /// The transport's connection-reuse knobs. An absent block leaves the
+    /// core's own defaults (`maxConnections` 1, `hMaxReusableSecs`
+    /// 1800–3000); a present one is emitted verbatim, and the core refuses
+    /// both connection limits at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XmuxConfig>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 impl MasqueTransport {
     /// Rewrite the draft into the document the core receives: fill the
-    /// default path, fold `user`/`pass` into the one `Authorization: Basic`
-    /// header the core's own conf build synthesizes, and drop the conf-only
-    /// keys (infra/conf/transport_method.go:801-844).
+    /// default path (or the WARP pair), fold `user`/`pass` into the one
+    /// `Authorization: Basic` header the core's own conf build synthesizes,
+    /// and drop the conf-only keys (infra/conf/transport_method.go:801-844).
     pub(crate) fn normalize_for_wire(&mut self) {
+        if self.warp.is_some() {
+            if self.host.is_empty() {
+                self.host = MASQUE_WARP_HOST.to_string();
+            }
+            if self.path.is_empty() {
+                self.path = MASQUE_WARP_PATH.to_string();
+            }
+        }
         if self.path.is_empty() {
             self.path = MASQUE_DEFAULT_PATH.to_string();
         }
@@ -874,6 +920,11 @@ pub struct XdriveTransport {
     /// the service without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<XdriveTemplate>,
+    /// Connection reuse, the same block XHTTP and MASQUE carry. Absent keeps
+    /// the core's defaults (one connection, or four for `google-drive` over
+    /// h2); the reloaded editor shows the block only when it was stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XmuxConfig>,
     /// True when a stored profile carried the retired `Google Drive`
     /// spelling and the load migrated it in memory. Never serialized: the
     /// save writes the current spelling.
@@ -937,6 +988,12 @@ pub struct TlsModel {
     pub certificates: Vec<TlsCert>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_system_root: Option<bool>,
+    /// Verify the server with the certificate store of the operating system
+    /// instead of the roots compiled into the core
+    /// (`infra/conf/transport_security.go`, `useSystemCA`). Off is the
+    /// bundled-roots default, so the key is written only when on.
+    #[serde(rename = "useSystemCA", skip_serializing_if = "skip_false")]
+    pub use_system_ca: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_session_resumption: Option<bool>,
     /// comma-separated hex pins — the replacement for allowInsecure
@@ -1442,6 +1499,23 @@ impl Default for FinalmaskNoise {
     }
 }
 
+/// The listener-only `filter` mask (`infra/conf/transport_finalmask.go:100-115`
+/// at v26.10.21). The core wraps an inbound's listener with it: a source
+/// address in `blockedSourceIPs` is dropped, and when `allowedSourceIPs` is
+/// not empty only a matching address is kept. Both lists use the routing
+/// IP-rule grammar (`common/geodata/rule_parser.go`). A dial never consults
+/// the mask, so the outbound editor does not offer it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FinalmaskFilter {
+    #[serde(rename = "blockedSourceIPs", skip_serializing_if = "skip_empty_vec")]
+    pub blocked_source_ips: Vec<String>,
+    #[serde(rename = "allowedSourceIPs", skip_serializing_if = "skip_empty_vec")]
+    pub allowed_source_ips: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskHeaderCustomUdp {
@@ -1844,6 +1918,12 @@ pub struct FinalmaskRealmTls {
     pub enable_session_resumption: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_system_root: Option<bool>,
+    /// Verify the server with the certificate store of the operating system
+    /// instead of the roots compiled into the core
+    /// (`infra/conf/transport_security.go`, `useSystemCA`). Off is the
+    /// bundled-roots default, so the key is written only when on.
+    #[serde(rename = "useSystemCA", skip_serializing_if = "skip_false")]
+    pub use_system_ca: bool,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub min_version: String,
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -2211,6 +2291,17 @@ macro_rules! finalmask_masks {
             impl $mask {
                 pub const TYPES: &'static [&'static str] = &[$( $kind ),*];
 
+                /// The mask types a dial can use. The core registers every
+                /// known type in both loaders, but `filter` only wraps a
+                /// listener (`transport/internet/finalmask/filter/config.go`),
+                /// so the outbound editor offers the rest.
+                pub fn outbound_types() -> impl Iterator<Item = &'static str> {
+                    Self::TYPES
+                        .iter()
+                        .copied()
+                        .filter(|kind| !FINALMASK_LISTENER_ONLY_TYPES.contains(kind))
+                }
+
                 pub fn known_type(&self) -> Option<&'static str> {
                     match self {
                         $( Self::$variant { .. } => Some($kind), )*
@@ -2276,8 +2367,13 @@ macro_rules! finalmask_masks {
     };
 }
 
+/// Mask types only a listener consults. Kept apart from the generated type
+/// list so a new mask variant stays a single row.
+const FINALMASK_LISTENER_ONLY_TYPES: &[&str] = &["filter"];
+
 finalmask_masks! {
     FinalmaskTcpMask {
+        Filter: FinalmaskFilter = FinalmaskFilter::default() => "filter",
         HeaderCustom: FinalmaskHeaderCustomTcp = FinalmaskHeaderCustomTcp::default()
             => "header-custom",
         Fragment: FinalmaskFragment = FinalmaskFragment {
@@ -2292,6 +2388,7 @@ finalmask_masks! {
 
 finalmask_masks! {
     FinalmaskUdpMask {
+        Filter: FinalmaskFilter = FinalmaskFilter::default() => "filter",
         HeaderCustom: FinalmaskHeaderCustomUdp = FinalmaskHeaderCustomUdp::default()
             => "header-custom",
         MkcpLegacy: FinalmaskMkcpLegacy = FinalmaskMkcpLegacy::default() => "mkcp-legacy",
@@ -2354,6 +2451,19 @@ impl FinalmaskModel {
             && self.udp.is_empty()
             && self.quic_params.is_none()
             && self.extra.is_empty()
+    }
+
+    /// The `streamSettings.finalmask` value, `None` when the block states
+    /// nothing. The envelope is the same shape on a listener and a dial: the
+    /// mask loader builds both from one config
+    /// (`infra/conf/transport_finalmask.go:1177-1196`).
+    pub fn wire_value(&self) -> Option<Value> {
+        (!self.is_empty()).then(|| {
+            serde_json::to_value(self).expect(
+                "model serialization is infallible: a finalmask envelope holds strings, \
+                 numbers, and string-keyed Value maps only",
+            )
+        })
     }
 }
 
@@ -2747,11 +2857,12 @@ impl StreamModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
-        HappyEyeballs, HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network,
-        RawSettings, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
+        CustomSockopt, FinalmaskModel, FinalmaskRealmTls, FinalmaskTcpMask, FinalmaskUdpHop,
+        FinalmaskUdpMask, HappyEyeballs, HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH,
+        Network, RawSettings, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
         XdriveOperation, XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry,
-        XdriveTransport, XhttpSettings, transport_settings_key, transport_settings_path,
+        XdriveTransport, XhttpSettings, XmuxConfig, transport_settings_key,
+        transport_settings_path,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -3021,6 +3132,42 @@ mod tests {
         );
     }
 
+    /// Xray's `useSystemCA` replaces the roots bundled with the core with the
+    /// operating system's certificate store
+    /// (`infra/conf/transport_security.go`). Off is the bundled-roots
+    /// default, so the key reaches the wire only when the switch is on; both
+    /// TLS surfaces carry the stored value through a load and a save.
+    #[test]
+    fn tls_trust_switch_writes_only_when_enabled() {
+        let off = serde_json::to_value(TlsModel::default()).unwrap();
+        assert!(off.get("useSystemCA").is_none(), "{off}");
+        let on = serde_json::to_value(TlsModel {
+            use_system_ca: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(on["useSystemCA"], json!(true));
+        assert!(
+            serde_json::from_value::<TlsModel>(on)
+                .unwrap()
+                .use_system_ca
+        );
+
+        let realm_off = serde_json::to_value(FinalmaskRealmTls::default()).unwrap();
+        assert!(realm_off.get("useSystemCA").is_none(), "{realm_off}");
+        let realm_on = serde_json::to_value(FinalmaskRealmTls {
+            use_system_ca: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(realm_on["useSystemCA"], json!(true));
+        assert!(
+            serde_json::from_value::<FinalmaskRealmTls>(realm_on)
+                .unwrap()
+                .use_system_ca
+        );
+    }
+
     #[test]
     fn tls_ech_sockopt_rejects_malformed_known_socket_fields() {
         let error = serde_json::from_value::<TlsModel>(json!({
@@ -3028,6 +3175,41 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("expected i32"));
+    }
+
+    /// The listener-only `filter` mask is a known discriminator on both
+    /// loaders: its blocked and allowed rules round-trip verbatim, an
+    /// unknown sibling key rides the settings object, and the dial-side type
+    /// list keeps it out while the listener list keeps it in.
+    #[test]
+    fn finalmask_filter_mask_round_trips_as_a_known_type() {
+        let value = json!({
+            "tcp": [{"type": "filter", "settings": {
+                "blockedSourceIPs": ["geoip:private", "203.0.113.0/24"],
+                "allowedSourceIPs": ["ext:geoip.dat:cn", "192.0.2.1"],
+                "futureFilter": true
+            }}],
+            "udp": [{"type": "filter", "settings": {
+                "blockedSourceIPs": ["!2001:db8::/32"]
+            }}]
+        });
+        let model: FinalmaskModel = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(model.tcp[0], FinalmaskTcpMask::Filter { .. }));
+        assert!(matches!(model.udp[0], FinalmaskUdpMask::Filter { .. }));
+        assert_eq!(serde_json::to_value(&model).unwrap(), value);
+
+        assert!(FinalmaskTcpMask::TYPES.contains(&"filter"));
+        assert!(FinalmaskUdpMask::TYPES.contains(&"filter"));
+        assert!(!FinalmaskTcpMask::outbound_types().any(|kind| kind == "filter"));
+        assert!(!FinalmaskUdpMask::outbound_types().any(|kind| kind == "filter"));
+        assert_eq!(
+            FinalmaskTcpMask::outbound_types().count() + 1,
+            FinalmaskTcpMask::TYPES.len()
+        );
+        assert_eq!(
+            FinalmaskUdpMask::outbound_types().count() + 1,
+            FinalmaskUdpMask::TYPES.len()
+        );
     }
 
     #[test]
@@ -4315,6 +4497,12 @@ mod tests {
                 },
                 extra: Map::new(),
             }),
+            xmux: Some(XmuxConfig {
+                max_connections: Some(Int32Range::single(4)),
+                c_max_reuse_times: Some(Int32Range::single(128)),
+                h_keep_alive_period: Some(30),
+                ..Default::default()
+            }),
             extra: Map::new(),
             ..Default::default()
         };
@@ -4335,6 +4523,7 @@ mod tests {
             json!("\"name\":\"([^\"]+)\"")
         );
         assert_eq!(wire["template"]["retry"]["status"], json!([429, 503]));
+        assert_eq!(wire["xmux"]["maxConnections"], json!(4));
         let round_tripped: XdriveTransport =
             serde_json::from_value(wire).expect("the block deserializes");
         assert_eq!(

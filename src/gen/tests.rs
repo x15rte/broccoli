@@ -1086,6 +1086,32 @@ fn golden_vless_xhttp_tls() {
     );
 }
 
+/// The trust switch on an outbound TLS profile: the generated document
+/// carries `useSystemCA` when the profile opts into the certificate store of
+/// the operating system. Every other TLS golden leaves it off, which is the
+/// bundled-roots default and writes no key.
+#[test]
+fn golden_vless_raw_tls_system_ca() {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    ob.settings = ProtocolSettings::Vless(VlessSettings {
+        address: "vless.example.com".into(),
+        port: 443,
+        id: "11111111-2222-3333-4444-555555555555".into(),
+        encryption: "none".into(),
+        ..Default::default()
+    });
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "vless.example.com".into(),
+        use_system_ca: true,
+        ..Default::default()
+    });
+    golden!(
+        "goldens/vless_raw_tls_system_ca.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_vmess_ws_tls() {
     let mut ob = OutboundModel::new(Protocol::Vmess);
@@ -1301,6 +1327,45 @@ fn golden_masque() {
     );
 }
 
+/// A MASQUE outbound carrying Mux.Cool and a tuned `xmux` block: the core
+/// builds both, and the document carries the transport's connection-limit and
+/// reuse knobs verbatim.
+#[test]
+fn golden_masque_xmux() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.mux.enabled = true;
+    let masque = ob
+        .stream
+        .masque_settings
+        .as_mut()
+        .expect("a masque outbound materializes its transport");
+    masque.host = "masque.example.com".into();
+    masque.xmux = Some(XmuxConfig {
+        max_connections: Some(Int32Range::new(2, 4)),
+        c_max_reuse_times: Some(Int32Range::single(100)),
+        h_max_request_times: Some(Int32Range::new(1000, 2000)),
+        h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+        h_keep_alive_period: Some(30),
+        ..Default::default()
+    });
+    let tls = ob
+        .stream
+        .tls_settings
+        .as_mut()
+        .expect("a masque outbound carries TLS");
+    tls.server_name = "masque.example.com".into();
+    tls.alpn = vec!["h2".into()];
+    golden!(
+        "goldens/masque_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 /// The outbound shape the core's xdrive gate accepts: a VLESS account with
 /// encryption and Mux.Cool, which the transport needs for every connection.
 fn xdrive_vless_outbound() -> OutboundModel {
@@ -1433,6 +1498,67 @@ fn golden_xdrive_template() {
     }
     golden!(
         "goldens/xdrive_template.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport with its connection-reuse block: the chosen limit and
+/// the H2 reuse knobs, as the pinned core accepts them.
+#[test]
+fn golden_xdrive_xmux() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "local".into();
+        xdrive.remote_folder = "xdrive-store".into();
+        xdrive.xmux = Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(4)),
+            c_max_reuse_times: Some(Int32Range::single(128)),
+            h_max_request_times: Some(Int32Range::single(600)),
+            h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+            h_keep_alive_period: Some(30),
+            ..Default::default()
+        });
+    }
+    golden!(
+        "goldens/xdrive_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport in its h3 form: TLS carries the ALPN list exactly
+/// `["h3"]`, which is the only spelling that reaches the QUIC path, and the
+/// Google Drive backend is the one the core's h3 rules name.
+#[test]
+fn golden_xdrive_h3() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE.into();
+        xdrive.remote_folder = "drive-folder-id".into();
+        xdrive.secrets = vec![
+            "client-id".into(),
+            "client-secret".into(),
+            "refresh-token".into(),
+        ];
+    }
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "www.googleapis.com".into(),
+        alpn: vec!["h3".into()],
+        fingerprint: "chrome".into(),
+        ..Default::default()
+    });
+    golden!(
+        "goldens/xdrive_h3.json",
         generate_deterministic(&single_server(ob), &base_settings())
     );
 }
@@ -1669,6 +1795,38 @@ fn golden_listen_lan() {
     );
 }
 
+/// A listener's source-IP `filter` mask reaches the wire as
+/// `streamSettings.finalmask`, carrying the blocked and allowed rule lists
+/// the core's IP-rule parser reads. The mask sits on both lists a SOCKS
+/// listener runs — TCP for accepted connections, UDP for the relay — and the
+/// emitted document must pass the pinned core's `run -test`.
+#[test]
+fn golden_inbound_filter_mask() {
+    let mut settings = base_settings();
+    settings.local_inbounds[0].finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["geoip:private".into(), "203.0.113.0/24".into()],
+                allowed_source_ips: vec!["ext:geoip.dat:cn".into(), "192.0.2.1".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        udp: vec![FinalmaskUdpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["2001:db8::/32".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/inbound_filter_mask.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
 #[test]
 fn golden_fakedns() {
     let mut settings = base_settings();
@@ -1679,6 +1837,20 @@ fn golden_fakedns() {
     settings.dns.fakedns.enabled = true;
     golden!(
         "goldens/fakedns.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+#[test]
+fn golden_dns_server_id() {
+    let mut settings = base_settings();
+    settings.dns.servers = vec![DnsServer {
+        address: "1.1.1.1".into(),
+        id: "resolver-a".into(),
+        ..Default::default()
+    }];
+    golden!(
+        "goldens/dns_server_id.json",
         generate_deterministic(&ServersFile::default(), &settings)
     );
 }
@@ -3935,6 +4107,118 @@ fn burst_observatory_projection_strips_enabled_and_keeps_ping_config() {
     assert_eq!(wire["pingConfig"]["httpMethod"], "HEAD");
 }
 
+#[test]
+fn dns_script_suppresses_the_parallel_query_default_on_the_wire() {
+    // The seeded model races its servers in parallel; the core refuses that
+    // pair beside a script (infra/conf/dns.go:276-278), so the app-owned
+    // default never reaches the wire next to one.
+    let cfg = DnsCfg {
+        script: Some("dns.lua".into()),
+        ..Default::default()
+    };
+    assert!(cfg.enable_parallel_query, "the seeded default is on");
+    let wire = cfg
+        .to_wire(false)
+        .expect("a script alone makes a dns block");
+    assert_eq!(wire["script"], json!("dns.lua"));
+    assert!(
+        wire.get("enableParallelQuery").is_none(),
+        "a DNS script suppresses the parallel-query default: {wire}"
+    );
+
+    // Without a script the seeded default still reaches the wire unchanged.
+    assert_eq!(
+        DnsCfg::default().to_wire(false).expect("dns wire")["enableParallelQuery"],
+        json!(true)
+    );
+}
+
+/// A DNS script owns resolution, so the app-owned scoped bootstrap server is
+/// omitted beside it: the core refuses a server carrying `domains` or
+/// `skipFallback` with a script (infra/conf/dns.go), and the pair that pins a
+/// dialed profile's domain to the module goes with it. Without a script the
+/// same profile gets both halves.
+#[test]
+fn dns_script_omits_the_app_owned_bootstrap_server_and_pin() {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    ob.settings = ProtocolSettings::Vless(VlessSettings {
+        address: "vless.example.com".into(),
+        port: 443,
+        id: "11111111-2222-3333-4444-555555555555".into(),
+        encryption: "none".into(),
+        ..Default::default()
+    });
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "vless.example.com".into(),
+        ..Default::default()
+    });
+    let servers = single_server(ob);
+
+    let pinned = generate_deterministic(&servers, &base_settings()).expect("generate config");
+    let pinned_servers = pinned["dns"]["servers"].as_array().unwrap();
+    assert!(
+        pinned_servers
+            .iter()
+            .any(|server| server["skipFallback"] == json!(true)),
+        "without a script the scoped bootstrap server is emitted: {pinned:#?}"
+    );
+    assert_eq!(
+        pinned["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
+        json!("useip")
+    );
+
+    let mut settings = base_settings();
+    settings.dns.script = Some("dns.lua".into());
+    let scripted = generate_deterministic(&servers, &settings).expect("generate config");
+    let scripted_servers = scripted["dns"]["servers"].as_array().unwrap();
+    assert!(
+        scripted_servers
+            .iter()
+            .all(|server| server.get("domains").is_none()
+                && server.get("skipFallback").is_none()
+                && server.get("finalQuery").is_none()),
+        "a DNS script cannot carry a server matcher: {scripted:#?}"
+    );
+    assert!(
+        scripted["outbounds"][0]["streamSettings"]
+            .get("sockopt")
+            .and_then(|sockopt| sockopt.get("domainStrategy"))
+            .is_none(),
+        "the profile pin goes with the scoped server it needs: {scripted:#?}"
+    );
+}
+
+/// The `dns.script` surface (`DNSConfig.Script`, infra/conf/dns.go:166) is
+/// emitted as a path the core resolves and compiles itself
+/// (`common/platform/platform.go`), and the app-owned parallel-query default
+/// is suppressed beside it. The fixture script is materialized beside the
+/// core for the config-test oracle, which compiles but never runs it.
+#[test]
+fn golden_dns_script() {
+    let mut settings = base_settings();
+    settings.dns.script = Some("broccoli-golden-dns.lua".into());
+    golden!(
+        "goldens/dns_script.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+/// The `routing.script` surface (`RouterConfig.Script`,
+/// infra/conf/router.go:75): the script owns every route, so the section
+/// carries no rules and no `domainStrategy` — not even the app-owned DNS
+/// interception rules — because the core refuses the combination
+/// (infra/conf/router.go:94-96).
+#[test]
+fn golden_routing_script() {
+    let mut settings = base_settings();
+    settings.routing.script = Some("broccoli-golden-routing.lua".into());
+    golden!(
+        "goldens/routing_script.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
 /// A routing rule carrying `localOS` emits the matcher under its upstream
 /// spelling: `infra/conf/router.go` reads `localOS` into
 /// `RoutingRule.local_os` (`app/router/config.proto` field 23), and
@@ -4100,6 +4384,48 @@ fn golden_blackhole_custom_response() {
     golden!(
         "goldens/blackhole_custom_response.json",
         generate_deterministic(&servers, &base_settings())
+    );
+}
+
+/// A MASQUE outbound with WARP: the block carries the two keys and the IPv4
+/// and IPv6 local addresses, and the wire carries the WARP host and path the
+/// core would otherwise fill in, so the golden does not depend on that
+/// implicit default. The keys are a P-256 pair the pinned core's config test
+/// accepts.
+#[test]
+fn golden_masque_warp() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        remote_dns: vec!["1.1.1.1".into()],
+        ..Default::default()
+    });
+    {
+        let masque = ob
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound materializes its transport");
+        masque.warp = Some(MasqueWarp {
+            private_key: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2R+yOSXTp/zNykQY/HVbuMQxMoTI2XutpN/4TTX/WpehRANCAARlO6Wtq45ad5jNOWMN4e180wQ58bR0T3MFTbHjCKDOxARmSdqP9JELFvbzaLgN0OsLaJVQ386KTCS42s46zZEb".into(),
+            public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZTulrauOWneYzTljDeHtfNMEOfG0dE9zBU2x4wigzsQEZknaj/SRCxb282i4DdDrC2iVUN/OikwkuNrOOs2RGw==".into(),
+            address: vec!["172.16.0.2".into(), "2606:4700:110:8a36::2/128".into()],
+            ..Default::default()
+        });
+    }
+    {
+        let tls = ob
+            .stream
+            .tls_settings
+            .as_mut()
+            .expect("a masque outbound carries TLS");
+        tls.server_name = "cloudflareaccess.com".into();
+        tls.alpn = vec!["h3".into()];
+    }
+    golden!(
+        "goldens/masque_warp.json",
+        generate_deterministic(&single_server(ob), &base_settings())
     );
 }
 

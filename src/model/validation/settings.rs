@@ -4,7 +4,9 @@
 //! and the vocabulary more than one scope reads.
 
 use super::outbound::{validate_outbound, validate_sniffing};
-use super::{ValidationCode, ValidationIssue, Verdict, excerpt, issue, warning};
+use super::{
+    ValidationCode, ValidationIssue, Verdict, excerpt, issue, validate_finalmask, warning,
+};
 use crate::model::dns::parse_pool_cidr;
 use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
@@ -41,6 +43,88 @@ pub fn validate_listen_address(s: &str) -> Result<(), ValidationCode> {
         Ok(_) => Ok(()),
         Err(_) => Err(ValidationCode::ListenAddressInvalid),
     }
+}
+
+/// The structural verdict for one configured Lua script path, mirroring the
+/// two refusals the core's file resolver makes before it reads anything: the
+/// blank path (`ResolveLuaFile`) and every extension other than `.lua`
+/// (`resolveLuaTarget`, `common/platform/platform.go`). `None` — no script —
+/// never reaches this rule. The extension compare is case-sensitive, exactly
+/// as the core's is.
+pub fn lua_script_path_issue(script: &str) -> Option<ValidationCode> {
+    if script.trim().is_empty() {
+        Some(ValidationCode::LuaScriptPathRequired)
+    } else if !script.ends_with(".lua") {
+        Some(ValidationCode::LuaScriptPathNotLua)
+    } else {
+        None
+    }
+}
+
+/// Every blocking conflict a DNS script creates with the rest of the DNS
+/// configuration, in the order the core names them (infra/conf/dns.go:
+/// the two fallback flags, then each server carrying `domains`,
+/// `skipFallback` or `finalQuery`). An absent script has no conflicts; an
+/// empty one is the core's own "no script" spelling, so only its structural
+/// finding fires.
+pub fn dns_script_issues(
+    script: Option<&str>,
+    servers: &[crate::model::DnsServer],
+    disable_fallback: bool,
+    disable_fallback_if_match: bool,
+) -> Vec<ValidationCode> {
+    let Some(script) = script else {
+        return Vec::new();
+    };
+    let mut issues: Vec<ValidationCode> = lua_script_path_issue(script).into_iter().collect();
+    if script.is_empty() {
+        return issues;
+    }
+    if disable_fallback || disable_fallback_if_match {
+        issues.push(ValidationCode::DnsScriptFallbackConflict);
+    }
+    for (index, server) in servers.iter().enumerate() {
+        for (set, field) in [
+            (!server.domains.is_empty(), "domains"),
+            (server.skip_fallback == Some(true), "skipFallback"),
+            (server.final_query == Some(true), "finalQuery"),
+        ] {
+            if set {
+                issues.push(ValidationCode::DnsScriptServerConflict(
+                    index + 1,
+                    field.into(),
+                ));
+            }
+        }
+    }
+    issues
+}
+
+/// Every blocking conflict a routing script creates: the core refuses a
+/// script beside any rule or any `domainStrategy` key
+/// (infra/conf/router.go). The app's model stores `AsIs` as "no strategy"
+/// (the key is omitted from the wire), so only a stored non-default strategy
+/// conflicts. An empty script is the core's "no script" spelling, so only its
+/// structural finding fires.
+pub fn routing_script_issues(
+    script: Option<&str>,
+    rules: usize,
+    domain_strategy: &str,
+) -> Vec<ValidationCode> {
+    let Some(script) = script else {
+        return Vec::new();
+    };
+    let mut issues: Vec<ValidationCode> = lua_script_path_issue(script).into_iter().collect();
+    if script.is_empty() {
+        return issues;
+    }
+    if rules > 0 {
+        issues.push(ValidationCode::RoutingScriptRulesConflict);
+    }
+    if domain_strategy != crate::model::DEFAULT_DOMAIN_STRATEGY {
+        issues.push(ValidationCode::RoutingScriptStrategyConflict);
+    }
+    issues
 }
 
 // ---------- settings-level verdict ----------
@@ -505,6 +589,22 @@ impl<'a> SettingsWalk<'a> {
                     severity: finding.severity,
                 });
             }
+            // The listener-side mask the core builds for this inbound. A
+            // malformed `filter` rule aborts the whole configuration at load,
+            // so it gates here like every other build refusal.
+            if let Some(finalmask) = &entry.finalmask {
+                for finding in validate_finalmask(finalmask) {
+                    let path = finding.path.map_or_else(
+                        || format!("localInbounds[{index}].finalmask"),
+                        |path| format!("localInbounds[{index}].{path}"),
+                    );
+                    self.issues.push(ValidationIssue {
+                        code: finding.code,
+                        path: Some(path),
+                        severity: finding.severity,
+                    });
+                }
+            }
             if listen_valid && entry.port != 0 {
                 let protocols = match entry.protocol {
                     LocalInboundProtocol::Socks => 1 | if entry.udp { 2 } else { 0 },
@@ -741,10 +841,19 @@ impl<'a> SettingsWalk<'a> {
         }
     }
 
-    /// Routing rules: an unresolved target short-circuits (the reference checks
-    /// below would name it), then the outbound, balancer and inbound references
-    /// each resolve against the set their emitter produced.
+    /// Routing rules: a configured script first (the core refuses it beside
+    /// any rule or a non-default strategy, and the app never drops the rules),
+    /// then an unresolved target short-circuits (the reference checks below
+    /// would name it), then the outbound, balancer and inbound references each
+    /// resolve against the set their emitter produced.
     fn routing_rules(&mut self) {
+        for code in routing_script_issues(
+            self.settings.routing.script.as_deref(),
+            self.settings.routing.rules.len(),
+            &self.settings.routing.domain_strategy,
+        ) {
+            self.issues.push(issue(code, Some("routing.script".into())));
+        }
         for (index, rule) in self.settings.routing.rules.iter().enumerate() {
             if let Some(error) = rule.target_error() {
                 self.issues.push(issue(
@@ -785,8 +894,11 @@ impl<'a> SettingsWalk<'a> {
         }
     }
 
-    /// The DNS module: the GUI bootstrap override, the server list, and the
-    /// fakeDNS pools. The bootstrap override replaces the auto-derived first
+    /// The DNS module: the configured script, the GUI bootstrap override, the
+    /// server list, and the fakeDNS pools. A script's structural path rule and
+    /// its conflicts with the fallback flags and the per-server matchers are
+    /// the core's own load refusals (infra/conf/dns.go). The bootstrap
+    /// override replaces the auto-derived first
     /// server as the resolver for proxy-server domains, so it must be an
     /// endpoint the generator can emit as the scoped `+local` entry: an
     /// IP-literal host (behind `https://`, `h2c://`, `quic://`, `tcp://` or
@@ -798,6 +910,14 @@ impl<'a> SettingsWalk<'a> {
     /// subnet fails the core at start (app/dns/fakedns/fake.go:82-90) — such a
     /// config must never be applied.
     fn dns(&mut self) {
+        for code in dns_script_issues(
+            self.settings.dns.script.as_deref(),
+            &self.settings.dns.servers,
+            self.settings.dns.disable_fallback,
+            self.settings.dns.disable_fallback_if_match,
+        ) {
+            self.issues.push(issue(code, Some("dns.script".into())));
+        }
         let bootstrap = self.settings.dns.bootstrap.trim();
         if !bootstrap.is_empty()
             && bootstrap != "localhost"
@@ -998,6 +1118,154 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    // ---------- Lua script surfaces ----------
+
+    #[test]
+    fn lua_script_paths_must_be_non_empty_and_lua() {
+        // The two structural refusals of the core's file resolver
+        // (common/platform/platform.go): the blank path and every extension
+        // other than `.lua`, compared case-sensitively.
+        assert_eq!(lua_script_path_issue("/tmp/dns.lua"), None);
+        assert_eq!(
+            lua_script_path_issue("dns.lua"),
+            None,
+            "a relative path is resolved by the core, so it passes the structural rule"
+        );
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                lua_script_path_issue(blank),
+                Some(ValidationCode::LuaScriptPathRequired),
+                "{blank:?}"
+            );
+        }
+        for other in [
+            "/tmp/dns.txt",
+            "/tmp/dns.lua.bak",
+            "/tmp/dns.LUA",
+            "/tmp/dns",
+        ] {
+            assert_eq!(
+                lua_script_path_issue(other),
+                Some(ValidationCode::LuaScriptPathNotLua),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_script_conflicts_with_fallback_flags_and_server_matchers() {
+        use crate::model::DnsServer;
+        let servers = vec![
+            DnsServer {
+                address: "1.1.1.1".into(),
+                ..Default::default()
+            },
+            DnsServer {
+                address: "2.2.2.2".into(),
+                domains: vec!["geosite:cn".into()],
+                skip_fallback: Some(true),
+                final_query: Some(true),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            dns_script_issues(Some("dns.lua"), &servers, true, true),
+            vec![
+                ValidationCode::DnsScriptFallbackConflict,
+                ValidationCode::DnsScriptServerConflict(2, "domains".into()),
+                ValidationCode::DnsScriptServerConflict(2, "skipFallback".into()),
+                ValidationCode::DnsScriptServerConflict(2, "finalQuery".into()),
+            ],
+            "the core names the flags first, then each server's matcher in wire order"
+        );
+
+        // `false` is the core's zero value: those servers carry no matcher.
+        let quiet = vec![DnsServer {
+            address: "1.1.1.1".into(),
+            skip_fallback: Some(false),
+            final_query: Some(false),
+            ..Default::default()
+        }];
+        assert!(dns_script_issues(Some("dns.lua"), &quiet, false, false).is_empty());
+        assert!(
+            dns_script_issues(None, &servers, true, true).is_empty(),
+            "no script means no conflict"
+        );
+    }
+
+    #[test]
+    fn dns_script_conflicts_gate_generation_with_the_same_codes() {
+        let mut settings = Settings::default();
+        settings.dns.script = Some("dns.lua".into());
+        settings.dns.disable_fallback_if_match = true;
+        settings.dns.servers[0].domains = vec!["geosite:cn".into()];
+
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        for code in [
+            ValidationCode::DnsScriptFallbackConflict,
+            ValidationCode::DnsScriptServerConflict(1, "domains".into()),
+        ] {
+            let issue = finding(&issues, &code)
+                .unwrap_or_else(|| panic!("{code:?} must reach the apply gate: {issues:#?}"));
+            assert_eq!(issue.path.as_deref(), Some("dns.script"));
+            assert_eq!(issue.severity, Severity::Error);
+        }
+
+        // An enabled script with no path is the core's empty-path refusal.
+        let mut blank = Settings::default();
+        blank.dns.script = Some(String::new());
+        let issues = validate_settings(&blank, &ServersFile::default(), 10853);
+        assert_eq!(
+            finding(&issues, &ValidationCode::LuaScriptPathRequired)
+                .expect("the empty path must gate")
+                .path
+                .as_deref(),
+            Some("dns.script")
+        );
+    }
+
+    #[test]
+    fn routing_script_conflicts_with_rules_and_a_domain_strategy() {
+        let mut settings = Settings::default();
+        settings.routing.script = Some("routing.lua".into());
+        settings.routing.rules.push(crate::model::routing::Rule {
+            outbound_tag: "direct".into(),
+            ..Default::default()
+        });
+        settings.routing.domain_strategy = "IpIfNonMatch".into();
+
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        for code in [
+            ValidationCode::RoutingScriptRulesConflict,
+            ValidationCode::RoutingScriptStrategyConflict,
+        ] {
+            let issue = finding(&issues, &code)
+                .unwrap_or_else(|| panic!("{code:?} must reach the apply gate: {issues:#?}"));
+            assert_eq!(issue.path.as_deref(), Some("routing.script"));
+            assert_eq!(issue.severity, Severity::Error);
+        }
+        assert_eq!(
+            settings.routing.rules.len(),
+            1,
+            "validation judges the rules, it never drops them"
+        );
+
+        // A script with no rules on the default strategy is appliable.
+        let mut clean = Settings::default();
+        clean.routing.script = Some("routing.lua".into());
+        let issues = validate_settings(&clean, &ServersFile::default(), 10853);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue.code,
+                ValidationCode::RoutingScriptRulesConflict
+                    | ValidationCode::RoutingScriptStrategyConflict
+                    | ValidationCode::LuaScriptPathNotLua
+                    | ValidationCode::LuaScriptPathRequired
+            )),
+            "a well-formed script on the default strategy must not gate: {issues:#?}"
+        );
     }
 
     // ---------- settings-level verdict (validate_settings) ----------

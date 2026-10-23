@@ -3,7 +3,7 @@
 //! listen address (default 127.0.0.1, any IP literal allowed); dokodemo also
 //! supports UNIX sockets.
 
-use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
+use crate::i18n::{Key, safety_message, t, t_fmt, validation_issue_message, validation_message};
 use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DokodemoNetwork, TUN_INBOUND_TAG,
@@ -12,13 +12,15 @@ use crate::model::inbound::{
 use crate::model::settings::Language;
 use crate::model::validation::{
     local_inbound_auth_verdict, normalize_windows_socket_path, sniffing_row_verdict,
-    validate_listen_address,
+    validate_finalmask, validate_listen_address,
 };
 use crate::model::{
-    Account, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Settings, Sniffing,
+    Account, DokodemoCfg, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, LocalInboundCfg,
+    LocalInboundProtocol, Settings, Sniffing,
 };
 use crate::ui::UiCtx;
 use crate::ui::widgets;
+use serde_json::Map;
 
 #[derive(Default)]
 pub struct InboundsScreen {
@@ -54,6 +56,10 @@ struct ValidationCache {
     /// renders the shared model message (same code), so the row and the
     /// gate never disagree.
     local_sniffing_errors: Vec<Option<String>>,
+    /// Every listener-mask finding per local endpoint list entry, in list
+    /// order — the same `validate_finalmask` pass the settings gate runs, so
+    /// a malformed `filter` rule reads identically in the row and at apply.
+    local_filter_errors: Vec<Vec<String>>,
     doko_collisions: Vec<Option<String>>,
     doko_references: Vec<usize>,
     doko_tag_errors: Vec<Option<String>>,
@@ -125,6 +131,20 @@ impl InboundsScreen {
                             &ctx.settings.local_inbounds[index].sniffing,
                             &format!("localInbounds[{index}].sniffing"),
                         )
+                    })
+                    .collect(),
+                local_filter_errors: (0..ctx.settings.local_inbounds.len())
+                    .map(|index| {
+                        ctx.settings.local_inbounds[index]
+                            .finalmask
+                            .as_ref()
+                            .map(|finalmask| {
+                                validate_finalmask(finalmask)
+                                    .iter()
+                                    .map(|issue| validation_issue_message(issue, lang))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
                     })
                     .collect(),
                 doko_collisions: (0..ctx.settings.dokodemo.len())
@@ -208,7 +228,11 @@ impl InboundsScreen {
                     );
                 }
                 for (i, entry) in ctx.settings.local_inbounds.iter_mut().enumerate() {
-                    ui.push_id(&entry.tag, |ui| {
+                    // Hash the tag to an owned salt first: the row editor
+                    // borrows the whole entry, which conflicts with a live
+                    // reference into it.
+                    let row_salt = egui::IdSalt::new(&entry.tag);
+                    ui.push_id(row_salt, |ui| {
                         ui.horizontal(|ui| {
                             ui.monospace(protocol_label(lang, entry.protocol));
                             changed |= ui
@@ -292,6 +316,10 @@ impl InboundsScreen {
                         inline_error(ui, validation.local_auth_errors[i].as_deref());
                         changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
                         inline_error(ui, validation.local_sniffing_errors[i].as_deref());
+                        changed |= local_filter_editor(ui, lang, entry);
+                        for message in &validation.local_filter_errors[i] {
+                            inline_error(ui, Some(message));
+                        }
                         inline_error(ui, validation.local_collisions[i].as_deref());
                     });
                     ui.separator();
@@ -528,6 +556,114 @@ impl InboundsScreen {
             ctx.mark_dirty();
         }
     }
+}
+
+/// Which mask list a listener's filter section edits.
+#[derive(Clone, Copy)]
+enum FilterList {
+    Tcp,
+    Udp,
+}
+
+/// The listener's source-IP `filter` mask, one toggle per mask list the
+/// listener runs (TCP always; UDP when the SOCKS relay is on). Enabling seeds
+/// an empty mask: the core builds no matcher from empty lists, so the mask
+/// changes nothing until a rule is added. `None` keeps the block out of the
+/// generated document.
+fn local_filter_editor(ui: &mut egui::Ui, lang: Language, entry: &mut LocalInboundCfg) -> bool {
+    let had_finalmask = entry.finalmask.is_some();
+    let mut finalmask = entry.finalmask.take().unwrap_or_default();
+    let udp_listener = entry.protocol == LocalInboundProtocol::Socks && entry.udp;
+    let mut changed = false;
+    widgets::section(ui, t(lang, Key::InboundsFilterMask), |ui| {
+        ui.label(
+            egui::RichText::new(t(lang, Key::InboundsFilterMaskHint))
+                .small()
+                .weak(),
+        );
+        changed |= filter_list_editor(ui, lang, FilterList::Tcp, &mut finalmask);
+        if udp_listener {
+            changed |= filter_list_editor(ui, lang, FilterList::Udp, &mut finalmask);
+        }
+    });
+    if had_finalmask || !finalmask.is_empty() {
+        entry.finalmask = Some(finalmask);
+    }
+    changed
+}
+
+fn filter_list_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    list: FilterList,
+    finalmask: &mut FinalmaskModel,
+) -> bool {
+    let mut enabled = match list {
+        FilterList::Tcp => finalmask
+            .tcp
+            .iter()
+            .any(|mask| matches!(mask, FinalmaskTcpMask::Filter { .. })),
+        FilterList::Udp => finalmask
+            .udp
+            .iter()
+            .any(|mask| matches!(mask, FinalmaskUdpMask::Filter { .. })),
+    };
+    let mut changed = false;
+    let label = match list {
+        FilterList::Tcp => "TCP",
+        FilterList::Udp => "UDP",
+    };
+    if ui.checkbox(&mut enabled, label).changed() {
+        changed = true;
+        match list {
+            FilterList::Tcp => finalmask
+                .tcp
+                .retain(|mask| !matches!(mask, FinalmaskTcpMask::Filter { .. })),
+            FilterList::Udp => finalmask
+                .udp
+                .retain(|mask| !matches!(mask, FinalmaskUdpMask::Filter { .. })),
+        }
+        if enabled {
+            match list {
+                FilterList::Tcp => finalmask.tcp.push(FinalmaskTcpMask::Filter {
+                    settings: Default::default(),
+                    extra: Map::new(),
+                }),
+                FilterList::Udp => finalmask.udp.push(FinalmaskUdpMask::Filter {
+                    settings: Default::default(),
+                    extra: Map::new(),
+                }),
+            }
+        }
+    }
+    let hint = "IP, CIDR, geoip:TAG, or ext:FILE:CODE";
+    let settings = match list {
+        FilterList::Tcp => finalmask.tcp.iter_mut().find_map(|mask| match mask {
+            FinalmaskTcpMask::Filter { settings, .. } => Some(settings),
+            _ => None,
+        }),
+        FilterList::Udp => finalmask.udp.iter_mut().find_map(|mask| match mask {
+            FinalmaskUdpMask::Filter { settings, .. } => Some(settings),
+            _ => None,
+        }),
+    };
+    if let Some(settings) = settings {
+        changed |= widgets::string_list(
+            ui,
+            lang,
+            t(lang, Key::InboundsBlockedSourceIps),
+            &mut settings.blocked_source_ips,
+            hint,
+        );
+        changed |= widgets::string_list(
+            ui,
+            lang,
+            t(lang, Key::InboundsAllowedSourceIps),
+            &mut settings.allowed_source_ips,
+            hint,
+        );
+    }
+    changed
 }
 
 fn dokodemo_network_editor(ui: &mut egui::Ui, lang: Language, config: &mut DokodemoCfg) -> bool {
