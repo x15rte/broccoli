@@ -1496,6 +1496,7 @@ keys! {
     SrvTlsServerNameEmptyNote 0,
     SrvRealityServerNameEmptyNote 0,
     SrvTlsFingerprintNote 0,
+    SrvTlsUseSystemCaNote 0,
     SrvRealityFingerprintNote 0,
     SrvVisionUdp443Note 0,
     SrvXudpProxyUdp443Note 0,
@@ -4590,6 +4591,12 @@ mod en {
             Key::SrvTlsFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. unsafe = native Go TLS, no imitation"
+            }
+            Key::SrvTlsUseSystemCaNote => {
+                "off (the default) = the root certificates bundled with the core verify the \
+                 server. on = the certificate store of the operating system verifies the server, \
+                 including roots a user installed. Turn it on only when a private certificate \
+                 authority must be trusted"
             }
             Key::SrvRealityFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
