@@ -5653,6 +5653,7 @@ impl ServersScreen {
                 changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
                 changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if had_settings || changed {
                     st.masque_settings = Some(s);
                 }
@@ -5823,6 +5824,7 @@ impl ServersScreen {
                         s.template = Some(template);
                     }
                 }
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if had_settings || changed {
                     st.xdrive_settings = Some(s);
                 }
@@ -6252,6 +6254,9 @@ impl ServersScreen {
                     &mut s.disable_system_root,
                     t(lang, Key::SrvUnset),
                 );
+                changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
+                    ui.checkbox(&mut s.use_system_ca, "useSystemCA").changed()
+                });
                 changed |= widgets::opt_bool(
                     ui,
                     "enableSessionResumption",
@@ -10682,6 +10687,47 @@ Authentication: ML-KEM-768, Post-Quantum
         }
     }
 
+    /// The masque transport's settings carry the shared XMUX section, and
+    /// the block the section owns lands on that transport.
+    #[test]
+    fn masque_transport_editor_carries_the_xmux_section() {
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            masque_settings: Some(MasqueTransport::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream_for_ui.borrow_mut(),
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Masque,
+                    mux: None,
+                },
+            );
+        });
+        harness.get_by_label(t(Language::En, Key::SrvXmux));
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(
+            stream
+                .borrow()
+                .masque_settings
+                .as_ref()
+                .is_some_and(|settings| settings.xmux.is_some()),
+            "the masque editor must write the xmux block it renders"
+        );
+    }
+
     /// The xdrive editor renders the service choice, the folder and every
     /// scalar as widgets, and the template backend as its own structured
     /// editor — the four operations, the authorization and the retry rules as
@@ -10751,6 +10797,54 @@ Authentication: ML-KEM-768, Post-Quantum
             5,
             "each substitution site lists the variables it expands"
         );
+    }
+
+    /// The xdrive transport settings carry the shared XMUX section: the enable
+    /// switch, the chosen connection limit, and the reuse knobs every xmux
+    /// transport shows.
+    #[test]
+    fn xdrive_transport_editor_renders_the_xmux_section() {
+        let mut stream = StreamModel {
+            network: Network::Xdrive,
+            xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                service: crate::model::stream::XDRIVE_SERVICE_LOCAL.into(),
+                remote_folder: "store".into(),
+                xmux: Some(XmuxConfig {
+                    max_connections: Some(Int32Range::single(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut screen = ServersScreen::default();
+        let harness = Harness::new_ui(|ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream,
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Vless,
+                    mux: None,
+                },
+            );
+        });
+        for label in [
+            t(Language::En, Key::SrvXmux),
+            t(Language::En, Key::SrvEnableXmux),
+            t(Language::En, Key::SrvConnectionLimit),
+            "maxConnections",
+            "cMaxReuseTimes",
+        ] {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the xdrive editor must render its {label:?} xmux control"
+            );
+        }
+        assert!(harness.query_by_label("maxConcurrency").is_none());
     }
 
     /// A transport profile whose settings carry a template the runtime builds
@@ -10976,6 +11070,69 @@ Authentication: ML-KEM-768, Post-Quantum
             );
         }
     }
+    #[test]
+    fn tls_trust_switch_edits_the_outbound_tls_settings_only() {
+        // The switch writes the same TLS block the editor already holds, and
+        // its note rides the row's hover. REALITY carries no TLS settings, so
+        // the control disappears with that block.
+        let note = t(Language::En, Key::SrvTlsUseSystemCaNote);
+        let stream = Rc::new(RefCell::new(StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(TlsModel::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().security_tab(
+                ui,
+                Language::En,
+                None,
+                &mut stream_for_ui.borrow_mut(),
+                None,
+                &[],
+            );
+        });
+        harness.run();
+
+        // An untouched frame writes no key: the bundled-roots default.
+        assert!(
+            serde_json::to_value(&*stream.borrow()).unwrap()["tlsSettings"]
+                .get("useSystemCA")
+                .is_none()
+        );
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note is the row's hover, never a rendered line"
+        );
+
+        harness.get_by_label("useSystemCA").scroll_to_me();
+        harness.run();
+        harness.get_by_label("useSystemCA").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the switch's hover must carry the note"
+        );
+
+        harness.get_by_label("useSystemCA").click();
+        harness.run();
+        assert!(stream.borrow().tls_settings.as_ref().unwrap().use_system_ca);
+        assert_eq!(
+            serde_json::to_value(&*stream.borrow()).unwrap()["tlsSettings"]["useSystemCA"],
+            json!(true)
+        );
+
+        harness.get_by_label("reality").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("useSystemCA").is_none(),
+            "REALITY holds no TLS settings, so the trust switch must not render there"
+        );
+    }
+
     #[test]
     fn probe_pin_panel_renders_rows_and_applies_on_click() {
         let leaf = "7f9c2b3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9";
@@ -15122,6 +15279,72 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             harness.query_by_label_contains(message.as_str()).is_none(),
             "the notice must clear with the value"
+        );
+    }
+
+    #[test]
+    fn realm_tls_trust_switch_edits_the_mask_tls_config() {
+        // The realm mask dials through its own TLS block, so the trust switch
+        // is the same control with the same note as the outbound TLS editor.
+        fn realm_tls(mask: &FinalmaskUdpMask) -> FinalmaskRealmTls {
+            match mask {
+                FinalmaskUdpMask::Realm { settings, .. } => settings
+                    .tls_config
+                    .clone()
+                    .expect("the fixture carries tlsConfig"),
+                other => panic!("the harness renders a realm mask, got {other:?}"),
+            }
+        }
+
+        let note = t(Language::En, Key::SrvTlsUseSystemCaNote);
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Realm {
+            settings: Box::new(FinalmaskRealm {
+                url: "realm://token@realm.example/id".into(),
+                tls_config: Some(FinalmaskRealmTls::default()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("realm-trust-switch-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+                false,
+            );
+        });
+        harness.run();
+
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note is the row's hover, never a rendered line"
+        );
+        harness.get_by_label("useSystemCA").scroll_to_me();
+        harness.run();
+        harness.get_by_label("useSystemCA").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the switch's hover must carry the note"
+        );
+
+        harness.get_by_label("useSystemCA").click();
+        harness.run();
+        assert!(realm_tls(&mask.borrow()).use_system_ca);
+        assert_eq!(
+            serde_json::to_value(&*mask.borrow()).unwrap()["settings"]["tlsConfig"]["useSystemCA"],
+            json!(true)
         );
     }
 

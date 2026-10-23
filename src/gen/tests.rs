@@ -1086,6 +1086,32 @@ fn golden_vless_xhttp_tls() {
     );
 }
 
+/// The trust switch on an outbound TLS profile: the generated document
+/// carries `useSystemCA` when the profile opts into the certificate store of
+/// the operating system. Every other TLS golden leaves it off, which is the
+/// bundled-roots default and writes no key.
+#[test]
+fn golden_vless_raw_tls_system_ca() {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    ob.settings = ProtocolSettings::Vless(VlessSettings {
+        address: "vless.example.com".into(),
+        port: 443,
+        id: "11111111-2222-3333-4444-555555555555".into(),
+        encryption: "none".into(),
+        ..Default::default()
+    });
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "vless.example.com".into(),
+        use_system_ca: true,
+        ..Default::default()
+    });
+    golden!(
+        "goldens/vless_raw_tls_system_ca.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn golden_vmess_ws_tls() {
     let mut ob = OutboundModel::new(Protocol::Vmess);
@@ -1301,6 +1327,45 @@ fn golden_masque() {
     );
 }
 
+/// A MASQUE outbound carrying Mux.Cool and a tuned `xmux` block: the core
+/// builds both, and the document carries the transport's connection-limit and
+/// reuse knobs verbatim.
+#[test]
+fn golden_masque_xmux() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.mux.enabled = true;
+    let masque = ob
+        .stream
+        .masque_settings
+        .as_mut()
+        .expect("a masque outbound materializes its transport");
+    masque.host = "masque.example.com".into();
+    masque.xmux = Some(XmuxConfig {
+        max_connections: Some(Int32Range::new(2, 4)),
+        c_max_reuse_times: Some(Int32Range::single(100)),
+        h_max_request_times: Some(Int32Range::new(1000, 2000)),
+        h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+        h_keep_alive_period: Some(30),
+        ..Default::default()
+    });
+    let tls = ob
+        .stream
+        .tls_settings
+        .as_mut()
+        .expect("a masque outbound carries TLS");
+    tls.server_name = "masque.example.com".into();
+    tls.alpn = vec!["h2".into()];
+    golden!(
+        "goldens/masque_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 /// The outbound shape the core's xdrive gate accepts: a VLESS account with
 /// encryption and Mux.Cool, which the transport needs for every connection.
 fn xdrive_vless_outbound() -> OutboundModel {
@@ -1433,6 +1498,67 @@ fn golden_xdrive_template() {
     }
     golden!(
         "goldens/xdrive_template.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport with its connection-reuse block: the chosen limit and
+/// the H2 reuse knobs, as the pinned core accepts them.
+#[test]
+fn golden_xdrive_xmux() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = "local".into();
+        xdrive.remote_folder = "xdrive-store".into();
+        xdrive.xmux = Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(4)),
+            c_max_reuse_times: Some(Int32Range::single(128)),
+            h_max_request_times: Some(Int32Range::single(600)),
+            h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+            h_keep_alive_period: Some(30),
+            ..Default::default()
+        });
+    }
+    golden!(
+        "goldens/xdrive_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// An xdrive transport in its h3 form: TLS carries the ALPN list exactly
+/// `["h3"]`, which is the only spelling that reaches the QUIC path, and the
+/// Google Drive backend is the one the core's h3 rules name.
+#[test]
+fn golden_xdrive_h3() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE.into();
+        xdrive.remote_folder = "drive-folder-id".into();
+        xdrive.secrets = vec![
+            "client-id".into(),
+            "client-secret".into(),
+            "refresh-token".into(),
+        ];
+    }
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "www.googleapis.com".into(),
+        alpn: vec!["h3".into()],
+        fingerprint: "chrome".into(),
+        ..Default::default()
+    });
+    golden!(
+        "goldens/xdrive_h3.json",
         generate_deterministic(&single_server(ob), &base_settings())
     );
 }
@@ -1676,6 +1802,20 @@ fn golden_fakedns() {
     settings.dns.fakedns.enabled = true;
     golden!(
         "goldens/fakedns.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+#[test]
+fn golden_dns_server_id() {
+    let mut settings = base_settings();
+    settings.dns.servers = vec![DnsServer {
+        address: "1.1.1.1".into(),
+        id: "resolver-a".into(),
+        ..Default::default()
+    }];
+    golden!(
+        "goldens/dns_server_id.json",
         generate_deterministic(&ServersFile::default(), &settings)
     );
 }
