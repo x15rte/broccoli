@@ -6,7 +6,7 @@ use crate::links::excerpt;
 use crate::sys::appdata::with_appdata;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// parse input → re-serialize → must equal input (canonical wire form).
 fn check<T>(input: Value)
@@ -656,6 +656,39 @@ fn settings_without_inbound_keys_default_to_the_seed_list() {
         seed,
         "the in-memory Default is the same seed list"
     );
+}
+
+#[test]
+fn local_inbound_filter_mask_round_trips_state_and_wire() {
+    let mut settings = Settings::default();
+    settings.local_inbounds[0].finalmask = Some(FinalmaskModel {
+        tcp: vec![FinalmaskTcpMask::Filter {
+            settings: FinalmaskFilter {
+                blocked_source_ips: vec!["geoip:private".into()],
+                allowed_source_ips: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    let value = serde_json::to_value(&settings).unwrap();
+    assert_eq!(
+        value["localInbounds"][0]["finalmask"]["tcp"][0]["type"],
+        "filter"
+    );
+    let reloaded: Settings = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reloaded).unwrap(), value);
+
+    let wire = reloaded.local_inbounds[0].to_wire(false);
+    assert_eq!(
+        wire["streamSettings"]["finalmask"]["tcp"][0]["settings"]["blockedSourceIPs"][0],
+        "geoip:private"
+    );
+    // An inbound with no mask emits no stream settings at all: every golden
+    // and generated document stays byte-identical.
+    let plain = LocalInboundCfg::socks_default("in-socks");
+    assert!(plain.to_wire(false).get("streamSettings").is_none());
 }
 
 #[test]

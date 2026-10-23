@@ -4,7 +4,9 @@
 //! and the vocabulary more than one scope reads.
 
 use super::outbound::{validate_outbound, validate_sniffing};
-use super::{ValidationCode, ValidationIssue, Verdict, excerpt, issue, warning};
+use super::{
+    ValidationCode, ValidationIssue, Verdict, excerpt, issue, validate_finalmask, warning,
+};
 use crate::model::dns::parse_pool_cidr;
 use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
@@ -504,6 +506,22 @@ impl<'a> SettingsWalk<'a> {
                     path: Some(format!("local inbound {:?}", excerpt(&entry.tag))),
                     severity: finding.severity,
                 });
+            }
+            // The listener-side mask the core builds for this inbound. A
+            // malformed `filter` rule aborts the whole configuration at load,
+            // so it gates here like every other build refusal.
+            if let Some(finalmask) = &entry.finalmask {
+                for finding in validate_finalmask(finalmask) {
+                    let path = finding.path.map_or_else(
+                        || format!("localInbounds[{index}].finalmask"),
+                        |path| format!("localInbounds[{index}].{path}"),
+                    );
+                    self.issues.push(ValidationIssue {
+                        code: finding.code,
+                        path: Some(path),
+                        severity: finding.severity,
+                    });
+                }
             }
             if listen_valid && entry.port != 0 {
                 let protocols = match entry.protocol {

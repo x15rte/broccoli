@@ -126,6 +126,11 @@ pub const GATEWAY: &str = "gateway";
 /// `sockopt` the generator patches caller-side dial policy into.
 pub const STREAM_SETTINGS: &str = "streamSettings";
 
+/// The stream block's `finalmask` object (`StreamConfig.FinalMask`,
+/// infra/conf/transport_internet.go at v26.10.21): the mask chain an inbound's
+/// listener or an outbound's dial builds.
+pub const FINALMASK: &str = "finalmask";
+
 /// The stream block's `sockopt` object (`StreamConfig.SocketSettings`,
 /// infra/conf/transport_internet.go:62): the per-dial socket options.
 pub const SOCKOPT: &str = "sockopt";

@@ -1442,6 +1442,23 @@ impl Default for FinalmaskNoise {
     }
 }
 
+/// The listener-only `filter` mask (`infra/conf/transport_finalmask.go:100-115`
+/// at v26.10.21). The core wraps an inbound's listener with it: a source
+/// address in `blockedSourceIPs` is dropped, and when `allowedSourceIPs` is
+/// not empty only a matching address is kept. Both lists use the routing
+/// IP-rule grammar (`common/geodata/rule_parser.go`). A dial never consults
+/// the mask, so the outbound editor does not offer it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FinalmaskFilter {
+    #[serde(rename = "blockedSourceIPs", skip_serializing_if = "skip_empty_vec")]
+    pub blocked_source_ips: Vec<String>,
+    #[serde(rename = "allowedSourceIPs", skip_serializing_if = "skip_empty_vec")]
+    pub allowed_source_ips: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskHeaderCustomUdp {
@@ -2076,6 +2093,17 @@ macro_rules! finalmask_masks {
             impl $mask {
                 pub const TYPES: &'static [&'static str] = &[$( $kind ),*];
 
+                /// The mask types a dial can use. The core registers every
+                /// known type in both loaders, but `filter` only wraps a
+                /// listener (`transport/internet/finalmask/filter/config.go`),
+                /// so the outbound editor offers the rest.
+                pub fn outbound_types() -> impl Iterator<Item = &'static str> {
+                    Self::TYPES
+                        .iter()
+                        .copied()
+                        .filter(|kind| !FINALMASK_LISTENER_ONLY_TYPES.contains(kind))
+                }
+
                 pub fn known_type(&self) -> Option<&'static str> {
                     match self {
                         $( Self::$variant { .. } => Some($kind), )*
@@ -2141,8 +2169,13 @@ macro_rules! finalmask_masks {
     };
 }
 
+/// Mask types only a listener consults. Kept apart from the generated type
+/// list so a new mask variant stays a single row.
+const FINALMASK_LISTENER_ONLY_TYPES: &[&str] = &["filter"];
+
 finalmask_masks! {
     FinalmaskTcpMask {
+        Filter: FinalmaskFilter = FinalmaskFilter::default() => "filter",
         HeaderCustom: FinalmaskHeaderCustomTcp = FinalmaskHeaderCustomTcp::default()
             => "header-custom",
         Fragment: FinalmaskFragment = FinalmaskFragment {
@@ -2157,6 +2190,7 @@ finalmask_masks! {
 
 finalmask_masks! {
     FinalmaskUdpMask {
+        Filter: FinalmaskFilter = FinalmaskFilter::default() => "filter",
         HeaderCustom: FinalmaskHeaderCustomUdp = FinalmaskHeaderCustomUdp::default()
             => "header-custom",
         MkcpLegacy: FinalmaskMkcpLegacy = FinalmaskMkcpLegacy::default() => "mkcp-legacy",
@@ -2219,6 +2253,19 @@ impl FinalmaskModel {
             && self.udp.is_empty()
             && self.quic_params.is_none()
             && self.extra.is_empty()
+    }
+
+    /// The `streamSettings.finalmask` value, `None` when the block states
+    /// nothing. The envelope is the same shape on a listener and a dial: the
+    /// mask loader builds both from one config
+    /// (`infra/conf/transport_finalmask.go:1177-1196`).
+    pub fn wire_value(&self) -> Option<Value> {
+        (!self.is_empty()).then(|| {
+            serde_json::to_value(self).expect(
+                "model serialization is infallible: a finalmask envelope holds strings, \
+                 numbers, and string-keyed Value maps only",
+            )
+        })
     }
 }
 
@@ -2907,6 +2954,41 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("expected i32"));
+    }
+
+    /// The listener-only `filter` mask is a known discriminator on both
+    /// loaders: its blocked and allowed rules round-trip verbatim, an
+    /// unknown sibling key rides the settings object, and the dial-side type
+    /// list keeps it out while the listener list keeps it in.
+    #[test]
+    fn finalmask_filter_mask_round_trips_as_a_known_type() {
+        let value = json!({
+            "tcp": [{"type": "filter", "settings": {
+                "blockedSourceIPs": ["geoip:private", "203.0.113.0/24"],
+                "allowedSourceIPs": ["ext:geoip.dat:cn", "192.0.2.1"],
+                "futureFilter": true
+            }}],
+            "udp": [{"type": "filter", "settings": {
+                "blockedSourceIPs": ["!2001:db8::/32"]
+            }}]
+        });
+        let model: FinalmaskModel = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(model.tcp[0], FinalmaskTcpMask::Filter { .. }));
+        assert!(matches!(model.udp[0], FinalmaskUdpMask::Filter { .. }));
+        assert_eq!(serde_json::to_value(&model).unwrap(), value);
+
+        assert!(FinalmaskTcpMask::TYPES.contains(&"filter"));
+        assert!(FinalmaskUdpMask::TYPES.contains(&"filter"));
+        assert!(!FinalmaskTcpMask::outbound_types().any(|kind| kind == "filter"));
+        assert!(!FinalmaskUdpMask::outbound_types().any(|kind| kind == "filter"));
+        assert_eq!(
+            FinalmaskTcpMask::outbound_types().count() + 1,
+            FinalmaskTcpMask::TYPES.len()
+        );
+        assert_eq!(
+            FinalmaskUdpMask::outbound_types().count() + 1,
+            FinalmaskUdpMask::TYPES.len()
+        );
     }
 
     #[test]

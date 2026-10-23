@@ -663,6 +663,10 @@ keys! {
     EndpointProtocolSocks 0,
     EndpointProtocolHttp 0,
     EmptyLocalListeners 0,
+    InboundsFilterMask 0,
+    InboundsFilterMaskHint 0,
+    InboundsBlockedSourceIps 0,
+    InboundsAllowedSourceIps 0,
     // Safety warnings (hazard taxonomy).
     SafetySocksListenerExposed 1,
     SafetyHttpListenerExposed 1,
@@ -1659,6 +1663,8 @@ keys! {
     FinalmaskXdnsResolverAddrInvalid 0,
     FinalmaskXdnsExtraPollInvalid 0,
     FinalmaskXicmpIpInvalid 0,
+    FinalmaskFilterIpRuleInvalid 1,
+    FinalmaskFilterOnOutbound 0,
     FinalmaskRealmScheme 0,
     FinalmaskRealmHostRequired 0,
     FinalmaskRealmTokenBeforeAt 0,
@@ -2678,6 +2684,8 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
         FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
         FinalmaskXicmpIpInvalid => t(lang, Key::FinalmaskXicmpIpInvalid),
+        FinalmaskFilterIpRuleInvalid(_) => t(lang, Key::FinalmaskFilterIpRuleInvalid),
+        FinalmaskFilterOnOutbound => t(lang, Key::FinalmaskFilterOnOutbound),
         FinalmaskRealmScheme => t(lang, Key::FinalmaskRealmScheme),
         FinalmaskRealmHostRequired => t(lang, Key::FinalmaskRealmHostRequired),
         FinalmaskRealmTokenBeforeAt => t(lang, Key::FinalmaskRealmTokenBeforeAt),
@@ -2800,6 +2808,7 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
             vec![format!("{arg:?}")]
         }
         ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
+        ValidationCode::FinalmaskFilterIpRuleInvalid(arg) => vec![arg.clone()],
         ValidationCode::FinalmaskUnknownTcpMask(arg)
         | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
             arg.as_deref()
@@ -3495,6 +3504,13 @@ mod en {
             Key::EndpointProtocolSocks => "SOCKS",
             Key::EndpointProtocolHttp => "HTTP",
             Key::EmptyLocalListeners => "No local listeners configured",
+            Key::InboundsFilterMask => "Source IP filter",
+            Key::InboundsFilterMaskHint => {
+                "The core drops a blocked source before the protocol sees it, and an allowed list \
+                 keeps only the sources it matches"
+            }
+            Key::InboundsBlockedSourceIps => "Blocked source IPs",
+            Key::InboundsAllowedSourceIps => "Allowed source IPs",
             Key::CollisionInvalidNetwork => "{} has an invalid listener network: {}",
             Key::CollisionNeedsPort => "{} needs a non-zero listen port",
             Key::CollisionNeedsUnix => "{} needs a UNIX socket path",
@@ -4968,6 +4984,13 @@ mod en {
             Key::FinalmaskXdnsResolverAddrInvalid => "enter the resolver address as host:port",
             Key::FinalmaskXdnsExtraPollInvalid => "use an extraPoll from 0 through 3",
             Key::FinalmaskXicmpIpInvalid => "enter a literal IPv4 or IPv6 address",
+            Key::FinalmaskFilterIpRuleInvalid => {
+                "{} is not an IP address, CIDR prefix, geoip: tag, or ext: rule"
+            }
+            Key::FinalmaskFilterOnOutbound => {
+                "This filter mask has no effect on an outbound: the core builds it, but only a \
+                 listener reads it"
+            }
             Key::FinalmaskRealmScheme => "scheme must be realm or realm+http",
             Key::FinalmaskRealmHostRequired => "host is required",
             Key::FinalmaskRealmTokenBeforeAt => "put the Realm token before @",
