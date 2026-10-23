@@ -3721,6 +3721,7 @@ fn validate_tls_exportable(tls: &TlsModel) -> Result<(), LinkError> {
         || !tls.curve_preferences.is_empty()
         || !tls.certificates.is_empty()
         || tls.disable_system_root.is_some()
+        || tls.use_system_ca
         || tls.enable_session_resumption.is_some()
         || !tls.master_key_log.is_empty()
         || tls.ech_sockopt.is_some()
@@ -6172,6 +6173,20 @@ mod tests {
             .as_mut()
             .unwrap()
             .min_version = "1.3".into();
+        expect_lossy(&profile, "tlsSettings");
+
+        // The share-link grammar has no trust-switch parameter, so a profile
+        // that opted into the certificate store of the operating system
+        // refuses the export instead of dropping the choice.
+        let mut profile =
+            parse_link(&format!("vless://{UUID}@tls.example.com:443?security=tls")).unwrap();
+        profile
+            .outbound
+            .stream
+            .tls_settings
+            .as_mut()
+            .unwrap()
+            .use_system_ca = true;
         expect_lossy(&profile, "tlsSettings");
 
         let mut profile = base.clone();

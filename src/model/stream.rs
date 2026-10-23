@@ -983,6 +983,12 @@ pub struct TlsModel {
     pub certificates: Vec<TlsCert>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_system_root: Option<bool>,
+    /// Verify the server with the certificate store of the operating system
+    /// instead of the roots compiled into the core
+    /// (`infra/conf/transport_security.go`, `useSystemCA`). Off is the
+    /// bundled-roots default, so the key is written only when on.
+    #[serde(rename = "useSystemCA", skip_serializing_if = "skip_false")]
+    pub use_system_ca: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_session_resumption: Option<bool>,
     /// comma-separated hex pins — the replacement for allowInsecure
@@ -1755,6 +1761,12 @@ pub struct FinalmaskRealmTls {
     pub enable_session_resumption: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_system_root: Option<bool>,
+    /// Verify the server with the certificate store of the operating system
+    /// instead of the roots compiled into the core
+    /// (`infra/conf/transport_security.go`, `useSystemCA`). Off is the
+    /// bundled-roots default, so the key is written only when on.
+    #[serde(rename = "useSystemCA", skip_serializing_if = "skip_false")]
+    pub use_system_ca: bool,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub min_version: String,
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -2671,10 +2683,10 @@ impl StreamModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
-        FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, HappyEyeballs, HysteriaTransport,
-        Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
-        StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
+        CustomSockopt, FinalmaskModel, FinalmaskRealmTls, FinalmaskTcpMask, FinalmaskUdpHop,
+        FinalmaskUdpMask, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, HappyEyeballs,
+        HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security,
+        SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
         XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings,
         transport_settings_key, transport_settings_path,
     };
@@ -2943,6 +2955,42 @@ mod tests {
             wire["streamSettings"]["tlsSettings"]
                 .get("ech_socket_settings")
                 .is_none()
+        );
+    }
+
+    /// Xray's `useSystemCA` replaces the roots bundled with the core with the
+    /// operating system's certificate store
+    /// (`infra/conf/transport_security.go`). Off is the bundled-roots
+    /// default, so the key reaches the wire only when the switch is on; both
+    /// TLS surfaces carry the stored value through a load and a save.
+    #[test]
+    fn tls_trust_switch_writes_only_when_enabled() {
+        let off = serde_json::to_value(TlsModel::default()).unwrap();
+        assert!(off.get("useSystemCA").is_none(), "{off}");
+        let on = serde_json::to_value(TlsModel {
+            use_system_ca: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(on["useSystemCA"], json!(true));
+        assert!(
+            serde_json::from_value::<TlsModel>(on)
+                .unwrap()
+                .use_system_ca
+        );
+
+        let realm_off = serde_json::to_value(FinalmaskRealmTls::default()).unwrap();
+        assert!(realm_off.get("useSystemCA").is_none(), "{realm_off}");
+        let realm_on = serde_json::to_value(FinalmaskRealmTls {
+            use_system_ca: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(realm_on["useSystemCA"], json!(true));
+        assert!(
+            serde_json::from_value::<FinalmaskRealmTls>(realm_on)
+                .unwrap()
+                .use_system_ca
         );
     }
 
