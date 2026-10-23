@@ -1327,6 +1327,45 @@ fn golden_masque() {
     );
 }
 
+/// A MASQUE outbound carrying Mux.Cool and a tuned `xmux` block: the core
+/// builds both, and the document carries the transport's connection-limit and
+/// reuse knobs verbatim.
+#[test]
+fn golden_masque_xmux() {
+    let mut ob = OutboundModel::new(Protocol::Masque);
+    ob.settings = ProtocolSettings::Masque(MasqueSettings {
+        address: "masque.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.mux.enabled = true;
+    let masque = ob
+        .stream
+        .masque_settings
+        .as_mut()
+        .expect("a masque outbound materializes its transport");
+    masque.host = "masque.example.com".into();
+    masque.xmux = Some(XmuxConfig {
+        max_connections: Some(Int32Range::new(2, 4)),
+        c_max_reuse_times: Some(Int32Range::single(100)),
+        h_max_request_times: Some(Int32Range::new(1000, 2000)),
+        h_max_reusable_secs: Some(Int32Range::new(1800, 3000)),
+        h_keep_alive_period: Some(30),
+        ..Default::default()
+    });
+    let tls = ob
+        .stream
+        .tls_settings
+        .as_mut()
+        .expect("a masque outbound carries TLS");
+    tls.server_name = "masque.example.com".into();
+    tls.alpn = vec!["h2".into()];
+    golden!(
+        "goldens/masque_xmux.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 /// The outbound shape the core's xdrive gate accepts: a VLESS account with
 /// encryption and Mux.Cool, which the transport needs for every connection.
 fn xdrive_vless_outbound() -> OutboundModel {

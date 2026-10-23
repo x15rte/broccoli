@@ -8,6 +8,7 @@ use super::stream::{
     hop_transport_migrates_connections, is_canonical_uuid, shadowsocks_2022_key_usable,
     shadowsocks_method_supported, sockopt_address_port_strategy_supported,
     target_strategy_supported, validate_stream, vless_flow_supported, vmess_security_supported,
+    xmux_limits_conflict,
 };
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, extra_has_key, extra_key_set,
@@ -370,12 +371,6 @@ fn validate_masque(o: &OutboundModel, issues: &mut Vec<ValidationIssue>) {
             Some("stream.network".into()),
         ));
     }
-    if o.protocol == Protocol::Masque && o.mux.enabled {
-        issues.push(issue(
-            ValidationCode::MasqueOutboundMuxUnsupported,
-            Some("mux.enabled".into()),
-        ));
-    }
     if let ProtocolSettings::Masque(settings) = &o.settings {
         if settings.address.is_empty() {
             issues.push(issue(
@@ -470,6 +465,15 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
             issues.push(issue(
                 ValidationCode::MasqueHostInvalid,
                 Some("stream.masqueSettings.host".into()),
+            ));
+        }
+        // The conf build reads the same two limits the other xmux carriers
+        // read and refuses them together
+        // (infra/conf/transport_method.go: the masque settings' `xmux`).
+        if xmux_limits_conflict(masque.xmux.as_ref()) {
+            issues.push(issue(
+                ValidationCode::XmuxLimitsExclusive,
+                Some("stream.masqueSettings.xmux".into()),
             ));
         }
         let credentials = !masque.user.is_empty() || !masque.pass.is_empty();
@@ -1313,9 +1317,10 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Int32Range;
     use crate::model::stream::{
         FinalmaskModel, HttpupgradeSettings, HysteriaTransport, MasqueTransport, SockoptModel,
-        WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings,
+        WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings, XmuxConfig,
     };
     use crate::model::validation::Severity;
     use crate::model::validation::tests::{codes, finding};
@@ -1524,9 +1529,74 @@ mod tests {
         outbound
     }
 
+    /// Mux.Cool is legal on a masque outbound: the core builds the outbound
+    /// with the mux settings the document carries, so the model must not
+    /// refuse a document the core runs.
+    #[test]
+    fn masque_outbound_carries_mux_cool() {
+        let mut muxed = runnable_masque();
+        muxed.mux.enabled = true;
+        muxed.mux.concurrency = Some(8);
+        let issues = validate_outbound(&muxed);
+        assert!(!issues.has_blocking(), "{issues:#?}");
+    }
+
+    /// The masque transport's `xmux` refuses both connection limits at once,
+    /// exactly as every transport that carries the block does: the core's
+    /// build answers `maxConnections cannot be specified together with
+    /// maxConcurrency` (infra/conf/transport_method.go).
+    #[test]
+    fn masque_xmux_limits_are_mutually_exclusive() {
+        let mut outbound = runnable_masque();
+        outbound
+            .stream
+            .masque_settings
+            .as_mut()
+            .expect("a masque outbound carries its transport")
+            .xmux = Some(XmuxConfig {
+            max_connections: Some(Int32Range::single(2)),
+            max_concurrency: Some(Int32Range::single(8)),
+            ..Default::default()
+        });
+
+        let issues = validate_outbound(&outbound);
+        let exclusive = finding(&issues, &ValidationCode::XmuxLimitsExclusive)
+            .unwrap_or_else(|| panic!("both limits must gate: {issues:#?}"));
+        assert_eq!(
+            exclusive.path.as_deref(),
+            Some("stream.masqueSettings.xmux")
+        );
+        assert_eq!(exclusive.severity, Severity::Error);
+
+        // Either limit alone is what the core accepts.
+        for xmux in [
+            XmuxConfig {
+                max_connections: Some(Int32Range::single(2)),
+                ..Default::default()
+            },
+            XmuxConfig {
+                max_concurrency: Some(Int32Range::single(8)),
+                ..Default::default()
+            },
+        ] {
+            let mut alone = runnable_masque();
+            alone
+                .stream
+                .masque_settings
+                .as_mut()
+                .expect("a masque outbound carries its transport")
+                .xmux = Some(xmux);
+            let issues = validate_outbound(&alone);
+            assert!(
+                finding(&issues, &ValidationCode::XmuxLimitsExclusive).is_none(),
+                "one limit at a time is legal: {issues:#?}"
+            );
+        }
+    }
+
     /// The pinned core refuses the masque transport on another protocol at
-    /// config load and refuses a masque outbound without its transport, with
-    /// mux, or without TLS at instance creation; the model gates each.
+    /// config load and refuses a masque outbound without its transport or
+    /// without TLS at instance creation; the model gates each.
     #[test]
     fn masque_outbound_and_transport_pair_rules_gate_both_directions() {
         assert!(
@@ -1553,12 +1623,6 @@ mod tests {
             found.contains(&ValidationCode::MasqueTransportRequiresMasqueOutbound),
             "{found:#?}"
         );
-
-        // Mux on the masque outbound (a config-load refusal).
-        let mut muxed = runnable_masque();
-        muxed.mux.enabled = true;
-        let found = codes(&validate_outbound(&muxed));
-        assert!(found.contains(&ValidationCode::MasqueOutboundMuxUnsupported));
 
         // No TLS on the masque transport (an instance-creation refusal).
         let mut plain = runnable_masque();

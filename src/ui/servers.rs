@@ -5653,6 +5653,7 @@ impl ServersScreen {
                 changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
                 changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
                 changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                changed |= xmux_section(ui, lang, &mut s.xmux);
                 if had_settings || changed {
                     st.masque_settings = Some(s);
                 }
@@ -10683,6 +10684,47 @@ Authentication: ML-KEM-768, Post-Quantum
                 "the masque editor must render its {label:?} field"
             );
         }
+    }
+
+    /// The masque transport's settings carry the shared XMUX section, and
+    /// the block the section owns lands on that transport.
+    #[test]
+    fn masque_transport_editor_carries_the_xmux_section() {
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            masque_settings: Some(MasqueTransport::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen.transport_tab(
+                ui,
+                Language::En,
+                &mut stream_for_ui.borrow_mut(),
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Masque,
+                    mux: None,
+                },
+            );
+        });
+        harness.get_by_label(t(Language::En, Key::SrvXmux));
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(
+            stream
+                .borrow()
+                .masque_settings
+                .as_ref()
+                .is_some_and(|settings| settings.xmux.is_some()),
+            "the masque editor must write the xmux block it renders"
+        );
     }
 
     /// The xdrive editor renders the service choice, the folder and every

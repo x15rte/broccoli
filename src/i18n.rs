@@ -1309,7 +1309,6 @@ keys! {
     SrvMasqueOutboundTransport 0,
     SrvMasqueTransportMissing 0,
     SrvMasqueSettingsMissing 0,
-    SrvMasqueMuxUnsupported 0,
     SrvMasqueTransportTls 0,
     SrvMasqueSettingsIncomplete 0,
     SrvMasqueRemoteDns 0,
@@ -1580,7 +1579,7 @@ keys! {
     SrvXhttpSeqPlacementInvalid 0,
     SrvXhttpSessionLengthRequired 0,
     SrvXhttpSessionTableInvalid 0,
-    SrvXhttpXmuxExclusive 0,
+    SrvXmuxLimitsExclusive 0,
     XhttpExtraShadowsSettings 1,
     SniffingDestOverrideInvalid 0,
     OutboundTargetStrategyInvalid 0,
@@ -2508,7 +2507,6 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
         MasqueTransportRequiresMasqueOutbound => t(lang, Key::SrvMasqueOutboundTransport),
         MasqueOutboundRequiresMasqueTransport => t(lang, Key::SrvMasqueTransportMissing),
-        MasqueOutboundMuxUnsupported => t(lang, Key::SrvMasqueMuxUnsupported),
         MasqueTransportRequiresTls => t(lang, Key::SrvMasqueTransportTls),
         MasqueSettingsIncomplete => t(lang, Key::SrvMasqueSettingsIncomplete),
         MasqueRemoteDnsInvalid => t(lang, Key::SrvMasqueRemoteDns),
@@ -2583,7 +2581,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         XhttpSeqPlacementInvalid => t(lang, Key::SrvXhttpSeqPlacementInvalid),
         XhttpSessionIdLengthRequired => t(lang, Key::SrvXhttpSessionLengthRequired),
         XhttpSessionIdTableInvalid => t(lang, Key::SrvXhttpSessionTableInvalid),
-        XhttpXmuxLimitsExclusive => t(lang, Key::SrvXhttpXmuxExclusive),
+        XmuxLimitsExclusive => t(lang, Key::SrvXmuxLimitsExclusive),
         XhttpExtraShadowsSettings(_) => t(lang, Key::XhttpExtraShadowsSettings),
         SniffingDestOverrideInvalid => t(lang, Key::SniffingDestOverrideInvalid),
         OutboundTargetStrategyInvalid => t(lang, Key::OutboundTargetStrategyInvalid),
@@ -4352,7 +4350,6 @@ mod en {
             Key::SrvMasqueOutboundTransport => "MASQUE transport requires a MASQUE outbound",
             Key::SrvMasqueTransportMissing => "MASQUE outbound requires the MASQUE transport",
             Key::SrvMasqueSettingsMissing => "MASQUE settings are missing",
-            Key::SrvMasqueMuxUnsupported => "MASQUE outbound does not support mux",
             Key::SrvMasqueTransportTls => "MASQUE transport requires TLS",
             Key::SrvMasqueSettingsIncomplete => "MASQUE server address and port are required",
             Key::SrvMasqueRemoteDns => "Every MASQUE remote DNS entry must be an IP address",
@@ -4791,7 +4788,7 @@ mod en {
                 "sessionIDTable must be ASCII and, together with sessionIDLength (from at \
                  least 1), provide at least 2^31 key combinations"
             }
-            Key::SrvXhttpXmuxExclusive => {
+            Key::SrvXmuxLimitsExclusive => {
                 "maxConnections and maxConcurrency are mutually exclusive. Choose one"
             }
             Key::XhttpExtraShadowsSettings => {
