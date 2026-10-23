@@ -127,6 +127,26 @@ pub fn routing_script_issues(
     issues
 }
 
+/// Every blocking conflict a noise-mask script creates: the mask build
+/// refuses a script beside any `noise` item and never reads the item list
+/// when the script arm is taken (`infra/conf/transport_finalmask.go`,
+/// `NoiseMask.Build`). Exactly one of the two reaches the core, so the app
+/// blocks the pair instead of picking a winner. An empty script is the
+/// core's "no script" spelling, so only its structural finding fires.
+pub fn noise_script_issues(script: Option<&str>, noise_items: usize) -> Vec<ValidationCode> {
+    let Some(script) = script else {
+        return Vec::new();
+    };
+    let mut issues: Vec<ValidationCode> = lua_script_path_issue(script).into_iter().collect();
+    if script.is_empty() {
+        return issues;
+    }
+    if noise_items > 0 {
+        issues.push(ValidationCode::FinalmaskNoiseScriptConflict);
+    }
+    issues
+}
+
 // ---------- settings-level verdict ----------
 //
 // The generator's former private pass, now the model's single answer to

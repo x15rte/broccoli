@@ -322,6 +322,11 @@ pub enum ValidationCode {
     FinalmaskUdpHeaderModeInvalid,
     FinalmaskMkcpHeaderInvalid,
     FinalmaskNoisePacketExclusive,
+    /// A `noise` mask carries both a `script` and one or more `noise` items:
+    /// the mask build refuses the pair and names it (infra/conf/
+    /// transport_finalmask.go, `NoiseMask.Build`), because the script arm
+    /// returns before the item list is read. Error tier.
+    FinalmaskNoiseScriptConflict,
     /// A `noise` item declares `type: "exp"` but its `packet` is absent or
     /// not a JSON string: the mask build unmarshals `packet` into a `string`
     /// and refuses the whole config otherwise
@@ -1365,9 +1370,9 @@ pub use outbound::{
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
     dns_script_issues, inbound_auth_trap, local_inbound_auth_verdict, lua_script_path_issue,
-    routing_script_issues, sniffing_row_verdict, tun_gateway_verdict, tun_ipv4_gateway,
-    tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address, validate_profiles,
-    validate_settings,
+    noise_script_issues, routing_script_issues, sniffing_row_verdict, tun_gateway_verdict,
+    tun_ipv4_gateway, tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address,
+    validate_profiles, validate_settings,
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,

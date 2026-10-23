@@ -8,7 +8,8 @@
 use crate::i18n::{Key, t, t_fmt, validation_message};
 use crate::model::settings::Language;
 use crate::model::validation::{
-    ValidationCode, noise_exp_finding, noise_exp_packet_finding, pinned_peer_cert_sha256_valid,
+    ValidationCode, noise_exp_finding, noise_exp_packet_finding, noise_script_issues,
+    pinned_peer_cert_sha256_valid,
 };
 use crate::model::{
     FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskNoiseItem, FinalmaskPortList,
@@ -1295,6 +1296,8 @@ pub(super) fn finalmask_udp_settings_editor(
     mut field: RawField<'_>,
     // Whether the mask's credentials render masked (the reveal control).
     masked: bool,
+    // The draft generation the script row's conflict verdict memoizes on.
+    revision: u64,
 ) -> bool {
     match mask {
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
@@ -1340,7 +1343,25 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Noise { settings, .. } => {
-            let mut changed = range_editor(ui, "reset", &mut settings.reset, i32::MIN..=i32::MAX);
+            // The script owns the mask's packets, so the row reports the
+            // core's own exclusivity rule beside the shared path rule: a
+            // script and the item list never reach the core together.
+            let items = settings.noise.len();
+            let conflict =
+                |script: &str| noise_script_issues(Some(script), items).into_iter().next();
+            let mut changed = widgets::lua_script_field(
+                ui,
+                lang,
+                widgets::LuaScriptLabels {
+                    toggle: t(lang, Key::SrvNoiseScriptToggle),
+                    path: t(lang, Key::SrvNoiseScriptPath),
+                    hint: t(lang, Key::SrvNoiseScriptHint),
+                },
+                &mut settings.script,
+                widgets::context_revision((revision, items)),
+                conflict,
+            );
+            changed |= range_editor(ui, "reset", &mut settings.reset, i32::MIN..=i32::MAX);
             let mut remove = None;
             for (index, item) in settings.noise.iter_mut().enumerate() {
                 ui.push_id(("noise", index), |ui| {

@@ -2442,6 +2442,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Noise { settings, .. } => {
+            for code in super::settings::noise_script_issues(
+                settings.script.as_deref(),
+                settings.noise.len(),
+            ) {
+                issues.push(issue(code, Some(format!("{path}.settings.script"))));
+            }
             for (item_index, item) in settings.noise.iter().enumerate() {
                 let item_path = format!("{path}.settings.noise[{item_index}]");
                 if !item.packet.is_absent() && finalmask_range_bounds(item.rand).1 > 0 {
@@ -4002,6 +4008,61 @@ mod tests {
         assert_eq!(
             issues[0].path.as_deref(),
             Some("finalmask.udp[0].settings.noise[1].packet")
+        );
+    }
+
+    /// A noise mask's `script` is exclusive with its `noise` items: the
+    /// core's build returns the script path only when the item list is empty
+    /// and refuses the pair (`infra/conf/transport_finalmask.go`,
+    /// `NoiseMask.Build`). The path itself carries the shared Lua rules, so a
+    /// blank or non-`.lua` path gates on its own.
+    #[test]
+    fn noise_script_gates_the_pair_and_the_path_shape() {
+        let codes_for = |settings: serde_json::Value| {
+            let fm: FinalmaskModel =
+                serde_json::from_value(json!({"udp": [{"type": "noise", "settings": settings}]}))
+                    .expect("fixture is valid finalmask JSON");
+            validate_finalmask(&fm)
+                .into_iter()
+                .map(|issue| (issue.code, issue.path, issue.severity))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            codes_for(json!({
+                "script": "/tmp/noise.lua",
+                "noise": [{"type": "hex", "packet": "00"}]
+            })),
+            vec![(
+                ValidationCode::FinalmaskNoiseScriptConflict,
+                Some("finalmask.udp[0].settings.script".into()),
+                Severity::Error,
+            )]
+        );
+        assert!(
+            codes_for(json!({"script": "/tmp/noise.lua", "noise": []})).is_empty(),
+            "a script alone is the script arm the core builds"
+        );
+        assert!(
+            codes_for(json!({"noise": [{"type": "hex", "packet": "00"}]})).is_empty(),
+            "items alone are the settings arm"
+        );
+        assert_eq!(
+            codes_for(json!({"script": ""})),
+            vec![(
+                ValidationCode::LuaScriptPathRequired,
+                Some("finalmask.udp[0].settings.script".into()),
+                Severity::Error,
+            )],
+            "a blank path never resolves"
+        );
+        assert_eq!(
+            codes_for(json!({"script": "/tmp/noise.txt"})),
+            vec![(
+                ValidationCode::LuaScriptPathNotLua,
+                Some("finalmask.udp[0].settings.script".into()),
+                Severity::Error,
+            )]
         );
     }
 

@@ -1548,6 +1548,9 @@ keys! {
     SrvSendThroughHint 0,
     SrvNoisePacketHint 0,
     SrvNoiseExpHint 0,
+    SrvNoiseScriptToggle 0,
+    SrvNoiseScriptPath 0,
+    SrvNoiseScriptHint 0,
     SrvXmcPasswordHint 0,
     SrvXmcTexturesValueHint 0,
     SrvXmcTexturesSignatureHint 0,
@@ -1670,6 +1673,7 @@ keys! {
     FinalmaskUdpHeaderModeInvalid 0,
     FinalmaskMkcpHeaderInvalid 0,
     FinalmaskNoisePacketExclusive 0,
+    FinalmaskNoiseScriptConflict 0,
     FinalmaskNoiseExpPacketNotString 0,
     FinalmaskNoiseExpEmpty 0,
     FinalmaskNoiseExpTrailingText 1,
@@ -2706,6 +2710,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskUdpHeaderModeInvalid => t(lang, Key::FinalmaskUdpHeaderModeInvalid),
         FinalmaskMkcpHeaderInvalid => t(lang, Key::FinalmaskMkcpHeaderInvalid),
         FinalmaskNoisePacketExclusive => t(lang, Key::FinalmaskNoisePacketExclusive),
+        FinalmaskNoiseScriptConflict => t(lang, Key::FinalmaskNoiseScriptConflict),
         FinalmaskNoiseExpPacketNotString => t(lang, Key::FinalmaskNoiseExpPacketNotString),
         FinalmaskNoiseExpEmpty => t(lang, Key::FinalmaskNoiseExpEmpty),
         FinalmaskNoiseExpTrailingText(_) => t(lang, Key::FinalmaskNoiseExpTrailingText),
@@ -4749,6 +4754,12 @@ mod en {
             Key::SrvSendThroughHint => "local IP, CIDR, origin, or srcip",
             Key::SrvNoisePacketHint => "payload or range",
             Key::SrvNoiseExpHint => "b, r, rc, rd, t, c, or n tokens in angle brackets",
+            Key::SrvNoiseScriptToggle => "Use a noise script",
+            Key::SrvNoiseScriptPath => "Script path",
+            Key::SrvNoiseScriptHint => {
+                "Absolute path to a .lua file. The core compiles it at load. The app never \
+                 runs it. A script and noise items are mutually exclusive."
+            }
             Key::SrvXmcPasswordHint => "RSA derivation password",
             Key::SrvXmcTexturesValueHint => "signed Mojang textures value",
             Key::SrvXmcTexturesSignatureHint => "signed Mojang textures signature",
@@ -5052,6 +5063,10 @@ mod en {
             Key::FinalmaskMkcpHeaderInvalid => "choose dns, dtls, srtp, utp, wechat, or wireguard",
             Key::FinalmaskNoisePacketExclusive => {
                 "packet bytes and a positive random-length range are mutually exclusive"
+            }
+            Key::FinalmaskNoiseScriptConflict => {
+                "A noise script and noise items cannot be used together. Remove the items or \
+                 turn the script off. The core accepts exactly one of the two."
             }
             Key::FinalmaskNoiseExpPacketNotString => {
                 "A noise exp item needs a packet string holding the token expression"

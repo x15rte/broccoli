@@ -565,6 +565,27 @@ fn script_paths_round_trip_through_the_state_files() {
 
     let absent: DnsCfg = serde_json::from_value(json!({"servers": []})).unwrap();
     assert_eq!(absent.script, None, "an absent key is no script");
+
+    // The noise mask's script is the third surface: a stored path survives the
+    // save/load boundary, and turning a noise-mask script off drops the key
+    // instead of storing the core's empty-string spelling.
+    let noise = crate::model::FinalmaskNoise {
+        script: Some("noise.lua".into()),
+        ..Default::default()
+    };
+    let stored = serde_json::to_value(&noise).unwrap();
+    assert_eq!(stored["script"], json!("noise.lua"));
+    check_value(&noise);
+    let off = crate::model::FinalmaskNoise {
+        script: Some(String::new()),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&off).unwrap(),
+        json!({}),
+        "a blank path is the core's no-script spelling"
+    );
+    check_value(&crate::model::FinalmaskNoise::default());
 }
 
 #[test]

@@ -49,6 +49,10 @@ const LUA_SCRIPT_FIXTURES: &[(&str, &str)] = &[
         "broccoli-golden-routing.lua",
         "function HandleRoute(ctx)\n    return nil\nend\n",
     ),
+    (
+        "broccoli-golden-noise.lua",
+        "function HandleNoise(plan, addr)\n    plan:Add(\"noise\")\n    return nil\nend\n",
+    ),
 ];
 
 /// Write the script fixtures the goldens name into the core's directory.
