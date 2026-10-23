@@ -37,14 +37,14 @@ use crate::model::validation::{
     dns_out_action_supported, ech_sockopt_emitted, freedom_final_rule_supported,
     masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
     pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
-    send_through_supported, server_name_implausible, tls_version_rank, validate_finalmask,
-    validate_outbound, validate_sockopt,
+    send_through_supported, server_name_implausible, validate_finalmask, validate_outbound,
+    validate_sockopt,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
     HttpCamouflageResponse, Int32Range, Network, OutboundModel, Protocol, ProtocolSettings,
     RawHeader, Security, ServerProfile, ServersFile, Settings, Sniffing, SockoptModel, StreamModel,
-    TlsCert, WsSettings,
+    WsSettings,
 };
 use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
@@ -64,6 +64,7 @@ use crate::ui::{
 mod finalmask_editors;
 mod keygen;
 mod raw_editor;
+mod tls_editor;
 mod validators;
 mod xmux;
 mod xray_tool;
@@ -73,7 +74,7 @@ use finalmask_editors::{
     finalmask_udp_settings_editor,
 };
 use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
-use raw_editor::{FieldKey, RawField, SeededBuffers, pem_lines_editor};
+use raw_editor::{FieldKey, RawField, SeededBuffers};
 use validators::{
     v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
     v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
@@ -6226,110 +6227,19 @@ impl ServersScreen {
                 let had_settings = st.tls_settings.is_some();
                 let mut s = st.tls_settings.take().unwrap_or_default();
                 let tool_working = self.tool_job.is_some();
-                changed |= widgets::noted(ui, t(lang, Key::SrvTlsServerNameEmptyNote), |ui| {
-                    widgets::text_field(
-                        ui,
-                        t(lang, Key::SrvServerNameSni),
-                        &mut s.server_name,
-                        "example.com",
-                    )
-                });
-                // Warn inline at the field when
-                // the value cannot plausibly be a hostname — the model's own
-                // predicate, so the inline hint can never drift from the
-                // sweep. Empty stays untouched (out of scope by design).
-                if server_name_implausible(&s.server_name) {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        validation_message(&ValidationCode::ServerNameImplausible, lang),
-                    );
-                }
-                changed |= widgets::string_list(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvAlpn),
-                    &mut s.alpn,
-                    t(lang, Key::SrvAlpnHint),
-                );
                 // The MASQUE transport dials HTTP/2 only when `h2` is present
                 // and `h3` is absent, so the pair silently picks HTTP/3; the
                 // model warning fires for the same pair.
-                if masque_transport
+                let alpn_warning = (masque_transport
                     && s.alpn.iter().any(|protocol| protocol == "h2")
-                    && s.alpn.iter().any(|protocol| protocol == "h3")
-                {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang),
-                    );
-                }
-                changed |= widgets::noted(ui, t(lang, Key::SrvTlsFingerprintNote), |ui| {
-                    fingerprint_editor(
-                        ui,
-                        lang,
-                        &mut s.fingerprint,
-                        ValidationCode::TlsFingerprintUnsupported,
-                    )
-                });
-                changed |= widgets::combo_str_labeled(
-                    ui,
-                    t(lang, Key::SrvMinVersion),
-                    &mut s.min_version,
-                    &TLS_VERSIONS,
-                    t(lang, Key::SrvDefault),
-                    false,
-                );
-                changed |= widgets::combo_str_labeled(
-                    ui,
-                    t(lang, Key::SrvMaxVersion),
-                    &mut s.max_version,
-                    &TLS_VERSIONS,
-                    t(lang, Key::SrvDefault),
-                    false,
-                );
-                if let (Some(min), Some(max)) = (
-                    tls_version_rank(&s.min_version),
-                    tls_version_rank(&s.max_version),
-                ) && min > max
-                {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        validation_message(&ValidationCode::TlsMinExceedsMax, lang),
-                    );
-                }
-                changed |= widgets::text_field(
-                    ui,
-                    t(lang, Key::SrvCipherSuites),
-                    &mut s.cipher_suites,
-                    t(lang, Key::SrvCipherSuitesHint),
-                );
-                changed |= widgets::string_list(
+                    && s.alpn.iter().any(|protocol| protocol == "h3"))
+                .then(|| validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang));
+                changed |= tls_editor::tls_fields_editor(
                     ui,
                     lang,
-                    t(lang, Key::SrvCurvePreferences),
-                    &mut s.curve_preferences,
-                    "X25519MLKEM768",
-                );
-                changed |= widgets::opt_bool(
-                    ui,
-                    "disableSystemRoot",
-                    &mut s.disable_system_root,
-                    t(lang, Key::SrvUnset),
-                );
-                changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
-                    ui.checkbox(&mut s.use_system_ca, "useSystemCA").changed()
-                });
-                changed |= widgets::opt_bool(
-                    ui,
-                    "enableSessionResumption",
-                    &mut s.enable_session_resumption,
-                    t(lang, Key::SrvUnset),
-                );
-                changed |= widgets::text_field(
-                    ui,
-                    "pinnedPeerCertSha256",
-                    &mut s.pinned_peer_cert_sha256,
-                    t(lang, Key::SrvPinnedPeerCertSha256Hint),
+                    &mut s,
+                    ValidationCode::TlsFingerprintUnsupported,
+                    alpn_warning.as_deref(),
                 );
                 if ui
                     .add_enabled(
@@ -6555,124 +6465,18 @@ impl ServersScreen {
                 {
                     self.probe_for_target(target).show_output = true;
                 }
-                changed |= widgets::text_field(
-                    ui,
-                    "verifyPeerCertByName",
-                    &mut s.verify_peer_cert_by_name,
-                    "",
-                );
-                changed |= path_field(ui, lang, "masterKeyLog", &mut s.master_key_log, true);
-                changed |= widgets::text_field(
-                    ui,
-                    "echConfigList",
-                    &mut s.ech_config_list,
-                    t(lang, Key::SrvEchConfigListHint),
-                );
-                changed |= ech_sockopt_editor(ui, lang, &mut s.ech_sockopt, ech_sockopt_errors);
-                if s.alpn.len() > 1 && s.alpn.iter().any(|value| value == "fromMitm") {
-                    ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvFromMitmOnlyAlpn));
-                }
-                let mut certs = !s.certificates.is_empty();
-                if ui
-                    .checkbox(&mut certs, t(lang, Key::SrvCustomCertificate))
-                    .changed()
-                {
-                    s.certificates = if certs {
-                        vec![TlsCert::default()]
-                    } else {
-                        Vec::new()
-                    };
-                    changed = true;
-                }
-                let mut remove_cert: Option<usize> = None;
-                // The profile id is part of the id salt so widgets inside the
-                // group (including the seeded PEM editor buffers) re-seed
-                // when the draft switches to another profile.
+                // The profile id is part of the certificate widgets' id salt,
+                // so their seeded PEM editor buffers re-seed when the draft
+                // switches to another profile.
                 let profile_id = target.map_or("", |target| target.profile_id);
-                for (i, c) in s.certificates.iter_mut().enumerate() {
-                    ui.push_id(("tls-cert", profile_id, i), |ui| {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(t_fmt(lang, Key::SrvCertificateN, &[&(i + 1)]));
-                                if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
-                                    remove_cert = Some(i);
-                                }
-                            });
-                            changed |= path_field(
-                                ui,
-                                lang,
-                                t(lang, Key::SrvCertificateFile),
-                                &mut c.certificate_file,
-                                false,
-                            );
-                            changed |= path_field(
-                                ui,
-                                lang,
-                                t(lang, Key::SrvKeyFile),
-                                &mut c.key_file,
-                                false,
-                            );
-                            changed |= pem_lines_editor(
-                                ui,
-                                t(lang, Key::SrvCertificatePem),
-                                profile_id,
-                                &mut c.certificate,
-                                "-----BEGIN CERTIFICATE-----",
-                                &mut self.seeded_buffers,
-                            );
-                            changed |= pem_lines_editor(
-                                ui,
-                                t(lang, Key::SrvKeyPem),
-                                profile_id,
-                                &mut c.key,
-                                "-----BEGIN PRIVATE KEY-----",
-                                &mut self.seeded_buffers,
-                            );
-                            changed |= widgets::combo_str_labeled(
-                                ui,
-                                "usage",
-                                &mut c.usage,
-                                &["", "encipherment", "verify", "issue"],
-                                t(lang, Key::SrvDefault),
-                                false,
-                            );
-                            changed |= widgets::opt_num(
-                                ui,
-                                t(lang, Key::SrvOcspStaplingS),
-                                &mut c.ocsp_stapling,
-                                0..=u64::MAX,
-                            );
-                            changed |= widgets::opt_bool(
-                                ui,
-                                "oneTimeLoading",
-                                &mut c.one_time_loading,
-                                t(lang, Key::SrvUnset),
-                            );
-                            changed |= widgets::opt_bool(
-                                ui,
-                                "buildChain",
-                                &mut c.build_chain,
-                                t(lang, Key::SrvUnset),
-                            );
-                            if c.certificate_file.trim().is_empty()
-                                && c.certificate.iter().all(|line| line.trim().is_empty())
-                            {
-                                ui.colored_label(
-                                    status_colors_of(ui).err,
-                                    t(lang, Key::SrvCertificateFileRequired),
-                                );
-                            }
-                        });
-                    });
-                }
-                if let Some(i) = remove_cert {
-                    s.certificates.remove(i);
-                    changed = true;
-                }
-                if ui.button(t(lang, Key::SrvAddCertificate)).clicked() {
-                    s.certificates.push(TlsCert::default());
-                    changed = true;
-                }
+                changed |= tls_editor::tls_connection_editor(
+                    ui,
+                    lang,
+                    &mut s,
+                    profile_id,
+                    &mut self.seeded_buffers,
+                    ech_sockopt_errors,
+                );
                 if had_settings || changed {
                     st.tls_settings = Some(s);
                 }
@@ -7056,7 +6860,7 @@ impl ServersScreen {
             }
 
             ui.separator();
-            changed |= finalmask_quic_editor(ui, lang, &mut fm.quic_params);
+            changed |= finalmask_quic_editor(ui, lang, "quicParams", &mut fm.quic_params);
             // Finalmask issues ride the memoized validation sweep (keyed on
             // draft generation + language): identical messages with zero
             // re-validation on idle repaint frames.
@@ -15550,6 +15354,94 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(xdns(&mask.borrow()).domains.len(), 1);
         remove(&mut harness);
         assert!(xdns(&mask.borrow()).domains.is_empty());
+    }
+
+    #[test]
+    fn xdns_resolver_tls_and_quic_sections_edit_the_mask() {
+        fn resolver(mask: &FinalmaskUdpMask) -> FinalmaskXdnsResolver {
+            match mask {
+                FinalmaskUdpMask::Xdns { settings, .. } => settings
+                    .resolvers
+                    .first()
+                    .cloned()
+                    .expect("the fixture carries one resolver"),
+                other => panic!("the harness renders an xdns mask, got {other:?}"),
+            }
+        }
+
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                resolvers: vec![FinalmaskXdnsResolver {
+                    addrs: vec!["https://dns.example/dns-query".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = finalmask_udp_settings_editor(
+                ui,
+                Language::En,
+                &mut mask_for_ui.borrow_mut(),
+                RawField {
+                    id: FieldKey {
+                        key: egui::Id::new("xdns-doh-test"),
+                        profile: "profile-test",
+                    },
+                    buffers: &mut buffers_for_ui.borrow_mut(),
+                },
+                false,
+            );
+        });
+        harness.run();
+
+        // The TLS block starts absent; enabling it is the same `TlsModel`
+        // editor the outbound TLS surface uses, including the trust switch
+        // and its note.
+        assert!(resolver(&mask.borrow()).tls_config.is_none());
+        let note = t(Language::En, Key::SrvTlsUseSystemCaNote);
+        harness.get_by_label("tlsConfig").click();
+        harness.run();
+        assert!(resolver(&mask.borrow()).tls_config.is_some());
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note is the row's hover, never a rendered line"
+        );
+        harness.get_by_label("useSystemCA").scroll_to_me();
+        harness.run();
+        harness.get_by_label("useSystemCA").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the switch's hover must carry the note"
+        );
+        harness.get_by_label("useSystemCA").click();
+        harness.run();
+        // The resolver's QUIC parameters gate behind their own key and, once
+        // enabled, expose the same editor and rule set as the mask-level
+        // block.
+        assert!(resolver(&mask.borrow()).quic_config.is_none());
+        harness.get_by_label("quicConfig").click();
+        harness.run();
+        assert!(resolver(&mask.borrow()).quic_config.is_some());
+        assert!(
+            harness.query_by_label("congestion").is_some(),
+            "the QUIC section renders its controls"
+        );
+
+        let resolver = resolver(&mask.borrow());
+        assert!(resolver.tls_config.expect("TLS was enabled").use_system_ca);
+        let wire = serde_json::to_value(&*mask.borrow()).unwrap();
+        assert_eq!(
+            wire["settings"]["resolvers"][0]["tlsConfig"]["useSystemCA"],
+            json!(true)
+        );
+        assert_eq!(wire["settings"]["resolvers"][0]["quicConfig"], json!({}));
     }
 
     #[test]

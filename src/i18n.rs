@@ -1500,6 +1500,7 @@ keys! {
     SrvResolversClient 0,
     SrvXdnsDomainN 1,
     SrvXdnsResolverN 1,
+    SrvXdnsResolverTlsNote 0,
     SrvAddXdnsDomain 0,
     SrvAddXdnsResolver 0,
     SrvAddXdnsName 0,
@@ -4666,6 +4667,10 @@ mod en {
             Key::SrvResolversClient => "resolvers (client)",
             Key::SrvXdnsDomainN => "Domain {}",
             Key::SrvXdnsResolverN => "Resolver {}",
+            Key::SrvXdnsResolverTlsNote => {
+                "A DoH resolver needs its tlsConfig. Set ALPN to h3 to dial over HTTP/3. The \
+                 quicConfig then applies."
+            }
             Key::SrvAddXdnsDomain => "Add domain",
             Key::SrvAddXdnsResolver => "Add resolver",
             Key::SrvAddXdnsName => "Add name",

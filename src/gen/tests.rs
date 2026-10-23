@@ -1657,6 +1657,119 @@ fn golden_hysteria2_xdns_mask() {
     );
 }
 
+/// A DoH resolver over HTTP/2 (`infra/conf/transport_finalmask.go:841-846`,
+/// `transport/internet/finalmask/xdns/resolver_doh.go:78-110`). The resolver
+/// carries its own `tlsConfig`, so the certificate store of the operating
+/// system verifies the name through the same `useSystemCA` key the outbound
+/// TLS block emits. The emitted document must pass the pinned core's
+/// `run -test`.
+#[test]
+fn golden_hysteria2_xdns_doh_h2() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "xdns.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "xdnspassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                domains: vec![FinalmaskXdnsDomain {
+                    names: vec!["tunnel.example.com".into()],
+                    len_limit: 255,
+                    label_limit: 63,
+                    types: vec![1, 28],
+                    ..Default::default()
+                }],
+                resolvers: vec![FinalmaskXdnsResolver {
+                    addrs: vec!["https://dns.example.com/dns-query".into()],
+                    tls_config: Some(TlsModel {
+                        server_name: "dns.example.com".into(),
+                        alpn: vec!["h2".into()],
+                        use_system_ca: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_xdns_doh_h2.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
+/// A DoH resolver over HTTP/3: the ALPN list holding exactly `h3` selects the
+/// QUIC transport (`transport/internet/finalmask/xdns/resolver_doh.go:51-56`),
+/// and the resolver's `quicConfig` then sizes the connection and its windows.
+#[test]
+fn golden_hysteria2_xdns_doh_h3() {
+    let mut ob = OutboundModel::new(Protocol::Hysteria);
+    ob.settings = ProtocolSettings::Hysteria(HysteriaSettings {
+        address: "xdns.example.com".into(),
+        port: 443,
+        ..Default::default()
+    });
+    ob.stream.network = Network::Hysteria;
+    ob.stream.hysteria_settings = Some(HysteriaTransport {
+        auth: "xdnspassword".into(),
+        udp_idle_timeout: Some(60),
+        ..Default::default()
+    });
+    ob.stream.finalmask = Some(FinalmaskModel {
+        udp: vec![FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                domains: vec![FinalmaskXdnsDomain {
+                    names: vec!["tunnel.example.com".into()],
+                    len_limit: 255,
+                    label_limit: 63,
+                    types: vec![1, 28],
+                    ..Default::default()
+                }],
+                resolvers: vec![FinalmaskXdnsResolver {
+                    addrs: vec!["https://dns.example.com/dns-query".into()],
+                    tls_config: Some(TlsModel {
+                        server_name: "dns.example.com".into(),
+                        alpn: vec!["h3".into()],
+                        fingerprint: "chrome".into(),
+                        ..Default::default()
+                    }),
+                    quic_config: Some(FinalmaskQuicParams {
+                        congestion: "bbr".into(),
+                        bbr_profile: "aggressive".into(),
+                        init_stream_receive_window: Some(16_384),
+                        max_stream_receive_window: Some(8_388_608),
+                        init_connection_receive_window: Some(16_384),
+                        max_connection_receive_window: Some(16_777_216),
+                        max_idle_timeout: Some(30),
+                        keep_alive_period: Some(10),
+                        max_incoming_streams: Some(100),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Map::new(),
+        }],
+        ..Default::default()
+    });
+    golden!(
+        "goldens/hysteria2_xdns_doh_h3.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 #[test]
 fn retired_quic_udp_hop_key_warns_and_never_reaches_the_wire() {
     let mut ob = OutboundModel::new(Protocol::Hysteria);

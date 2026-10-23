@@ -15,7 +15,8 @@ use crate::model::{
     FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealmPortMapping, FinalmaskRealmTls,
     FinalmaskSudoku, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg,
     FinalmaskUdpHop, FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain,
-    FinalmaskXdnsResolver, FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert, fold_eq,
+    FinalmaskXdnsResolver, FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert, TlsModel,
+    fold_eq,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -23,6 +24,7 @@ use crate::ui::widgets;
 use super::raw_editor::{
     JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
 };
+use super::tls_editor::{tls_connection_editor, tls_fields_editor};
 use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
 // ---------- finalmask typed editor ----------
@@ -815,7 +817,12 @@ fn xdns_text_row(
 /// addresses and worker count), and the `extraPoll` counter. A stored mask
 /// written against a removed shape reaches this editor already migrated, so
 /// only the current shape renders.
-fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut FinalmaskXdns) -> bool {
+fn finalmask_xdns_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    settings: &mut FinalmaskXdns,
+    field: &mut RawField<'_>,
+) -> bool {
     // The record types the core's `NewDomain` accepts, as the body's numbers.
     const RECORD_TYPES: [(i32, &str); 4] = [(1, "A"), (5, "CNAME"), (16, "TXT"), (28, "AAAA")];
     let mut changed = false;
@@ -943,6 +950,41 @@ fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Final
                         .add(egui::DragValue::new(&mut resolver.worker).range(0..=i32::MAX))
                         .changed();
                 });
+                // A DoH resolver needs its own TLS block to run, and its h3
+                // form is the ALPN list holding exactly `h3`. Both blocks use
+                // the editors the outbound TLS settings and the mask-level
+                // QUIC parameters already use, so the field names and rules
+                // stay identical across the surfaces.
+                let mut has_tls = resolver.tls_config.is_some();
+                if ui
+                    .checkbox(&mut has_tls, "tlsConfig")
+                    .on_hover_text(t(lang, Key::SrvXdnsResolverTlsNote))
+                    .changed()
+                {
+                    resolver.tls_config = has_tls.then(TlsModel::default);
+                    changed = true;
+                }
+                if let Some(tls) = resolver.tls_config.as_mut() {
+                    changed |= tls_fields_editor(
+                        ui,
+                        lang,
+                        tls,
+                        ValidationCode::TlsFingerprintUnsupported,
+                        None,
+                    );
+                    changed |= tls_connection_editor(
+                        ui,
+                        lang,
+                        tls,
+                        field.id.profile,
+                        &mut *field.buffers,
+                        // The finalmask sweep already validates this nested
+                        // block under its mask path, so the inline pass has
+                        // no separate memoized list to render.
+                        &[],
+                    );
+                }
+                changed |= finalmask_quic_editor(ui, lang, "quicConfig", &mut resolver.quic_config);
             });
         });
     }
@@ -1341,7 +1383,9 @@ pub(super) fn finalmask_udp_settings_editor(
         FinalmaskUdpMask::Sudoku { settings, .. } => {
             finalmask_sudoku_editor(ui, lang, settings, masked)
         }
-        FinalmaskUdpMask::Xdns { settings, .. } => finalmask_xdns_editor(ui, lang, settings),
+        FinalmaskUdpMask::Xdns { settings, .. } => {
+            finalmask_xdns_editor(ui, lang, settings, &mut field)
+        }
         FinalmaskUdpMask::Xicmp { settings, .. } => {
             let mut changed = ui.checkbox(&mut settings.dgram, "dgram").changed();
             changed |= widgets::string_list(
@@ -1428,11 +1472,14 @@ pub(super) fn finalmask_udp_settings_editor(
 pub(super) fn finalmask_quic_editor(
     ui: &mut egui::Ui,
     lang: Language,
+    // The key the block hangs under in this context: `quicParams` at the
+    // mask level, `quicConfig` inside an xdns resolver.
+    label: &str,
     quic: &mut Option<FinalmaskQuicParams>,
 ) -> bool {
     let mut changed = false;
     let mut enabled = quic.is_some();
-    if ui.checkbox(&mut enabled, "quicParams").changed() {
+    if ui.checkbox(&mut enabled, label).changed() {
         *quic = enabled.then(FinalmaskQuicParams::default);
         changed = true;
     }

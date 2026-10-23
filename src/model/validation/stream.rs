@@ -3616,6 +3616,85 @@ mod tests {
         );
     }
 
+    /// The resolver's own `quicConfig` goes through the same QUIC rule set as
+    /// the mask-level block, under the resolver's path; a resolver that
+    /// carries TLS satisfies the DoH rule.
+    #[test]
+    fn finalmask_xdns_resolver_quic_params_validate_under_the_resolver() {
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {"resolvers": [
+                {
+                    "addrs": ["https://dns.example/dns-query"],
+                    "tlsConfig": {"alpn": ["h3"]},
+                    "quicConfig": {
+                        "congestion": "force-brutal",
+                        "initStreamReceiveWindow": 1,
+                        "maxIdleTimeout": 3,
+                        "keepAlivePeriod": 61,
+                        "maxIncomingStreams": 7
+                    }
+                },
+                {
+                    "addrs": ["https://dns.example/dns-query"],
+                    "tlsConfig": {"alpn": ["h3"]},
+                    "quicConfig": {
+                        "congestion": "force-brutal",
+                        "brutalUp": "100 mbps",
+                        "initStreamReceiveWindow": 16384,
+                        "maxIdleTimeout": 30,
+                        "keepAlivePeriod": 10,
+                        "maxIncomingStreams": 8
+                    }
+                }
+            ]}}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&fm);
+        let root = "finalmask.udp[0].settings.resolvers[0].quicConfig";
+        for (code, field) in [
+            (ValidationCode::FinalmaskQuicForceBrutalNeedsUp, "brutalUp"),
+            (
+                ValidationCode::FinalmaskQuicReceiveWindowTooSmall,
+                "initStreamReceiveWindow",
+            ),
+            (
+                ValidationCode::FinalmaskQuicMaxIdleTimeoutInvalid,
+                "maxIdleTimeout",
+            ),
+            (
+                ValidationCode::FinalmaskQuicKeepAlivePeriodInvalid,
+                "keepAlivePeriod",
+            ),
+            (
+                ValidationCode::FinalmaskQuicMaxIncomingStreamsInvalid,
+                "maxIncomingStreams",
+            ),
+        ] {
+            let path = format!("{root}.{field}");
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == code && issue.path.as_deref() == Some(&path)),
+                "missing {code:?} at {path:?} in {issues:#?}"
+            );
+        }
+        // The configured TLS block satisfies the DoH rule, and the second
+        // resolver's complete parameters report nothing.
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskXdnsHttpsRequiresTls),
+            "{issues:#?}"
+        );
+        assert!(
+            !issues.iter().any(|issue| issue
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("resolvers[1]"))),
+            "{issues:#?}"
+        );
+    }
+
     /// Sub-byte bandwidths are values, not unset: a positive bit rate that
     /// truncates below one byte per second reports the too-small rule (blank
     /// input and an explicit zero stay the unset shape the rule's own message
