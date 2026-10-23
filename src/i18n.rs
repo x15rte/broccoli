@@ -583,6 +583,10 @@ keys! {
     DnsServeStale 0,
     DnsServeStaleHint 0,
     DnsParallelQueries 0,
+    DnsParallelQueriesScriptHint 0,
+    DnsScriptToggle 0,
+    DnsScriptPath 0,
+    DnsScriptHint 0,
     DnsUseSystemHosts 0,
     DnsServeExpiredTtl 0,
     DnsSectionFakedns 0,
@@ -707,6 +711,10 @@ keys! {
     GeodataAddGeosite 0,
     GeodataAddGeoip 0,
     RoutingRulesSection 0,
+    RoutingScriptSection 0,
+    RoutingScriptToggle 0,
+    RoutingScriptPath 0,
+    RoutingScriptHint 0,
     RoutingMoveUp 0,
     RoutingMoveDown 0,
     RoutingDeleteRule 0,
@@ -1800,6 +1808,12 @@ keys! {
     SettingsRoutingRuleInboundMissing 2,
     SettingsDnsServerAddressMissing 1,
     SettingsDnsBootstrapNotResolvable 0,
+    SettingsLuaScriptPathRequired 0,
+    SettingsLuaScriptPathNotLua 0,
+    SettingsDnsScriptFallbackConflict 0,
+    SettingsDnsScriptServerConflict 2,
+    SettingsRoutingScriptRulesConflict 0,
+    SettingsRoutingScriptStrategyConflict 0,
     SettingsFakeDnsPoolCidrInvalid 1,
     SettingsFakeDnsPoolSizeInvalid 1,
     SettingsFakeDnsPoolCapacityExceeded 3,
@@ -1875,6 +1889,7 @@ keys! {
     ShellXrayArchiveFilter 0,
     ShellMasterKeyLogFileName 0,
     ShellCertificateFilter 0,
+    ShellLuaScriptFilter 0,
     // Error chains and runtime messages, rendered at the display boundary.
     LinkPercentTruncated 1,
     LinkPercentEscape 1,
@@ -2763,6 +2778,12 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         RoutingRuleInboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleInboundMissing),
         DnsServerAddressMissing(_) => t(lang, Key::SettingsDnsServerAddressMissing),
         DnsBootstrapNotResolvable => t(lang, Key::SettingsDnsBootstrapNotResolvable),
+        LuaScriptPathRequired => t(lang, Key::SettingsLuaScriptPathRequired),
+        LuaScriptPathNotLua => t(lang, Key::SettingsLuaScriptPathNotLua),
+        DnsScriptFallbackConflict => t(lang, Key::SettingsDnsScriptFallbackConflict),
+        DnsScriptServerConflict(..) => t(lang, Key::SettingsDnsScriptServerConflict),
+        RoutingScriptRulesConflict => t(lang, Key::SettingsRoutingScriptRulesConflict),
+        RoutingScriptStrategyConflict => t(lang, Key::SettingsRoutingScriptStrategyConflict),
         FakeDnsPoolCidrInvalid(_) => t(lang, Key::SettingsFakeDnsPoolCidrInvalid),
         FakeDnsPoolSizeInvalid(_) => t(lang, Key::SettingsFakeDnsPoolSizeInvalid),
         FakeDnsPoolCapacityExceeded(_, _, _) => t(lang, Key::SettingsFakeDnsPoolCapacityExceeded),
@@ -2899,6 +2920,9 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         }
         ValidationCode::FakeDnsPoolCapacityExceeded(index, size, pool) => {
             vec![index.to_string(), size.to_string(), pool.clone()]
+        }
+        ValidationCode::DnsScriptServerConflict(index, field) => {
+            vec![index.to_string(), field.clone()]
         }
         ValidationCode::GeodataUrlInvalid(file) => {
             vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()]
@@ -3393,6 +3417,16 @@ mod en {
             Key::DnsServeStale => "Serve stale",
             Key::DnsServeStaleHint => "Reply with expired cache entries while refreshing",
             Key::DnsParallelQueries => "Parallel queries",
+            Key::DnsParallelQueriesScriptHint => {
+                "A DNS script schedules queries itself. The core refuses parallel queries \
+                 beside a script, so the setting is not emitted while one is set."
+            }
+            Key::DnsScriptToggle => "Use a DNS script",
+            Key::DnsScriptPath => "Script path",
+            Key::DnsScriptHint => {
+                "Absolute path to a .lua file. The core compiles it at load. The app never \
+                 runs it."
+            }
             Key::DnsUseSystemHosts => "Use system hosts file",
             Key::DnsServeExpiredTtl => "Serve expired TTL (s)",
             Key::DnsSectionFakedns => "FakeDNS",
@@ -3557,6 +3591,15 @@ mod en {
             Key::GeodataAddGeosite => "Add geosite…",
             Key::GeodataAddGeoip => "Add geoip…",
             Key::RoutingRulesSection => "Rules (first match wins)",
+            // The section's switch and path belong to the script control's
+            // shared label set; keep the two surfaces' wording parallel.
+            Key::RoutingScriptSection => "Routing script",
+            Key::RoutingScriptToggle => "Use a routing script",
+            Key::RoutingScriptPath => "Script path",
+            Key::RoutingScriptHint => {
+                "Absolute path to a .lua file. The core compiles it at load. The app never \
+                 runs it."
+            }
             Key::RoutingMoveUp => "Move up (rules match in order)",
             Key::RoutingMoveDown => "Move down",
             Key::RoutingDeleteRule => "Remove rule",
@@ -5252,6 +5295,26 @@ mod en {
                 "routing rule {} references missing inbound {}"
             }
             Key::SettingsDnsServerAddressMissing => "DNS server {} has no address",
+            Key::SettingsLuaScriptPathRequired => {
+                "the script path is required once a script is enabled"
+            }
+            Key::SettingsLuaScriptPathNotLua => "the script path must name a .lua file",
+            Key::SettingsDnsScriptFallbackConflict => {
+                "A DNS script cannot be combined with disableFallback or \
+                 disableFallbackIfMatch. Turn the script off or clear those flags."
+            }
+            Key::SettingsDnsScriptServerConflict => {
+                "DNS server {} sets {}. A DNS script cannot be combined with domains, \
+                 skipFallback or finalQuery."
+            }
+            Key::SettingsRoutingScriptRulesConflict => {
+                "A routing script cannot be combined with routing rules. Remove the rules \
+                 or turn the script off. The app never drops them for you."
+            }
+            Key::SettingsRoutingScriptStrategyConflict => {
+                "A routing script cannot be combined with a domain strategy. Set the \
+                 strategy to AsIs or turn the script off."
+            }
             Key::SettingsDnsBootstrapNotResolvable => {
                 "bootstrap resolver: must be an IP literal or localhost, since a domain host \
                  needs the resolution this entry provides"
@@ -5394,6 +5457,7 @@ mod en {
             Key::ShellXrayArchiveFilter => "Xray archive",
             Key::ShellMasterKeyLogFileName => "tls.keys.log",
             Key::ShellCertificateFilter => "Certificate",
+            Key::ShellLuaScriptFilter => "Lua script",
             Key::LinkPercentTruncated => "The share link has truncated percent-encoding in {}.",
             Key::LinkPercentEscape => "The share link has a bad percent escape in {}.",
             Key::LinkPercentUtf8 => "The share link has invalid UTF-8 in percent-encoded {}.",

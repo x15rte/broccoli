@@ -37,8 +37,8 @@ pub use outbound::{
     WireguardPeer, WireguardSettings,
 };
 pub use routing::{
-    Balancer, BurstObservatoryCfg, LeastLoadSettings, ObservatoryCfg, PingConfig, RoutingCfg, Rule,
-    StrategyCfg, StrategyCost, Webhook,
+    Balancer, BurstObservatoryCfg, DEFAULT_DOMAIN_STRATEGY, LeastLoadSettings, ObservatoryCfg,
+    PingConfig, RoutingCfg, Rule, StrategyCfg, StrategyCost, Webhook,
 };
 pub use safety::{HazardClass, SafetyCode, SafetyFinding};
 pub use servers::{ServerProfile, ServersFile};

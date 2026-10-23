@@ -492,15 +492,27 @@ pub struct RoutingCfg {
     /// AsIs | IpIfNonMatch | IpOnDemand
     #[serde(skip_serializing_if = "RoutingCfg::skip_default_strategy")]
     pub domain_strategy: String,
+    /// Path to a Lua routing script (`routing.script`,
+    /// infra/conf/router.go:75): `None` = no script, `Some(path)` = the file
+    /// the core resolves and compiles at load. The app stores the path
+    /// verbatim and never reads or runs the file; the path's structural rules
+    /// live in the validation pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     pub observatory: ObservatoryCfg,
     pub burst_observatory: BurstObservatoryCfg,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
+/// The routing `domainStrategy` value the core reads as its zero strategy
+/// (`infra/conf/router.go:79-91`): the model seed, the wire-omission
+/// predicate, and the script-conflict rule all read this one spelling.
+pub const DEFAULT_DOMAIN_STRATEGY: &str = "AsIs";
+
 impl RoutingCfg {
     fn skip_default_strategy(s: &str) -> bool {
-        s == "AsIs"
+        s == DEFAULT_DOMAIN_STRATEGY
     }
 
     /// True when the configuration carries a balancer that reads live
@@ -629,7 +641,8 @@ impl Default for RoutingCfg {
         Self {
             rules: Vec::new(),
             balancers: Vec::new(),
-            domain_strategy: "AsIs".into(),
+            domain_strategy: DEFAULT_DOMAIN_STRATEGY.into(),
+            script: None,
             observatory: ObservatoryCfg::default(),
             burst_observatory: BurstObservatoryCfg::default(),
             extra: Map::new(),

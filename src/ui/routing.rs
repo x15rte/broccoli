@@ -10,6 +10,7 @@ use crate::model::inbound::{
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
+use crate::model::validation::routing_script_issues;
 use crate::model::{
     Balancer, DurationMs, LeastLoadSettings, Rule, ServerProfile, ServersFile, Settings,
     StrategyCost, Webhook,
@@ -631,6 +632,7 @@ impl RoutingScreen {
         self.consume_trial_results(ctx, lang);
         self.poll_live_out_tags();
 
+        self.script_section(ui, ctx, lang, &mut changed);
         self.rules_section(ui, ctx, lang, &mut changed);
         self.balancers_section(ui, ctx, lang, &mut changed);
         self.observability_section(ui, ctx, lang, &mut changed);
@@ -1484,6 +1486,38 @@ impl RoutingScreen {
             rule_geo_warnings,
             known_inbounds,
             rule_inbounds,
+        });
+    }
+
+    // ---------- script ----------
+
+    /// The routing script row. The script owns every route, so its verdict is
+    /// the apply gate's own rule: the core refuses a script beside rules or a
+    /// domain strategy (infra/conf/router.go:94-96), and the app never drops
+    /// the user's rules to make the script fit.
+    fn script_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, lang: Language, changed: &mut bool) {
+        widgets::section(ui, t(lang, Key::RoutingScriptSection), |ui| {
+            let revision = *ctx.model_generation;
+            let routing = &mut ctx.settings.routing;
+            let rules = routing.rules.len();
+            let domain_strategy = &routing.domain_strategy;
+            let conflict = |script: &str| {
+                routing_script_issues(Some(script), rules, domain_strategy)
+                    .into_iter()
+                    .next()
+            };
+            *changed |= widgets::lua_script_field(
+                ui,
+                lang,
+                widgets::LuaScriptLabels {
+                    toggle: t(lang, Key::RoutingScriptToggle),
+                    path: t(lang, Key::RoutingScriptPath),
+                    hint: t(lang, Key::RoutingScriptHint),
+                },
+                &mut routing.script,
+                revision,
+                conflict,
+            );
         });
     }
 

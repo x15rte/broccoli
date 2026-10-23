@@ -4104,6 +4104,118 @@ fn burst_observatory_projection_strips_enabled_and_keeps_ping_config() {
     assert_eq!(wire["pingConfig"]["httpMethod"], "HEAD");
 }
 
+#[test]
+fn dns_script_suppresses_the_parallel_query_default_on_the_wire() {
+    // The seeded model races its servers in parallel; the core refuses that
+    // pair beside a script (infra/conf/dns.go:276-278), so the app-owned
+    // default never reaches the wire next to one.
+    let cfg = DnsCfg {
+        script: Some("dns.lua".into()),
+        ..Default::default()
+    };
+    assert!(cfg.enable_parallel_query, "the seeded default is on");
+    let wire = cfg
+        .to_wire(false)
+        .expect("a script alone makes a dns block");
+    assert_eq!(wire["script"], json!("dns.lua"));
+    assert!(
+        wire.get("enableParallelQuery").is_none(),
+        "a DNS script suppresses the parallel-query default: {wire}"
+    );
+
+    // Without a script the seeded default still reaches the wire unchanged.
+    assert_eq!(
+        DnsCfg::default().to_wire(false).expect("dns wire")["enableParallelQuery"],
+        json!(true)
+    );
+}
+
+/// A DNS script owns resolution, so the app-owned scoped bootstrap server is
+/// omitted beside it: the core refuses a server carrying `domains` or
+/// `skipFallback` with a script (infra/conf/dns.go), and the pair that pins a
+/// dialed profile's domain to the module goes with it. Without a script the
+/// same profile gets both halves.
+#[test]
+fn dns_script_omits_the_app_owned_bootstrap_server_and_pin() {
+    let mut ob = OutboundModel::new(Protocol::Vless);
+    ob.settings = ProtocolSettings::Vless(VlessSettings {
+        address: "vless.example.com".into(),
+        port: 443,
+        id: "11111111-2222-3333-4444-555555555555".into(),
+        encryption: "none".into(),
+        ..Default::default()
+    });
+    ob.stream.security = Security::Tls;
+    ob.stream.tls_settings = Some(TlsModel {
+        server_name: "vless.example.com".into(),
+        ..Default::default()
+    });
+    let servers = single_server(ob);
+
+    let pinned = generate_deterministic(&servers, &base_settings()).expect("generate config");
+    let pinned_servers = pinned["dns"]["servers"].as_array().unwrap();
+    assert!(
+        pinned_servers
+            .iter()
+            .any(|server| server["skipFallback"] == json!(true)),
+        "without a script the scoped bootstrap server is emitted: {pinned:#?}"
+    );
+    assert_eq!(
+        pinned["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
+        json!("useip")
+    );
+
+    let mut settings = base_settings();
+    settings.dns.script = Some("dns.lua".into());
+    let scripted = generate_deterministic(&servers, &settings).expect("generate config");
+    let scripted_servers = scripted["dns"]["servers"].as_array().unwrap();
+    assert!(
+        scripted_servers
+            .iter()
+            .all(|server| server.get("domains").is_none()
+                && server.get("skipFallback").is_none()
+                && server.get("finalQuery").is_none()),
+        "a DNS script cannot carry a server matcher: {scripted:#?}"
+    );
+    assert!(
+        scripted["outbounds"][0]["streamSettings"]
+            .get("sockopt")
+            .and_then(|sockopt| sockopt.get("domainStrategy"))
+            .is_none(),
+        "the profile pin goes with the scoped server it needs: {scripted:#?}"
+    );
+}
+
+/// The `dns.script` surface (`DNSConfig.Script`, infra/conf/dns.go:166) is
+/// emitted as a path the core resolves and compiles itself
+/// (`common/platform/platform.go`), and the app-owned parallel-query default
+/// is suppressed beside it. The fixture script is materialized beside the
+/// core for the config-test oracle, which compiles but never runs it.
+#[test]
+fn golden_dns_script() {
+    let mut settings = base_settings();
+    settings.dns.script = Some("broccoli-golden-dns.lua".into());
+    golden!(
+        "goldens/dns_script.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
+/// The `routing.script` surface (`RouterConfig.Script`,
+/// infra/conf/router.go:75): the script owns every route, so the section
+/// carries no rules and no `domainStrategy` — not even the app-owned DNS
+/// interception rules — because the core refuses the combination
+/// (infra/conf/router.go:94-96).
+#[test]
+fn golden_routing_script() {
+    let mut settings = base_settings();
+    settings.routing.script = Some("broccoli-golden-routing.lua".into());
+    golden!(
+        "goldens/routing_script.json",
+        generate_deterministic(&ServersFile::default(), &settings)
+    );
+}
+
 /// A routing rule carrying `localOS` emits the matcher under its upstream
 /// spelling: `infra/conf/router.go` reads `localOS` into
 /// `RoutingRule.local_os` (`app/router/config.proto` field 23), and

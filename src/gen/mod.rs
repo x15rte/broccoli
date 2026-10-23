@@ -17,7 +17,8 @@ use crate::model::validation::{
     ValidationIssue, Verdict, tun_ipv4_gateway, validate_profiles, validate_settings,
 };
 use crate::model::{
-    DnsCfg, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile, Settings, TunCfg,
+    DEFAULT_DOMAIN_STRATEGY, DnsCfg, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile,
+    Settings, TunCfg,
 };
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
@@ -256,8 +257,19 @@ fn generate_reporting(
     server_domains.dedup();
     let dns_upstreams = dns_upstream_endpoints(settings);
     // The scoped server must land inside an emitted `dns` object; without a
-    // module there is nothing for it (or for useip dials) to attach to.
-    let bootstrap = if dns_wire.is_some() && !server_domains.is_empty() {
+    // module there is nothing for it (or for useip dials) to attach to. A DNS
+    // script owns resolution instead: the core refuses a server carrying
+    // `domains`/`skipFallback` beside a script (infra/conf/dns.go), so the
+    // app-owned scoped server — and with it the half of the pair that pins
+    // profile dials to the module — is omitted rather than emitted into a
+    // document the core would refuse. The dialed profile's domain then
+    // resolves the way it does without a module, through the OS resolver.
+    let dns_script = settings
+        .dns
+        .script
+        .as_deref()
+        .is_some_and(|script| !script.is_empty());
+    let bootstrap = if dns_wire.is_some() && !server_domains.is_empty() && !dns_script {
         bootstrap_dns_server(settings, &server_domains)
     } else {
         None
@@ -982,13 +994,47 @@ fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
 }
 
 fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
-    // The app's own rules are emitted FIRST and the user's configured rules
-    // LAST: Xray's router takes the first match, and the interception rules
-    // below own DNS for the intercepted inbounds — a user rule that matches
-    // port-53 traffic ahead of them would shadow them and send those DNS
-    // queries out of the tunnel as plaintext. Trial rules keep landing after
-    // every configured rule either way, because Xray appends them (`AddRule`
-    // with `shouldAppend=true`).
+    let mut routing = Map::new();
+    // A routing script owns every route: the core refuses a script beside
+    // rules or a `domainStrategy` (infra/conf/router.go:94-96), so the
+    // emitted section carries neither. The model's gate blocks user rules and
+    // a non-default strategy beside a script; the app's own interception and
+    // upstream-pinning rules are not user configuration and are omitted too,
+    // because the script decides every route in their place.
+    match cfg.script.as_deref().filter(|script| !script.is_empty()) {
+        Some(script) => {
+            routing.insert("script".into(), json!(script));
+        }
+        None => {
+            routing.insert(
+                "rules".into(),
+                Value::Array(app_and_user_rules(cfg, emission)),
+            );
+            if cfg.domain_strategy != DEFAULT_DOMAIN_STRATEGY {
+                routing.insert("domainStrategy".into(), json!(cfg.domain_strategy.clone()));
+            }
+        }
+    }
+    if !cfg.balancers.is_empty() {
+        routing.insert(
+            "balancers".into(),
+            serde_json::to_value(&cfg.balancers).expect(
+                "model serialization is infallible: Balancer fields are strings, \
+                 string-keyed Value maps, and editor-range-clamped finite floats only",
+            ),
+        );
+    }
+    Value::Object(routing)
+}
+
+/// The rules the routing section carries when no script owns routing: the
+/// app's own rules FIRST and the user's configured rules LAST — Xray's router
+/// takes the first match, and the interception rules below own DNS for the
+/// intercepted inbounds, so a user rule that matches port-53 traffic ahead of
+/// them would shadow them and send those DNS queries out of the tunnel as
+/// plaintext. Trial rules keep landing after every configured rule either
+/// way, because Xray appends them (`AddRule` with `shouldAppend=true`).
+fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     let mut rules: Vec<Value> = Vec::new();
     // DoH ordering insurance: the DNS module's upstream TCP dials are
     // pinned to the active outbound by address+port, so a GUI reorder can
@@ -1052,21 +1098,7 @@ fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
                  string vecs, and string-keyed Value maps only",
         ));
     }
-    let mut routing = Map::new();
-    if cfg.domain_strategy != "AsIs" {
-        routing.insert("domainStrategy".into(), json!(cfg.domain_strategy.clone()));
-    }
-    routing.insert("rules".into(), Value::Array(rules));
-    if !cfg.balancers.is_empty() {
-        routing.insert(
-            "balancers".into(),
-            serde_json::to_value(&cfg.balancers).expect(
-                "model serialization is infallible: Balancer fields are strings, \
-                 string-keyed Value maps, and editor-range-clamped finite floats only",
-            ),
-        );
-    }
-    Value::Object(routing)
+    rules
 }
 
 /// dns object, or None when effectively empty. Strips the GUI-only `fakedns`

@@ -9,10 +9,11 @@
 
 use egui::{RichText, Stroke, StrokeKind};
 
-use crate::i18n::{Key, t};
+use crate::i18n::{Key, t, validation_message};
 use crate::model::DurationMs;
 use crate::model::Int32Range;
 use crate::model::settings::Language;
+use crate::model::validation::{ValidationCode, lua_script_path_issue};
 use crate::ui::status::status_colors_of;
 
 /// A commit-gated edit draft: one buffer a screen's widget edits for the
@@ -446,6 +447,80 @@ pub fn validated_field_captioned(
         validate,
         FieldExtras::default(),
     )
+}
+
+/// The three labels one optional Lua script row renders: the switch that
+/// enables it, the path field that follows, and the field's hint. One value
+/// keeps the row's call sites readable — the switch and the field are two
+/// controls of the one surface, and every user of this widget supplies all
+/// three.
+pub struct LuaScriptLabels<'a> {
+    pub toggle: &'a str,
+    pub path: &'a str,
+    pub hint: &'a str,
+}
+
+/// Label + checkbox for an optional Lua script and, once it is on, the
+/// script's path field with a Browse button that only offers `.lua` files.
+///
+/// `value` is the script the model stores: `None` = no script,
+/// `Some(path)` = the file the core resolves and compiles at load. Turning the
+/// switch on seeds an empty path, which the field's own verdict refuses (the
+/// core cannot resolve an empty path); turning it off clears the path. The
+/// picker hands over the file dialog's path, which is always absolute.
+///
+/// The verdict combines the shared structural rule ([`lua_script_path_issue`])
+/// with `conflict`, the surface's own cross-field rule, so a script row
+/// reports exactly what the apply gate refuses. `revision` must change
+/// whenever the state `conflict` reads changes — pass [`context_revision`] of
+/// it. The app stores the path verbatim and never reads or runs the file.
+pub fn lua_script_field(
+    ui: &mut egui::Ui,
+    lang: Language,
+    labels: LuaScriptLabels<'_>,
+    value: &mut Option<String>,
+    revision: u64,
+    conflict: impl Fn(&str) -> Option<ValidationCode>,
+) -> bool {
+    let mut enabled = value.is_some();
+    let mut changed = false;
+    if ui.checkbox(&mut enabled, labels.toggle).changed() {
+        *value = enabled.then(String::new);
+        changed = true;
+    }
+    let Some(script) = value.as_mut() else {
+        return changed;
+    };
+    let validate = |path: &str| {
+        lua_script_path_issue(path)
+            .or_else(|| conflict(path))
+            .map(|code| validation_message(&code, lang))
+    };
+    let mut browse = |ui: &mut egui::Ui| -> Option<String> {
+        if !ui.small_button(t(lang, Key::SrvBrowse)).clicked() {
+            return None;
+        }
+        rfd::FileDialog::new()
+            .add_filter(t(lang, Key::ShellLuaScriptFilter), &["lua"])
+            .pick_file()
+            .map(|path| path.to_string_lossy().into_owned())
+    };
+    changed |= validated_field_impl(
+        ui,
+        labels.path,
+        script,
+        labels.hint,
+        FieldContext {
+            revision,
+            ..FieldContext::default()
+        },
+        validate,
+        FieldExtras {
+            trailing: Some(&mut browse),
+            ..FieldExtras::default()
+        },
+    );
+    changed
 }
 
 /// The verdict cache behind every validated field: the validator is a pure
@@ -1733,5 +1808,115 @@ mod tests {
             Some("C:\\xdrive"),
             "the field must render the text the control yielded"
         );
+    }
+
+    /// The Lua script control: a switch that seeds and clears the optional
+    /// path, a path row that appears only while the script is on, a Browse
+    /// button that belongs to that row, and — under the field — the same
+    /// verdict the apply gate renders: the structural path rule first, then
+    /// the surface's conflict rule, recomputed when the revision moves.
+    #[test]
+    fn lua_script_field_toggles_the_path_and_renders_the_gate_verdict() {
+        #[derive(Default)]
+        struct Row {
+            script: Option<String>,
+            /// The surface's own conflict, driven through the revision.
+            conflict: bool,
+            revision: u64,
+            changed: bool,
+        }
+
+        let browse = t(Language::En, Key::SrvBrowse).to_string();
+        let required = validation_message(&ValidationCode::LuaScriptPathRequired, Language::En);
+        let not_lua = validation_message(&ValidationCode::LuaScriptPathNotLua, Language::En);
+        let conflict = validation_message(&ValidationCode::DnsScriptFallbackConflict, Language::En);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 220.0))
+            .build_ui_state(
+                |ui, row: &mut Row| {
+                    let Row {
+                        script,
+                        conflict,
+                        revision,
+                        changed,
+                    } = row;
+                    *changed = lua_script_field(
+                        ui,
+                        Language::En,
+                        LuaScriptLabels {
+                            toggle: "Use a DNS script",
+                            path: "Script path",
+                            hint: "absolute path to a .lua file",
+                        },
+                        script,
+                        *revision,
+                        |_| conflict.then_some(ValidationCode::DnsScriptFallbackConflict),
+                    );
+                },
+                Row::default(),
+            );
+        harness.run();
+
+        // Off: no path row, and the picker belongs to the path row.
+        assert!(harness.state().script.is_none());
+        assert!(harness.query_by_label("Script path").is_none());
+        assert!(harness.query_by_label(&browse).is_none());
+
+        // The switch seeds an empty path, which the shared structural rule
+        // refuses: the row reports the gate's own message immediately.
+        harness.get_by_label("Use a DNS script").click();
+        harness.run();
+        assert_eq!(harness.state().script.as_deref(), Some(""));
+        assert!(
+            harness.query_by_label("Script path").is_some(),
+            "the path row appears with the switch"
+        );
+        assert!(
+            harness.query_by_label(&browse).is_some(),
+            "the picker belongs to the enabled script's path row"
+        );
+        assert!(
+            harness.query_by_label(&required).is_some(),
+            "an enabled script with no path must show the required error"
+        );
+
+        // A non-`.lua` path is refused by the same structural rule.
+        let field = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Script path");
+        field.click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "Script path")
+            .type_text("notes.txt");
+        harness.run_steps(3);
+        assert_eq!(harness.state().script.as_deref(), Some("notes.txt"));
+        assert!(
+            harness.query_by_label(&not_lua).is_some(),
+            "a non-.lua path must show the extension error"
+        );
+
+        // The surface's conflict rule joins the verdict, and follows the
+        // revision that reports the state beside the path changing. A
+        // well-formed path clears the structural error, leaving the conflict
+        // as the row's refusal.
+        harness.state_mut().script = Some("dns.lua".into());
+        harness.state_mut().conflict = true;
+        harness.state_mut().revision += 1;
+        harness.run();
+        assert!(
+            harness.query_by_label(&not_lua).is_none(),
+            "a .lua path clears the structural error"
+        );
+        assert!(
+            harness.query_by_label(&conflict).is_some(),
+            "the surface's conflict must render through the same verdict"
+        );
+
+        // Switching the script off clears the stored path and the row.
+        harness.get_by_label("Use a DNS script").click();
+        harness.run();
+        assert!(harness.state().script.is_none());
+        assert!(harness.query_by_label("Script path").is_none());
+        assert!(harness.query_by_label(&conflict).is_none());
     }
 }

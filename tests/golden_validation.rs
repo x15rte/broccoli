@@ -34,6 +34,31 @@ fn goldens_dir() -> PathBuf {
         .join("goldens")
 }
 
+/// The Lua files the script goldens name. The core resolves a relative path
+/// against its own working directory (`ResolveLuaFile`,
+/// `common/platform/platform.go`), so the harness writes each fixture beside
+/// the binary before the config test compiles it. Compiling the chunk is all
+/// `run -test` does with a script — the app never runs one, and the test mode
+/// does not reach the script's entry point either.
+const LUA_SCRIPT_FIXTURES: &[(&str, &str)] = &[
+    (
+        "broccoli-golden-dns.lua",
+        "function HandleDNSQuery(domain, option)\n    return nil\nend\n",
+    ),
+    (
+        "broccoli-golden-routing.lua",
+        "function HandleRoute(ctx)\n    return nil\nend\n",
+    ),
+];
+
+/// Write the script fixtures the goldens name into the core's directory.
+fn materialize_lua_fixtures(core_dir: &Path) {
+    for (name, body) in LUA_SCRIPT_FIXTURES {
+        std::fs::write(core_dir.join(name), body)
+            .unwrap_or_else(|e| panic!("cannot write the Lua fixture {name}: {e}"));
+    }
+}
+
 /// Run the real core's config validator on `config`, from the core's own
 /// directory so its geo data lookup resolves.
 fn run_xray_test(xray: &Path, config: &Path) -> std::process::Output {
@@ -53,6 +78,7 @@ fn goldens_pass_xray_test() {
         return;
     };
     let dir = goldens_dir();
+    materialize_lua_fixtures(xray.parent().expect("the core path has a parent directory"));
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())

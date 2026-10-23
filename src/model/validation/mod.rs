@@ -619,6 +619,34 @@ pub enum ValidationCode {
     /// warning (Severity::Warning), never a gate; Xray loads and runs the
     /// document with the entry absent.
     DnsBootstrapNotResolvable,
+    /// A Lua script path that is configured but blank: the core's file
+    /// resolver refuses the empty path before reading anything
+    /// (`common/platform/platform.go`, `ResolveLuaFile`), so the whole
+    /// document fails to load. Error tier.
+    LuaScriptPathRequired,
+    /// A Lua script path that does not end in `.lua`: the core's resolver
+    /// refuses every other extension (`resolveLuaTarget`, same file), so the
+    /// document never loads. Error tier; the app stores the path verbatim
+    /// and never reads or runs the file.
+    LuaScriptPathNotLua,
+    /// A DNS script beside `disableFallback` or `disableFallbackIfMatch`:
+    /// Xray's DNS build refuses the combination (infra/conf/dns.go:276-278).
+    /// Error tier.
+    DnsScriptFallbackConflict,
+    /// A DNS script beside a server carrying `domains`, `skipFallback` or
+    /// `finalQuery`: Xray's DNS build refuses the combination and names the
+    /// server (infra/conf/dns.go:279-283). The payload is the 1-based server
+    /// index and the offending field's wire name. Error tier.
+    DnsScriptServerConflict(usize, String),
+    /// A routing script beside routing rules: Xray's router build refuses the
+    /// pair (infra/conf/router.go:94-96), and the app never drops the user's
+    /// rules to make the script fit. Error tier.
+    RoutingScriptRulesConflict,
+    /// A routing script beside a non-default `domainStrategy`: the core
+    /// refuses a script with any `domainStrategy` key
+    /// (infra/conf/router.go:94-96), and the app emits none beside a script.
+    /// Error tier.
+    RoutingScriptStrategyConflict,
     /// A fakeDNS pool whose `ipPool` is not an IP CIDR range (1-based index).
     FakeDnsPoolCidrInvalid(usize),
     /// A fakeDNS pool with a non-positive `poolSize` (1-based index).
@@ -1323,9 +1351,10 @@ pub use outbound::{
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
-    inbound_auth_trap, local_inbound_auth_verdict, sniffing_row_verdict, tun_gateway_verdict,
-    tun_ipv4_gateway, tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address,
-    validate_profiles, validate_settings,
+    dns_script_issues, inbound_auth_trap, local_inbound_auth_verdict, lua_script_path_issue,
+    routing_script_issues, sniffing_row_verdict, tun_gateway_verdict, tun_ipv4_gateway,
+    tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address, validate_profiles,
+    validate_settings,
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
