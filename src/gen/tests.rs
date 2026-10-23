@@ -1497,24 +1497,27 @@ fn golden_hysteria2_xdns_mask() {
     ob.stream.finalmask = Some(FinalmaskModel {
         udp: vec![FinalmaskUdpMask::Xdns {
             settings: FinalmaskXdns {
-                domains: vec![FinalmaskXdnsDomainEntry::Domain(FinalmaskXdnsDomain {
-                    name: "tunnel.example.com".into(),
+                domains: vec![FinalmaskXdnsDomain {
+                    names: vec!["tunnel.example.com".into(), "alt.example.com".into()],
                     len_limit: 255,
                     label_limit: 63,
                     types: vec![1, 28],
                     edns0: 1232,
                     ..Default::default()
-                })],
-                resolvers: vec![FinalmaskXdnsResolverEntry::Resolver(
+                }],
+                resolvers: vec![
                     FinalmaskXdnsResolver {
-                        resolver_type: "udp".into(),
-                        settings: FinalmaskXdnsResolverSettings {
-                            addr: "1.1.1.1:53".into(),
-                            ..Default::default()
-                        },
+                        // A bare host reads as UDP on the core's default
+                        // port, and the spelled scheme keeps its own.
+                        addrs: vec!["1.1.1.1".into(), "udp://8.8.8.8:53".into()],
                         ..Default::default()
                     },
-                )],
+                    FinalmaskXdnsResolver {
+                        addrs: vec!["tcp://9.9.9.9:53".into()],
+                        worker: 40,
+                        ..Default::default()
+                    },
+                ],
                 extra_poll: 2,
                 ..Default::default()
             },

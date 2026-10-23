@@ -7999,7 +7999,7 @@ mod tests {
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskNoise,
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
-        FinalmaskXdns, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, FreedomFinalRule,
+        FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver, FreedomFinalRule,
         HysteriaTransport, Int32Range, MasqueTransport, Network, Noise, OutboundModel, Protocol,
         ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel,
         WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
@@ -15126,7 +15126,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn xdns_mask_editor_edits_objects_and_clears_retired_entries() {
+    fn xdns_mask_editor_edits_names_addresses_and_worker() {
         fn xdns(mask: &FinalmaskUdpMask) -> &FinalmaskXdns {
             match mask {
                 FinalmaskUdpMask::Xdns { settings, .. } => settings,
@@ -15135,11 +15135,17 @@ Authentication: ML-KEM-768, Post-Quantum
         }
         let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Xdns {
             settings: FinalmaskXdns {
-                domain: FinalmaskRawValue::Present(json!("legacy.example")),
-                domains: vec![FinalmaskXdnsDomainEntry::Retired("old.example".into())],
-                resolvers: vec![FinalmaskXdnsResolverEntry::Retired(
-                    "dns.example+udp://1.1.1.1:53".into(),
-                )],
+                domains: vec![FinalmaskXdnsDomain {
+                    names: vec!["a.example".into()],
+                    len_limit: 255,
+                    label_limit: 63,
+                    types: vec![1],
+                    ..Default::default()
+                }],
+                resolvers: vec![FinalmaskXdnsResolver {
+                    addrs: vec!["1.1.1.1:53".into()],
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             extra: Default::default(),
@@ -15164,36 +15170,46 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         harness.run();
 
-        // Each retired spelling — the string domain, the string resolver, and
-        // the removed `domain` key — renders its own notice and remove action.
-        let notices = |harness: &Harness<'_, ()>| {
-            harness
-                .query_all_by_label(t(Language::En, Key::FinalmaskXdnsShapeRetired))
-                .count()
-        };
-        assert_eq!(notices(&harness), 3, "one notice per retired spelling");
+        // The stored name and address each edit through their own text row,
+        // and the worker row renders beside them.
+        let name = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, "name")
+            .next()
+            .expect("the domain name row renders");
+        assert_eq!(name.value().as_deref(), Some("a.example"));
+        name.click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the name field takes focus")
+            .type_text(".alt");
+        harness.run();
+        assert_eq!(
+            xdns(&mask.borrow()).domains[0].names,
+            vec!["a.example.alt".to_string()]
+        );
+        let addr = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, "addr")
+            .next()
+            .expect("the resolver address row renders");
+        assert_eq!(addr.value().as_deref(), Some("1.1.1.1:53"));
+        assert!(
+            harness.query_by_label("worker").is_some(),
+            "the resolver renders its worker row"
+        );
 
-        // The first remove action clears the retired string domain, then the
-        // string resolver, then the removed `domain` key.
-        let remove = |harness: &mut Harness<'_, ()>| {
-            harness
-                .query_all_by_label(t(Language::En, Key::SrvRemove))
-                .next()
-                .expect("a retired row renders its remove action")
-                .click();
-            harness.run();
-        };
-        remove(&mut harness);
-        assert!(xdns(&mask.borrow()).domains.is_empty());
-        assert_eq!(notices(&harness), 2);
-        remove(&mut harness);
-        assert!(xdns(&mask.borrow()).resolvers.is_empty());
-        assert_eq!(notices(&harness), 1);
-        remove(&mut harness);
-        assert!(xdns(&mask.borrow()).domain.is_absent());
-        assert_eq!(notices(&harness), 0);
-
-        // The add actions append the object forms with the core's limits.
+        // The add actions append a name, an address, and a whole row; a new
+        // domain keeps the A and AAAA record types instead of the core's
+        // TXT-only empty default.
+        harness
+            .get_by_label(t(Language::En, Key::SrvAddXdnsName))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvAddXdnsAddr))
+            .click();
+        harness.run();
         harness
             .get_by_label(t(Language::En, Key::SrvAddXdnsDomain))
             .click();
@@ -15202,24 +15218,44 @@ Authentication: ML-KEM-768, Post-Quantum
             .get_by_label(t(Language::En, Key::SrvAddXdnsResolver))
             .click();
         harness.run();
-        let settings = mask.borrow();
-        let settings = xdns(&settings);
-        match &settings.domains[..] {
-            [FinalmaskXdnsDomainEntry::Domain(domain)] => {
-                assert_eq!(domain.len_limit, 255);
-                assert_eq!(domain.label_limit, 63);
-                assert!(domain.types.is_empty());
-                assert_eq!(domain.edns0, 0);
+        {
+            let settings = mask.borrow();
+            let settings = xdns(&settings);
+            assert_eq!(settings.domains[0].names.len(), 2);
+            assert_eq!(settings.resolvers[0].addrs.len(), 2);
+            match &settings.domains[..] {
+                [_, domain] => {
+                    assert_eq!(domain.len_limit, 255);
+                    assert_eq!(domain.label_limit, 63);
+                    assert_eq!(domain.types, vec![1, 28]);
+                    assert_eq!(domain.edns0, 0);
+                }
+                other => panic!("the add-domain action must append one row, got {other:?}"),
             }
-            other => panic!("the add-domain action must append one object row, got {other:?}"),
-        }
-        match &settings.resolvers[..] {
-            [FinalmaskXdnsResolverEntry::Resolver(resolver)] => {
-                assert!(resolver.resolver_type.is_empty());
-                assert!(resolver.settings.addr.is_empty());
+            match &settings.resolvers[..] {
+                [_, resolver] => {
+                    assert!(resolver.addrs.is_empty());
+                    assert_eq!(resolver.worker, 0);
+                    assert!(resolver.tls_config.is_none());
+                }
+                other => panic!("the add-resolver action must append one row, got {other:?}"),
             }
-            other => panic!("the add-resolver action must append one object row, got {other:?}"),
         }
+
+        // The first remove action clears the first domain row, the second the
+        // next one.
+        let remove = |harness: &mut Harness<'_, ()>| {
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvRemove))
+                .next()
+                .expect("a row renders its remove action")
+                .click();
+            harness.run();
+        };
+        remove(&mut harness);
+        assert_eq!(xdns(&mask.borrow()).domains.len(), 1);
+        remove(&mut harness);
+        assert!(xdns(&mask.borrow()).domains.is_empty());
     }
 
     #[test]

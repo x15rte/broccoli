@@ -319,18 +319,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_xdns_string_spellings_load_warn_and_survive_an_unrelated_save() {
-        use crate::model::stream::{
-            FinalmaskUdpMask, FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry,
-        };
+    fn stored_xdns_old_shape_loads_warns_once_and_saves_the_current_shape() {
+        use crate::model::stream::FinalmaskUdpMask;
         use crate::model::validation::{Severity, ValidationCode, validate_profiles};
         use crate::sys::appdata::with_appdata;
 
         with_appdata(|| {
-            // A stored profile from a build that wrote the old string arrays
-            // and the removed `domain` key: the rewritten core refuses the
-            // strings at unmarshal, and the model must not fail the load over
-            // them.
+            // A stored profile from a build that wrote the old object fields,
+            // the bare-string arrays, and the removed `domain` key: the
+            // rewritten core refuses each at unmarshal, and the model must not
+            // fail the load over them.
             let stored = serde_json::json!({
                 "version": 1,
                 "active": "aaaaaaaa11111111",
@@ -364,23 +362,9 @@ mod tests {
             let FinalmaskUdpMask::Xdns { settings, .. } = mask else {
                 panic!("the stored profile holds an xdns mask");
             };
-            assert!(matches!(
-                settings.domains[0],
-                FinalmaskXdnsDomainEntry::Retired(_)
-            ));
-            assert!(matches!(
-                settings.domains[1],
-                FinalmaskXdnsDomainEntry::Domain(_)
-            ));
-            assert!(matches!(
-                settings.resolvers[0],
-                FinalmaskXdnsResolverEntry::Retired(_)
-            ));
-            assert!(matches!(
-                settings.resolvers[1],
-                FinalmaskXdnsResolverEntry::Resolver(_)
-            ));
-            assert!(!settings.domain.is_absent());
+            assert!(settings.retired_shape, "the load migrated the entry");
+            assert_eq!(settings.domains.len(), 3);
+            assert_eq!(settings.resolvers.len(), 2);
 
             let retired_warnings = |servers: &ServersFile| {
                 validate_profiles(&servers.profiles, servers.active.as_deref(), false)
@@ -390,28 +374,33 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             let warnings = retired_warnings(&servers);
-            assert_eq!(warnings.len(), 3, "one warning per retired spelling");
-            assert!(
-                warnings
-                    .iter()
-                    .all(|issue| issue.severity == Severity::Warning),
-                "a retired spelling is advisory, never a gate: {warnings:#?}"
-            );
+            assert_eq!(warnings.len(), 1, "one warning for the whole mask");
+            assert_eq!(warnings[0].severity, Severity::Warning);
 
-            // An unrelated edit saves the file and the retired spellings stay
-            // on disk until the user removes them.
+            // An unrelated edit saves the file, and the migration reaches
+            // disk: nothing but the current shape is written back.
             servers.profiles[0].name = "xdns-renamed".into();
             servers.save().expect("save servers.json");
             let saved: Value = load_state("servers.json").expect("reload the saved file");
             let settings = &saved["profiles"][0]["outbound"]["streamSettings"]["finalmask"]["udp"]
                 [0]["settings"];
-            assert_eq!(settings["domain"], "old.example.com");
-            assert_eq!(settings["domains"][0], "dns.example");
-            assert_eq!(settings["domains"][1]["name"], "kept.example");
-            assert_eq!(settings["resolvers"][0], "dns.example+udp://1.1.1.1:53");
+            assert_eq!(
+                *settings,
+                serde_json::json!({
+                    "domains": [
+                        {"names": ["dns.example"], "types": [1, 28]},
+                        {"names": ["kept.example"], "types": [1]},
+                        {"names": ["old.example.com"], "types": [1, 28]}
+                    ],
+                    "resolvers": [
+                        {"addrs": ["udp://1.1.1.1:53"]},
+                        {"addrs": ["udp://1.1.1.1:53"]}
+                    ]
+                })
+            );
             let reloaded = ServersFile::load().expect("reload the saved file");
             assert_eq!(reloaded.profiles[0].name, "xdns-renamed");
-            assert_eq!(retired_warnings(&reloaded).len(), 3);
+            assert!(retired_warnings(&reloaded).is_empty());
         });
     }
 

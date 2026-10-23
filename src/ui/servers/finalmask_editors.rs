@@ -11,12 +11,11 @@ use crate::model::validation::{
     ValidationCode, noise_exp_finding, noise_exp_packet_finding, pinned_peer_cert_sha256_valid,
 };
 use crate::model::{
-    FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
-    FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku, FinalmaskTcpItem,
-    FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop, FinalmaskUdpItem,
-    FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsDomainEntry,
-    FinalmaskXdnsResolver, FinalmaskXdnsResolverEntry, FinalmaskXmc, FinalmaskXmcProfile,
-    Int32Range, TlsCert, fold_eq,
+    FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskNoiseItem, FinalmaskPortList, FinalmaskQuicParams,
+    FinalmaskRawValue, FinalmaskRealmPortMapping, FinalmaskRealmTls, FinalmaskSudoku,
+    FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskTransform, FinalmaskTransformArg, FinalmaskUdpHop,
+    FinalmaskUdpItem, FinalmaskUdpMask, FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver,
+    FinalmaskXmc, FinalmaskXmcProfile, Int32Range, TlsCert, fold_eq,
 };
 use crate::ui::status::status_colors_of;
 use crate::ui::widgets;
@@ -782,76 +781,109 @@ fn finalmask_xmc_editor(
     changed
 }
 
-/// Editor for the `xdns` settings: a server-domain list, a client-resolver
-/// list, and the `extraPoll` counter. A retired string entry — or the removed
-/// `domain` key — renders its notice and a remove action instead of an object
-/// row; the wire pass drops it, so it never leaves the settings file.
+/// One removable text row of the `xdns` lists: the label and field, then the
+/// remove action. Returns whether the text changed and whether the row asked
+/// to be removed.
+fn xdns_text_row(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        let label = ui.label(label);
+        changed = ui
+            .add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY),
+            )
+            .labelled_by(label.id)
+            .changed();
+        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+            remove = true;
+        }
+    });
+    (changed, remove)
+}
+
+/// Editor for the `xdns` settings: the server domains (each with its names,
+/// limits, record types, and edns0), the client resolvers (each with its
+/// addresses and worker count), and the `extraPoll` counter. A stored mask
+/// written against a removed shape reaches this editor already migrated, so
+/// only the current shape renders.
 fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut FinalmaskXdns) -> bool {
     // The record types the core's `NewDomain` accepts, as the body's numbers.
     const RECORD_TYPES: [(i32, &str); 4] = [(1, "A"), (5, "CNAME"), (16, "TXT"), (28, "AAAA")];
-    let notice = |ui: &mut egui::Ui| {
-        ui.colored_label(
-            status_colors_of(ui).warn,
-            t(lang, Key::FinalmaskXdnsShapeRetired),
-        );
-    };
     let mut changed = false;
 
     ui.label(t(lang, Key::SrvDomainsServer));
     let mut remove_domain = None;
-    for (index, entry) in settings.domains.iter_mut().enumerate() {
+    for (index, domain) in settings.domains.iter_mut().enumerate() {
         ui.push_id(("xdns-domain", index), |ui| {
-            ui.group(|ui| match entry {
-                FinalmaskXdnsDomainEntry::Retired(text) => {
-                    notice(ui);
-                    ui.label(t_fmt(lang, Key::SrvPreserved, &[text]));
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t_fmt(lang, Key::SrvXdnsDomainN, &[&(index + 1)]));
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove_domain = Some(index);
                     }
-                }
-                FinalmaskXdnsDomainEntry::Domain(domain) => {
-                    ui.horizontal(|ui| {
-                        ui.label(t_fmt(lang, Key::SrvXdnsDomainN, &[&(index + 1)]));
-                        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
-                            remove_domain = Some(index);
+                });
+                let mut remove_name = None;
+                for (name_index, name) in domain.names.iter_mut().enumerate() {
+                    ui.push_id(("xdns-domain-name", name_index), |ui| {
+                        let (name_changed, remove) =
+                            xdns_text_row(ui, lang, "name", name, "example.com");
+                        changed |= name_changed;
+                        if remove {
+                            remove_name = Some(name_index);
                         }
                     });
-                    changed |= widgets::text_field(ui, "name", &mut domain.name, "example.com");
-                    // The limits stay the core's own ranges. Whether a pair
-                    // leaves room for the encoded payload depends on the name
-                    // edited in this row, so the row cannot offer a tighter
-                    // bound; the validation pass reports a pair that does not.
-                    ui.horizontal(|ui| {
-                        ui.label("lenLimit");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut domain.len_limit).range(0..=255))
-                            .changed();
-                        ui.label("labelLimit");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut domain.label_limit).range(0..=63))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("types");
-                        for (record_type, label) in RECORD_TYPES {
-                            let mut on = domain.types.contains(&record_type);
-                            if ui.checkbox(&mut on, label).changed() {
-                                if on {
-                                    domain.types.push(record_type);
-                                } else {
-                                    domain.types.retain(|value| *value != record_type);
-                                }
-                                changed = true;
+                }
+                if let Some(name_index) = remove_name {
+                    domain.names.remove(name_index);
+                    changed = true;
+                }
+                if ui.small_button(t(lang, Key::SrvAddXdnsName)).clicked() {
+                    domain.names.push(String::new());
+                    changed = true;
+                }
+                // The limits stay the core's own ranges. Whether a pair
+                // leaves room for the encoded payload depends on the names
+                // edited in this row, so the row cannot offer a tighter
+                // bound; the validation pass reports a pair that does not.
+                ui.horizontal(|ui| {
+                    ui.label("lenLimit");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut domain.len_limit).range(0..=255))
+                        .changed();
+                    ui.label("labelLimit");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut domain.label_limit).range(0..=63))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("types");
+                    for (record_type, label) in RECORD_TYPES {
+                        let mut on = domain.types.contains(&record_type);
+                        if ui.checkbox(&mut on, label).changed() {
+                            if on {
+                                domain.types.push(record_type);
+                            } else {
+                                domain.types.retain(|value| *value != record_type);
                             }
+                            changed = true;
                         }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("edns0");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut domain.edns0).range(0..=4096))
-                            .changed();
-                    });
-                }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("edns0");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut domain.edns0).range(0..=4096))
+                        .changed();
+                });
             });
         });
     }
@@ -860,48 +892,57 @@ fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Final
         changed = true;
     }
     if ui.small_button(t(lang, Key::SrvAddXdnsDomain)).clicked() {
-        settings
-            .domains
-            .push(FinalmaskXdnsDomainEntry::Domain(FinalmaskXdnsDomain {
-                // The core's 255/63 defaults, written out so the row shows
-                // the limits it runs with.
-                len_limit: 255,
-                label_limit: 63,
-                ..Default::default()
-            }));
+        settings.domains.push(FinalmaskXdnsDomain {
+            // The core's 255/63 defaults, written out so the row shows the
+            // limits it runs with; the types keep the row answering the
+            // address records instead of the core's TXT-only default.
+            len_limit: 255,
+            label_limit: 63,
+            types: FINALMASK_XDNS_DEFAULT_TYPES.to_vec(),
+            ..Default::default()
+        });
         changed = true;
     }
 
     ui.label(t(lang, Key::SrvResolversClient));
     let mut remove_resolver = None;
-    for (index, entry) in settings.resolvers.iter_mut().enumerate() {
+    for (index, resolver) in settings.resolvers.iter_mut().enumerate() {
         ui.push_id(("xdns-resolver", index), |ui| {
-            ui.group(|ui| match entry {
-                FinalmaskXdnsResolverEntry::Retired(text) => {
-                    notice(ui);
-                    ui.label(t_fmt(lang, Key::SrvPreserved, &[text]));
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t_fmt(lang, Key::SrvXdnsResolverN, &[&(index + 1)]));
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove_resolver = Some(index);
                     }
-                }
-                FinalmaskXdnsResolverEntry::Resolver(resolver) => {
-                    ui.horizontal(|ui| {
-                        ui.label(t_fmt(lang, Key::SrvXdnsResolverN, &[&(index + 1)]));
-                        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
-                            remove_resolver = Some(index);
+                });
+                let mut remove_addr = None;
+                for (addr_index, addr) in resolver.addrs.iter_mut().enumerate() {
+                    ui.push_id(("xdns-resolver-addr", addr_index), |ui| {
+                        let (addr_changed, remove) =
+                            xdns_text_row(ui, lang, "addr", addr, "1.1.1.1:53");
+                        changed |= addr_changed;
+                        if remove {
+                            remove_addr = Some(addr_index);
                         }
                     });
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "type",
-                        &mut resolver.resolver_type,
-                        &["tcp", "udp"],
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    changed |=
-                        widgets::text_field(ui, "addr", &mut resolver.settings.addr, "1.1.1.1:53");
                 }
+                if let Some(addr_index) = remove_addr {
+                    resolver.addrs.remove(addr_index);
+                    changed = true;
+                }
+                if ui.small_button(t(lang, Key::SrvAddXdnsAddr)).clicked() {
+                    resolver.addrs.push(String::new());
+                    changed = true;
+                }
+                // Zero is the core's own 32-worker default, so the row
+                // offers it as the unset shape; a negative count is what the
+                // DoH resolver refuses, and the validation pass names it.
+                ui.horizontal(|ui| {
+                    ui.label("worker");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut resolver.worker).range(0..=i32::MAX))
+                        .changed();
+                });
             });
         });
     }
@@ -910,11 +951,7 @@ fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Final
         changed = true;
     }
     if ui.small_button(t(lang, Key::SrvAddXdnsResolver)).clicked() {
-        settings
-            .resolvers
-            .push(FinalmaskXdnsResolverEntry::Resolver(
-                FinalmaskXdnsResolver::default(),
-            ));
+        settings.resolvers.push(FinalmaskXdnsResolver::default());
         changed = true;
     }
 
@@ -924,14 +961,6 @@ fn finalmask_xdns_editor(ui: &mut egui::Ui, lang: Language, settings: &mut Final
             .add(egui::DragValue::new(&mut settings.extra_poll).range(0..=3))
             .changed();
     });
-
-    if !settings.domain.is_absent() {
-        notice(ui);
-        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
-            settings.domain = FinalmaskRawValue::Absent;
-            changed = true;
-        }
-    }
 
     changed
 }

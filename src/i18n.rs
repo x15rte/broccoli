@@ -1477,6 +1477,8 @@ keys! {
     SrvXdnsResolverN 1,
     SrvAddXdnsDomain 0,
     SrvAddXdnsResolver 0,
+    SrvAddXdnsName 0,
+    SrvAddXdnsAddr 0,
     SrvMaxIdleTimeoutS 0,
     SrvKeepAlivePeriodS 0,
     SrvRewriteAddress 0,
@@ -1655,8 +1657,10 @@ keys! {
     FinalmaskXdnsDomainNameInvalid 0,
     FinalmaskXdnsDomainLimitInvalid 0,
     FinalmaskXdnsDomainCapacityInvalid 0,
-    FinalmaskXdnsResolverTypeUnknown 0,
     FinalmaskXdnsResolverAddrInvalid 0,
+    FinalmaskXdnsAddrSchemeUnknown 1,
+    FinalmaskXdnsHttpsRequiresTls 0,
+    FinalmaskXdnsWorkerInvalid 0,
     FinalmaskXdnsExtraPollInvalid 0,
     FinalmaskXicmpIpInvalid 0,
     FinalmaskRealmScheme 0,
@@ -2674,8 +2678,10 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskXdnsDomainNameInvalid => t(lang, Key::FinalmaskXdnsDomainNameInvalid),
         FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
         FinalmaskXdnsDomainCapacityInvalid => t(lang, Key::FinalmaskXdnsDomainCapacityInvalid),
-        FinalmaskXdnsResolverTypeUnknown => t(lang, Key::FinalmaskXdnsResolverTypeUnknown),
         FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
+        FinalmaskXdnsAddrSchemeUnknown(_) => t(lang, Key::FinalmaskXdnsAddrSchemeUnknown),
+        FinalmaskXdnsHttpsRequiresTls => t(lang, Key::FinalmaskXdnsHttpsRequiresTls),
+        FinalmaskXdnsWorkerInvalid => t(lang, Key::FinalmaskXdnsWorkerInvalid),
         FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
         FinalmaskXicmpIpInvalid => t(lang, Key::FinalmaskXicmpIpInvalid),
         FinalmaskRealmScheme => t(lang, Key::FinalmaskRealmScheme),
@@ -2794,6 +2800,7 @@ fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
         | ValidationCode::TunLeakValueUnknown(arg)
         | ValidationCode::MasqueHeaderInvalid(arg)
         | ValidationCode::MasqueReservedHeader(arg)
+        | ValidationCode::FinalmaskXdnsAddrSchemeUnknown(arg)
         | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
         ValidationCode::XdriveServiceUnsupported(arg)
         | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
@@ -4554,6 +4561,8 @@ mod en {
             Key::SrvXdnsResolverN => "Resolver {}",
             Key::SrvAddXdnsDomain => "Add domain",
             Key::SrvAddXdnsResolver => "Add resolver",
+            Key::SrvAddXdnsName => "Add name",
+            Key::SrvAddXdnsAddr => "Add address",
             Key::SrvMaxIdleTimeoutS => "maxIdleTimeout (s)",
             Key::SrvKeepAlivePeriodS => "keepAlivePeriod (s)",
             Key::SrvRewriteAddress => "rewrite address",
@@ -4949,8 +4958,8 @@ mod en {
                 "use 0 for normal Salamander, or a Gecko range from 1 through 2048"
             }
             Key::FinalmaskXdnsShapeRetired => {
-                "Xray removed the old xdns spelling. Rebuild the entry as a domain object or a \
-                 resolver object."
+                "the stored xdns entry used a removed shape. It now carries names, addresses, and \
+                 a worker count. Review the migrated values"
             }
             Key::FinalmaskXdnsDomainTypesInvalid => {
                 "use at least one of the record types A, CNAME, TXT, or AAAA"
@@ -4964,8 +4973,17 @@ mod en {
                 "the name and limits leave too little room for the encoded payload. Raise \
                  lenLimit or shorten the name"
             }
-            Key::FinalmaskXdnsResolverTypeUnknown => "choose tcp or udp",
-            Key::FinalmaskXdnsResolverAddrInvalid => "enter the resolver address as host:port",
+            Key::FinalmaskXdnsAddrSchemeUnknown => {
+                "{} is not an address scheme the mask reads. Use a bare host, tcp://, udp://, or \
+                 https://"
+            }
+            Key::FinalmaskXdnsResolverAddrInvalid => {
+                "enter the resolver address as host, host:port, tcp://, udp://, or https://"
+            }
+            Key::FinalmaskXdnsHttpsRequiresTls => "an https:// resolver needs TLS settings",
+            Key::FinalmaskXdnsWorkerInvalid => {
+                "use 0 for the core's default worker count, or a positive number"
+            }
             Key::FinalmaskXdnsExtraPollInvalid => "use an extraPoll from 0 through 3",
             Key::FinalmaskXicmpIpInvalid => "enter a literal IPv4 or IPv6 address",
             Key::FinalmaskRealmScheme => "scheme must be realm or realm+http",

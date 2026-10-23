@@ -1820,9 +1820,8 @@ fn finalmask_param(stream: &StreamModel, q: &mut Vec<(String, String)>) -> Resul
 }
 
 fn validate_finalmask(finalmask: &FinalmaskModel) -> Result<(), LinkError> {
-    if let Some(issue) = crate::model::validation::validate_finalmask(finalmask)
-        .into_iter()
-        .next()
+    if let Some(issue) =
+        crate::model::validation::validate_finalmask(finalmask).into_first_blocking()
     {
         return Err(LinkError::InvalidModel {
             prefix: Some(Key::LinkFinalmaskInvalid),
@@ -4664,6 +4663,49 @@ mod tests {
         let f = p.outbound.stream.finalmask.as_ref().unwrap();
         assert_eq!(f.udp.len(), 1);
         assert!(canonical.contains("fm="));
+    }
+
+    #[test]
+    fn old_xdns_share_link_migrates_and_exports_the_current_shape() {
+        // A link from another client carries the removed domain `name` and
+        // resolver `type` + `settings.addr`; the import runs the same
+        // migration as the stored model, and the export writes the current
+        // shape only.
+        let fm = pct_encode(
+            r#"{"udp":[{"type":"xdns","settings":{
+                "domains":[{"name":"tunnel.example.com","types":[1,28]}],
+                "resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]
+            }}]}"#,
+        );
+        let link = format!("vless://{UUID}@fm.local:443?fm={fm}#XDNS");
+        let (profile, canonical) = round_trip(&link);
+        let finalmask = profile.outbound.stream.finalmask.as_ref().unwrap();
+        let crate::model::stream::FinalmaskUdpMask::Xdns { settings, .. } = &finalmask.udp[0]
+        else {
+            panic!("the link carries an xdns mask");
+        };
+        assert_eq!(settings.domains[0].names, vec!["tunnel.example.com"]);
+        assert_eq!(settings.resolvers[0].addrs, vec!["udp://1.1.1.1:53"]);
+
+        let query = canonical
+            .split_once('?')
+            .expect("the exported link carries a query")
+            .1;
+        let query = query.split('#').next().unwrap_or(query);
+        let exported = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("fm="))
+            .expect("the export carries the finalmask parameter");
+        let exported: Value =
+            serde_json::from_str(&pct_decode(exported).expect("the export percent-encodes"))
+                .expect("the exported finalmask is JSON");
+        assert_eq!(
+            exported["udp"][0]["settings"],
+            serde_json::json!({
+                "domains": [{"names": ["tunnel.example.com"], "types": [1, 28]}],
+                "resolvers": [{"addrs": ["udp://1.1.1.1:53"]}]
+            })
+        );
     }
 
     // ----- vmess -----

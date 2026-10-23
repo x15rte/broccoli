@@ -1514,18 +1514,25 @@ pub struct FinalmaskSudoku {
     pub extra: Map<String, Value>,
 }
 
-/// One `xdns` `domains[]` entry: a server-side domain the mask answers and
-/// the record types it accepts (`infra/conf/transport_finalmask.go:794-800`).
-/// A zero `lenLimit` or `labelLimit` takes the core's 255/63 default
-/// (`:838-843`), so an unset limit emits no key; the editor writes those
+/// The record types a new `xdns` domain row starts with — A and AAAA. The
+/// core turns an empty list into TXT alone
+/// (`transport/internet/finalmask/xdns/client.go:72-74`), which would change
+/// what the mask answers; a row added here answers the two address records
+/// the editor has always offered.
+pub const FINALMASK_XDNS_DEFAULT_TYPES: [i32; 2] = [1, 28];
+
+/// One `xdns` `domains[]` entry: the names the mask answers and the record
+/// types it accepts (`infra/conf/transport_finalmask.go:833-839`). A zero
+/// `lenLimit` or `labelLimit` takes the core's 255/63 default
+/// (`:858-863`), so an unset limit emits no key; the editor writes those
 /// values when it adds a row. `types` holds DNS type numbers and the core
 /// requires at least one. `edns0` is the advertised UDP payload size (`0`
 /// disables it).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FinalmaskXdnsDomain {
-    #[serde(skip_serializing_if = "skip_empty_str")]
-    pub name: String,
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub names: Vec<String>,
     #[serde(skip_serializing_if = "finalmask_zero_i32")]
     pub len_limit: i32,
     #[serde(skip_serializing_if = "finalmask_zero_i32")]
@@ -1538,118 +1545,246 @@ pub struct FinalmaskXdnsDomain {
     pub extra: Map<String, Value>,
 }
 
-/// The `settings` object an `xdns` resolver carries. Both accepted `type`s
-/// (`tcp`, `udp`) read a single `addr` — the `host:port` the mask dials
-/// (`infra/conf/transport_finalmask.go:802-813`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct FinalmaskXdnsResolverSettings {
-    #[serde(skip_serializing_if = "skip_empty_str")]
-    pub addr: String,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
-}
-
-impl FinalmaskXdnsResolverSettings {
-    fn is_empty(&self) -> bool {
-        self.addr.is_empty() && self.extra.is_empty()
+impl<'de> Deserialize<'de> for FinalmaskXdnsDomain {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        finalmask_xdns_domain_from_value(Value::deserialize(deserializer)?)
+            .map(|(domain, _)| domain)
+            .map_err(<D::Error as serde::de::Error>::custom)
     }
 }
 
-/// One `xdns` `resolvers[]` entry (`infra/conf/transport_finalmask.go:823-826`):
-/// `type` selects the settings shape (the loader folds case, `:818-821`) and
-/// `settings` carries the resolver's address.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+/// One `xdns` `resolvers[]` entry (`infra/conf/transport_finalmask.go:841-846`):
+/// `addrs` holds the endpoints the mask rotates over, `worker` the worker
+/// count the core substitutes 32 for when it is zero, and the optional
+/// `tlsConfig` and `quicConfig` blocks configure a DoH resolver.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FinalmaskXdnsResolver {
-    #[serde(rename = "type", skip_serializing_if = "skip_empty_str")]
-    pub resolver_type: String,
-    #[serde(skip_serializing_if = "FinalmaskXdnsResolverSettings::is_empty")]
-    pub settings: FinalmaskXdnsResolverSettings,
+    #[serde(skip_serializing_if = "skip_empty_vec")]
+    pub addrs: Vec<String>,
+    #[serde(skip_serializing_if = "finalmask_zero_i32")]
+    pub worker: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_config: Option<TlsModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quic_config: Option<FinalmaskQuicParams>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
-/// One `domains` entry. The rewritten core reads an object
-/// (`infra/conf/transport_finalmask.go:829`); builds before the rewrite wrote
-/// a bare string under the same key. Both spellings live in the one member, so
-/// the entry keeps the retired string instead of failing the settings load —
-/// the old form would be refused at unmarshal — and the wire pass drops the
-/// retired arm so the generated document carries objects only.
-#[derive(Clone, Debug, PartialEq)]
-pub enum FinalmaskXdnsDomainEntry {
-    Domain(FinalmaskXdnsDomain),
-    Retired(String),
-}
-
-impl Serialize for FinalmaskXdnsDomainEntry {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Domain(domain) => domain.serialize(serializer),
-            Self::Retired(text) => text.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FinalmaskXdnsDomainEntry {
+impl<'de> Deserialize<'de> for FinalmaskXdnsResolver {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match Value::deserialize(deserializer)? {
-            Value::String(text) => Ok(Self::Retired(text)),
-            other => crate::model::outbound::from_value_path(other)
-                .map(Self::Domain)
-                .map_err(<D::Error as serde::de::Error>::custom),
-        }
+        finalmask_xdns_resolver_from_value(Value::deserialize(deserializer)?)
+            .map(|(resolver, _)| resolver)
+            .map_err(<D::Error as serde::de::Error>::custom)
     }
 }
 
-/// One `resolvers` entry: an object in the rewritten schema
-/// (`infra/conf/transport_finalmask.go:830`) and a bare string before it. The
-/// retired arm is captured the same way as [`FinalmaskXdnsDomainEntry`] and
-/// dropped from the wire.
-#[derive(Clone, Debug, PartialEq)]
-pub enum FinalmaskXdnsResolverEntry {
-    Resolver(FinalmaskXdnsResolver),
-    Retired(String),
-}
-
-impl Serialize for FinalmaskXdnsResolverEntry {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Resolver(resolver) => resolver.serialize(serializer),
-            Self::Retired(text) => text.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FinalmaskXdnsResolverEntry {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match Value::deserialize(deserializer)? {
-            Value::String(text) => Ok(Self::Retired(text)),
-            other => crate::model::outbound::from_value_path(other)
-                .map(Self::Resolver)
-                .map_err(<D::Error as serde::de::Error>::custom),
-        }
-    }
-}
-
-/// `xdns` finalmask settings (`infra/conf/transport_finalmask.go:828-832`).
-/// `domains` and `resolvers` hold objects; `extraPoll` is a 0–3 counter. An
-/// empty object is a valid mask.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+/// `xdns` finalmask settings (`infra/conf/transport_finalmask.go:848-852`).
+/// `domains` and `resolvers` hold the current objects; `extraPoll` is a 0–3
+/// counter. An empty object is a valid mask.
+///
+/// A stored profile written against an older shape loads through
+/// [`Deserialize`], which migrates every removed spelling in memory and sets
+/// `retired_shape` so the validation pass can warn once; the saved document
+/// therefore always carries the current shape.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FinalmaskXdns {
-    /// Removed upstream. Kept presence-aware so imported invalid state is
-    /// visible and can be removed without silently converting `null`.
-    #[serde(skip_serializing_if = "FinalmaskRawValue::is_absent")]
-    pub domain: FinalmaskRawValue,
     #[serde(skip_serializing_if = "skip_empty_vec")]
-    pub domains: Vec<FinalmaskXdnsDomainEntry>,
+    pub domains: Vec<FinalmaskXdnsDomain>,
     #[serde(skip_serializing_if = "skip_empty_vec")]
-    pub resolvers: Vec<FinalmaskXdnsResolverEntry>,
+    pub resolvers: Vec<FinalmaskXdnsResolver>,
     #[serde(skip_serializing_if = "finalmask_zero_i32")]
     pub extra_poll: i32,
+    /// True when the load migrated a removed spelling. Never serialized: the
+    /// save writes the current shape, and the validation pass turns the flag
+    /// into one advisory naming the migration.
+    #[serde(skip)]
+    pub retired_shape: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for FinalmaskXdns {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let Value::Object(mut object) = value else {
+            return Err(serde::de::Error::custom(
+                "an xdns settings value must be a JSON object",
+            ));
+        };
+        let mut retired_shape = false;
+
+        let mut domains = Vec::new();
+        for entry in finalmask_xdns_take::<Vec<Value>>(&mut object, "domains")
+            .map_err(<D::Error as serde::de::Error>::custom)?
+        {
+            match entry {
+                // The pre-object schema held one bare name per entry.
+                Value::String(name) => {
+                    retired_shape = true;
+                    domains.push(FinalmaskXdnsDomain {
+                        names: vec![name],
+                        types: FINALMASK_XDNS_DEFAULT_TYPES.to_vec(),
+                        ..Default::default()
+                    });
+                }
+                other => {
+                    let (domain, migrated) = finalmask_xdns_domain_from_value(other)
+                        .map_err(<D::Error as serde::de::Error>::custom)?;
+                    retired_shape |= migrated;
+                    domains.push(domain);
+                }
+            }
+        }
+        // The removed top-level `domain` key predates the list; its string is
+        // one more server name. Any other JSON shape cannot name a domain and
+        // is dropped with the same advisory.
+        if let Some(value) = object.remove("domain") {
+            retired_shape = true;
+            if let Value::String(name) = value {
+                domains.push(FinalmaskXdnsDomain {
+                    names: vec![name],
+                    types: FINALMASK_XDNS_DEFAULT_TYPES.to_vec(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let mut resolvers = Vec::new();
+        for entry in finalmask_xdns_take::<Vec<Value>>(&mut object, "resolvers")
+            .map_err(<D::Error as serde::de::Error>::custom)?
+        {
+            match entry {
+                // A bare string spelled `<name>+<scheme>://<addr>`; only the
+                // address half belongs to the current schema.
+                Value::String(text) => {
+                    retired_shape = true;
+                    resolvers.push(FinalmaskXdnsResolver {
+                        addrs: vec![finalmask_xdns_addr_from_retired_entry(&text)],
+                        ..Default::default()
+                    });
+                }
+                other => {
+                    let (resolver, migrated) = finalmask_xdns_resolver_from_value(other)
+                        .map_err(<D::Error as serde::de::Error>::custom)?;
+                    retired_shape |= migrated;
+                    resolvers.push(resolver);
+                }
+            }
+        }
+
+        Ok(Self {
+            domains,
+            resolvers,
+            extra_poll: finalmask_xdns_take(&mut object, "extraPoll")
+                .map_err(<D::Error as serde::de::Error>::custom)?,
+            retired_shape,
+            extra: object,
+        })
+    }
+}
+
+/// Read one typed field out of a stored object, naming the key when the value
+/// cannot express the field.
+fn finalmask_xdns_take<T>(object: &mut Map<String, Value>, key: &str) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match object.remove(key) {
+        Some(value) => crate::model::outbound::from_value_path(value)
+            .map_err(|error| format!("invalid {key}: {error}")),
+        None => Ok(T::default()),
+    }
+}
+
+/// Read one `xdns` domain from the stored JSON, folding the removed `name`
+/// key into `names`, and report whether the stored entry used it.
+fn finalmask_xdns_domain_from_value(value: Value) -> Result<(FinalmaskXdnsDomain, bool), String> {
+    let Value::Object(mut object) = value else {
+        return Err("an xdns domain must be a JSON object".into());
+    };
+    let mut names: Vec<String> = finalmask_xdns_take(&mut object, "names")?;
+    let mut migrated = false;
+    if let Some(name) = object.remove("name") {
+        migrated = true;
+        if let Value::String(name) = name
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    Ok((
+        FinalmaskXdnsDomain {
+            names,
+            len_limit: finalmask_xdns_take(&mut object, "lenLimit")?,
+            label_limit: finalmask_xdns_take(&mut object, "labelLimit")?,
+            types: finalmask_xdns_take(&mut object, "types")?,
+            edns0: finalmask_xdns_take(&mut object, "edns0")?,
+            extra: object,
+        },
+        migrated,
+    ))
+}
+
+/// Read one `xdns` resolver from the stored JSON, folding the removed
+/// `type` + `settings.addr` pair into `addrs`, and report whether the stored
+/// entry used it.
+fn finalmask_xdns_resolver_from_value(
+    value: Value,
+) -> Result<(FinalmaskXdnsResolver, bool), String> {
+    let Value::Object(mut object) = value else {
+        return Err("an xdns resolver must be a JSON object".into());
+    };
+    let mut addrs: Vec<String> = finalmask_xdns_take(&mut object, "addrs")?;
+    let retired_type: String = finalmask_xdns_take(&mut object, "type")?;
+    let mut migrated = false;
+    if let Some(settings) = object.remove("settings") {
+        migrated = true;
+        let retired_addr = settings
+            .as_object()
+            .and_then(|settings| settings.get("addr"))
+            .and_then(Value::as_str);
+        if let Some(addr) = retired_addr
+            && addrs.is_empty()
+        {
+            addrs.push(finalmask_xdns_addr_from_retired_parts(&retired_type, addr));
+        }
+    }
+    migrated |= !retired_type.is_empty();
+    Ok((
+        FinalmaskXdnsResolver {
+            addrs,
+            worker: finalmask_xdns_take(&mut object, "worker")?,
+            tls_config: finalmask_xdns_take(&mut object, "tlsConfig")?,
+            quic_config: finalmask_xdns_take(&mut object, "quicConfig")?,
+            extra: object,
+        },
+        migrated,
+    ))
+}
+
+/// The address the current schema wants for a resolver stored in the removed
+/// `type` + `settings.addr` shape: the loader folded the type, and a value
+/// that already spells a scheme keeps it.
+fn finalmask_xdns_addr_from_retired_parts(resolver_type: &str, addr: &str) -> String {
+    if resolver_type.is_empty() || addr.contains("://") {
+        return addr.to_string();
+    }
+    format!("{}://{addr}", fold_lower(resolver_type))
+}
+
+/// The address the current schema wants for a resolver stored as one string.
+/// The old spelling prefixed the address with a name and the transport
+/// (`tunnel.example+udp://1.1.1.1:53`); only the scheme and the address carry
+/// over, and a string with no scheme is the address itself.
+fn finalmask_xdns_addr_from_retired_entry(text: &str) -> String {
+    let Some((head, rest)) = text.split_once("://") else {
+        return text.to_string();
+    };
+    let scheme = head.rsplit('+').next().unwrap_or(head);
+    format!("{scheme}://{rest}")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1889,7 +2024,7 @@ fn go_ip_addr(value: &str) -> Option<std::net::IpAddr> {
     value.parse::<std::net::IpAddr>().ok()
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FinalmaskQuicParams {
     #[serde(skip_serializing_if = "skip_empty_str")]
@@ -2501,19 +2636,6 @@ impl StreamModel {
                         }
                     }
                 }
-                if let FinalmaskUdpMask::Xdns { settings, .. } = mask {
-                    // The retired spellings are settings-file facts only: a
-                    // stored profile keeps the removed `domain` key and the
-                    // string forms so the user still sees its state, and the
-                    // generated document carries the object forms alone.
-                    settings.domain = FinalmaskRawValue::Absent;
-                    settings
-                        .domains
-                        .retain(|entry| matches!(entry, FinalmaskXdnsDomainEntry::Domain(_)));
-                    settings
-                        .resolvers
-                        .retain(|entry| matches!(entry, FinalmaskXdnsResolverEntry::Resolver(_)));
-                }
             }
         }
     }
@@ -2626,11 +2748,10 @@ impl StreamModel {
 mod tests {
     use super::{
         CustomSockopt, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
-        FinalmaskXdnsDomainEntry, FinalmaskXdnsResolverEntry, HappyEyeballs, HysteriaTransport,
-        Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network, RawSettings, Security, SockoptModel,
-        StreamModel, TlsCert, TlsModel, WsSettings, XdriveOperation, XdriveTemplate,
-        XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry, XdriveTransport, XhttpSettings,
-        transport_settings_key, transport_settings_path,
+        HappyEyeballs, HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH, Network,
+        RawSettings, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
+        XdriveOperation, XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry,
+        XdriveTransport, XhttpSettings, transport_settings_key, transport_settings_path,
     };
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
@@ -2951,10 +3072,10 @@ mod tests {
                 {"type": "salamander", "settings": {"password": "pw", "packetSize": "1200-1400"}},
                 {"type": "xdns", "settings": {
                     "domains": [{
-                        "name": "dns.example", "lenLimit": 255, "labelLimit": 63,
+                        "names": ["dns.example"], "lenLimit": 255, "labelLimit": 63,
                         "types": [1, 28], "edns0": 1232
                     }],
-                    "resolvers": [{"type": "udp", "settings": {"addr": "1.1.1.1:53"}}],
+                    "resolvers": [{"addrs": ["udp://1.1.1.1:53"], "worker": 32}],
                     "extraPoll": 2
                 }},
                 {"type": "udphop", "settings": {
@@ -3135,7 +3256,9 @@ mod tests {
                     "noise": [{"rand": 1, "type": "hex", "packet": "00"}]
                 }},
                 {"type": "salamander", "settings": {"packetSize": "0-2049"}},
-                {"type": "xdns", "settings": {"resolvers": [{"type": "quic", "settings": {"addr": "1.1.1.1:53"}}]}},
+                {"type": "xdns", "settings": {
+                    "resolvers": [{"addrs": ["quic://1.1.1.1:53"]}]
+                }},
                 {"type": "xicmp", "settings": {"ips": ["not-an-ip"]}},
                 {"type": "realm", "settings": {"url": "https://example", "stunServers": []}},
                 {"type": "udphop", "settings": {
@@ -3170,8 +3293,10 @@ mod tests {
                 "finalmask.udp[1].settings.packetSize",
             ),
             (
-                crate::model::validation::ValidationCode::FinalmaskXdnsResolverTypeUnknown,
-                "finalmask.udp[2].settings.resolvers[0].type",
+                crate::model::validation::ValidationCode::FinalmaskXdnsAddrSchemeUnknown(
+                    "quic".into(),
+                ),
+                "finalmask.udp[2].settings.resolvers[0].addrs[0]",
             ),
             (
                 crate::model::validation::ValidationCode::FinalmaskXicmpIpInvalid,
@@ -3232,17 +3357,20 @@ mod tests {
     }
 
     #[test]
-    fn finalmask_xdns_objects_round_trip_and_retired_spellings_load() {
-        // The object schema the core reads
-        // (`infra/conf/transport_finalmask.go:828-832`) round-trips through
-        // the settings file untouched.
+    fn finalmask_xdns_new_shape_round_trips_and_retired_shapes_migrate() {
+        // The current object schema (`infra/conf/transport_finalmask.go:
+        // 826-845`) round-trips through the settings file untouched.
         let objects = json!({
             "udp": [{"type": "xdns", "settings": {
                 "domains": [{
-                    "name": "tunnel.example.com", "lenLimit": 255, "labelLimit": 63,
+                    "names": ["tunnel.example.com", "alt.example.com"],
+                    "lenLimit": 255, "labelLimit": 63,
                     "types": [1, 28], "edns0": 1232
                 }],
-                "resolvers": [{"type": "udp", "settings": {"addr": "1.1.1.1:53"}}],
+                "resolvers": [{
+                    "addrs": ["1.1.1.1", "tcp://8.8.8.8:53"],
+                    "worker": 40
+                }],
                 "extraPoll": 2
             }}]
         });
@@ -3264,8 +3392,10 @@ mod tests {
         );
         assert!(crate::model::validation::validate_finalmask(&empty).is_empty());
 
-        // The retired spellings — string `domains`/`resolvers` and the removed
-        // `domain` key — still load, land in the retired arm, and warn.
+        // Every removed spelling — the `domain` key, the bare-string domain
+        // and resolver entries, and the domain `name` / resolver
+        // `type` + `settings.addr` objects — loads, migrates in memory, and
+        // produces one advisory for the whole mask.
         let retired = json!({
             "udp": [{"type": "xdns", "settings": {
                 "domain": "old.example.com",
@@ -3276,55 +3406,43 @@ mod tests {
                 ]
             }}]
         });
-        let model: FinalmaskModel = serde_json::from_value(retired.clone())
+        let model: FinalmaskModel = serde_json::from_value(retired)
             .expect("a stored profile with retired xdns spellings must load");
-        assert_eq!(serde_json::to_value(&model).unwrap(), retired);
         let FinalmaskUdpMask::Xdns { settings, .. } = &model.udp[0] else {
             panic!("the fixture holds an xdns mask");
         };
-        assert!(matches!(
-            settings.domains[0],
-            FinalmaskXdnsDomainEntry::Retired(_)
-        ));
-        assert!(matches!(
-            settings.domains[1],
-            FinalmaskXdnsDomainEntry::Domain(_)
-        ));
-        assert!(matches!(
-            settings.resolvers[0],
-            FinalmaskXdnsResolverEntry::Retired(_)
-        ));
-        assert!(matches!(
-            settings.resolvers[1],
-            FinalmaskXdnsResolverEntry::Resolver(_)
-        ));
-        assert!(!settings.domain.is_absent());
-
+        assert!(settings.retired_shape, "the migration must be recorded");
         let issues = crate::model::validation::validate_finalmask(&model);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
         assert_eq!(
-            issues
-                .iter()
-                .map(|issue| (issue.code.clone(), issue.path.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    crate::model::validation::ValidationCode::FinalmaskXdnsShapeRetired,
-                    Some("finalmask.udp[0].settings.domain".to_string())
-                ),
-                (
-                    crate::model::validation::ValidationCode::FinalmaskXdnsShapeRetired,
-                    Some("finalmask.udp[0].settings.domains[0]".to_string())
-                ),
-                (
-                    crate::model::validation::ValidationCode::FinalmaskXdnsShapeRetired,
-                    Some("finalmask.udp[0].settings.resolvers[0]".to_string())
-                ),
-            ],
-            "{issues:#?}"
+            issues[0].code,
+            crate::model::validation::ValidationCode::FinalmaskXdnsShapeRetired
         );
+        assert_eq!(
+            issues[0].severity,
+            crate::model::validation::Severity::Warning
+        );
+        assert_eq!(issues[0].path.as_deref(), Some("finalmask.udp[0].settings"));
+        assert!(!issues.has_blocking(), "{issues:#?}");
 
-        // The wire pass drops every retired spelling; the generated document
-        // carries the object entries alone.
+        // The saved document — settings file and wire alike — carries only
+        // the current shape: the old domain name pairs with the A and AAAA
+        // types a fresh row gets, and each resolver address gains its scheme.
+        let migrated = json!({
+            "domains": [
+                {"names": ["dns.example"], "types": [1, 28]},
+                {"names": ["kept.example"], "types": [1]},
+                {"names": ["old.example.com"], "types": [1, 28]}
+            ],
+            "resolvers": [
+                {"addrs": ["udp://1.1.1.1:53"]},
+                {"addrs": ["tcp://8.8.8.8:53"]}
+            ]
+        });
+        assert_eq!(
+            serde_json::to_value(&model).unwrap()["udp"][0]["settings"],
+            migrated
+        );
         let mut stream = StreamModel {
             finalmask: Some(model),
             ..Default::default()
@@ -3332,10 +3450,7 @@ mod tests {
         stream.retain_selected_stream_blocks_for_wire();
         assert_eq!(
             serde_json::to_value(&stream).unwrap()["finalmask"]["udp"][0]["settings"],
-            json!({
-                "domains": [{"name": "kept.example", "types": [1]}],
-                "resolvers": [{"type": "tcp", "settings": {"addr": "8.8.8.8:53"}}]
-            })
+            migrated
         );
     }
 
