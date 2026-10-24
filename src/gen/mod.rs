@@ -133,20 +133,6 @@ pub fn generate_with_api_port(
     generate_reporting(servers, settings, api_port, &mut verdict)
 }
 
-/// [`generate`] with the model's advisory findings: the document is emitted
-/// exactly as [`generate`] emits it, and every finding the model pass
-/// produced that does not gate it — an xray-legal configuration that cannot
-/// behave as written — is returned beside it, in pass order. The apply path
-/// logs them, because a user who never opens the offending editor would
-/// otherwise never learn that the emitted document drops what they set.
-pub fn generate_with_advisories(
-    servers: &ServersFile,
-    settings: &Settings,
-) -> Result<(Value, Vec<ValidationIssue>), GenerateError> {
-    let (result, verdict) = generate_with_verdict(servers, settings);
-    result.map(|value| (value, verdict.advisory().cloned().collect()))
-}
-
 /// The generation and the verdict that judged it — the entry point a shell
 /// stores per model generation. `Ok` carries the document beside the verdict;
 /// `Err` carries the failure beside the same verdict, so a blocking finding

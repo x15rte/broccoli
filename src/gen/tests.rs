@@ -4993,35 +4993,37 @@ fn golden_hysteria2_noise_script() {
     );
 }
 
-/// The reporting entry returns the advisory half of the settings verdict
+/// The generation entry returns the advisory half of the settings verdict
 /// beside the document: the document itself is unchanged (the warning never
 /// gates) and the blocking half still refuses with no advisory returned.
 #[test]
 fn the_reporting_entry_returns_the_advisory_findings() {
     let mut warned = base_settings();
     warned.dns.bootstrap = "https://dns.google/dns-query".into();
-    let (config, advisories) = generate_with_advisories(&ServersFile::default(), &warned)
-        .expect("a warning-only model must still generate");
+    let (generated, verdict) = generate_with_verdict(&ServersFile::default(), &warned);
+    let config = generated.expect("a warning-only model must still generate");
     assert!(
         config.get("outbounds").is_some(),
         "the document must be the emitted configuration"
     );
+    let advisories: Vec<_> = verdict.advisory().map(|issue| issue.code.clone()).collect();
     assert_eq!(
-        advisories
-            .iter()
-            .map(|issue| issue.code.clone())
-            .collect::<Vec<_>>(),
+        advisories,
         vec![ValidationCode::DnsBootstrapNotResolvable],
         "{advisories:#?}"
     );
 
     let mut blocked = base_settings();
     blocked.dns.servers = vec![DnsServer::default()];
-    let error = generate_with_advisories(&ServersFile::default(), &blocked)
-        .expect_err("an address-less DNS server must refuse the model");
+    let (generated, verdict) = generate_with_verdict(&ServersFile::default(), &blocked);
+    let error = generated.expect_err("an address-less DNS server must refuse the model");
     assert!(
         matches!(error, GenerateError::InvalidFinding(_)),
         "the refusal must be the blocking finding: {error:?}"
+    );
+    assert!(
+        verdict.has_blocking(),
+        "the failing generation publishes the finding that refused it"
     );
 }
 
