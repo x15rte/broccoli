@@ -13,11 +13,13 @@
 //!   live backend, never the requested next mode; it is cleared only after
 //!   exit/forced ownership release so every intentional kill attempts
 //!   RemoveInbound first.
-//! - [`PendingTransition`] keeps `(candidate ∧ rollback)` unrepresentable:
-//!   arming a rollback clears the candidate.
+//! - [`PendingCandidate`] declares its two per-kind differences in
+//!   [`CandidateKind`]: arming a rollback clears a configuration candidate
+//!   (keeping `(candidate ∧ rollback)` unrepresentable) but keeps a
+//!   core-update candidate, and a lost helper synthesizes the kind's own line.
 //! - [`CoreUpdatePending`] mirrors the durable core-swap marker; its retained
-//!   backup is ACKed only by first readiness, and arming a rollback
-//!   deliberately does not clear the candidate (durable-marker continuity).
+//!   backup is ACKed only by first readiness, which is why its candidate
+//!   survives arming a rollback (durable-marker continuity).
 //! - A rollback is consumed exactly once, and only on the exact confirmed
 //!   old-child exit ([`RollbackGate::take_after_confirmed_exit`]).
 //! - [`ExitPolicy`] reachable states are exactly {Idle, Stop, Restart,
@@ -44,10 +46,9 @@ const UPTIME_RESET: Duration = Duration::from_secs(60);
 
 /// Reason retained while a failed candidate is being stopped. Rollback and
 /// replacement spawn happen only from the confirmed-exit path; this gate is
-/// shared by the config-apply group and the core-update group because the
-/// consumption rule is identical. The reason stays a [`Diag`] until the
-/// display boundary, so every composition site renders it in the active
-/// language.
+/// shared by both [`CandidateKind`]s because the consumption rule is
+/// identical. The reason stays a [`Diag`] until the display boundary, so every
+/// composition site renders it in the active language.
 pub(super) struct RollbackGate(Option<Diag>);
 
 impl RollbackGate {
@@ -76,42 +77,83 @@ impl RollbackGate {
     }
 }
 
-/// A just-committed config candidate plus its armed rollback.
+/// Which unproven candidate a [`PendingCandidate`] tracks. The kinds differ in
+/// exactly two places, both declared here:
+/// - whether arming a rollback clears the candidate marker;
+/// - which line a lost helper synthesizes while the candidate is still
+///   pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CandidateKind {
+    /// A freshly applied configuration awaiting its first readiness. Arming
+    /// its rollback clears the candidate, keeping `(candidate ∧ rollback)`
+    /// unrepresentable.
+    Configuration,
+    /// A core swap awaiting the durable health ACK. Arming its rollback keeps
+    /// the candidate: the durable marker must remain set until the owning
+    /// backend's exit is confirmed, otherwise the rollback path loses the fact
+    /// that it still needs to restore `core.bak`.
+    CoreUpdate,
+}
+
+impl CandidateKind {
+    /// Whether arming a rollback drops the candidate marker.
+    const fn clears_candidate_on_arm(self) -> bool {
+        matches!(self, Self::Configuration)
+    }
+
+    /// The line synthesized when a still-pending candidate loses its helper
+    /// before the failure is otherwise known.
+    fn lost_helper_line(self) -> Key {
+        match self {
+            Self::Configuration => Key::RtFrameCandidateLostHelper,
+            Self::CoreUpdate => Key::RtFrameUpdatedCoreLostHelper,
+        }
+    }
+}
+
+/// A candidate awaiting proof, plus the rollback armed if the proof fails.
 ///
-/// Invariant: `(candidate ∧ rollback)` is unrepresentable — arming a rollback
-/// clears the candidate.
-pub(super) struct PendingTransition {
-    candidate: bool,
+/// One value serves both kinds; [`CandidateKind`] is the single place the two
+/// per-kind differences are declared. Every other verb — commit, clear,
+/// drain, confirmed-exit take — is identical, and a rollback is consumed
+/// exactly once, only on the exact confirmed exit of the old child.
+pub(super) struct PendingCandidate {
+    kind: CandidateKind,
+    pending: bool,
     rollback: RollbackGate,
 }
 
-impl PendingTransition {
-    pub(super) const fn new() -> Self {
+impl PendingCandidate {
+    pub(super) const fn new(kind: CandidateKind) -> Self {
         Self {
-            candidate: false,
+            kind,
+            pending: false,
             rollback: RollbackGate::new(),
         }
     }
 
     pub(super) fn is_candidate_pending(&self) -> bool {
-        self.candidate
+        self.pending
     }
 
-    /// Commit a freshly applied config: the current/next start carries the
-    /// unproven candidate and must use the short readiness deadline.
+    /// Commit a freshly applied configuration or a landed update: the
+    /// current/next start carries the unproven candidate and must use the
+    /// short readiness deadline.
     pub(super) fn commit_candidate(&mut self) {
-        self.candidate = true;
+        self.pending = true;
     }
 
     /// Arm a rollback before terminating a candidate that failed pre-readiness.
-    /// Clears the candidate so `(candidate ∧ rollback)` stays unrepresentable.
-    /// Returns false when there is nothing to roll back or one is already armed
-    /// (the shared [`rollback_armable`] gate).
+    /// The kind decides whether the candidate marker survives. Returns false
+    /// when there is nothing to roll back or one is already armed (the shared
+    /// [`rollback_armable`] gate).
     pub(super) fn arm_rollback(&mut self, reason: Diag) -> bool {
-        if !rollback_armable(self.candidate, self.rollback.pending().is_some()) {
+        if !rollback_armable(self.pending, self.rollback.pending().is_some()) {
             return false;
         }
-        self.candidate = false;
+        if self.kind.clears_candidate_on_arm() {
+            self.pending = false;
+        }
         self.rollback = RollbackGate(Some(reason));
         true
     }
@@ -122,164 +164,25 @@ impl PendingTransition {
 
     /// Clear the armed rollback (explicit Stop/Shutdown). The candidate marker
     /// deliberately survives: the next explicit Start still carries the
-    /// unproven config.
+    /// unproven configuration or core.
     pub(super) fn clear(&mut self) {
         self.rollback = RollbackGate::new();
     }
 
     /// First readiness (or a completed rollback) proves the candidate moot.
     pub(super) fn clear_candidate(&mut self) {
-        self.candidate = false;
+        self.pending = false;
     }
 
     /// Drain the failure for the unconfirmed-exit path: take the armed
-    /// rollback, else synthesize a reason from a still-pending candidate.
+    /// rollback, else synthesize the kind's own reason from a still-pending
+    /// candidate.
     pub(super) fn drain_failure(&mut self) -> Option<Diag> {
         let failure = self.rollback.drain().or_else(|| {
-            self.candidate
-                .then(|| Diag::new(Key::RtFrameCandidateLostHelper))
+            self.pending
+                .then(|| Diag::new(self.kind.lost_helper_line()))
         });
-        self.candidate = false;
-        failure
-    }
-
-    /// Take the armed rollback, consumed only on the confirmed old-child exit.
-    pub(super) fn take_rollback_after_confirmed_exit(&mut self, confirmed: bool) -> Option<Diag> {
-        self.rollback.take_after_confirmed_exit(confirmed)
-    }
-
-    /// Housekeeping's forced-termination fallback drains the armed reason
-    /// without the confirmed-exit condition (never clears the candidate).
-    pub(super) fn drain_rollback(&mut self) -> Option<Diag> {
-        self.rollback.drain()
-    }
-}
-
-/// The core-swap candidate plus its armed rollback.
-///
-/// The candidate mirrors the durable core-swap health marker; unlike
-/// [`PendingTransition`], arming a rollback deliberately does NOT clear the
-/// candidate — the durable marker must remain set until the owning backend's
-/// exit is confirmed, otherwise the rollback path loses the fact that it still
-/// needs to restore `core.bak`.
-pub(super) struct CoreUpdatePending {
-    candidate: bool,
-    rollback: RollbackGate,
-    /// Automatic dns-in bind-race retries spent by the current update
-    /// transaction (see [`TUN_BIND_RACE_RETRIES`]); reset when an install
-    /// arms a new candidate.
-    bind_race_retries: u8,
-    /// Last bounded loopback gRPC readiness miss for a core-update candidate.
-    /// Included in the terminal update result so a real failed install is
-    /// diagnosable without guessing from a generic timeout. Kept as a
-    /// [`Diag`] so the composed rollback reason renders in the active
-    /// language.
-    last_readiness_error: Option<Diag>,
-}
-
-impl CoreUpdatePending {
-    pub(super) const fn new() -> Self {
-        Self {
-            candidate: false,
-            rollback: RollbackGate::new(),
-            bind_race_retries: 0,
-            last_readiness_error: None,
-        }
-    }
-
-    pub(super) fn is_candidate_pending(&self) -> bool {
-        self.candidate
-    }
-
-    /// A completed install arms the health-gate start; the retained backup is
-    /// ACKed only by first readiness.
-    pub(super) fn commit_candidate(&mut self) {
-        self.candidate = true;
-        self.bind_race_retries = 0;
-    }
-
-    /// Spend one automatic retry for the TUN dns-in bind race on this
-    /// update's health-gate start. Returns the attempt number while inside the
-    /// budget, else `None` (the caller falls back to the rollback path). Each
-    /// attempt is a fresh process, so the Go map-order roll is re-drawn — see
-    /// [`TUN_BIND_RACE_RETRIES`].
-    pub(super) fn spend_bind_race_retry(&mut self) -> Option<u8> {
-        spend_retry_attempt(&mut self.bind_race_retries, TUN_BIND_RACE_RETRIES)
-    }
-
-    /// Adopt the durable pending-swap marker recovered at startup while
-    /// preserving this session's in-memory candidate.
-    pub(super) fn adopt_durable_marker(&mut self, durable_pending_update: bool) {
-        self.candidate =
-            super::preserve_core_update_readiness(self.candidate, durable_pending_update);
-    }
-
-    /// Arm a core-update rollback before termination. Keeps the candidate set
-    /// (durable-marker continuity); returns false when there is nothing to
-    /// roll back or one is already armed (the shared [`rollback_armable`]
-    /// gate).
-    pub(super) fn arm_rollback(&mut self, reason: Diag) -> bool {
-        if !rollback_armable(self.candidate, self.rollback.pending().is_some()) {
-            return false;
-        }
-        self.rollback = RollbackGate(Some(reason));
-        true
-    }
-
-    pub(super) fn rollback_pending(&self) -> Option<&Diag> {
-        self.rollback.pending()
-    }
-
-    pub(super) fn last_readiness_error(&self) -> Option<&Diag> {
-        self.last_readiness_error.as_ref()
-    }
-
-    /// Record a bounded readiness miss only while a candidate is pending.
-    pub(super) fn record_readiness_error(&mut self, error: Diag) {
-        if self.candidate {
-            self.last_readiness_error = Some(error);
-        }
-    }
-
-    pub(super) fn clear_last_error(&mut self) {
-        self.last_readiness_error = None;
-    }
-
-    /// Durable acknowledgement of the first successful readiness probe. The
-    /// retained backup is ACKed only here; a failed ACK keeps both the
-    /// candidate marker and the last API error intact so the next tick retries.
-    pub(super) fn ack_ready(&mut self) -> Result<(), DiagError> {
-        if !self.candidate {
-            self.last_readiness_error = None;
-            return Ok(());
-        }
-        if let Err(error) = crate::sys::core_dl::acknowledge_core_health() {
-            return Err(DiagError::new(Diag::new(Key::RtLogUpdateAckFailed)).caused_by(error));
-        }
-        self.candidate = false;
-        self.last_readiness_error = None;
-        Ok(())
-    }
-
-    /// Clear the armed rollback (explicit Stop/Shutdown).
-    pub(super) fn clear(&mut self) {
-        self.rollback = RollbackGate::new();
-    }
-
-    /// Clear the candidate without touching the gate (spawn failure, completed
-    /// rollback).
-    pub(super) fn clear_candidate(&mut self) {
-        self.candidate = false;
-    }
-
-    /// Drain the failure for the unconfirmed-exit path: take the armed
-    /// rollback, else synthesize a reason from a still-pending candidate.
-    pub(super) fn drain_failure(&mut self) -> Option<Diag> {
-        let failure = self.rollback.drain().or_else(|| {
-            self.candidate
-                .then(|| Diag::new(Key::RtFrameUpdatedCoreLostHelper))
-        });
-        self.candidate = false;
+        self.pending = false;
         failure
     }
 
@@ -298,8 +201,146 @@ impl CoreUpdatePending {
     /// already confirmed (it is the candidate's own child), so the rollback is
     /// armed unconditionally and the candidate marker is dropped.
     pub(super) fn fail_before_readiness(&mut self, reason: Diag) {
-        self.candidate = false;
+        self.pending = false;
         self.rollback = RollbackGate(Some(reason));
+    }
+}
+
+/// The core-swap candidate: the shared [`PendingCandidate`] of kind
+/// [`CandidateKind::CoreUpdate`] plus the update's own retry/readiness fields.
+///
+/// The candidate mirrors the durable core-swap health marker; arming a
+/// rollback deliberately does NOT clear it (see [`CandidateKind::CoreUpdate`]),
+/// and the retained backup is ACKed only by first readiness.
+pub(super) struct CoreUpdatePending {
+    candidate: PendingCandidate,
+    /// Automatic dns-in bind-race retries spent by the current update
+    /// transaction (see [`TUN_BIND_RACE_RETRIES`]); reset when an install
+    /// arms a new candidate.
+    bind_race_retries: u8,
+    /// Last bounded loopback gRPC readiness miss for a core-update candidate.
+    /// Included in the terminal update result so a real failed install is
+    /// diagnosable without guessing from a generic timeout. Kept as a
+    /// [`Diag`] so the composed rollback reason renders in the active
+    /// language.
+    last_readiness_error: Option<Diag>,
+}
+
+impl CoreUpdatePending {
+    pub(super) const fn new() -> Self {
+        Self {
+            candidate: PendingCandidate::new(CandidateKind::CoreUpdate),
+            bind_race_retries: 0,
+            last_readiness_error: None,
+        }
+    }
+
+    pub(super) fn is_candidate_pending(&self) -> bool {
+        self.candidate.is_candidate_pending()
+    }
+
+    /// A completed install arms the health-gate start; the retained backup is
+    /// ACKed only by first readiness.
+    pub(super) fn commit_candidate(&mut self) {
+        self.candidate.commit_candidate();
+        self.bind_race_retries = 0;
+    }
+
+    /// Spend one automatic retry for the TUN dns-in bind race on this
+    /// update's health-gate start. Returns the attempt number while inside the
+    /// budget, else `None` (the caller falls back to the rollback path). Each
+    /// attempt is a fresh process, so the Go map-order roll is re-drawn — see
+    /// [`TUN_BIND_RACE_RETRIES`].
+    pub(super) fn spend_bind_race_retry(&mut self) -> Option<u8> {
+        spend_retry_attempt(&mut self.bind_race_retries, TUN_BIND_RACE_RETRIES)
+    }
+
+    /// Adopt the durable pending-swap marker recovered at startup while
+    /// preserving this session's in-memory candidate (durable-marker
+    /// continuity).
+    pub(super) fn adopt_durable_marker(&mut self, durable_pending_update: bool) {
+        if durable_pending_update {
+            self.candidate.commit_candidate();
+        }
+    }
+
+    /// Arm a core-update rollback before termination. The shared candidate
+    /// keeps its marker set (durable-marker continuity); returns false when
+    /// there is nothing to roll back or one is already armed (the shared
+    /// [`rollback_armable`] gate).
+    pub(super) fn arm_rollback(&mut self, reason: Diag) -> bool {
+        self.candidate.arm_rollback(reason)
+    }
+
+    pub(super) fn rollback_pending(&self) -> Option<&Diag> {
+        self.candidate.rollback_pending()
+    }
+
+    pub(super) fn last_readiness_error(&self) -> Option<&Diag> {
+        self.last_readiness_error.as_ref()
+    }
+
+    /// Record a bounded readiness miss only while a candidate is pending.
+    pub(super) fn record_readiness_error(&mut self, error: Diag) {
+        if self.candidate.is_candidate_pending() {
+            self.last_readiness_error = Some(error);
+        }
+    }
+
+    pub(super) fn clear_last_error(&mut self) {
+        self.last_readiness_error = None;
+    }
+
+    /// Durable acknowledgement of the first successful readiness probe. The
+    /// retained backup is ACKed only here; a failed ACK keeps both the
+    /// candidate marker and the last API error intact so the next tick retries.
+    pub(super) fn ack_ready(&mut self) -> Result<(), DiagError> {
+        if !self.candidate.is_candidate_pending() {
+            self.last_readiness_error = None;
+            return Ok(());
+        }
+        if let Err(error) = crate::sys::core_dl::acknowledge_core_health() {
+            return Err(DiagError::new(Diag::new(Key::RtLogUpdateAckFailed)).caused_by(error));
+        }
+        self.candidate.clear_candidate();
+        self.last_readiness_error = None;
+        Ok(())
+    }
+
+    /// Clear the armed rollback (explicit Stop/Shutdown).
+    pub(super) fn clear(&mut self) {
+        self.candidate.clear();
+    }
+
+    /// Clear the candidate without touching the gate (spawn failure, completed
+    /// rollback).
+    pub(super) fn clear_candidate(&mut self) {
+        self.candidate.clear_candidate();
+    }
+
+    /// Drain the failure for the unconfirmed-exit path: take the armed
+    /// rollback, else synthesize the update's lost-helper line from a
+    /// still-pending candidate.
+    pub(super) fn drain_failure(&mut self) -> Option<Diag> {
+        self.candidate.drain_failure()
+    }
+
+    /// Take the armed rollback, consumed only on the confirmed old-child exit.
+    pub(super) fn take_rollback_after_confirmed_exit(&mut self, confirmed: bool) -> Option<Diag> {
+        self.candidate.take_rollback_after_confirmed_exit(confirmed)
+    }
+
+    /// Housekeeping's forced-termination fallback drains the armed reason
+    /// without the confirmed-exit condition (never clears the candidate).
+    pub(super) fn drain_rollback(&mut self) -> Option<Diag> {
+        self.candidate.drain_rollback()
+    }
+
+    /// The candidate exited on its own before first readiness. This exit is
+    /// already confirmed (it is the candidate's own child), so the rollback is
+    /// armed unconditionally and the candidate marker is dropped.
+    pub(super) fn fail_before_readiness(&mut self, reason: Diag) {
+        self.candidate.fail_before_readiness(reason);
     }
 }
 
@@ -604,8 +645,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        BACKOFF_BASE_MS, BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition,
-        UPTIME_RESET,
+        BACKOFF_BASE_MS, BackendState, Backoff, CandidateKind, CoreUpdatePending, ExitPolicy,
+        PendingCandidate, UPTIME_RESET,
     };
     use crate::diag::Diag;
     use crate::i18n::Key;
@@ -619,36 +660,39 @@ mod tests {
     // group transitions instead of the free functions.
 
     #[test]
-    fn candidate_failure_queues_exactly_one_post_exit_rollback() {
-        let mut transition = PendingTransition::new();
-        transition.commit_candidate();
-        assert!(transition.arm_rollback(reason(Key::RtFrameCandidateExited)));
-        assert!(!transition.is_candidate_pending());
+    fn configuration_candidate_failure_queues_exactly_one_post_exit_rollback() {
+        let mut candidate = PendingCandidate::new(CandidateKind::Configuration);
+        candidate.commit_candidate();
+        assert!(candidate.arm_rollback(reason(Key::RtFrameCandidateExited)));
+        assert!(
+            !candidate.is_candidate_pending(),
+            "arming a configuration rollback clears the candidate"
+        );
         assert_eq!(
-            transition.rollback_pending().map(Diag::key),
+            candidate.rollback_pending().map(Diag::key),
             Some(Key::RtFrameCandidateExited)
         );
         assert!(
-            !transition.arm_rollback(reason(Key::RtFrameUpdatedCoreExited)),
+            !candidate.arm_rollback(reason(Key::RtFrameUpdatedCoreExited)),
             "an armed rollback must reject a second arm"
         );
         assert_eq!(
-            transition.rollback_pending().map(Diag::key),
+            candidate.rollback_pending().map(Diag::key),
             Some(Key::RtFrameCandidateExited)
         );
         assert_eq!(
-            transition.take_rollback_after_confirmed_exit(false),
+            candidate.take_rollback_after_confirmed_exit(false),
             None,
             "rollback must remain pending before old-child exit"
         );
         assert_eq!(
-            transition
+            candidate
                 .take_rollback_after_confirmed_exit(true)
                 .map(|reason| reason.key()),
             Some(Key::RtFrameCandidateExited)
         );
         assert_eq!(
-            transition.take_rollback_after_confirmed_exit(true),
+            candidate.take_rollback_after_confirmed_exit(true),
             None,
             "confirmed exit consumes the one rollback exactly once"
         );
@@ -675,38 +719,76 @@ mod tests {
                 .map(|reason| reason.key()),
             Some(Key::RtFrameUpdatedCoreReadyTimeout)
         );
+        assert_eq!(
+            update.take_rollback_after_confirmed_exit(true),
+            None,
+            "confirmed exit consumes the update rollback exactly once"
+        );
     }
 
     #[test]
-    fn pending_transition_invariants() {
-        let mut transition = PendingTransition::new();
-        assert!(!transition.is_candidate_pending());
+    fn candidate_kind_declares_arm_and_lost_helper_differences() {
+        // Arming clears a configuration candidate (nothing is left to prove)
+        // but keeps the core-update candidate's durable marker.
+        let mut config = PendingCandidate::new(CandidateKind::Configuration);
+        config.commit_candidate();
+        assert!(config.arm_rollback(reason(Key::RtFrameCandidateExited)));
+        assert!(!config.is_candidate_pending());
+
+        let mut update = PendingCandidate::new(CandidateKind::CoreUpdate);
+        update.commit_candidate();
+        assert!(update.arm_rollback(reason(Key::RtFrameUpdatedCoreExited)));
+        assert!(update.is_candidate_pending());
+
+        // A lost helper with a still-pending candidate names the kind's line.
+        let mut config = PendingCandidate::new(CandidateKind::Configuration);
+        config.commit_candidate();
+        assert_eq!(
+            config.drain_failure().map(|reason| reason.key()),
+            Some(Key::RtFrameCandidateLostHelper)
+        );
+        let mut update = PendingCandidate::new(CandidateKind::CoreUpdate);
+        update.commit_candidate();
+        assert_eq!(
+            update.drain_failure().map(|reason| reason.key()),
+            Some(Key::RtFrameUpdatedCoreLostHelper)
+        );
         assert!(
-            !transition.arm_rollback(reason(Key::RtFrameCandidateExited)),
+            !update.is_candidate_pending(),
+            "drain_failure consumes the candidate it names"
+        );
+    }
+
+    #[test]
+    fn configuration_candidate_invariants() {
+        let mut candidate = PendingCandidate::new(CandidateKind::Configuration);
+        assert!(!candidate.is_candidate_pending());
+        assert!(
+            !candidate.arm_rollback(reason(Key::RtFrameCandidateExited)),
             "arming without a candidate is refused"
         );
         // `(candidate ∧ rollback)` unrepresentable: arming clears the candidate.
-        transition.commit_candidate();
-        assert!(transition.is_candidate_pending());
-        assert!(transition.arm_rollback(reason(Key::RtFrameCandidateReadyTimeout)));
-        assert!(!transition.is_candidate_pending());
-        assert!(transition.rollback_pending().is_some());
+        candidate.commit_candidate();
+        assert!(candidate.is_candidate_pending());
+        assert!(candidate.arm_rollback(reason(Key::RtFrameCandidateReadyTimeout)));
+        assert!(!candidate.is_candidate_pending());
+        assert!(candidate.rollback_pending().is_some());
         // clear() drops only the rollback; the candidate marker survives Stop.
-        transition.commit_candidate();
-        transition.clear();
-        assert!(transition.is_candidate_pending());
-        assert!(transition.rollback_pending().is_none());
+        candidate.commit_candidate();
+        candidate.clear();
+        assert!(candidate.is_candidate_pending());
+        assert!(candidate.rollback_pending().is_none());
         // drain_failure consumes either the armed reason or the candidate.
-        transition.commit_candidate();
+        candidate.commit_candidate();
         assert_eq!(
-            transition.drain_failure().map(|reason| reason.key()),
+            candidate.drain_failure().map(|reason| reason.key()),
             Some(Key::RtFrameCandidateLostHelper)
         );
-        assert!(!transition.is_candidate_pending());
-        transition.commit_candidate();
-        transition.arm_rollback(reason(Key::RtFrameCandidateExited));
+        assert!(!candidate.is_candidate_pending());
+        candidate.commit_candidate();
+        candidate.arm_rollback(reason(Key::RtFrameCandidateExited));
         assert_eq!(
-            transition.drain_failure().map(|reason| reason.key()),
+            candidate.drain_failure().map(|reason| reason.key()),
             Some(Key::RtFrameCandidateExited)
         );
     }

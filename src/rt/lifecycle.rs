@@ -13,11 +13,97 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use super::CorePhase;
+use super::SpawnConfigSource;
 use super::helper::ChildPhase;
 use super::policy::CoreExitFacts;
 use super::readiness::Readiness;
-use super::state::{BackendState, Backoff, CoreUpdatePending, ExitPolicy, PendingTransition};
+use super::state::{
+    BackendState, Backoff, CandidateKind, CoreUpdatePending, ExitPolicy, PendingCandidate,
+};
 use crate::diag::Diag;
+
+/// The one configuration a start runs: the source chosen for it and the
+/// artefact captured for the elevated helper to stage.
+///
+/// Source selection consumes the one-shot flags that arm an update's health
+/// gate and the post-rollback replay, so exactly one start observes them. The
+/// capture records the exact bytes this build produced (a fresh apply's
+/// validated candidate, a generation, or a stamped replay) together with the
+/// app-owned DNS-takeover choice; the elevated helper never re-reads the
+/// user-writable active path, so a same-user swap after capture cannot reach
+/// the stage.
+pub(super) struct SpawnConfig {
+    source: SpawnConfigSource,
+    gate_armed: bool,
+    replay_armed: bool,
+    captured: Option<Vec<u8>>,
+    dns_takeover: bool,
+}
+
+impl SpawnConfig {
+    pub(super) const fn new() -> Self {
+        Self {
+            source: SpawnConfigSource::SavedState,
+            gate_armed: false,
+            replay_armed: false,
+            captured: None,
+            dns_takeover: true,
+        }
+    }
+
+    /// Choose this start's configuration source, consuming the one-shot gate
+    /// and replay flags. A freshly committed configuration candidate
+    /// supersedes the gate — the user's own start then carries the update's
+    /// verdict — and the gate flag is consumed either way.
+    pub(super) fn select_source(&mut self, config_candidate_pending: bool) -> SpawnConfigSource {
+        let gate = std::mem::take(&mut self.gate_armed);
+        let replay = std::mem::take(&mut self.replay_armed);
+        self.source = if config_candidate_pending {
+            SpawnConfigSource::Committed
+        } else if gate {
+            SpawnConfigSource::CoreGate
+        } else if replay {
+            SpawnConfigSource::RolledBackReplay
+        } else {
+            SpawnConfigSource::SavedState
+        };
+        self.source
+    }
+
+    /// Arm the next start's update health gate (`CoreGate` source).
+    pub(super) fn arm_gate(&mut self) {
+        self.gate_armed = true;
+    }
+
+    /// Arm the next start's replay of the restored last-known-good artefact.
+    pub(super) fn arm_replay(&mut self) {
+        self.replay_armed = true;
+    }
+
+    /// Record the artefact this start captured: the exact bytes a helper
+    /// start stages and the app-owned DNS-takeover choice that goes with them.
+    pub(super) fn capture(&mut self, bytes: Vec<u8>, dns_takeover: bool) {
+        self.captured = Some(bytes);
+        self.dns_takeover = dns_takeover;
+    }
+
+    /// The captured bytes, or `None` when no start has captured yet.
+    pub(super) fn bytes(&self) -> Option<&[u8]> {
+        self.captured.as_deref()
+    }
+
+    /// The app-owned DNS-takeover choice captured with the bytes; true when no
+    /// apply has recorded another.
+    pub(super) fn dns_takeover(&self) -> bool {
+        self.dns_takeover
+    }
+
+    /// Drop the captured bytes because the active config changed under the
+    /// runtime; the next helper start must capture the new file.
+    pub(super) fn clear_capture(&mut self) {
+        self.captured = None;
+    }
+}
 
 /// One runtime's lifecycle state.
 pub(super) struct Lifecycle {
@@ -27,17 +113,10 @@ pub(super) struct Lifecycle {
     /// Stop/restart/silence policy for the in-flight expected exit.
     pub(super) exit_policy: ExitPolicy,
     /// A just-committed config candidate plus its armed rollback.
-    pub(super) pending_transition: PendingTransition,
-    /// The exact config content a helper start must stage. A start that
-    /// generated its configuration captures those bytes directly (regenerate,
-    /// gate, rollback replay); a start carrying a fresh apply's committed
-    /// artefact keeps the bytes the apply gate validated. The elevated helper
-    /// never re-reads the user-writable active path, so a same-user swap after
-    /// capture cannot reach the stage; `None` means no start has captured yet.
-    pub(super) helper_config_bytes: Option<Vec<u8>>,
-    /// App-owned DNS-takeover choice captured with [`Self::helper_config_bytes`]
-    /// and sent on the helper start. True preserves the established behavior.
-    pub(super) helper_dns_takeover: bool,
+    pub(super) pending_transition: PendingCandidate,
+    /// The configuration this start runs: the source chosen from the armed
+    /// flags and the artefact captured for a helper start.
+    pub(super) spawn_config: SpawnConfig,
     /// The core-swap candidate (durable health marker) plus its rollback.
     pub(super) core_update: CoreUpdatePending,
     /// Unexpected-exit backoff and the stability clock that resets it.
@@ -45,19 +124,6 @@ pub(super) struct Lifecycle {
     pub(super) phase: CorePhase,
     pub(super) requested_tun_mode: bool,
     pub(super) shutting_down: bool,
-    /// The next start is a completed core update's health gate: it runs the
-    /// app-owned configuration, never the user's profiles, so the gate
-    /// answers only "does this binary run and answer". Armed when an install
-    /// lands and when a durable pending-swap marker is adopted; consumed by
-    /// the start it belongs to. A fresh apply supersedes it — the user's own
-    /// start then carries the update's verdict.
-    pub(super) update_gate_start: bool,
-    /// The next start replays the restored last-known-good artefact instead of
-    /// regenerating, because regeneration would reproduce the configuration a
-    /// rolled-back candidate failed on. Set only where a deliberate rollback
-    /// completed; the replay checks the artefact's stamp first and regenerates
-    /// when it names another build.
-    pub(super) replay_after_rollback: bool,
     /// The live backend is the health gate's proof process: it runs the
     /// app-owned configuration, so its first readiness ACKs the update and
     /// then ends the process (the phase settles to Stopped). Set by the start
@@ -92,16 +158,13 @@ impl Lifecycle {
         Self {
             backend: BackendState::new(),
             exit_policy: ExitPolicy::idle(),
-            pending_transition: PendingTransition::new(),
-            helper_config_bytes: None,
-            helper_dns_takeover: true,
+            pending_transition: PendingCandidate::new(CandidateKind::Configuration),
+            spawn_config: SpawnConfig::new(),
             core_update: CoreUpdatePending::new(),
             backoff: Backoff::new(),
             phase: CorePhase::Stopped,
             requested_tun_mode: false,
             shutting_down: false,
-            update_gate_start: false,
-            replay_after_rollback: false,
             gate_backend_alive: false,
             candidate_boot_retries: 0,
             pending_restart: None,
@@ -182,5 +245,90 @@ impl Lifecycle {
         let reason = self.core_update.take_rollback_after_confirmed_exit(true)?;
         self.core_update.clear_candidate();
         Some(reason)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SpawnConfig, SpawnConfigSource};
+
+    /// Precedence: committed candidate > armed gate > armed replay >
+    /// regenerate, and each one-shot flag is consumed by the start that
+    /// observes it.
+    #[test]
+    fn spawn_config_source_precedence_consumes_one_shot_flags() {
+        // A frozen configuration candidate supersedes an armed gate; the gate
+        // is consumed either way.
+        let mut config = SpawnConfig::new();
+        config.arm_gate();
+        assert_eq!(
+            config.select_source(true),
+            SpawnConfigSource::Committed,
+            "the committed candidate supersedes the gate"
+        );
+        assert_eq!(
+            config.select_source(false),
+            SpawnConfigSource::SavedState,
+            "the gate is consumed even when the candidate superseded it"
+        );
+
+        // Gate beats replay; both one-shot flags are consumed by the start
+        // that observes them, so the replay cannot leak into a later start.
+        let mut config = SpawnConfig::new();
+        config.arm_gate();
+        config.arm_replay();
+        assert_eq!(config.select_source(false), SpawnConfigSource::CoreGate);
+        assert_eq!(
+            config.select_source(false),
+            SpawnConfigSource::SavedState,
+            "the replay flag is consumed with the gate it was superseded by"
+        );
+
+        // Replay alone.
+        let mut config = SpawnConfig::new();
+        config.arm_replay();
+        assert_eq!(
+            config.select_source(false),
+            SpawnConfigSource::RolledBackReplay
+        );
+        assert_eq!(config.select_source(false), SpawnConfigSource::SavedState);
+
+        // Cold start regenerates.
+        assert_eq!(
+            SpawnConfig::new().select_source(false),
+            SpawnConfigSource::SavedState
+        );
+    }
+
+    /// The capture records the bytes and the DNS-takeover choice together, and
+    /// a later start keeps the choice while replacing the bytes; clearing the
+    /// capture drops both the start's artefact and its availability.
+    #[test]
+    fn spawn_config_capture_records_and_clears_once() {
+        let mut config = SpawnConfig::new();
+        assert!(config.bytes().is_none(), "no start has captured yet");
+        assert!(
+            config.dns_takeover(),
+            "the established default preserves the takeover"
+        );
+
+        config.capture(b"gate".to_vec(), false);
+        assert_eq!(config.bytes(), Some(b"gate".as_slice()));
+        assert!(!config.dns_takeover());
+
+        // A generation this start produced replaces the bytes, keeping the
+        // captured takeover choice.
+        config.capture(b"generated".to_vec(), config.dns_takeover());
+        assert_eq!(config.bytes(), Some(b"generated".as_slice()));
+        assert!(
+            !config.dns_takeover(),
+            "replacing the bytes must not reset the app-owned choice"
+        );
+
+        config.clear_capture();
+        assert!(
+            config.bytes().is_none(),
+            "the active config changed; the next start recaptures"
+        );
     }
 }

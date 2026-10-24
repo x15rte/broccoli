@@ -826,12 +826,6 @@ fn cancelled_cleanup() -> ExclusiveOutcome {
 fn connect_after_helper_launch<T>(cancel: &AtomicBool, connect: impl FnOnce() -> T) -> Option<T> {
     (!cancel.load(Ordering::Acquire)).then(connect)
 }
-fn preserve_core_update_readiness(
-    session_candidate_pending_readiness: bool,
-    durable_pending_update: bool,
-) -> bool {
-    session_candidate_pending_readiness || durable_pending_update
-}
 
 /// Mark kept by [`should_emit_download_progress`] before the first snapshot:
 /// an elapsed-millisecond value no real download can reach, so the mark never
@@ -2297,7 +2291,7 @@ impl Runtime {
                     self.lifecycle.core_update.commit_candidate();
                     // The gate proves the installed binary with the app-owned
                     // configuration; it starts on the next housekeeping tick.
-                    self.lifecycle.update_gate_start = true;
+                    self.lifecycle.spawn_config.arm_gate();
                     self.set_phase(CorePhase::Stopped);
                     self.lifecycle.pending_restart = Some(Instant::now());
                     return;
@@ -2365,8 +2359,9 @@ impl Runtime {
             self.release_exclusive();
             return;
         }
-        self.lifecycle.helper_config_bytes = Some(validated_bytes);
-        self.lifecycle.helper_dns_takeover = intent.dns_takeover();
+        self.lifecycle
+            .spawn_config
+            .capture(validated_bytes, intent.dns_takeover());
         self.emit(CoreEvt::ApplyResult {
             ok: true,
             output,
@@ -2418,25 +2413,6 @@ impl Runtime {
     }
 
     // -- backend lifecycle ---------------------------------------------------
-
-    /// Which configuration this start runs, consuming the one-shot flags that
-    /// arm the gate and the post-rollback replay. A freshly committed
-    /// candidate supersedes the gate: the user's own start then carries the
-    /// update's verdict (the gate flag is consumed either way).
-    fn take_spawn_config_source(&mut self) -> SpawnConfigSource {
-        let gate = std::mem::take(&mut self.lifecycle.update_gate_start);
-        let replay = std::mem::take(&mut self.lifecycle.replay_after_rollback);
-        if self.lifecycle.pending_transition.is_candidate_pending() {
-            return SpawnConfigSource::Committed;
-        }
-        if gate {
-            return SpawnConfigSource::CoreGate;
-        }
-        if replay {
-            return SpawnConfigSource::RolledBackReplay;
-        }
-        SpawnConfigSource::SavedState
-    }
 
     /// Whether this start runs behind the elevated helper. TUN sessions do;
     /// the health gate never does: it proves the installed binary with an
@@ -2519,7 +2495,7 @@ impl Runtime {
         if !update_pending_before && self.lifecycle.core_update.is_candidate_pending() {
             // A swap landed but was never proven: the first start of the
             // session is its health gate, with the app-owned configuration.
-            self.lifecycle.update_gate_start = true;
+            self.lifecycle.spawn_config.arm_gate();
         }
 
         // Every spawn runs a configuration this build produced. A stored
@@ -2527,7 +2503,11 @@ impl Runtime {
         // from the saved state, the gate writes its own app-owned
         // configuration, and the one deliberate replay (the restored
         // last-known-good after a rolled-back candidate) is stamp-checked.
-        let source = self.take_spawn_config_source();
+        let config_candidate_pending = self.lifecycle.pending_transition.is_candidate_pending();
+        let source = self
+            .lifecycle
+            .spawn_config
+            .select_source(config_candidate_pending);
         // Which configuration this start runs: one line at the decision,
         // before any spawn (direct or behind the elevated helper).
         self.app_log(source.notice());
@@ -2609,27 +2589,29 @@ impl Runtime {
             // validated bytes; only a start without one falls back to the
             // active file.
             if let Some(bytes) = generated_bytes {
-                self.lifecycle.helper_config_bytes = Some(bytes);
-            } else if self.lifecycle.helper_config_bytes.is_none() {
-                self.lifecycle.helper_config_bytes =
-                    Some(match std::fs::read(apply::active_path()) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            self.settle_spawn_config_failure(
-                                DiagError::new(Diag::new(Key::RtPhaseConfigReadFailed))
-                                    .caused_by(error),
-                            );
-                            return;
-                        }
-                    });
+                let dns_takeover = self.lifecycle.spawn_config.dns_takeover();
+                self.lifecycle.spawn_config.capture(bytes, dns_takeover);
+            } else if self.lifecycle.spawn_config.bytes().is_none() {
+                let bytes = match std::fs::read(apply::active_path()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.settle_spawn_config_failure(
+                            DiagError::new(Diag::new(Key::RtPhaseConfigReadFailed))
+                                .caused_by(error),
+                        );
+                        return;
+                    }
+                };
+                let dns_takeover = self.lifecycle.spawn_config.dns_takeover();
+                self.lifecycle.spawn_config.capture(bytes, dns_takeover);
             }
             // Arm the in-tun DNS listeners from the exact bytes the helper
             // stages: each listener binds an address this config assigns to
             // the tun adapter, so the two can never drift.
             self.lifecycle.dns_in_pending = self
                 .lifecycle
-                .helper_config_bytes
-                .as_deref()
+                .spawn_config
+                .bytes()
                 .and_then(dns_in::listener_for_bytes)
                 .map(|listener| listener.addresses())
                 .unwrap_or_default();
@@ -2721,13 +2703,13 @@ impl Runtime {
     /// bytes before the pipe existed — and must fail loudly, never fall back to
     /// a file re-read; a refused start is the helper's own failure.
     fn start_helper_pipe(&self, pipe: &helper::HelperPipe) -> Result<(), PhaseError> {
-        let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
+        let Some(config_bytes) = self.lifecycle.spawn_config.bytes() else {
             return Err(PhaseError::new(Diag::new(Key::RtPhaseHelperConfigLost)));
         };
         pipe.start(
             self.api_port,
             config_bytes,
-            self.lifecycle.helper_dns_takeover,
+            self.lifecycle.spawn_config.dns_takeover(),
         )
         .map_err(|error| {
             PhaseError::new(
@@ -3365,11 +3347,11 @@ impl Runtime {
                 // The next start replays the restored last-known-good
                 // artefact instead of regenerating: regeneration would
                 // produce the configuration the candidate just failed on.
-                self.lifecycle.replay_after_rollback = true;
+                self.lifecycle.spawn_config.arm_replay();
                 // The active config changed under us; the next start must
                 // capture the rolled-back file instead of the rejected
                 // candidate's bytes.
-                self.lifecycle.helper_config_bytes = None;
+                self.lifecycle.spawn_config.clear_capture();
                 // Queue rather than recursively awaiting the start graph.
                 self.lifecycle.pending_restart = Some(Instant::now());
             }
@@ -8630,7 +8612,7 @@ mod tests {
 
             let (mut runtime, events) = runtime_with_events();
             runtime.lifecycle.core_update.commit_candidate();
-            runtime.lifecycle.update_gate_start = true;
+            runtime.lifecycle.spawn_config.arm_gate();
             runtime.start_backend().await;
 
             let emitted: Vec<_> = events.try_iter().collect();
@@ -8691,7 +8673,7 @@ mod tests {
             )
             .expect("write the foreign stamp");
             let (mut runtime, _events) = runtime_with_events();
-            runtime.lifecycle.replay_after_rollback = true;
+            runtime.lifecycle.spawn_config.arm_replay();
             runtime.start_backend().await;
             let regenerated = std::fs::read_to_string(super::apply::active_path())
                 .expect("read the regenerated artefact");
@@ -8715,7 +8697,7 @@ mod tests {
                 super::apply::stamp_is_current(),
                 "a stamp describing the stored bytes must match"
             );
-            runtime.lifecycle.replay_after_rollback = true;
+            runtime.lifecycle.spawn_config.arm_replay();
             runtime.start_backend().await;
             assert_eq!(
                 std::fs::read(super::apply::active_path()).expect("read the replayed artefact"),
