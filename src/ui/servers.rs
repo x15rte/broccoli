@@ -1822,6 +1822,116 @@ struct AdvancedTabCtx<'a> {
     masked: bool,
 }
 
+/// What one finalmask list needs that the other does not: its wording and
+/// the identity its rows' raw-editor buffers are keyed by. The two lists
+/// otherwise render the same rows.
+struct MaskListSpec<'a> {
+    /// The list's `push_id` salt (`finalmask-tcp` / `finalmask-udp`).
+    group: &'static str,
+    /// The kind's wire name — the field id's middle element.
+    tag: &'static str,
+    /// The profile id the raw-editor buffers belong to.
+    profile: &'a str,
+    heading: Key,
+    note: Key,
+    /// The "mask N" row label.
+    ordinal: Key,
+    add_label: Key,
+    /// Whether the rows' credentials render masked (the reveal control).
+    masked: bool,
+    /// The draft generation the settings editors' verdicts memoize on.
+    revision: u64,
+}
+
+/// The envelope's `type` string, known or not: what a mask displays when its
+/// type is one this build does not know.
+trait MaskEnvelope {
+    fn discriminator(&self) -> Option<&str>;
+}
+
+/// The finalmask list's per-kind vocabulary and editor: the TCP and UDP
+/// lists render the same rows — type combo, reorder controls, then the
+/// kind's own settings — and differ only here.
+trait MaskKind: MaskEnvelope + Sized {
+    /// The `type` string this mask serializes as, when it is a known one.
+    fn known_type(&self) -> Option<&'static str>;
+    /// The mask of this kind `kind` names (the loader folds the spelling).
+    fn from_known_type(kind: &str) -> Option<Self>;
+    /// The types the outbound editor offers, in the model's table order.
+    fn outbound_types() -> impl Iterator<Item = &'static str>;
+    /// The kind's settings rows, below the type combo.
+    fn edit_settings(
+        ui: &mut egui::Ui,
+        lang: Language,
+        mask: &mut Self,
+        field: RawField<'_>,
+        masked: bool,
+        revision: u64,
+    ) -> bool;
+}
+
+impl MaskEnvelope for FinalmaskTcpMask {
+    fn discriminator(&self) -> Option<&str> {
+        FinalmaskTcpMask::discriminator(self)
+    }
+}
+
+impl MaskEnvelope for FinalmaskUdpMask {
+    fn discriminator(&self) -> Option<&str> {
+        FinalmaskUdpMask::discriminator(self)
+    }
+}
+
+impl MaskKind for FinalmaskTcpMask {
+    fn known_type(&self) -> Option<&'static str> {
+        FinalmaskTcpMask::known_type(self)
+    }
+
+    fn from_known_type(kind: &str) -> Option<Self> {
+        FinalmaskTcpMask::from_known_type(kind)
+    }
+
+    fn outbound_types() -> impl Iterator<Item = &'static str> {
+        FinalmaskTcpMask::outbound_types()
+    }
+
+    fn edit_settings(
+        ui: &mut egui::Ui,
+        lang: Language,
+        mask: &mut Self,
+        field: RawField<'_>,
+        masked: bool,
+        _revision: u64,
+    ) -> bool {
+        finalmask_tcp_settings_editor(ui, lang, mask, field, masked)
+    }
+}
+
+impl MaskKind for FinalmaskUdpMask {
+    fn known_type(&self) -> Option<&'static str> {
+        FinalmaskUdpMask::known_type(self)
+    }
+
+    fn from_known_type(kind: &str) -> Option<Self> {
+        FinalmaskUdpMask::from_known_type(kind)
+    }
+
+    fn outbound_types() -> impl Iterator<Item = &'static str> {
+        FinalmaskUdpMask::outbound_types()
+    }
+
+    fn edit_settings(
+        ui: &mut egui::Ui,
+        lang: Language,
+        mask: &mut Self,
+        field: RawField<'_>,
+        masked: bool,
+        revision: u64,
+    ) -> bool {
+        finalmask_udp_settings_editor(ui, lang, mask, field, masked, revision)
+    }
+}
+
 /// The chain target the draft was loaded with: the dial-through tag the
 /// committed profile carried (`streamSettings.sockopt.dialerProxy`), read
 /// from the draft's serialized source. `None` when the source had none.
@@ -5023,43 +5133,14 @@ impl ServersScreen {
             protocol,
             mut mux,
         } = ctx;
-        // The transport selector offers the masque transport only for a
-        // masque outbound and only it for one, and xdrive only for a VLESS
-        // outbound; the mismatches the model reports are unreachable here.
-        const WITHOUT_XDRIVE: &[Network] = &[
-            Network::Raw,
-            Network::Xhttp,
-            Network::Kcp,
-            Network::Grpc,
-            Network::Ws,
-            Network::Httpupgrade,
-            Network::Hysteria,
-        ];
-        const WITH_XDRIVE: &[Network] = &[
-            Network::Raw,
-            Network::Xhttp,
-            Network::Kcp,
-            Network::Grpc,
-            Network::Ws,
-            Network::Httpupgrade,
-            Network::Hysteria,
-            Network::Xdrive,
-        ];
-        let masque_outbound = protocol == Protocol::Masque;
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvNetwork));
-            let networks: &[Network] = if masque_outbound {
-                &[Network::Masque]
-            } else if protocol == Protocol::Vless {
-                WITH_XDRIVE
-            } else {
-                WITHOUT_XDRIVE
-            };
-            for &n in networks {
-                let allowed = st.security != Security::Reality
-                    || n.supports_reality()
-                    || n == Network::Hysteria;
+            // The selector's list is the model's own fact: a MASQUE outbound
+            // offers only its handler's transport, VLESS every other
+            // transport, and every other protocol the general set.
+            for &n in Network::selectable_networks(protocol) {
+                let allowed = st.can_select_network(n).is_ok();
                 let response = ui
                     .add_enabled_ui(allowed, |ui| {
                         ui.selectable_label(st.network == n, n.as_str())
@@ -5138,759 +5219,790 @@ impl ServersScreen {
         }
         match st.network {
             Network::Raw => {
-                let had_settings = st.raw_settings.is_some();
-                let mut s = st.raw_settings.take().unwrap_or_default();
-                let mut hdr = s.header.is_some();
-                if ui
-                    .checkbox(&mut hdr, t(lang, Key::SrvHttpCamouflageHeader))
-                    .changed()
-                {
-                    s.header = if hdr {
-                        Some(RawHeader {
-                            r#type: "http".into(),
-                            ..Default::default()
-                        })
-                    } else {
-                        None
-                    };
-                    changed = true;
-                }
-                if let Some(h) = s.header.as_mut() {
-                    let mut req = h.request.is_some();
+                changed |= st.edit_raw(|s| {
+                    let mut changed = false;
+                    let mut hdr = s.header.is_some();
                     if ui
-                        .checkbox(&mut req, t(lang, Key::SrvRequestCamouflage))
+                        .checkbox(&mut hdr, t(lang, Key::SrvHttpCamouflageHeader))
                         .changed()
                     {
-                        h.request = if req {
-                            Some(HttpCamouflageRequest::default())
+                        s.header = if hdr {
+                            Some(RawHeader {
+                                r#type: "http".into(),
+                                ..Default::default()
+                            })
                         } else {
                             None
                         };
                         changed = true;
                     }
-                    if let Some(r) = h.request.as_mut() {
-                        changed |= widgets::text_field(ui, "version", &mut r.version, "1.1");
-                        changed |= widgets::text_field(ui, "method", &mut r.method, "GET");
-                        changed |= widgets::string_list(ui, lang, "paths", &mut r.path, "/");
-                        changed |= json_map_kv(
-                            ui,
-                            lang,
-                            &mut r.headers,
-                            t(lang, Key::HeaderHint),
-                            t(lang, Key::ValueHint),
-                            &mut self.json_key_scratch,
-                        );
-                    }
-                    let mut resp = h.response.is_some();
-                    if ui
-                        .checkbox(&mut resp, t(lang, Key::SrvResponseCamouflage))
-                        .changed()
-                    {
-                        h.response = if resp {
-                            Some(HttpCamouflageResponse::default())
-                        } else {
-                            None
-                        };
-                        changed = true;
-                    }
-                    if let Some(r) = h.response.as_mut() {
-                        changed |= widgets::text_field(ui, "version", &mut r.version, "1.1");
-                        changed |= widgets::text_field(ui, "status", &mut r.status, "200");
-                        changed |= widgets::text_field(ui, "reason", &mut r.reason, "OK");
-                        changed |= json_map_kv(
-                            ui,
-                            lang,
-                            &mut r.headers,
-                            t(lang, Key::HeaderHint),
-                            t(lang, Key::ValueHint),
-                            &mut self.json_key_scratch,
-                        );
-                    }
-                }
-                if had_settings || changed {
-                    st.raw_settings = Some(s);
-                }
-            }
-            Network::Xhttp => {
-                let had_settings = st.xhttp_settings.is_some();
-                let mut s = st.xhttp_settings.take().unwrap_or_default();
-                let mut mode_changed = false;
-                widgets::section(ui, t(lang, Key::SrvBasics), |ui| {
-                    changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
-                    changed |= widgets::text_field(ui, "path", &mut s.path, "/");
-                    mode_changed = widgets::combo_str_labeled(
-                        ui,
-                        "mode",
-                        &mut s.mode,
-                        XHTTP_MODES,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    changed |= mode_changed;
-                    changed |=
-                        transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
-                });
-                widgets::section(ui, t(lang, Key::SrvPadding), |ui| {
-                    changed |=
-                        widgets::opt_range(ui, "xPaddingBytes", &mut s.x_padding_bytes, 1..=4096);
-                    changed |= widgets::opt_bool(
-                        ui,
-                        "xPaddingObfsMode",
-                        &mut s.x_padding_obfs_mode,
-                        t(lang, Key::SrvUnset),
-                    );
-                    changed |= widgets::text_field(ui, "xPaddingKey", &mut s.x_padding_key, "");
-                    changed |=
-                        widgets::text_field(ui, "xPaddingHeader", &mut s.x_padding_header, "");
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "xPaddingPlacement",
-                        &mut s.x_padding_placement,
-                        X_PADDING_PLACEMENTS,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "xPaddingMethod",
-                        &mut s.x_padding_method,
-                        PADDING_METHODS,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                });
-                widgets::section(ui, t(lang, Key::SrvUpload), |ui| {
-                    changed |= widgets::text_field(
-                        ui,
-                        "uplinkHTTPMethod",
-                        &mut s.uplink_http_method,
-                        "POST",
-                    );
-                    let incompatible_placement = s.mode != "packet-up"
-                        && !validation::uplink_placement_mode_supported(
-                            &s.uplink_data_placement,
-                            &s.mode,
-                        );
-                    if mode_changed && incompatible_placement {
-                        s.uplink_data_placement.clear();
-                    }
-                    let placements: &[&str] = if s.mode == "packet-up" {
-                        UPLINK_PLACEMENTS
-                    } else {
-                        &UPLINK_STREAM_PLACEMENTS
-                    };
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "uplinkDataPlacement",
-                        &mut s.uplink_data_placement,
-                        placements,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    if s.mode != "packet-up"
-                        && !validation::uplink_placement_mode_supported(
-                            &s.uplink_data_placement,
-                            &s.mode,
-                        )
-                    {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                status_colors_of(ui).err,
-                                t(lang, Key::SrvCookieHeaderNeedsPacketUp),
-                            );
-                            if ui.small_button(t(lang, Key::SrvUseAuto)).clicked() {
-                                s.uplink_data_placement.clear();
-                                changed = true;
-                            }
-                        });
-                    }
-                    changed |= widgets::text_field(ui, "uplinkDataKey", &mut s.uplink_data_key, "");
-                    changed |= widgets::opt_range(
-                        ui,
-                        "uplinkChunkSize",
-                        &mut s.uplink_chunk_size,
-                        1..=1_000_000,
-                    );
-                    changed |= widgets::opt_bool(
-                        ui,
-                        "noGRPCHeader",
-                        &mut s.no_grpc_header,
-                        t(lang, Key::SrvUnset),
-                    );
-                    changed |= widgets::opt_bool(
-                        ui,
-                        "noSSEHeader",
-                        &mut s.no_sse_header,
-                        t(lang, Key::SrvUnset),
-                    );
-                });
-                widgets::section(ui, t(lang, Key::SrvSession), |ui| {
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "sessionIDPlacement",
-                        &mut s.session_id_placement,
-                        SESSION_PLACEMENTS,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    changed |= widgets::text_field(ui, "sessionIDKey", &mut s.session_id_key, "");
-                    changed |=
-                        widgets::text_field(ui, "sessionIDTable", &mut s.session_id_table, "");
-                    changed |=
-                        widgets::opt_range(ui, "sessionIDLength", &mut s.session_id_length, 1..=64);
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "seqPlacement",
-                        &mut s.seq_placement,
-                        SESSION_PLACEMENTS,
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    changed |= widgets::text_field(ui, "seqKey", &mut s.seq_key, "");
-                });
-                widgets::section(ui, t(lang, Key::SrvLimits), |ui| {
-                    changed |= widgets::opt_range(
-                        ui,
-                        "scMaxEachPostBytes",
-                        &mut s.sc_max_each_post_bytes,
-                        1000..=10_000_000,
-                    );
-                    changed |= widgets::opt_range(
-                        ui,
-                        "scMinPostsIntervalMs",
-                        &mut s.sc_min_posts_interval_ms,
-                        0..=10_000,
-                    );
-                    changed |= widgets::opt_num(
-                        ui,
-                        "scMaxBufferedPosts",
-                        &mut s.sc_max_buffered_posts,
-                        1..=1000,
-                    );
-                    changed |= widgets::opt_range(
-                        ui,
-                        "scStreamUpServerSecs",
-                        &mut s.sc_stream_up_server_secs,
-                        0..=3600,
-                    );
-                    changed |= widgets::opt_num(
-                        ui,
-                        "serverMaxHeaderBytes",
-                        &mut s.server_max_header_bytes,
-                        1024..=1_048_576,
-                    );
-                });
-                changed |= xmux_section(ui, lang, &mut s.xmux);
-                if mode_changed && s.mode == "stream-one" {
-                    s.download_settings = None;
-                }
-                if s.mode == "stream-one" && s.download_settings.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            status_colors_of(ui).err,
-                            t(lang, Key::SrvDownloadNotAllowed),
-                        );
+                    if let Some(h) = s.header.as_mut() {
+                        let mut req = h.request.is_some();
                         if ui
-                            .small_button(t(lang, Key::SrvRemoveSplitDownload))
-                            .clicked()
+                            .checkbox(&mut req, t(lang, Key::SrvRequestCamouflage))
+                            .changed()
                         {
-                            s.download_settings = None;
+                            h.request = if req {
+                                Some(HttpCamouflageRequest::default())
+                            } else {
+                                None
+                            };
                             changed = true;
                         }
-                    });
-                }
-                if (depth as usize) < MAX_XHTTP_DOWNLOAD_DEPTH {
-                    widgets::section(
-                        ui,
-                        &t_fmt(lang, Key::SrvDownloadDepth, &[&(depth + 1)]),
-                        |ui| {
-                            if s.mode == "stream-one" {
-                                ui.weak(t(lang, Key::SrvUnavailableStreamOne));
-                                return;
-                            }
-                            let mut has = s.download_settings.is_some();
-                            if ui
-                                .checkbox(&mut has, t(lang, Key::SrvSeparateDownlinkStream))
-                                .changed()
-                            {
-                                s.download_settings = if has {
-                                    Some(Box::new(StreamModel::default()))
-                                } else {
-                                    None
-                                };
-                                changed = true;
-                            }
-                            if let Some(download) = s.download_settings.as_mut() {
-                                ui.indent(("download", depth), |ui| {
-                                    changed |= self.transport_tab(
-                                        ui,
-                                        lang,
-                                        download,
-                                        depth + 1,
-                                        TransportTabCtx {
-                                            target,
-                                            masked,
-                                            protocol,
-                                            mux: None,
-                                        },
-                                    );
-                                    changed |= self.security_tab_readonly(ui, lang, download);
-                                });
-                            }
-                        },
-                    );
-                } else if let Some(download) = s.download_settings.as_ref() {
-                    ui.colored_label(
-                        status_colors_of(ui).err,
-                        t_fmt(lang, Key::SrvDepthExceeded, &[&MAX_XHTTP_DOWNLOAD_DEPTH]),
-                    );
-                    egui::CollapsingHeader::new(t(lang, Key::SrvPreservedOverLimit))
-                        .id_salt(ui.auto_id_with(("download-over-limit", depth)))
-                        .show(ui, |ui| {
-                            let json = self.over_limit_json_for(target, depth, lang, download);
-                            egui::ScrollArea::vertical()
-                                .max_height(180.0)
-                                .show(ui, |ui| {
-                                    ui.monospace(json);
-                                });
-                        });
-                }
-                if had_settings || changed {
-                    st.xhttp_settings = Some(s);
-                }
-            }
-            Network::Kcp => {
-                let had_settings = st.kcp_settings.is_some();
-                let mut s = st.kcp_settings.take().unwrap_or_default();
-                changed |= widgets::opt_num(ui, "mtu", &mut s.mtu, 576..=9000);
-                changed |= widgets::opt_num(ui, t(lang, Key::SrvTtiMs), &mut s.tti, 10..=200);
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvUplinkCapacity),
-                    &mut s.uplink_capacity,
-                    0..=10_000,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvDownlinkCapacity),
-                    &mut s.downlink_capacity,
-                    0..=10_000,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvCwndMultiplier),
-                    &mut s.cwnd_multiplier,
-                    1..=16,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvMaxSendingWindow),
-                    &mut s.max_sending_window,
-                    1..=10_000,
-                );
-                if had_settings || changed {
-                    st.kcp_settings = Some(s);
-                }
-            }
-            Network::Grpc => {
-                let had_settings = st.grpc_settings.is_some();
-                let mut s = st.grpc_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(ui, "serviceName", &mut s.service_name, "grpc");
-                changed |= widgets::text_field(ui, "authority", &mut s.authority, "example.com");
-                changed |= widgets::noted(ui, t(lang, Key::SrvGrpcMultiModeNote), |ui| {
-                    widgets::opt_bool(ui, "multiMode", &mut s.multi_mode, t(lang, Key::SrvUnset))
-                });
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvIdleTimeoutS),
-                    &mut s.idle_timeout,
-                    0..=3600,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvHealthCheckTimeoutS),
-                    &mut s.health_check_timeout,
-                    0..=600,
-                );
-                changed |= widgets::opt_bool(
-                    ui,
-                    "permit_without_stream",
-                    &mut s.permit_without_stream,
-                    t(lang, Key::SrvUnset),
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    "initial_windows_size",
-                    &mut s.initial_windows_size,
-                    0..=16_777_215,
-                );
-                changed |= opt_string(ui, "user_agent", &mut s.user_agent, "");
-                if had_settings || changed {
-                    st.grpc_settings = Some(s);
-                }
-            }
-            Network::Ws => {
-                let had_settings = st.ws_settings.is_some();
-                let mut s = st.ws_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
-                changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
-                changed |=
-                    websocket_transport_headers(ui, lang, &mut s, &mut self.json_key_scratch);
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvHeartbeatPeriodS),
-                    &mut s.heartbeat_period,
-                    0..=600,
-                );
-                if had_settings || changed {
-                    st.ws_settings = Some(s);
-                }
-            }
-            Network::Httpupgrade => {
-                let had_settings = st.httpupgrade_settings.is_some();
-                let mut s = st.httpupgrade_settings.take().unwrap_or_default();
-                changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
-                changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
-                changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
-                if had_settings || changed {
-                    st.httpupgrade_settings = Some(s);
-                }
-            }
-            Network::Hysteria => {
-                let had_settings = st.hysteria_settings.is_some();
-                let mut s = st.hysteria_settings.take().unwrap_or_default();
-                if s.version != 2 {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(status_colors_of(ui).err, t(lang, Key::SrvOnlyHysteria2));
-                        if ui.small_button(t(lang, Key::SrvUseVersion2)).clicked() {
-                            s.version = 2;
-                            changed = true;
-                        }
-                    });
-                }
-                changed |= widgets::masked_text_field(
-                    ui,
-                    t(lang, Key::SrvAuthPassword),
-                    &mut s.auth,
-                    "",
-                    masked,
-                );
-                changed |= widgets::opt_num(
-                    ui,
-                    t(lang, Key::SrvUdpIdleTimeoutS),
-                    &mut s.udp_idle_timeout,
-                    2..=600,
-                );
-                let mut has = s.masquerade.is_some();
-                if ui.checkbox(&mut has, t(lang, Key::SrvMasquerade)).changed() {
-                    s.masquerade = if has {
-                        Some(MasqueradeCfg::default())
-                    } else {
-                        None
-                    };
-                    changed = true;
-                }
-                if let Some(m) = s.masquerade.as_mut() {
-                    changed |= widgets::combo_str_labeled(
-                        ui,
-                        "type",
-                        &mut m.r#type,
-                        &["", "file", "proxy", "string"],
-                        t(lang, Key::SrvDefault),
-                        false,
-                    );
-                    match m.r#type.as_str() {
-                        "file" => {
-                            changed |= widgets::text_field(ui, "dir", &mut m.dir, "C:\\\\web");
-                        }
-                        "proxy" => {
-                            changed |=
-                                widgets::text_field(ui, "url", &mut m.url, "https://example.com");
-                            changed |= ui
-                                .checkbox(&mut m.rewrite_host, t(lang, Key::SrvRewriteHost))
-                                .changed();
-                            changed |= ui
-                                .checkbox(&mut m.x_forwarded, t(lang, Key::SrvXForwarded))
-                                .changed();
-                            changed |= ui
-                                .checkbox(&mut m.insecure, t(lang, Key::SrvSkipTlsVerify))
-                                .changed();
-                        }
-                        "string" => {
-                            changed |= widgets::text_field(ui, "content", &mut m.content, "");
+                        if let Some(r) = h.request.as_mut() {
+                            changed |= widgets::text_field(ui, "version", &mut r.version, "1.1");
+                            changed |= widgets::text_field(ui, "method", &mut r.method, "GET");
+                            changed |= widgets::string_list(ui, lang, "paths", &mut r.path, "/");
                             changed |= json_map_kv(
                                 ui,
                                 lang,
-                                &mut m.headers,
+                                &mut r.headers,
                                 t(lang, Key::HeaderHint),
                                 t(lang, Key::ValueHint),
                                 &mut self.json_key_scratch,
                             );
-                            let mut sc = m.status_code;
-                            if widgets::opt_num(ui, t(lang, Key::SrvStatusCode), &mut sc, 100..=599)
+                        }
+                        let mut resp = h.response.is_some();
+                        if ui
+                            .checkbox(&mut resp, t(lang, Key::SrvResponseCamouflage))
+                            .changed()
+                        {
+                            h.response = if resp {
+                                Some(HttpCamouflageResponse::default())
+                            } else {
+                                None
+                            };
+                            changed = true;
+                        }
+                        if let Some(r) = h.response.as_mut() {
+                            changed |= widgets::text_field(ui, "version", &mut r.version, "1.1");
+                            changed |= widgets::text_field(ui, "status", &mut r.status, "200");
+                            changed |= widgets::text_field(ui, "reason", &mut r.reason, "OK");
+                            changed |= json_map_kv(
+                                ui,
+                                lang,
+                                &mut r.headers,
+                                t(lang, Key::HeaderHint),
+                                t(lang, Key::ValueHint),
+                                &mut self.json_key_scratch,
+                            );
+                        }
+                    }
+                    changed
+                });
+            }
+            Network::Xhttp => {
+                changed |= st.edit_xhttp(|s| {
+                    let mut changed = false;
+                    let mut mode_changed = false;
+                    widgets::section(ui, t(lang, Key::SrvBasics), |ui| {
+                        changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                        changed |= widgets::text_field(ui, "path", &mut s.path, "/");
+                        mode_changed = widgets::combo_str_labeled(
+                            ui,
+                            "mode",
+                            &mut s.mode,
+                            XHTTP_MODES,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        changed |= mode_changed;
+                        changed |=
+                            transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                    });
+                    widgets::section(ui, t(lang, Key::SrvPadding), |ui| {
+                        changed |= widgets::opt_range(
+                            ui,
+                            "xPaddingBytes",
+                            &mut s.x_padding_bytes,
+                            1..=4096,
+                        );
+                        changed |= widgets::opt_bool(
+                            ui,
+                            "xPaddingObfsMode",
+                            &mut s.x_padding_obfs_mode,
+                            t(lang, Key::SrvUnset),
+                        );
+                        changed |= widgets::text_field(ui, "xPaddingKey", &mut s.x_padding_key, "");
+                        changed |=
+                            widgets::text_field(ui, "xPaddingHeader", &mut s.x_padding_header, "");
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "xPaddingPlacement",
+                            &mut s.x_padding_placement,
+                            X_PADDING_PLACEMENTS,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "xPaddingMethod",
+                            &mut s.x_padding_method,
+                            PADDING_METHODS,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                    });
+                    widgets::section(ui, t(lang, Key::SrvUpload), |ui| {
+                        changed |= widgets::text_field(
+                            ui,
+                            "uplinkHTTPMethod",
+                            &mut s.uplink_http_method,
+                            "POST",
+                        );
+                        let incompatible_placement = s.mode != "packet-up"
+                            && !validation::uplink_placement_mode_supported(
+                                &s.uplink_data_placement,
+                                &s.mode,
+                            );
+                        if mode_changed && incompatible_placement {
+                            s.uplink_data_placement.clear();
+                        }
+                        let placements: &[&str] = if s.mode == "packet-up" {
+                            UPLINK_PLACEMENTS
+                        } else {
+                            &UPLINK_STREAM_PLACEMENTS
+                        };
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "uplinkDataPlacement",
+                            &mut s.uplink_data_placement,
+                            placements,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        if s.mode != "packet-up"
+                            && !validation::uplink_placement_mode_supported(
+                                &s.uplink_data_placement,
+                                &s.mode,
+                            )
+                        {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    status_colors_of(ui).err,
+                                    t(lang, Key::SrvCookieHeaderNeedsPacketUp),
+                                );
+                                if ui.small_button(t(lang, Key::SrvUseAuto)).clicked() {
+                                    s.uplink_data_placement.clear();
+                                    changed = true;
+                                }
+                            });
+                        }
+                        changed |=
+                            widgets::text_field(ui, "uplinkDataKey", &mut s.uplink_data_key, "");
+                        changed |= widgets::opt_range(
+                            ui,
+                            "uplinkChunkSize",
+                            &mut s.uplink_chunk_size,
+                            1..=1_000_000,
+                        );
+                        changed |= widgets::opt_bool(
+                            ui,
+                            "noGRPCHeader",
+                            &mut s.no_grpc_header,
+                            t(lang, Key::SrvUnset),
+                        );
+                        changed |= widgets::opt_bool(
+                            ui,
+                            "noSSEHeader",
+                            &mut s.no_sse_header,
+                            t(lang, Key::SrvUnset),
+                        );
+                    });
+                    widgets::section(ui, t(lang, Key::SrvSession), |ui| {
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "sessionIDPlacement",
+                            &mut s.session_id_placement,
+                            SESSION_PLACEMENTS,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        changed |=
+                            widgets::text_field(ui, "sessionIDKey", &mut s.session_id_key, "");
+                        changed |=
+                            widgets::text_field(ui, "sessionIDTable", &mut s.session_id_table, "");
+                        changed |= widgets::opt_range(
+                            ui,
+                            "sessionIDLength",
+                            &mut s.session_id_length,
+                            1..=64,
+                        );
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "seqPlacement",
+                            &mut s.seq_placement,
+                            SESSION_PLACEMENTS,
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        changed |= widgets::text_field(ui, "seqKey", &mut s.seq_key, "");
+                    });
+                    widgets::section(ui, t(lang, Key::SrvLimits), |ui| {
+                        changed |= widgets::opt_range(
+                            ui,
+                            "scMaxEachPostBytes",
+                            &mut s.sc_max_each_post_bytes,
+                            1000..=10_000_000,
+                        );
+                        changed |= widgets::opt_range(
+                            ui,
+                            "scMinPostsIntervalMs",
+                            &mut s.sc_min_posts_interval_ms,
+                            0..=10_000,
+                        );
+                        changed |= widgets::opt_num(
+                            ui,
+                            "scMaxBufferedPosts",
+                            &mut s.sc_max_buffered_posts,
+                            1..=1000,
+                        );
+                        changed |= widgets::opt_range(
+                            ui,
+                            "scStreamUpServerSecs",
+                            &mut s.sc_stream_up_server_secs,
+                            0..=3600,
+                        );
+                        changed |= widgets::opt_num(
+                            ui,
+                            "serverMaxHeaderBytes",
+                            &mut s.server_max_header_bytes,
+                            1024..=1_048_576,
+                        );
+                    });
+                    changed |= xmux_section(ui, lang, &mut s.xmux);
+                    if mode_changed && s.mode == "stream-one" {
+                        s.download_settings = None;
+                    }
+                    if s.mode == "stream-one" && s.download_settings.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                t(lang, Key::SrvDownloadNotAllowed),
+                            );
+                            if ui
+                                .small_button(t(lang, Key::SrvRemoveSplitDownload))
+                                .clicked()
                             {
-                                m.status_code = sc;
+                                s.download_settings = None;
                                 changed = true;
                             }
-                        }
-                        _ => {}
+                        });
                     }
-                }
-                if had_settings || changed {
-                    st.hysteria_settings = Some(s);
-                }
-            }
-            Network::Masque => {
-                let had_settings = st.masque_settings.is_some();
-                let mut s = st.masque_settings.take().unwrap_or_default();
-                // WARP changes both defaults the core applies: it replaces the
-                // host with `cloudflareaccess.com` and the path with `/`. The
-                // hints show the values the wire will carry, and the model's
-                // wire pass fills them in.
-                let default_host = if s.warp.is_some() {
-                    crate::model::stream::MASQUE_WARP_HOST
-                } else {
-                    "example.com"
-                };
-                let default_path = if s.warp.is_some() {
-                    crate::model::stream::MASQUE_WARP_PATH
-                } else {
-                    crate::model::stream::MASQUE_DEFAULT_PATH
-                };
-                changed |= widgets::text_field(ui, "host", &mut s.host, default_host);
-                // An unset path leaves the core's own default; the field hint
-                // shows that value, and only the two placeholders survive the
-                // model's `MasquePathInvalid` rule.
-                changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
-                changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
-                changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
-                changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
-                changed |= xmux_section(ui, lang, &mut s.xmux);
-                let mut has_warp = s.warp.is_some();
-                if ui
-                    .checkbox(&mut has_warp, t(lang, Key::SrvMasqueWarp))
-                    .changed()
-                {
-                    s.warp = has_warp.then(MasqueWarp::default);
-                    changed = true;
-                }
-                let credentials = !s.user.is_empty() || !s.pass.is_empty();
-                if let Some(warp) = s.warp.as_mut() {
-                    if credentials {
+                    if (depth as usize) < MAX_XHTTP_DOWNLOAD_DEPTH {
+                        widgets::section(
+                            ui,
+                            &t_fmt(lang, Key::SrvDownloadDepth, &[&(depth + 1)]),
+                            |ui| {
+                                if s.mode == "stream-one" {
+                                    ui.weak(t(lang, Key::SrvUnavailableStreamOne));
+                                    return;
+                                }
+                                let mut has = s.download_settings.is_some();
+                                if ui
+                                    .checkbox(&mut has, t(lang, Key::SrvSeparateDownlinkStream))
+                                    .changed()
+                                {
+                                    s.download_settings = if has {
+                                        Some(Box::new(StreamModel::default()))
+                                    } else {
+                                        None
+                                    };
+                                    changed = true;
+                                }
+                                if let Some(download) = s.download_settings.as_mut() {
+                                    ui.indent(("download", depth), |ui| {
+                                        changed |= self.transport_tab(
+                                            ui,
+                                            lang,
+                                            download,
+                                            depth + 1,
+                                            TransportTabCtx {
+                                                target,
+                                                masked,
+                                                protocol,
+                                                mux: None,
+                                            },
+                                        );
+                                        changed |= self.security_tab_readonly(ui, lang, download);
+                                    });
+                                }
+                            },
+                        );
+                    } else if let Some(download) = s.download_settings.as_ref() {
                         ui.colored_label(
                             status_colors_of(ui).err,
-                            validation_message(
-                                &ValidationCode::MasqueWarpCredentialsConflict,
-                                lang,
-                            ),
+                            t_fmt(lang, Key::SrvDepthExceeded, &[&MAX_XHTTP_DOWNLOAD_DEPTH]),
                         );
+                        egui::CollapsingHeader::new(t(lang, Key::SrvPreservedOverLimit))
+                            .id_salt(ui.auto_id_with(("download-over-limit", depth)))
+                            .show(ui, |ui| {
+                                let json = self.over_limit_json_for(target, depth, lang, download);
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        ui.monospace(json);
+                                    });
+                            });
                     }
-                    changed |= widgets::masked_validated_field(
-                        ui,
-                        t(lang, Key::SrvMasqueWarpPrivateKey),
-                        &mut warp.private_key,
-                        "",
-                        |value| v_masque_warp_private_key(lang, value),
-                        masked,
-                    );
-                    changed |= widgets::masked_validated_field(
-                        ui,
-                        t(lang, Key::SrvMasqueWarpPublicKey),
-                        &mut warp.public_key,
-                        "",
-                        |value| v_masque_warp_public_key(lang, value),
-                        masked,
-                    );
-                    // One entry can be IPv4 or IPv6; a second must be the
-                    // other family. The row rule judges one entry, and the
-                    // list rule — the same one the model pass reads — reports
-                    // the count and family rule under the list.
-                    changed |= widgets::validated_string_list(
-                        ui,
-                        lang,
-                        t(lang, Key::SrvMasqueWarpAddresses),
-                        &mut warp.address,
-                        "172.16.0.2",
-                        |entry, _list_len| v_masque_warp_address_entry(lang, entry),
-                    );
-                    if let Some(code) = masque_warp_address_list_verdict(&warp.address) {
-                        ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
-                    }
-                }
-                if had_settings || changed {
-                    st.masque_settings = Some(s);
-                }
+                    changed
+                });
             }
-            Network::Xdrive => {
-                let had_settings = st.xdrive_settings.is_some();
-                let mut s = st.xdrive_settings.take().unwrap_or_default();
-                changed |= widgets::combo_str_labeled(
-                    ui,
-                    t(lang, Key::SrvXdriveService),
-                    &mut s.service,
-                    XDRIVE_SERVICES,
-                    t(lang, Key::SrvXdriveServiceUnset),
-                    false,
-                );
-                // The service decides what the folder names, so the hint
-                // follows the choice and the field is required exactly where
-                // the core refuses an empty one at start.
-                let folder_hint = match s.service.as_str() {
-                    XDRIVE_SERVICE_LOCAL => t(lang, Key::SrvXdriveFolderLocalHint),
-                    XDRIVE_SERVICE_DRIVE => t(lang, Key::SrvXdriveFolderDriveHint),
-                    XDRIVE_SERVICE_TEMPLATE => t(lang, Key::SrvXdriveFolderTemplateHint),
-                    _ => "",
-                };
-                let folder_required =
-                    s.service == XDRIVE_SERVICE_LOCAL || s.service == XDRIVE_SERVICE_DRIVE;
-                let folder_validate = |folder: &str| {
-                    (folder_required && folder.is_empty()).then(|| {
-                        validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
-                    })
-                };
-                // The local service is the one that names a directory on this
-                // machine — the one folder whose format the user cannot guess
-                // — so it gets the picker. The Drive folder id and the
-                // template token are opaque to the outside, and the button
-                // comes and goes with the service chosen above.
-                let mut pick_folder = |ui: &mut egui::Ui| -> Option<String> {
-                    if !ui.small_button(t(lang, Key::SrvBrowse)).clicked() {
-                        return None;
-                    }
-                    rfd::FileDialog::new()
-                        .pick_folder()
-                        .map(|folder| folder.to_string_lossy().into_owned())
-                };
-                let folder_picker: Option<widgets::Trailing<'_>> =
-                    (s.service == XDRIVE_SERVICE_LOCAL).then_some(&mut pick_folder);
-                changed |= widgets::validated_field_with_trailing(
-                    ui,
-                    t(lang, Key::SrvXdriveRemoteFolder),
-                    &mut s.remote_folder,
-                    folder_hint,
-                    folder_validate,
-                    folder_picker,
-                );
-                changed |= widgets::masked_string_list(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveSecrets),
-                    &mut s.secrets,
-                    "",
-                    masked,
-                );
-                if s.service == XDRIVE_SERVICE_DRIVE {
-                    ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
-                    // The core's conf build refuses any count but three, so
-                    // the editor says so where the rows are.
-                    if s.secrets.len() != 3 {
-                        ui.colored_label(
-                            status_colors_of(ui).err,
-                            validation_message(&ValidationCode::XdriveDriveSecretsInvalid, lang),
-                        );
-                    }
-                }
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveSegmentBytes),
-                    &mut s.segment_bytes,
-                    XDRIVE_MAX_SEGMENT_BYTES,
-                    XDRIVE_DEFAULT_SEGMENT_BYTES,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveFlushInterval),
-                    &mut s.flush_interval_ms,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdrivePollInterval),
-                    &mut s.poll_interval_ms,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_POLL_INTERVAL_MS,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveMaxPollInterval),
-                    &mut s.max_poll_interval_ms,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-                );
-                // The core raises a max poll interval below the min poll
-                // interval (transport/internet/xdrive/params.go:65-67); the
-                // model warns for the same pair, so the editor shows it here
-                // where both fields are visible.
-                let effective = |value: u32, default: u32| if value == 0 { default } else { value };
-                if effective(s.max_poll_interval_ms, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS)
-                    < effective(s.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
-                {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        validation_message(&ValidationCode::XdriveScalarClamped, lang),
+            Network::Kcp => {
+                changed |= st.edit_kcp(|s| {
+                    let mut changed = false;
+                    changed |= widgets::opt_num(ui, "mtu", &mut s.mtu, 576..=9000);
+                    changed |= widgets::opt_num(ui, t(lang, Key::SrvTtiMs), &mut s.tti, 10..=200);
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvUplinkCapacity),
+                        &mut s.uplink_capacity,
+                        0..=10_000,
                     );
-                }
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveSessionTtl),
-                    &mut s.session_ttl_seconds,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_SESSION_TTL_SECONDS,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveConcurrency),
-                    &mut s.concurrency,
-                    XDRIVE_MAX_CONCURRENCY,
-                    XDRIVE_DEFAULT_CONCURRENCY,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveEagerWindow),
-                    &mut s.eager_window_ms,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_EAGER_WINDOW_MS,
-                );
-                changed |= xdrive_scalar(
-                    ui,
-                    lang,
-                    t(lang, Key::SrvXdriveHoleTimeout),
-                    &mut s.hole_timeout_ms,
-                    u32::MAX,
-                    XDRIVE_DEFAULT_HOLE_TIMEOUT_MS,
-                );
-                // The one configuration that writes outside the app's own
-                // state, so the user sees the warning where they type the
-                // path; the apply gate asks for the same acknowledgment.
-                if s.service == XDRIVE_SERVICE_LOCAL && !s.remote_folder.is_empty() {
-                    ui.colored_label(
-                        status_colors_of(ui).warn,
-                        t(lang, Key::SrvXdriveLocalWarning),
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvDownlinkCapacity),
+                        &mut s.downlink_capacity,
+                        0..=10_000,
                     );
-                }
-                if s.service == XDRIVE_SERVICE_TEMPLATE {
-                    let had_template = s.template.is_some();
-                    let mut template = s.template.take().unwrap_or_default();
-                    if self.xdrive_template_editor(ui, lang, &mut template, s.secrets.len(), masked)
-                    {
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvCwndMultiplier),
+                        &mut s.cwnd_multiplier,
+                        1..=16,
+                    );
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvMaxSendingWindow),
+                        &mut s.max_sending_window,
+                        1..=10_000,
+                    );
+                    changed
+                });
+            }
+            Network::Grpc => {
+                changed |= st.edit_grpc(|s| {
+                    let mut changed = false;
+                    changed |= widgets::text_field(ui, "serviceName", &mut s.service_name, "grpc");
+                    changed |=
+                        widgets::text_field(ui, "authority", &mut s.authority, "example.com");
+                    changed |= widgets::noted(ui, t(lang, Key::SrvGrpcMultiModeNote), |ui| {
+                        widgets::opt_bool(
+                            ui,
+                            "multiMode",
+                            &mut s.multi_mode,
+                            t(lang, Key::SrvUnset),
+                        )
+                    });
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvIdleTimeoutS),
+                        &mut s.idle_timeout,
+                        0..=3600,
+                    );
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvHealthCheckTimeoutS),
+                        &mut s.health_check_timeout,
+                        0..=600,
+                    );
+                    changed |= widgets::opt_bool(
+                        ui,
+                        "permit_without_stream",
+                        &mut s.permit_without_stream,
+                        t(lang, Key::SrvUnset),
+                    );
+                    changed |= widgets::opt_num(
+                        ui,
+                        "initial_windows_size",
+                        &mut s.initial_windows_size,
+                        0..=16_777_215,
+                    );
+                    changed |= opt_string(ui, "user_agent", &mut s.user_agent, "");
+                    changed
+                });
+            }
+            Network::Ws => {
+                changed |= st.edit_ws(|s| {
+                    let mut changed = false;
+                    changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                    changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
+                    changed |= websocket_transport_headers(ui, lang, s, &mut self.json_key_scratch);
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvHeartbeatPeriodS),
+                        &mut s.heartbeat_period,
+                        0..=600,
+                    );
+                    changed
+                });
+            }
+            Network::Httpupgrade => {
+                changed |= st.edit_httpupgrade(|s| {
+                    let mut changed = false;
+                    changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
+                    changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
+                    changed |=
+                        transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                    changed
+                });
+            }
+            Network::Hysteria => {
+                changed |= st.edit_hysteria(|s| {
+                    let mut changed = false;
+                    if s.version != 2 {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                t(lang, Key::SrvOnlyHysteria2),
+                            );
+                            if ui.small_button(t(lang, Key::SrvUseVersion2)).clicked() {
+                                s.version = 2;
+                                changed = true;
+                            }
+                        });
+                    }
+                    changed |= widgets::masked_text_field(
+                        ui,
+                        t(lang, Key::SrvAuthPassword),
+                        &mut s.auth,
+                        "",
+                        masked,
+                    );
+                    changed |= widgets::opt_num(
+                        ui,
+                        t(lang, Key::SrvUdpIdleTimeoutS),
+                        &mut s.udp_idle_timeout,
+                        2..=600,
+                    );
+                    let mut has = s.masquerade.is_some();
+                    if ui.checkbox(&mut has, t(lang, Key::SrvMasquerade)).changed() {
+                        s.masquerade = if has {
+                            Some(MasqueradeCfg::default())
+                        } else {
+                            None
+                        };
                         changed = true;
                     }
-                    if had_template || changed {
-                        s.template = Some(template);
+                    if let Some(m) = s.masquerade.as_mut() {
+                        changed |= widgets::combo_str_labeled(
+                            ui,
+                            "type",
+                            &mut m.r#type,
+                            &["", "file", "proxy", "string"],
+                            t(lang, Key::SrvDefault),
+                            false,
+                        );
+                        match m.r#type.as_str() {
+                            "file" => {
+                                changed |= widgets::text_field(ui, "dir", &mut m.dir, "C:\\\\web");
+                            }
+                            "proxy" => {
+                                changed |= widgets::text_field(
+                                    ui,
+                                    "url",
+                                    &mut m.url,
+                                    "https://example.com",
+                                );
+                                changed |= ui
+                                    .checkbox(&mut m.rewrite_host, t(lang, Key::SrvRewriteHost))
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(&mut m.x_forwarded, t(lang, Key::SrvXForwarded))
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(&mut m.insecure, t(lang, Key::SrvSkipTlsVerify))
+                                    .changed();
+                            }
+                            "string" => {
+                                changed |= widgets::text_field(ui, "content", &mut m.content, "");
+                                changed |= json_map_kv(
+                                    ui,
+                                    lang,
+                                    &mut m.headers,
+                                    t(lang, Key::HeaderHint),
+                                    t(lang, Key::ValueHint),
+                                    &mut self.json_key_scratch,
+                                );
+                                let mut sc = m.status_code;
+                                if widgets::opt_num(
+                                    ui,
+                                    t(lang, Key::SrvStatusCode),
+                                    &mut sc,
+                                    100..=599,
+                                ) {
+                                    m.status_code = sc;
+                                    changed = true;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                }
-                changed |= xmux_section(ui, lang, &mut s.xmux);
-                if had_settings || changed {
-                    st.xdrive_settings = Some(s);
-                }
+                    changed
+                });
+            }
+            Network::Masque => {
+                changed |= st.edit_masque(|s| {
+                    let mut changed = false;
+                    // WARP changes both defaults the core applies: it replaces the
+                    // host with `cloudflareaccess.com` and the path with `/`. The
+                    // hints show the values the wire will carry, and the model's
+                    // wire pass fills them in.
+                    let default_host = if s.warp.is_some() {
+                        crate::model::stream::MASQUE_WARP_HOST
+                    } else {
+                        "example.com"
+                    };
+                    let default_path = if s.warp.is_some() {
+                        crate::model::stream::MASQUE_WARP_PATH
+                    } else {
+                        crate::model::stream::MASQUE_DEFAULT_PATH
+                    };
+                    changed |= widgets::text_field(ui, "host", &mut s.host, default_host);
+                    // An unset path leaves the core's own default; the field hint
+                    // shows that value, and only the two placeholders survive the
+                    // model's `MasquePathInvalid` rule.
+                    changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
+                    changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
+                    changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
+                    changed |=
+                        transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                    changed |= xmux_section(ui, lang, &mut s.xmux);
+                    let mut has_warp = s.warp.is_some();
+                    if ui
+                        .checkbox(&mut has_warp, t(lang, Key::SrvMasqueWarp))
+                        .changed()
+                    {
+                        s.warp = has_warp.then(MasqueWarp::default);
+                        changed = true;
+                    }
+                    let credentials = !s.user.is_empty() || !s.pass.is_empty();
+                    if let Some(warp) = s.warp.as_mut() {
+                        if credentials {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                validation_message(
+                                    &ValidationCode::MasqueWarpCredentialsConflict,
+                                    lang,
+                                ),
+                            );
+                        }
+                        changed |= widgets::masked_validated_field(
+                            ui,
+                            t(lang, Key::SrvMasqueWarpPrivateKey),
+                            &mut warp.private_key,
+                            "",
+                            |value| v_masque_warp_private_key(lang, value),
+                            masked,
+                        );
+                        changed |= widgets::masked_validated_field(
+                            ui,
+                            t(lang, Key::SrvMasqueWarpPublicKey),
+                            &mut warp.public_key,
+                            "",
+                            |value| v_masque_warp_public_key(lang, value),
+                            masked,
+                        );
+                        // One entry can be IPv4 or IPv6; a second must be the
+                        // other family. The row rule judges one entry, and the
+                        // list rule — the same one the model pass reads — reports
+                        // the count and family rule under the list.
+                        changed |= widgets::validated_string_list(
+                            ui,
+                            lang,
+                            t(lang, Key::SrvMasqueWarpAddresses),
+                            &mut warp.address,
+                            "172.16.0.2",
+                            |entry, _list_len| v_masque_warp_address_entry(lang, entry),
+                        );
+                        if let Some(code) = masque_warp_address_list_verdict(&warp.address) {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                validation_message(&code, lang),
+                            );
+                        }
+                    }
+                    changed
+                });
+            }
+            Network::Xdrive => {
+                changed |= st.edit_xdrive(|s| {
+                    let mut changed = false;
+                    changed |= widgets::combo_str_labeled(
+                        ui,
+                        t(lang, Key::SrvXdriveService),
+                        &mut s.service,
+                        XDRIVE_SERVICES,
+                        t(lang, Key::SrvXdriveServiceUnset),
+                        false,
+                    );
+                    // The service decides what the folder names, so the hint
+                    // follows the choice and the field is required exactly where
+                    // the core refuses an empty one at start.
+                    let folder_hint = match s.service.as_str() {
+                        XDRIVE_SERVICE_LOCAL => t(lang, Key::SrvXdriveFolderLocalHint),
+                        XDRIVE_SERVICE_DRIVE => t(lang, Key::SrvXdriveFolderDriveHint),
+                        XDRIVE_SERVICE_TEMPLATE => t(lang, Key::SrvXdriveFolderTemplateHint),
+                        _ => "",
+                    };
+                    let folder_required =
+                        s.service == XDRIVE_SERVICE_LOCAL || s.service == XDRIVE_SERVICE_DRIVE;
+                    let folder_validate = |folder: &str| {
+                        (folder_required && folder.is_empty()).then(|| {
+                            validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
+                        })
+                    };
+                    // The local service is the one that names a directory on this
+                    // machine — the one folder whose format the user cannot guess
+                    // — so it gets the picker. The Drive folder id and the
+                    // template token are opaque to the outside, and the button
+                    // comes and goes with the service chosen above.
+                    let mut pick_folder = |ui: &mut egui::Ui| -> Option<String> {
+                        if !ui.small_button(t(lang, Key::SrvBrowse)).clicked() {
+                            return None;
+                        }
+                        rfd::FileDialog::new()
+                            .pick_folder()
+                            .map(|folder| folder.to_string_lossy().into_owned())
+                    };
+                    let folder_picker: Option<widgets::Trailing<'_>> =
+                        (s.service == XDRIVE_SERVICE_LOCAL).then_some(&mut pick_folder);
+                    changed |= widgets::validated_field_with_trailing(
+                        ui,
+                        t(lang, Key::SrvXdriveRemoteFolder),
+                        &mut s.remote_folder,
+                        folder_hint,
+                        folder_validate,
+                        folder_picker,
+                    );
+                    changed |= widgets::masked_string_list(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveSecrets),
+                        &mut s.secrets,
+                        "",
+                        masked,
+                    );
+                    if s.service == XDRIVE_SERVICE_DRIVE {
+                        ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
+                        // The core's conf build refuses any count but three, so
+                        // the editor says so where the rows are.
+                        if s.secrets.len() != 3 {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                validation_message(
+                                    &ValidationCode::XdriveDriveSecretsInvalid,
+                                    lang,
+                                ),
+                            );
+                        }
+                    }
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveSegmentBytes),
+                        &mut s.segment_bytes,
+                        XDRIVE_MAX_SEGMENT_BYTES,
+                        XDRIVE_DEFAULT_SEGMENT_BYTES,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveFlushInterval),
+                        &mut s.flush_interval_ms,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdrivePollInterval),
+                        &mut s.poll_interval_ms,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_POLL_INTERVAL_MS,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveMaxPollInterval),
+                        &mut s.max_poll_interval_ms,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+                    );
+                    // The core raises a max poll interval below the min poll
+                    // interval (transport/internet/xdrive/params.go:65-67); the
+                    // model warns for the same pair, so the editor shows it here
+                    // where both fields are visible.
+                    let effective =
+                        |value: u32, default: u32| if value == 0 { default } else { value };
+                    if effective(s.max_poll_interval_ms, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS)
+                        < effective(s.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
+                    {
+                        ui.colored_label(
+                            status_colors_of(ui).warn,
+                            validation_message(&ValidationCode::XdriveScalarClamped, lang),
+                        );
+                    }
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveSessionTtl),
+                        &mut s.session_ttl_seconds,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_SESSION_TTL_SECONDS,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveConcurrency),
+                        &mut s.concurrency,
+                        XDRIVE_MAX_CONCURRENCY,
+                        XDRIVE_DEFAULT_CONCURRENCY,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveEagerWindow),
+                        &mut s.eager_window_ms,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_EAGER_WINDOW_MS,
+                    );
+                    changed |= xdrive_scalar(
+                        ui,
+                        lang,
+                        t(lang, Key::SrvXdriveHoleTimeout),
+                        &mut s.hole_timeout_ms,
+                        u32::MAX,
+                        XDRIVE_DEFAULT_HOLE_TIMEOUT_MS,
+                    );
+                    // The one configuration that writes outside the app's own
+                    // state, so the user sees the warning where they type the
+                    // path; the apply gate asks for the same acknowledgment.
+                    if s.service == XDRIVE_SERVICE_LOCAL && !s.remote_folder.is_empty() {
+                        ui.colored_label(
+                            status_colors_of(ui).warn,
+                            t(lang, Key::SrvXdriveLocalWarning),
+                        );
+                    }
+                    if s.service == XDRIVE_SERVICE_TEMPLATE {
+                        let had_template = s.template.is_some();
+                        let mut template = s.template.take().unwrap_or_default();
+                        if self.xdrive_template_editor(
+                            ui,
+                            lang,
+                            &mut template,
+                            s.secrets.len(),
+                            masked,
+                        ) {
+                            changed = true;
+                        }
+                        if had_template || changed {
+                            s.template = Some(template);
+                        }
+                    }
+                    changed |= xmux_section(ui, lang, &mut s.xmux);
+                    changed
+                });
             }
         }
         changed
@@ -6607,6 +6719,95 @@ impl ServersScreen {
 
     // ---------- Advanced tab ----------
 
+    /// One finalmask list: the kind's rows, the reorder/remove application,
+    /// and the add button — the chrome both mask kinds share.
+    fn finalmask_mask_list<M: MaskKind>(
+        ui: &mut egui::Ui,
+        lang: Language,
+        spec: &MaskListSpec<'_>,
+        masks: &mut Vec<M>,
+        buffers: &mut SeededBuffers,
+    ) -> bool {
+        ui.heading(t(lang, spec.heading));
+        ui.weak(t(lang, spec.note));
+        let len = masks.len();
+        let mut remove = None;
+        let mut move_to = None;
+        let mut changed = false;
+        for (index, mask) in masks.iter_mut().enumerate() {
+            ui.push_id((spec.group, spec.profile, index), |ui| {
+                ui.group(|ui| {
+                    let known = mask.known_type();
+                    // Known masks display their &'static type name — no
+                    // per-frame allocation; the translated placeholder is
+                    // built only for unknown envelopes.
+                    let selected: std::borrow::Cow<'static, str> = match known {
+                        Some(kind) => std::borrow::Cow::Borrowed(kind),
+                        None => std::borrow::Cow::Owned(t_fmt(
+                            lang,
+                            Key::SrvUnknownType,
+                            &[&mask.discriminator().unwrap_or(t(lang, Key::SrvMissingType))],
+                        )),
+                    };
+                    let mut picked: Option<&'static str> = None;
+                    ui.horizontal(|ui| {
+                        ui.label(t_fmt(lang, spec.ordinal, &[&(index + 1)]));
+                        egui::ComboBox::from_id_salt("type")
+                            .selected_text(selected.as_ref())
+                            .show_ui(ui, |ui| {
+                                for kind in M::outbound_types() {
+                                    if ui.selectable_label(known == Some(kind), kind).clicked() {
+                                        picked = Some(kind);
+                                    }
+                                }
+                                if known.is_none() {
+                                    // Keep-the-unknown row: clicking it must
+                                    // not replace the unknown envelope with a
+                                    // known type.
+                                    ui.selectable_label(true, selected.as_ref()).clicked();
+                                }
+                            });
+                        finalmask_move_buttons(ui, lang, index, len, &mut move_to, &mut remove);
+                    });
+                    if picked != known
+                        && let Some(replacement) = picked.and_then(M::from_known_type)
+                    {
+                        *mask = replacement;
+                        changed = true;
+                    }
+                    changed |= M::edit_settings(
+                        ui,
+                        lang,
+                        mask,
+                        RawField {
+                            id: FieldKey {
+                                key: egui::Id::new(("fm", spec.profile, spec.tag, index)),
+                                profile: spec.profile,
+                            },
+                            buffers: &mut *buffers,
+                        },
+                        spec.masked,
+                        spec.revision,
+                    );
+                });
+            });
+        }
+        if let Some((from, to)) = move_to {
+            masks.swap(from, to);
+            changed = true;
+        }
+        if let Some(index) = remove {
+            masks.remove(index);
+            changed = true;
+        }
+        if ui.button(t(lang, spec.add_label)).clicked() {
+            masks
+                .push(M::from_known_type("header-custom").expect("registered finalmask mask type"));
+            changed = true;
+        }
+        changed
+    }
+
     /// Renders the Advanced tab — shared by the existing-draft editor and
     /// the add-server dialog (the add draft is not yet in the profile set,
     /// so excluding its id from the tag options is inert there).
@@ -6680,185 +6881,42 @@ impl ServersScreen {
             let had_finalmask = o.stream.finalmask.is_some();
             let mut fm = o.stream.finalmask.take().unwrap_or_default();
 
-            ui.heading(t(lang, Key::SrvTcpMasks));
-            ui.weak(t(lang, Key::SrvTcpMaskOrderNote));
-            let tcp_len = fm.tcp.len();
-            let mut tcp_remove = None;
-            let mut tcp_move = None;
-            for (index, mask) in fm.tcp.iter_mut().enumerate() {
-                ui.push_id(("finalmask-tcp", key, index), |ui| {
-                    ui.group(|ui| {
-                        let known = mask.known_type();
-                        // Known masks display their &'static type name — no
-                        // per-frame allocation; the translated placeholder is
-                        // built only for unknown envelopes.
-                        let selected: std::borrow::Cow<'static, str> = match known {
-                            Some(kind) => std::borrow::Cow::Borrowed(kind),
-                            None => std::borrow::Cow::Owned(t_fmt(
-                                lang,
-                                Key::SrvUnknownType,
-                                &[&mask.discriminator().unwrap_or(t(lang, Key::SrvMissingType))],
-                            )),
-                        };
-                        let mut picked: Option<&'static str> = None;
-                        ui.horizontal(|ui| {
-                            ui.label(t_fmt(lang, Key::SrvTcpN, &[&(index + 1)]));
-                            egui::ComboBox::from_id_salt("type")
-                                .selected_text(selected.as_ref())
-                                .show_ui(ui, |ui| {
-                                    for kind in FinalmaskTcpMask::outbound_types() {
-                                        if ui
-                                            .selectable_label(mask.known_type() == Some(kind), kind)
-                                            .clicked()
-                                        {
-                                            picked = Some(kind);
-                                        }
-                                    }
-                                    if known.is_none() {
-                                        // Keep-the-unknown row: clicking it
-                                        // must not replace the unknown
-                                        // envelope with a known type.
-                                        ui.selectable_label(true, selected.as_ref()).clicked();
-                                    }
-                                });
-                            finalmask_move_buttons(
-                                ui,
-                                lang,
-                                index,
-                                tcp_len,
-                                &mut tcp_move,
-                                &mut tcp_remove,
-                            );
-                        });
-                        if picked != mask.known_type()
-                            && let Some(replacement) =
-                                picked.and_then(FinalmaskTcpMask::from_known_type)
-                        {
-                            *mask = replacement;
-                            changed = true;
-                        }
-                        changed |= finalmask_tcp_settings_editor(
-                            ui,
-                            lang,
-                            mask,
-                            RawField {
-                                id: FieldKey {
-                                    key: egui::Id::new(("fm", key, "tcp", index)),
-                                    profile: key,
-                                },
-                                buffers: &mut *buffers,
-                            },
-                            masked,
-                        );
-                    });
-                });
-            }
-            if let Some((from, to)) = tcp_move {
-                fm.tcp.swap(from, to);
-                changed = true;
-            }
-            if let Some(index) = tcp_remove {
-                fm.tcp.remove(index);
-                changed = true;
-            }
-            if ui.button(t(lang, Key::SrvAddTcpMask)).clicked() {
-                fm.tcp.push(
-                    FinalmaskTcpMask::from_known_type("header-custom")
-                        .expect("registered finalmask TCP type"),
-                );
-                changed = true;
-            }
+            changed |= Self::finalmask_mask_list(
+                ui,
+                lang,
+                &MaskListSpec {
+                    group: "finalmask-tcp",
+                    tag: "tcp",
+                    profile: key,
+                    heading: Key::SrvTcpMasks,
+                    note: Key::SrvTcpMaskOrderNote,
+                    ordinal: Key::SrvTcpN,
+                    add_label: Key::SrvAddTcpMask,
+                    masked,
+                    revision: set_key.0,
+                },
+                &mut fm.tcp,
+                buffers,
+            );
 
             ui.separator();
-            ui.heading(t(lang, Key::SrvUdpMasks));
-            ui.weak(t(lang, Key::SrvUdpMaskOrderNote));
-            let udp_len = fm.udp.len();
-            let mut udp_remove = None;
-            let mut udp_move = None;
-            for (index, mask) in fm.udp.iter_mut().enumerate() {
-                ui.push_id(("finalmask-udp", key, index), |ui| {
-                    ui.group(|ui| {
-                        let known = mask.known_type();
-                        // Known masks display their &'static type name — no
-                        // per-frame allocation; the translated placeholder is
-                        // built only for unknown envelopes.
-                        let selected: std::borrow::Cow<'static, str> = match known {
-                            Some(kind) => std::borrow::Cow::Borrowed(kind),
-                            None => std::borrow::Cow::Owned(t_fmt(
-                                lang,
-                                Key::SrvUnknownType,
-                                &[&mask.discriminator().unwrap_or(t(lang, Key::SrvMissingType))],
-                            )),
-                        };
-                        let mut picked: Option<&'static str> = None;
-                        ui.horizontal(|ui| {
-                            ui.label(t_fmt(lang, Key::SrvUdpN, &[&(index + 1)]));
-                            egui::ComboBox::from_id_salt("type")
-                                .selected_text(selected.as_ref())
-                                .show_ui(ui, |ui| {
-                                    for kind in FinalmaskUdpMask::outbound_types() {
-                                        if ui
-                                            .selectable_label(mask.known_type() == Some(kind), kind)
-                                            .clicked()
-                                        {
-                                            picked = Some(kind);
-                                        }
-                                    }
-                                    if known.is_none() {
-                                        // Keep-the-unknown row: clicking it
-                                        // must not replace the unknown
-                                        // envelope with a known type.
-                                        ui.selectable_label(true, selected.as_ref()).clicked();
-                                    }
-                                });
-                            finalmask_move_buttons(
-                                ui,
-                                lang,
-                                index,
-                                udp_len,
-                                &mut udp_move,
-                                &mut udp_remove,
-                            );
-                        });
-                        if picked != mask.known_type()
-                            && let Some(replacement) =
-                                picked.and_then(FinalmaskUdpMask::from_known_type)
-                        {
-                            *mask = replacement;
-                            changed = true;
-                        }
-                        changed |= finalmask_udp_settings_editor(
-                            ui,
-                            lang,
-                            mask,
-                            RawField {
-                                id: FieldKey {
-                                    key: egui::Id::new(("fm", key, "udp", index)),
-                                    profile: key,
-                                },
-                                buffers: &mut *buffers,
-                            },
-                            masked,
-                            set_key.0,
-                        );
-                    });
-                });
-            }
-            if let Some((from, to)) = udp_move {
-                fm.udp.swap(from, to);
-                changed = true;
-            }
-            if let Some(index) = udp_remove {
-                fm.udp.remove(index);
-                changed = true;
-            }
-            if ui.button(t(lang, Key::SrvAddUdpMask)).clicked() {
-                fm.udp.push(
-                    FinalmaskUdpMask::from_known_type("header-custom")
-                        .expect("registered finalmask UDP type"),
-                );
-                changed = true;
-            }
+            changed |= Self::finalmask_mask_list(
+                ui,
+                lang,
+                &MaskListSpec {
+                    group: "finalmask-udp",
+                    tag: "udp",
+                    profile: key,
+                    heading: Key::SrvUdpMasks,
+                    note: Key::SrvUdpMaskOrderNote,
+                    ordinal: Key::SrvUdpN,
+                    add_label: Key::SrvAddUdpMask,
+                    masked,
+                    revision: set_key.0,
+                },
+                &mut fm.udp,
+                buffers,
+            );
 
             ui.separator();
             changed |= finalmask_quic_editor(ui, lang, "quicParams", &mut fm.quic_params);

@@ -2,6 +2,7 @@
 //! finalmask. `network` selects which `<network>Settings` key is meaningful;
 //! serialization always emits flat `streamSettings` wire shape.
 
+use super::outbound::Protocol;
 use super::validation::ValidationCode;
 use super::{
     Int32Range, fold_eq, fold_lower, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
@@ -75,6 +76,48 @@ impl Network {
     /// REALITY is accepted by Xray only for raw/TCP, XHTTP, and gRPC.
     pub fn supports_reality(self) -> bool {
         matches!(self, Network::Raw | Network::Xhttp | Network::Grpc)
+    }
+
+    /// Every transport, in model variant order.
+    pub const ALL: [Network; 9] = [
+        Network::Raw,
+        Network::Xhttp,
+        Network::Kcp,
+        Network::Grpc,
+        Network::Ws,
+        Network::Httpupgrade,
+        Network::Hysteria,
+        Network::Masque,
+        Network::Xdrive,
+    ];
+
+    /// The transports the outbound editor offers for `protocol`, in selector
+    /// order: a MASQUE outbound is the MASQUE handler and carries that one
+    /// transport only; a VLESS outbound carries every transport but MASQUE;
+    /// every other protocol carries the general transports (neither
+    /// handler-integrated transport applies to it).
+    pub fn selectable_networks(protocol: Protocol) -> &'static [Network] {
+        /// [`Network::ALL`] in selector order: the general transports, then
+        /// the outbound-handler transports, Xdrive before Masque.
+        const SELECTOR: &[Network] = &[
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+            Network::Xdrive,
+            Network::Masque,
+        ];
+        /// The general transports are the selector's prefix up to here.
+        const GENERAL: usize = 7;
+        let (general, handlers) = SELECTOR.split_at(GENERAL);
+        match protocol {
+            Protocol::Masque => &handlers[1..],
+            Protocol::Vless => &SELECTOR[..=GENERAL],
+            _ => general,
+        }
     }
 }
 
@@ -2487,7 +2530,8 @@ impl FinalmaskModel {
 }
 
 /// The transport-block table: one row per `network`, naming the settings
-/// field it owns and the wire key that field serializes under.
+/// field it owns, the editor accessor that renders it, and the wire key that
+/// field serializes under.
 ///
 /// `network` is a discriminator whose payload lives in eight sibling fields,
 /// so "which block does this transport use" is a fact every reader needs:
@@ -2496,7 +2540,7 @@ impl FinalmaskModel {
 /// transport configured". The rows are the one place the correspondence is
 /// written, so a new transport is one row and no caller can be forgotten.
 macro_rules! transport_blocks {
-    ($($variant:ident : $field:ident, $settings:ty => $requirement:ident $block:literal;)*) => {
+    ($($variant:ident : $field:ident, $settings:ty, $editor:ident => $requirement:ident $block:literal;)*) => {
         /// The selected transport's block, borrowed mutably: what an editor
         /// tab or a transport selector edits, without a take-and-put-back
         /// around a local copy.
@@ -2526,6 +2570,23 @@ macro_rules! transport_blocks {
                     )*
                 }
             }
+
+            $(
+                /// Render the selected transport's block through the one
+                /// table. The block is taken out so an untouched render
+                /// leaves an absent block absent (the draft keeps the user's
+                /// switch state), and it is put back when it was present
+                /// before or the editor reported a change.
+                pub fn $editor(&mut self, edit: impl FnOnce(&mut $settings) -> bool) -> bool {
+                    let had = self.$field.is_some();
+                    let mut block = self.$field.take().unwrap_or_default();
+                    let changed = edit(&mut block);
+                    if had || changed {
+                        self.$field = Some(block);
+                    }
+                    changed
+                }
+            )*
 
             /// Whether the selected transport's block is present at all. Xray
             /// builds every non-nil transport block, so an absent one for the
@@ -2581,15 +2642,15 @@ macro_rules! transport_blocks {
 }
 
 transport_blocks! {
-    Raw: raw_settings, RawSettings => optional "tcpSettings";
-    Xhttp: xhttp_settings, XhttpSettings => required "xhttpSettings";
-    Kcp: kcp_settings, KcpSettings => required "kcpSettings";
-    Grpc: grpc_settings, GrpcSettings => required "grpcSettings";
-    Ws: ws_settings, WsSettings => required "wsSettings";
-    Httpupgrade: httpupgrade_settings, HttpupgradeSettings => required "httpupgradeSettings";
-    Hysteria: hysteria_settings, HysteriaTransport => required "hysteriaSettings";
-    Masque: masque_settings, MasqueTransport => required "masqueSettings";
-    Xdrive: xdrive_settings, Box<XdriveTransport> => required "xdriveSettings";
+    Raw: raw_settings, RawSettings, edit_raw => optional "tcpSettings";
+    Xhttp: xhttp_settings, XhttpSettings, edit_xhttp => required "xhttpSettings";
+    Kcp: kcp_settings, KcpSettings, edit_kcp => required "kcpSettings";
+    Grpc: grpc_settings, GrpcSettings, edit_grpc => required "grpcSettings";
+    Ws: ws_settings, WsSettings, edit_ws => required "wsSettings";
+    Httpupgrade: httpupgrade_settings, HttpupgradeSettings, edit_httpupgrade => required "httpupgradeSettings";
+    Hysteria: hysteria_settings, HysteriaTransport, edit_hysteria => required "hysteriaSettings";
+    Masque: masque_settings, MasqueTransport, edit_masque => required "masqueSettings";
+    Xdrive: xdrive_settings, Box<XdriveTransport>, edit_xdrive => required "xdriveSettings";
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2783,14 +2844,22 @@ impl StreamModel {
             && self.extra.is_empty()
     }
 
-    /// Select a transport while keeping the cross-field Xray invariants valid.
-    pub fn select_network(&mut self, network: Network) -> Result<(), ValidationCode> {
+    /// Whether the current security mode can ride `network`: REALITY is
+    /// accepted only on the transports that support it, with Hysteria the
+    /// exception (choosing it switches the security mode to TLS).
+    pub fn can_select_network(&self, network: Network) -> Result<(), ValidationCode> {
         if self.security == Security::Reality
             && network != Network::Hysteria
             && !network.supports_reality()
         {
             return Err(ValidationCode::RealityRequiresTransport);
         }
+        Ok(())
+    }
+
+    /// Select a transport while keeping the cross-field Xray invariants valid.
+    pub fn select_network(&mut self, network: Network) -> Result<(), ValidationCode> {
+        self.can_select_network(network)?;
         self.network = network;
         // The selector materializes the selected block through the one table;
         // hysteria carries two further invariants Xray's own loader would
@@ -2883,6 +2952,7 @@ mod tests {
         XdriveTransport, XhttpSettings, XmuxConfig, transport_settings_key,
         transport_settings_path,
     };
+    use crate::model::validation::ValidationCode;
     use crate::model::{OutboundModel, Protocol};
     use serde_json::{Map, json};
 
@@ -2974,6 +3044,205 @@ mod tests {
                 "{network:?}: only the selected transport's block reaches the wire"
             );
         }
+    }
+
+    /// The table's editor accessors take the block out and put it back only
+    /// when it was there before or the editor reported a change: an untouched
+    /// render leaves an absent block absent (the draft keeps the user's
+    /// switch state), and a changed one materializes the block it edits.
+    #[test]
+    fn transport_editors_leave_absent_blocks_absent_and_materialize_changes() {
+        let mut stream = StreamModel::default();
+        macro_rules! assert_absent {
+            ($($field:ident => $editor:ident,)*) => {
+                $(
+                    assert!(
+                        !stream.$editor(|_| false),
+                        concat!(stringify!($editor), " reports no change for an untouched block")
+                    );
+                    assert!(
+                        stream.$field.is_none(),
+                        concat!(stringify!($editor), " must leave the absent block absent")
+                    );
+                )*
+            };
+        }
+        assert_absent! {
+            raw_settings => edit_raw,
+            xhttp_settings => edit_xhttp,
+            kcp_settings => edit_kcp,
+            grpc_settings => edit_grpc,
+            ws_settings => edit_ws,
+            httpupgrade_settings => edit_httpupgrade,
+            hysteria_settings => edit_hysteria,
+            masque_settings => edit_masque,
+            xdrive_settings => edit_xdrive,
+        }
+        assert!(
+            !stream.any_transport_block(),
+            "an untouched render of every transport leaves no block behind"
+        );
+
+        // A reported change materializes exactly the block that was edited,
+        // and a block that was already present survives an untouched render.
+        assert!(stream.edit_kcp(|s| {
+            s.mtu = Some(1350);
+            true
+        }));
+        assert_eq!(stream.kcp_settings.as_ref().and_then(|s| s.mtu), Some(1350));
+        assert!(!stream.edit_kcp(|_| false));
+        assert!(
+            stream.kcp_settings.is_some(),
+            "a stored block survives an untouched render"
+        );
+
+        // Xdrive's block is boxed: the editor closure edits through the Box.
+        assert!(stream.edit_xdrive(|s| {
+            s.remote_folder = "folder".into();
+            true
+        }));
+        assert_eq!(
+            stream
+                .xdrive_settings
+                .as_ref()
+                .map(|s| s.remote_folder.as_str()),
+            Some("folder")
+        );
+    }
+
+    /// The selector's per-protocol transport lists are the model's fact, in
+    /// the selector's order: a MASQUE outbound carries only its handler's
+    /// transport, VLESS every transport but MASQUE, every other protocol the
+    /// general set. A transport no list offers is unreachable in the editor.
+    #[test]
+    fn selectable_networks_names_each_protocols_transports() {
+        const GENERAL: [Network; 7] = [
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+        ];
+        const VLESS: [Network; 8] = [
+            Network::Raw,
+            Network::Xhttp,
+            Network::Kcp,
+            Network::Grpc,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Hysteria,
+            Network::Xdrive,
+        ];
+        assert_eq!(
+            Network::selectable_networks(Protocol::Masque),
+            &[Network::Masque][..]
+        );
+        assert_eq!(Network::selectable_networks(Protocol::Vless), &VLESS[..]);
+        for protocol in Protocol::ALL {
+            let offered = Network::selectable_networks(protocol);
+            assert_eq!(
+                offered.contains(&Network::Masque),
+                protocol == Protocol::Masque,
+                "{}: MASQUE is the MASQUE handler's own transport",
+                protocol.as_str()
+            );
+            assert_eq!(
+                offered.contains(&Network::Xdrive),
+                protocol == Protocol::Vless,
+                "{}: Xdrive is the VLESS handler's transport",
+                protocol.as_str()
+            );
+            if protocol != Protocol::Masque {
+                for network in GENERAL {
+                    assert!(
+                        offered.contains(&network),
+                        "{} offers every general transport, {network:?} missing",
+                        protocol.as_str()
+                    );
+                }
+            }
+            if protocol != Protocol::Masque && protocol != Protocol::Vless {
+                assert_eq!(
+                    offered,
+                    &GENERAL[..],
+                    "{}: the general set",
+                    protocol.as_str()
+                );
+            }
+        }
+        // Every transport the model knows is offered by some protocol.
+        let mut offered = Vec::new();
+        for protocol in Protocol::ALL {
+            offered.extend_from_slice(Network::selectable_networks(protocol));
+        }
+        for network in Network::ALL {
+            assert!(
+                offered.contains(&network),
+                "{network:?} is offered by no protocol"
+            );
+        }
+    }
+
+    /// REALITY rides only the transports that support it: the check the
+    /// selector greys a network out with is the selector's own gate, and
+    /// Hysteria stays selectable because choosing it switches the security
+    /// mode to TLS.
+    #[test]
+    fn can_select_network_gates_reality_and_lets_hysteria_switch_it() {
+        let mut stream = StreamModel {
+            security: Security::Reality,
+            ..Default::default()
+        };
+        for network in [
+            Network::Raw,
+            Network::Xhttp,
+            Network::Grpc,
+            Network::Hysteria,
+        ] {
+            assert_eq!(
+                stream.can_select_network(network),
+                Ok(()),
+                "{network:?} supports REALITY"
+            );
+        }
+        for network in [
+            Network::Kcp,
+            Network::Ws,
+            Network::Httpupgrade,
+            Network::Masque,
+            Network::Xdrive,
+        ] {
+            assert_eq!(
+                stream.can_select_network(network),
+                Err(ValidationCode::RealityRequiresTransport),
+                "{network:?} cannot ride REALITY"
+            );
+            assert_eq!(
+                stream.select_network(network),
+                Err(ValidationCode::RealityRequiresTransport),
+                "selecting {network:?} refuses through the same check"
+            );
+            assert_eq!(
+                stream.network,
+                Network::Raw,
+                "a refused selection changes nothing"
+            );
+        }
+        stream
+            .select_network(Network::Hysteria)
+            .expect("hysteria is selectable under REALITY");
+        assert_eq!(stream.network, Network::Hysteria);
+        assert_eq!(
+            stream.security,
+            Security::Tls,
+            "choosing hysteria switches the security mode to TLS"
+        );
+        assert!(
+            stream.tls_settings.is_some(),
+            "choosing hysteria materializes the TLS block"
+        );
     }
 
     /// Every transport's diagnostic path names the block its own wire form
