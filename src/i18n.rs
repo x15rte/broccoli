@@ -1684,10 +1684,12 @@ keys! {
     FinalmaskNoiseExpArgumentNotAllowed 1,
     FinalmaskSalamanderPacketSize 0,
     FinalmaskXdnsShapeRetired 0,
+    FinalmaskXdnsDomainsEmpty 0,
     FinalmaskXdnsDomainTypesInvalid 0,
     FinalmaskXdnsDomainNameInvalid 0,
     FinalmaskXdnsDomainLimitInvalid 0,
     FinalmaskXdnsDomainCapacityInvalid 0,
+    FinalmaskXdnsResolversEmpty 0,
     FinalmaskXdnsResolverAddrInvalid 0,
     FinalmaskXdnsResolverAddrsEmpty 0,
     FinalmaskXdnsAddrSchemeUnknown 1,
@@ -2722,10 +2724,12 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskNoiseExpArgumentNotAllowed(_) => t(lang, Key::FinalmaskNoiseExpArgumentNotAllowed),
         FinalmaskSalamanderPacketSize => t(lang, Key::FinalmaskSalamanderPacketSize),
         FinalmaskXdnsShapeRetired => t(lang, Key::FinalmaskXdnsShapeRetired),
+        FinalmaskXdnsDomainsEmpty => t(lang, Key::FinalmaskXdnsDomainsEmpty),
         FinalmaskXdnsDomainTypesInvalid => t(lang, Key::FinalmaskXdnsDomainTypesInvalid),
         FinalmaskXdnsDomainNameInvalid => t(lang, Key::FinalmaskXdnsDomainNameInvalid),
         FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
         FinalmaskXdnsDomainCapacityInvalid => t(lang, Key::FinalmaskXdnsDomainCapacityInvalid),
+        FinalmaskXdnsResolversEmpty => t(lang, Key::FinalmaskXdnsResolversEmpty),
         FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
         FinalmaskXdnsResolverAddrsEmpty => t(lang, Key::FinalmaskXdnsResolverAddrsEmpty),
         FinalmaskXdnsAddrSchemeUnknown(_) => t(lang, Key::FinalmaskXdnsAddrSchemeUnknown),
@@ -5096,6 +5100,7 @@ mod en {
                 "the stored xdns entry used a removed shape. It now carries names, addresses, and \
                  a worker count. Review the migrated values"
             }
+            Key::FinalmaskXdnsDomainsEmpty => "add at least one domain",
             Key::FinalmaskXdnsDomainTypesInvalid => {
                 "use at least one of the record types A, CNAME, TXT, or AAAA"
             }
@@ -5108,6 +5113,7 @@ mod en {
                 "the name and limits leave too little room for the encoded payload. Raise \
                  lenLimit or shorten the name"
             }
+            Key::FinalmaskXdnsResolversEmpty => "add at least one resolver",
             Key::FinalmaskXdnsAddrSchemeUnknown => {
                 "{} is not an address scheme the mask reads. Use a bare host, tcp://, udp://, or \
                  https://"

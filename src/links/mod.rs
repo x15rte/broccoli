@@ -4674,10 +4674,13 @@ mod tests {
         // outbound's, so a link that smuggles a session-key log into it is
         // refused by the same rule and path.
         let evil = pct_encode(
-            r#"{"udp":[{"type":"xdns","settings":{"resolvers":[{
-                "addrs":["https://dns.example/dns-query"],
-                "tlsConfig":{"masterKeyLog":"keys.log"}
-            }]}}]}"#,
+            r#"{"udp":[{"type":"xdns","settings":{
+                "domains":[{"names":["tunnel.example.com"],"types":[1]}],
+                "resolvers":[{
+                    "addrs":["https://dns.example/dns-query"],
+                    "tlsConfig":{"masterKeyLog":"keys.log"}
+                }]
+            }}]}"#,
         );
         let link = format!("vless://{UUID}@fm.local:443?fm={evil}#XDNS");
         let error = parse_link(&link).expect_err("the resolver's masterKeyLog must refuse import");
@@ -4692,10 +4695,13 @@ mod tests {
 
         // A clean DoH resolver still imports.
         let clean = pct_encode(
-            r#"{"udp":[{"type":"xdns","settings":{"resolvers":[{
-                "addrs":["https://dns.example/dns-query"],
-                "tlsConfig":{"serverName":"dns.example"}
-            }]}}]}"#,
+            r#"{"udp":[{"type":"xdns","settings":{
+                "domains":[{"names":["tunnel.example.com"],"types":[1]}],
+                "resolvers":[{
+                    "addrs":["https://dns.example/dns-query"],
+                    "tlsConfig":{"serverName":"dns.example"}
+                }]
+            }}]}"#,
         );
         let link = format!("vless://{UUID}@fm.local:443?fm={clean}#XDNS");
         let profile = parse_link(&link)

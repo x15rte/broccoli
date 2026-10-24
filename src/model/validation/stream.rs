@@ -2434,6 +2434,23 @@ fn finalmask_validate_udp_mask(
                     Some(format!("{path}.settings")),
                 ));
             }
+            // The mask build emits one domain per name and one resolver per
+            // address (`infra/conf/transport_finalmask.go`), so either list
+            // with no row hands `NewClient` the empty list it refuses before
+            // it reads any entry (`transport/internet/finalmask/xdns/client.go`).
+            // The per-row findings below cannot see a list with no rows.
+            if settings.domains.is_empty() {
+                issues.push(issue(
+                    ValidationCode::FinalmaskXdnsDomainsEmpty,
+                    Some(format!("{path}.settings.domains")),
+                ));
+            }
+            if settings.resolvers.is_empty() {
+                issues.push(issue(
+                    ValidationCode::FinalmaskXdnsResolversEmpty,
+                    Some(format!("{path}.settings.resolvers")),
+                ));
+            }
             for (domain_index, domain) in settings.domains.iter().enumerate() {
                 let entry_path = format!("{path}.settings.domains[{domain_index}]");
                 if domain.types.is_empty()
@@ -3768,6 +3785,99 @@ mod tests {
             ),
             "the apply gate must refuse the empty resolver row: {gate:#?}"
         );
+    }
+
+    /// `NewClient` refuses a mask whose built domain list or resolver list is
+    /// empty before it reads any entry
+    /// (`transport/internet/finalmask/xdns/client.go`), and the per-row
+    /// findings cannot see a list with no rows. Each list reports at its own
+    /// path, so the model pass and the apply gate refuse the same state.
+    #[test]
+    fn finalmask_xdns_empty_lists_block_both_gates() {
+        let empty: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {}}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&empty);
+        for (code, path) in [
+            (
+                ValidationCode::FinalmaskXdnsDomainsEmpty,
+                "finalmask.udp[0].settings.domains",
+            ),
+            (
+                ValidationCode::FinalmaskXdnsResolversEmpty,
+                "finalmask.udp[0].settings.resolvers",
+            ),
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == code && issue.path.as_deref() == Some(path)),
+                "missing {code:?} at {path:?} in {issues:#?}"
+            );
+        }
+
+        // A populated list does not hide the other list's empty state.
+        let domains_only: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {"domains": [
+                {"names": ["a.example"], "types": [1]}
+            ]}}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&domains_only);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskXdnsResolversEmpty),
+            "{issues:#?}"
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskXdnsDomainsEmpty),
+            "{issues:#?}"
+        );
+
+        // Selecting the xdns type in the mask editor builds the default
+        // settings, whose lists hold no rows; the apply gate refuses that
+        // exact state. A mask with one row in each list reports neither.
+        let brand_new = FinalmaskUdpMask::from_known_type("xdns")
+            .expect("the mask editor offers the xdns type");
+        let mut outbound =
+            crate::model::outbound::OutboundModel::new(crate::model::outbound::Protocol::Vless);
+        outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![brand_new],
+            ..Default::default()
+        });
+        let gate = crate::model::validation::validate_outbound(&outbound);
+        for code in [
+            ValidationCode::FinalmaskXdnsDomainsEmpty,
+            ValidationCode::FinalmaskXdnsResolversEmpty,
+        ] {
+            assert!(
+                gate.iter().any(|issue| issue.code == code),
+                "the apply gate must refuse a brand-new xdns mask ({code:?}): {gate:#?}"
+            );
+        }
+
+        let populated: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {
+                "domains": [{"names": ["a.example"], "types": [1]}],
+                "resolvers": [{"addrs": ["1.1.1.1"]}]
+            }}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        outbound.stream.finalmask = Some(populated);
+        let gate = crate::model::validation::validate_outbound(&outbound);
+        for code in [
+            ValidationCode::FinalmaskXdnsDomainsEmpty,
+            ValidationCode::FinalmaskXdnsResolversEmpty,
+        ] {
+            assert!(
+                !gate.iter().any(|issue| issue.code == code),
+                "a populated xdns mask must pass ({code:?}): {gate:#?}"
+            );
+        }
     }
 
     /// Sub-byte bandwidths are values, not unset: a positive bit rate that

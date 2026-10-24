@@ -11914,18 +11914,21 @@ Authentication: ML-KEM-768, Post-Quantum
         profile.outbound.stream.finalmask = Some(
             serde_json::from_value(json!({
                 "udp": [{"type": "xdns", "settings": {
+                    "domains": [{"names": ["a.example"], "types": [1]}],
                     "resolvers": [{"addrs": []}]
                 }}]
             }))
             .expect("fixture is a valid finalmask"),
         );
         let findings = super::finalmask_findings(&profile);
+        let issue = finding(&findings, ValidationCode::FinalmaskXdnsResolverAddrsEmpty);
+        let message = validation_message(&issue.code, Language::En);
         let errors = super::render_findings(findings.iter(), Language::En);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(
-            errors[0].contains("add at least one resolver address"),
-            "{errors:?}"
-        );
+        let rendered = errors
+            .iter()
+            .find(|error| error.contains(&message))
+            .expect("the empty resolver row's finding is rendered");
 
         let mut screen = ServersScreen::default();
         let mut harness = Harness::builder()
@@ -11948,9 +11951,69 @@ Authentication: ML-KEM-768, Post-Quantum
             });
         harness.run();
         assert!(
-            harness.query_by_label(&errors[0]).is_some(),
+            harness.query_by_label(rendered).is_some(),
             "the editor must render the empty resolver row's finding: {errors:?}"
         );
+    }
+
+    /// Selecting the xdns type in the mask editor builds the default
+    /// settings, whose domain and resolver lists hold no rows. The client
+    /// refuses both empty lists, so the Advanced tab must render one finding
+    /// for each under the mask list.
+    #[test]
+    fn advanced_tab_renders_the_empty_xdns_mask_findings() {
+        let mut profile = ServerProfile::new("xdns-new", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![
+                FinalmaskUdpMask::from_known_type("xdns")
+                    .expect("the mask editor offers the xdns type"),
+            ],
+            ..Default::default()
+        });
+        let findings = super::finalmask_findings(&profile);
+        let errors = super::render_findings(findings.iter(), Language::En);
+        let mut rendered = Vec::new();
+        for code in [
+            ValidationCode::FinalmaskXdnsDomainsEmpty,
+            ValidationCode::FinalmaskXdnsResolversEmpty,
+        ] {
+            let issue = finding(&findings, code);
+            let message = validation_message(&issue.code, Language::En);
+            rendered.push(
+                errors
+                    .iter()
+                    .find(|error| error.contains(&message))
+                    .expect("the empty list's finding is rendered")
+                    .clone(),
+            );
+        }
+
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 2000.0))
+            .build_ui(|ui| {
+                let _ = ServersScreen::advanced_tab(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    &[],
+                    AdvancedTabCtx {
+                        set_key: (0, 0),
+                        finalmask_errors: &errors,
+                        stream_sockopt_errors: &[],
+                        dialer_proxy_options: &mut screen.existing.chain_options,
+                        buffers: &mut screen.seeded_buffers,
+                        masked: false,
+                    },
+                );
+            });
+        harness.run();
+        for message in rendered {
+            assert!(
+                harness.query_by_label(&message).is_some(),
+                "the editor must render the empty xdns mask's finding: {message:?}"
+            );
+        }
     }
 
     #[test]

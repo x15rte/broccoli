@@ -1,8 +1,9 @@
 //! kittest coverage: both Lua script surfaces — the DNS screen and the routing
-//! screen — are mounted, and editing through them writes the model. The
-//! shared control's own switch/reveal/path-rule behaviour is pinned by its
-//! unit test, and the gate conflicts by the validation pass, so this file
-//! carries only the screen wiring.
+//! screen — are mounted, editing through them writes the model, and each
+//! screen renders the conflict its apply gate refuses. The shared control's
+//! own switch/reveal/path-rule behaviour stays pinned by its unit test, and
+//! the conflict rules themselves by the validation pass, so this file carries
+//! the screen wiring of both.
 //!
 //! The harness boots the real `BroccoliApp` (the shared UI harness pattern:
 //! temp APPDATA with the state written through the app's own writers, first-run
@@ -14,8 +15,9 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::{Key, t};
+use broccoli::i18n::{Key, t, validation_message};
 use broccoli::model::settings::{Language, Settings};
+use broccoli::model::validation::ValidationCode;
 use broccoli::model::{RoutingCfg, Rule, ServersFile};
 use broccoli::ui::Screen;
 use egui::Vec2;
@@ -41,16 +43,21 @@ fn type_into(h: &mut Harness<'static, BroccoliApp>, label: &str, text: &str) {
     h.run_steps(4);
 }
 
-/// The DNS screen mounts the shared script control and writes the path it
-/// edits into the model.
+/// The DNS screen mounts the shared script control, writes the path it edits
+/// into the model, and renders the server conflict the apply gate refuses.
 #[test]
-fn dns_script_row_mounts_and_writes_the_model() {
+fn dns_script_row_mounts_writes_the_model_and_renders_the_server_conflict() {
+    let mut settings = Settings::default();
+    settings.dns.servers[0].domains = vec!["geosite:cn".into()];
     let (_lock, _tmp, mut h): (
         MutexGuard<'static, ()>,
         common::TempEnvironment,
         Harness<'static, BroccoliApp>,
     ) = nav::boot_screen(
-        screen::BootState::default(),
+        screen::BootState {
+            settings,
+            servers: ServersFile::default(),
+        },
         Some(Screen::Dns),
         Vec2::new(1100.0, 2800.0),
     );
@@ -72,12 +79,21 @@ fn dns_script_row_mounts_and_writes_the_model() {
         Some("dns.lua"),
         "the DNS script row must write the model"
     );
+    let conflict = validation_message(
+        &ValidationCode::DnsScriptServerConflict(1, "domains".into()),
+        Language::En,
+    );
+    assert!(
+        h.query_by_label(&conflict).is_some(),
+        "the DNS screen must render the server conflict its gate refuses: {conflict:?}"
+    );
 }
 
-/// The routing screen mounts the shared script control and writes the path it
-/// edits into the model.
+/// The routing screen mounts the shared script control, writes the path it
+/// edits into the model, renders the rules conflict its gate refuses, and
+/// keeps the user's rule in the editor.
 #[test]
-fn routing_script_row_mounts_and_writes_the_model() {
+fn routing_script_row_mounts_writes_the_model_and_keeps_rules_after_the_conflict() {
     let settings = Settings {
         routing: RoutingCfg {
             rules: vec![Rule {
@@ -122,5 +138,14 @@ fn routing_script_row_mounts_and_writes_the_model() {
             .as_deref(),
         Some("routing.lua"),
         "the routing script row must write the model"
+    );
+    let conflict = validation_message(&ValidationCode::RoutingScriptRulesConflict, Language::En);
+    assert!(
+        h.query_by_label(&conflict).is_some(),
+        "the routing screen must render the rules conflict its gate refuses: {conflict:?}"
+    );
+    assert!(
+        h.query_by_label("rule-one").is_some(),
+        "the user's rule must stay in the editor after the conflict is shown"
     );
 }

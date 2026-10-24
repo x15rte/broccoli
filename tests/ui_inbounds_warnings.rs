@@ -17,7 +17,7 @@ use broccoli::app::BroccoliApp;
 use broccoli::i18n::{Key, safety_finding_message, t, validation_issue_message};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
-use broccoli::model::validation::validate_finalmask;
+use broccoli::model::validation::{ValidationCode, validate_finalmask};
 use broccoli::model::{
     DokodemoCfg, FinalmaskFilter, FinalmaskModel, FinalmaskTcpMask, LocalInboundCfg,
     LocalInboundProtocol, ServersFile,
@@ -107,9 +107,8 @@ fn bad_filter_message() -> String {
         .as_ref()
         .expect("the fixture carries a mask");
     let issue = validate_finalmask(finalmask)
-        .iter()
-        .next()
-        .cloned()
+        .into_iter()
+        .find(|issue| matches!(issue.code, ValidationCode::FinalmaskFilterIpRuleInvalid(_)))
         .expect("the malformed rule must produce a finding");
     validation_issue_message(&issue, Language::En)
 }

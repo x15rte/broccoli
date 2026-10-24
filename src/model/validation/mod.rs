@@ -373,6 +373,13 @@ pub enum ValidationCode {
     /// in memory and the save writes the current shape, so the mask runs
     /// without user action. Advisory (Severity::Warning), never a gate.
     FinalmaskXdnsShapeRetired,
+    /// An `xdns` mask carries no `domains` entries. The mask build emits one
+    /// domain per name, so an empty list hands the client an empty domain
+    /// list, which it refuses before it reads any entry
+    /// (`transport/internet/finalmask/xdns/client.go`). Error tier: zero rows
+    /// is never a working configuration, and the per-row findings cannot see
+    /// this state.
+    FinalmaskXdnsDomainsEmpty,
     /// An `xdns` domain `types` list is empty or names a type outside A (1),
     /// CNAME (5), TXT (16), and AAAA (28): the domain build refuses it
     /// (`transport/internet/finalmask/xdns/domain.go:88-98`). Error tier.
@@ -391,6 +398,13 @@ pub enum ValidationCode {
     /// capacity is below 17 bytes
     /// (`transport/internet/finalmask/xdns/domain.go:112-128`). Error tier.
     FinalmaskXdnsDomainCapacityInvalid,
+    /// An `xdns` mask carries no `resolvers` entries. The mask build emits
+    /// one resolver per address, so an empty list hands the client an empty
+    /// resolver list, which it refuses before it reads any entry
+    /// (`transport/internet/finalmask/xdns/client.go`). Error tier: zero rows
+    /// is never a working configuration, and the resolver row findings cannot
+    /// see this state.
+    FinalmaskXdnsResolversEmpty,
     /// An `xdns` resolver address carries a scheme the mask build refuses:
     /// it maps only bare addresses (UDP, port 53), `tcp`, `udp`, and `https`
     /// onto a resolver (`infra/conf/transport_finalmask.go:903-923`). The

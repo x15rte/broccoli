@@ -1673,7 +1673,9 @@ impl<'de> Deserialize<'de> for FinalmaskXdnsResolver {
 
 /// `xdns` finalmask settings (`infra/conf/transport_finalmask.go:848-852`).
 /// `domains` and `resolvers` hold the current objects; `extraPoll` is a 0–3
-/// counter. An empty object is a valid mask.
+/// counter. The client refuses a mask with no built domain or no built resolver
+/// at creation (`transport/internet/finalmask/xdns/client.go`), so the
+/// validation pass gates a mask with no `domains` row or no `resolvers` row.
 ///
 /// A stored profile written against an older shape loads through
 /// [`Deserialize`], which migrates every removed spelling in memory and sets
@@ -3581,15 +3583,15 @@ mod tests {
             crate::model::validation::validate_finalmask(&model)
         );
 
-        // An empty settings object is a valid mask now that the old
-        // domains-and-resolvers presence check is gone.
+        // An empty settings object still round-trips as written. It is not a
+        // runnable mask — the client refuses the empty domain and resolver
+        // lists — which the validation pass reports at each list.
         let empty: FinalmaskModel =
             serde_json::from_value(json!({"udp": [{"type": "xdns", "settings": {}}]})).unwrap();
         assert_eq!(
             serde_json::to_value(&empty).unwrap()["udp"][0]["settings"],
             json!({})
         );
-        assert!(crate::model::validation::validate_finalmask(&empty).is_empty());
 
         // Every removed spelling — the `domain` key, the bare-string domain
         // and resolver entries, and the domain `name` / resolver
