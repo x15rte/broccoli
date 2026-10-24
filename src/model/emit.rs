@@ -60,8 +60,10 @@ pub fn socks_inbound_tags(settings: &Settings) -> Vec<String> {
 
 /// True when the DNS module answers intercepted port-53 traffic: a DNS
 /// configuration plus an inbound that can carry UDP (the tun inbound, or an
-/// enabled SOCKS endpoint). The `dns-out` outbound, the interception rules, the
-/// TUN adapter-DNS pin and the runtime's in-tun listener all ride this one gate.
+/// enabled SOCKS endpoint). The `dns-out` outbound, the TUN adapter-DNS pin and
+/// the runtime's in-tun listener ride this gate; the generated interception
+/// rules additionally require the user's `builtin.dns_interception` switch,
+/// while the in-tun listener's own rule (`dns-in`/`dns-in6`) stays either way.
 pub fn dns_intercept(settings: &Settings) -> bool {
     dns_module_emitted(settings)
         && (tun_inbound_emitted(settings) || dns_capable_socks(settings).next().is_some())

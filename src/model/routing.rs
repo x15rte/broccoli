@@ -482,6 +482,42 @@ impl fmt::Display for RoutingIntegrityError {
 
 impl Error for RoutingIntegrityError {}
 
+/// The app's own routing rule groups, each switchable. Every field defaults
+/// on, and a field stays out of the settings file while it is on, so an older
+/// file loads with all three enabled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BuiltinRules {
+    #[serde(skip_serializing_if = "is_true")]
+    pub pin_dns_upstreams: bool,
+    #[serde(skip_serializing_if = "is_true")]
+    pub dns_interception: bool,
+    #[serde(skip_serializing_if = "is_true")]
+    pub private_direct: bool,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+impl BuiltinRules {
+    /// True when every switch is on, the state an absent `builtin` object
+    /// means; keeps the default out of the settings file.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for BuiltinRules {
+    fn default() -> Self {
+        Self {
+            pin_dns_upstreams: true,
+            dns_interception: true,
+            private_direct: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RoutingCfg {
@@ -489,6 +525,9 @@ pub struct RoutingCfg {
     pub rules: Vec<Rule>,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub balancers: Vec<Balancer>,
+    /// The app's own rule groups; see [`BuiltinRules`].
+    #[serde(skip_serializing_if = "BuiltinRules::is_default")]
+    pub builtin: BuiltinRules,
     /// AsIs | IpIfNonMatch | IpOnDemand
     #[serde(skip_serializing_if = "RoutingCfg::skip_default_strategy")]
     pub domain_strategy: String,
@@ -641,6 +680,7 @@ impl Default for RoutingCfg {
         Self {
             rules: Vec::new(),
             balancers: Vec::new(),
+            builtin: BuiltinRules::default(),
             domain_strategy: DEFAULT_DOMAIN_STRATEGY.into(),
             script: None,
             observatory: ObservatoryCfg::default(),
@@ -652,7 +692,43 @@ impl Default for RoutingCfg {
 
 #[cfg(test)]
 mod integrity_tests {
-    use super::{Balancer, RouteTestRequest, RoutingCfg, RoutingIntegrityError, Rule, StrategyCfg};
+    use super::{
+        Balancer, BuiltinRules, RouteTestRequest, RoutingCfg, RoutingIntegrityError, Rule,
+        StrategyCfg,
+    };
+
+    #[test]
+    fn builtin_rules_default_on_and_only_switches_off_serialize() {
+        let cfg = RoutingCfg::default();
+        assert!(cfg.builtin.pin_dns_upstreams);
+        assert!(cfg.builtin.dns_interception);
+        assert!(cfg.builtin.private_direct);
+
+        let wire = serde_json::to_value(&cfg).expect("routing serializes");
+        assert!(wire.get("builtin").is_none(), "{wire}");
+
+        let loaded: RoutingCfg = serde_json::from_value(serde_json::json!({})).expect("loads");
+        assert!(loaded.builtin.pin_dns_upstreams);
+        assert!(loaded.builtin.dns_interception);
+        assert!(loaded.builtin.private_direct);
+
+        let off = RoutingCfg {
+            builtin: BuiltinRules {
+                dns_interception: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&off).expect("routing serializes");
+        assert_eq!(
+            wire["builtin"],
+            serde_json::json!({ "dnsInterception": false })
+        );
+        let loaded: RoutingCfg = serde_json::from_value(wire).expect("loads");
+        assert!(!loaded.builtin.dns_interception);
+        assert!(loaded.builtin.pin_dns_upstreams);
+        assert!(loaded.builtin.private_direct);
+    }
 
     #[test]
     fn balancer_rename_rewrites_all_rule_references_atomically() {

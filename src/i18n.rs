@@ -720,6 +720,13 @@ keys! {
     RoutingScriptToggle 0,
     RoutingScriptPath 0,
     RoutingScriptHint 0,
+    RoutingBuiltinSection 0,
+    RoutingBuiltinPins 0,
+    RoutingBuiltinPinsNote 0,
+    RoutingBuiltinDns 0,
+    RoutingBuiltinDnsNote 0,
+    RoutingBuiltinPrivate 0,
+    RoutingBuiltinPrivateNote 0,
     RoutingMoveUp 0,
     RoutingMoveDown 0,
     RoutingDeleteRule 0,
@@ -3634,6 +3641,23 @@ mod en {
             Key::RoutingScriptHint => {
                 "Absolute path to a .lua file. The core compiles it at load. The app never \
                  runs it."
+            }
+            Key::RoutingBuiltinSection => "Built-in rules",
+            Key::RoutingBuiltinPins => "Pin the DNS upstream dials",
+            Key::RoutingBuiltinPinsNote => {
+                "Keeps the DNS module's own upstream connections on the active server. Off \
+                 drops the pin. Those dials then follow the routing rules like any other \
+                 connection."
+            }
+            Key::RoutingBuiltinDns => "Intercept DNS from the TUN and SOCKS inbounds",
+            Key::RoutingBuiltinDnsNote => {
+                "Sends their port-53 queries to the DNS module. Off lets them take the \
+                 default route. The app's own TUN DNS listener keeps its rule either way."
+            }
+            Key::RoutingBuiltinPrivate => "Send private destinations direct",
+            Key::RoutingBuiltinPrivateNote => {
+                "LAN, loopback, link-local, and multicast destinations bypass the tunnel \
+                 unless a rule above claims them. Off sends them through the active server."
             }
             Key::RoutingMoveUp => "Move up (rules match in order)",
             Key::RoutingMoveDown => "Move down",

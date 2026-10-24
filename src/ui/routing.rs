@@ -632,6 +632,7 @@ impl RoutingScreen {
         self.poll_live_out_tags();
 
         self.script_section(ui, ctx, lang, &mut changed);
+        self.builtin_section(ui, ctx, lang, &mut changed);
         self.rules_section(ui, ctx, lang, &mut changed);
         self.balancers_section(ui, ctx, lang, &mut changed);
         self.observability_section(ui, ctx, lang, &mut changed);
@@ -1517,6 +1518,46 @@ impl RoutingScreen {
                 revision,
                 conflict,
             );
+        });
+    }
+
+    // ---------- built-in rules ----------
+
+    /// The app's own rule groups, each switchable. A routing script owns every
+    /// route, so the switches only reach the emitted rules without one.
+    fn builtin_section(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &mut UiCtx,
+        lang: Language,
+        changed: &mut bool,
+    ) {
+        let script_active = ctx
+            .settings
+            .routing
+            .script
+            .as_deref()
+            .is_some_and(|script| !script.is_empty());
+        widgets::section(ui, t(lang, Key::RoutingBuiltinSection), |ui| {
+            ui.add_enabled_ui(!script_active, |ui| {
+                let builtin = &mut ctx.settings.routing.builtin;
+                let (pins, dns, private) = (
+                    &mut builtin.pin_dns_upstreams,
+                    &mut builtin.dns_interception,
+                    &mut builtin.private_direct,
+                );
+                *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinPinsNote), |ui| {
+                    ui.checkbox(pins, t(lang, Key::RoutingBuiltinPins))
+                        .changed()
+                });
+                *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinDnsNote), |ui| {
+                    ui.checkbox(dns, t(lang, Key::RoutingBuiltinDns)).changed()
+                });
+                *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinPrivateNote), |ui| {
+                    ui.checkbox(private, t(lang, Key::RoutingBuiltinPrivate))
+                        .changed()
+                });
+            });
         });
     }
 
@@ -6262,6 +6303,82 @@ mod routing_control_render_tests {
             )
             .accesskit_node()
             .is_disabled()
+    }
+
+    fn switch_state(
+        harness: &Harness<'static, (RoutingScreen, UiTestRig)>,
+        label: &str,
+    ) -> Option<bool> {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .accesskit_node()
+            .toggled()
+            .map(|toggled| matches!(toggled, egui::accesskit::Toggled::True))
+    }
+
+    #[test]
+    fn builtin_switches_render_loaded_values_and_disable_under_a_script() {
+        let mut rig = UiTestRig::default();
+        rig.settings.routing.builtin.private_direct = false;
+        let mut harness = harness_for((RoutingScreen::default(), rig));
+        assert_eq!(
+            switch_state(&harness, t(Language::En, Key::RoutingBuiltinPrivate)),
+            Some(false),
+            "a stored off switch must render off"
+        );
+        assert_eq!(
+            switch_state(&harness, t(Language::En, Key::RoutingBuiltinPins)),
+            Some(true)
+        );
+
+        harness.state_mut().1.settings.routing.script = Some("routing.lua".into());
+        harness.run();
+        let pins = harness.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            t(Language::En, Key::RoutingBuiltinPins),
+        );
+        assert!(
+            pins.accesskit_node().is_disabled(),
+            "a routing script owns every route, so the switches are inert"
+        );
+    }
+
+    #[test]
+    fn builtin_rule_switches_write_through() {
+        let mut harness = harness_for((RoutingScreen::default(), UiTestRig::default()));
+        let pins = t(Language::En, Key::RoutingBuiltinPins);
+        assert!(harness.state().1.settings.routing.builtin.pin_dns_upstreams);
+        assert!(!harness.state().1.requests.dirty);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, pins)
+            .click();
+        harness.run();
+        assert!(!harness.state().1.settings.routing.builtin.pin_dns_upstreams);
+        assert!(
+            harness.state().1.requests.dirty,
+            "flipping a built-in switch must mark the settings dirty"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, pins)
+            .click();
+        harness.run();
+        assert!(harness.state().1.settings.routing.builtin.pin_dns_upstreams);
+
+        let dns = t(Language::En, Key::RoutingBuiltinDns);
+        assert!(harness.state().1.settings.routing.builtin.dns_interception);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, dns)
+            .click();
+        harness.run();
+        assert!(!harness.state().1.settings.routing.builtin.dns_interception);
+
+        let private = t(Language::En, Key::RoutingBuiltinPrivate);
+        assert!(harness.state().1.settings.routing.builtin.private_direct);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, private)
+            .click();
+        harness.run();
+        assert!(!harness.state().1.settings.routing.builtin.private_direct);
     }
 
     /// Take the next command off the rig's channel, asserting the screen has

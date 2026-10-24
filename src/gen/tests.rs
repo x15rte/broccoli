@@ -2285,6 +2285,100 @@ fn private_fallbacks_yield_to_fakedns() {
 }
 
 #[test]
+fn all_builtin_switches_off_keep_the_dns_listener_rule_and_the_user_rule() {
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.dns.servers.push(DnsServer {
+        address: "https://1.1.1.1/dns-query".into(),
+        ..Default::default()
+    });
+    settings.routing.rules.push(Rule {
+        rule_tag: "user".into(),
+        domain: vec!["domain:blocked.example".into()],
+        outbound_tag: "block".into(),
+        ..Default::default()
+    });
+    settings.routing.builtin.pin_dns_upstreams = false;
+    settings.routing.builtin.dns_interception = false;
+    settings.routing.builtin.private_direct = false;
+
+    let cfg = generate_deterministic(&single_server(vless_server("1.2.3.4", 443)), &settings)
+        .expect("generate config");
+    let rules = cfg["routing"]["rules"].as_array().unwrap();
+    // The in-tun DNS listener's own rule survives: the runtime adds that
+    // listener, so its route is not a user-facing switch. Everything else
+    // the app owns is gone, leaving the user rule last.
+    assert_eq!(rules.len(), 2, "{rules:#?}");
+    assert_eq!(
+        rules[0]["inboundTag"],
+        json!([DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG])
+    );
+    assert_eq!(rules[1]["ruleTag"], json!("user"));
+}
+
+#[test]
+fn each_builtin_switch_drops_only_its_own_group() {
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.dns.servers.push(DnsServer {
+        address: "https://1.1.1.1/dns-query".into(),
+        ..Default::default()
+    });
+    settings.routing.rules.push(Rule {
+        rule_tag: "user".into(),
+        domain: vec!["domain:blocked.example".into()],
+        outbound_tag: "block".into(),
+        ..Default::default()
+    });
+    let rules = |settings: &Settings| -> Vec<Value> {
+        generate_deterministic(&single_server(vless_server("1.2.3.4", 443)), settings)
+            .expect("generate config")["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let port = |rules: &[Value], port: &str| {
+        rules
+            .iter()
+            .filter(|rule| rule["port"] == json!(port))
+            .count()
+    };
+    let private = |rules: &[Value]| {
+        rules
+            .iter()
+            .filter(|rule| {
+                rule["ip"] == json!(PRIVATE_IP_RANGES) || rule["domain"] == json!(PRIVATE_DOMAINS)
+            })
+            .count()
+    };
+
+    let all = rules(&settings);
+    assert_eq!(port(&all, "443"), 1);
+    assert_eq!(port(&all, "53"), 3);
+    assert_eq!(private(&all), 2);
+
+    settings.routing.builtin.pin_dns_upstreams = false;
+    let no_pins = rules(&settings);
+    assert_eq!(port(&no_pins, "443"), 0);
+    assert_eq!(port(&no_pins, "53"), 3);
+    assert_eq!(private(&no_pins), 2);
+
+    settings.routing.builtin.pin_dns_upstreams = true;
+    settings.routing.builtin.dns_interception = false;
+    let no_dns = rules(&settings);
+    assert_eq!(port(&no_dns, "443"), 1);
+    assert_eq!(port(&no_dns, "53"), 1, "only the dns-in rule remains");
+    assert_eq!(private(&no_dns), 2);
+
+    settings.routing.builtin.dns_interception = true;
+    settings.routing.builtin.private_direct = false;
+    let no_private = rules(&settings);
+    assert_eq!(port(&no_private, "443"), 1);
+    assert_eq!(port(&no_private, "53"), 3);
+    assert_eq!(private(&no_private), 0);
+}
+
+#[test]
 fn user_port_53_rule_is_routed_after_the_dns_interception_rules() {
     // A user rule matching UDP port 53 with no inboundTag condition (any
     // inbound, any domain) is the worst case for first-match routing: ahead

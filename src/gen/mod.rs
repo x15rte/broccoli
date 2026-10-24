@@ -1090,7 +1090,8 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     // END of the live rule list, and an unconditional in-tun catch-all
     // would swallow every TUN connection before an injected trial rule is
     // ever evaluated.)
-    if emission.dns_on
+    if cfg.builtin.pin_dns_upstreams
+        && emission.dns_on
         && let Some(tag) = emission.active.map(ServerProfile::tag)
     {
         for (host, port) in &emission.dns_upstreams {
@@ -1105,7 +1106,9 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     // by the DNS module (dns-out), and the loopback listener's TCP+UDP
     // queries are as well. The module's own upstream DoH traffic is
     // TCP:443, which never matches these rules and falls through
-    // to the active outbound — no loop.
+    // to the active outbound — no loop. The listener's own rule is not
+    // switchable (the runtime adds that listener); the TUN and SOCKS rules
+    // follow builtin.dns_interception.
     if emission.dns_intercept {
         if emission.dns_on && emission.tun_on {
             rules.push(json!({
@@ -1115,7 +1118,7 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
         }
-        if emission.tun_on {
+        if emission.tun_on && cfg.builtin.dns_interception {
             rules.push(json!({
                 "inboundTag": [TUN_INBOUND_TAG],
                 "network": "udp",
@@ -1123,7 +1126,7 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
         }
-        if !emission.socks_tags.is_empty() {
+        if !emission.socks_tags.is_empty() && cfg.builtin.dns_interception {
             rules.push(json!({
                 "inboundTag": emission.socks_tags,
                 "network": "udp",
@@ -1146,10 +1149,11 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     // send a private range (a remote LAN behind the proxy) through it. The
     // DNS interception above already owns port 53. Two rules because a rule's
     // conditions are ANDed: an IP target matches the first, a sniffed
-    // hostname matches the second. Skipped under fakeDNS, whose fake IPs come
-    // from 198.18.0.0/15 — a range in the private set — and must keep taking
-    // the default route.
-    if !emission.fakedns {
+    // hostname matches the second. builtin.private_direct turns the pair off
+    // together, and fakeDNS forces it off: its fake IPs come from
+    // 198.18.0.0/15 — a range in the private set — and must keep taking the
+    // default route.
+    if cfg.builtin.private_direct && !emission.fakedns {
         rules.push(json!({
             "ip": PRIVATE_IP_RANGES,
             "outboundTag": DIRECT_OUTBOUND_TAG,
