@@ -10,7 +10,7 @@ use crate::model::inbound::{
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
-use crate::model::validation::routing_script_issues;
+use crate::model::validation::{ip_rule_valid, routing_script_issues};
 use crate::model::{
     Balancer, DurationMs, LeastLoadSettings, Rule, ServerProfile, ServersFile, Settings,
     StrategyCost, Webhook,
@@ -25,7 +25,6 @@ use crate::ui::{UiCtx, widgets};
 use egui::{DragValue, RichText, Ui};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, VecDeque};
-use std::net::IpAddr;
 use tokio::sync::oneshot;
 
 /// Transient string buffers for the leastload sub-form of one balancer
@@ -4529,7 +4528,7 @@ mod view_cache_tests {
 /// warnings follow [`assess`] through the view cache.
 #[cfg(test)]
 mod routing_grammar_tests {
-    use super::{Language, RoutingScreen, valid_ip_rule, valid_port_list};
+    use super::{Language, RoutingScreen, ip_rule_valid, valid_port_list};
     use crate::i18n::{Key, t};
     use crate::model::{
         Balancer, OutboundModel, ServerProfile, ServersFile, Settings, StrategyCfg,
@@ -4638,6 +4637,8 @@ mod routing_grammar_tests {
     fn ip_rule_grammar_matches_the_wire_parser() {
         for valid in [
             "1.2.3.4",
+            " 1.2.3.4 ",
+            "[::1]",
             "::1",
             "2001:db8::68",
             "10.0.0.0/8",
@@ -4646,13 +4647,17 @@ mod routing_grammar_tests {
             "0.0.0.0/0",
             "::/0",
             "1.2.3.4/32",
+            "1.2.3.4/",
             "::1/128",
             "geoip:cn",
             "geoip:private",
+            "geoip:!private",
+            "ext:geoip.dat:cn",
+            "ext-ip:geoip.dat:cn",
             "!1.2.3.4",
             "!!geoip:cn",
         ] {
-            assert!(valid_ip_rule(valid), "{valid:?} must be a valid IP rule");
+            assert!(ip_rule_valid(valid), "{valid:?} must be a valid IP rule");
         }
         for invalid in [
             "abc",
@@ -4660,13 +4665,19 @@ mod routing_grammar_tests {
             "1.2.3.4/33",
             "::1/129",
             "1.2.3.4/abc",
+            "1.2.3.4/ 24",
+            "1.2.3.4/24/8",
             "/24",
             "geoip:",
+            "ext:",
+            "ext:geoip.dat",
+            "ext::cn",
+            "ext:geoip.dat:",
             "999.1.2.3",
-            "1.2.3.4/",
             "10.0.0.0/-1",
+            "10.0.0.0/8 ",
         ] {
-            assert!(!valid_ip_rule(invalid), "{invalid:?} must be rejected");
+            assert!(!ip_rule_valid(invalid), "{invalid:?} must be rejected");
         }
     }
 
@@ -5108,36 +5119,15 @@ fn valid_port_number(s: &str) -> Option<u32> {
     (port <= u16::MAX as u32).then_some(port)
 }
 
-/// Xray routing IP-rule grammar (`common/geodata/rule_parser.go`):
-/// each token is an IP literal or CIDR range (v4 prefix ≤ 32, v6 prefix ≤
-/// 128) or a `geoip:` tag reference; leading `!` negations are part of the
-/// grammar. Tag existence is checked against the installed geoip.dat at
-/// load, so any non-empty `geoip:` tag passes here.
-fn valid_ip_rule(s: &str) -> bool {
-    let s = s.trim_start_matches('!');
-    if let Some(tag) = s.strip_prefix("geoip:") {
-        return !tag.is_empty();
-    }
-    match s.split_once('/') {
-        Some((ip, prefix)) => {
-            let Ok(ip) = ip.parse::<IpAddr>() else {
-                return false;
-            };
-            let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
-            prefix.parse::<u32>().is_ok_and(|bits| bits <= max_prefix)
-        }
-        None => s.parse::<IpAddr>().is_ok(),
-    }
-}
-
 /// Inline red-tier error for a rule IP list (`ip`, `source`, `local_ip`):
-/// Xray's `ParseIPRules` hard-rejects any non-geoip token that is not an IP
-/// literal or CIDR range at config load ("illegal ip rule"), so the editor
-/// flags those tokens before the config is ever generated.
+/// Xray's `ParseIPRules` hard-rejects a malformed token at config load
+/// ("illegal ip rule"), so the editor flags those tokens before the config
+/// is ever generated. The predicate is the model's shared `ParseIPRules`
+/// mirror, the same one the inbound `filter` mask gates on.
 fn ip_list_error(lang: Language, items: &[String]) -> Option<String> {
     items
         .iter()
-        .any(|item| !valid_ip_rule(item))
+        .any(|item| !ip_rule_valid(item))
         .then(|| t(lang, Key::RoutingIpListInvalid).to_string())
 }
 

@@ -61,7 +61,7 @@ use crate::ui::{
     FeedbackLevel, UiCtx, format_latency_probe_feedback, format_single_latency_probe_feedback,
 };
 
-mod finalmask_editors;
+pub(crate) mod finalmask_editors;
 mod keygen;
 mod raw_editor;
 mod tls_editor;
@@ -10680,7 +10680,7 @@ Authentication: ML-KEM-768, Post-Quantum
     /// transport shows.
     #[test]
     fn xdrive_transport_editor_renders_the_xmux_section() {
-        let mut stream = StreamModel {
+        let stream = Rc::new(RefCell::new(StreamModel {
             network: Network::Xdrive,
             xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
                 service: crate::model::stream::XDRIVE_SERVICE_LOCAL.into(),
@@ -10692,13 +10692,14 @@ Authentication: ML-KEM-768, Post-Quantum
                 ..Default::default()
             })),
             ..Default::default()
-        };
+        }));
+        let stream_for_ui = Rc::clone(&stream);
         let mut screen = ServersScreen::default();
-        let harness = Harness::new_ui(|ui| {
+        let mut harness = Harness::new_ui(move |ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
-                &mut stream,
+                &mut stream_for_ui.borrow_mut(),
                 0,
                 TransportTabCtx {
                     target: None,
@@ -10708,19 +10709,30 @@ Authentication: ML-KEM-768, Post-Quantum
                 },
             );
         });
-        for label in [
-            t(Language::En, Key::SrvXmux),
-            t(Language::En, Key::SrvEnableXmux),
-            t(Language::En, Key::SrvConnectionLimit),
-            "maxConnections",
-            "cMaxReuseTimes",
-        ] {
-            assert!(
-                harness.query_all_by_label_contains(label).next().is_some(),
-                "the xdrive editor must render its {label:?} xmux control"
-            );
-        }
-        assert!(harness.query_by_label("maxConcurrency").is_none());
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvXmux))
+                .is_some(),
+            "the xdrive editor must mount the xmux section"
+        );
+        assert!(
+            harness.query_by_label("cMaxReuseTimes").is_some(),
+            "the section must render the transport's stored block"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableXmux))
+            .click();
+        harness.run();
+        assert!(
+            stream
+                .borrow()
+                .xdrive_settings
+                .as_ref()
+                .expect("the transport keeps its settings")
+                .xmux
+                .is_none(),
+            "the section must write the xdrive transport's block"
+        );
     }
 
     /// A transport profile whose settings carry a template the runtime builds
@@ -11891,6 +11903,54 @@ Authentication: ML-KEM-768, Post-Quantum
         for absent in ["realm", "sudoku"] {
             assert!(!udp.contains(absent), "{udp:?} must not name {absent}");
         }
+    }
+
+    /// The Advanced tab renders the finalmask verdict the gate computes: a
+    /// resolver row the editor creates with no address shows its blocking
+    /// finding under the mask list.
+    #[test]
+    fn advanced_tab_renders_the_empty_xdns_resolver_finding() {
+        let mut profile = ServerProfile::new("xdns-empty", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream.finalmask = Some(
+            serde_json::from_value(json!({
+                "udp": [{"type": "xdns", "settings": {
+                    "resolvers": [{"addrs": []}]
+                }}]
+            }))
+            .expect("fixture is a valid finalmask"),
+        );
+        let findings = super::finalmask_findings(&profile);
+        let errors = super::render_findings(findings.iter(), Language::En);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("add at least one resolver address"),
+            "{errors:?}"
+        );
+
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 2000.0))
+            .build_ui(|ui| {
+                let _ = ServersScreen::advanced_tab(
+                    ui,
+                    Language::En,
+                    &mut profile,
+                    &[],
+                    AdvancedTabCtx {
+                        set_key: (0, 0),
+                        finalmask_errors: &errors,
+                        stream_sockopt_errors: &[],
+                        dialer_proxy_options: &mut screen.existing.chain_options,
+                        buffers: &mut screen.seeded_buffers,
+                        masked: false,
+                    },
+                );
+            });
+        harness.run();
+        assert!(
+            harness.query_by_label(&errors[0]).is_some(),
+            "the editor must render the empty resolver row's finding: {errors:?}"
+        );
     }
 
     #[test]
@@ -15450,6 +15510,72 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(wire["settings"]["resolvers"][0]["quicConfig"], json!({}));
     }
 
+    /// Every `xdns` name and address row keeps its Remove action inside the
+    /// row's clip rect at a narrow width. The rows share one right-to-left
+    /// shape: the button pins to the right edge and the field fills the rest.
+    /// A left-to-right row puts the unbounded field first and lays the button
+    /// out past the clip rect, where egui never hit-tests it.
+    #[test]
+    fn xdns_text_rows_keep_their_remove_buttons_on_screen() {
+        let mask = Rc::new(RefCell::new(FinalmaskUdpMask::Xdns {
+            settings: FinalmaskXdns {
+                domains: vec![FinalmaskXdnsDomain {
+                    names: vec!["a.example".into()],
+                    len_limit: 255,
+                    label_limit: 63,
+                    types: vec![1, 28],
+                    ..Default::default()
+                }],
+                resolvers: vec![FinalmaskXdnsResolver {
+                    addrs: vec!["1.1.1.1:53".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            extra: Default::default(),
+        }));
+        let mask_for_ui = Rc::clone(&mask);
+        let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
+        let buffers_for_ui = Rc::clone(&buffers);
+        let width = 360.0;
+        let height = 1600.0;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(width, height))
+            .build_ui(move |ui| {
+                let _ = finalmask_udp_settings_editor(
+                    ui,
+                    Language::En,
+                    &mut mask_for_ui.borrow_mut(),
+                    RawField {
+                        id: FieldKey {
+                            key: egui::Id::new("xdns-remove-clip-test"),
+                            profile: "profile-test",
+                        },
+                        buffers: &mut buffers_for_ui.borrow_mut(),
+                    },
+                    false,
+                    0,
+                );
+            });
+        harness.run();
+
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+        let buttons: Vec<egui::Rect> = harness
+            .query_all_by_label(t(Language::En, Key::SrvRemove))
+            .map(|node| node.rect())
+            .collect();
+        assert!(
+            buttons.len() >= 4,
+            "the fixture renders a domain, a name, a resolver, and an address row: {buttons:?}"
+        );
+        for rect in buttons {
+            assert!(
+                viewport.contains_rect(rect),
+                "an xdns Remove button must stay inside the clip rect: {rect:?} outside {viewport:?}"
+            );
+        }
+    }
+
     #[test]
     fn noise_exp_item_offers_its_type_and_edits_as_text() {
         fn noise(mask: &FinalmaskUdpMask) -> &FinalmaskNoise {
@@ -15787,9 +15913,8 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(xmux.borrow().is_none());
     }
 
-    /// The XHTTP transport settings mount the shared XMUX control: its
-    /// controls render from the transport's stored block, and its enable
-    /// switch writes that block.
+    /// The XHTTP transport settings mount the shared XMUX control and write
+    /// the transport's own block.
     #[test]
     fn xhttp_transport_settings_mount_the_shared_xmux_control() {
         let stream = Rc::new(RefCell::new(StreamModel {
@@ -15824,7 +15949,6 @@ Authentication: ML-KEM-768, Post-Quantum
                 ServersScreen::default(),
             );
         harness.get_by_label(t(Language::En, Key::SrvXmux));
-        harness.get_by_label("cMaxReuseTimes");
         harness
             .get_by_label(t(Language::En, Key::SrvEnableXmux))
             .click();

@@ -16,6 +16,16 @@ use crate::ui::widgets;
 use super::raw_editor::{SeededBuffers, pem_lines_editor};
 use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
+/// The `useSystemCA` row shared by every surface that edits TLS settings:
+/// the outbound TLS block, a DoH resolver's nested `tlsConfig`, and the
+/// finalmask realm TLS block. The switch writes the same model field, and
+/// the note explains the bundled-roots default.
+pub(super) fn use_system_ca_row(ui: &mut egui::Ui, lang: Language, on: &mut bool) -> bool {
+    widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
+        ui.checkbox(on, "useSystemCA").changed()
+    })
+}
+
 /// The plain TLS settings, from the server name through the certificate pin.
 ///
 /// `fingerprint_code` is the model code that judges this context's
@@ -106,9 +116,7 @@ pub(super) fn tls_fields_editor(
         &mut tls.disable_system_root,
         t(lang, Key::SrvUnset),
     );
-    changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
-        ui.checkbox(&mut tls.use_system_ca, "useSystemCA").changed()
-    });
+    changed |= use_system_ca_row(ui, lang, &mut tls.use_system_ca);
     changed |= widgets::opt_bool(
         ui,
         "enableSessionResumption",

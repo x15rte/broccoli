@@ -12,7 +12,7 @@ use crate::model::outbound::{OutboundModel, ProtocolSettings};
 use crate::model::stream::{
     FinalmaskFilter, FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
     FinalmaskSudoku, FinalmaskTcpMask, FinalmaskTransform, FinalmaskUdpMask, FinalmaskXdnsDomain,
-    FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security, SockoptModel, StreamModel,
+    FinalmaskXmc, MAX_XHTTP_DOWNLOAD_DEPTH, Network, Security, SockoptModel, StreamModel, TlsModel,
     XmuxConfig,
 };
 use crate::model::{
@@ -535,6 +535,142 @@ pub(super) fn freedom_domain_strategy_supported(strategy: &str) -> bool {
     target_strategy_supported(strategy)
 }
 
+/// The TLS settings findings Xray's `TLSConfig.Build` applies whatever the
+/// surface: the `serverName` advisory, the removed `masterKeyLog` and
+/// `allowInsecure` keys, the fingerprint vocabulary, the certificate pin,
+/// and the version strings. `path` is the settings block's wire path
+/// (`stream.tlsSettings`, or a resolver's `...resolvers[i].tlsConfig`), so
+/// the same rule reports under the block the user edited.
+fn validate_tls_settings(tls: &TlsModel, path: &str, issues: &mut Vec<ValidationIssue>) {
+    // Advisory: a serverName that can never be a real SNI (UUID-shaped or
+    // impossible characters) always fails the handshake, yet Xray accepts the
+    // config — warn, never gate. Empty is out of scope.
+    if server_name_implausible(&tls.server_name) {
+        issues.push(warning(
+            ValidationCode::ServerNameImplausible,
+            Some(format!("{path}.serverName")),
+        ));
+    }
+    // `masterKeyLog` makes Xray create/append an attacker-chosen file and
+    // log TLS session keys to it — refused on import (the share-link
+    // export already rejects it as outside #716). serde binds only the
+    // exact-case `masterKeyLog` to the model field; a case variant lands
+    // in the flattened `extra` map, is still flattened verbatim into the
+    // generated config, and Go's case-insensitive JSON unmarshal sets
+    // MasterKeyLog regardless — so the extra map is scanned
+    // case-insensitively too.
+    if !tls.master_key_log.is_empty()
+        || tls
+            .extra
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("masterKeyLog"))
+    {
+        issues.push(issue(
+            ValidationCode::MasterKeyLogNotSupported,
+            Some(format!("{path}.masterKeyLog")),
+        ));
+    }
+    // `allowInsecure` is a removed Xray TLS field (not modeled), so a
+    // carried value lands in the flattened `extra` map and must be
+    // refused. `false` is the Go zero value — Xray runs it fine; any
+    // other value (`true`, strings, numbers) either hard-fails
+    // TLSConfig.Build (PrintRemovedFeatureError) or Xray's JSON
+    // unmarshal into `AllowInsecure bool`. Go's unmarshal matches field
+    // names case-insensitively, so every key case must be scanned.
+    if tls.extra.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("allowInsecure")
+            && !matches!(value, Value::Bool(false) | Value::Null)
+    }) {
+        issues.push(issue(
+            ValidationCode::TlsAllowInsecureRemoved,
+            Some(format!("{path}.allowInsecure")),
+        ));
+    }
+    // The fingerprint vocabulary is the canonical table in
+    // `crate::model::fingerprint` — TLS accepts the full wire vocabulary
+    // (`unsafe`/`hellogolang` included).
+    if !crate::model::fingerprint::wire_validation_supported(&tls.fingerprint) {
+        issues.push(issue(
+            ValidationCode::TlsFingerprintUnsupported,
+            Some(format!("{path}.fingerprint")),
+        ));
+    }
+    if !pinned_peer_cert_sha256_valid(&tls.pinned_peer_cert_sha256) {
+        issues.push(issue(
+            ValidationCode::PinnedPeerCertSha256Invalid,
+            Some(format!("{path}.pinnedPeerCertSha256")),
+        ));
+    }
+    // Configuration warning: Xray accepts any string here
+    // but the version switches in tls/config.go leave unrecognized
+    // values at the Go default — the configured cap/floor silently
+    // never applies. The in-range min > max inversion is a separate
+    // runtime-class rule and is NOT coded here.
+    for (version, field) in [
+        (&tls.min_version, "minVersion"),
+        (&tls.max_version, "maxVersion"),
+    ] {
+        if !version.is_empty() && !tls_version_supported(version) {
+            issues.push(warning(
+                ValidationCode::TlsVersionRangeInvalid,
+                Some(format!("{path}.{field}")),
+            ));
+        }
+    }
+    // In-range min > max inversion:
+    // both versions are valid {1.0..1.3} but the range is inverted.
+    // Live repro 2026-09-06 on Xray 26.7.28: `run -test` accepts the
+    // pair and the wire negotiates TLS 1.3 — the client version
+    // pins never apply (a maxVersion-only "1.2" probe also
+    // negotiates 1.3, and a minVersion-only "1.3" probe accepts
+    // 1.2), so the config silently never behaves as written —
+    // configuration warning (Severity::Warning).
+    if let (Some(min), Some(max)) = (
+        tls_version_rank(&tls.min_version),
+        tls_version_rank(&tls.max_version),
+    ) && min > max
+    {
+        issues.push(warning(
+            ValidationCode::TlsMinExceedsMax,
+            Some(path.to_string()),
+        ));
+    }
+}
+
+/// The TLS settings rules Xray applies only when the block is actually
+/// selected: the `fromMitm` ALPN shape and the certificate rows. The stream
+/// takes them when `security` is TLS; a DoH resolver always does.
+fn validate_tls_connection_settings(tls: &TlsModel, path: &str, issues: &mut Vec<ValidationIssue>) {
+    // `fromMitm` beside another ALPN name: Xray's conf build refuses
+    // the list (infra/conf/transport_security.go: only one element is
+    // allowed in "alpn" when using "fromMitm" in it).
+    if tls.alpn.len() > 1 && tls.alpn.iter().any(|value| value == "fromMitm") {
+        issues.push(issue(
+            ValidationCode::TlsFromMitmAlpnShort,
+            Some(format!("{path}.alpn")),
+        ));
+    }
+    // A certificate row with neither a file nor inline PEM lines has
+    // no key material to load (infra/conf: both file and bytes are
+    // empty). Both tests are trimmed: a whitespace-only path names no
+    // readable file and a blank-only line list parses no certificate,
+    // so the row has nothing to load. The path names the row so the
+    // finding points at the entry the user has to fill in.
+    for (index, certificate) in tls.certificates.iter().enumerate() {
+        if certificate.certificate_file.trim().is_empty()
+            && certificate
+                .certificate
+                .iter()
+                .all(|line| line.trim().is_empty())
+        {
+            issues.push(issue(
+                ValidationCode::TlsCertificateRequired,
+                Some(format!("{path}.certificates[{index}]")),
+            ));
+        }
+    }
+}
+
 /// Validate a stream model, recursing over every modeled XHTTP download
 /// stream. Mirrors the old `StreamModel::validation_errors` visit logic.
 pub fn validate_stream(s: &StreamModel) -> Verdict {
@@ -603,19 +739,18 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 Some("stream.tlsSettings".into()),
             ));
         }
-        // Advisory: a TLS/REALITY serverName that can
-        // never be a real SNI (UUID-shaped or impossible characters) always
-        // fails the handshake, yet Xray accepts the config — warn, never
-        // gate. Mirrors the masterKeyLog convention below: the check rides
-        // the settings block whenever one is present, and empty is out of
-        // scope.
-        if let Some(tls) = stream.tls_settings.as_ref()
-            && server_name_implausible(&tls.server_name)
-        {
-            issues.push(warning(
-                ValidationCode::ServerNameImplausible,
-                Some("stream.tlsSettings.serverName".into()),
-            ));
+        // The TLS settings rules, shared by the outbound `stream.tlsSettings`
+        // block and the DoH resolver's nested `tlsConfig` in an `xdns` mask:
+        // both carry the same `TlsModel`, and the core applies one
+        // `TLSConfig.Build` rule set to both, so the path prefix is the only
+        // difference. A resolver always speaks TLS, so it takes the
+        // connection rules unconditionally; the stream takes them only when
+        // `security` selects TLS (the wire pass drops the block otherwise).
+        if let Some(tls) = stream.tls_settings.as_ref() {
+            validate_tls_settings(tls, "stream.tlsSettings", issues);
+            if stream.security == Security::Tls {
+                validate_tls_connection_settings(tls, "stream.tlsSettings", issues);
+            }
         }
         if let Some(reality) = stream.reality_settings.as_ref()
             && server_name_implausible(&reality.server_name)
@@ -623,26 +758,6 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             issues.push(warning(
                 ValidationCode::ServerNameImplausible,
                 Some("stream.realitySettings.serverName".into()),
-            ));
-        }
-        // `masterKeyLog` makes Xray create/append an attacker-chosen file and
-        // log TLS session keys to it — refused on import (the share-link
-        // export already rejects it as outside #716). serde binds only the
-        // exact-case `masterKeyLog` to the model field; a case variant lands
-        // in the flattened `extra` map, is still flattened verbatim into the
-        // generated config, and Go's case-insensitive JSON unmarshal sets
-        // MasterKeyLog regardless — so the extra map is scanned
-        // case-insensitively too.
-        if let Some(tls) = stream.tls_settings.as_ref()
-            && (!tls.master_key_log.is_empty()
-                || tls
-                    .extra
-                    .keys()
-                    .any(|key| key.eq_ignore_ascii_case("masterKeyLog")))
-        {
-            issues.push(issue(
-                ValidationCode::MasterKeyLogNotSupported,
-                Some("stream.tlsSettings.masterKeyLog".into()),
             ));
         }
         if let Some(reality) = stream.reality_settings.as_ref()
@@ -655,24 +770,6 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             issues.push(issue(
                 ValidationCode::MasterKeyLogNotSupported,
                 Some("stream.realitySettings.masterKeyLog".into()),
-            ));
-        }
-        // `allowInsecure` is a removed Xray TLS field (not modeled), so a
-        // carried value lands in the flattened `extra` map and must be
-        // refused. `false` is the Go zero value — Xray runs it fine; any
-        // other value (`true`, strings, numbers) either hard-fails
-        // TLSConfig.Build (PrintRemovedFeatureError) or Xray's JSON
-        // unmarshal into `AllowInsecure bool`. Go's unmarshal matches field
-        // names case-insensitively, so every key case must be scanned.
-        if let Some(tls) = stream.tls_settings.as_ref()
-            && tls.extra.iter().any(|(key, value)| {
-                key.eq_ignore_ascii_case("allowInsecure")
-                    && !matches!(value, Value::Bool(false) | Value::Null)
-            })
-        {
-            issues.push(issue(
-                ValidationCode::TlsAllowInsecureRemoved,
-                Some("stream.tlsSettings.allowInsecure".into()),
             ));
         }
         // Extra-passthrough scans — transport-level extras: the same
@@ -756,102 +853,12 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 }
             }
         }
-        // Transport-security formats: REALITY client formats, fingerprint
-        // wire vocabulary on both blocks, cert pins, and the silently-dropped
-        // TLS version strings.
-        // All Error findings mirror Xray conf-load rejections
+        // REALITY client formats: the fingerprint vocabulary and the
+        // key/SPX shapes. All Error findings mirror Xray conf-load rejections
         // (conf/transport_security.go), so they gate save/apply exactly like
-        // an import refusal; the version drop is class-E silent, so it warns
-        // instead (tls/config.go). The security refusals above (masterKeyLog,
-        // allowInsecure) report first when several findings share one block;
-        // like those conventions, the format checks ride the settings block
-        // whenever one is present. Fingerprint vocabulary is the canonical
-        // table in `crate::model::fingerprint` — TLS accepts the full wire
-        // vocabulary (`unsafe`/`hellogolang` included), REALITY additionally
-        // excludes `unsafe` and `hellogolang`.
-        if let Some(tls) = stream.tls_settings.as_ref() {
-            if !crate::model::fingerprint::wire_validation_supported(&tls.fingerprint) {
-                issues.push(issue(
-                    ValidationCode::TlsFingerprintUnsupported,
-                    Some("stream.tlsSettings.fingerprint".into()),
-                ));
-            }
-            if !pinned_peer_cert_sha256_valid(&tls.pinned_peer_cert_sha256) {
-                issues.push(issue(
-                    ValidationCode::PinnedPeerCertSha256Invalid,
-                    Some("stream.tlsSettings.pinnedPeerCertSha256".into()),
-                ));
-            }
-            // Configuration warning: Xray accepts any string here
-            // but the version switches in tls/config.go leave unrecognized
-            // values at the Go default — the configured cap/floor silently
-            // never applies. The in-range min > max inversion is a separate
-            // runtime-class rule and is NOT coded here.
-            for (version, path) in [
-                (&tls.min_version, "stream.tlsSettings.minVersion"),
-                (&tls.max_version, "stream.tlsSettings.maxVersion"),
-            ] {
-                if !version.is_empty() && !tls_version_supported(version) {
-                    issues.push(warning(
-                        ValidationCode::TlsVersionRangeInvalid,
-                        Some(path.into()),
-                    ));
-                }
-            }
-            // In-range min > max inversion:
-            // both versions are valid {1.0..1.3} but the range is inverted.
-            // Live repro 2026-09-06 on Xray 26.7.28: `run -test` accepts the
-            // pair and the wire negotiates TLS 1.3 — the client version
-            // pins never apply (a maxVersion-only "1.2" probe also
-            // negotiates 1.3, and a minVersion-only "1.3" probe accepts
-            // 1.2), so the config silently never behaves as written —
-            // configuration warning (Severity::Warning).
-            if let (Some(min), Some(max)) = (
-                tls_version_rank(&tls.min_version),
-                tls_version_rank(&tls.max_version),
-            ) && min > max
-            {
-                issues.push(warning(
-                    ValidationCode::TlsMinExceedsMax,
-                    Some("stream.tlsSettings".into()),
-                ));
-            }
-        }
-        // Xray consults `tlsSettings` only when `security` selects TLS (the
-        // wire pass drops the block otherwise), so the certificate and ALPN
-        // rules ride that selection, exactly like the ECH sockopt check below.
-        if stream.security == Security::Tls
-            && let Some(tls) = stream.tls_settings.as_ref()
-        {
-            // `fromMitm` beside another ALPN name: Xray's conf build refuses
-            // the list (infra/conf/transport_security.go: only one element is
-            // allowed in "alpn" when using "fromMitm" in it).
-            if tls.alpn.len() > 1 && tls.alpn.iter().any(|value| value == "fromMitm") {
-                issues.push(issue(
-                    ValidationCode::TlsFromMitmAlpnShort,
-                    Some("stream.tlsSettings.alpn".into()),
-                ));
-            }
-            // A certificate row with neither a file nor inline PEM lines has
-            // no key material to load (infra/conf: both file and bytes are
-            // empty). Both tests are trimmed: a whitespace-only path names no
-            // readable file and a blank-only line list parses no certificate,
-            // so the row has nothing to load. The path names the row so the
-            // finding points at the entry the user has to fill in.
-            for (index, certificate) in tls.certificates.iter().enumerate() {
-                if certificate.certificate_file.trim().is_empty()
-                    && certificate
-                        .certificate
-                        .iter()
-                        .all(|line| line.trim().is_empty())
-                {
-                    issues.push(issue(
-                        ValidationCode::TlsCertificateRequired,
-                        Some(format!("stream.tlsSettings.certificates[{index}]")),
-                    ));
-                }
-            }
-        }
+        // an import refusal. Fingerprint vocabulary is the canonical table in
+        // `crate::model::fingerprint`; REALITY excludes exactly
+        // `unsafe`/`hellogolang`.
         if let Some(reality) = stream.reality_settings.as_ref() {
             if !crate::model::fingerprint::reality_wire_supported(&reality.fingerprint) {
                 issues.push(issue(
@@ -1333,7 +1340,7 @@ fn finalmask_validate_filter(
         ("allowedSourceIPs", &settings.allowed_source_ips),
     ] {
         for (index, rule) in rules.iter().enumerate() {
-            if !finalmask_ip_rule_valid(rule) {
+            if !super::ip_rule_valid(rule) {
                 issues.push(issue(
                     ValidationCode::FinalmaskFilterIpRuleInvalid(excerpt(rule)),
                     Some(format!("{path}.{key}[{index}]")),
@@ -1341,81 +1348,6 @@ fn finalmask_validate_filter(
             }
         }
     }
-}
-
-/// True for one rule the `filter` build accepts, mirroring
-/// `geodata.ParseIPRules` (`common/geodata/rule_parser.go:25-61`): leading
-/// `!` negations, `geoip:TAG` (read as `ext:geoip.dat:TAG`), an
-/// `ext:`/`ext-ip:` `FILE:CODE` reference, or an IP literal / CIDR range.
-/// Whether a tag exists in its data file is the core's lookup, not this
-/// grammar's rule; the routing editor draws the line in the same place.
-fn finalmask_ip_rule_valid(rule: &str) -> bool {
-    let rule = rule.trim_start_matches('!');
-    if let Some(tag) = rule.strip_prefix("geoip:") {
-        return finalmask_ext_ip_rule_valid(&format!("geoip.dat:{tag}"));
-    }
-    if let Some(reference) = rule
-        .strip_prefix("ext:")
-        .or_else(|| rule.strip_prefix("ext-ip:"))
-    {
-        return finalmask_ext_ip_rule_valid(reference);
-    }
-    finalmask_cidr_rule_valid(rule)
-}
-
-/// The `FILE:CODE` half of a geo rule: `parseGeoIPRule` cuts at the first
-/// colon, refuses an empty file or a code that is empty after its own `!`
-/// prefixes (`common/geodata/rule_parser.go:63-91`).
-fn finalmask_ext_ip_rule_valid(reference: &str) -> bool {
-    match reference.split_once(':') {
-        Some((file, code)) => !file.is_empty() && !code.trim_start_matches('!').is_empty(),
-        None => false,
-    }
-}
-
-/// An IP literal or CIDR range as `parseCIDR` reads it
-/// (`common/geodata/rule_parser.go:113-141`): the address follows
-/// `ParseAddress` (one bracket pair stripped, edges trimmed when
-/// non-alphanumeric — `common/net/address.go:79-96`), the prefix after the
-/// first `/` is decimal digits up to the family width, and an empty or absent
-/// prefix means the full width.
-fn finalmask_cidr_rule_valid(rule: &str) -> bool {
-    let (address, prefix) = match rule.split_once('/') {
-        Some((address, prefix)) => (address, Some(prefix)),
-        None => (rule, None),
-    };
-    let Some(max_prefix) = finalmask_address_width(address) else {
-        return false;
-    };
-    match prefix {
-        None | Some("") => true,
-        Some(prefix) => {
-            prefix.bytes().all(|byte| byte.is_ascii_digit())
-                && prefix.parse::<u32>().is_ok_and(|bits| bits <= max_prefix)
-        }
-    }
-}
-
-/// The family width `net.ParseAddress` produces for an IP literal: 32 for
-/// IPv4, 128 for IPv6, and `None` for everything else (domains included).
-fn finalmask_address_width(address: &str) -> Option<u32> {
-    let mut address = address;
-    if let Some(inner) = address
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    {
-        address = inner;
-    }
-    let bytes = address.as_bytes();
-    if let (Some(first), Some(last)) = (bytes.first(), bytes.last())
-        && (!first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric())
-    {
-        address = address.trim();
-    }
-    address
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| if ip.is_ipv4() { 32 } else { 128 })
 }
 
 /// Gate the UDP mask positions the wrap refuses. `NewFinalMask` reverses both
@@ -2550,6 +2482,12 @@ fn finalmask_validate_udp_mask(
             }
             for (resolver_index, resolver) in settings.resolvers.iter().enumerate() {
                 let entry_path = format!("{path}.settings.resolvers[{resolver_index}]");
+                if resolver.addrs.is_empty() {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskXdnsResolverAddrsEmpty,
+                        Some(format!("{entry_path}.addrs")),
+                    ));
+                }
                 for (addr_index, addr) in resolver.addrs.iter().enumerate() {
                     let addr_path = format!("{entry_path}.addrs[{addr_index}]");
                     match finalmask_xdns_addr_scheme(addr) {
@@ -2577,6 +2515,15 @@ fn finalmask_validate_udp_mask(
                         ValidationCode::FinalmaskXdnsWorkerInvalid,
                         Some(format!("{entry_path}.worker")),
                     ));
+                }
+                // A resolver's nested `tlsConfig` is the same `TlsModel` the
+                // outbound carries, built by the same `TLSConfig.Build`, so
+                // it takes the same rules under its own path. DoH speaks TLS
+                // unconditionally, so the connection rules apply as well.
+                if let Some(tls) = resolver.tls_config.as_ref() {
+                    let tls_path = format!("{entry_path}.tlsConfig");
+                    validate_tls_settings(tls, &tls_path, issues);
+                    validate_tls_connection_settings(tls, &tls_path, issues);
                 }
                 if let Some(quic) = resolver.quic_config.as_ref() {
                     finalmask_validate_quic_params(
@@ -3698,6 +3645,128 @@ mod tests {
                 .as_deref()
                 .is_some_and(|path| path.contains("resolvers[1]"))),
             "{issues:#?}"
+        );
+    }
+
+    /// A resolver's nested `tlsConfig` is the outbound TLS block in another
+    /// place, built by the same `TLSConfig.Build`, so every rule that gates
+    /// an outbound TLS block gates it too — under the resolver's own path.
+    /// `masterKeyLog` in particular must not survive import and reach the
+    /// core, which would write session keys to the chosen file.
+    #[test]
+    fn finalmask_xdns_resolver_tls_config_takes_the_stream_tls_rules() {
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {"resolvers": [
+                {
+                    "addrs": ["https://dns.example/dns-query"],
+                    "tlsConfig": {"masterKeyLog": "keys.log"}
+                },
+                {
+                    "addrs": ["https://dns.example/dns-query"],
+                    "tlsConfig": {
+                        "fingerprint": "bogus",
+                        "pinnedPeerCertSha256": "zz",
+                        "alpn": ["fromMitm", "h2"]
+                    }
+                },
+                {
+                    "addrs": ["https://dns.example/dns-query"],
+                    "tlsConfig": {"serverName": "dns.example"}
+                }
+            ]}}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&fm);
+        let root = "finalmask.udp[0].settings.resolvers";
+        for (code, path) in [
+            (
+                ValidationCode::MasterKeyLogNotSupported,
+                format!("{root}[0].tlsConfig.masterKeyLog"),
+            ),
+            (
+                ValidationCode::TlsFingerprintUnsupported,
+                format!("{root}[1].tlsConfig.fingerprint"),
+            ),
+            (
+                ValidationCode::PinnedPeerCertSha256Invalid,
+                format!("{root}[1].tlsConfig.pinnedPeerCertSha256"),
+            ),
+            (
+                ValidationCode::TlsFromMitmAlpnShort,
+                format!("{root}[1].tlsConfig.alpn"),
+            ),
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == code && issue.path.as_deref() == Some(&path)),
+                "missing {code:?} at {path:?} in {issues:#?}"
+            );
+        }
+        assert!(
+            !issues.iter().any(|issue| issue
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("resolvers[2]"))),
+            "a clean DoH resolver must pass: {issues:#?}"
+        );
+
+        // The same rules reach the outbound gate, which is what the editor
+        // and the share-link importer call.
+        let mut outbound =
+            crate::model::outbound::OutboundModel::new(crate::model::outbound::Protocol::Vless);
+        outbound.stream.finalmask = Some(fm);
+        let gate = crate::model::validation::validate_outbound(&outbound);
+        assert!(
+            gate.iter().any(
+                |issue| issue.code == ValidationCode::MasterKeyLogNotSupported
+                    && issue.path.as_deref()
+                        == Some("finalmask.udp[0].settings.resolvers[0].tlsConfig.masterKeyLog")
+            ),
+            "the apply gate must refuse the resolver's masterKeyLog: {gate:#?}"
+        );
+    }
+
+    /// A resolver row with no address contributes nothing to the built
+    /// resolver list, and a mask whose rows all lack addresses hands the
+    /// client an empty list it refuses at creation. The row is the unit the
+    /// editor creates and the user fills in, so an empty one blocks with its
+    /// own path.
+    #[test]
+    fn finalmask_xdns_resolver_without_addresses_blocks_the_model_gate() {
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "xdns", "settings": {"resolvers": [
+                {"addrs": []},
+                {"addrs": ["1.1.1.1"]}
+            ]}}]
+        }))
+        .expect("fixture is valid finalmask JSON");
+        let issues = validate_finalmask(&fm);
+        assert!(
+            issues.iter().any(|issue| issue.code
+                == ValidationCode::FinalmaskXdnsResolverAddrsEmpty
+                && issue.path.as_deref() == Some("finalmask.udp[0].settings.resolvers[0].addrs")),
+            "the empty resolver row must block at its own path: {issues:#?}"
+        );
+        assert!(
+            !issues.iter().any(|issue| issue
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("resolvers[1]"))),
+            "a resolver with an address must not fire: {issues:#?}"
+        );
+
+        let mut outbound =
+            crate::model::outbound::OutboundModel::new(crate::model::outbound::Protocol::Vless);
+        outbound.stream.finalmask = Some(fm);
+        let gate = crate::model::validation::validate_outbound(&outbound);
+        assert!(
+            gate.iter().any(
+                |issue| issue.code == ValidationCode::FinalmaskXdnsResolverAddrsEmpty
+                    && issue.path.as_deref()
+                        == Some("finalmask.udp[0].settings.resolvers[0].addrs")
+            ),
+            "the apply gate must refuse the empty resolver row: {gate:#?}"
         );
     }
 

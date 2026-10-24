@@ -1689,6 +1689,7 @@ keys! {
     FinalmaskXdnsDomainLimitInvalid 0,
     FinalmaskXdnsDomainCapacityInvalid 0,
     FinalmaskXdnsResolverAddrInvalid 0,
+    FinalmaskXdnsResolverAddrsEmpty 0,
     FinalmaskXdnsAddrSchemeUnknown 1,
     FinalmaskXdnsHttpsRequiresTls 0,
     FinalmaskXdnsWorkerInvalid 0,
@@ -2726,6 +2727,7 @@ fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
         FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
         FinalmaskXdnsDomainCapacityInvalid => t(lang, Key::FinalmaskXdnsDomainCapacityInvalid),
         FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
+        FinalmaskXdnsResolverAddrsEmpty => t(lang, Key::FinalmaskXdnsResolverAddrsEmpty),
         FinalmaskXdnsAddrSchemeUnknown(_) => t(lang, Key::FinalmaskXdnsAddrSchemeUnknown),
         FinalmaskXdnsHttpsRequiresTls => t(lang, Key::FinalmaskXdnsHttpsRequiresTls),
         FinalmaskXdnsWorkerInvalid => t(lang, Key::FinalmaskXdnsWorkerInvalid),
@@ -5113,6 +5115,7 @@ mod en {
             Key::FinalmaskXdnsResolverAddrInvalid => {
                 "enter the resolver address as host, host:port, tcp://, udp://, or https://"
             }
+            Key::FinalmaskXdnsResolverAddrsEmpty => "add at least one resolver address",
             Key::FinalmaskXdnsHttpsRequiresTls => "an https:// resolver needs TLS settings",
             Key::FinalmaskXdnsWorkerInvalid => {
                 "use 0 for the core's default worker count, or a positive number"

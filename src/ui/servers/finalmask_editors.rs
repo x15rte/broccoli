@@ -3,7 +3,8 @@
 //! (range/sequence/list rows, transforms, TCP/UDP masks, realm TLS, QUIC
 //! hops), entered from the screen's advanced-tab editor plus intra-family
 //! recursion. Raw-JSON and PEM fields edit through the screen's seeded
-//! buffer machinery (`super::raw_editor`). Private to the screen.
+//! buffer machinery (`super::raw_editor`). The `filter` list editor is shared
+//! with the inbound screen, which mounts the same mask on a listener.
 
 use crate::i18n::{Key, t, t_fmt, validation_message};
 use crate::model::settings::Language;
@@ -25,7 +26,7 @@ use crate::ui::widgets;
 use super::raw_editor::{
     JsonEditorSpec, RawField, SeededBuffers, pem_lines_editor, raw_buffer_edit,
 };
-use super::tls_editor::{tls_connection_editor, tls_fields_editor};
+use super::tls_editor::{tls_connection_editor, tls_fields_editor, use_system_ca_row};
 use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
 // ---------- finalmask typed editor ----------
@@ -798,17 +799,23 @@ fn xdns_text_row(
     let mut remove = false;
     ui.horizontal(|ui| {
         let label = ui.label(label);
-        changed = ui
-            .add(
-                egui::TextEdit::singleline(value)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY),
-            )
-            .labelled_by(label.id)
-            .changed();
-        if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
-            remove = true;
-        }
+        // Right-to-left: the remove button pins to the row's right edge and
+        // the field fills exactly the remaining width. An unbounded field
+        // laid out first would claim the whole row and push the button past
+        // the clip rect (invisible, unclickable).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
+                remove = true;
+            }
+            changed = ui
+                .add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id)
+                .changed();
+        });
     });
     (changed, remove)
 }
@@ -1071,7 +1078,7 @@ pub(super) fn finalmask_tcp_settings_editor(
             finalmask_sudoku_editor(ui, lang, settings, masked)
         }
         FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings, masked),
-        FinalmaskTcpMask::Filter { settings, .. } => finalmask_filter_editor(ui, lang, settings),
+        FinalmaskTcpMask::Filter { settings, .. } => filter_settings_editor(ui, lang, settings),
         FinalmaskTcpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }
@@ -1081,25 +1088,27 @@ pub(super) fn finalmask_tcp_settings_editor(
 /// The two source-IP rule lists of a `filter` mask
 /// (`infra/conf/transport_finalmask.go:100-115`). Both accept the routing
 /// IP-rule grammar; the core refuses the configuration on a malformed entry.
-fn finalmask_filter_editor(
+/// Shared by the listener editor and the finalmask editor, so the caption,
+/// hint, and row shape cannot drift.
+pub(crate) fn filter_settings_editor(
     ui: &mut egui::Ui,
     lang: Language,
     settings: &mut FinalmaskFilter,
 ) -> bool {
-    let hint = "IP, CIDR, geoip:TAG, or ext:FILE:CODE";
+    const HINT: &str = "IP, CIDR, geoip:TAG, or ext:FILE:CODE";
     let mut changed = widgets::string_list(
         ui,
         lang,
-        "blockedSourceIPs",
+        t(lang, Key::InboundsBlockedSourceIps),
         &mut settings.blocked_source_ips,
-        hint,
+        HINT,
     );
     changed |= widgets::string_list(
         ui,
         lang,
-        "allowedSourceIPs",
+        t(lang, Key::InboundsAllowedSourceIps),
         &mut settings.allowed_source_ips,
-        hint,
+        HINT,
     );
     changed
 }
@@ -1140,9 +1149,7 @@ fn finalmask_realm_tls_editor(
         &mut tls.disable_system_root,
         t(lang, Key::SrvUnset),
     );
-    changed |= widgets::noted(ui, t(lang, Key::SrvTlsUseSystemCaNote), |ui| {
-        ui.checkbox(&mut tls.use_system_ca, "useSystemCA").changed()
-    });
+    changed |= use_system_ca_row(ui, lang, &mut tls.use_system_ca);
     changed |= widgets::combo_str_labeled(
         ui,
         "minVersion",
@@ -1483,7 +1490,7 @@ pub(super) fn finalmask_udp_settings_editor(
             changed
         }
         FinalmaskUdpMask::Udphop { settings, .. } => finalmask_udphop_editor(ui, lang, settings),
-        FinalmaskUdpMask::Filter { settings, .. } => finalmask_filter_editor(ui, lang, settings),
+        FinalmaskUdpMask::Filter { settings, .. } => filter_settings_editor(ui, lang, settings),
         FinalmaskUdpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
         }

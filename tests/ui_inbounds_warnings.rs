@@ -14,10 +14,14 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::{Key, safety_finding_message, t};
+use broccoli::i18n::{Key, safety_finding_message, t, validation_issue_message};
 use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
 use broccoli::model::settings::{Language, Settings};
-use broccoli::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, ServersFile};
+use broccoli::model::validation::validate_finalmask;
+use broccoli::model::{
+    DokodemoCfg, FinalmaskFilter, FinalmaskModel, FinalmaskTcpMask, LocalInboundCfg,
+    LocalInboundProtocol, ServersFile,
+};
 use broccoli::ui::Screen;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
@@ -69,6 +73,45 @@ fn settings_with_socks_listen(listen: &str) -> Settings {
         }],
         ..Default::default()
     }
+}
+
+/// One listener carrying a `filter` mask with a malformed rule: the core
+/// refuses the whole configuration when the mask is built, and the settings
+/// walk only builds the mask of an emitted listener.
+fn settings_with_bad_filter(enabled: bool) -> Settings {
+    Settings {
+        local_inbounds: vec![LocalInboundCfg {
+            enabled,
+            finalmask: Some(FinalmaskModel {
+                tcp: vec![FinalmaskTcpMask::Filter {
+                    settings: FinalmaskFilter {
+                        blocked_source_ips: vec!["nope".into()],
+                        ..Default::default()
+                    },
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The row renders the same finding the mask pass produces, under the same
+/// path: the filter editor feeds the verdict straight through.
+fn bad_filter_message() -> String {
+    let settings = settings_with_bad_filter(true);
+    let finalmask = settings.local_inbounds[0]
+        .finalmask
+        .as_ref()
+        .expect("the fixture carries a mask");
+    let issue = validate_finalmask(finalmask)
+        .iter()
+        .next()
+        .cloned()
+        .expect("the malformed rule must produce a finding");
+    validation_issue_message(&issue, Language::En)
 }
 
 fn settings_with_dokodemo(enabled: bool) -> Settings {
@@ -249,4 +292,26 @@ fn non_applicable_options_never_render() {
             .is_none(),
         "the HTTP allowTransparent knob must not render"
     );
+}
+
+/// A listener the emitter drops never reaches the settings walk, so its
+/// mask's findings stay off the row — the same predicate the neighbouring
+/// sniffing row uses. Enabling the listener brings the finding back.
+#[test]
+fn disabled_listener_filter_row_matches_the_gate() {
+    let message = bad_filter_message();
+    {
+        let (_lock, _tmp, h) = boot_inbounds(&settings_with_bad_filter(false));
+        assert!(
+            h.query_by_label(&message).is_none(),
+            "a disabled listener's filter finding must not render: {message}"
+        );
+    }
+    {
+        let (_lock, _tmp, h) = boot_inbounds(&settings_with_bad_filter(true));
+        assert!(
+            h.query_by_label(&message).is_some(),
+            "an emitted listener's filter finding must render: {message}"
+        );
+    }
 }

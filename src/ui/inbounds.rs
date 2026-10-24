@@ -19,6 +19,7 @@ use crate::model::{
     LocalInboundProtocol, Settings, Sniffing,
 };
 use crate::ui::UiCtx;
+use crate::ui::servers::finalmask_editors::filter_settings_editor;
 use crate::ui::widgets;
 use serde_json::Map;
 
@@ -133,9 +134,16 @@ impl InboundsScreen {
                         )
                     })
                     .collect(),
+                // A disabled listener reaches neither the wire nor the
+                // settings walk, so its mask verdict must stay off the row
+                // for the same reason its sniffing verdict does.
                 local_filter_errors: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
-                        ctx.settings.local_inbounds[index]
+                        let entry = &ctx.settings.local_inbounds[index];
+                        if !emit::local_inbound_emitted(entry) {
+                            return Vec::new();
+                        }
+                        entry
                             .finalmask
                             .as_ref()
                             .map(|finalmask| {
@@ -636,7 +644,6 @@ fn filter_list_editor(
             }
         }
     }
-    let hint = "IP, CIDR, geoip:TAG, or ext:FILE:CODE";
     let settings = match list {
         FilterList::Tcp => finalmask.tcp.iter_mut().find_map(|mask| match mask {
             FinalmaskTcpMask::Filter { settings, .. } => Some(settings),
@@ -648,20 +655,7 @@ fn filter_list_editor(
         }),
     };
     if let Some(settings) = settings {
-        changed |= widgets::string_list(
-            ui,
-            lang,
-            t(lang, Key::InboundsBlockedSourceIps),
-            &mut settings.blocked_source_ips,
-            hint,
-        );
-        changed |= widgets::string_list(
-            ui,
-            lang,
-            t(lang, Key::InboundsAllowedSourceIps),
-            &mut settings.allowed_source_ips,
-            hint,
-        );
+        changed |= filter_settings_editor(ui, lang, settings);
     }
     changed
 }

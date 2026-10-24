@@ -401,6 +401,14 @@ pub enum ValidationCode {
     /// and an `https` address needs a URL with a host
     /// (`infra/conf/transport_finalmask.go:903-923`). Error tier.
     FinalmaskXdnsResolverAddrInvalid,
+    /// An `xdns` resolver carries no addresses. The mask build emits one
+    /// resolver per address, so a row with none contributes nothing and a
+    /// mask whose rows all lack addresses hands the client an empty resolver
+    /// list, which it refuses at creation
+    /// (`transport/internet/finalmask/xdns/client.go`). Error tier: the
+    /// resolver row is the unit the user configures, and an empty one is
+    /// never a working configuration.
+    FinalmaskXdnsResolverAddrsEmpty,
     /// An `xdns` resolver addresses DoH over `https://` without a
     /// `tlsConfig`: the DoH resolver refuses to start without one
     /// (`transport/internet/finalmask/xdns/resolver_doh.go:46-48`). Error
@@ -1342,6 +1350,83 @@ fn extra_key_set(extra: &Map<String, Value>, key: &str) -> bool {
     extra
         .iter()
         .any(|(candidate, value)| candidate.eq_ignore_ascii_case(key) && !value.is_null())
+}
+
+/// True for one routing IP rule, the grammar `geodata.ParseIPRules` accepts
+/// (`common/geodata/rule_parser.go`): leading `!` negations, `geoip:TAG`
+/// (read as `ext:geoip.dat:TAG`), an `ext:`/`ext-ip:` `FILE:CODE`
+/// reference, or an IP literal / CIDR range. Whether a tag exists in its
+/// data file is the core's lookup, not this grammar's rule. The routing
+/// editor's inline check and the `filter` mask's build gate both call this
+/// predicate, so the two surfaces cannot drift; the compiled core is the
+/// arbiter of the accepted set.
+pub fn ip_rule_valid(rule: &str) -> bool {
+    let rule = rule.trim_start_matches('!');
+    if let Some(tag) = rule.strip_prefix("geoip:") {
+        return ext_ip_rule_valid(&format!("geoip.dat:{tag}"));
+    }
+    if let Some(reference) = rule
+        .strip_prefix("ext:")
+        .or_else(|| rule.strip_prefix("ext-ip:"))
+    {
+        return ext_ip_rule_valid(reference);
+    }
+    cidr_rule_valid(rule)
+}
+
+/// The `FILE:CODE` half of a geo rule: `parseGeoIPRule` cuts at the first
+/// colon and refuses an empty file or a code that is empty after its own `!`
+/// prefixes (`common/geodata/rule_parser.go`).
+fn ext_ip_rule_valid(reference: &str) -> bool {
+    match reference.split_once(':') {
+        Some((file, code)) => !file.is_empty() && !code.trim_start_matches('!').is_empty(),
+        None => false,
+    }
+}
+
+/// An IP literal or CIDR range as `parseCIDR` reads it
+/// (`common/geodata/rule_parser.go`): the address follows `ParseAddress`
+/// (one bracket pair stripped, edges trimmed when non-alphanumeric —
+/// `common/net/address.go`), the prefix after the first `/` is decimal
+/// digits up to the family width, and an empty or absent prefix means the
+/// full width.
+fn cidr_rule_valid(rule: &str) -> bool {
+    let (address, prefix) = match rule.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (rule, None),
+    };
+    let Some(max_prefix) = address_width(address) else {
+        return false;
+    };
+    match prefix {
+        None | Some("") => true,
+        Some(prefix) => {
+            prefix.bytes().all(|byte| byte.is_ascii_digit())
+                && prefix.parse::<u32>().is_ok_and(|bits| bits <= max_prefix)
+        }
+    }
+}
+
+/// The family width `net.ParseAddress` produces for an IP literal: 32 for
+/// IPv4, 128 for IPv6, and `None` for everything else (domains included).
+fn address_width(address: &str) -> Option<u32> {
+    let mut address = address;
+    if let Some(inner) = address
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        address = inner;
+    }
+    let bytes = address.as_bytes();
+    if let (Some(first), Some(last)) = (bytes.first(), bytes.last())
+        && (!first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric())
+    {
+        address = address.trim();
+    }
+    address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| if ip.is_ipv4() { 32 } else { 128 })
 }
 
 /// The vision (XRV) flow spellings Xray's XRV servers accept, in display

@@ -4669,6 +4669,47 @@ mod tests {
     }
 
     #[test]
+    fn xdns_resolver_tls_config_is_judged_like_outbound_tls_on_import() {
+        // A resolver's nested TLS block is the same TLS model as the
+        // outbound's, so a link that smuggles a session-key log into it is
+        // refused by the same rule and path.
+        let evil = pct_encode(
+            r#"{"udp":[{"type":"xdns","settings":{"resolvers":[{
+                "addrs":["https://dns.example/dns-query"],
+                "tlsConfig":{"masterKeyLog":"keys.log"}
+            }]}}]}"#,
+        );
+        let link = format!("vless://{UUID}@fm.local:443?fm={evil}#XDNS");
+        let error = parse_link(&link).expect_err("the resolver's masterKeyLog must refuse import");
+        let LinkError::InvalidModel { issue, .. } = &error else {
+            panic!("expected the model refusal, got {error:?}");
+        };
+        assert_eq!(issue.code, ValidationCode::MasterKeyLogNotSupported);
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("finalmask.udp[0].settings.resolvers[0].tlsConfig.masterKeyLog")
+        );
+
+        // A clean DoH resolver still imports.
+        let clean = pct_encode(
+            r#"{"udp":[{"type":"xdns","settings":{"resolvers":[{
+                "addrs":["https://dns.example/dns-query"],
+                "tlsConfig":{"serverName":"dns.example"}
+            }]}}]}"#,
+        );
+        let link = format!("vless://{UUID}@fm.local:443?fm={clean}#XDNS");
+        let profile = parse_link(&link)
+            .expect("a clean DoH resolver must import")
+            .profile;
+        let finalmask = profile.outbound.stream.finalmask.as_ref().unwrap();
+        let crate::model::stream::FinalmaskUdpMask::Xdns { settings, .. } = &finalmask.udp[0]
+        else {
+            panic!("the link carries an xdns mask");
+        };
+        assert!(settings.resolvers[0].tls_config.is_some());
+    }
+
+    #[test]
     fn old_xdns_share_link_migrates_and_exports_the_current_shape() {
         // A link from another client carries the removed domain `name` and
         // resolver `type` + `settings.addr`; the import runs the same
