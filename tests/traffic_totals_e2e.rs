@@ -163,7 +163,10 @@ fn totals_rates_and_table_share_one_counter_sweep() {
     rt.cmd
         .send(broccoli::rt::CoreCmd::Apply {
             value: config,
-            intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
+            intent: broccoli::rt::ApplyIntent::CommitAndStart {
+                tun_mode: false,
+                dns_takeover: true,
+            },
             revision: 0,
         })
         .unwrap();

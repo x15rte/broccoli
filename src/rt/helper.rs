@@ -172,9 +172,6 @@ struct EngagedSession {
     pid: u32,
     tun_name: String,
     tun_if_index: u32,
-    /// The staged config's `autoOutboundsInterface`; `None` means `auto`.
-    /// Kept as the setting so a config change is noticed.
-    outbound_setting: Option<String>,
     targets: crate::sys::dns_takeover::Targets,
 }
 static ENGAGED_SESSION: Mutex<Option<EngagedSession>> = Mutex::new(None);
@@ -1065,23 +1062,6 @@ fn dns_takeover_record_path() -> Result<PathBuf, DiagError> {
     Ok(secure_stage_base()?.join(DNS_TAKEOVER_RECORD))
 }
 
-/// The staged TUN inbound's `autoOutboundsInterface` value. `None` when the
-/// inbound or the key is absent; the takeover then applies the `auto`
-/// heuristic, which is the value the app writes by default.
-fn auto_outbounds_interface(config: &serde_json::Value) -> Option<String> {
-    config
-        .get("inbounds")?
-        .as_array()?
-        .iter()
-        .find(|inbound| {
-            inbound.get("tag").and_then(serde_json::Value::as_str) == Some(TUN_INBOUND_TAG)
-        })?
-        .get("settings")?
-        .get("autoOutboundsInterface")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 fn stage_entry_allowed(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| STAGE_ENTRIES.contains(&name))
@@ -1279,6 +1259,9 @@ enum HelperCommand {
         /// UTF-16 units of the core source directory (the GUI's managed tree).
         core_path_utf16: Vec<u16>,
         config_base64: String,
+        /// App-owned switch: whether this start also takes the system DNS
+        /// over.
+        dns_takeover: bool,
     },
     Stop,
     Status,
@@ -1707,6 +1690,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                 api_port,
                 core_path_utf16,
                 config_base64,
+                dns_takeover,
             } => {
                 let parsed = (|| -> Result<(u16, PathBuf, Vec<u8>), DiagError> {
                     let api_port = (api_port != 0)
@@ -1718,7 +1702,14 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                 })();
                 match parsed {
                     Ok((api_port, core_source, config_bytes)) => {
-                        helper_start(&current, &writer, api_port, &core_source, &config_bytes);
+                        helper_start(
+                            &current,
+                            &writer,
+                            api_port,
+                            &core_source,
+                            &config_bytes,
+                            dns_takeover,
+                        );
                     }
                     Err(detail) => {
                         send_log_record(
@@ -1938,12 +1929,19 @@ fn child_is_live_current(current: &Arc<Mutex<Option<HelperChild>>>, pid: u32) ->
     }
 }
 
+/// The app switch AND the config's TUN+DNS gate. Off keeps the generated
+/// TUN adapter DNS pin (Xray's native behavior) but skips the system takeover.
+fn takeover_needed(dns_takeover: bool, config: Option<&serde_json::Value>) -> bool {
+    dns_takeover && config.is_some_and(crate::model::inbound::config_runs_tun_dns)
+}
+
 fn helper_start(
     current: &Arc<Mutex<Option<HelperChild>>>,
     writer: &Arc<Mutex<File>>,
     api_port: u16,
     core_source: &Path,
     config_bytes: &[u8],
+    dns_takeover: bool,
 ) {
     let prepared = (|| -> Result<SecureRuntimeStage, DiagError> {
         // The staged config's own geodata block suspends the geo data pins,
@@ -2067,12 +2065,13 @@ fn helper_start(
             _stage: stage,
         });
     }
-    // System DNS takeover: while a TUN core with a DNS module runs, point
-    // every other adapter's DNS servers at the tunnel so a name the tunnel
+    // System DNS takeover: while a TUN core with a DNS module runs, point every
+    // connected physical adapter's DNS at the tunnel so a name the tunnel
     // answers with a negative result does not wait out the resolver's whole
-    // retry schedule (see `sys::dns_takeover`). It triggers on the same gate
-    // that makes the core emit its leak block: a TUN inbound and a top-level
-    // `dns` object. The TUN adapter (and its interface index) exists only
+    // retry schedule
+    // (see `sys::dns_takeover`). It triggers on the same gate that makes the
+    // core emit its leak block — a TUN inbound and a top-level `dns` object —
+    // plus the app-owned switch. The TUN adapter (and its interface index) exists only
     // after the child's tun inbound comes up, so the index is resolved by
     // polling `GetAdaptersAddresses` for the staged tun name, and that index
     // is what excludes the tunnel adapter itself from the capture. The
@@ -2089,9 +2088,7 @@ fn helper_start(
     let config: Option<serde_json::Value> = config_text
         .as_deref()
         .and_then(|text| serde_json::from_str(text).ok());
-    let needs = config
-        .as_ref()
-        .is_some_and(crate::model::inbound::config_runs_tun_dns);
+    let needs = takeover_needed(dns_takeover, config.as_ref());
     let takeover_error = if needs && !SHUTTING_DOWN.load(Ordering::SeqCst) {
         match config_text
             .as_deref()
@@ -2147,8 +2144,6 @@ fn helper_start(
                             v4: in_tun.v4,
                             v6: in_tun.v6,
                         };
-                        let outbound_setting =
-                            config.as_ref().and_then(auto_outbounds_interface);
                         // Publish the session before the first write. If
                         // `engage` fails, the watcher must retry it as a
                         // reconcile, not mistake the record for a previous
@@ -2161,7 +2156,6 @@ fn helper_start(
                                 pid,
                                 tun_name: name.clone(),
                                 tun_if_index: ifindex,
-                                outbound_setting: outbound_setting.clone(),
                                 targets,
                             });
                         }
@@ -2169,13 +2163,19 @@ fn helper_start(
                             &path,
                             ifindex,
                             Some(&name),
-                            outbound_setting.as_deref(),
                             targets,
                         )?;
                         Ok(Some(counts))
                     })();
                     match outcome {
                         Ok(Some(counts)) => {
+                            // The GUI cannot flush an unelevated `ipconfig` on
+                            // builds that require elevation for it; the helper
+                            // owns this transition and can. `report_takeover`
+                            // already flushes when it restored an old adapter.
+                            if counts.restored == 0 {
+                                flush_resolver_cache();
+                            }
                             report_takeover(
                                 writer,
                                 &counts,
@@ -2205,6 +2205,12 @@ fn helper_start(
             }
         }
     } else {
+        if !SHUTTING_DOWN.load(Ordering::SeqCst) {
+            // A start with the takeover off (or without the TUN+DNS gate)
+            // must not inherit a record or session from the start it
+            // supersedes.
+            release_dns_takeover(writer, TakeoverOrigin::OwnSession);
+        }
         None
     };
     if let Some(error) = takeover_error {
@@ -2970,7 +2976,6 @@ fn reconcile_network_state(
             &path,
             session.tun_if_index,
             Some(&session.tun_name),
-            session.outbound_setting.as_deref(),
             session.targets,
         )?
     };
@@ -3587,11 +3592,17 @@ fn send_helper_lifecycle_event(event: HelperEvent, sender: &mpsc::Sender<HelperE
 /// bytes the GUI validated in the same operation, so the elevated helper
 /// stages those bytes — and derives the pin mode from them with the shared
 /// open decision — and never re-reads the user-writable active config path.
-fn start_command(api_port: u16, core: &Path, config_bytes: &[u8]) -> HelperCommand {
+fn start_command(
+    api_port: u16,
+    core: &Path,
+    config_bytes: &[u8],
+    dns_takeover: bool,
+) -> HelperCommand {
     HelperCommand::Start {
         api_port,
         core_path_utf16: core.as_os_str().encode_wide().collect(),
         config_base64: base64::engine::general_purpose::STANDARD.encode(config_bytes),
+        dns_takeover,
     }
 }
 
@@ -3604,10 +3615,11 @@ fn start_wire_message(
     api_port: u16,
     core: &Path,
     config_bytes: &[u8],
+    dns_takeover: bool,
 ) -> Result<HelperCommand, DiagError> {
-    let command = start_command(api_port, core, config_bytes);
+    let command = start_command(api_port, core, config_bytes, dns_takeover);
     let message = serde_json::to_string(&command)
-        .expect("the wire command is a plain struct of numbers, strings and a u16 list");
+        .expect("the wire command is a plain struct of numbers, strings, u16 units and a bool");
     if message.len().saturating_add(1) > MAX_WIRE_MESSAGE_BYTES {
         return Err(DiagError::new(
             Diag::new(Key::HelperConfigTooLarge)
@@ -3807,7 +3819,12 @@ impl HelperPipe {
     /// An over-cap config is refused here — never truncated, never silently
     /// replaced by a path re-read — and the refusal is loud through the
     /// caller's Error phase.
-    pub fn start(&self, api_port: u16, config_bytes: &[u8]) -> Result<(), DiagError> {
+    pub fn start(
+        &self,
+        api_port: u16,
+        config_bytes: &[u8],
+        dns_takeover: bool,
+    ) -> Result<(), DiagError> {
         if api_port == 0 {
             return Err(DiagError::new(Diag::new(Key::HelperStartPortInvalid)));
         }
@@ -3820,7 +3837,12 @@ impl HelperPipe {
                 Key::HelperStartCorePathNotAbsolute,
             )));
         }
-        self.send(&start_wire_message(api_port, &core, config_bytes)?)
+        self.send(&start_wire_message(
+            api_port,
+            &core,
+            config_bytes,
+            dns_takeover,
+        )?)
     }
 
     pub fn stop(&self) -> Result<(), DiagError> {
@@ -3844,7 +3866,7 @@ impl HelperPipe {
 
     fn send(&self, command: &HelperCommand) -> Result<(), DiagError> {
         let mut message = serde_json::to_string(command)
-            .expect("the wire command is a plain struct of numbers, strings and a u16 list");
+            .expect("the wire command is a plain struct of numbers, strings, u16 units and a bool");
         message.push('\n');
         let mut writer = self
             .writer
@@ -3889,14 +3911,13 @@ mod tests {
 
     use super::{
         ChildPhase, HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES,
-        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction,
-        auto_outbounds_interface, config_from_wire, current_process_user_sid,
-        dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
+        ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction, config_from_wire,
+        current_process_user_sid, dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
         ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
         path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
         run_shutdown_window_with_class, shutdown_action, stage_config_bytes_at,
-        stage_entry_allowed, start_wire_message, to_wide, token_matches, validated_ace,
-        validated_pipe_name, verify_protected_directory,
+        stage_entry_allowed, start_wire_message, takeover_needed, to_wide, token_matches,
+        validated_ace, validated_pipe_name, verify_protected_directory,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -4225,31 +4246,17 @@ mod tests {
     }
 
     #[test]
-    fn the_tun_outbound_setting_comes_from_the_staged_inbound() {
+    fn the_dns_takeover_switch_gates_only_the_system_takeover() {
         let config = serde_json::json!({
-            "inbounds": [
-                {"tag": "in-socks", "settings": {"autoOutboundsInterface": "wrong"}},
-                {
-                    "tag": crate::model::inbound::TUN_INBOUND_TAG,
-                    "settings": {"autoOutboundsInterface": "auto"},
-                },
-            ],
+            "inbounds": [{"protocol": "tun", "settings": {}}],
+            "dns": {},
         });
-        assert_eq!(
-            auto_outbounds_interface(&config),
-            Some("auto".to_string()),
-            "the TUN inbound's value wins over another inbound's"
+        assert!(takeover_needed(true, Some(&config)));
+        assert!(
+            !takeover_needed(false, Some(&config)),
+            "off still lets Xray pin the TUN adapter DNS to the gateway"
         );
-        assert_eq!(
-            auto_outbounds_interface(&serde_json::json!({
-                "inbounds": [{
-                    "tag": crate::model::inbound::TUN_INBOUND_TAG,
-                    "settings": {},
-                }],
-            })),
-            None,
-            "an absent key leaves the auto heuristic to apply"
-        );
+        assert!(!takeover_needed(true, None));
     }
 
     #[test]
@@ -4372,11 +4379,12 @@ mod tests {
             br#"{"geodata":{"assets":[{"url":"https://example.com/geoip.dat","file":"geoip.dat"}]}}"#;
         let plain: &[u8] = br#"{"outbounds":[]}"#;
 
-        let staged = start_command(12345, core, geodata);
+        let staged = start_command(12345, core, geodata, true);
         let HelperCommand::Start {
             api_port,
             core_path_utf16,
             config_base64,
+            dns_takeover,
         } = &staged
         else {
             panic!("a start command must build the start variant");
@@ -4387,11 +4395,18 @@ mod tests {
             &std::os::windows::ffi::OsStrExt::encode_wide(core.as_os_str()).collect::<Vec<u16>>()
         );
         assert_eq!(config_from_wire(config_base64).unwrap(), geodata);
-        let plain_command = start_command(12345, core, plain);
-        let HelperCommand::Start { config_base64, .. } = &plain_command else {
+        assert!(dns_takeover, "the command carries the app-owned switch");
+        let plain_command = start_command(12345, core, plain, false);
+        let HelperCommand::Start {
+            config_base64,
+            dns_takeover,
+            ..
+        } = &plain_command
+        else {
             unreachable!("the start command is always the start variant");
         };
         assert_eq!(config_from_wire(config_base64).unwrap(), plain);
+        assert!(!dns_takeover, "the off choice must cross the wire");
     }
 
     #[test]
@@ -4411,7 +4426,8 @@ mod tests {
 
         // The wire start command carries exactly the validated content; the
         // swapped file exists at stage time but is never consulted.
-        let command = start_wire_message(12345, core, validated).expect("modest config crosses");
+        let command =
+            start_wire_message(12345, core, validated, true).expect("modest config crosses");
         let HelperCommand::Start {
             api_port,
             config_base64,
@@ -4450,7 +4466,7 @@ mod tests {
     fn start_wire_refuses_over_cap_config_without_a_fallback() {
         let core = std::path::Path::new(r"C:\core");
         let over_cap = vec![b'x'; MAX_WIRE_MESSAGE_BYTES];
-        let error = match start_wire_message(12345, core, &over_cap) {
+        let error = match start_wire_message(12345, core, &over_cap, true) {
             Ok(_) => panic!("an over-cap config must be refused, never truncated"),
             Err(error) => error,
         };
@@ -4464,7 +4480,7 @@ mod tests {
             "the refusal must name the wire cap"
         );
         // A modest config still crosses with the full command shape.
-        let command = start_wire_message(12345, core, br#"{"outbounds":[]}"#)
+        let command = start_wire_message(12345, core, br#"{"outbounds":[]}"#, true)
             .expect("a modest config crosses the wire");
         let HelperCommand::Start { config_base64, .. } = &command else {
             unreachable!("a start message is the start variant");
@@ -4934,7 +4950,7 @@ mod tests {
             br#"{"log":{"loglevel":"warning"},"outbounds":[{"protocol":"freedom","tag":"probe"}]}"#
                 .to_vec()
         });
-        pipe.start(api_port, &config_bytes)
+        pipe.start(api_port, &config_bytes, true)
             .expect("send start command");
         let mut saw_starting = false;
         let mut saw_refusal = false;

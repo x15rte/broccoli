@@ -2631,6 +2631,29 @@ fn port_collision_between_two_local_entries_is_rejected() {
 }
 
 #[test]
+fn dns_takeover_switch_does_not_change_the_tun_dns_pin() {
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.dns_takeover = false;
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let tun = cfg["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ib| ib["protocol"] == "tun")
+        .expect("tun inbound");
+    assert_eq!(
+        tun["settings"]["dns"],
+        json!(["10.255.0.1"]),
+        "off keeps Xray's native TUN adapter DNS pin"
+    );
+    assert!(
+        cfg.get("dnsTakeover").is_none(),
+        "the app-owned switch never reaches the Xray config"
+    );
+}
+
+#[test]
 fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;

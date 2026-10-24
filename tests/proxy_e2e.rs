@@ -73,7 +73,10 @@ fn socks_to_freedom_e2e() {
     rt.cmd
         .send(broccoli::rt::CoreCmd::Apply {
             value: config,
-            intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
+            intent: broccoli::rt::ApplyIntent::CommitAndStart {
+                tun_mode: false,
+                dns_takeover: true,
+            },
             revision: 0,
         })
         .unwrap();

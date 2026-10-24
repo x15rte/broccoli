@@ -345,6 +345,10 @@ pub struct BroccoliApp {
     /// ephemeral API port cannot mask equality. `None` only while
     /// generation fails, which keeps the gate up.
     applied_candidate: Option<serde_json::Value>,
+    /// The app-owned DNS-takeover choice the running/startup baseline used.
+    /// The generated config does not carry it, so the changes-pending gate
+    /// compares this separately.
+    applied_dns_takeover: bool,
     /// Monotonic in-memory edit generation used to prevent an older runtime
     /// result from settling newer saved edits: an apply verdict names the
     /// revision it applied, so a verdict for an older one cannot settle the
@@ -812,6 +816,7 @@ impl BroccoliApp {
         let applied_candidate = generated_candidate
             .ok()
             .map(|(candidate, _)| normalize_candidate_for_compare(candidate));
+        let applied_dns_takeover = settings.dns_takeover;
 
         let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(EVT_CHANNEL_CAPACITY);
         let rt = spawn_runtime(evt_tx.clone(), cc.egui_ctx.clone());
@@ -899,6 +904,7 @@ impl BroccoliApp {
             apply_result: None,
             config_dirty: persistence_error.is_some() || config_error.is_some(),
             applied_candidate,
+            applied_dns_takeover,
             config_revision: 0,
             model_generation: 0,
             last_persist: None,
@@ -1134,6 +1140,7 @@ impl BroccoliApp {
                                     .map(|(candidate, _)| {
                                         normalize_candidate_for_compare(candidate)
                                     });
+                            self.applied_dns_takeover = self.settings.dns_takeover;
                         }
                         self.config_dirty = !settles_current;
                         // A success for an older revision is not a failure of
@@ -1773,7 +1780,10 @@ impl BroccoliApp {
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
-            intent: ApplyIntent::CommitAndStart { tun_mode: want_tun },
+            intent: ApplyIntent::CommitAndStart {
+                tun_mode: want_tun,
+                dns_takeover: self.settings.dns_takeover,
+            },
             revision: self.config_revision,
         }) {
             Ok(())
@@ -1925,6 +1935,8 @@ impl BroccoliApp {
                     self.config_dirty = config_gate_after_persist(
                         self.applied_candidate.as_ref(),
                         &normalize_candidate_for_compare(config),
+                        self.applied_dns_takeover,
+                        self.settings.dns_takeover,
                         self.persistence_error.as_deref(),
                     );
                 }
@@ -2004,7 +2016,10 @@ impl BroccoliApp {
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
-            intent: ApplyIntent::Commit { tun_mode: want_tun },
+            intent: ApplyIntent::Commit {
+                tun_mode: want_tun,
+                dns_takeover: self.settings.dns_takeover,
+            },
             revision: self.config_revision,
         }) {
             self.apply_result = None;
@@ -2478,9 +2493,13 @@ fn normalize_candidate_for_compare(mut config: serde_json::Value) -> serde_json:
 fn config_gate_after_persist(
     applied_candidate: Option<&serde_json::Value>,
     current_candidate: &serde_json::Value,
+    applied_dns_takeover: bool,
+    current_dns_takeover: bool,
     persistence_error: Option<&str>,
 ) -> bool {
-    persistence_error.is_some() || applied_candidate != Some(current_candidate)
+    persistence_error.is_some()
+        || applied_dns_takeover != current_dns_takeover
+        || applied_candidate != Some(current_candidate)
 }
 
 /// While `state_error` is set the in-memory model is `Default` and writing
@@ -4688,14 +4707,38 @@ mod config_gate_tests {
     #[test]
     fn gate_is_down_when_the_current_candidate_matches_the_applied_one() {
         let applied = json!({"outbounds": [{"tag": "a"}]});
-        assert!(!config_gate_after_persist(Some(&applied), &applied, None));
+        assert!(!config_gate_after_persist(
+            Some(&applied),
+            &applied,
+            true,
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn gate_is_up_when_only_the_dns_takeover_switch_changed() {
+        let applied = json!({"outbounds": [{"tag": "a"}]});
+        assert!(config_gate_after_persist(
+            Some(&applied),
+            &applied,
+            true,
+            false,
+            None
+        ));
     }
 
     #[test]
     fn gate_is_up_when_the_candidate_differs_from_the_applied_one() {
         let applied = json!({"outbounds": [{"tag": "a"}]});
         let current = json!({"outbounds": [{"tag": "b"}]});
-        assert!(config_gate_after_persist(Some(&applied), &current, None));
+        assert!(config_gate_after_persist(
+            Some(&applied),
+            &current,
+            true,
+            true,
+            None
+        ));
     }
 
     #[test]
@@ -4704,6 +4747,8 @@ mod config_gate_tests {
         assert!(config_gate_after_persist(
             Some(&applied),
             &applied,
+            true,
+            true,
             Some("disk full")
         ));
     }
@@ -4711,7 +4756,7 @@ mod config_gate_tests {
     #[test]
     fn gate_is_up_when_no_applied_baseline_exists() {
         let current = json!({"outbounds": [{"tag": "a"}]});
-        assert!(config_gate_after_persist(None, &current, None));
+        assert!(config_gate_after_persist(None, &current, true, true, None));
     }
 
     #[test]

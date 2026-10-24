@@ -114,13 +114,6 @@ pub fn list_all() -> Vec<NetIf> {
     enumerate(false).unwrap_or_default()
 }
 
-/// [`list_all`] with the API failure kept distinct from a successful
-/// enumeration that found no adapters. A caller that must not mistake a
-/// read failure for "the network disappeared" uses this.
-pub(crate) fn list_all_result() -> Option<Vec<NetIf>> {
-    enumerate(false)
-}
-
 /// Resolve a network adapter's interface index by its friendly name. The
 /// elevated helper uses this to find the TUN adapter the staged core created,
 /// so the system-DNS takeover can exclude the tunnel adapter itself from the
@@ -371,40 +364,6 @@ fn auto_outbound_interface(ifaces: &[NetIf], tun_self_index: Option<u32>) -> Opt
         })
     });
     Some(pick_outbound_interface(candidates, tun_self_index))
-}
-
-/// The TUN outbound's adapter for a caller that must distinguish "no adapter
-/// qualifies" from "the network state could not be read". `None` is a read
-/// failure (keep the caller's state and retry); `Some(None)` means no
-/// outbound; `Some(Some(name))` is the selected adapter.
-///
-/// `setting` is the config's `autoOutboundsInterface`: absent, empty, or
-/// `auto` runs Xray's `findOutboundInterface` heuristic, while a fixed name
-/// must exist. `tun_adapter_name` is matched against the
-/// enumeration so a renamed or recreated TUN is excluded by its current
-/// index; `tun_if_index` is the fallback while the name is not present.
-pub(crate) fn resolved_outbound_interface(
-    setting: Option<&str>,
-    tun_adapter_name: Option<&str>,
-    tun_if_index: u32,
-    ifaces: Option<&[NetIf]>,
-) -> Option<Option<String>> {
-    let ifaces = ifaces?;
-    let tun_self_index = tun_adapter_name
-        .and_then(|name| ifaces.iter().find(|iface| iface.name == name))
-        .map(|iface| iface.index)
-        .or(Some(tun_if_index));
-    let setting = setting.unwrap_or("auto").trim();
-    if setting.is_empty() || setting == "auto" {
-        return auto_outbound_interface(ifaces, tun_self_index).map(|name| name.map(str::to_owned));
-    }
-    Some(
-        ifaces
-            .iter()
-            .find(|iface| iface.name == setting)
-            .filter(|iface| Some(iface.index) != tun_self_index)
-            .map(|iface| iface.name.clone()),
-    )
 }
 
 /// The verdict for a configured fixed TUN uplink name, checked against an
@@ -695,38 +654,6 @@ mod tests {
     #[test]
     fn picker_without_candidates_returns_none() {
         assert_eq!(pick_outbound_interface(Vec::new(), None), None);
-    }
-
-    #[test]
-    fn resolved_outbound_distinguishes_unknown_from_absent() {
-        // A failed enumeration is `None`: the caller must keep its record
-        // instead of restoring a working takeover. A successful empty
-        // enumeration is `Some(None)`: the network really has no outbound.
-        assert_eq!(
-            resolved_outbound_interface(Some("wired"), None, 9, None),
-            None
-        );
-        assert_eq!(
-            resolved_outbound_interface(Some("wired"), None, 9, Some(&[])),
-            Some(None)
-        );
-        let tun = test_iface("broccoli0", 9, false, true, &[]);
-        let wired = test_iface("wired", 2, false, true, &[]);
-        let ifaces = [tun, wired];
-        assert_eq!(
-            resolved_outbound_interface(Some("ghost"), Some("broccoli0"), 9, Some(&ifaces)),
-            Some(None),
-            "a fixed name that is absent selects nothing"
-        );
-        assert_eq!(
-            resolved_outbound_interface(Some("broccoli0"), Some("broccoli0"), 9, Some(&ifaces)),
-            Some(None),
-            "the TUN itself is not an outbound"
-        );
-        assert_eq!(
-            resolved_outbound_interface(Some("wired"), Some("broccoli0"), 9, Some(&ifaces)),
-            Some(Some("wired".to_string()))
-        );
     }
 
     #[test]

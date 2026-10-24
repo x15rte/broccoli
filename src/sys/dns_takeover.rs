@@ -10,27 +10,22 @@
 //!
 //! The DNS client sends each query from the interface that owns the server,
 //! so a route cannot move those queries into the tunnel: only the adapter's
-//! own server list decides where they go. This module captures the adapter
-//! the TUN outbound uses — a configured fixed name, or Xray's
-//! `findOutboundInterface` choice over the default-route table (a wireless
-//! winner overrides a better wired metric) — and points that adapter's DNS
-//! list at the in-tun address for the session, for each address family the
-//! tunnel carries. The core re-evaluates that choice on route and interface
-//! changes for its new dials; existing sockets stay on the adapter they
-//! already use, so the takeover follows the new-dial choice. A local-only adapter
-//! with no default route is left exactly as it was: it is not the outbound,
-//! and changing it was both unnecessary and intrusive. The captured list is
-//! restored when the session ends, or when the outbound moves to a different
-//! adapter.
+//! own server list decides where they go. This module captures every connected
+//! physical adapter with DNS servers — the resolver asks all of them, so
+//! pointing only one adapter at the tunnel would still let a blocked server on
+//! another stall a negative answer — and points each captured list at the
+//! in-tun address for the session, for each address family the tunnel carries.
+//! Loopback, the TUN, virtual switches, and disconnected adapters are left
+//! alone. The captured list is restored when the session ends or an adapter
+//! disconnects.
 //!
 //! Restoring is the safety-critical half, so the capture is written to a
 //! record file *before* any change. `release` restores from that record and
 //! deletes it, and the helper calls `release` at every teardown path, on its
 //! own exit path, and once at startup, so a helper that dies hard leaves a
 //! record that the next helper repairs instead of a machine with a dead DNS
-//! server. An adapter that is absent at restore time keeps its entry in the
-//! record: the takeover's value stays in that adapter's saved configuration
-//! until something writes it back, so only that entry can undo it.
+//! server. An adapter that is absent at restore time is restored through its
+//! saved registry configuration; only a failed registry write keeps its entry.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -39,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GAA_FLAG_SKIP_ANYCAST,
-    GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK,
-    SetInterfaceDnsSettings,
+    GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, GetIfEntry2, IF_TYPE_SOFTWARE_LOOPBACK,
+    MIB_IF_ROW2, SetInterfaceDnsSettings,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::core::{GUID, PWSTR};
@@ -127,6 +122,9 @@ struct Record {
     entries: Vec<Entry>,
 }
 
+/// `MIB_IF_ROW2.InterfaceAndOperStatusFlags.HardwareInterface` is bit 0.
+const HARDWARE_INTERFACE_BIT: u8 = 1;
+
 /// One adapter as enumerated: the fields the capture reads, split from the
 /// Windows walk so the decisions stay testable without a live system.
 /// (`NET_LUID_LH` is a union without `Debug` or `PartialEq`, so this view
@@ -138,6 +136,9 @@ struct AdapterView {
     if_index: u32,
     if_type: u32,
     up: bool,
+    /// `MIB_IF_ROW2.InterfaceAndOperStatusFlags.HardwareInterface`: a real
+    /// adapter, not a virtual switch or tunnel.
+    physical: bool,
     luid: windows::Win32::NetworkManagement::Ndis::NET_LUID_LH,
     dns: Vec<IpAddr>,
 }
@@ -199,42 +200,21 @@ fn family_state(
     })
 }
 
-/// The adapter the TUN outbound uses, resolved from the staged
-/// `autoOutboundsInterface` setting with Xray's `findOutboundInterface`
-/// heuristic: `auto` (or an absent value) picks a default-route candidate,
-/// with a wireless winner overriding a better wired metric, and a fixed name
-/// must exist. `None` means the network state could not be read — the caller
-/// must keep the record and retry — while `Some(None)` means no adapter
-/// qualifies, so nothing is taken over. Local-only adapters (no default route)
-/// never qualify under `auto`, which keeps their DNS settings untouched.
-fn outbound_interface(
-    tun_name: Option<&str>,
-    tun_if_index: u32,
-    setting: Option<&str>,
-) -> Option<Option<String>> {
-    let ifaces = crate::sys::netif::list_all_result();
-    crate::sys::netif::resolved_outbound_interface(
-        setting,
-        tun_name,
-        tun_if_index,
-        ifaces.as_deref(),
-    )
-}
-
-/// The entries to take over from an enumeration. Skips the loopback adapters
-/// and the tunnel adapter itself — by friendly name when the caller knows it,
-/// otherwise by the captured index — and keeps only the adapter the TUN
-/// outbound uses, so a local-only NIC with its own DNS servers is not changed.
-/// A family is captured only when `targets` carries an address for it, the
-/// tunnel address that family's queries will be pointed at. A family the
-/// tunnel does not serve is left exactly as it is: an empty server list is not
-/// expressible through the interface settings API, and a family left out of
-/// the record is a family the restore must not rewrite.
+/// The entries to take over from an enumeration. Includes every connected
+/// physical adapter with DNS servers — the resolver asks all of them, so
+/// pointing only the current outbound at the tunnel would still let a blocked
+/// server on another adapter stall a negative answer. Skips loopback, the
+/// tunnel adapter itself (by friendly name when known, otherwise by index),
+/// virtual adapters, and disconnected adapters. A family is captured only when
+/// `targets` carries an address for it, the tunnel address that family's
+/// queries will be pointed at. A family the tunnel does not serve is left
+/// exactly as it is: an empty server list is not expressible through the
+/// interface settings API, and a family left out of the record is a family the
+/// restore must not rewrite.
 fn plan(
     views: &[AdapterView],
     tun_if_index: u32,
     tun_name: Option<&str>,
-    outbound: Option<&str>,
     targets: Targets,
 ) -> Record {
     let mut entries = Vec::new();
@@ -249,7 +229,7 @@ fn plan(
         if tun_name.is_none() && view.if_index == tun_if_index {
             continue;
         }
-        if !outbound.is_some_and(|name| view.alias.eq_ignore_ascii_case(name)) {
+        if !view.up || !view.physical {
             continue;
         }
         let v4 = targets
@@ -325,6 +305,19 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
                 server = node.Next;
             }
             let if_index = adapter.Anonymous1.Anonymous.IfIndex;
+            // `GetIfEntry2` reports the hardware bit the DNS takeover uses to
+            // keep virtual adapters out of the plan.
+            let mut if_row = MIB_IF_ROW2 {
+                InterfaceLuid: adapter.Luid,
+                ..Default::default()
+            };
+            // SAFETY: `if_row` is a fully initialized local; the API writes
+            // its fields on success and leaves the rest untouched.
+            // A failed row read cannot classify the adapter; treating it as
+            // physical keeps an already-captured adapter from being restored
+            // and dropped on a transient API failure.
+            let physical = GetIfEntry2(&mut if_row) != ERROR_SUCCESS
+                || if_row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE_BIT != 0;
             out.push(AdapterView {
                 adapter: if adapter.AdapterName.is_null() {
                     String::new()
@@ -343,6 +336,7 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
                 },
                 if_type: adapter.IfType,
                 up: adapter.OperStatus == IfOperStatusUp,
+                physical,
                 luid: adapter.Luid,
                 dns,
             });
@@ -590,9 +584,15 @@ fn restore_saved_family(
     } else {
         TCPIP4_INTERFACES
     };
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(format!(r"{root}\{adapter}"), KEY_SET_VALUE)
-        .map_err(|error| registry_error(alias, error))?;
+    {
+        Ok(key) => key,
+        // The adapter was uninstalled; the key and its NameServer are gone,
+        // so there is nothing left to restore.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(registry_error(alias, error)),
+    };
     match state.restore_write() {
         Servers::List(servers) if !servers.is_empty() => {
             let value = servers.join(" ");
@@ -624,18 +624,36 @@ fn registry_error(alias: &str, error: std::io::Error) -> DiagError {
     }
 }
 
-/// Restore the captured state of every adapter the record names. Returns the
-/// number of adapters restored. A failure leaves the whole record in place for
-/// the next path to retry; an absent adapter is restored through its saved
-/// registry configuration, so it does not become a residual entry.
-fn restore(record: &Record) -> Result<usize, DiagError> {
+/// Restore every adapter the record names. A failure on one entry keeps only
+/// that entry in the residual record; the other adapters are still restored.
+/// Returns the restored count, the residual entries, and the first failure so
+/// the caller can report it and retry the remainder.
+fn restore(record: &Record) -> Result<(usize, Vec<Entry>, Option<DiagError>), DiagError> {
     let views = enumerate()?;
+    Ok(restore_entries(&record.entries, |entry| {
+        restore_entry(&views, entry)
+    }))
+}
+
+/// Restore every entry independently: one failure keeps only that entry for
+/// the next pass, while the others still go back.
+fn restore_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    mut restore_one: impl FnMut(&Entry) -> Result<(), DiagError>,
+) -> (usize, Vec<Entry>, Option<DiagError>) {
     let mut restored = 0;
-    for entry in &record.entries {
-        restore_entry(&views, entry)?;
-        restored += 1;
+    let mut residual = Vec::new();
+    let mut first_error = None;
+    for entry in entries {
+        match restore_one(entry) {
+            Ok(()) => restored += 1,
+            Err(error) => {
+                residual.push(entry.clone());
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(restored)
+    (restored, residual, first_error)
 }
 
 /// Delete the record. A file already gone is success: the restore ran, and a
@@ -716,22 +734,22 @@ fn merge(existing: Option<Record>, fresh: Record) -> Record {
 }
 
 /// What one engage or reconcile pass changed: adapters pointed at the tunnel,
-/// and adapters put back because the outbound moved away from them.
+/// and adapters put back because they are no longer connected.
 #[derive(Debug, Default)]
 pub(crate) struct TakeoverCounts {
     pub(crate) applied: usize,
     pub(crate) restored: usize,
-    /// The first old-outbound restore that failed while moving the takeover.
-    /// The new outbound is still applied; the caller reports the failure and
-    /// the entry stays in the record for the next pass.
+    /// The first restore that failed while moving the takeover off an entry.
+    /// The remaining adapters are still applied; the caller reports the
+    /// failure and the entry stays in the record for the next pass.
     pub(crate) restore_error: Option<DiagError>,
 }
 
 /// Merge the fresh capture with the record an earlier pass left. An entry the
-/// fresh capture no longer selects is restored first — the outbound moved, or
-/// an older record covered more adapters — and dropped once the restore
-/// succeeds. An absent adapter is restored through its saved configuration; a
-/// failed restore keeps the entry for the next pass.
+/// fresh capture no longer covers is restored first — an adapter disconnected
+/// or was removed, or an older record covered more adapters — and dropped once
+/// the restore succeeds. An absent adapter is restored through its saved
+/// configuration; a failed restore keeps the entry for the next pass.
 fn split_record(existing: Record, fresh: &Record) -> (Vec<Entry>, Vec<Entry>) {
     let mut carried = Vec::new();
     let mut dropped = Vec::new();
@@ -758,17 +776,9 @@ fn prepare_record(
         return Ok((fresh, 0, None));
     };
     let (mut carried, dropped) = split_record(existing, &fresh);
-    let mut restored = 0;
-    let mut restore_error = None;
-    for entry in dropped {
-        match restore_entry(views, &entry) {
-            Ok(()) => restored += 1,
-            Err(error) => {
-                carried.push(entry);
-                restore_error.get_or_insert(error);
-            }
-        }
-    }
+    let (restored, residual, restore_error) =
+        restore_entries(&dropped, |entry| restore_entry(views, entry));
+    carried.extend(residual);
     Ok((
         merge(Some(Record { entries: carried }), fresh),
         restored,
@@ -776,31 +786,25 @@ fn prepare_record(
     ))
 }
 
-/// Take the system DNS over for this TUN session: capture the outbound
-/// adapter's servers, persist the capture as the record, then point it at the
-/// tunnel. `outbound_setting` is the staged config's
-/// `autoOutboundsInterface` value; `None` means the config omitted it and the
-/// route-table `auto` choice applies.
+/// Take the system DNS over for this TUN session: capture every connected
+/// physical adapter's servers, persist the capture as the record, then point
+/// them at the tunnel.
 ///
 /// The record is written before the first change, so a crash between the two
 /// leaves a repair behind rather than an unrecoverable machine.
 ///
-/// A restart of the running core calls this again while the adapter is still
+/// A restart of the running core calls this again while the adapters are still
 /// pointed at the tunnel, so the fresh capture is merged with the record
-/// [`merge`] keeps. An entry the fresh capture no longer selects is restored
-/// and dropped, which is what follows an outbound change.
+/// [`merge`] keeps. An entry the fresh capture no longer covers (a disconnected
+/// or removed adapter) is restored and dropped.
 pub(crate) fn engage(
     record_path: &Path,
     tun_if_index: u32,
     tun_name: Option<&str>,
-    outbound_setting: Option<&str>,
     targets: Targets,
 ) -> Result<TakeoverCounts, DiagError> {
     let views = enumerate()?;
-    let Some(outbound) = outbound_interface(tun_name, tun_if_index, outbound_setting) else {
-        return Ok(TakeoverCounts::default());
-    };
-    let fresh = plan(&views, tun_if_index, tun_name, outbound.as_deref(), targets);
+    let fresh = plan(&views, tun_if_index, tun_name, targets);
     let (record, restored, restore_error) =
         prepare_record(read_record(record_path)?, fresh, &views)?;
     if record.entries.is_empty() {
@@ -828,30 +832,26 @@ pub(crate) fn engage(
     })
 }
 
-/// Reconcile an active session with the adapter the outbound uses now.
+/// Reconcile an active session with the connected physical adapters.
 /// Returns the adapters pointed at the tunnel and the ones put back because
-/// they are no longer the outbound.
+/// they are no longer connected.
 ///
-/// The capture is merged with the existing record, so the adapter selected
-/// now is captured and pointed at the tunnel without changing an original
-/// already recorded. An entry the fresh capture no longer selects is restored
-/// and dropped; a failed restore keeps its entry for a later pass. The record
-/// is rewritten only when it changed, and a server list that already carries
-/// the target is not written again. A network monitor calls this both on
-/// change notifications and on a periodic backstop, so it must stay
+/// The capture is merged with the existing record, so a newly connected
+/// physical adapter is captured and pointed at the tunnel without changing an
+/// original already recorded. An entry the fresh capture no longer covers is
+/// restored and dropped; a failed restore keeps its entry for a later pass.
+/// The record is rewritten only when it changed, and a server list that already
+/// carries the target is not written again. A network monitor calls this both
+/// on change notifications and on a periodic backstop, so it must stay
 /// idempotent.
 pub(crate) fn reconcile(
     record_path: &Path,
     tun_if_index: u32,
     tun_name: Option<&str>,
-    outbound_setting: Option<&str>,
     targets: Targets,
 ) -> Result<TakeoverCounts, DiagError> {
     let views = enumerate()?;
-    let Some(outbound) = outbound_interface(tun_name, tun_if_index, outbound_setting) else {
-        return Ok(TakeoverCounts::default());
-    };
-    let fresh = plan(&views, tun_if_index, tun_name, outbound.as_deref(), targets);
+    let fresh = plan(&views, tun_if_index, tun_name, targets);
     let existing = read_record(record_path)?;
     let (record, restored, restore_error) = prepare_record(existing.clone(), fresh, &views)?;
     if record.entries.is_empty() {
@@ -893,8 +893,15 @@ pub(crate) fn release(record_path: &Path) -> Result<Option<usize>, DiagError> {
     let Some(record) = read_record(record_path)? else {
         return Ok(None);
     };
-    let restored = restore(&record)?;
-    remove_record(record_path)?;
+    let (restored, residual, first_error) = restore(&record)?;
+    if residual.is_empty() {
+        remove_record(record_path)?;
+    } else {
+        write_record(record_path, &Record { entries: residual })?;
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
     Ok(Some(restored))
 }
 
@@ -920,6 +927,7 @@ mod tests {
             if_index,
             if_type,
             up: true,
+            physical: true,
             luid: Default::default(),
             dns: dns.iter().map(|s| s.parse().expect("ip")).collect(),
         }
@@ -971,7 +979,6 @@ mod tests {
             &views,
             9,
             None,
-            Some("alias-{wired}"),
             Targets {
                 v4: Some(Ipv4Addr::new(10, 255, 0, 1)),
                 v6: None,
@@ -998,7 +1005,7 @@ mod tests {
             view("{wired}", 4, 6, &["192.0.2.1"]),
             view("{quiet}", 5, 6, &[]),
         ];
-        let record = plan(&views, 9, None, Some("alias-{wired}"), both_families());
+        let record = plan(&views, 9, None, both_families());
         assert_eq!(
             record.entries.len(),
             1,
@@ -1016,28 +1023,35 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_takes_over_only_the_actual_outbound_adapter() {
-        // A local-only NIC can carry DNS servers without a default route.
-        // Changing it is unnecessary and intrusive: only the adapter the TUN
-        // outbound uses is captured.
+    fn the_plan_takes_over_every_connected_physical_adapter() {
+        // The resolver asks every adapter's servers, so the takeover covers
+        // all connected physical NICs, not just the current outbound.
         let views = [
             view("{tun}", 9, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["192.0.2.1"]),
-            view("{local}", 5, 6, &["198.51.100.1"]),
+            view("{wifi}", 5, 71, &["198.51.100.1"]),
         ];
-        let record = plan(&views, 9, None, Some("alias-{wired}"), both_families());
-        assert_eq!(record.entries.len(), 1);
+        let record = plan(&views, 9, None, both_families());
+        assert_eq!(record.entries.len(), 2);
         assert_eq!(record.entries[0].adapter, "{wired}");
+        assert_eq!(record.entries[1].adapter, "{wifi}");
     }
 
     #[test]
-    fn no_outbound_captures_nothing() {
+    fn the_plan_skips_disconnected_and_virtual_adapters() {
+        let mut virtual_view = view("{virtual}", 5, 6, &["198.51.100.1"]);
+        virtual_view.physical = false;
+        let mut down = view("{down}", 6, 6, &["198.51.100.2"]);
+        down.up = false;
         let views = [
             view("{tun}", 9, 53, &["10.255.0.1"]),
-            view("{local}", 5, 6, &["198.51.100.1"]),
+            virtual_view,
+            down,
+            view("{wired}", 4, 6, &["192.0.2.1"]),
         ];
-        let record = plan(&views, 9, None, None, both_families());
-        assert!(record.entries.is_empty());
+        let record = plan(&views, 9, None, both_families());
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].adapter, "{wired}");
     }
 
     #[test]
@@ -1049,7 +1063,7 @@ mod tests {
             view("{tun}", 9, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["192.0.2.1", "2001:db8::1"]),
         ];
-        let record = plan(&views, 9, None, Some("alias-{wired}"), both_families());
+        let record = plan(&views, 9, None, both_families());
         assert_eq!(
             record.entries[0]
                 .v6
@@ -1069,7 +1083,7 @@ mod tests {
             view("{tun}", 9, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["10.255.0.1", "fd00::1"]),
         ];
-        let record = plan(&views, 9, None, Some("alias-{wired}"), both_families());
+        let record = plan(&views, 9, None, both_families());
         let entry = &record.entries[0];
         let v4 = entry.v4.as_ref().expect("the v4 family is captured");
         assert_eq!(v4.servers, Vec::<String>::new());
@@ -1087,19 +1101,13 @@ mod tests {
             view("{tun}", 42, 53, &["10.255.0.1"]),
             view("{wired}", 4, 6, &["192.0.2.1"]),
         ];
-        let record = plan(
-            &views,
-            9,
-            Some("alias-{tun}"),
-            Some("alias-{wired}"),
-            both_families(),
-        );
+        let record = plan(&views, 9, Some("alias-{tun}"), both_families());
         assert_eq!(record.entries.len(), 1);
         assert_eq!(record.entries[0].adapter, "{wired}");
     }
 
     #[test]
-    fn a_record_entry_the_outbound_no_longer_selects_is_dropped() {
+    fn a_record_entry_the_plan_no_longer_covers_is_dropped() {
         let entry = |adapter: &str| Entry {
             adapter: adapter.to_string(),
             alias: adapter.trim_matches(['{', '}']).to_string(),
@@ -1117,6 +1125,35 @@ mod tests {
         assert_eq!(carried[0].adapter, "{wifi}");
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].adapter, "{wired}");
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_only_that_entry() {
+        let ok = Entry {
+            adapter: "{ok}".to_string(),
+            alias: "ok".to_string(),
+            v4: None,
+            v6: None,
+        };
+        let bad = Entry {
+            adapter: "{bad}".to_string(),
+            alias: "bad".to_string(),
+            v4: None,
+            v6: None,
+        };
+        let entries = [ok, bad];
+        let (restored, residual, error) = restore_entries(&entries, |entry| {
+            if entry.adapter == "{bad}" {
+                Err(DiagError::new(Diag::new(Key::DnsTakeoverVerifyFailed)))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(restored, 1);
+        assert_eq!(residual.len(), 1);
+        assert_eq!(residual[0].adapter, "{bad}");
+        assert!(error.is_some());
+        assert_eq!(entries[0].adapter, "{ok}");
     }
 
     #[test]

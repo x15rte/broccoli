@@ -259,18 +259,19 @@ pub enum CoreCmd {
 }
 
 /// What one `CoreCmd::Apply` asks the runtime to do with a validated
-/// candidate — the two facts the runtime acts on, named instead of the call
+/// candidate — the three facts the runtime acts on, named instead of the call
 /// site that decided them: the transport the committed configuration is run
-/// under, and whether a stopped core starts on it.
+/// under, whether a stopped core starts on it, and the app-owned DNS-takeover
+/// choice the helper start carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyIntent {
     /// Commit the candidate and start the core on it (Connect applies the
     /// current candidate before starting anything, so an invalid candidate
     /// can never leave a stale configuration running).
-    CommitAndStart { tun_mode: bool },
+    CommitAndStart { tun_mode: bool, dns_takeover: bool },
     /// Commit the candidate without starting a stopped core; a core that is
     /// running restarts onto it because its transport changed (Apply now).
-    Commit { tun_mode: bool },
+    Commit { tun_mode: bool, dns_takeover: bool },
 }
 
 impl ApplyIntent {
@@ -279,7 +280,17 @@ impl ApplyIntent {
     /// bind the adapter; `false` runs the direct child.
     pub fn tun_mode(self) -> bool {
         match self {
-            Self::CommitAndStart { tun_mode } | Self::Commit { tun_mode } => tun_mode,
+            Self::CommitAndStart { tun_mode, .. } | Self::Commit { tun_mode, .. } => tun_mode,
+        }
+    }
+
+    /// Whether the elevated helper should take the system DNS over for this
+    /// start. App-owned; it never reaches the Xray config.
+    pub fn dns_takeover(self) -> bool {
+        match self {
+            Self::CommitAndStart { dns_takeover, .. } | Self::Commit { dns_takeover, .. } => {
+                dns_takeover
+            }
         }
     }
 
@@ -2328,6 +2339,7 @@ impl Runtime {
             return;
         }
         self.lifecycle.helper_config_bytes = Some(validated_bytes);
+        self.lifecycle.helper_dns_takeover = intent.dns_takeover();
         self.emit(CoreEvt::ApplyResult {
             ok: true,
             output,
@@ -2685,7 +2697,12 @@ impl Runtime {
         let Some(config_bytes) = self.lifecycle.helper_config_bytes.as_deref() else {
             return Err(PhaseError::new(Diag::new(Key::RtPhaseHelperConfigLost)));
         };
-        pipe.start(self.api_port, config_bytes).map_err(|error| {
+        pipe.start(
+            self.api_port,
+            config_bytes,
+            self.lifecycle.helper_dns_takeover,
+        )
+        .map_err(|error| {
             PhaseError::new(
                 DiagError::new(Diag::new(Key::RtPhaseHelperStartFailed)).caused_by(error),
             )
@@ -3077,8 +3094,11 @@ impl Runtime {
             .arg("/flushdns")
             .status()
         {
-            Ok(status) if status.success() => {}
-            Ok(_) => self.app_log(Diag::new(Key::RtLogDnsFlushExit)),
+            // A non-zero exit is expected when the GUI is unelevated on a
+            // Windows build that requires elevation for `ipconfig /flushdns`.
+            // The elevated helper flushes at TUN start and on restore, so this
+            // fallback stays silent; only a spawn failure is actionable.
+            Ok(_) => {}
             Err(error) => self.app_log(Diag::new(Key::RtLogDnsFlushFailed).arg(error)),
         }
     }
@@ -5620,7 +5640,10 @@ mod tests {
         runtime
             .handle_cmd(CoreCmd::Apply {
                 value: serde_json::json!({}),
-                intent: super::ApplyIntent::Commit { tun_mode: false },
+                intent: super::ApplyIntent::Commit {
+                    tun_mode: false,
+                    dns_takeover: true,
+                },
                 revision: 7,
             })
             .await;

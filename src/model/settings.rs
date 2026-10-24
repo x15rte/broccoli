@@ -99,6 +99,16 @@ pub enum TrafficUnit {
     GiBps,
 }
 
+/// True is the default for app-owned opt-out switches, so an absent key keeps
+/// the established behavior and a saved true stays out of the file.
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// Skip the `trafficUnit` key when the dashboard uses the adaptive default.
 fn skip_default_traffic_unit(unit: &TrafficUnit) -> bool {
     *unit == TrafficUnit::Auto
@@ -275,6 +285,14 @@ pub struct Settings {
     /// which only gates xray's error-log channel.
     #[serde(skip_serializing_if = "skip_false")]
     pub access_log: bool,
+    /// Broccoli-owned: whether the elevated helper points the outbound
+    /// adapter's DNS at the tunnel while TUN runs. Off keeps Xray's native TUN
+    /// DNS — the TUN adapter still points at the gateway — and leaves every
+    /// other adapter's DNS alone. Never emitted into the Xray config. Unlike
+    /// the core fields, the app-owned true default is omitted: absence means
+    /// on, and only the off override is persisted.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub dns_takeover: bool,
     /// UI locale; English is the fallback and the only pack that ships today.
     pub language: Language,
     /// Dashboard traffic-unit ladder: Auto scales adaptively, the
@@ -327,6 +345,7 @@ impl Default for Settings {
             mode: Mode::default(),
             log_level: "warning".into(),
             access_log: false,
+            dns_takeover: true,
             language: Language::default(),
             traffic_unit: TrafficUnit::default(),
             accent_color: None,
@@ -822,6 +841,26 @@ mod tests {
             settings.ping_test_probe_url(),
             "https://observatory.example/generate_204"
         );
+    }
+
+    #[test]
+    fn dns_takeover_defaults_on_and_off_round_trips() {
+        let default = Settings::default();
+        assert!(default.dns_takeover, "the established behavior is on");
+        let wire = serde_json::to_value(&default).expect("settings serialize");
+        assert!(
+            wire.get("dnsTakeover").is_none(),
+            "the default stays out of the file"
+        );
+
+        let off = Settings {
+            dns_takeover: false,
+            ..default
+        };
+        let wire = serde_json::to_value(&off).expect("settings serialize");
+        assert_eq!(wire["dnsTakeover"], false);
+        let loaded: Settings = serde_json::from_value(wire).expect("settings load");
+        assert!(!loaded.dns_takeover);
     }
 
     #[test]

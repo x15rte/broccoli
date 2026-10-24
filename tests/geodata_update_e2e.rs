@@ -76,7 +76,10 @@ fn runnable_config(
 fn apply_and_start(config: serde_json::Value) -> CoreCmd {
     CoreCmd::Apply {
         value: config,
-        intent: broccoli::rt::ApplyIntent::CommitAndStart { tun_mode: false },
+        intent: broccoli::rt::ApplyIntent::CommitAndStart {
+            tun_mode: false,
+            dns_takeover: true,
+        },
         revision: 0,
     }
 }

@@ -35,6 +35,9 @@ pub(super) struct Lifecycle {
     /// never re-reads the user-writable active path, so a same-user swap after
     /// capture cannot reach the stage; `None` means no start has captured yet.
     pub(super) helper_config_bytes: Option<Vec<u8>>,
+    /// App-owned DNS-takeover choice captured with [`Self::helper_config_bytes`]
+    /// and sent on the helper start. True preserves the established behavior.
+    pub(super) helper_dns_takeover: bool,
     /// The core-swap candidate (durable health marker) plus its rollback.
     pub(super) core_update: CoreUpdatePending,
     /// Unexpected-exit backoff and the stability clock that resets it.
@@ -91,6 +94,7 @@ impl Lifecycle {
             exit_policy: ExitPolicy::idle(),
             pending_transition: PendingTransition::new(),
             helper_config_bytes: None,
+            helper_dns_takeover: true,
             core_update: CoreUpdatePending::new(),
             backoff: Backoff::new(),
             phase: CorePhase::Stopped,

@@ -3,7 +3,7 @@
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
 use crate::model::validation::{ValidationCode, tun_gateway_verdict, tun_leak_misconfig_tun_off};
-use crate::model::{Mode, fold_eq};
+use crate::model::{Mode, emit, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
 use crate::ui::UiCtx;
@@ -44,6 +44,9 @@ struct ValidationCache {
     tun_warning: Option<String>,
     gateway_error: Option<String>,
     leak_warning: Option<String>,
+    /// The DNS leak block is emitted and its DNS half is on: the only state
+    /// in which turning the takeover off can stall name resolution.
+    dns_leak_block_on: bool,
 }
 
 /// Write one leak-block half into the stored list: the core's canonical
@@ -133,6 +136,8 @@ impl TunScreen {
                     .map(|code| validation_message(&code, lang)),
                 leak_warning: tun_leak_misconfig_tun_off(ctx.settings)
                     .then(|| validation_message(&ValidationCode::TunLeakMisconfigTunOff, lang)),
+                dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
+                    && ctx.settings.tun.leak_blocks_dns(),
             });
         }
         let tun_warning = match &self.validation {
@@ -145,6 +150,10 @@ impl TunScreen {
         };
         let leak_warning = match &self.validation {
             Some(cache) => cache.leak_warning.as_deref(),
+            None => unreachable!("validation is built when absent, above"),
+        };
+        let dns_leak_block_on = match &self.validation {
+            Some(cache) => cache.dns_leak_block_on,
             None => unreachable!("validation is built when absent, above"),
         };
 
@@ -373,6 +382,28 @@ impl TunScreen {
                     );
                 }
             });
+        });
+
+        // Broccoli-owned behavior lives below the Xray sections and says so:
+        // these switches never reach the generated configuration.
+        widgets::section(ui, t(lang, Key::TunSectionApp), |ui| {
+            ui.label(t(lang, Key::TunAppNote));
+            let mut takeover = ctx.settings.dns_takeover;
+            if widgets::noted(ui, t(lang, Key::TunDnsTakeoverNote), |ui| {
+                ui.checkbox(&mut takeover, t(lang, Key::TunDnsTakeoverLabel))
+            })
+            .changed()
+            {
+                ctx.settings.dns_takeover = takeover;
+                changed = true;
+            }
+            if !takeover && dns_leak_block_on {
+                ui.label(
+                    egui::RichText::new(t(lang, Key::TunDnsTakeoverOffWarning))
+                        .small()
+                        .color(status_colors_of(ui).warn),
+                );
+            }
         });
 
         if changed {
@@ -743,6 +774,72 @@ mod tests {
             harness.state().1.settings.tun.auto_system_wfp_block_leak,
             vec!["bogus".to_string(), TUN_LEAK_MISCONFIG_TUN.to_string()],
             "turning the DNS half off must remove every spelling of it"
+        );
+    }
+
+    /// The app-owned takeover switch renders its own section, starts on, and
+    /// writes through to the settings the helper start reads.
+    #[test]
+    fn the_app_dns_takeover_switch_writes_through() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        let mut harness = leak_harness(rig);
+        let label = t(Language::En, Key::TunDnsTakeoverLabel);
+        assert_eq!(
+            leak_switch(&harness, label),
+            Some(true),
+            "the established behavior starts on"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert!(!harness.state().1.settings.dns_takeover);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunDnsTakeoverOffWarning))
+                .is_some(),
+            "turning the takeover off must warn about slow resolution"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert!(harness.state().1.settings.dns_takeover);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunDnsTakeoverOffWarning))
+                .is_none(),
+            "the warning clears when the takeover is back on"
+        );
+
+        // Without the DNS leak block, other resolvers answer normally, so
+        // turning the takeover off has no stall to warn about.
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.dns_takeover = false;
+        rig.settings.tun.auto_system_wfp_block_leak.clear();
+        let harness = leak_harness(rig);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunDnsTakeoverOffWarning))
+                .is_none(),
+            "the warning needs the DNS leak block"
+        );
+
+        // The block is not emitted with TUN off, so the stored half alone
+        // must not resurrect the warning.
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Off;
+        rig.settings.dns_takeover = false;
+        let harness = leak_harness(rig);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunDnsTakeoverOffWarning))
+                .is_none(),
+            "the warning needs the emitted leak block, not just the stored list"
         );
     }
 

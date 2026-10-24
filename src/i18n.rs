@@ -472,6 +472,11 @@ keys! {
     TunAutoOutboundsDown 1,
     TunAutoOutboundsMissing 1,
     TunSectionLeakBlock 0,
+    TunSectionApp 0,
+    TunAppNote 0,
+    TunDnsTakeoverLabel 0,
+    TunDnsTakeoverNote 0,
+    TunDnsTakeoverOffWarning 0,
     TunLeakDnsLabel 0,
     TunLeakDnsNote 0,
     TunLeakMisconfigLabel 0,
@@ -1852,7 +1857,6 @@ keys! {
     RtLogTunCloseTimeout (Log, Warn, 0),
     RtLogTunCoreExited (Log, Info, 0),
     RtLogTunCoreAlive (Log, Warn, 0),
-    RtLogDnsFlushExit (Log, Warn, 0),
     RtLogConnected (Log, Info, 0),
     RtLogDisconnected (Log, Info, 0),
     RtLogExitNotReported (Log, Warn, 0),
@@ -3293,6 +3297,18 @@ mod en {
                 "'{0}' no longer exists. Pick an active interface or 'auto'."
             }
             Key::TunSectionLeakBlock => "Leak block",
+            Key::TunSectionApp => "broccoli",
+            Key::TunAppNote => "Handled by broccoli, not Xray.",
+            Key::TunDnsTakeoverLabel => "take over the system DNS while TUN runs",
+            Key::TunDnsTakeoverNote => {
+                "Points every connected physical adapter's DNS at the tunnel so Windows does not \
+                 wait on blocked resolvers. Off uses Xray's native TUN DNS: the TUN adapter still \
+                 points at the gateway, other adapters keep their own DNS."
+            }
+            Key::TunDnsTakeoverOffWarning => {
+                "With the DNS leak block on, turning this off can make DNS slow. Name lookups may \
+                 wait about ten seconds on other adapters' blocked resolvers."
+            }
             Key::TunLeakDnsLabel => "keep DNS inside the tunnel",
             Key::TunLeakDnsNote => {
                 "The core permits DNS only through the tunnel. Set the resolvers on the DNS tab."
@@ -5407,7 +5423,6 @@ mod en {
             Key::RtLogTunCoreAlive => {
                 "TUN core alive after the wintun create window; stopping it now"
             }
-            Key::RtLogDnsFlushExit => "ipconfig exited non-zero during the DNS cache flush",
             Key::RtLogConnected => "connected",
             Key::RtLogDisconnected => "disconnected",
             Key::RtLogExitNotReported => {
@@ -6262,7 +6277,7 @@ mod en {
                 "elevated helper restored the DNS servers of {} adapters"
             }
             Key::HelperDnsTakeoverNetworkRestored => {
-                "elevated helper restored the DNS of {} adapters after the outbound adapter changed"
+                "elevated helper restored the DNS of {} adapters after a network change"
             }
             Key::HelperDnsTakeoverShutdownRestored => {
                 "elevated helper restored the DNS servers of {} adapters for shutdown"

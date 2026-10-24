@@ -252,7 +252,10 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
         .cmd
         .send(CoreCmd::Apply {
             value: main_config,
-            intent: ApplyIntent::CommitAndStart { tun_mode: false },
+            intent: ApplyIntent::CommitAndStart {
+                tun_mode: false,
+                dns_takeover: true,
+            },
             revision: 0,
         })
         .expect("start main runtime");
