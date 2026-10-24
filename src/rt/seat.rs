@@ -16,10 +16,11 @@
 //! Declared here are the facts every shared path reads for them: the
 //! conflict rule, the busy-reject flavour the begin runner emits for a held
 //! window, the user-facing operation name the busy window is reported
-//! through, whether a hard abort must
-//! leave the task to its own terminal, whether an unexpected exit cancels
-//! the in-flight task, and where the exactly-one terminal travels when the
-//! worker's own outcome cannot arrive.
+//! through, the single [`CancelPlan`] per kind (whether a hard abort must
+//! leave the task to its own terminal, whether the worker polls the cancel
+//! flag, whether an unexpected exit cancels the in-flight task), and where
+//! the exactly-one terminal travels when the worker's own outcome cannot
+//! arrive.
 
 use std::future::Future;
 
@@ -147,15 +148,6 @@ pub(crate) trait QuerySeat: Send + 'static {
     const GATE: GateOrder;
     /// The registry-reject flavor.
     const BUSY: BusyReject;
-    /// Whether this seat's task must run to its own terminal even under the
-    /// Stop/Shutdown drain. The trial-rule mutations write to the core and
-    /// then read the rule list back: an abort between the two RPCs would
-    /// report "cancelled" for a rule that is already live (and an
-    /// append-mode retry would add a duplicate). Such a record still gets
-    /// the drain's cancel flag; each RPC carries its own local deadline
-    /// ([`GrpcClient`] bounds every call), so the task always ends promptly
-    /// on its own and its reply guard delivers the true verdict.
-    const RUNS_TO_OWN_TERMINAL: bool = false;
 
     /// Availability and validation, run at the point [`QuerySeat::GATE`]
     /// declares; `Err` is the rejection text delivered on the reply channel.
@@ -244,24 +236,73 @@ pub(crate) fn exclusive_reject(kind: JobKind) -> ExclusiveReject {
     }
 }
 
-/// Whether this kind's in-flight task must be left to its own terminal:
-/// the worker owns on-disk work that a hard abort would strand — the
-/// core-update install runs past the abortable point, and the profile
-/// validation's `xray -test` child holds its scratch config open, so Windows
-/// cannot delete it under a live reader. Read by the registry's preemptive
-/// begin, its lifecycle releases (`JobRegistry::exclusive_runs_to_terminal`),
-/// and the runtime's shutdown wait: none of them may end such a task.
-pub(crate) const fn runs_to_own_terminal(kind: JobKind) -> bool {
-    matches!(kind, JobKind::UpdateCore | JobKind::ValidateProfiles)
+/// How one kind's in-flight task reacts to cancellation. One plan per kind,
+/// so every cancel path reads one table instead of composing its own
+/// predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CancelPlan {
+    /// A hard abort would strand work the worker owns: the core-update
+    /// install runs past the abortable point in `spawn_blocking` (which
+    /// `abort()` cannot interrupt), the profile validation's `xray -test`
+    /// child holds its scratch config open (Windows cannot delete the file
+    /// under a live reader), and the trial-rule mutation pair would report
+    /// "cancelled" for a rule the core already has (an append-mode retry
+    /// would duplicate it). Such a task is left to its own terminal.
+    pub runs_to_terminal: bool,
+    /// The worker polls the record's cancel flag between units of work: the
+    /// profile validation checks it before the first profile and between
+    /// profiles. A worker without such a boundary finishes on its own; its
+    /// landing reads the keep-slot flag instead.
+    pub polls_flag: bool,
+    /// An unexpected core exit (or TUN helper transport loss) must cancel the
+    /// in-flight task and settle its terminal — the user operations whose
+    /// result would otherwise be silently dropped. Task-less busy slots are
+    /// owned by the normal exit/readiness path.
+    pub cancel_on_exit: bool,
 }
 
-/// Whether this kind's worker polls its record's cancel flag between units
-/// of work, so a cooperative cancel must raise it: the profile validation
-/// checks it before the first profile and between profiles. A worker without
-/// such a boundary (the core-update install) finishes on its own; its landing
-/// reads the keep-slot flag instead.
-pub(crate) const fn worker_polls_cancel_flag(kind: JobKind) -> bool {
-    matches!(kind, JobKind::ValidateProfiles)
+impl CancelPlan {
+    const fn new(runs_to_terminal: bool, polls_flag: bool, cancel_on_exit: bool) -> Self {
+        CancelPlan {
+            runs_to_terminal,
+            polls_flag,
+            cancel_on_exit,
+        }
+    }
+}
+
+/// The cancel plan of each kind, read by the registry's preemptive begin and
+/// stop decision, the runtime's cancel paths, the query runner's abort
+/// registration, and the shutdown wait. Declared as one table per kind so no
+/// call site re-derives the facts.
+pub(crate) const fn cancel_plan(kind: JobKind) -> CancelPlan {
+    match kind {
+        // The install's swap cannot be aborted; the worker finishes on its own
+        // and its landing releases the record.
+        JobKind::UpdateCore => CancelPlan::new(true, false, false),
+        // The `xray -test` child owns the scratch config; the worker polls the
+        // flag between profiles and only its own terminal releases the record.
+        JobKind::ValidateProfiles => CancelPlan::new(true, true, false),
+        // The mutation writes to the core, then reads the rule list back: each
+        // RPC carries its own deadline, so the task ends promptly on its own
+        // and its reply guard delivers the true verdict.
+        JobKind::TrialRules => CancelPlan::new(true, false, false),
+        // Core-backed user operations whose terminal would otherwise be
+        // dropped when the core goes away under them.
+        JobKind::ApplyConfig | JobKind::TestConfig | JobKind::LatencyProbe => {
+            CancelPlan::new(false, false, true)
+        }
+        // Lifecycle spans, the cleanup, and the remaining queries own no
+        // artifact, poll no flag, and are not cancelled by an exit.
+        JobKind::Start
+        | JobKind::Stop
+        | JobKind::CleanUp
+        | JobKind::Restart
+        | JobKind::TestRoute
+        | JobKind::Balancer
+        | JobKind::LoggerRestart
+        | JobKind::RuntimeState => CancelPlan::new(false, false, false),
+    }
 }
 
 /// The log record a cooperative (flag-only) cancel leaves behind: the worker
@@ -300,21 +341,6 @@ pub(crate) fn deliver_profile_reply(
     }
 }
 
-/// Whether an unexpected core exit (or TUN helper transport loss) must
-/// cancel this kind's in-flight task and settle its terminal — the three
-/// user operations whose result would otherwise be silently dropped.
-/// Task-less busy slots (lifecycle spans, a deferred apply-restart, a
-/// completed update awaiting readiness) are owned by the normal
-/// exit/readiness path, and a profile validation is deliberately absent: its
-/// child is independent of the core, and only the worker's own terminal may
-/// end its scratch-config lifetime.
-pub(crate) const fn cancelled_on_exit(kind: JobKind) -> bool {
-    matches!(
-        kind,
-        JobKind::ApplyConfig | JobKind::TestConfig | JobKind::LatencyProbe
-    )
-}
-
 /// Deliver the config-test reply terminal (the sidecar parked at begin).
 /// Exactly one terminal path may take the sidecar, so a missing or
 /// mismatched one is a declaration error.
@@ -337,9 +363,13 @@ pub(crate) fn deliver_test_reply(
 }
 
 /// Deliver one apply failure: exactly one `ApplyResult` settles the config
-/// revision the in-flight command carried (parked where its begin put it).
+/// revision the in-flight command carried (parked on its own record at
+/// begin, so the verdict names the configuration it settled).
 fn deliver_apply_failure(runtime: &mut Runtime, output: ApplyOutput) {
-    let revision = runtime.apply_revision;
+    let revision = runtime
+        .jobs
+        .apply_revision()
+        .expect("the held apply record carries the revision its begin parked");
     runtime.emit(CoreEvt::ApplyResult {
         ok: false,
         output,
@@ -629,11 +659,6 @@ impl QuerySeat for AddTrialRuleSeat {
     const KIND: JobKind = JobKind::TrialRules;
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
-    // The add is append-mode, and the read-back after it is the only
-    // authority on what the core holds: aborting that read-back would report
-    // a cancelled add for a rule the core may already have, and make a retry
-    // duplicate it. The task therefore always runs to its own terminal.
-    const RUNS_TO_OWN_TERMINAL: bool = true;
 
     fn gate(&self, runtime: &Runtime) -> Result<router_cfg::RoutingRule, DiagError> {
         if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
@@ -680,10 +705,6 @@ impl QuerySeat for RemoveTrialRuleSeat {
     const KIND: JobKind = JobKind::TrialRules;
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
-    // The removal is already live server-side once `remove_rule` returns;
-    // aborting the following `list_rules` read-back would report a
-    // cancelled removal for a rule that is gone.
-    const RUNS_TO_OWN_TERMINAL: bool = true;
 
     fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
         if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
@@ -774,9 +795,10 @@ impl Runtime {
     /// Run one accepted query job: the reply guard (exactly-one terminal on
     /// every death path), the conflict check with its seat-declared reject
     /// flavor, the availability gate, the `grpc`/`repaint` clones, the spawn,
-    /// the terminal send, and the abort registration. A seat that declares
-    /// [`QuerySeat::RUNS_TO_OWN_TERMINAL`] registers its task so completion
-    /// is still provable to the lazy sweep, but no cancel path aborts it.
+    /// the terminal send, and the abort registration. A seat whose kind's
+    /// [`cancel_plan`] runs to its own terminal registers its task so
+    /// completion is still provable to the lazy sweep, but no cancel path
+    /// aborts it.
     pub(crate) async fn run_query<Seat: QuerySeat>(
         &mut self,
         seat: Seat,
@@ -823,7 +845,7 @@ impl Runtime {
             let _ = guard.send(result);
             repaint.request_repaint();
         });
-        if Seat::RUNS_TO_OWN_TERMINAL {
+        if cancel_plan(Seat::KIND).runs_to_terminal {
             self.jobs.set_abort_keep_running(id, task.abort_handle());
         } else {
             self.jobs.set_abort(id, task.abort_handle());

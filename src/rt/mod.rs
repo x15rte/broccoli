@@ -76,7 +76,9 @@ const RUNTIME_JOIN_BOUND: Duration =
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::rt::jobs::{Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry, declared_kind};
+use crate::rt::jobs::{
+    Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry, StopPlan, declared_kind,
+};
 
 pub use grpc::{
     BalancerInfoView, GrpcClient, HealthPingView, OutboundStatusView, RuntimeEntryView, StatsTick,
@@ -322,8 +324,8 @@ pub(crate) enum BusyAnswer<'a> {
     /// tags its failure event carries from them (the worker parks the same
     /// tags for its own terminal).
     ProbeProfiles(&'a [crate::model::ServerProfile]),
-    /// The apply command's config revision: parked on the runtime by an
-    /// accepted begin, so every verdict of that apply names the
+    /// The apply command's config revision: parked on its own exclusive
+    /// record by an accepted begin, so every verdict of that apply names the
     /// configuration it settled, and carried by the apply-verdict flavour
     /// otherwise.
     ApplyRevision(u64),
@@ -1008,16 +1010,10 @@ struct Runtime {
     /// profile validation, and the lifecycle transitions) carries the
     /// runtime's whole operation
     /// state on its record — kind, cancel flag, keep-slot flag,
-    /// pollable task, per-kind sidecar. Concurrent query records (route
-    /// test, balancer, trial rules, logger restart, runtime state) abort on
-    /// the Stop/Shutdown drain.
+    /// pollable task, per-kind sidecar, and the apply revision. Concurrent
+    /// query records (route test, balancer, trial rules, logger restart,
+    /// runtime state) abort on the Stop/Shutdown drain.
     jobs: JobRegistry,
-    /// The config revision the in-flight apply command carried, parked by its
-    /// begin: every verdict of that apply — the completion, the cancel and the
-    /// join-error terminal — names the configuration it settled. Only one
-    /// apply can be in flight (the exclusive rule), so a verdict that reads
-    /// this always reads its own.
-    apply_revision: u64,
     /// Busy-window bookends the registry sink queued but not yet delivered
     /// to the GUI: `Some(kind)` on exclusive begin, `None` on release. The
     /// [`Runtime::begin_exclusive`] / [`Runtime::release_exclusive`]
@@ -1107,7 +1103,6 @@ impl Runtime {
             jobs: JobRegistry::with_busy_sink(move |bookend| {
                 let _ = bookend_tx.send(bookend);
             }),
-            apply_revision: 0,
             pending_bookends: bookend_rx,
             cleanup: None,
         }
@@ -1208,7 +1203,9 @@ impl Runtime {
                         self.jobs
                             .set_exclusive_sidecar(ExclusiveSidecar::ProfileReply(reply));
                     }
-                    BusyAnswer::ApplyRevision(revision) => self.apply_revision = revision,
+                    BusyAnswer::ApplyRevision(revision) => {
+                        self.jobs.set_apply_revision(revision);
+                    }
                     BusyAnswer::Nowhere | BusyAnswer::ProbeProfiles(_) => {}
                 }
                 Some(id)
@@ -1347,33 +1344,56 @@ impl Runtime {
     /// task-bearing terminal state is taken off the sidecar before the
     /// cancel, so a second terminal path can never fire.
     ///
-    /// A kind whose worker runs to its own terminal is cancelled
-    /// cooperatively instead: the record stays held, its cancel flag is
-    /// raised, and the worker observes it between units of work. Hard
-    /// aborting is never an option there — an in-flight core-update install
-    /// runs in `spawn_blocking`, which `abort()` cannot interrupt (it only
-    /// detaches the closure, so the update would land after the UI saw
-    /// "cancelled" and a second install could overlap it), and an in-flight
-    /// profile validation's `xray -test` child holds its scratch config open
-    /// (Windows cannot delete the file under a live reader, so an abort would
-    /// strand plaintext secrets and orphan the child).
+    /// The decision is the registry's one [`StopPlan`], read off the record
+    /// and its kind's cancellation facts:
+    ///
+    /// - `Abort` aborts the task and settles the kind's exactly-one terminal.
+    /// - `Cooperative` raises the worker's cancel flag; the worker observes it
+    ///   between units of work and its own terminal releases the record.
+    /// - `KeepSlot` records the keep-slot cancellation of a worker without a
+    ///   flag boundary; the worker finishes on its own and its landing
+    ///   releases the record.
+    /// - `ReleaseOnly` ends a task-less span with the cancel log and the
+    ///   release (its result already landed or the lifecycle path owns it).
+    /// - `Idle` means no exclusive record was held.
+    ///
+    /// Hard aborting is never an option for a worker that owns its artifact —
+    /// an in-flight core-update install runs in `spawn_blocking`, which
+    /// `abort()` cannot interrupt (it only detaches the closure, so the
+    /// update would land after the UI saw "cancelled" and a second install
+    /// could overlap it), and an in-flight profile validation's `xray -test`
+    /// child holds its scratch config open (Windows cannot delete the file
+    /// under a live reader, so an abort would strand plaintext secrets and
+    /// orphan the child).
     fn cancel_exclusive(&mut self, reason: &Diag) {
-        let Some(kind) = self.jobs.busy_kind() else {
-            return;
-        };
-        if self.jobs.exclusive_task_active() && seat::runs_to_own_terminal(kind) {
-            // A worker with a cancel boundary observes the flag between units
-            // of work; one without it finishes on its own and only needs the
-            // keep-slot flag recorded.
-            if seat::worker_polls_cancel_flag(kind) {
-                self.jobs.request_cooperative_cancel();
-            } else {
-                self.jobs.request_cancel_flagged();
+        match self.jobs.stop_plan() {
+            StopPlan::Idle => {}
+            StopPlan::ReleaseOnly { kind } => {
+                // Nothing is in flight to abort or hand a terminal to (a
+                // lifecycle span between phases, a cleanup waiting on its
+                // helper, a completed task awaiting its deferred release):
+                // the cancel log names the operation and the release ends the
+                // window. A cleanup still armed here is owned by this cancel,
+                // so dropping it must not be reported as a failure the user
+                // never saw.
+                self.cleanup = None;
+                self.app_log(
+                    Diag::new(Key::RtLogOperationCancelled)
+                        .arg_message(seat::occupant_name(kind))
+                        .arg_message(reason.clone()),
+                );
+                self.release_exclusive();
             }
-            self.app_log(seat::cooperative_cancel_log(kind, reason));
-            return;
+            StopPlan::Abort { kind } => self.cancel_task_exclusive(kind, reason),
+            StopPlan::Cooperative { kind } => {
+                self.jobs.request_cooperative_cancel();
+                self.app_log(seat::cooperative_cancel_log(kind, reason));
+            }
+            StopPlan::KeepSlot { kind } => {
+                self.jobs.request_cancel_flagged();
+                self.app_log(seat::cooperative_cancel_log(kind, reason));
+            }
         }
-        self.cancel_task_exclusive(kind, reason);
     }
 
     /// Abort one in-flight exclusive task and settle the kind's exactly-one
@@ -1419,7 +1439,8 @@ impl Runtime {
         let Some(kind) = self.jobs.busy_kind() else {
             return;
         };
-        let foreign_task = self.jobs.exclusive_task_active() && seat::cancelled_on_exit(kind);
+        let foreign_task =
+            self.jobs.exclusive_task_active() && seat::cancel_plan(kind).cancel_on_exit;
         if !foreign_task {
             return;
         }
@@ -1673,7 +1694,7 @@ impl Runtime {
             // secrets and orphan the child. The loop keeps polling the task
             // arm (bounded by the child's own timeout) until that terminal
             // clears the record.
-            if self.lifecycle.shutting_down && !self.jobs.exclusive_runs_to_terminal() {
+            if self.lifecycle.shutting_down && !self.jobs.stop_plan().worker_owns_slot() {
                 break;
             }
         }
@@ -1746,7 +1767,7 @@ impl Runtime {
                 // config). Neither is preempted here and neither is released
                 // here — the worker's own terminal ends the record, and the
                 // update landing keeps the state it is mid-transaction with.
-                let slot_kept = self.jobs.exclusive_runs_to_terminal();
+                let slot_kept = self.jobs.stop_plan().worker_owns_slot();
                 let update_landing = matches!(self.jobs.busy_kind(), Some(JobKind::UpdateCore));
                 if self.lifecycle.backend.tun_owned_or_alive() && !slot_kept {
                     // Stop preempts: the begin cannot reject here, because a
@@ -2014,7 +2035,10 @@ impl Runtime {
     }
 
     async fn begin_apply_work(&mut self, value: serde_json::Value, intent: ApplyIntent) {
-        let revision = self.apply_revision;
+        let revision = self
+            .jobs
+            .apply_revision()
+            .expect("the accepted apply record carries the revision its begin parked");
         // The control-plane port is ephemeral and lives only in the
         // emitted config; derive it from the candidate the runtime will run so
         // the gRPC client polls exactly the committed listener.
@@ -2294,8 +2318,11 @@ impl Runtime {
         api_port: u16,
     ) {
         // The verdict names the configuration the command was generated from,
-        // read before any terminal releases the record that parked it.
-        let revision = self.apply_revision;
+        // read from the record before any terminal releases it.
+        let revision = self
+            .jobs
+            .apply_revision()
+            .expect("the held apply record carries the revision its begin parked");
         if !ok {
             self.emit(CoreEvt::ApplyResult {
                 ok: false,
@@ -4131,6 +4158,14 @@ mod tests {
             .expect("test occupies an empty registry window");
     }
 
+    /// Begin an apply record carrying the config revision its command was
+    /// generated from — the direct-call mirror of the dispatch arm's
+    /// `begin_exclusive(.., BusyAnswer::ApplyRevision(revision))`.
+    fn occupy_apply(runtime: &mut Runtime, revision: u64) {
+        occupy_exclusive(runtime, JobKind::ApplyConfig);
+        runtime.jobs.set_apply_revision(revision);
+    }
+
     /// Park an abortable, never-resolving task on the exclusive record, as
     /// the dispatch arms do after spawning a task-bearing job.
     fn park_pending_task(runtime: &mut Runtime) {
@@ -5937,7 +5972,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stopping_apply_emits_cancellation_before_release() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::ApplyConfig);
+        occupy_apply(&mut runtime, 1);
         park_pending_task(&mut runtime);
 
         runtime.handle_cmd(CoreCmd::Stop).await;
@@ -5966,9 +6001,10 @@ mod tests {
         assert!(apply_indices[0] < none_indices[0]);
         assert!(matches!(
             &emitted[apply_indices[0]],
-            CoreEvt::ApplyResult { ok: false, output, .. }
-                if output.text(Language::En)
-                    == apply_cancelled_text(Key::RtReasonStopRequested)
+            CoreEvt::ApplyResult { ok: false, output, revision }
+                if *revision == 1
+                    && output.text(Language::En)
+                        == apply_cancelled_text(Key::RtReasonStopRequested)
         ));
         assert!(
             !emitted
@@ -5983,7 +6019,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_cancels_inflight_apply_with_terminal_result() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::ApplyConfig);
+        occupy_apply(&mut runtime, 1);
         park_pending_task(&mut runtime);
 
         runtime.handle_cmd(CoreCmd::Shutdown).await;
@@ -6467,7 +6503,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unexpected_exit_cancels_inflight_apply_with_terminal_result() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::ApplyConfig);
+        occupy_apply(&mut runtime, 1);
         park_pending_task(&mut runtime);
 
         runtime.on_core_exit(None).await;
@@ -7809,7 +7845,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn helper_loss_cancels_inflight_apply() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::ApplyConfig);
+        occupy_apply(&mut runtime, 1);
         park_pending_task(&mut runtime);
 
         runtime.on_unconfirmed_backend_loss();
@@ -8050,7 +8086,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn apply_join_error_emits_exactly_one_failure_result() {
         let (mut runtime, events) = runtime_with_events();
-        occupy_exclusive(&mut runtime, JobKind::ApplyConfig);
+        occupy_apply(&mut runtime, 1);
         let task = tokio::spawn(async { panic!("deliberate apply worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
         runtime.complete_exclusive_join_error(JobKind::ApplyConfig, error);

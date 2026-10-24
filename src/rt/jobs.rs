@@ -10,7 +10,7 @@
 //! while an exclusive job holds the window. Every record carries a kind,
 //! an abort handle, and a cancel flag — a query whose mutation pair must
 //! reach its own terminal registers the handle without making it abortable
-//! ([`super::seat::QuerySeat::RUNS_TO_OWN_TERMINAL`]) — and [`ReplyGuard`]
+//! ([`super::seat::cancel_plan`]) — and [`ReplyGuard`]
 //! delivers exactly one terminal result per query job over a per-request
 //! tokio one-shot channel on every path — completion, drop-without-send,
 //! cancel, abort, join error, panic, exit.
@@ -344,8 +344,9 @@ impl<T> Drop for ReplyGuard<T> {
 /// of the task running it (once the task reports in via
 /// [`JobRegistry::set_abort`]). The exclusive record additionally carries
 /// the runtime's whole operation state: the pollable task handle the
-/// select loop awaits, the keep-slot cancellation flag, and the
-/// per-kind terminal pairing (sidecar) parked at begin.
+/// select loop awaits, the keep-slot cancellation flag, the per-kind
+/// terminal pairing (sidecar) parked at begin, and the apply revision of
+/// the config command it settled.
 struct Record {
     id: u64,
     kind: JobKind,
@@ -358,12 +359,19 @@ struct Record {
     keep_running: bool,
     /// The exclusive task the select loop polls (exclusive records only).
     task: Option<JoinHandle<ExclusiveOutcome>>,
-    /// Flag-only cancel: set when Stop/Shutdown cancelled an
-    /// in-flight UpdateCore install that `abort()` cannot interrupt. The
-    /// record keeps occupying until the worker's terminal result lands.
+    /// Flag-only cancel: set when Stop/Shutdown cancelled an in-flight
+    /// worker that runs to its own terminal (the UpdateCore install, the
+    /// profile validation). The record keeps occupying until the worker's
+    /// terminal result lands.
     cancel_requested: bool,
     /// Per-kind terminal pairing parked at begin (exclusive records only).
     sidecar: Option<ExclusiveSidecar>,
+    /// The config revision the in-flight apply command carried, parked by its
+    /// begin (an exclusive `ApplyConfig` record only). Every verdict of that
+    /// apply — completion, cancel and join error — names the configuration it
+    /// settled. Only one apply can be in flight (the exclusive rule), so a
+    /// verdict that reads this always reads its own.
+    apply_revision: Option<u64>,
 }
 
 impl Record {
@@ -377,6 +385,7 @@ impl Record {
             task: None,
             cancel_requested: false,
             sidecar: None,
+            apply_revision: None,
         }
     }
 
@@ -410,10 +419,46 @@ impl Record {
     }
 }
 
+/// What a Stop/Shutdown cancel must do with the exclusive occupant, decided
+/// from the record alone (is a task in flight?) plus its kind's
+/// [`super::seat::cancel_plan`]. Every cancel path matches this plan instead
+/// of composing those facts again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopPlan {
+    /// No exclusive occupant: nothing to cancel or release.
+    Idle,
+    /// The record holds the window without an in-flight task (a lifecycle
+    /// span between phases, a cleanup waiting on its helper's terminal): its
+    /// work already landed, so only the release is left.
+    ReleaseOnly { kind: JobKind },
+    /// An abortable task: abort it and settle the kind's exactly-one
+    /// terminal.
+    Abort { kind: JobKind },
+    /// A worker that polls its cancel flag: raise the flag and leave the
+    /// record held until the worker's own terminal.
+    Cooperative { kind: JobKind },
+    /// A worker with no flag boundary: record the keep-slot cancellation and
+    /// leave the record held until the worker's own terminal.
+    KeepSlot { kind: JobKind },
+}
+
+impl StopPlan {
+    /// Whether the record's worker owns the busy window until its own
+    /// terminal: such a record is never aborted and never released by a
+    /// lifecycle path (the preemptive begin, [`JobRegistry::finish_exclusive`]
+    /// and the runtime's shutdown wait all leave it alone).
+    pub(crate) fn worker_owns_slot(self) -> bool {
+        matches!(
+            self,
+            StopPlan::Cooperative { .. } | StopPlan::KeepSlot { .. }
+        )
+    }
+}
+
 /// The job registry: at most one exclusive job plus any number
 /// of concurrent jobs. The exclusive record carries the runtime's whole
 /// operation state — pollable task, cancel flag, keep-slot flag,
-/// per-kind sidecar — and is only ever released by the explicit
+/// per-kind sidecar, apply revision — and is only ever released by the explicit
 /// [`JobRegistry::finish_concurrent`]/[`JobRegistry::finish_exclusive`],
 /// which the
 /// caller times (release can lag the terminal: apply-then-restart and the
@@ -463,11 +508,11 @@ impl JobRegistry {
         // Preemptive kinds (Stop) cancel the exclusive occupant first —
         // the old `cancel_operation`-then-`begin_operation` sequence
         // (bookend None then Some(new)) now happens inside the registry.
-        // A record that runs to its own terminal is not preempted: aborting
-        // its task would strand the artifact it owns (see
-        // [`JobRegistry::exclusive_runs_to_terminal`]).
+        // A record whose worker owns the slot is not preempted: aborting its
+        // task would strand the artifact it owns (see
+        // [`JobRegistry::stop_plan`]).
         if rule.preemptive
-            && !self.exclusive_runs_to_terminal()
+            && !self.stop_plan().worker_owns_slot()
             && let Some(record) = self.exclusive.take()
         {
             record.request_cancel();
@@ -541,10 +586,10 @@ impl JobRegistry {
     }
 
     /// Like [`JobRegistry::set_abort`] for a task that must be left to its
-    /// own terminal (see [`super::seat::QuerySeat::RUNS_TO_OWN_TERMINAL`]):
-    /// the handle still evidences completion to the lazy sweep, but no
-    /// cancel path aborts the task — Stop/Shutdown raise the record's cancel
-    /// flag only, and the task's own reply guard delivers its terminal.
+    /// own terminal (see [`super::seat::cancel_plan`]): the handle still
+    /// evidences completion to the lazy sweep, but no cancel path aborts the
+    /// task — Stop/Shutdown raise the record's cancel flag only, and the
+    /// task's own reply guard delivers its terminal.
     pub fn set_abort_keep_running(&mut self, id: u64, abort: AbortHandle) {
         if let Some(record) = self.find_mut(id) {
             record.abort = Some(abort);
@@ -689,37 +734,72 @@ impl JobRegistry {
         }
     }
 
+    /// Parks the config revision the accepted apply command carried on the
+    /// exclusive record (the one apply in flight), so every verdict of that
+    /// apply reads the configuration it settles from the job that owns it.
+    pub(crate) fn set_apply_revision(&mut self, revision: u64) {
+        if let Some(record) = &mut self.exclusive {
+            record.apply_revision = Some(revision);
+        }
+    }
+
+    /// The config revision of the in-flight apply, if the held record
+    /// carries one. Only one apply can be in flight (the exclusive rule), so
+    /// a verdict that reads this always reads its own; the record's release
+    /// clears it with the rest of the record.
+    pub(crate) fn apply_revision(&self) -> Option<u64> {
+        self.exclusive
+            .as_ref()
+            .and_then(|record| record.apply_revision)
+    }
+
     /// Whether the exclusive occupant is under a keep-slot cancellation
     /// (an UpdateCore install Stop/Shutdown asked to cancel but could not
-    /// abort). Read by the landing handler to suppress the health-gate
-    /// restart.
+    /// abort, or a cooperative flag the worker has not reached yet). Read by
+    /// the landing handler to suppress the health-gate restart. The flag is
+    /// only ever raised by the [`StopPlan`] variants that keep the slot
+    /// ([`JobRegistry::request_cancel_flagged`] and
+    /// [`JobRegistry::request_cooperative_cancel`]).
     pub fn is_cancel_requested(&self) -> bool {
         self.exclusive
             .as_ref()
             .is_some_and(|record| record.cancel_requested)
     }
 
-    /// True while the exclusive occupant must be left to its own terminal:
-    /// its worker owns an on-disk artifact that a hard abort would strand
-    /// (see [`super::seat::runs_to_own_terminal`]) and its task is still in
-    /// flight. The preemptive begin, the lifecycle releases and the shutdown
-    /// wait all read this one fact; the per-kind terminal clears it by
-    /// clearing the task ([`JobRegistry::clear_exclusive_task`]).
-    pub fn exclusive_runs_to_terminal(&self) -> bool {
-        self.exclusive.as_ref().is_some_and(|record| {
-            record.task.is_some() && super::seat::runs_to_own_terminal(record.kind)
-        })
+    /// The one Stop/Shutdown decision for the exclusive occupant, read from
+    /// the record (is a task in flight?) and its kind's
+    /// [`super::seat::cancel_plan`]. A task-less span is released; an
+    /// abortable task is aborted; a worker that owns its artifact is left to
+    /// its own terminal, cooperatively (flag-raising worker) or by recording
+    /// the keep-slot cancellation (worker without a flag boundary).
+    pub(crate) fn stop_plan(&self) -> StopPlan {
+        let Some(record) = &self.exclusive else {
+            return StopPlan::Idle;
+        };
+        let kind = record.kind;
+        if record.task.is_none() {
+            return StopPlan::ReleaseOnly { kind };
+        }
+        let plan = super::seat::cancel_plan(kind);
+        if !plan.runs_to_terminal {
+            return StopPlan::Abort { kind };
+        }
+        if plan.polls_flag {
+            StopPlan::Cooperative { kind }
+        } else {
+            StopPlan::KeepSlot { kind }
+        }
     }
 
     /// Releases the exclusive occupant, if any — the busy-window release.
     /// Emits the `None` bookend through the sink. A no-op when no record
-    /// is busy; release can lag the terminal result. An occupant that runs to
-    /// its own terminal ([`JobRegistry::exclusive_runs_to_terminal`]) is left
-    /// alone: the lifecycle releases (readiness, core exit, a deferred start
-    /// that failed) own the record of the operation that deferred its
-    /// release, never a worker still holding its artifact.
+    /// is busy; release can lag the terminal result. An occupant whose
+    /// worker owns the slot ([`JobRegistry::stop_plan`]) is left alone: the
+    /// lifecycle releases (readiness, core exit, a deferred start that
+    /// failed) own the record of the operation that deferred its release,
+    /// never a worker still holding its artifact.
     pub fn finish_exclusive(&mut self) {
-        if self.exclusive.is_some() && !self.exclusive_runs_to_terminal() {
+        if self.exclusive.is_some() && !self.stop_plan().worker_owns_slot() {
             self.exclusive = None;
             self.emit_bookend(None);
         }
@@ -1338,7 +1418,7 @@ mod tests {
         registry.try_begin(JobKind::ValidateProfiles).unwrap();
         let task = tokio::spawn(async { std::future::pending::<ExclusiveOutcome>().await });
         registry.attach_exclusive_task(task);
-        assert!(registry.exclusive_runs_to_terminal());
+        assert!(registry.stop_plan().worker_owns_slot());
 
         // Stop is preemptive, but not against a worker that owns its
         // artifact: the begin rejects instead of aborting it.
@@ -1360,7 +1440,7 @@ mod tests {
         // The worker's own terminal clears the task; the explicit release
         // then ends the record (the terminal handler's order).
         registry.clear_exclusive_task();
-        assert!(!registry.exclusive_runs_to_terminal());
+        assert!(!registry.stop_plan().worker_owns_slot());
         registry.finish_exclusive();
         assert_eq!(registry.busy_kind(), None);
         assert_eq!(
@@ -1530,5 +1610,182 @@ mod tests {
             registry.take_exclusive_sidecar().is_none(),
             "a second terminal path must find no sidecar (exactly-one)"
         );
+    }
+
+    /// One plan per kind: the table every cancel path reads instead of
+    /// composing its own predicates.
+    #[test]
+    fn cancel_plan_truth_table() {
+        use crate::rt::seat::{CancelPlan, cancel_plan};
+
+        let expect = |runs_to_terminal: bool, polls_flag: bool, cancel_on_exit: bool| CancelPlan {
+            runs_to_terminal,
+            polls_flag,
+            cancel_on_exit,
+        };
+        // The kinds that own an artifact a hard abort would strand.
+        assert_eq!(cancel_plan(JobKind::UpdateCore), expect(true, false, false));
+        assert_eq!(
+            cancel_plan(JobKind::ValidateProfiles),
+            expect(true, true, false)
+        );
+        // The trial-rule mutation pair must reach its read-back terminal.
+        assert_eq!(cancel_plan(JobKind::TrialRules), expect(true, false, false));
+        // The operations whose terminal an exit would silently drop.
+        for kind in [
+            JobKind::ApplyConfig,
+            JobKind::TestConfig,
+            JobKind::LatencyProbe,
+        ] {
+            assert_eq!(cancel_plan(kind), expect(false, false, true), "{kind:?}");
+        }
+        // Everything else: abortable, no flag boundary, no exit cancel.
+        for kind in [
+            JobKind::Start,
+            JobKind::Stop,
+            JobKind::CleanUp,
+            JobKind::Restart,
+            JobKind::TestRoute,
+            JobKind::Balancer,
+            JobKind::LoggerRestart,
+            JobKind::RuntimeState,
+        ] {
+            assert_eq!(cancel_plan(kind), expect(false, false, false), "{kind:?}");
+        }
+        // Only a worker that runs to its terminal may be flagged instead of
+        // aborted.
+        for kind in ALL_KINDS {
+            let plan = cancel_plan(kind);
+            assert!(
+                !plan.polls_flag || plan.runs_to_terminal,
+                "{kind:?}: a polling worker must be one a hard abort cannot interrupt"
+            );
+        }
+    }
+
+    /// The registry's one Stop decision, exercised across the states a
+    /// cancel meets: idle, a task-less span, an abortable task, a cooperative
+    /// worker, and the keep-slot landing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_plan_per_kind() {
+        let mut registry = JobRegistry::new();
+        assert_eq!(registry.stop_plan(), StopPlan::Idle);
+        assert!(!registry.stop_plan().worker_owns_slot());
+
+        // A task-less span (a lifecycle window between phases): release only,
+        // and the release ends it.
+        registry.try_begin(JobKind::Start).unwrap();
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::ReleaseOnly {
+                kind: JobKind::Start
+            }
+        );
+        assert!(!registry.stop_plan().worker_owns_slot());
+        registry.finish_exclusive();
+        assert_eq!(registry.stop_plan(), StopPlan::Idle);
+
+        // An abortable task: abort it.
+        registry.try_begin(JobKind::LatencyProbe).unwrap();
+        registry.attach_exclusive_task(tokio::spawn(async {
+            std::future::pending::<ExclusiveOutcome>().await
+        }));
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::Abort {
+                kind: JobKind::LatencyProbe
+            }
+        );
+        assert!(!registry.stop_plan().worker_owns_slot());
+        registry.finish_exclusive();
+        assert_eq!(registry.stop_plan(), StopPlan::Idle);
+
+        // A worker that polls its flag: cooperative.
+        registry.try_begin(JobKind::ValidateProfiles).unwrap();
+        registry.attach_exclusive_task(tokio::spawn(async {
+            std::future::pending::<ExclusiveOutcome>().await
+        }));
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::Cooperative {
+                kind: JobKind::ValidateProfiles
+            }
+        );
+        assert!(registry.stop_plan().worker_owns_slot());
+        // The worker's terminal is the only release while it owns the slot;
+        // the landing then releases.
+        registry.finish_exclusive();
+        assert_eq!(registry.busy_kind(), Some(JobKind::ValidateProfiles));
+        registry.clear_exclusive_task();
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::ReleaseOnly {
+                kind: JobKind::ValidateProfiles
+            }
+        );
+        registry.finish_exclusive();
+        assert_eq!(registry.stop_plan(), StopPlan::Idle);
+
+        // A worker with no flag boundary: keep the slot.
+        registry.try_begin(JobKind::UpdateCore).unwrap();
+        registry.attach_exclusive_task(tokio::spawn(async {
+            std::future::pending::<ExclusiveOutcome>().await
+        }));
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::KeepSlot {
+                kind: JobKind::UpdateCore
+            }
+        );
+        assert!(registry.stop_plan().worker_owns_slot());
+        // The install's landing clears the task before it releases.
+        registry.clear_exclusive_task();
+        assert_eq!(
+            registry.stop_plan(),
+            StopPlan::ReleaseOnly {
+                kind: JobKind::UpdateCore
+            }
+        );
+        registry.finish_exclusive();
+        assert_eq!(registry.stop_plan(), StopPlan::Idle);
+    }
+
+    /// The apply verdict's identity lives on the job that owns it: the begin
+    /// parks the revision, the release clears it, and a second apply cannot
+    /// overwrite a live verdict (the busy window rejects it before any begin).
+    #[test]
+    fn apply_revision_lives_with_the_apply_record() {
+        let bookends: Bookends = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = recorder_registry(&bookends);
+        assert_eq!(registry.apply_revision(), None);
+
+        registry.try_begin(JobKind::ApplyConfig).unwrap();
+        assert_eq!(
+            registry.apply_revision(),
+            None,
+            "the record carries no revision until the command parks one"
+        );
+        registry.set_apply_revision(7);
+        assert_eq!(registry.apply_revision(), Some(7));
+
+        // A second apply meets the busy window, so it can never reach the
+        // setter and overwrite the live verdict.
+        assert_eq!(
+            registry.try_begin(JobKind::ApplyConfig),
+            Err(Busy {
+                active: JobKind::ApplyConfig
+            })
+        );
+        assert_eq!(registry.apply_revision(), Some(7));
+
+        registry.finish_exclusive();
+        assert_eq!(
+            registry.apply_revision(),
+            None,
+            "the record's release clears the revision with it"
+        );
+        // A set with no apply record has nothing to land on.
+        registry.set_apply_revision(9);
+        assert_eq!(registry.apply_revision(), None);
     }
 }
