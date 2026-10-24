@@ -34,6 +34,38 @@ fn goldens_dir() -> PathBuf {
         .join("goldens")
 }
 
+/// Compose a feature delta over the shared baseline. The rule matches the unit
+/// harness in `src/gen/tests.rs` (objects merge recursively, arrays replace
+/// wholesale, `null` removes a key); the composer is duplicated here because
+/// the lib's test-only module is not reachable from an integration test.
+fn compose(baseline: &serde_json::Value, delta: &serde_json::Value) -> serde_json::Value {
+    let (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) = (baseline, delta)
+    else {
+        return delta.clone();
+    };
+    let mut merged = base.clone();
+    for (key, value) in overlay {
+        if value.is_null() {
+            merged.remove(key);
+            continue;
+        }
+        let composed = match merged.get(key) {
+            Some(base_value) => compose(base_value, value),
+            None => compose(&serde_json::Value::Object(serde_json::Map::new()), value),
+        };
+        merged.insert(key.clone(), composed);
+    }
+    serde_json::Value::Object(merged)
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()))
+}
+
 /// The Lua files the script goldens name. The core resolves a relative path
 /// against its own working directory (`ResolveLuaFile`,
 /// `common/platform/platform.go`), so the harness writes each fixture beside
@@ -82,19 +114,31 @@ fn goldens_pass_xray_test() {
         return;
     };
     let dir = goldens_dir();
+    let baseline = read_json(&dir.join("baseline.json"));
     materialize_lua_fixtures(xray.parent().expect("the core path has a parent directory"));
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| p.file_name().and_then(|name| name.to_str()) != Some("baseline.json"))
         .collect();
     entries.sort();
     assert!(!entries.is_empty(), "no goldens found in {}", dir.display());
 
     let mut failures = Vec::new();
     for path in &entries {
-        let out = run_xray_test(&xray, path);
+        let config = compose(&baseline, &read_json(path));
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("create a temp config file");
+        std::io::Write::write_all(
+            &mut file,
+            serde_json::to_string(&config).unwrap().as_bytes(),
+        )
+        .expect("write the temp config");
+        let out = run_xray_test(&xray, file.path());
         if !out.status.success() {
             failures.push(format!(
                 "== {} (exit {:?})\n{}",

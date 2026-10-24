@@ -46,23 +46,131 @@ fn single_server(outbound: OutboundModel) -> ServersFile {
     }
 }
 
+/// Compose the shared baseline with a feature delta: objects merge
+/// recursively, arrays replace wholesale, and a `null` delta value removes
+/// the key.
+fn compose_golden(baseline: &Value, delta: &Value) -> Value {
+    let (Value::Object(base), Value::Object(overlay)) = (baseline, delta) else {
+        return delta.clone();
+    };
+    let mut merged = base.clone();
+    for (key, value) in overlay {
+        if value.is_null() {
+            merged.remove(key);
+            continue;
+        }
+        let composed = match merged.get(key) {
+            Some(base_value) => compose_golden(base_value, value),
+            None => compose_golden(&Value::Object(Map::new()), value),
+        };
+        merged.insert(key.clone(), composed);
+    }
+    Value::Object(merged)
+}
+
+/// Recursive delta from `baseline` to `new`: unchanged paths are omitted,
+/// arrays replace wholesale, and removed keys are rendered as `null`.
+fn golden_delta(baseline: &Value, new: &Value) -> Option<Value> {
+    match (baseline, new) {
+        (Value::Object(base), Value::Object(new_map)) => {
+            let mut delta = Map::new();
+            for (key, new_value) in new_map {
+                match base.get(key) {
+                    Some(base_value) => {
+                        if let Some(change) = golden_delta(base_value, new_value) {
+                            delta.insert(key.clone(), change);
+                        }
+                    }
+                    None => {
+                        delta.insert(key.clone(), new_value.clone());
+                    }
+                }
+            }
+            for key in base.keys() {
+                if !new_map.contains_key(key) {
+                    delta.insert(key.clone(), Value::Null);
+                }
+            }
+            if delta.is_empty() {
+                None
+            } else {
+                Some(Value::Object(delta))
+            }
+        }
+        _ if baseline == new => None,
+        _ => Some(new.clone()),
+    }
+}
+
+/// The shared document every feature golden refines: generation for the
+/// default GUI state at the fixed test API port.
+static GOLDEN_BASELINE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+    generate_deterministic(&ServersFile::default(), &base_settings())
+        .expect("generate baseline config")
+});
+
+fn golden_baseline() -> &'static Value {
+    &GOLDEN_BASELINE
+}
+
+/// The feature name behind a golden path (`goldens/x.json` → `x`).
+fn golden_feature(file: &str) -> &str {
+    file.strip_prefix("goldens/")
+        .and_then(|name| name.strip_suffix(".json"))
+        .unwrap_or(file)
+}
+
+fn golden_path(relative: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/gen")
+        .join(relative)
+}
+
+/// `BROCCOLI_UPDATE_GOLDENS` writer. `only_if_moved` leaves the shared
+/// baseline untouched when the generated default state still matches it.
+fn write_golden(relative: &str, value: &Value, only_if_moved: bool) {
+    let path = golden_path(relative);
+    if only_if_moved
+        && std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|existing| serde_json::from_str::<Value>(&existing).ok())
+            .is_some_and(|existing| existing == *value)
+    {
+        return;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+}
+
+/// Serializes the shared baseline write while every feature test updates the
+/// goldens in one process.
+static BASELINE_GOLDEN_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 macro_rules! golden {
     ($file:literal, $got:expr_2021) => {{
         let got: Value = $got.expect("generate config");
+        let feature = golden_feature($file);
         if std::env::var_os("BROCCOLI_UPDATE_GOLDENS").is_some() {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/gen")
-                .join($file);
-            std::fs::write(&path, serde_json::to_string_pretty(&got).unwrap()).unwrap();
+            let baseline = golden_baseline();
+            // A moved baseline shifts every composed expectation, so after
+            // rewriting it rerun the whole golden set to rebase every delta.
+            {
+                let _guard = BASELINE_GOLDEN_WRITE.lock().unwrap();
+                write_golden("goldens/baseline.json", baseline, true);
+            }
+            let delta = golden_delta(baseline, &got).unwrap_or_else(|| Value::Object(Map::new()));
+            write_golden($file, &delta, false);
             return;
         }
-        let want: Value = serde_json::from_str(include_str!($file)).unwrap();
+        let baseline: Value = serde_json::from_str(include_str!("goldens/baseline.json")).unwrap();
+        let delta: Value = serde_json::from_str(include_str!($file)).unwrap();
+        let want = compose_golden(&baseline, &delta);
         assert_eq!(
             got,
             want,
-            "golden mismatch for {}\nGOT:\n{}\n",
-            $file,
-            serde_json::to_string_pretty(&got).unwrap()
+            "golden mismatch for {}\nGOT:\n{}\nWANT:\n{}\n",
+            feature,
+            serde_json::to_string_pretty(&got).unwrap(),
+            serde_json::to_string_pretty(&want).unwrap()
         );
     }};
 }
