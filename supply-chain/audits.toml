@@ -3329,6 +3329,11 @@ notes = "RustCrypto stream cipher; no build script"
 criteria = "safe-to-deploy"
 version = "5.4.1"
 
+[[audits.clipboard-win]]
+criteria = "safe-to-deploy"
+version = "5.4.3"
+notes = "5.4.1 -> 5.4.3: the clipboard-open retry sleeps 5 ms instead of yielding (Sleep(0)), the HTML fragment read replaces a raw pointer copy with a bounds-checked slice copy that rejects out-of-range offsets, and only docs, tests and the clippy attribute follow. No new dependencies, no build script."
+
 [[audits.cmake]]
 criteria = "safe-to-deploy"
 version = "0.1.58"
