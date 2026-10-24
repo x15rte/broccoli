@@ -4,9 +4,7 @@
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message, t, t_fmt};
 use crate::model::emit;
-use crate::model::inbound::{
-    API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, TUN_INBOUND_TAG,
-};
+use crate::model::inbound::DIRECT_OUTBOUND_TAG;
 use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
@@ -1409,22 +1407,8 @@ impl RoutingScreen {
         // that is switched off right now — the dialog offers it, and the core
         // answers for the tags it does not know — so disabled entries stay in
         // this list on purpose.
-        let known_inbounds: Vec<String> = settings
-            .local_inbounds
-            .iter()
-            .map(|entry| entry.tag.clone())
-            .chain(
-                [
-                    TUN_INBOUND_TAG,
-                    DNS_INBOUND_TAG,
-                    DNS_INBOUND_V6_TAG,
-                    API_INBOUND_TAG,
-                ]
-                .into_iter()
-                .map(str::to_string),
-            )
-            .chain(settings.dokodemo.iter().map(|entry| entry.tag.clone()))
-            .collect();
+        let known_inbounds: Vec<String> =
+            emit::inbound_tags(settings, emit::InboundScope::Declared);
         // The rule editor's inbound selector offers the listeners the settings
         // themselves carry — every enabled local endpoint and dokodemo
         // listener, in list order — never the ones the app adds: the `api`
@@ -1432,19 +1416,8 @@ impl RoutingScreen {
         // traffic a user scopes a rule by, the same reason the outbound menu
         // omits the internal `dns-out`. The model pass still accepts the app's
         // tags, so the text list beside the menu can carry one.
-        let rule_inbounds: Vec<String> = settings
-            .local_inbounds
-            .iter()
-            .filter(|entry| emit::local_inbound_emitted(entry))
-            .map(|entry| entry.tag.clone())
-            .chain(
-                settings
-                    .dokodemo
-                    .iter()
-                    .filter(|entry| emit::dokodemo_emitted(entry))
-                    .map(|entry| entry.tag.clone()),
-            )
-            .collect();
+        let rule_inbounds: Vec<String> =
+            emit::inbound_tags(settings, emit::InboundScope::UserListeners);
         // The shell's verdict for this generation: the balancer breakage
         // paths are the one slice of it this screen renders (the other
         // screens render their own), and the assessment itself runs once per

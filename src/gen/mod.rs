@@ -7,7 +7,7 @@ pub mod keys;
 
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
-use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scoped_bootstrap_endpoint};
+use crate::model::dns::DEFAULT_PLAINTEXT_RESOLVERS;
 use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG,
@@ -22,7 +22,6 @@ use crate::model::{
     Settings, TunCfg,
 };
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -167,8 +166,6 @@ fn generate_reporting(
         return serde_json::from_str(raw).map_err(GenerateError::RawOverride);
     }
 
-    let fakedns = settings.dns.fakedns.enabled;
-    let tun_on = emit::tun_inbound_emitted(settings);
     let verdict = validate_settings(settings, servers, api_port);
     advisories.extend(verdict.advisory().cloned());
     if let Some(error) = invalid_model_error(verdict) {
@@ -219,61 +216,24 @@ fn generate_reporting(
     }
     .write(&mut root);
 
-    let dns_wire = dns(&settings.dns, fakedns);
-    // Enabled SOCKS entries (in list order) carry DNS port-53 to dns-out;
-    // HTTP entries are not part of the DNS-interception policy.
-    let socks_tags = emit::socks_inbound_tags(settings);
-    // Local DNS interception: when a DNS server list exists and a proxy
-    // inbound can carry UDP, port-53 queries are answered by the DNS module
-    // (dns-out) instead of traveling the tunnel as raw UDP. The gate has one
-    // home (emit::dns_intercept), shared with every reader that judges the
-    // emitted tags.
-    let dns_intercept = emit::dns_intercept(settings);
+    // The derived facts the stages read, composed once per document: every
+    // gate (which families reach the wire, which of them attach to the DNS
+    // module, which profiles this document dials) lives in the emission value
+    // or in the query it calls, so no stage can disagree with another.
+    let emission = emit::Emission::new(servers, settings);
 
     // Proxy-server bootstrap: a direct-dial outbound's domain resolves
     // through a scoped `+local` DNS server (direct dial) instead of the OS
-    // resolver, so the tunnel chain can bootstrap itself. Only the outbounds
-    // the emitted document actually dials take the marking: the default route
-    // and the profiles its rules, balancers and health engines reach. A
-    // profile the document never dials — a standby server the user has not
-    // activated — carries neither the scope entry nor the injection until a
-    // commit makes it the default route or a rule's target. A chained hop's
-    // domain stays out of the scope: that server is reached through the chain
-    // and resolves on the far side. Both halves are load-bearing:
-    // `useip` routes the server dial into the DNS module, and the scoped
-    // server answers it without the tunnel; emitting one without the other
-    // would leave the dial on the OS resolver or deadlock it inside the
-    // module (the DoH dial needs the very chain the query is for).
-    let dialed = crate::model::dial::DialGraph::for_profiles(&servers.profiles)
-        .dialed_outbound_tags(settings);
-    let mut server_domains: Vec<String> = servers
-        .profiles
-        .iter()
-        .filter(|profile| dialed.contains(&profile.tag()))
-        .filter_map(profile_server_domain)
-        .collect();
-    server_domains.sort();
-    server_domains.dedup();
-    // The scoped server must land inside an emitted `dns` object; without a
-    // module there is nothing for it (or for useip dials) to attach to. A DNS
-    // script owns resolution instead: the core refuses a server carrying
-    // `domains`/`skipFallback` beside a script (infra/conf/dns.go), so the
-    // app-owned scoped server — and with it the half of the pair that pins
-    // profile dials to the module — is omitted rather than emitted into a
-    // document the core would refuse. The dialed profile's domain then
-    // resolves the way it does without a module, through the OS resolver.
-    let dns_script = settings
-        .dns
-        .script
-        .as_deref()
-        .is_some_and(|script| !script.is_empty());
-    let bootstrap = if dns_wire.is_some() && !server_domains.is_empty() && !dns_script {
-        bootstrap_dns_server(settings, &server_domains)
-    } else {
-        None
-    };
-    let mut dns_wire = dns_wire;
-    if let Some(bootstrap) = &bootstrap
+    // resolver, so the tunnel chain can bootstrap itself. The emission value
+    // derives the server when the document has a DNS module, a dialed
+    // profile's domain, and no DNS script; here it is appended to the DNS
+    // server list. The outbound-side half (`useip` routing the dial into the
+    // module) is applied by `outbounds` from the same value: emitting one
+    // without the other would leave the dial on the OS resolver or deadlock
+    // it inside the module (the DoH dial needs the very chain the query is
+    // for).
+    let mut dns_wire = dns(&settings.dns, emission.fakedns);
+    if let Some(bootstrap) = emission.bootstrap_server()
         && let Some(object) = dns_wire.as_mut().and_then(Value::as_object_mut)
     {
         let servers = object
@@ -285,18 +245,6 @@ fn generate_reporting(
             .push(bootstrap.clone());
     }
 
-    // The derived facts the stages read, assembled once: a stage asks this
-    // value instead of receiving positional facts it could swap for one
-    // another.
-    let emission = Emission {
-        dialed,
-        bootstrap: bootstrap.is_some(),
-        dns_on: dns_wire.is_some(),
-        dns_intercept,
-        socks_tags,
-        tun_on,
-        fakedns,
-    };
     root.insert(keys::OUTBOUNDS.into(), outbounds(servers, &emission));
     root.insert(keys::INBOUNDS.into(), inbounds(settings, &emission));
     root.insert(keys::ROUTING.into(), routing(&settings.routing, &emission));
@@ -340,7 +288,9 @@ fn generate_reporting(
 
     // fakeDns trio (1/3): top-level pool. (2/3) dns server + (3/3) sniffing
     // destOverride are handled in dns()/inbounds().
-    if fakedns && let Some(wire) = settings.dns.fakedns.to_wire() {
+    if emission.fakedns
+        && let Some(wire) = settings.dns.fakedns.to_wire()
+    {
         root.insert(keys::FAKE_DNS.into(), wire);
     }
 
@@ -579,97 +529,6 @@ fn invalid_model_error(verdict: Verdict) -> Option<GenerateError> {
         .map(|issue| GenerateError::InvalidFinding(Box::new(issue)))
 }
 
-/// The proxy-server host of a profile when it is a domain (not an IP
-/// literal). WireGuard's endpoint is `ServerProfile::server_address`'s
-/// verbatim peer endpoint — `host` or `host:port` — and is included so its
-/// peer dials can use the bootstrap resolver too; it never receives a
-/// sockopt injection (its dial path honors `settings.domainStrategy`, not
-/// sockopt, XTLS/Xray-core#5363).
-fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
-    let address = profile.server_address()?;
-    let host = if let Some((host, _)) = address
-        .strip_prefix('[')
-        .and_then(|address| address.split_once(']'))
-    {
-        host
-    } else if let Some((host, port)) = address.rsplit_once(':')
-        && !port.is_empty()
-        && port.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        host
-    } else {
-        address.as_str()
-    };
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return None;
-    }
-    let host = host.to_ascii_lowercase();
-    // A trailing-dot address is the same fully-qualified name the importer
-    // accepts and the dial uses, so it stays in the scope with that exact
-    // spelling: Xray matches these `domains` entries textually against the
-    // dialed address, and dropping the entry would send the server's own
-    // resolution back through the DNS module it bootstraps.
-    (!host.is_empty()
-        && host.len() <= 255
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        && host.contains('.')
-        && !host.starts_with('.'))
-    .then_some(host)
-}
-/// Derive the scoped `+local` bootstrap DNS server for proxy-server domains.
-/// Queries are answered by dialing the endpoint DIRECTLY (no routing —
-/// `https+local` & friends bypass the dispatcher,
-/// app/dns/nameserver.go:60-68), so the tunnel chain can resolve its own
-/// server without the OS resolver and without recursing back into the DNS
-/// module. The endpoint is the GUI `bootstrap` override when set, else the
-/// first configured DNS server (the auto-derive assumes that server is
-/// reachable directly — on networks where it is blocked, e.g. Cloudflare
-/// DoH behind the GFW, the override must name a reachable one). The
-/// special override `localhost` asks the OS resolver: its entry is emitted
-/// verbatim (no scheme rewrite, no IP-literal gate) and remains scoped to
-/// the proxy-server domains. Any other endpoint is only emitted when its
-/// host is an IP literal: a domain host would itself need resolution,
-/// which re-enters the module through the TUN and deadlocks the bootstrap.
-fn bootstrap_dns_server(settings: &Settings, domains: &[String]) -> Option<Value> {
-    let override_address = settings.dns.bootstrap.trim();
-    // Every emitted bootstrap entry is scoped to the proxy-server domains.
-    let domains: Vec<Value> = domains
-        .iter()
-        .map(|domain| json!(format!("domain:{domain}")))
-        .collect();
-    // Special value (the DnsCfg::default bootstrap): ask the OS resolver.
-    // The OS resolver is not an Xray endpoint, so it cannot take a
-    // `+local` scheme rewrite and needs no IP-literal gate — the address
-    // is emitted verbatim, still scoped to the proxy-server domains so
-    // general queries never reach it (skipFallback, see below).
-    if override_address == "localhost" {
-        return Some(json!({
-            "address": "localhost",
-            "domains": domains,
-            "skipFallback": true,
-        }));
-    }
-    let (address, fallback_port) = if override_address.is_empty() {
-        let first = settings.dns.servers.first()?;
-        (first.address.trim(), first.port)
-    } else {
-        (override_address, None)
-    };
-    let scoped = scoped_bootstrap_endpoint(address, fallback_port)?;
-    Some(json!({
-        "address": format!("{}://{}", scoped.scheme, scoped.endpoint),
-        "domains": domains,
-        // Without this, Xray's DNS sortClients fallback appends EVERY
-        // server to the query list — scoped ones included — so every
-        // system query would be dialed DIRECTLY against this resolver
-        // (the `+local` scheme bypasses routing), leaking all DNS out of
-        // the tunnel. skipFallback restricts it to its matched domain.
-        "skipFallback": true,
-    }))
-}
-
 /// Pin a profile outbound's server dial to the DNS module (sockopt
 /// `useip`) unless the user already chose a strategy.
 fn inject_server_domain_strategy(wire: &mut Value) {
@@ -750,7 +609,7 @@ fn profile_wire_outbound(profile: &ServerProfile, policy: OutboundWirePolicy<'_>
     if matches!(profile.outbound.settings, ProtocolSettings::Wireguard(_)) {
         return wire;
     }
-    if policy.bootstrap && profile_server_domain(profile).is_some() {
+    if policy.bootstrap && emit::profile_server_domain(profile).is_some() {
         inject_server_domain_strategy(&mut wire);
     }
     if let Some(interface) = policy.interface {
@@ -762,46 +621,6 @@ fn profile_wire_outbound(profile: &ServerProfile, policy: OutboundWirePolicy<'_>
 fn append_builtin_outbounds(out: &mut Vec<Value>) {
     for (protocol, tag) in emit::BUILTIN_OUTBOUNDS {
         out.push(json!({ keys::PROTOCOL: protocol, keys::TAG: tag }));
-    }
-}
-
-/// The user's server order, then the built-in `direct`/`block` tags and the
-/// The derived facts every emission stage reads, computed once per document:
-/// which families reach the wire and which of them attach to the DNS module.
-/// The stages take this value instead of the positional booleans they used to
-/// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
-/// the compiler noticing.
-struct Emission {
-    /// The outbound tags this document dials: the default route and the
-    /// profiles its rules, balancers and health engines reach, each mapped to
-    /// its chain terminal. These are the only profiles whose server address
-    /// this machine dials, so the only ones whose domain the bootstrap
-    /// resolver may answer.
-    dialed: BTreeSet<String>,
-    /// Whether a scoped bootstrap resolver was emitted at all: a DNS module
-    /// exists and a dialed outbound's server domain needs one.
-    bootstrap: bool,
-    /// Whether the DNS module reaches the wire at all.
-    dns_on: bool,
-    /// Whether port-53 traffic is intercepted into the DNS module.
-    dns_intercept: bool,
-    /// The enabled SOCKS endpoints' tags, in list order.
-    socks_tags: Vec<String>,
-    /// Whether the TUN inbound reaches the wire.
-    tun_on: bool,
-    /// Whether the FakeDNS pool is enabled (every inbound that carries a
-    /// `sniffing.destOverride` needs the same answer).
-    fakedns: bool,
-}
-
-impl Emission {
-    /// Whether this profile's own dial goes through the scoped bootstrap DNS
-    /// server: only an outbound the document dials has its domain in the
-    /// scope (a chained hop's server is reached through the chain and resolves
-    /// on the far side, and a standby the document never dials resolves
-    /// nothing before the tunnel — see [`crate::model::dial`]).
-    fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
-        self.bootstrap && self.dialed.contains(&profile.tag())
     }
 }
 
@@ -871,13 +690,14 @@ impl ControlPlane<'_> {
     }
 }
 
+/// The user's server order, then the built-in `direct`/`block` tags and the
 /// optional `dns-out`. Server profiles emit in list order, and the list keeps
 /// the active (default) profile in its first slot — Xray's default route is
 /// the first outbound — so the emitted order and the GUI list can never
 /// disagree. The DNS outbound is appended last so the default outbound (the
 /// first entry) is unchanged; it only ever receives port-53 traffic via the
 /// interception rules.
-fn outbounds(servers: &ServersFile, emission: &Emission) -> Value {
+fn outbounds(servers: &ServersFile, emission: &emit::Emission) -> Value {
     let mut out = Vec::new();
     for profile in &servers.profiles {
         let policy = OutboundWirePolicy {
@@ -897,19 +717,19 @@ fn outbounds(servers: &ServersFile, emission: &Emission) -> Value {
     Value::Array(out)
 }
 
-fn inbounds(settings: &Settings, emission: &Emission) -> Value {
+fn inbounds(settings: &Settings, emission: &emit::Emission) -> Value {
     let mut list: Vec<Value> = Vec::new();
 
     // Local endpoints emit in list order; disabled entries stay off the wire.
     for entry in &settings.local_inbounds {
-        if entry.enabled {
+        if emit::local_inbound_emitted(entry) {
             list.push(entry.to_wire(emission.fakedns));
         }
     }
     // Enabled entries always carry a stable GUI-owned tag: validate_settings
     // rejects tagless dokodemo before generation runs.
     for d in settings.dokodemo.iter() {
-        if !d.enabled {
+        if !emit::dokodemo_emitted(d) {
             continue;
         }
         list.push(d.to_wire(&d.tag, emission.fakedns));
@@ -958,7 +778,7 @@ fn inbounds(settings: &Settings, emission: &Emission) -> Value {
     Value::Array(list)
 }
 
-fn routing(cfg: &RoutingCfg, emission: &Emission) -> Value {
+fn routing(cfg: &RoutingCfg, emission: &emit::Emission) -> Value {
     let mut routing = Map::new();
     // A routing script owns every route: the core refuses a script beside
     // rules or a `domainStrategy` (infra/conf/router.go:94-96), so the
@@ -1041,7 +861,7 @@ const PRIVATE_DOMAINS: [&str; 10] = [
 /// them (`AddRule` with `shouldAppend=true`). There is deliberately no
 /// broader TUN catch-all: an unconditional in-tun catch-all would swallow
 /// every TUN connection before an injected trial rule is evaluated.
-fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission) -> Vec<Value> {
+fn app_and_user_rules(cfg: &RoutingCfg, emission: &emit::Emission) -> Vec<Value> {
     let mut rules: Vec<Value> = Vec::new();
     // Local DNS interception rules: port-53 from TUN/SOCKS is answered
     // by the DNS module (dns-out), and the loopback listener's TCP+UDP

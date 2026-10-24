@@ -1,11 +1,13 @@
-//! The tag universe the running configuration carries.
+//! The tag universe and emission gates the running configuration carries.
 //!
-//! `gen` writes the document and owns every emission detail — entry order,
-//! conditional inclusion, the settings each wire projection reads. Every
-//! module that *judges* the document (the model validation pass, the safety
-//! pass, the routing screen) asks these queries instead of re-deriving the tag
-//! sets: a hand-kept copy keeps judging a configuration that no longer exists
-//! once an emission gate moves.
+//! `gen` writes the document, but the facts it emits from are composed here:
+//! [`Emission`] computes every derived gate once per document (which families
+//! reach the wire, which attach to the DNS module, which profiles the document
+//! dials), and the queries below answer for the tag sets. Every module that
+//! *judges* the document (the model validation pass, the safety pass, the
+//! routing screen) asks these queries instead of re-deriving the tag sets: a
+//! hand-kept copy keeps judging a configuration that no longer exists once an
+//! emission gate moves.
 //!
 //! A query answers for the whole running configuration, not only the
 //! `inbounds`/`outbounds` arrays: the control-plane listener is declared by the
@@ -15,12 +17,15 @@
 
 use std::collections::BTreeSet;
 
+use super::dial::DialGraph;
+use super::dns::scoped_bootstrap_endpoint;
 use super::inbound::{
-    BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG,
-    DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
+    DNS_OUTBOUND_TAG, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
 use super::servers::{ServerProfile, ServersFile};
 use super::settings::{Mode, Settings};
+use serde_json::{Value, json};
 
 /// The outbounds every generated document carries, whatever the settings: the
 /// `freedom` `direct` and `blackhole` `block` outbounds, in emission order
@@ -33,7 +38,7 @@ pub const BUILTIN_OUTBOUNDS: [(&str, &str); 2] = [
 /// True when the document carries the top-level `dns` object: `DnsCfg::to_wire`
 /// collapses an effectively empty configuration to nothing, and every DNS arm
 /// of the generator keys on that same value.
-fn dns_module_emitted(settings: &Settings) -> bool {
+pub fn dns_module_emitted(settings: &Settings) -> bool {
     !settings.dns.is_effectively_empty()
 }
 
@@ -134,11 +139,268 @@ pub fn appended_inbound_tags(settings: &Settings) -> impl Iterator<Item = &'stat
         .chain(dns_listeners.then_some(DNS_INBOUND_V6_TAG))
 }
 
+/// Which inbound-tag universe a caller asks [`inbound_tags`] about. The
+/// three callers ask three different questions, and each scope names the
+/// projection it wants instead of every caller rebuilding the list.
+pub enum InboundScope {
+    /// Every tag the running configuration answers to: the control-plane
+    /// listener, the tags [`appended_inbound_tags`] adds, the enabled local
+    /// endpoints, and the enabled dokodemo listeners. This is the set the
+    /// settings verdict judges, where a duplicate is a refusal. Order is
+    /// informative (emission order) — callers compare it as a set.
+    Emitted,
+    /// Every tag the settings model declares, emitted or not: all local
+    /// endpoints in list order, the tun/dns/api listeners the app owns, and
+    /// every dokodemo tag in list order. The TestRoute dialog offers this
+    /// universe, because a trial rule may name a listener that is switched
+    /// off right now.
+    Declared,
+    /// The listeners a user scopes a rule by: the enabled local endpoints and
+    /// enabled dokodemo listeners, in list order. The app-owned `api`,
+    /// `tun-in`, and in-tun DNS listeners are deliberately absent — they are
+    /// not traffic a user routes.
+    UserListeners,
+}
+
+/// The inbound tags `settings` carries, projected onto `scope`. Every
+/// consumer's universe comes from here, so a new listener (or a changed
+/// emission gate) reaches all of them at once.
+pub fn inbound_tags(settings: &Settings, scope: InboundScope) -> Vec<String> {
+    match scope {
+        InboundScope::Emitted => std::iter::once(API_INBOUND_TAG.to_string())
+            .chain(appended_inbound_tags(settings).map(str::to_string))
+            .chain(
+                settings
+                    .local_inbounds
+                    .iter()
+                    .filter(|entry| local_inbound_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .chain(
+                settings
+                    .dokodemo
+                    .iter()
+                    .filter(|entry| dokodemo_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .collect(),
+        InboundScope::Declared => settings
+            .local_inbounds
+            .iter()
+            .map(|entry| entry.tag.clone())
+            .chain(
+                [
+                    TUN_INBOUND_TAG,
+                    DNS_INBOUND_TAG,
+                    DNS_INBOUND_V6_TAG,
+                    API_INBOUND_TAG,
+                ]
+                .into_iter()
+                .map(str::to_string),
+            )
+            .chain(settings.dokodemo.iter().map(|entry| entry.tag.clone()))
+            .collect(),
+        InboundScope::UserListeners => settings
+            .local_inbounds
+            .iter()
+            .filter(|entry| local_inbound_emitted(entry))
+            .map(|entry| entry.tag.clone())
+            .chain(
+                settings
+                    .dokodemo
+                    .iter()
+                    .filter(|entry| dokodemo_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .collect(),
+    }
+}
+
+/// The proxy-server host of a profile when it is a domain (not an IP
+/// literal). WireGuard's endpoint is `ServerProfile::server_address`'s
+/// verbatim peer endpoint — `host` or `host:port` — and is included so its
+/// peer dials can use the bootstrap resolver too; it never receives a
+/// sockopt injection (its dial path honors `settings.domainStrategy`, not
+/// sockopt, XTLS/Xray-core#5363).
+pub(crate) fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
+    let address = profile.server_address()?;
+    let host = if let Some((host, _)) = address
+        .strip_prefix('[')
+        .and_then(|address| address.split_once(']'))
+    {
+        host
+    } else if let Some((host, port)) = address.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        host
+    } else {
+        address.as_str()
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    // A trailing-dot address is the same fully-qualified name the importer
+    // accepts and the dial uses, so it stays in the scope with that exact
+    // spelling: Xray matches these `domains` entries textually against the
+    // dialed address, and dropping the entry would send the server's own
+    // resolution back through the DNS module it bootstraps.
+    (!host.is_empty()
+        && host.len() <= 255
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && host.contains('.')
+        && !host.starts_with('.'))
+    .then_some(host)
+}
+
+/// Derive the scoped `+local` bootstrap DNS server for proxy-server domains.
+/// Queries are answered by dialing the endpoint DIRECTLY (no routing —
+/// `https+local` & friends bypass the dispatcher,
+/// app/dns/nameserver.go:60-68), so the tunnel chain can resolve its own
+/// server without the OS resolver and without recursing back into the DNS
+/// module. The endpoint is the GUI `bootstrap` override when set, else the
+/// first configured DNS server (the auto-derive assumes that server is
+/// reachable directly — on networks where it is blocked, e.g. Cloudflare
+/// DoH behind the GFW, the override must name a reachable one). The
+/// special override `localhost` asks the OS resolver: its entry is emitted
+/// verbatim (no scheme rewrite, no IP-literal gate) and remains scoped to
+/// the proxy-server domains. Any other endpoint is only emitted when its
+/// host is an IP literal: a domain host would itself need resolution,
+/// which re-enters the module through the TUN and deadlocks the bootstrap.
+fn bootstrap_dns_server(settings: &Settings, domains: &[String]) -> Option<Value> {
+    let override_address = settings.dns.bootstrap.trim();
+    // Every emitted bootstrap entry is scoped to the proxy-server domains.
+    let domains: Vec<Value> = domains
+        .iter()
+        .map(|domain| json!(format!("domain:{domain}")))
+        .collect();
+    // Special value (the DnsCfg::default bootstrap): ask the OS resolver.
+    // The OS resolver is not an Xray endpoint, so it cannot take a
+    // `+local` scheme rewrite and needs no IP-literal gate — the address
+    // is emitted verbatim, still scoped to the proxy-server domains so
+    // general queries never reach it (skipFallback, see below).
+    if override_address == "localhost" {
+        return Some(json!({
+            "address": "localhost",
+            "domains": domains,
+            "skipFallback": true,
+        }));
+    }
+    let (address, fallback_port) = if override_address.is_empty() {
+        let first = settings.dns.servers.first()?;
+        (first.address.trim(), first.port)
+    } else {
+        (override_address, None)
+    };
+    let scoped = scoped_bootstrap_endpoint(address, fallback_port)?;
+    Some(json!({
+        "address": format!("{}://{}", scoped.scheme, scoped.endpoint),
+        "domains": domains,
+        // Without this, Xray's DNS sortClients fallback appends EVERY
+        // server to the query list — scoped ones included — so every
+        // system query would be dialed DIRECTLY against this resolver
+        // (the `+local` scheme bypasses routing), leaking all DNS out of
+        // the tunnel. skipFallback restricts it to its matched domain.
+        "skipFallback": true,
+    }))
+}
+
+/// The derived facts every emission stage reads, computed once per document:
+/// which families reach the wire and which of them attach to the DNS module.
+/// The stages take this value instead of the positional booleans they used to
+/// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
+/// the compiler noticing.
+pub(crate) struct Emission {
+    /// The outbound tags this document dials: the default route and the
+    /// profiles its rules, balancers and health engines reach, each mapped to
+    /// its chain terminal. These are the only profiles whose server address
+    /// this machine dials, so the only ones whose domain the bootstrap
+    /// resolver may answer.
+    dialed: BTreeSet<String>,
+    /// The scoped bootstrap resolver this document emits, if any: a DNS
+    /// module exists, a dialed profile has a domain, and no DNS script owns
+    /// resolution. `gen::dns` appends it to the DNS server list.
+    bootstrap: Option<Value>,
+    /// Whether the DNS module reaches the wire at all.
+    pub(crate) dns_on: bool,
+    /// Whether port-53 traffic is intercepted into the DNS module.
+    pub(crate) dns_intercept: bool,
+    /// The enabled SOCKS endpoints' tags, in list order.
+    pub(crate) socks_tags: Vec<String>,
+    /// Whether the TUN inbound reaches the wire.
+    pub(crate) tun_on: bool,
+    /// Whether the FakeDNS pool is enabled (every inbound that carries a
+    /// `sniffing.destOverride` needs the same answer).
+    pub(crate) fakedns: bool,
+}
+
+impl Emission {
+    /// Compose the emission value for one document. Every gate lives here (or
+    /// in the query it calls), so the stages cannot disagree about which
+    /// families reach the wire.
+    pub(crate) fn new(servers: &ServersFile, settings: &Settings) -> Emission {
+        let fakedns = settings.dns.fakedns.enabled;
+        let dns_on = dns_module_emitted(settings);
+        let dialed = DialGraph::for_profiles(&servers.profiles).dialed_outbound_tags(settings);
+        let mut server_domains: Vec<String> = servers
+            .profiles
+            .iter()
+            .filter(|profile| dialed.contains(&profile.tag()))
+            .filter_map(profile_server_domain)
+            .collect();
+        server_domains.sort();
+        server_domains.dedup();
+        // The scoped server must land inside an emitted `dns` object; without
+        // a module there is nothing for it (or for useip dials) to attach to.
+        // A DNS script owns resolution instead: the core refuses a server
+        // carrying `domains`/`skipFallback` beside a script
+        // (infra/conf/dns.go), so the app-owned scoped server — and with it
+        // the half of the pair that pins profile dials to the module — is
+        // omitted rather than emitted into a document the core would refuse.
+        // The dialed profile's domain then resolves the way it does without a
+        // module, through the OS resolver.
+        let dns_script = settings
+            .dns
+            .script
+            .as_deref()
+            .is_some_and(|script| !script.is_empty());
+        let bootstrap = (dns_on && !server_domains.is_empty() && !dns_script)
+            .then(|| bootstrap_dns_server(settings, &server_domains))
+            .flatten();
+        Emission {
+            dialed,
+            bootstrap,
+            dns_on,
+            dns_intercept: dns_intercept(settings),
+            socks_tags: socks_inbound_tags(settings),
+            tun_on: tun_inbound_emitted(settings),
+            fakedns,
+        }
+    }
+
+    /// Whether this profile's own dial goes through the scoped bootstrap DNS
+    /// server: only an outbound the document dials has its domain in the
+    /// scope (a chained hop's server is reached through the chain and resolves
+    /// on the far side, and a standby the document never dials resolves
+    /// nothing before the tunnel — see [`crate::model::dial`]).
+    pub(crate) fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
+        self.bootstrap.is_some() && self.dialed.contains(&profile.tag())
+    }
+
+    /// The scoped bootstrap server to append to the DNS document, if one is
+    /// emitted.
+    pub(crate) fn bootstrap_server(&self) -> Option<&Value> {
+        self.bootstrap.as_ref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::r#gen::keys;
-    use crate::model::inbound::API_INBOUND_TAG;
     use crate::model::safety::SafetyVerdicts;
     use crate::model::validation::{ValidationCode, validate_settings};
     use crate::model::{
@@ -258,33 +520,57 @@ mod tests {
         tags
     }
 
-    /// The inbound universe the emission predicates answer: the control-plane
-    /// listener, the tags [`appended_inbound_tags`] adds, every local endpoint
-    /// [`local_inbound_emitted`] keeps, and every dokodemo listener
-    /// [`dokodemo_emitted`] keeps.
-    ///
-    /// This is the oracle's side of the comparison below, which is its only
-    /// caller: the settings walk cannot use the composed set, because the
-    /// insert that fails *is* its duplicate rule, so it grows its own universe
-    /// entry by entry and reports the entry that inserted second.
-    fn queried_inbound_tags(settings: &Settings) -> BTreeSet<String> {
-        let mut tags = BTreeSet::from([API_INBOUND_TAG.to_string()]);
-        tags.extend(appended_inbound_tags(settings).map(str::to_string));
-        tags.extend(
-            settings
-                .local_inbounds
-                .iter()
-                .filter(|entry| local_inbound_emitted(entry))
-                .map(|entry| entry.tag.clone()),
+    /// The three scopes answer the three questions their callers ask: the
+    /// emitted set in emission order, every declared tag whether emitted or
+    /// not, and only the listeners a user scopes a rule by.
+    #[test]
+    fn inbound_scopes_project_their_declared_orders() {
+        let mut settings = Settings {
+            mode: Mode::Tun,
+            ..Settings::default()
+        };
+        settings.local_inbounds = vec![
+            LocalInboundCfg::socks_default("in-socks"),
+            LocalInboundCfg::http_default("in-http"),
+            LocalInboundCfg {
+                enabled: false,
+                ..LocalInboundCfg::socks_default("in-socks-off")
+            },
+        ];
+        settings.dokodemo = vec![dokodemo("in-doko-on", true), dokodemo("in-doko-off", false)];
+
+        assert_eq!(
+            inbound_tags(&settings, InboundScope::Emitted),
+            [
+                API_INBOUND_TAG,
+                TUN_INBOUND_TAG,
+                DNS_INBOUND_TAG,
+                DNS_INBOUND_V6_TAG,
+                "in-socks",
+                "in-http",
+                "in-doko-on",
+            ]
+            .map(str::to_string)
         );
-        tags.extend(
-            settings
-                .dokodemo
-                .iter()
-                .filter(|entry| dokodemo_emitted(entry))
-                .map(|entry| entry.tag.clone()),
+        assert_eq!(
+            inbound_tags(&settings, InboundScope::Declared),
+            [
+                "in-socks",
+                "in-http",
+                "in-socks-off",
+                TUN_INBOUND_TAG,
+                DNS_INBOUND_TAG,
+                DNS_INBOUND_V6_TAG,
+                API_INBOUND_TAG,
+                "in-doko-on",
+                "in-doko-off",
+            ]
+            .map(str::to_string)
         );
-        tags
+        assert_eq!(
+            inbound_tags(&settings, InboundScope::UserListeners),
+            ["in-socks", "in-http", "in-doko-on"].map(str::to_string)
+        );
     }
 
     /// Every gate the emission universe depends on: the DNS module on and off,
@@ -355,7 +641,9 @@ mod tests {
             );
             assert_eq!(
                 document_inbound_tags(&config, &settings),
-                queried_inbound_tags(&settings),
+                inbound_tags(&settings, InboundScope::Emitted)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
                 "{label}: emitted inbound tags"
             );
             // The in-tun DNS listener's own gate is the runtime's, derived
