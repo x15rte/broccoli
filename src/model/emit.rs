@@ -42,9 +42,9 @@ pub fn tun_inbound_emitted(settings: &Settings) -> bool {
     settings.mode == Mode::Tun
 }
 
-/// The emitted SOCKS endpoints, in list order — the endpoints whose UDP:53
-/// traffic the DNS module answers. HTTP endpoints are TCP-only, so they can
-/// never carry DNS and never appear in the interception rules.
+/// The emitted SOCKS endpoints, in list order — the endpoints whose port-53
+/// traffic the DNS module answers. HTTP endpoints are not part of the
+/// DNS-interception policy and never appear in the interception rules.
 fn dns_capable_socks(settings: &Settings) -> impl Iterator<Item = &LocalInboundCfg> {
     settings.local_inbounds.iter().filter(|entry| {
         local_inbound_emitted(entry) && entry.protocol == LocalInboundProtocol::Socks
@@ -212,7 +212,8 @@ mod tests {
     }
 
     /// `settings` with every local endpoint disabled: no SOCKS listener is
-    /// left to carry UDP:53, so DNS interception has no inbound to answer for.
+    /// left to carry port-53 traffic, so DNS interception has no inbound to
+    /// answer for.
     fn without_local_endpoints(mut settings: Settings) -> Settings {
         for entry in &mut settings.local_inbounds {
             entry.enabled = false;
@@ -307,8 +308,9 @@ mod tests {
             without_dns_module(Settings::default()),
         ));
 
-        // The module with no inbound that can carry UDP:53 (every endpoint
-        // disabled, no TUN): the `dns` object is emitted, interception is not.
+        // The module with no inbound that can carry port-53 traffic (every
+        // endpoint disabled, no TUN): the `dns` object is emitted,
+        // interception is not.
         let mut module_only = without_local_endpoints(Settings::default());
         module_only.dokodemo = vec![dokodemo("in-doko-a", true)];
         states.push((

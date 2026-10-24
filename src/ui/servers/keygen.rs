@@ -121,11 +121,17 @@ pub(super) fn run_xray_bounded(
             }
             Ok(None) => {
                 let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_reader(stdout.take(), lang);
-                let stderr = join_reader(stderr.take(), lang)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
-                    .unwrap_or_default();
+                child.wait().map_err(|error| {
+                    t_fmt(
+                        lang,
+                        Key::SrvWaitXrayFailed,
+                        &[&redacted_tool_args(args), &error],
+                    )
+                })?;
+                let out = join_reader(stdout.take(), lang);
+                let err = join_reader(stderr.take(), lang);
+                out?;
+                let stderr = String::from_utf8_lossy(&err?).trim().to_owned();
                 let suffix = if stderr.is_empty() {
                     String::new()
                 } else {
@@ -162,12 +168,15 @@ fn spawn_drain(
     })
 }
 
+/// One read's worth of a child pipe.
+const READ_CHUNK: usize = 8192;
+
 /// Read a child pipe to EOF. Plain `read` keeps the Windows child-pipe path
 /// that uses `ReadFileEx`; `read_to_end` and `read_vectored` switch to the
 /// synchronous path, which aborts the process on a pending overlapped read.
 fn drain(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; READ_CHUNK];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => return Ok(out),
@@ -224,7 +233,7 @@ pub(super) fn gen_short_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::drain;
+    use super::{READ_CHUNK, drain};
     use std::process::{Command, Stdio};
 
     /// A tool that writes more than one pipe buffer must arrive whole. This
@@ -246,7 +255,10 @@ mod tests {
         child.wait().expect("reap cmd");
 
         assert!(errors.is_empty());
-        assert!(output.len() > 8192, "the child filled more than one read");
+        assert!(
+            output.len() > READ_CHUNK,
+            "the child filled more than one read"
+        );
         assert_eq!(
             output.iter().filter(|&&byte| byte == b'\n').count(),
             4000,

@@ -2346,20 +2346,17 @@ fn each_builtin_switch_drops_only_its_own_group() {
     };
 
     let all = rules(&settings);
-    assert_eq!(port(&all, "443"), 0, "no rule left behind by the pin group");
     assert_eq!(port(&all, "53"), 3);
     assert_eq!(private(&all), 2);
 
     settings.routing.builtin.dns_interception = false;
     let no_dns = rules(&settings);
-    assert_eq!(port(&no_dns, "443"), 0);
     assert_eq!(port(&no_dns, "53"), 1, "only the dns-in rule remains");
     assert_eq!(private(&no_dns), 2);
 
     settings.routing.builtin.dns_interception = true;
     settings.routing.builtin.private_direct = false;
     let no_private = rules(&settings);
-    assert_eq!(port(&no_private, "443"), 0);
     assert_eq!(port(&no_private, "53"), 3);
     assert_eq!(private(&no_private), 0);
 }

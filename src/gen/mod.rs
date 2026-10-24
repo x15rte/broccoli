@@ -221,7 +221,7 @@ fn generate_reporting(
 
     let dns_wire = dns(&settings.dns, fakedns);
     // Enabled SOCKS entries (in list order) carry DNS port-53 to dns-out;
-    // HTTP entries are TCP-only and never appear in the interception rules.
+    // HTTP entries are not part of the DNS-interception policy.
     let socks_tags = emit::socks_inbound_tags(settings);
     // Local DNS interception: when a DNS server list exists and a proxy
     // inbound can carry UDP, port-53 queries are answered by the DNS module
@@ -963,8 +963,8 @@ fn routing(cfg: &RoutingCfg, emission: &Emission) -> Value {
     // A routing script owns every route: the core refuses a script beside
     // rules or a `domainStrategy` (infra/conf/router.go:94-96), so the
     // emitted section carries neither. The model's gate blocks user rules and
-    // a non-default strategy beside a script; the app's own interception and
-    // upstream-pinning rules are not user configuration and are omitted too,
+    // a non-default strategy beside a script; the app's own interception
+    // rules are not user configuration and are omitted too,
     // because the script decides every route in their place.
     match cfg.script_path() {
         Some(script) => {
@@ -1076,8 +1076,8 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission) -> Vec<Value> {
             }));
         }
     }
-    // The user's rules, in model order, after the pinned upstreams and the
-    // DNS interception — none of them may shadow those.
+    // The user's rules, in model order, after the DNS interception — nothing
+    // here may shadow it.
     for r in &cfg.rules {
         rules.push(serde_json::to_value(r).expect(
             "model serialization is infallible: routing Rule fields are strings, \
