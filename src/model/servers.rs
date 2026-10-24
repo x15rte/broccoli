@@ -1,6 +1,6 @@
 //! Server profiles (GUI state: %APPDATA%\broccoli\state\servers.json).
 
-use super::outbound::{OutboundModel, ProtocolSettings};
+use super::outbound::OutboundModel;
 use super::{StateLoadError, load_state, save_state, skip_empty_vec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -123,41 +123,12 @@ impl ServerProfile {
             .map(|sockopt| sockopt.dialer_proxy.as_str())
             .filter(|tag| !tag.is_empty())
     }
-    /// The remote server endpoint as `host:port` (IPv6 bracketed), or `None`
-    /// when the protocol carries no usable address. WireGuard's endpoint is
-    /// its first peer's non-empty `endpoint` string, returned verbatim (not
-    /// re-formatted or port-checked); protocols without a server address
-    /// (freedom, blackhole, dns, loopback) yield `None`.
+    /// The remote server endpoint in display form, or `None` when the
+    /// protocol carries no usable address. The protocol table owns both the
+    /// shape and the spelling
+    /// ([`crate::model::outbound::ProtocolSettings::server_address`]).
     pub fn server_address(&self) -> Option<String> {
-        let (address, port) = match &self.outbound.settings {
-            ProtocolSettings::Vless(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Vmess(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Trojan(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Shadowsocks(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Socks(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Http(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Hysteria(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Masque(settings) => (&settings.address, settings.port),
-            ProtocolSettings::Wireguard(settings) => {
-                let endpoint = settings
-                    .peers
-                    .iter()
-                    .find_map(|peer| (!peer.endpoint.is_empty()).then_some(peer.endpoint.as_str()));
-                return endpoint.map(str::to_owned);
-            }
-            ProtocolSettings::Freedom(_)
-            | ProtocolSettings::Blackhole(_)
-            | ProtocolSettings::Dns(_)
-            | ProtocolSettings::Loopback(_) => return None,
-        };
-        if address.is_empty() || port == 0 {
-            return None;
-        }
-        Some(if address.contains(':') {
-            format!("[{address}]:{port}")
-        } else {
-            format!("{address}:{port}")
-        })
+        self.outbound.settings.server_address()
     }
 }
 #[cfg(test)]

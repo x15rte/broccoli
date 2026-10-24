@@ -12,17 +12,86 @@ use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
+/// The remote endpoint an outbound dials, as its settings spell it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerEndpoint<'a> {
+    /// An address and port the settings carry as their own fields.
+    HostPort { address: &'a str, port: u16 },
+    /// A peer endpoint string carried verbatim (WireGuard).
+    Peer(&'a str),
+}
+
+/// One generated-secret slot: the fields a protocol's Generate buttons fill.
+/// Each table row declares the slots it offers, so the protocol table — not
+/// the tool-apply step — says which protocols carry which field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedSecret {
+    /// The `id` credential VLESS and VMess dial with.
+    Id,
+    /// VLESS's client `encryption` string.
+    VlessEncryption,
+    /// WireGuard's `secretKey`.
+    WireguardSecretKey,
+}
+
+/// Expand one table row's endpoint shape against its settings binding.
+macro_rules! outbound_server_endpoint {
+    ($settings:ident, { host_port($address:ident, $port:ident) }) => {
+        if $settings.$address.is_empty() || $settings.$port == 0 {
+            None
+        } else {
+            Some(ServerEndpoint::HostPort {
+                address: $settings.$address.as_str(),
+                port: $settings.$port,
+            })
+        }
+    };
+    ($settings:ident, { peer($peers:ident, $endpoint:ident) }) => {
+        $settings.$peers.iter().find_map(|peer| {
+            (!peer.$endpoint.is_empty()).then_some(ServerEndpoint::Peer(peer.$endpoint.as_str()))
+        })
+    };
+    ($settings:ident, { none }) => {{
+        let _ = $settings;
+        None
+    }};
+}
+
+/// Expand one table row's generated-secret slots against its settings
+/// binding: the slot named by `secret` receives `value`; a row that does not
+/// declare that slot is `Err(())` and leaves the settings untouched.
+macro_rules! outbound_write_generated_secret {
+    ($settings:ident, $secret:ident, $value:ident; ) => {{
+        let _ = $settings;
+        Err(())
+    }};
+    ($settings:ident, $secret:ident, $value:ident; $($slot:ident => $field:ident),+ $(,)?) => {{
+        $(
+            if $secret == GeneratedSecret::$slot {
+                $settings.$field = $value.to_owned();
+                return Ok(());
+            }
+        )+
+        Err(())
+    }};
+}
+
 /// One row per client-side outbound protocol: the variant, the spelling the
 /// core accepts for it on the wire (infra/conf/xray.go:37-52), any further
 /// spelling that names the same handler (`direct` and `block` are the
-/// `freedom` and `blackhole` handler aliases), and the settings payload that
-/// carries the protocol's settings. The enum, its spellings,
-/// [`Protocol::ALL`], the settings enum and the settings dispatch all come
-/// from these rows, so a new protocol is one row.
+/// `freedom` and `blackhole` handler aliases), the settings payload that
+/// carries the protocol's settings, the shape of its remote endpoint, and the
+/// generated-secret slots its Generate buttons fill. The enum, its spellings,
+/// [`Protocol::ALL`], the settings enum, the settings dispatch, the endpoint
+/// accessors and the secret writes all come from these rows, so a new
+/// protocol is one row.
 macro_rules! outbound_protocols {
     ($(
         $(#[$variant_meta:meta])*
-        $variant:ident = $wire:literal $( | $alias:literal )* => $settings:ident,
+        $variant:ident = $wire:literal $( | $alias:literal )* => $settings:ident {
+            endpoint: $endpoint:tt,
+            secrets: { $( $secret:ident => $secret_field:ident ),* $(,)? } $(,)?
+        } $(,)?
     )*) => {
         /// The 13 client-side outbound protocols (infra/conf/xray.go:37-52).
         /// Serializes to the Xray protocol string.
@@ -101,6 +170,48 @@ macro_rules! outbound_protocols {
                     $( Protocol::$variant => from_value_path(v).map(Self::$variant), )*
                 }
             }
+
+            /// The remote endpoint this outbound dials, or `None` when the
+            /// protocol carries none (freedom, blackhole, dns, loopback) or
+            /// its host/port is unusable (empty host or zero port).
+            pub fn server_endpoint(&self) -> Option<ServerEndpoint<'_>> {
+                match self {
+                    $( Self::$variant(settings) => outbound_server_endpoint!(settings, $endpoint), )*
+                }
+            }
+
+            /// The remote endpoint in display form: `host:port` with an IPv6
+            /// host bracketed, and WireGuard's peer endpoint verbatim.
+            pub fn server_address(&self) -> Option<String> {
+                match self.server_endpoint()? {
+                    ServerEndpoint::HostPort { address, port } if address.contains(':') => {
+                        Some(format!("[{address}]:{port}"))
+                    }
+                    ServerEndpoint::HostPort { address, port } => {
+                        Some(format!("{address}:{port}"))
+                    }
+                    ServerEndpoint::Peer(endpoint) => Some(endpoint.to_owned()),
+                }
+            }
+
+            /// Write `value` into the generated-secret slot `secret` this
+            /// protocol declares. A protocol that does not declare the slot
+            /// returns `Err(())` and leaves its settings untouched.
+            pub(crate) fn write_generated_secret(
+                &mut self,
+                secret: GeneratedSecret,
+                value: &str,
+            ) -> Result<(), ()> {
+                match self {
+                    $(
+                        Self::$variant(settings) => {
+                            outbound_write_generated_secret!(
+                                settings, secret, value; $($secret => $secret_field),*
+                            )
+                        }
+                    )*
+                }
+            }
         }
     };
 }
@@ -109,19 +220,58 @@ outbound_protocols! {
     /// The table's default: a persisted outbound without a `protocol` key
     /// loads as this one.
     #[default]
-    Vless = "vless" => VlessSettings,
-    Vmess = "vmess" => VmessSettings,
-    Trojan = "trojan" => TrojanSettings,
-    Shadowsocks = "shadowsocks" => ShadowsocksSettings,
-    Socks = "socks" => SocksSettings,
-    Http = "http" => HttpSettings,
-    Wireguard = "wireguard" => WireguardSettings,
-    Freedom = "freedom" | "direct" => FreedomSettings,
-    Blackhole = "blackhole" | "block" => BlackholeSettings,
-    Dns = "dns" => DnsOutboundSettings,
-    Loopback = "loopback" => LoopbackSettings,
-    Hysteria = "hysteria" => HysteriaSettings,
-    Masque = "masque" => MasqueSettings,
+    Vless = "vless" => VlessSettings {
+        endpoint: { host_port(address, port) },
+        secrets: { Id => id, VlessEncryption => encryption },
+    },
+    Vmess = "vmess" => VmessSettings {
+        endpoint: { host_port(address, port) },
+        secrets: { Id => id },
+    },
+    Trojan = "trojan" => TrojanSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
+    Shadowsocks = "shadowsocks" => ShadowsocksSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
+    Socks = "socks" => SocksSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
+    Http = "http" => HttpSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
+    Wireguard = "wireguard" => WireguardSettings {
+        endpoint: { peer(peers, endpoint) },
+        secrets: { WireguardSecretKey => secret_key },
+    },
+    Freedom = "freedom" | "direct" => FreedomSettings {
+        endpoint: { none },
+        secrets: {},
+    },
+    Blackhole = "blackhole" | "block" => BlackholeSettings {
+        endpoint: { none },
+        secrets: {},
+    },
+    Dns = "dns" => DnsOutboundSettings {
+        endpoint: { none },
+        secrets: {},
+    },
+    Loopback = "loopback" => LoopbackSettings {
+        endpoint: { none },
+        secrets: {},
+    },
+    Hysteria = "hysteria" => HysteriaSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
+    Masque = "masque" => MasqueSettings {
+        endpoint: { host_port(address, port) },
+        secrets: {},
+    },
 }
 
 impl Serialize for Protocol {
@@ -1321,9 +1471,9 @@ impl<'de> Deserialize<'de> for OutboundModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlackholeSettings, Fragment, Int32Range, Noise, OutboundModel, Protocol, ProtocolSettings,
-        WireguardPeer, WireguardSettings, endpoint_requires_transport_security,
-        is_valid_wireguard_key,
+        BlackholeSettings, Fragment, GeneratedSecret, Int32Range, Noise, OutboundModel, Protocol,
+        ProtocolSettings, ServerEndpoint, WireguardPeer, WireguardSettings,
+        endpoint_requires_transport_security, is_valid_wireguard_key,
     };
     use crate::model::settings::Language;
     use crate::model::stream::{
@@ -2818,5 +2968,168 @@ mod tests {
             wire["streamSettings"]["xdriveSettings"]["service"], XDRIVE_SERVICE_DRIVE,
             "the generated document carries the current spelling"
         );
+    }
+
+    /// Fill the settings' own address/port fields when the row's endpoint is
+    /// that shape; `false` for every other row.
+    fn set_host_port(settings: &mut ProtocolSettings, address: &str, port: u16) -> bool {
+        let (address_field, port_field) = match settings {
+            ProtocolSettings::Vless(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Vmess(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Trojan(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Shadowsocks(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Socks(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Http(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Hysteria(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Masque(settings) => (&mut settings.address, &mut settings.port),
+            ProtocolSettings::Wireguard(_)
+            | ProtocolSettings::Freedom(_)
+            | ProtocolSettings::Blackhole(_)
+            | ProtocolSettings::Dns(_)
+            | ProtocolSettings::Loopback(_) => return false,
+        };
+        *address_field = address.to_owned();
+        *port_field = port;
+        true
+    }
+
+    /// Read the field one generated-secret slot writes, when the settings
+    /// type carries it. This is the independent statement of the old
+    /// tool-apply arms' targets.
+    fn generated_slot_value(settings: &ProtocolSettings, secret: GeneratedSecret) -> Option<&str> {
+        match (settings, secret) {
+            (ProtocolSettings::Vless(settings), GeneratedSecret::Id) => Some(&settings.id),
+            (ProtocolSettings::Vmess(settings), GeneratedSecret::Id) => Some(&settings.id),
+            (ProtocolSettings::Vless(settings), GeneratedSecret::VlessEncryption) => {
+                Some(&settings.encryption)
+            }
+            (ProtocolSettings::Wireguard(settings), GeneratedSecret::WireguardSecretKey) => {
+                Some(&settings.secret_key)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn server_endpoint_and_address_follow_the_protocol_table() {
+        for protocol in Protocol::ALL {
+            let mut settings = ProtocolSettings::default_for(protocol);
+            if set_host_port(&mut settings, "2001:db8::1", 443) {
+                assert_eq!(
+                    settings.server_endpoint(),
+                    Some(ServerEndpoint::HostPort {
+                        address: "2001:db8::1",
+                        port: 443,
+                    }),
+                    "{protocol:?}"
+                );
+                assert_eq!(
+                    settings.server_address().as_deref(),
+                    Some("[2001:db8::1]:443"),
+                    "{protocol:?} brackets an IPv6 host"
+                );
+                set_host_port(&mut settings, "1.2.3.4", 443);
+                assert_eq!(
+                    settings.server_address().as_deref(),
+                    Some("1.2.3.4:443"),
+                    "{protocol:?}"
+                );
+                // A host/port pair the core cannot dial is no endpoint.
+                set_host_port(&mut settings, "", 443);
+                assert_eq!(settings.server_endpoint(), None, "{protocol:?}");
+                assert_eq!(settings.server_address(), None, "{protocol:?}");
+                set_host_port(&mut settings, "1.2.3.4", 0);
+                assert_eq!(settings.server_endpoint(), None, "{protocol:?}");
+                assert_eq!(settings.server_address(), None, "{protocol:?}");
+            } else if protocol == Protocol::Wireguard {
+                if let ProtocolSettings::Wireguard(wg) = &mut settings {
+                    wg.peers = vec![
+                        WireguardPeer {
+                            endpoint: String::new(),
+                            ..Default::default()
+                        },
+                        WireguardPeer {
+                            endpoint: "peer.example:51820".into(),
+                            ..Default::default()
+                        },
+                        WireguardPeer {
+                            endpoint: "later.example:7".into(),
+                            ..Default::default()
+                        },
+                    ];
+                }
+                assert_eq!(
+                    settings.server_endpoint(),
+                    Some(ServerEndpoint::Peer("peer.example:51820")),
+                    "the first non-empty peer endpoint is the server"
+                );
+                assert_eq!(
+                    settings.server_address().as_deref(),
+                    Some("peer.example:51820"),
+                    "a peer endpoint is displayed verbatim"
+                );
+                if let ProtocolSettings::Wireguard(wg) = &mut settings {
+                    wg.peers.clear();
+                }
+                assert_eq!(settings.server_endpoint(), None);
+                assert_eq!(settings.server_address(), None);
+            } else {
+                assert!(
+                    matches!(
+                        protocol,
+                        Protocol::Freedom
+                            | Protocol::Blackhole
+                            | Protocol::Dns
+                            | Protocol::Loopback
+                    ),
+                    "{protocol:?} must declare an endpoint shape the table covers"
+                );
+                assert_eq!(settings.server_endpoint(), None, "{protocol:?}");
+                assert_eq!(settings.server_address(), None, "{protocol:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_secret_slots_match_the_tool_apply_arms() {
+        const MARKER: &str = "generated-value";
+        const SLOTS: [GeneratedSecret; 3] = [
+            GeneratedSecret::Id,
+            GeneratedSecret::VlessEncryption,
+            GeneratedSecret::WireguardSecretKey,
+        ];
+        // The three verbs the tool-apply step replaced, and the rows each
+        // one wrote: Uuid → VLESS/VMess id, VlessEncryption → VLESS
+        // encryption, WireguardSecret → WireGuard secretKey.
+        let old_arms: [(GeneratedSecret, &[Protocol]); 3] = [
+            (GeneratedSecret::Id, &[Protocol::Vless, Protocol::Vmess]),
+            (GeneratedSecret::VlessEncryption, &[Protocol::Vless]),
+            (GeneratedSecret::WireguardSecretKey, &[Protocol::Wireguard]),
+        ];
+        for protocol in Protocol::ALL {
+            for secret in SLOTS {
+                let mut settings = ProtocolSettings::default_for(protocol);
+                let accepted = old_arms
+                    .iter()
+                    .any(|(slot, protocols)| *slot == secret && protocols.contains(&protocol));
+                let result = settings.write_generated_secret(secret, MARKER);
+                if accepted {
+                    assert_eq!(result, Ok(()), "{protocol:?} accepts {secret:?}");
+                    assert_eq!(
+                        generated_slot_value(&settings, secret),
+                        Some(MARKER),
+                        "{protocol:?} writes {secret:?} into its own field"
+                    );
+                } else {
+                    assert_eq!(result, Err(()), "{protocol:?} refuses {secret:?}");
+                    let serialized =
+                        serde_json::to_string(&settings).expect("the settings serialize");
+                    assert!(
+                        !serialized.contains(MARKER),
+                        "{protocol:?} must not write {secret:?} anywhere: {serialized}"
+                    );
+                }
+            }
+        }
     }
 }

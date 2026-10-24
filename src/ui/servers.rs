@@ -17,8 +17,8 @@ use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
 use crate::model::go_std_base64_decodes;
 use crate::model::outbound::{
-    BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
-    WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
+    BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, GeneratedSecret, MuxModel, Noise,
+    VlessReverse, WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
 use crate::model::settings::Language;
 use crate::model::stream::{
@@ -2730,19 +2730,17 @@ impl ServersScreen {
                 if v_uuid(lang, value).is_some() {
                     Err(t(lang, Key::SrvUuidInvalid).to_string())
                 } else if let Some(profile) = self.profile_for_target_mut(target) {
-                    match &mut profile.outbound.settings {
-                        ProtocolSettings::Vless(settings) => settings.id = value.to_owned(),
-                        ProtocolSettings::Vmess(settings) => settings.id = value.to_owned(),
-                        _ => {
-                            return self.report_tool_error(
-                                target,
-                                kind,
-                                t(lang, Key::SrvUuidTargetNoId).into(),
-                            );
-                        }
+                    if profile
+                        .outbound
+                        .settings
+                        .write_generated_secret(GeneratedSecret::Id, value)
+                        .is_ok()
+                    {
+                        applied = true;
+                        Ok(t(lang, Key::SrvUuidGenerated).to_string())
+                    } else {
+                        Err(t(lang, Key::SrvUuidTargetNoId).into())
                     }
-                    applied = true;
-                    Ok(t(lang, Key::SrvUuidGenerated).to_string())
                 } else {
                     Err(t(lang, Key::SrvToolTargetFieldNotFound).to_string())
                 }
@@ -2753,8 +2751,12 @@ impl ServersScreen {
                     if v_vless_encryption(lang, &value).is_some() {
                         Err(t(lang, Key::SrvVlessencInvalid).into())
                     } else if let Some(profile) = self.profile_for_target_mut(target) {
-                        if let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings {
-                            settings.encryption = value;
+                        if profile
+                            .outbound
+                            .settings
+                            .write_generated_secret(GeneratedSecret::VlessEncryption, &value)
+                            .is_ok()
+                        {
                             applied = true;
                             Ok(t(lang, Key::SrvClientEncryptionGenerated).to_string())
                         } else {
@@ -2769,10 +2771,12 @@ impl ServersScreen {
             XrayToolKind::WireguardSecret => match keygen_value(&output, PRIV_PREFIXES) {
                 Some(value) if v_wg_secret_key(lang, &value).is_none() => {
                     if let Some(profile) = self.profile_for_target_mut(target) {
-                        if let ProtocolSettings::Wireguard(settings) =
-                            &mut profile.outbound.settings
+                        if profile
+                            .outbound
+                            .settings
+                            .write_generated_secret(GeneratedSecret::WireguardSecretKey, &value)
+                            .is_ok()
                         {
-                            settings.secret_key = value;
                             applied = true;
                             Ok(t(lang, Key::SrvWgSecretGenerated).to_string())
                         } else {
