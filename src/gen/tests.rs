@@ -4503,8 +4503,9 @@ fn golden_blackhole_custom_response() {
 /// A MASQUE outbound with WARP: the block carries the two keys and the IPv4
 /// and IPv6 local addresses, and the wire carries the WARP host and path the
 /// core would otherwise fill in, so the golden does not depend on that
-/// implicit default. The keys are a P-256 pair the pinned core's config test
-/// accepts.
+/// implicit default. The keys are a throwaway P-256 pair generated solely for
+/// this fixture; they were never registered with an endpoint, and the pinned
+/// core's config test accepts them.
 #[test]
 fn golden_masque_warp() {
     let mut ob = OutboundModel::new(Protocol::Masque);
