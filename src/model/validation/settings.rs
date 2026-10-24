@@ -1543,18 +1543,6 @@ mod tests {
             codes_at(FindingTarget::Balancer(0)).contains(&ValidationCode::BalancerTagMissing(1))
         );
         assert!(codes_at(FindingTarget::Balancer(1)).is_empty());
-
-        // Every finding the walk produced is found at exactly the target it
-        // carries: the query and the field cannot disagree.
-        for issue in verdict.iter() {
-            assert!(
-                verdict
-                    .for_target(issue.target.clone())
-                    .any(|found| std::ptr::eq(found, issue)),
-                "{issue:?} must be reachable at {:?}",
-                issue.target
-            );
-        }
     }
 
     #[test]

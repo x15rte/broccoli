@@ -62,6 +62,14 @@ struct ValidationCache {
     /// a tag a builtin/reserved listener took, and a duplicate among the
     /// dokodemo list — including disabled entries, which the walk skips.
     doko_tag_errors: Vec<Option<String>>,
+    /// The model's per-row findings the editors render under their own field,
+    /// pre-rendered at the same generation cadence as the collisions: the
+    /// local endpoint's auth trap and sniffing vocabulary, and the dokodemo
+    /// row's sniffing vocabulary. Rendered once per generation, so an idle
+    /// repaint frame formats nothing.
+    local_auth: Vec<Option<String>>,
+    local_sniffing: Vec<Option<String>>,
+    doko_sniffing: Vec<Option<String>>,
     /// i18n'd exposure warnings from the shell's verdict, pre-rendered at
     /// the same generation cadence as the collisions. Each listen field
     /// renders its own entry as the amber warning channel; the paths mirror
@@ -150,6 +158,36 @@ impl InboundsScreen {
                     .collect(),
                 doko_tag_errors: (0..ctx.settings.dokodemo.len())
                     .map(|index| dokodemo_tag_error(ctx.settings, lang, index))
+                    .collect(),
+                local_auth: (0..ctx.settings.local_inbounds.len())
+                    .map(|index| {
+                        row_finding(
+                            verdict,
+                            lang,
+                            FindingTarget::LocalInbound(index),
+                            &ValidationCode::LocalInboundAuthRequiresAccounts,
+                        )
+                    })
+                    .collect(),
+                local_sniffing: (0..ctx.settings.local_inbounds.len())
+                    .map(|index| {
+                        row_finding(
+                            verdict,
+                            lang,
+                            FindingTarget::LocalInbound(index),
+                            &ValidationCode::SniffingDestOverrideInvalid,
+                        )
+                    })
+                    .collect(),
+                doko_sniffing: (0..ctx.settings.dokodemo.len())
+                    .map(|index| {
+                        row_finding(
+                            verdict,
+                            lang,
+                            FindingTarget::Dokodemo(index),
+                            &ValidationCode::SniffingDestOverrideInvalid,
+                        )
+                    })
                     .collect(),
                 local_warnings: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
@@ -295,27 +333,9 @@ impl InboundsScreen {
                         // accounts editor it qualifies: password-mode HTTP with
                         // zero accounts authenticates nobody on the wire, so
                         // the row cannot apply at any bind.
-                        inline_error(
-                            ui,
-                            row_finding(
-                                verdict,
-                                lang,
-                                FindingTarget::LocalInbound(i),
-                                &ValidationCode::LocalInboundAuthRequiresAccounts,
-                            )
-                            .as_deref(),
-                        );
+                        inline_error(ui, validation.local_auth[i].as_deref());
                         changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
-                        inline_error(
-                            ui,
-                            row_finding(
-                                verdict,
-                                lang,
-                                FindingTarget::LocalInbound(i),
-                                &ValidationCode::SniffingDestOverrideInvalid,
-                            )
-                            .as_deref(),
-                        );
+                        inline_error(ui, validation.local_sniffing[i].as_deref());
                         changed |= local_filter_editor(ui, lang, entry);
                         for message in &validation.local_filter_errors[i] {
                             inline_error(ui, Some(message));
@@ -534,16 +554,7 @@ impl InboundsScreen {
                             .collect();
                     }
                     changed |= sniffing_editor(ui, lang, &mut d.sniffing, fakedns_on);
-                    inline_error(
-                        ui,
-                        row_finding(
-                            verdict,
-                            lang,
-                            FindingTarget::Dokodemo(i),
-                            &ValidationCode::SniffingDestOverrideInvalid,
-                        )
-                        .as_deref(),
-                    );
+                    inline_error(ui, validation.doko_sniffing[i].as_deref());
                 });
                 ui.separator();
             }
@@ -961,9 +972,10 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
 }
 
 /// One row's finding of `code` from the published generation verdict,
-/// rendered as the code's own message. The model reported it for this
-/// structural target, so the row only asks and renders: the finding's path is
-/// the document's location text, which the row itself already is.
+/// rendered as the code's own message. Called when the screen's cache is
+/// rebuilt — once per generation — so the row sites read a `&str` and an idle
+/// repaint frame formats nothing. The finding's path is the document's
+/// location text, which the row itself already is.
 fn row_finding(
     verdict: &Verdict,
     lang: Language,

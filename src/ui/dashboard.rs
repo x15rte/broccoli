@@ -1205,7 +1205,7 @@ mod tests {
                     let error = rig.terminal_error.clone().expect("fixture message");
                     let mut ctx = rig.ctx();
                     if terminal_error_block(ui, ctx.settings.language, &error).open_core_setup {
-                        ctx.request_open_core_setup();
+                        ctx.hooks().request_open_core_setup();
                     }
                 },
                 rig,

@@ -683,56 +683,12 @@ impl<'a> UiCtx<'a> {
         }
     }
 
-    /// The frame's hooks over this context's own fields. Slice producers use
-    /// the same [`hooks_of`] constructor, so there is one hooks value shape.
+    /// The frame's hooks over this context's own fields, for a test that acts
+    /// between frames. Production screens get their hooks inside their slice;
+    /// the assembler itself hands out no mutation seam.
+    #[cfg(test)]
     pub(crate) fn hooks(&mut self) -> FrameHooks<'_> {
         hooks_of(self.requests, self.cmd, self.model_generation)
-    }
-
-    /// Record a model edit — delegates to [`FrameHooks::mark_dirty`], the one
-    /// implementation.
-    pub fn mark_dirty(&mut self) {
-        self.hooks().mark_dirty();
-    }
-
-    /// Persist a display-only preference — delegates to
-    /// [`FrameHooks::mark_ui_dirty`].
-    pub fn mark_ui_dirty(&mut self) {
-        self.hooks().mark_ui_dirty();
-    }
-
-    /// Send a command through the one seam — delegates to
-    /// [`FrameHooks::send`].
-    pub fn send(&mut self, cmd: CoreCmd) -> bool {
-        self.hooks().send(cmd)
-    }
-
-    /// Request Connect — delegates to [`FrameHooks::request_connect`].
-    pub fn request_connect(&mut self) {
-        self.hooks().request_connect();
-    }
-
-    /// Request Disconnect/Cancel — delegates to [`FrameHooks::request_stop`].
-    pub fn request_stop(&mut self) {
-        self.hooks().request_stop();
-    }
-
-    /// Run a pinned-payload verification — delegates to
-    /// [`FrameHooks::request_core_verify`].
-    pub fn request_core_verify(&mut self) {
-        self.hooks().request_core_verify();
-    }
-
-    /// Open the managed core directory — delegates to
-    /// [`FrameHooks::request_open_core_folder`].
-    pub fn request_open_core_folder(&mut self) {
-        self.hooks().request_open_core_folder();
-    }
-
-    /// Open the core setup surface — delegates to
-    /// [`FrameHooks::request_open_core_setup`].
-    pub fn request_open_core_setup(&mut self) {
-        self.hooks().request_open_core_setup();
     }
 
     /// The About screen's slice.

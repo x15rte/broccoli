@@ -417,7 +417,7 @@ pub struct BroccoliApp {
     /// control-plane port. An edit inside the persist throttle is judged by
     /// the generation it would commit, exactly like `config_error`: the
     /// previous generation's findings stay published until the persist step
-    /// regenerates (ADR-0084). `None` until the boot generation.
+    /// regenerates. `None` until the boot generation.
     generation_verdict: Option<GenerationVerdict>,
     /// A state file (settings.json / servers.json) held valid JSON that
     /// could not be loaded — an unknown `security`/`network` value, a field

@@ -42,6 +42,10 @@ pub struct TunScreen {
 struct ValidationCache {
     generation: u64,
     tun_warning: Option<String>,
+    /// The model's TUN findings, rendered at the cache's generation cadence:
+    /// the gateway requirement and the leak block's unrouted-family advisory.
+    gateway_error: Option<String>,
+    leak_warning: Option<String>,
     /// The DNS leak block is emitted and its DNS half is on: the only state
     /// in which turning the takeover off can stall name resolution.
     dns_leak_block_on: bool,
@@ -134,6 +138,14 @@ impl TunScreen {
                 tun_warning: findings
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
+                gateway_error: verdict
+                    .for_target(FindingTarget::Tun)
+                    .find(|issue| issue.code == ValidationCode::TunIpv4GatewayRequired)
+                    .map(|issue| validation_message(&issue.code, lang)),
+                leak_warning: verdict
+                    .for_target(FindingTarget::Tun)
+                    .find(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff)
+                    .map(|issue| validation_message(&issue.code, lang)),
                 dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
                     && ctx.settings.tun.leak_blocks_dns(),
             });
@@ -142,16 +154,16 @@ impl TunScreen {
             Some(cache) => cache.tun_warning.as_deref(),
             None => unreachable!("validation is built when absent, above"),
         };
-        // The model's own TUN findings, rendered as their code's message
-        // (the switch and the gateway editor are the locations).
-        let gateway_error = verdict
-            .for_target(FindingTarget::Tun)
-            .find(|issue| issue.code == ValidationCode::TunIpv4GatewayRequired)
-            .map(|issue| validation_message(&issue.code, lang));
-        let leak_warning = verdict
-            .for_target(FindingTarget::Tun)
-            .find(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff)
-            .map(|issue| validation_message(&issue.code, lang));
+        // The model's own TUN findings, rendered at the cache's generation
+        // cadence (the switch and the gateway editor are the locations).
+        let gateway_error = match &self.validation {
+            Some(cache) => cache.gateway_error.as_deref(),
+            None => unreachable!("validation is built when absent, above"),
+        };
+        let leak_warning = match &self.validation {
+            Some(cache) => cache.leak_warning.as_deref(),
+            None => unreachable!("validation is built when absent, above"),
+        };
         let dns_leak_block_on = match &self.validation {
             Some(cache) => cache.dns_leak_block_on,
             None => unreachable!("validation is built when absent, above"),
@@ -251,7 +263,7 @@ impl TunScreen {
             // pass renders, never a second sentence. A plain label consumes
             // no auto-id slot, so the section's widget ids do not shift when
             // it appears or clears.
-            if let Some(message) = leak_warning.as_deref() {
+            if let Some(message) = leak_warning {
                 ui.label(
                     egui::RichText::new(message)
                         .small()
@@ -295,7 +307,7 @@ impl TunScreen {
             // screen mirrors that verdict exactly where the user can fix it.
             // A plain label consumes no egui auto-id slot, so the section's
             // widget ids never shift when the error appears or clears.
-            if let Some(error) = gateway_error.as_deref() {
+            if let Some(error) = gateway_error {
                 ui.label(
                     egui::RichText::new(error)
                         .small()

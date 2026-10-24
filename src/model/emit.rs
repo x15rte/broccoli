@@ -140,15 +140,9 @@ pub fn appended_inbound_tags(settings: &Settings) -> impl Iterator<Item = &'stat
 }
 
 /// Which inbound-tag universe a caller asks [`inbound_tags`] about. The
-/// three callers ask three different questions, and each scope names the
+/// two callers ask two different questions, and each scope names the
 /// projection it wants instead of every caller rebuilding the list.
 pub enum InboundScope {
-    /// Every tag the running configuration answers to: the control-plane
-    /// listener, the tags [`appended_inbound_tags`] adds, the enabled local
-    /// endpoints, and the enabled dokodemo listeners. This is the set the
-    /// settings verdict judges, where a duplicate is a refusal. Order is
-    /// informative (emission order) — callers compare it as a set.
-    Emitted,
     /// Every tag the settings model declares, emitted or not: all local
     /// endpoints in list order, the tun/dns/api listeners the app owns, and
     /// every dokodemo tag in list order. The TestRoute dialog offers this
@@ -167,23 +161,6 @@ pub enum InboundScope {
 /// emission gate) reaches all of them at once.
 pub fn inbound_tags(settings: &Settings, scope: InboundScope) -> Vec<String> {
     match scope {
-        InboundScope::Emitted => std::iter::once(API_INBOUND_TAG.to_string())
-            .chain(appended_inbound_tags(settings).map(str::to_string))
-            .chain(
-                settings
-                    .local_inbounds
-                    .iter()
-                    .filter(|entry| local_inbound_emitted(entry))
-                    .map(|entry| entry.tag.clone()),
-            )
-            .chain(
-                settings
-                    .dokodemo
-                    .iter()
-                    .filter(|entry| dokodemo_emitted(entry))
-                    .map(|entry| entry.tag.clone()),
-            )
-            .collect(),
         InboundScope::Declared => settings
             .local_inbounds
             .iter()
@@ -506,6 +483,29 @@ mod tests {
             .collect()
     }
 
+    /// The emitted inbound universe, composed here rather than published: the
+    /// oracle below is its only reader, so this stays test-local instead of a
+    /// production query that exists for a test.
+    fn emitted_inbound_tags(settings: &Settings) -> BTreeSet<String> {
+        std::iter::once(API_INBOUND_TAG.to_string())
+            .chain(appended_inbound_tags(settings).map(str::to_string))
+            .chain(
+                settings
+                    .local_inbounds
+                    .iter()
+                    .filter(|entry| local_inbound_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .chain(
+                settings
+                    .dokodemo
+                    .iter()
+                    .filter(|entry| dokodemo_emitted(entry))
+                    .map(|entry| entry.tag.clone()),
+            )
+            .collect()
+    }
+
     /// The document's own inbound universe: the `inbounds` array plus the two
     /// listeners that are not emitted as array entries — the control-plane
     /// listener the top-level `api` object declares, and the in-tun DNS
@@ -539,19 +539,6 @@ mod tests {
         ];
         settings.dokodemo = vec![dokodemo("in-doko-on", true), dokodemo("in-doko-off", false)];
 
-        assert_eq!(
-            inbound_tags(&settings, InboundScope::Emitted),
-            [
-                API_INBOUND_TAG,
-                TUN_INBOUND_TAG,
-                DNS_INBOUND_TAG,
-                DNS_INBOUND_V6_TAG,
-                "in-socks",
-                "in-http",
-                "in-doko-on",
-            ]
-            .map(str::to_string)
-        );
         assert_eq!(
             inbound_tags(&settings, InboundScope::Declared),
             [
@@ -641,9 +628,7 @@ mod tests {
             );
             assert_eq!(
                 document_inbound_tags(&config, &settings),
-                inbound_tags(&settings, InboundScope::Emitted)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>(),
+                emitted_inbound_tags(&settings),
                 "{label}: emitted inbound tags"
             );
             // The in-tun DNS listener's own gate is the runtime's, derived

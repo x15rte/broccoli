@@ -78,7 +78,9 @@ impl Network {
         matches!(self, Network::Raw | Network::Xhttp | Network::Grpc)
     }
 
-    /// Every transport, in model variant order.
+    /// Every transport, in selector order: the general transports every
+    /// protocol offers, then the two an outbound handler claims. The selector
+    /// reads this shape directly; tests enumerate it.
     pub const ALL: [Network; 9] = [
         Network::Raw,
         Network::Xhttp,
@@ -87,36 +89,24 @@ impl Network {
         Network::Ws,
         Network::Httpupgrade,
         Network::Hysteria,
-        Network::Masque,
         Network::Xdrive,
+        Network::Masque,
     ];
 
     /// The transports the outbound editor offers for `protocol`, in selector
-    /// order: a MASQUE outbound is the MASQUE handler and carries that one
-    /// transport only; a VLESS outbound carries every transport but MASQUE;
-    /// every other protocol carries the general transports (neither
-    /// handler-integrated transport applies to it).
+    /// order: a MASQUE outbound carries the MASQUE handler's transport only, a
+    /// VLESS outbound carries the general transports plus Xdrive, and every
+    /// other protocol carries the general transports.
     pub fn selectable_networks(protocol: Protocol) -> &'static [Network] {
-        /// [`Network::ALL`] in selector order: the general transports, then
-        /// the outbound-handler transports, Xdrive before Masque.
-        const SELECTOR: &[Network] = &[
-            Network::Raw,
-            Network::Xhttp,
-            Network::Kcp,
-            Network::Grpc,
-            Network::Ws,
-            Network::Httpupgrade,
-            Network::Hysteria,
-            Network::Xdrive,
-            Network::Masque,
-        ];
-        /// The general transports are the selector's prefix up to here.
+        /// The leading run of general transports in [`Network::ALL`], the ones
+        /// no outbound handler claims.
         const GENERAL: usize = 7;
-        let (general, handlers) = SELECTOR.split_at(GENERAL);
+        /// Xdrive follows the general run; only VLESS may select it.
+        const XDRIVE: usize = GENERAL + 1;
         match protocol {
-            Protocol::Masque => &handlers[1..],
-            Protocol::Vless => &SELECTOR[..=GENERAL],
-            _ => general,
+            Protocol::Masque => &Network::ALL[XDRIVE..],
+            Protocol::Vless => &Network::ALL[..XDRIVE],
+            _ => &Network::ALL[..GENERAL],
         }
     }
 }

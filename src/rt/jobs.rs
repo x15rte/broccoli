@@ -84,8 +84,13 @@ pub enum JobKind {
     Balancer,
     /// `CoreCmd::RestartLogger`.
     LoggerRestart,
-    /// `AddTrialRule`/`RemoveTrialRule`/`ListTrialRules`.
+    /// `AddTrialRule`/`RemoveTrialRule`.
     TrialRules,
+    /// `CoreCmd::ListTrialRules`: the live rule inventory, a pure read. It is
+    /// its own kind because the mutation pair must survive a hard abort (its
+    /// write would otherwise be reported cancelled for a rule the core has)
+    /// while the read must not.
+    TrialRuleList,
     /// `CoreCmd::ListRuntimeState`.
     RuntimeState,
 }
@@ -182,9 +187,8 @@ impl super::CoreCmd {
             | Self::SetBalancerOverride { .. }
             | Self::ClearBalancerOverride { .. } => JobKind::Balancer,
             Self::RestartLogger { .. } => JobKind::LoggerRestart,
-            Self::AddTrialRule { .. }
-            | Self::RemoveTrialRule { .. }
-            | Self::ListTrialRules { .. } => JobKind::TrialRules,
+            Self::AddTrialRule { .. } | Self::RemoveTrialRule { .. } => JobKind::TrialRules,
+            Self::ListTrialRules { .. } => JobKind::TrialRuleList,
             Self::ListRuntimeState { .. } => JobKind::RuntimeState,
             Self::Shutdown | Self::CheckUpdate | Self::SetObservatory { .. } => return None,
         })
@@ -888,7 +892,7 @@ mod tests {
     ];
 
     /// Every kind, for whole-table invariants.
-    const ALL_KINDS: [JobKind; 14] = [
+    const ALL_KINDS: [JobKind; 15] = [
         JobKind::Start,
         JobKind::Stop,
         JobKind::CleanUp,
@@ -902,6 +906,7 @@ mod tests {
         JobKind::Balancer,
         JobKind::LoggerRestart,
         JobKind::TrialRules,
+        JobKind::TrialRuleList,
         JobKind::RuntimeState,
     ];
 
@@ -928,6 +933,7 @@ mod tests {
         assert_eq!(JobKind::Balancer.rule(), expect(false, false, true));
         assert_eq!(JobKind::LoggerRestart.rule(), expect(false, false, true));
         assert_eq!(JobKind::TrialRules.rule(), expect(false, false, false));
+        assert_eq!(JobKind::TrialRuleList.rule(), expect(false, false, false));
         assert_eq!(JobKind::RuntimeState.rule(), expect(false, false, false));
     }
 

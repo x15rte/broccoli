@@ -59,6 +59,7 @@ pub(crate) fn operation_name(kind: JobKind) -> Option<Diag> {
         | JobKind::Balancer
         | JobKind::LoggerRestart
         | JobKind::TrialRules
+        | JobKind::TrialRuleList
         | JobKind::RuntimeState => return None,
     };
     Some(Diag::new(key))
@@ -207,7 +208,7 @@ pub(crate) fn rule(kind: JobKind) -> KindRule {
         JobKind::ValidateProfiles => OCCUPYING,
         // Queries.
         JobKind::TestRoute | JobKind::Balancer | JobKind::LoggerRestart => BLOCKED_QUERY,
-        JobKind::TrialRules | JobKind::RuntimeState => FREE_QUERY,
+        JobKind::TrialRules | JobKind::TrialRuleList | JobKind::RuntimeState => FREE_QUERY,
     }
 }
 
@@ -293,7 +294,9 @@ pub(crate) const fn cancel_plan(kind: JobKind) -> CancelPlan {
             CancelPlan::new(false, false, true)
         }
         // Lifecycle spans, the cleanup, and the remaining queries own no
-        // artifact, poll no flag, and are not cancelled by an exit.
+        // artifact, poll no flag, and are not cancelled by an exit. The rule
+        // inventory read is one of them: unlike its mutation pair it has no
+        // write to strand, so Stop aborts it like any other query.
         JobKind::Start
         | JobKind::Stop
         | JobKind::CleanUp
@@ -301,6 +304,7 @@ pub(crate) const fn cancel_plan(kind: JobKind) -> CancelPlan {
         | JobKind::TestRoute
         | JobKind::Balancer
         | JobKind::LoggerRestart
+        | JobKind::TrialRuleList
         | JobKind::RuntimeState => CancelPlan::new(false, false, false),
     }
 }
@@ -737,7 +741,7 @@ impl QuerySeat for ListTrialRulesSeat {
     type Payload = Vec<(String, String)>;
     type Prepared = ();
 
-    const KIND: JobKind = JobKind::TrialRules;
+    const KIND: JobKind = JobKind::TrialRuleList;
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
 

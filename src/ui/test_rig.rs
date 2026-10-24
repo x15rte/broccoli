@@ -269,7 +269,7 @@ impl UiTestRig {
     /// `mark_dirty`, so the persist request and the generation bump stay one
     /// behaviour rather than a test-side copy of it.
     pub(crate) fn edit(&mut self) {
-        self.ctx().mark_dirty();
+        self.ctx().hooks().mark_dirty();
     }
 
     /// Assemble the UiCtx the screen under test receives — through
