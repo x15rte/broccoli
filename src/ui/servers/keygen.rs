@@ -82,17 +82,25 @@ pub(super) fn run_xray_bounded(
     // CreateProcess has consumed the verified paths; release the locks so
     // a running core's geodata updater stays unblocked.
     drop(verified_core);
+    // Both pipes drain on their own threads from the moment the child
+    // starts, so a chatty tool cannot block on a full pipe. `Read::read` is
+    // the child-pipe path that uses `ReadFileEx`; `wait_with_output` with
+    // one stream and `read_to_end` take the synchronous path, which aborts
+    // the process when an overlapped read does not complete synchronously
+    // (std `handle.rs`).
+    let mut stdout = child.stdout.take().map(spawn_drain);
+    let mut stderr = child.stderr.take().map(spawn_drain);
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| t_fmt(lang, Key::SrvCollectOutputFailed, &[&error]))?;
-                if output.status.success() {
-                    return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            Ok(Some(status)) => {
+                let out = join_reader(stdout.take(), lang);
+                let err = join_reader(stderr.take(), lang);
+                let stdout = out?;
+                let stderr = String::from_utf8_lossy(&err?).trim().to_owned();
+                if status.success() {
+                    return Ok(String::from_utf8_lossy(&stdout).into_owned());
                 }
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 let suffix = if stderr.is_empty() {
                     String::new()
                 } else {
@@ -101,11 +109,7 @@ pub(super) fn run_xray_bounded(
                 return Err(t_fmt(
                     lang,
                     Key::SrvXrayExited,
-                    &[
-                        &redacted_tool_args(args),
-                        &output.status.to_string(),
-                        &suffix,
-                    ],
+                    &[&redacted_tool_args(args), &status.to_string(), &suffix],
                 ));
             }
             // A cancelled request must not hold its child until the
@@ -117,10 +121,11 @@ pub(super) fn run_xray_bounded(
             }
             Ok(None) => {
                 let _ = child.kill();
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| t_fmt(lang, Key::SrvReapTimedOutFailed, &[&error]))?;
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let _ = child.wait();
+                let _ = join_reader(stdout.take(), lang);
+                let stderr = join_reader(stderr.take(), lang)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+                    .unwrap_or_default();
                 let suffix = if stderr.is_empty() {
                     String::new()
                 } else {
@@ -135,6 +140,8 @@ pub(super) fn run_xray_bounded(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_reader(stdout.take(), lang);
+                let _ = join_reader(stderr.take(), lang);
                 return Err(t_fmt(
                     lang,
                     Key::SrvWaitXrayFailed,
@@ -142,6 +149,52 @@ pub(super) fn run_xray_bounded(
                 ));
             }
         }
+    }
+}
+
+/// Drain one child pipe on a thread of its own.
+fn spawn_drain(
+    stream: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut stream = stream;
+        drain(&mut stream)
+    })
+}
+
+/// Read a child pipe to EOF. Plain `read` keeps the Windows child-pipe path
+/// that uses `ReadFileEx`; `read_to_end` and `read_vectored` switch to the
+/// synchronous path, which aborts the process on a pending overlapped read.
+fn drain(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Join one drain thread, reporting a read failure as the collection error
+/// the caller renders.
+fn join_reader(
+    handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    lang: Language,
+) -> Result<Vec<u8>, String> {
+    match handle {
+        None => Ok(Vec::new()),
+        Some(handle) => match handle.join() {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(error)) => Err(t_fmt(lang, Key::SrvCollectOutputFailed, &[&error])),
+            Err(_) => Err(t_fmt(
+                lang,
+                Key::SrvCollectOutputFailed,
+                &[&"reader thread panicked"],
+            )),
+        },
     }
 }
 
@@ -167,4 +220,37 @@ pub(super) fn gen_short_id() -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain;
+    use std::process::{Command, Stdio};
+
+    /// A tool that writes more than one pipe buffer must arrive whole. This
+    /// is the reader the bounded runner uses; `read_to_end` on the same
+    /// handle takes std's synchronous path and can abort the process.
+    #[test]
+    fn drain_reads_past_one_pipe_buffer() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "for /L %i in (1,1,4000) do @echo 0123456789abcdef"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cmd");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let reader = std::thread::spawn(move || drain(&mut stdout));
+        let errors = drain(&mut stderr).expect("drain stderr");
+        let output = reader.join().expect("reader thread").expect("drain stdout");
+        child.wait().expect("reap cmd");
+
+        assert!(errors.is_empty());
+        assert!(output.len() > 8192, "the child filled more than one read");
+        assert_eq!(
+            output.iter().filter(|&&byte| byte == b'\n').count(),
+            4000,
+            "every line arrives"
+        );
+    }
 }
