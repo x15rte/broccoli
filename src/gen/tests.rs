@@ -138,7 +138,8 @@ fn generate_on_defaults() {
             "serveExpiredTTL": 86400,
         })
     );
-    // The SOCKS UDP:53 interception rule answers locally via dns-out.
+    // The SOCKS UDP:53 interception rule answers locally via dns-out, and
+    // unmatched private destinations fall through to direct.
     assert_eq!(
         cfg["routing"],
         json!({
@@ -148,6 +149,14 @@ fn generate_on_defaults() {
                     "network": "udp",
                     "port": "53",
                     "outboundTag": DNS_OUTBOUND_TAG,
+                },
+                {
+                    "ip": PRIVATE_IP_RANGES,
+                    "outboundTag": DIRECT_OUTBOUND_TAG,
+                },
+                {
+                    "domain": PRIVATE_DOMAINS,
+                    "outboundTag": DIRECT_OUTBOUND_TAG,
                 }
             ]
         })
@@ -2084,13 +2093,11 @@ fn tun_user_rules_follow_the_dns_interception_rules() {
     let rules = generated["routing"]["rules"].as_array().unwrap();
     // The system rules come first — the interception rules that own DNS for
     // the intercepted inbounds (seeded DNS module: dns-in, in-tun:53,
-    // in-socks:53) — and the user's rules last. Xray routes by first match,
-    // so a user rule ahead of the interception rules would shadow them.
-    // There is no trailing TUN catch-all either: unmatched TUN traffic falls
-    // to Xray's default outbound (the first outbound, always the active
-    // profile), and an unconditional in-tun catch-all would swallow appended
-    // trial rules before they are evaluated.
-    assert_eq!(rules.len(), 4);
+    // in-socks:53) — then the user's rules, then the private fallback. Xray
+    // routes by first match, so a user rule ahead of the interception rules
+    // would shadow them, while a user rule ahead of the fallback may still
+    // claim a private destination for the proxy.
+    assert_eq!(rules.len(), 6);
     assert_eq!(
         rules[0]["inboundTag"],
         json!([DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG])
@@ -2099,14 +2106,19 @@ fn tun_user_rules_follow_the_dns_interception_rules() {
     assert_eq!(rules[2]["inboundTag"], json!(["in-socks"]));
     assert_eq!(rules[3]["outboundTag"], json!("block"));
     assert_eq!(rules[3]["domain"], json!(["domain:blocked.example"]));
+    assert_eq!(rules[4]["ip"], json!(PRIVATE_IP_RANGES));
+    assert_eq!(rules[4]["outboundTag"], json!(DIRECT_OUTBOUND_TAG));
+    assert_eq!(rules[5]["domain"], json!(PRIVATE_DOMAINS));
+    assert_eq!(rules[5]["outboundTag"], json!(DIRECT_OUTBOUND_TAG));
 }
 
 #[test]
-fn tun_emits_pins_then_dns_interception_then_user_rules_in_order() {
+fn tun_emits_pins_then_dns_then_user_rules_then_the_private_fallback() {
     // The whole emitted order in one array: a user rule emitted above a pin
     // (or an interception rule above a pin) would silently shadow it under
-    // Xray's first-match routing, so no single group's order pins the
-    // contract on its own.
+    // Xray's first-match routing, and the private fallback must stay behind
+    // the user's rules so an explicit rule can still send a private range
+    // through the proxy. No single group's order pins the contract on its own.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.dns.servers.push(DnsServer {
@@ -2150,13 +2162,125 @@ fn tun_emits_pins_then_dns_interception_then_user_rules_in_order() {
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
-            // The user's rules last.
+            // The user's rules next.
             {
                 "ruleTag": "user-rule",
                 "domain": ["domain:blocked.example"],
                 "outboundTag": "block",
             },
+            // Private destinations fall through to direct last, so a user
+            // rule above may still claim a private range for the proxy.
+            {
+                "ip": PRIVATE_IP_RANGES,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
+            {
+                "domain": PRIVATE_DOMAINS,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
         ])
+    );
+}
+
+#[test]
+fn a_user_rule_can_claim_private_destinations_ahead_of_the_direct_fallback() {
+    // A remote LAN reachable through the proxy must stay routable: the
+    // private fallback is a default, not a safety rule, so the user's rule
+    // sits ahead of it under Xray's first-match order.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.routing.rules.push(Rule {
+        rule_tag: "user-private".into(),
+        ip: vec!["192.168.0.0/16".into()],
+        outbound_tag: "block".into(),
+        ..Default::default()
+    });
+
+    let generated =
+        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let rules = generated["routing"]["rules"].as_array().unwrap();
+    let user = rules
+        .iter()
+        .position(|rule| rule["ruleTag"] == json!("user-private"))
+        .expect("the user private rule on the wire");
+    let fallback = rules
+        .iter()
+        .position(|rule| rule["ip"] == json!(PRIVATE_IP_RANGES))
+        .expect("the private fallback on the wire");
+    assert!(user < fallback, "{rules:#?}");
+    assert!(
+        rules[fallback..]
+            .iter()
+            .any(|rule| rule["domain"] == json!(PRIVATE_DOMAINS)),
+        "{rules:#?}"
+    );
+}
+
+#[test]
+fn private_fallbacks_mirror_xrays_private_sets() {
+    // Oracle: the emitted sets are Xray's own (`common/geodata/consts.go`),
+    // copied literally so a dropped range or suffix fails here rather than
+    // only in goldens that regenerate from the same constant.
+    assert_eq!(
+        PRIVATE_IP_RANGES,
+        [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "224.0.0.0/3",
+            "::/127",
+            "fc00::/7",
+            "fe80::/10",
+            "ff00::/8",
+        ]
+    );
+    assert_eq!(
+        PRIVATE_DOMAINS,
+        [
+            "domain:lan",
+            "domain:local",
+            "domain:localhost",
+            "domain:localdomain",
+            "domain:home.arpa",
+            "domain:internal",
+            "domain:invalid",
+            "domain:test",
+            "domain:example",
+            "regexp:^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+        ]
+    );
+}
+
+#[test]
+fn private_fallbacks_yield_to_fakedns() {
+    // fakeDNS allocates from 198.18.0.0/15, which is in the private set; the
+    // fake IPs must keep taking the default route or the feature breaks.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.dns.fakedns.enabled = true;
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let rules = cfg["routing"]["rules"].as_array().unwrap();
+    assert!(
+        !rules
+            .iter()
+            .any(|rule| rule["ip"] == json!(PRIVATE_IP_RANGES)),
+        "{rules:#?}"
+    );
+    assert!(
+        !rules
+            .iter()
+            .any(|rule| rule["domain"] == json!(PRIVATE_DOMAINS)),
+        "{rules:#?}"
     );
 }
 
@@ -2193,9 +2317,11 @@ fn user_port_53_rule_is_routed_after_the_dns_interception_rules() {
     }
     assert_eq!(
         user_index,
-        rules.len() - 1,
-        "the user port-53 rule must be the last rule: {rules:?}"
+        rules.len() - 3,
+        "the user port-53 rule must precede only the private fallbacks: {rules:?}"
     );
+    assert_eq!(rules[rules.len() - 2]["ip"], json!(PRIVATE_IP_RANGES));
+    assert_eq!(rules[rules.len() - 1]["domain"], json!(PRIVATE_DOMAINS));
 }
 
 /// User report: a trial rule blocking a domain was confirmed by Test Route
@@ -2203,10 +2329,11 @@ fn user_port_53_rule_is_routed_after_the_dns_interception_rules() {
 /// appends injected trial rules at the END of the live rule list, and
 /// first-match routing means an unconditional `in-tun` catch-all rule would
 /// swallow every TUN connection before the appended trial rule is ever
-/// evaluated. The generated TUN routing must contain no such catch-all —
-/// unmatched TUN traffic already falls to the default outbound (the first
-/// outbound, which is always the active profile), so the catch-all is
-/// redundant.
+/// evaluated. The generated TUN routing must contain no such catch-all:
+/// unmatched TUN traffic falls to the conditional private fallbacks or the
+/// default outbound (the first outbound, always the active profile). A trial
+/// rule whose target is private cannot shadow those fallbacks; a normal user
+/// rule above them is the supported way to claim a private range.
 #[test]
 fn tun_routing_has_no_unconditional_catch_all_shadowing_trial_rules() {
     let mut settings = base_settings();
@@ -2322,7 +2449,8 @@ fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {
         json!({ "protocol": "dns", "tag": DNS_OUTBOUND_TAG })
     );
 
-    // SOCKS UDP:53 is answered locally by the DNS module.
+    // SOCKS UDP:53 is answered locally by the DNS module; the private
+    // fallback follows.
     assert_eq!(
         cfg["routing"]["rules"],
         json!([
@@ -2331,6 +2459,14 @@ fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {
                 "network": "udp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
+            },
+            {
+                "ip": PRIVATE_IP_RANGES,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
+            {
+                "domain": PRIVATE_DOMAINS,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
             }
         ])
     );
@@ -2356,6 +2492,14 @@ fn multiple_socks_entries_all_join_the_udp53_interception_rule() {
                 "network": "udp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
+            },
+            {
+                "ip": PRIVATE_IP_RANGES,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
+            {
+                "domain": PRIVATE_DOMAINS,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
             }
         ])
     );
@@ -2375,8 +2519,21 @@ fn disabled_socks_entries_stay_off_the_wire_and_out_of_interception() {
         .collect();
     assert_eq!(tags, ["in-http"]);
     // No enabled socks entry and no TUN: no DNS interception rules, and
-    // no dns-out outbound to receive them.
-    assert_eq!(cfg["routing"]["rules"].as_array().unwrap().len(), 0);
+    // no dns-out outbound to receive them. The private fallback is the only
+    // rule left.
+    assert_eq!(
+        cfg["routing"]["rules"],
+        json!([
+            {
+                "ip": PRIVATE_IP_RANGES,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
+            {
+                "domain": PRIVATE_DOMAINS,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            }
+        ])
+    );
     let out = cfg["outbounds"].as_array().unwrap();
     assert!(out.iter().all(|o| o["tag"] != DNS_OUTBOUND_TAG));
 }
@@ -2690,9 +2847,9 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
     );
 
     // Interception rules; DoH (TCP:443) never matches them and falls to
-    // Xray's default outbound (the first outbound = the active profile). No
-    // trailing TUN catch-all — one would swallow injected trial rules before
-    // they are evaluated.
+    // Xray's default outbound (the first outbound = the active profile). The
+    // trailing rules are the conditional private fallbacks, not a catch-all;
+    // a trial rule for a private destination cannot shadow them.
     assert_eq!(
         cfg["routing"]["rules"],
         json!([
@@ -2713,6 +2870,14 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
                 "network": "udp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
+            },
+            {
+                "ip": PRIVATE_IP_RANGES,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
+            },
+            {
+                "domain": PRIVATE_DOMAINS,
+                "outboundTag": DIRECT_OUTBOUND_TAG,
             }
         ])
     );

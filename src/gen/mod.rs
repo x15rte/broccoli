@@ -10,7 +10,8 @@ use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scheme_host, scoped_bootstrap_endpoint};
 use crate::model::emit;
 use crate::model::inbound::{
-    API_INBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG, TUN_INBOUND_TAG,
+    API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG,
+    TUN_INBOUND_TAG,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{
@@ -1027,13 +1028,54 @@ fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
     Value::Object(routing)
 }
 
+/// Xray's definition of a private address (`common/geodata/consts.go`),
+/// emitted literally rather than as `geoip:private`: a refreshed `geoip.dat`
+/// without the `PRIVATE` code would otherwise fail the core at load.
+const PRIVATE_IP_RANGES: [&str; 18] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/3",
+    "::/127",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
+
+/// Xray's private-domain suffixes (`common/geodata/consts.go`): the names a
+/// LAN resolves under. Sniffing replaces the target with the hostname, so the
+/// IP rule below cannot see these; the domain rule keeps them off the tunnel.
+const PRIVATE_DOMAINS: [&str; 10] = [
+    "domain:lan",
+    "domain:local",
+    "domain:localhost",
+    "domain:localdomain",
+    "domain:home.arpa",
+    "domain:internal",
+    "domain:invalid",
+    "domain:test",
+    "domain:example",
+    "regexp:^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+];
+
 /// The rules the routing section carries when no script owns routing: the
-/// app's own rules FIRST and the user's configured rules LAST — Xray's router
-/// takes the first match, and the interception rules below own DNS for the
-/// intercepted inbounds, so a user rule that matches port-53 traffic ahead of
-/// them would shadow them and send those DNS queries out of the tunnel as
-/// plaintext. Trial rules keep landing after every configured rule either
-/// way, because Xray appends them (`AddRule` with `shouldAppend=true`).
+/// app's own rules FIRST, the user's configured rules next, and the private
+/// fallback LAST — Xray's router takes the first match, and the interception
+/// rules below own DNS for the intercepted inbounds, so a user rule that
+/// matches port-53 traffic ahead of them would shadow them and send those DNS
+/// queries out of the tunnel as plaintext. Trial rules keep landing after
+/// every configured rule either way, because Xray appends them (`AddRule`
+/// with `shouldAppend=true`).
 fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     let mut rules: Vec<Value> = Vec::new();
     // DoH ordering insurance: the DNS module's upstream TCP dials are
@@ -1090,13 +1132,32 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
             }));
         }
     }
-    // The user's rules, in model order, after every app-owned rule above —
-    // none of them may shadow the pinned upstreams or the DNS interception.
+    // The user's rules, in model order, after the pinned upstreams and the
+    // DNS interception — none of them may shadow those.
     for r in &cfg.rules {
         rules.push(serde_json::to_value(r).expect(
             "model serialization is infallible: routing Rule fields are strings, \
                  string vecs, and string-keyed Value maps only",
         ));
+    }
+    // Private destinations stay on the machine by default: LAN peers,
+    // loopback, link-local, and multicast (SSDP, mDNS) never travel through
+    // the tunnel. Last, after the user's rules, so an explicit rule can still
+    // send a private range (a remote LAN behind the proxy) through it. The
+    // DNS interception above already owns port 53. Two rules because a rule's
+    // conditions are ANDed: an IP target matches the first, a sniffed
+    // hostname matches the second. Skipped under fakeDNS, whose fake IPs come
+    // from 198.18.0.0/15 — a range in the private set — and must keep taking
+    // the default route.
+    if !emission.fakedns {
+        rules.push(json!({
+            "ip": PRIVATE_IP_RANGES,
+            "outboundTag": DIRECT_OUTBOUND_TAG,
+        }));
+        rules.push(json!({
+            "domain": PRIVATE_DOMAINS,
+            "outboundTag": DIRECT_OUTBOUND_TAG,
+        }));
     }
     rules
 }
