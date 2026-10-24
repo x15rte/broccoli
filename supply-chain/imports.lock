@@ -46,6 +46,13 @@ user-id = 6741
 user-login = "Darksonn"
 user-name = "Alice Ryhl"
 
+[[publisher.tokio]]
+version = "1.53.3"
+when = "2026-10-13"
+user-id = 6741
+user-login = "Darksonn"
+user-name = "Alice Ryhl"
+
 [[publisher.tray-icon]]
 version = "0.26.1"
 when = "2026-10-07"
