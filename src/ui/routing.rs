@@ -1537,15 +1537,7 @@ impl RoutingScreen {
         widgets::section(ui, t(lang, Key::RoutingBuiltinSection), |ui| {
             ui.add_enabled_ui(!script_active, |ui| {
                 let builtin = &mut ctx.settings.routing.builtin;
-                let (pins, dns, private) = (
-                    &mut builtin.pin_dns_upstreams,
-                    &mut builtin.dns_interception,
-                    &mut builtin.private_direct,
-                );
-                *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinPinsNote), |ui| {
-                    ui.checkbox(pins, t(lang, Key::RoutingBuiltinPins))
-                        .changed()
-                });
+                let (dns, private) = (&mut builtin.dns_interception, &mut builtin.private_direct);
                 *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinDnsNote), |ui| {
                     ui.checkbox(dns, t(lang, Key::RoutingBuiltinDns)).changed()
                 });
@@ -6331,18 +6323,18 @@ mod routing_control_render_tests {
             "a stored off switch must render off"
         );
         assert_eq!(
-            switch_state(&harness, t(Language::En, Key::RoutingBuiltinPins)),
+            switch_state(&harness, t(Language::En, Key::RoutingBuiltinDns)),
             Some(true)
         );
 
         harness.state_mut().1.settings.routing.script = Some("routing.lua".into());
         harness.run();
-        let pins = harness.get_by_role_and_label(
+        let dns = harness.get_by_role_and_label(
             egui::accesskit::Role::CheckBox,
-            t(Language::En, Key::RoutingBuiltinPins),
+            t(Language::En, Key::RoutingBuiltinDns),
         );
         assert!(
-            pins.accesskit_node().is_disabled(),
+            dns.accesskit_node().is_disabled(),
             "a routing script owns every route, so the switches are inert"
         );
     }
@@ -6365,13 +6357,13 @@ mod routing_control_render_tests {
                 .is_disabled(),
             "fakeDNS fixes the private range's route, so the switch cannot act"
         );
-        let pins = harness.get_by_role_and_label(
+        let dns = harness.get_by_role_and_label(
             egui::accesskit::Role::CheckBox,
-            t(Language::En, Key::RoutingBuiltinPins),
+            t(Language::En, Key::RoutingBuiltinDns),
         );
         assert!(
-            !pins.accesskit_node().is_disabled(),
-            "the other built-in groups still apply under fakeDNS"
+            !dns.accesskit_node().is_disabled(),
+            "the other built-in group still applies under fakeDNS"
         );
 
         harness
@@ -6390,31 +6382,23 @@ mod routing_control_render_tests {
     #[test]
     fn builtin_rule_switches_write_through() {
         let mut harness = harness_for((RoutingScreen::default(), UiTestRig::default()));
-        let pins = t(Language::En, Key::RoutingBuiltinPins);
-        assert!(harness.state().1.settings.routing.builtin.pin_dns_upstreams);
-        assert!(!harness.state().1.requests.dirty);
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::CheckBox, pins)
-            .click();
-        harness.run();
-        assert!(!harness.state().1.settings.routing.builtin.pin_dns_upstreams);
-        assert!(
-            harness.state().1.requests.dirty,
-            "flipping a built-in switch must mark the settings dirty"
-        );
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::CheckBox, pins)
-            .click();
-        harness.run();
-        assert!(harness.state().1.settings.routing.builtin.pin_dns_upstreams);
-
         let dns = t(Language::En, Key::RoutingBuiltinDns);
         assert!(harness.state().1.settings.routing.builtin.dns_interception);
+        assert!(!harness.state().1.requests.dirty);
         harness
             .get_by_role_and_label(egui::accesskit::Role::CheckBox, dns)
             .click();
         harness.run();
         assert!(!harness.state().1.settings.routing.builtin.dns_interception);
+        assert!(
+            harness.state().1.requests.dirty,
+            "flipping a built-in switch must mark the settings dirty"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, dns)
+            .click();
+        harness.run();
+        assert!(harness.state().1.settings.routing.builtin.dns_interception);
 
         let private = t(Language::En, Key::RoutingBuiltinPrivate);
         assert!(harness.state().1.settings.routing.builtin.private_direct);

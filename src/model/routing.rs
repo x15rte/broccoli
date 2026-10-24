@@ -484,12 +484,10 @@ impl Error for RoutingIntegrityError {}
 
 /// The app's own routing rule groups, each switchable. Every field defaults
 /// on, and a field stays out of the settings file while it is on, so an older
-/// file loads with all three enabled.
+/// file loads with every switch enabled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BuiltinRules {
-    #[serde(skip_serializing_if = "skip_true")]
-    pub pin_dns_upstreams: bool,
     #[serde(skip_serializing_if = "skip_true")]
     pub dns_interception: bool,
     #[serde(skip_serializing_if = "skip_true")]
@@ -507,7 +505,6 @@ impl BuiltinRules {
 impl Default for BuiltinRules {
     fn default() -> Self {
         Self {
-            pin_dns_upstreams: true,
             dns_interception: true,
             private_direct: true,
         }
@@ -704,7 +701,6 @@ mod integrity_tests {
     #[test]
     fn builtin_rules_default_on_and_only_switches_off_serialize() {
         let cfg = RoutingCfg::default();
-        assert!(cfg.builtin.pin_dns_upstreams);
         assert!(cfg.builtin.dns_interception);
         assert!(cfg.builtin.private_direct);
 
@@ -712,7 +708,6 @@ mod integrity_tests {
         assert!(wire.get("builtin").is_none(), "{wire}");
 
         let loaded: RoutingCfg = serde_json::from_value(serde_json::json!({})).expect("loads");
-        assert!(loaded.builtin.pin_dns_upstreams);
         assert!(loaded.builtin.dns_interception);
         assert!(loaded.builtin.private_direct);
 
@@ -730,7 +725,6 @@ mod integrity_tests {
         );
         let loaded: RoutingCfg = serde_json::from_value(wire).expect("loads");
         assert!(!loaded.builtin.dns_interception);
-        assert!(loaded.builtin.pin_dns_upstreams);
         assert!(loaded.builtin.private_direct);
     }
 

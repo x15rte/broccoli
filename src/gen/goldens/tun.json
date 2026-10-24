@@ -136,7 +136,7 @@
         "inboundTag": [
           "in-tun"
         ],
-        "network": "udp",
+        "network": "udp,tcp",
         "outboundTag": "dns-out",
         "port": "53"
       },
@@ -144,7 +144,7 @@
         "inboundTag": [
           "in-socks"
         ],
-        "network": "udp",
+        "network": "udp,tcp",
         "outboundTag": "dns-out",
         "port": "53"
       },

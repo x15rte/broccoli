@@ -721,8 +721,6 @@ keys! {
     RoutingScriptPath 0,
     RoutingScriptHint 0,
     RoutingBuiltinSection 0,
-    RoutingBuiltinPins 0,
-    RoutingBuiltinPinsNote 0,
     RoutingBuiltinDns 0,
     RoutingBuiltinDnsNote 0,
     RoutingBuiltinPrivate 0,
@@ -3644,12 +3642,6 @@ mod en {
                  runs it."
             }
             Key::RoutingBuiltinSection => "Built-in rules",
-            Key::RoutingBuiltinPins => "Pin the DNS upstream dials",
-            Key::RoutingBuiltinPinsNote => {
-                "Keeps the DNS module's own upstream connections on the active server. Off \
-                 drops the pin. Those dials then follow the routing rules like any other \
-                 connection."
-            }
             Key::RoutingBuiltinDns => "Intercept DNS from the TUN and SOCKS inbounds",
             Key::RoutingBuiltinDnsNote => {
                 "Sends their port-53 queries to the DNS module. Off lets them take the \

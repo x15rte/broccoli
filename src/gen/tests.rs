@@ -138,7 +138,7 @@ fn generate_on_defaults() {
             "serveExpiredTTL": 86400,
         })
     );
-    // The SOCKS UDP:53 interception rule answers locally via dns-out, and
+    // The SOCKS port-53 interception rule answers locally via dns-out, and
     // unmatched private destinations fall through to direct.
     assert_eq!(
         cfg["routing"],
@@ -146,7 +146,7 @@ fn generate_on_defaults() {
             "rules": [
                 {
                     "inboundTag": ["in-socks"],
-                    "network": "udp",
+                    "network": "udp,tcp",
                     "port": "53",
                     "outboundTag": DNS_OUTBOUND_TAG,
                 },
@@ -2113,12 +2113,12 @@ fn tun_user_rules_follow_the_dns_interception_rules() {
 }
 
 #[test]
-fn tun_emits_pins_then_dns_then_user_rules_then_the_private_fallback() {
-    // The whole emitted order in one array: a user rule emitted above a pin
-    // (or an interception rule above a pin) would silently shadow it under
-    // Xray's first-match routing, and the private fallback must stay behind
-    // the user's rules so an explicit rule can still send a private range
-    // through the proxy. No single group's order pins the contract on its own.
+fn tun_emits_dns_then_user_rules_then_the_private_fallback() {
+    // The whole emitted order in one array: an interception rule is first
+    // (it is the app's DNS policy for the inbounds), then the user's rules,
+    // and the private fallback must stay behind them so an explicit rule can
+    // still send a private range through the proxy. No single group's order
+    // pins the contract on its own.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.dns.servers.push(DnsServer {
@@ -2137,12 +2137,6 @@ fn tun_emits_pins_then_dns_then_user_rules_then_the_private_fallback() {
     assert_eq!(
         cfg["routing"]["rules"],
         json!([
-            // The DoH upstream pin: the module's dial to the active profile.
-            {
-                "ip": ["1.1.1.1"],
-                "port": "443",
-                "outboundTag": "srv-01234567",
-            },
             // Local DNS interception, in emitter order: dns-in, TUN, SOCKS.
             {
                 "inboundTag": [DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG],
@@ -2152,13 +2146,13 @@ fn tun_emits_pins_then_dns_then_user_rules_then_the_private_fallback() {
             },
             {
                 "inboundTag": [TUN_INBOUND_TAG],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
             {
                 "inboundTag": ["in-socks"],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
@@ -2298,7 +2292,6 @@ fn all_builtin_switches_off_keep_the_dns_listener_rule_and_the_user_rule() {
         outbound_tag: "block".into(),
         ..Default::default()
     });
-    settings.routing.builtin.pin_dns_upstreams = false;
     settings.routing.builtin.dns_interception = false;
     settings.routing.builtin.private_direct = false;
 
@@ -2353,27 +2346,20 @@ fn each_builtin_switch_drops_only_its_own_group() {
     };
 
     let all = rules(&settings);
-    assert_eq!(port(&all, "443"), 1);
+    assert_eq!(port(&all, "443"), 0, "no rule left behind by the pin group");
     assert_eq!(port(&all, "53"), 3);
     assert_eq!(private(&all), 2);
 
-    settings.routing.builtin.pin_dns_upstreams = false;
-    let no_pins = rules(&settings);
-    assert_eq!(port(&no_pins, "443"), 0);
-    assert_eq!(port(&no_pins, "53"), 3);
-    assert_eq!(private(&no_pins), 2);
-
-    settings.routing.builtin.pin_dns_upstreams = true;
     settings.routing.builtin.dns_interception = false;
     let no_dns = rules(&settings);
-    assert_eq!(port(&no_dns, "443"), 1);
+    assert_eq!(port(&no_dns, "443"), 0);
     assert_eq!(port(&no_dns, "53"), 1, "only the dns-in rule remains");
     assert_eq!(private(&no_dns), 2);
 
     settings.routing.builtin.dns_interception = true;
     settings.routing.builtin.private_direct = false;
     let no_private = rules(&settings);
-    assert_eq!(port(&no_private, "443"), 1);
+    assert_eq!(port(&no_private, "443"), 0);
     assert_eq!(port(&no_private, "53"), 3);
     assert_eq!(private(&no_private), 0);
 }
@@ -2525,7 +2511,7 @@ const GEOSITE_URL: &str =
     "https://github.com/XTLS/Xray-core/releases/download/v26.10.21/geosite.dat";
 
 #[test]
-fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {
+fn dns_interception_wires_dns_outbound_and_socks_port53_rule() {
     let mut settings = base_settings();
     settings.dns.servers.push(DnsServer {
         address: "https://1.1.1.1/dns-query".into(),
@@ -2543,14 +2529,14 @@ fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {
         json!({ "protocol": "dns", "tag": DNS_OUTBOUND_TAG })
     );
 
-    // SOCKS UDP:53 is answered locally by the DNS module; the private
+    // SOCKS port-53 is answered locally by the DNS module; the private
     // fallback follows.
     assert_eq!(
         cfg["routing"]["rules"],
         json!([
             {
                 "inboundTag": ["in-socks"],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
@@ -2567,8 +2553,8 @@ fn dns_interception_wires_dns_outbound_and_socks_udp53_rule() {
 }
 
 #[test]
-fn multiple_socks_entries_all_join_the_udp53_interception_rule() {
-    // Every ENABLED socks entry contributes its tag to the DNS UDP:53
+fn multiple_socks_entries_all_join_the_port53_interception_rule() {
+    // Every ENABLED socks entry contributes its tag to the DNS port-53
     // interception rule, in list order; the HTTP entry never appears.
     let mut settings = base_settings();
     settings.local_inbounds.push(LocalInboundCfg {
@@ -2583,7 +2569,7 @@ fn multiple_socks_entries_all_join_the_udp53_interception_rule() {
         json!([
             {
                 "inboundTag": ["in-socks", "in-socks-1"],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
@@ -2633,7 +2619,7 @@ fn disabled_socks_entries_stay_off_the_wire_and_out_of_interception() {
 }
 
 #[test]
-fn disabled_socks_entries_are_excluded_from_the_udp53_rule() {
+fn disabled_socks_entries_are_excluded_from_the_port53_rule() {
     // Disabled socks entries neither emit nor join the interception rule;
     // enabled ones still do.
     let mut settings = base_settings();
@@ -2955,13 +2941,13 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
             },
             {
                 "inboundTag": [TUN_INBOUND_TAG],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
             {
                 "inboundTag": ["in-socks"],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             },
@@ -3140,97 +3126,6 @@ fn bootstrap_dns_ipv6_endpoint_gets_local_server() {
     assert_eq!(
         out["streamSettings"]["sockopt"]["domainStrategy"],
         json!("useip")
-    );
-}
-#[test]
-fn doh_dials_are_pinned_to_active_outbound() {
-    // The DNS module's upstream TCP dials must land on the ACTIVE server,
-    // not whatever outbound happens to be first after a GUI reorder.
-    let mut settings = base_settings();
-    settings.dns.servers.push(DnsServer {
-        address: "https://1.1.1.1/dns-query".into(),
-        ..Default::default()
-    });
-    let ob = vless_server("1.2.3.4", 443);
-    let cfg = generate_deterministic(&single_server(ob), &settings).expect("generate config");
-
-    let rules = cfg["routing"]["rules"].as_array().unwrap();
-    // The two seeded UDP servers have no pinning rule (UDP is not pinned);
-    // only the pushed DoH server pins to the active outbound.
-    assert_eq!(
-        rules[0],
-        json!({
-            "ip": ["1.1.1.1"],
-            "port": "443",
-            "outboundTag": "srv-01234567",
-        })
-    );
-}
-
-#[test]
-fn doh_pinning_uses_per_server_ports() {
-    let mut settings = base_settings();
-    settings.dns.servers.push(DnsServer {
-        address: "https://1.1.1.1/dns-query".into(),
-        ..Default::default()
-    });
-    settings.dns.servers.push(DnsServer {
-        address: "tcp://9.9.9.9".into(),
-        port: Some(5353),
-        ..Default::default()
-    });
-    let ob = vless_server("1.2.3.4", 443);
-    let cfg = generate_deterministic(&single_server(ob), &settings).expect("generate config");
-
-    let rules = cfg["routing"]["rules"].as_array().unwrap();
-    // The two seeded UDP servers have no pinning rule; the pushed entries
-    // pin in order with their per-server ports.
-    assert_eq!(rules[0]["ip"], json!(["1.1.1.1"]));
-    assert_eq!(rules[0]["port"], json!("443"));
-    assert_eq!(rules[1]["ip"], json!(["9.9.9.9"]));
-    assert_eq!(rules[1]["port"], json!("5353"));
-    assert_eq!(rules[1]["outboundTag"], json!("srv-01234567"));
-}
-
-#[test]
-fn doh_pinning_skipped_without_active_profile() {
-    // No active server → no outboundTag to pin to; the interception rules
-    // are the only system rules.
-    let mut settings = base_settings();
-    settings.mode = Mode::Tun;
-    settings.dns.servers.push(DnsServer {
-        address: "https://1.1.1.1/dns-query".into(),
-        ..Default::default()
-    });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
-
-    let rules = cfg["routing"]["rules"].as_array().unwrap();
-    assert!(
-        rules.iter().all(|rule| rule["port"] != "443"),
-        "no DoH pin without an active profile: {rules:?}"
-    );
-    assert_eq!(
-        rules[0]["inboundTag"],
-        json!([DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG])
-    );
-}
-
-#[test]
-fn doh_pinning_skipped_for_domain_dns_servers() {
-    // A domain DNS server cannot be pinned by IP; skip rather than emit a
-    // rule that never matches.
-    let mut settings = base_settings();
-    settings.dns.servers = vec![DnsServer {
-        address: "https://dns.example.com/dns-query".into(),
-        ..Default::default()
-    }];
-    let ob = vless_server("1.2.3.4", 443);
-    let cfg = generate_deterministic(&single_server(ob), &settings).expect("generate config");
-
-    let rules = cfg["routing"]["rules"].as_array().unwrap();
-    assert!(
-        rules.iter().all(|rule| rule["port"] != "443"),
-        "no DoH pin for a domain DNS server: {rules:?}"
     );
 }
 #[test]
@@ -4534,7 +4429,7 @@ fn dns_script_suppresses_the_parallel_query_default_on_the_wire() {
 /// dialed profile's domain to the module goes with it. Without a script the
 /// same profile gets both halves.
 #[test]
-fn dns_script_omits_the_app_owned_bootstrap_server_and_pin() {
+fn dns_script_omits_the_app_owned_bootstrap_server() {
     let mut ob = OutboundModel::new(Protocol::Vless);
     ob.settings = ProtocolSettings::Vless(VlessSettings {
         address: "vless.example.com".into(),

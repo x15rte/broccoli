@@ -7,7 +7,7 @@ pub mod keys;
 
 use crate::diag::Diag;
 use crate::i18n::{Key, t_fmt, validation_issue_message};
-use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scheme_host, scoped_bootstrap_endpoint};
+use crate::model::dns::{DEFAULT_PLAINTEXT_RESOLVERS, scoped_bootstrap_endpoint};
 use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG, DNS_OUTBOUND_TAG,
@@ -174,8 +174,6 @@ fn generate_reporting(
     if let Some(error) = invalid_model_error(verdict) {
         return Err(error);
     }
-    let active = servers.active_profile();
-
     // Health engine: the ordinary observatory (user-selected, or emitted for
     // a balancer that reads live health data) or the burst observatory. A core
     // serves one `extension.Observatory`: `infra/conf/xray.go` appends
@@ -222,7 +220,7 @@ fn generate_reporting(
     .write(&mut root);
 
     let dns_wire = dns(&settings.dns, fakedns);
-    // Enabled SOCKS entries (in list order) carry DNS UDP:53 to dns-out;
+    // Enabled SOCKS entries (in list order) carry DNS port-53 to dns-out;
     // HTTP entries are TCP-only and never appear in the interception rules.
     let socks_tags = emit::socks_inbound_tags(settings);
     // Local DNS interception: when a DNS server list exists and a proxy
@@ -256,7 +254,6 @@ fn generate_reporting(
         .collect();
     server_domains.sort();
     server_domains.dedup();
-    let dns_upstreams = dns_upstream_endpoints(settings);
     // The scoped server must land inside an emitted `dns` object; without a
     // module there is nothing for it (or for useip dials) to attach to. A DNS
     // script owns resolution instead: the core refuses a server carrying
@@ -297,10 +294,8 @@ fn generate_reporting(
         dns_on: dns_wire.is_some(),
         dns_intercept,
         socks_tags,
-        dns_upstreams,
         tun_on,
         fakedns,
-        active,
     };
     root.insert(keys::OUTBOUNDS.into(), outbounds(servers, &emission));
     root.insert(keys::INBOUNDS.into(), inbounds(settings, &emission));
@@ -623,33 +618,6 @@ fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
         && !host.starts_with('.'))
     .then_some(host)
 }
-/// IP-literal upstream endpoints of scheme-based DNS servers, as (ip, port)
-/// pairs for routing pinning. Only servers whose dials go out as TCP
-/// (https/h2c/quic/tcp) qualify; bare hosts are UDP DNS, already pinned by
-/// the UDP:53 interception rules. Domain hosts cannot be pinned by IP and
-/// are skipped.
-fn dns_upstream_endpoints(settings: &Settings) -> Vec<(String, u16)> {
-    settings
-        .dns
-        .servers
-        .iter()
-        .filter_map(|server| {
-            let address = server.address.trim();
-            let (scheme, rest) = address.split_once("://")?;
-            let port = match scheme {
-                "https" | "h2c" | "quic" => 443,
-                "tcp" => server.port.unwrap_or(53),
-                _ => return None,
-            };
-            let host = scheme_host(rest)
-                .parse::<std::net::IpAddr>()
-                .ok()?
-                .to_string();
-            Some((host, port))
-        })
-        .collect()
-}
-
 /// Derive the scoped `+local` bootstrap DNS server for proxy-server domains.
 /// Queries are answered by dialing the endpoint DIRECTLY (no routing —
 /// `https+local` & friends bypass the dispatcher,
@@ -803,7 +771,7 @@ fn append_builtin_outbounds(out: &mut Vec<Value>) {
 /// The stages take this value instead of the positional booleans they used to
 /// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
 /// the compiler noticing.
-struct Emission<'a> {
+struct Emission {
     /// The outbound tags this document dials: the default route and the
     /// profiles its rules, balancers and health engines reach, each mapped to
     /// its chain terminal. These are the only profiles whose server address
@@ -819,18 +787,14 @@ struct Emission<'a> {
     dns_intercept: bool,
     /// The enabled SOCKS endpoints' tags, in list order.
     socks_tags: Vec<String>,
-    /// The DNS upstream endpoints the DoH outbound dials.
-    dns_upstreams: Vec<(String, u16)>,
     /// Whether the TUN inbound reaches the wire.
     tun_on: bool,
     /// Whether the FakeDNS pool is enabled (every inbound that carries a
     /// `sniffing.destOverride` needs the same answer).
     fakedns: bool,
-    /// The active profile, whose outbound is the document's default route.
-    active: Option<&'a ServerProfile>,
 }
 
-impl Emission<'_> {
+impl Emission {
     /// Whether this profile's own dial goes through the scoped bootstrap DNS
     /// server: only an outbound the document dials has its domain in the
     /// scope (a chained hop's server is reached through the chain and resolves
@@ -911,9 +875,9 @@ impl ControlPlane<'_> {
 /// the active (default) profile in its first slot — Xray's default route is
 /// the first outbound — so the emitted order and the GUI list can never
 /// disagree. The DNS outbound is appended last so the default outbound (the
-/// first entry) is unchanged; it only ever receives UDP:53 via the
+/// first entry) is unchanged; it only ever receives port-53 traffic via the
 /// interception rules.
-fn outbounds(servers: &ServersFile, emission: &Emission<'_>) -> Value {
+fn outbounds(servers: &ServersFile, emission: &Emission) -> Value {
     let mut out = Vec::new();
     for profile in &servers.profiles {
         let policy = OutboundWirePolicy {
@@ -933,7 +897,7 @@ fn outbounds(servers: &ServersFile, emission: &Emission<'_>) -> Value {
     Value::Array(out)
 }
 
-fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
+fn inbounds(settings: &Settings, emission: &Emission) -> Value {
     let mut list: Vec<Value> = Vec::new();
 
     // Local endpoints emit in list order; disabled entries stay off the wire.
@@ -994,7 +958,7 @@ fn inbounds(settings: &Settings, emission: &Emission<'_>) -> Value {
     Value::Array(list)
 }
 
-fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
+fn routing(cfg: &RoutingCfg, emission: &Emission) -> Value {
     let mut routing = Map::new();
     // A routing script owns every route: the core refuses a script beside
     // rules or a `domainStrategy` (infra/conf/router.go:94-96), so the
@@ -1069,40 +1033,17 @@ const PRIVATE_DOMAINS: [&str; 10] = [
 ];
 
 /// The rules the routing section carries when no script owns routing: the
-/// app's own rules FIRST, the user's configured rules next, and the private
-/// fallback LAST — Xray's router takes the first match, and the interception
-/// rules below own DNS for the intercepted inbounds, so a user rule that
-/// matches port-53 traffic ahead of them would shadow them and send those DNS
-/// queries out of the tunnel as plaintext. Trial rules keep landing after
-/// every configured rule either way, because Xray appends them (`AddRule`
-/// with `shouldAppend=true`).
-fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
+/// app's DNS interception rules FIRST, the user's configured rules next, and
+/// the private fallback LAST — Xray's router takes the first match, so a user
+/// rule that matches port-53 traffic would otherwise shadow the interception
+/// and send those DNS queries out of the tunnel as plaintext. Trial rules
+/// keep landing after every configured rule either way, because Xray appends
+/// them (`AddRule` with `shouldAppend=true`). There is deliberately no
+/// broader TUN catch-all: an unconditional in-tun catch-all would swallow
+/// every TUN connection before an injected trial rule is evaluated.
+fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission) -> Vec<Value> {
     let mut rules: Vec<Value> = Vec::new();
-    // DoH ordering insurance: the DNS module's upstream TCP dials are
-    // pinned to the active outbound by address+port, so a GUI reorder can
-    // never send them direct. Regenerated whenever the active server
-    // changes. (The module's own DoH dials also carry the originating
-    // inbound, which would already fall through to the active outbound —
-    // Xray's default route is the first outbound, the list's first profile,
-    // which `ServersFile::activate` keeps the active one — so this rule only
-    // makes that explicit. There is deliberately
-    // no broader TUN catch-all: Xray's AddRule appends trial rules at the
-    // END of the live rule list, and an unconditional in-tun catch-all
-    // would swallow every TUN connection before an injected trial rule is
-    // ever evaluated.)
-    if cfg.builtin.pin_dns_upstreams
-        && emission.dns_on
-        && let Some(tag) = emission.active.map(ServerProfile::tag)
-    {
-        for (host, port) in &emission.dns_upstreams {
-            rules.push(json!({
-                "ip": [host],
-                "port": port.to_string(),
-                "outboundTag": tag,
-            }));
-        }
-    }
-    // Local DNS interception rules: UDP port-53 from TUN/SOCKS is answered
+    // Local DNS interception rules: port-53 from TUN/SOCKS is answered
     // by the DNS module (dns-out), and the loopback listener's TCP+UDP
     // queries are as well. The module's own upstream DoH traffic is
     // TCP:443, which never matches these rules and falls through
@@ -1121,7 +1062,7 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
         if emission.tun_on && cfg.builtin.dns_interception {
             rules.push(json!({
                 "inboundTag": [TUN_INBOUND_TAG],
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
@@ -1129,7 +1070,7 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
         if !emission.socks_tags.is_empty() && cfg.builtin.dns_interception {
             rules.push(json!({
                 "inboundTag": emission.socks_tags,
-                "network": "udp",
+                "network": "udp,tcp",
                 "port": "53",
                 "outboundTag": DNS_OUTBOUND_TAG,
             }));
