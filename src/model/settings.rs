@@ -5,7 +5,7 @@ use super::inbound::{DokodemoCfg, LocalInboundCfg, TunCfg, default_local_inbound
 use super::routing::RoutingCfg;
 use super::{
     StateLoadError, load_state, save_state, skip_blank_str, skip_empty_str, skip_empty_vec,
-    skip_false, skip_zero_u32,
+    skip_false, skip_true, skip_zero_u32,
 };
 use crate::i18n::{Key, t};
 use serde::{Deserialize, Serialize};
@@ -103,10 +103,6 @@ pub enum TrafficUnit {
 /// the established behavior and a saved true stays out of the file.
 fn default_true() -> bool {
     true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
 }
 
 /// Skip the `trafficUnit` key when the dashboard uses the adaptive default.
@@ -291,7 +287,7 @@ pub struct Settings {
     /// other adapter's DNS alone. Never emitted into the Xray config. Unlike
     /// the core fields, the app-owned true default is omitted: absence means
     /// on, and only the off override is persisted.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(default = "default_true", skip_serializing_if = "skip_true")]
     pub dns_takeover: bool,
     /// UI locale; English is the fallback and the only pack that ships today.
     pub language: Language,

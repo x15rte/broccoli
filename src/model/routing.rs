@@ -5,7 +5,7 @@
 use super::inbound::DIRECT_OUTBOUND_TAG;
 use super::{
     DurationMs, fold_eq, skip_duration_zero, skip_empty_map, skip_empty_str, skip_empty_vec,
-    skip_false,
+    skip_false, skip_true,
 };
 use crate::diag::Diag;
 use crate::i18n::{Key, t, t_fmt};
@@ -488,16 +488,12 @@ impl Error for RoutingIntegrityError {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BuiltinRules {
-    #[serde(skip_serializing_if = "is_true")]
+    #[serde(skip_serializing_if = "skip_true")]
     pub pin_dns_upstreams: bool,
-    #[serde(skip_serializing_if = "is_true")]
+    #[serde(skip_serializing_if = "skip_true")]
     pub dns_interception: bool,
-    #[serde(skip_serializing_if = "is_true")]
+    #[serde(skip_serializing_if = "skip_true")]
     pub private_direct: bool,
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
 }
 
 impl BuiltinRules {
@@ -552,6 +548,14 @@ pub const DEFAULT_DOMAIN_STRATEGY: &str = "AsIs";
 impl RoutingCfg {
     fn skip_default_strategy(s: &str) -> bool {
         s == DEFAULT_DOMAIN_STRATEGY
+    }
+
+    /// The routing script path when the field names one; an empty field
+    /// leaves every route to the rules. The generator and the editor read
+    /// this one predicate, so the emitted section and the rule controls
+    /// cannot disagree on whether a script owns the route table.
+    pub fn script_path(&self) -> Option<&str> {
+        self.script.as_deref().filter(|script| !script.is_empty())
     }
 
     /// True when the configuration carries a balancer that reads live

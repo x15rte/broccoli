@@ -1532,12 +1532,8 @@ impl RoutingScreen {
         lang: Language,
         changed: &mut bool,
     ) {
-        let script_active = ctx
-            .settings
-            .routing
-            .script
-            .as_deref()
-            .is_some_and(|script| !script.is_empty());
+        let script_active = ctx.settings.routing.script_path().is_some();
+        let fakedns_on = ctx.settings.dns.fakedns.enabled;
         widgets::section(ui, t(lang, Key::RoutingBuiltinSection), |ui| {
             ui.add_enabled_ui(!script_active, |ui| {
                 let builtin = &mut ctx.settings.routing.builtin;
@@ -1553,9 +1549,17 @@ impl RoutingScreen {
                 *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinDnsNote), |ui| {
                     ui.checkbox(dns, t(lang, Key::RoutingBuiltinDns)).changed()
                 });
-                *changed |= widgets::noted(ui, t(lang, Key::RoutingBuiltinPrivateNote), |ui| {
-                    ui.checkbox(private, t(lang, Key::RoutingBuiltinPrivate))
-                        .changed()
+                let private_note = if fakedns_on {
+                    t(lang, Key::RoutingBuiltinPrivateFakeDnsNote)
+                } else {
+                    t(lang, Key::RoutingBuiltinPrivateNote)
+                };
+                *changed |= widgets::noted(ui, private_note, |ui| {
+                    ui.add_enabled(
+                        !fakedns_on,
+                        egui::Checkbox::new(private, t(lang, Key::RoutingBuiltinPrivate)),
+                    )
+                    .changed()
                 });
             });
         });
@@ -6340,6 +6344,46 @@ mod routing_control_render_tests {
         assert!(
             pins.accesskit_node().is_disabled(),
             "a routing script owns every route, so the switches are inert"
+        );
+    }
+
+    #[test]
+    fn builtin_private_switch_reads_fakedns_rather_than_ignoring_it() {
+        let mut rig = UiTestRig::default();
+        rig.settings.dns.fakedns.enabled = true;
+        let mut harness = harness_for((RoutingScreen::default(), rig));
+        let private = t(Language::En, Key::RoutingBuiltinPrivate);
+        assert_eq!(
+            switch_state(&harness, private),
+            Some(true),
+            "fakeDNS does not change the stored switch"
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, private)
+                .accesskit_node()
+                .is_disabled(),
+            "fakeDNS fixes the private range's route, so the switch cannot act"
+        );
+        let pins = harness.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            t(Language::En, Key::RoutingBuiltinPins),
+        );
+        assert!(
+            !pins.accesskit_node().is_disabled(),
+            "the other built-in groups still apply under fakeDNS"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, private)
+            .hover();
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::RoutingBuiltinPrivateFakeDnsNote))
+                .next()
+                .is_some(),
+            "the row must name the exception instead of looking silently inert"
         );
     }
 

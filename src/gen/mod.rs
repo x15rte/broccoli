@@ -1002,7 +1002,7 @@ fn routing(cfg: &RoutingCfg, emission: &Emission<'_>) -> Value {
     // a non-default strategy beside a script; the app's own interception and
     // upstream-pinning rules are not user configuration and are omitted too,
     // because the script decides every route in their place.
-    match cfg.script.as_deref().filter(|script| !script.is_empty()) {
+    match cfg.script_path() {
         Some(script) => {
             routing.insert("script".into(), json!(script));
         }
@@ -1147,10 +1147,10 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &Emission<'_>) -> Vec<Value> {
     // loopback, link-local, and multicast (SSDP, mDNS) never travel through
     // the tunnel. Last, after the user's rules, so an explicit rule can still
     // send a private range (a remote LAN behind the proxy) through it. The
-    // DNS interception above already owns port 53. Two rules because a rule's
-    // conditions are ANDed: an IP target matches the first, a sniffed
-    // hostname matches the second. builtin.private_direct turns the pair off
-    // together, and fakeDNS forces it off: its fake IPs come from
+    // DNS interception above owns port 53 while its switch is on. Two rules
+    // because a rule's conditions are ANDed: an IP target matches the first,
+    // a sniffed hostname matches the second. builtin.private_direct turns the
+    // pair off together, and fakeDNS forces it off: its fake IPs come from
     // 198.18.0.0/15 — a range in the private set — and must keep taking the
     // default route.
     if cfg.builtin.private_direct && !emission.fakedns {

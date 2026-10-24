@@ -80,6 +80,10 @@ use windows::core::BOOL;
 pub(crate) fn skip_false(b: &bool) -> bool {
     !*b
 }
+/// Skip a switch that is on.
+pub(crate) fn skip_true(b: &bool) -> bool {
+    *b
+}
 pub(crate) fn skip_empty_str(s: &str) -> bool {
     s.is_empty()
 }

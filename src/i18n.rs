@@ -727,6 +727,7 @@ keys! {
     RoutingBuiltinDnsNote 0,
     RoutingBuiltinPrivate 0,
     RoutingBuiltinPrivateNote 0,
+    RoutingBuiltinPrivateFakeDnsNote 0,
     RoutingMoveUp 0,
     RoutingMoveDown 0,
     RoutingDeleteRule 0,
@@ -3658,6 +3659,10 @@ mod en {
             Key::RoutingBuiltinPrivateNote => {
                 "LAN, loopback, link-local, and multicast destinations bypass the tunnel \
                  unless a rule above claims them. Off sends them through the active server."
+            }
+            Key::RoutingBuiltinPrivateFakeDnsNote => {
+                "FakeDNS is on. Its fake IPs must keep the default route, so this switch \
+                 has no effect."
             }
             Key::RoutingMoveUp => "Move up (rules match in order)",
             Key::RoutingMoveDown => "Move down",
