@@ -607,12 +607,10 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
     }
     // The transport dials HTTP/2 only when the TLS ALPN list carries `h2` and
     // no `h3` (transport/internet/masque/dialer.go:132-134); with both the
-    // list picks HTTP/3, which the core accepts silently.
-    if stream.security == Security::Tls
-        && let Some(tls) = stream.tls_settings.as_ref()
-        && tls.alpn.iter().any(|value| value == "h2")
-        && tls.alpn.iter().any(|value| value == "h3")
-    {
+    // list picks HTTP/3, which the core accepts silently. The predicate is the
+    // stream's own (`masque_alpn_prefers_http3`), so the TLS block in the
+    // editor renders the same verdict this pass reports.
+    if stream.masque_alpn_prefers_http3() {
         issues.push(warning(
             ValidationCode::MasqueAlpnPrefersHttp3,
             Some("stream.tlsSettings.alpn".into()),
@@ -899,6 +897,32 @@ pub(super) fn validate_xdrive_outbound(o: &OutboundModel, issues: &mut Vec<Valid
     }
 }
 
+/// The empty-address state every remote-dialing protocol shares: a fresh
+/// draft has not filled it in yet, and an outbound dialing the empty host
+/// fails every connection. Whitespace-only counts as empty — the editor's
+/// address field trims before it judges, and the model is the same rule.
+fn require_address(issues: &mut Vec<ValidationIssue>, address: &str) {
+    if address.trim().is_empty() {
+        issues.push(issue(
+            ValidationCode::ServerAddressRequired,
+            Some("settings.address".into()),
+        ));
+    }
+}
+
+/// [`require_address`] plus the zero-port state, for the protocols whose port
+/// has no dedicated code: SOCKS, HTTP and Hysteria. VLESS and VMess report
+/// port 0 as [`ValidationCode::SettingsPortZero`] instead.
+fn require_remote(issues: &mut Vec<ValidationIssue>, address: &str, port: u16) {
+    require_address(issues, address);
+    if port == 0 {
+        issues.push(issue(
+            ValidationCode::ServerPortRequired,
+            Some("settings.port".into()),
+        ));
+    }
+}
+
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
@@ -913,6 +937,14 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     // the servers-level pass scopes the finding with the profile's location.
     if o.retired_proxy_settings.is_some() {
         issues.push(issue(ValidationCode::OutboundProxySettingsRemoved, None));
+    }
+    // The protocol tag and the `settings` block are two independently bound
+    // fields, so a hand-edited state file can disagree. Every rule below reads
+    // one of them, so the disagreement is reported first — with no path, since
+    // it is the pair that is wrong, not a field. The pass keeps going: the
+    // settings variant is still the source of the field-level findings.
+    if o.protocol != o.settings.protocol() {
+        issues.push(issue(ValidationCode::ProtocolSettingsMismatch, None));
     }
     if let ProtocolSettings::Shadowsocks(settings) = &o.settings
         && settings.level.is_some_and(|level| level > u8::MAX.into())
@@ -1041,17 +1073,43 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         }
     }
 
-    // Protocol-`settings` vocabulary / required values: the out-of-vocab
-    // VLESS flow/encryption, unsupported SS method, missing Trojan/SS
-    // essentials, and VLESS/VMess port-0 / non-UUID id rows the editor combos
-    // and the share-link grammar already refuse. These gate save/apply exactly
-    // like an import refusal, whatever the source of the profile (state file,
+    // Protocol-`settings` vocabulary / required values: the missing
+    // address/port/id essentials every remote-dialing protocol shares, the
+    // out-of-vocab VLESS flow/encryption, the unsupported SS method, the
+    // missing Trojan/SS essentials, and the VLESS/VMess port-0 / non-UUID id
+    // rows. These are the rules the editor used to mint as draft
+    // requirements; the model owns them now, so save, `validate_settings`,
+    // generation, and the share-link grammar's `validate_outbound` call
+    // answer one verdict, whatever the source of the profile (state file,
     // deserialization, draft). The SS-2022 key rule joins them for every key
     // the core refuses at load; only a key longer than the method's size, which
     // the core hashes down and runs, warns.
     // Paths are the wire paths of the offending fields.
     match &o.settings {
         ProtocolSettings::Vless(settings) => {
+            require_address(&mut issues, &settings.address);
+            if settings.id.is_empty() {
+                issues.push(issue(
+                    ValidationCode::VlessIdRequired,
+                    Some("settings.id".into()),
+                ));
+            }
+            if settings.encryption.is_empty() {
+                issues.push(issue(
+                    ValidationCode::VlessEncryptionRequired,
+                    Some("settings.encryption".into()),
+                ));
+            }
+            if settings
+                .reverse
+                .as_ref()
+                .is_some_and(|reverse| reverse.tag.trim().is_empty())
+            {
+                issues.push(issue(
+                    ValidationCode::VlessReverseTagRequired,
+                    Some("settings.reverse.tag".into()),
+                ));
+            }
             if !vless_flow_supported(&settings.flow) {
                 issues.push(issue(
                     ValidationCode::VlessFlowUnsupported,
@@ -1078,6 +1136,13 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             }
         }
         ProtocolSettings::Vmess(settings) => {
+            require_address(&mut issues, &settings.address);
+            if settings.id.is_empty() {
+                issues.push(issue(
+                    ValidationCode::VmessIdRequired,
+                    Some("settings.id".into()),
+                ));
+            }
             if settings.port == 0 {
                 issues.push(issue(
                     ValidationCode::SettingsPortZero,
@@ -1151,6 +1216,21 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
                     Some("settings.password".into()),
                 ));
             }
+        }
+        ProtocolSettings::Socks(settings) => {
+            require_remote(&mut issues, &settings.address, settings.port);
+        }
+        ProtocolSettings::Http(settings) => {
+            require_remote(&mut issues, &settings.address, settings.port);
+        }
+        ProtocolSettings::Hysteria(settings) => {
+            require_remote(&mut issues, &settings.address, settings.port);
+        }
+        ProtocolSettings::Loopback(settings) if settings.inbound_tag.trim().is_empty() => {
+            issues.push(issue(
+                ValidationCode::LoopbackTagRequired,
+                Some("settings.inboundTag".into()),
+            ));
         }
         _ => {}
     }
@@ -3567,7 +3647,7 @@ mod tests {
             ("down", "stream.hysteriaSettings.down"),
             ("udphop", "stream.hysteriaSettings.udphop"),
         ] {
-            let mut outbound = OutboundModel::new(Protocol::Hysteria);
+            let mut outbound = configured_hysteria();
             outbound
                 .stream
                 .hysteria_settings
@@ -3587,7 +3667,7 @@ mod tests {
         }
         // JSON null is the Go zero shape and stays silent; a canonical
         // hysteria profile stays clean.
-        let mut null_knob = OutboundModel::new(Protocol::Hysteria);
+        let mut null_knob = configured_hysteria();
         null_knob
             .stream
             .hysteria_settings
@@ -3596,7 +3676,31 @@ mod tests {
             .extra
             .insert("congestion".into(), Value::Null);
         assert!(validate_outbound(&null_knob).is_empty());
-        assert!(validate_outbound(&OutboundModel::new(Protocol::Hysteria)).is_empty());
+        assert!(validate_outbound(&configured_hysteria()).is_empty());
+        // The endpoint is what makes the profile canonical: a fresh hysteria
+        // draft reports the missing address and port from the model pass.
+        let bare = validate_outbound(&OutboundModel::new(Protocol::Hysteria));
+        assert_eq!(
+            codes(&bare),
+            vec![
+                ValidationCode::ServerAddressRequired,
+                ValidationCode::ServerPortRequired
+            ],
+            "a fresh hysteria draft has no endpoint to dial: {bare:#?}"
+        );
+    }
+
+    /// A hysteria outbound with the endpoint filled in: the settings the
+    /// `settings`-level rules require, so a test about another block sees only
+    /// that block's findings.
+    fn configured_hysteria() -> OutboundModel {
+        let mut outbound = OutboundModel::new(Protocol::Hysteria);
+        let ProtocolSettings::Hysteria(settings) = &mut outbound.settings else {
+            unreachable!()
+        };
+        settings.address = "hysteria.example.com".into();
+        settings.port = 443;
+        outbound
     }
 
     #[test]
@@ -4050,6 +4154,14 @@ mod tests {
         ValidationCode::ShadowsocksSettingsIncomplete,
         ValidationCode::SettingsPortZero,
         ValidationCode::SettingsIdNotUuid,
+        ValidationCode::ServerAddressRequired,
+        ValidationCode::ServerPortRequired,
+        ValidationCode::VlessIdRequired,
+        ValidationCode::VlessEncryptionRequired,
+        ValidationCode::VlessReverseTagRequired,
+        ValidationCode::VmessIdRequired,
+        ValidationCode::LoopbackTagRequired,
+        ValidationCode::ProtocolSettingsMismatch,
     ];
 
     #[test]
@@ -4265,14 +4377,14 @@ mod tests {
     }
 
     #[test]
-    fn vless_empty_states_are_accepted_by_the_model() {
-        // `""` encryption/flow/id are the state seam's defaults (a fresh
-        // profile before the editor's enforce_invariants normalization);
-        // the model accepts them — the required-value rules live in the
-        // editor's draft sweep. Fields are cleared *after*
-        // `OutboundModel::new` (whose enforce_invariants would already have
-        // normalized encryption to "none"); address/port are pinned so no
-        // other rule distracts.
+    fn vless_empty_states_follow_the_model_required_value_rules() {
+        // `""` flow is the plain profile's legal state, so no flow rule fires.
+        // An empty id or encryption is the missing-value state the model owns
+        // now (it used to be the editor's draft sweep alone, which left a
+        // hand-edited state file with an unusable account ungated). Fields are
+        // cleared *after* `OutboundModel::new` (whose enforce_invariants would
+        // already have normalized encryption to "none"); address/port are
+        // pinned so no other rule distracts.
         let mut outbound = OutboundModel::new(Protocol::Vless);
         {
             let ProtocolSettings::Vless(settings) = &mut outbound.settings else {
@@ -4285,11 +4397,23 @@ mod tests {
             settings.encryption.clear();
         }
         let issues = validate_outbound(&outbound);
-        for code in MUST_NOT_FIRE_CODES {
-            assert!(
-                !issues.iter().any(|issue| &issue.code == code),
-                "{code:?} must not fire on empty default settings: {issues:#?}"
-            );
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::VlessFlowUnsupported),
+            "the empty flow is the plain profile: {issues:#?}"
+        );
+        for (code, path) in [
+            (ValidationCode::VlessIdRequired, "settings.id"),
+            (
+                ValidationCode::VlessEncryptionRequired,
+                "settings.encryption",
+            ),
+        ] {
+            let issue = finding(&issues, &code)
+                .unwrap_or_else(|| panic!("{code:?} must gate the empty value: {issues:#?}"));
+            assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+            assert_eq!(issue.path.as_deref(), Some(path));
         }
     }
 
@@ -4617,6 +4741,177 @@ mod tests {
         assert!(
             !issues.iter().any(|issue| issue.severity == Severity::Error),
             "no Error may fire on the canonical mux+vision profile: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn model_owns_the_required_endpoint_values_per_protocol() {
+        // VLESS: the empty address, id and encryption, each on its own wire
+        // path, plus a reverse block that is present but whose tag is empty.
+        let mut vless = vless_canonical();
+        {
+            let ProtocolSettings::Vless(settings) = &mut vless.settings else {
+                unreachable!()
+            };
+            settings.address.clear();
+            settings.id.clear();
+            settings.encryption.clear();
+            settings.reverse = Some(crate::model::outbound::VlessReverse::default());
+        }
+        let issues = validate_outbound(&vless);
+        for (code, path) in [
+            (ValidationCode::ServerAddressRequired, "settings.address"),
+            (ValidationCode::VlessIdRequired, "settings.id"),
+            (
+                ValidationCode::VlessEncryptionRequired,
+                "settings.encryption",
+            ),
+            (
+                ValidationCode::VlessReverseTagRequired,
+                "settings.reverse.tag",
+            ),
+        ] {
+            let issue = finding(&issues, &code).unwrap_or_else(|| {
+                panic!("{code:?} must fire on a fresh VLESS draft: {issues:#?}")
+            });
+            assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+            assert_eq!(issue.path.as_deref(), Some(path));
+        }
+
+        // Whitespace is the same missing value — the editor's address field
+        // trims before it judges, and the model is now that same rule. An
+        // absent reverse block stays the valid default.
+        let mut vless = vless_canonical();
+        {
+            let ProtocolSettings::Vless(settings) = &mut vless.settings else {
+                unreachable!()
+            };
+            settings.address = "   ".into();
+            settings.reverse = Some(crate::model::outbound::VlessReverse {
+                tag: "  ".into(),
+                ..Default::default()
+            });
+        }
+        let issues = validate_outbound(&vless);
+        assert!(
+            finding(&issues, &ValidationCode::ServerAddressRequired).is_some(),
+            "a whitespace address is empty: {issues:#?}"
+        );
+        assert!(
+            finding(&issues, &ValidationCode::VlessReverseTagRequired).is_some(),
+            "a whitespace reverse tag is empty: {issues:#?}"
+        );
+        let ProtocolSettings::Vless(reverse_cleared) = &mut vless.settings else {
+            unreachable!()
+        };
+        reverse_cleared.reverse = None;
+        let issues = validate_outbound(&vless);
+        assert!(
+            finding(&issues, &ValidationCode::VlessReverseTagRequired).is_none(),
+            "an absent reverse block is the default: {issues:#?}"
+        );
+
+        // VMess: the empty address and id.
+        let mut vmess = vmess_canonical();
+        {
+            let ProtocolSettings::Vmess(settings) = &mut vmess.settings else {
+                unreachable!()
+            };
+            settings.address.clear();
+            settings.id.clear();
+        }
+        let issues = validate_outbound(&vmess);
+        for (code, path) in [
+            (ValidationCode::ServerAddressRequired, "settings.address"),
+            (ValidationCode::VmessIdRequired, "settings.id"),
+        ] {
+            let issue = finding(&issues, &code).unwrap_or_else(|| {
+                panic!("{code:?} must fire on a fresh VMess draft: {issues:#?}")
+            });
+            assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+            assert_eq!(issue.path.as_deref(), Some(path));
+        }
+
+        // SOCKS, HTTP and Hysteria share the empty-address / zero-port pair.
+        for protocol in [Protocol::Socks, Protocol::Http, Protocol::Hysteria] {
+            let outbound = OutboundModel::new(protocol);
+            let issues = validate_outbound(&outbound);
+            for (code, path) in [
+                (ValidationCode::ServerAddressRequired, "settings.address"),
+                (ValidationCode::ServerPortRequired, "settings.port"),
+            ] {
+                let issue = finding(&issues, &code).unwrap_or_else(|| {
+                    panic!("{}: {code:?} must fire: {issues:#?}", protocol.as_str())
+                });
+                assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+                assert_eq!(issue.path.as_deref(), Some(path));
+            }
+            // A configured endpoint of the same protocol stays clean.
+            let mut configured = OutboundModel::new(protocol);
+            match &mut configured.settings {
+                ProtocolSettings::Socks(settings) => {
+                    settings.address = "proxy.example.com".into();
+                    settings.port = 1080;
+                }
+                ProtocolSettings::Http(settings) => {
+                    settings.address = "proxy.example.com".into();
+                    settings.port = 8080;
+                }
+                ProtocolSettings::Hysteria(settings) => {
+                    settings.address = "hysteria.example.com".into();
+                    settings.port = 443;
+                }
+                other => unreachable!("unexpected settings {other:?}"),
+            }
+            let issues = validate_outbound(&configured);
+            assert!(
+                finding(&issues, &ValidationCode::ServerAddressRequired).is_none()
+                    && finding(&issues, &ValidationCode::ServerPortRequired).is_none(),
+                "{}: a configured endpoint must pass: {issues:#?}",
+                protocol.as_str()
+            );
+        }
+
+        // Loopback hands the connection back to the inbound it names, so an
+        // empty (or whitespace) tag has no target.
+        let dispatch = |tag: &str| {
+            let mut outbound = OutboundModel::new(Protocol::Loopback);
+            let ProtocolSettings::Loopback(settings) = &mut outbound.settings else {
+                unreachable!()
+            };
+            settings.inbound_tag = tag.into();
+            validate_outbound(&outbound)
+        };
+        for tag in ["", "   "] {
+            let issues = dispatch(tag);
+            let issue = finding(&issues, &ValidationCode::LoopbackTagRequired)
+                .unwrap_or_else(|| panic!("{tag:?} must be refused: {issues:#?}"));
+            assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+            assert_eq!(issue.path.as_deref(), Some("settings.inboundTag"));
+        }
+        assert!(
+            finding(&dispatch("dns-in"), &ValidationCode::LoopbackTagRequired).is_none(),
+            "a named inbound is the valid state"
+        );
+    }
+
+    /// The protocol tag and the `settings` block are separate fields: a
+    /// hand-edited state file can disagree, and the model refuses the pair
+    /// once, with no path (the pair is wrong, not a field).
+    #[test]
+    fn protocol_and_settings_mismatch_gates_once_without_a_path() {
+        let mut outbound = vless_canonical();
+        outbound.protocol = Protocol::Vmess;
+        let issues = validate_outbound(&outbound);
+        let issue = finding(&issues, &ValidationCode::ProtocolSettingsMismatch)
+            .unwrap_or_else(|| panic!("the mismatch must gate: {issues:#?}"));
+        assert_eq!(issue.severity, Severity::Error, "{issue:?}");
+        assert_eq!(issue.path, None);
+
+        let matching = validate_outbound(&vless_canonical());
+        assert!(
+            finding(&matching, &ValidationCode::ProtocolSettingsMismatch).is_none(),
+            "a matching pair never reports: {matching:#?}"
         );
     }
 

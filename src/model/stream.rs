@@ -2872,8 +2872,12 @@ impl StreamModel {
         Ok(())
     }
 
-    /// Select security if Xray supports it for the current transport.
-    pub fn select_security(&mut self, security: Security) -> Result<(), ValidationCode> {
+    /// Whether Xray accepts `security` on the current transport: hysteria and
+    /// MASQUE run over TLS only, and REALITY rides only the transports
+    /// [`Network::supports_reality`] names. [`Self::select_security`] enforces
+    /// this rule and the editor's security selector renders it, so the
+    /// selector's disabled options and the model cannot disagree.
+    pub fn can_select_security(&self, security: Security) -> Result<(), ValidationCode> {
         if self.network == Network::Hysteria && security != Security::Tls {
             return Err(ValidationCode::HysteriaTransportRequiresTls);
         }
@@ -2883,6 +2887,36 @@ impl StreamModel {
         if security == Security::Reality && !self.network.supports_reality() {
             return Err(ValidationCode::RealityRequiresTransport);
         }
+        Ok(())
+    }
+
+    /// The transport-security pair this stream currently carries, as the
+    /// refusal [`Self::can_select_security`] gives for it — `None` when the
+    /// pair is one Xray accepts. The transport and security tabs render this
+    /// code's message above their rows, so the notice and the selector's
+    /// disabled options are the model's own verdict rather than a second
+    /// copy of the predicates.
+    pub fn transport_security_notice(&self) -> Option<ValidationCode> {
+        self.can_select_security(self.security).err()
+    }
+
+    /// Whether the MASQUE transport's TLS ALPN list carries both `h2` and
+    /// `h3`: the transport dials HTTP/2 only when `h2` is present and `h3`
+    /// absent (`transport/internet/masque/dialer.go:132-134`), so the pair
+    /// silently picks HTTP/3. `validate_masque_stream` reports the advisory
+    /// and the TLS block renders it from this same predicate.
+    pub fn masque_alpn_prefers_http3(&self) -> bool {
+        self.network == Network::Masque
+            && self.security == Security::Tls
+            && self.tls_settings.as_ref().is_some_and(|tls| {
+                tls.alpn.iter().any(|value| value == "h2")
+                    && tls.alpn.iter().any(|value| value == "h3")
+            })
+    }
+
+    /// Select security if Xray supports it for the current transport.
+    pub fn select_security(&mut self, security: Security) -> Result<(), ValidationCode> {
+        self.can_select_security(security)?;
         self.security = security;
         match security {
             Security::None => {}
@@ -3243,6 +3277,129 @@ mod tests {
             stream.tls_settings.is_some(),
             "choosing hysteria materializes the TLS block"
         );
+    }
+
+    /// `can_select_security` is the rule `select_security` enforces: every
+    /// (network, security) pair is accepted — and the state changed — by both,
+    /// so the security selector's disabled options and its hover message are
+    /// the model's verdict instead of a second copy of the predicates.
+    #[test]
+    fn can_select_security_rejects_exactly_the_pairs_select_security_rejects() {
+        for network in Network::ALL {
+            for security in [Security::None, Security::Tls, Security::Reality] {
+                let mut stream = StreamModel {
+                    network,
+                    security: Security::None,
+                    ..Default::default()
+                };
+                let verdict = stream.can_select_security(security);
+                assert_eq!(
+                    verdict,
+                    stream.select_security(security),
+                    "{network:?} + {security:?}: the two readers must agree"
+                );
+                match verdict {
+                    Ok(()) => assert_eq!(stream.security, security, "{network:?}"),
+                    Err(_) => assert_eq!(
+                        stream.security,
+                        Security::None,
+                        "{network:?} + {security:?}: a refused pair changes nothing"
+                    ),
+                }
+            }
+        }
+
+        // The codes each pair produces — the message the selector renders.
+        let refusal = |network: Network, security: Security| {
+            StreamModel {
+                network,
+                ..Default::default()
+            }
+            .can_select_security(security)
+        };
+        assert_eq!(
+            refusal(Network::Hysteria, Security::None),
+            Err(ValidationCode::HysteriaTransportRequiresTls)
+        );
+        assert_eq!(
+            refusal(Network::Hysteria, Security::Reality),
+            Err(ValidationCode::HysteriaTransportRequiresTls),
+            "the transport's TLS requirement wins over REALITY's"
+        );
+        assert_eq!(
+            refusal(Network::Masque, Security::None),
+            Err(ValidationCode::MasqueTransportRequiresTls)
+        );
+        assert_eq!(
+            refusal(Network::Masque, Security::Reality),
+            Err(ValidationCode::MasqueTransportRequiresTls)
+        );
+        for network in Network::ALL
+            .into_iter()
+            .filter(|network| !network.supports_reality())
+        {
+            if matches!(network, Network::Hysteria | Network::Masque) {
+                continue;
+            }
+            assert_eq!(
+                refusal(network, Security::Reality),
+                Err(ValidationCode::RealityRequiresTransport),
+                "{network:?} cannot ride REALITY"
+            );
+        }
+
+        // The notice is that same refusal for the pair the stream carries,
+        // and `None` once the pair is one the model accepts.
+        let mut stream = StreamModel {
+            network: Network::Hysteria,
+            security: Security::None,
+            ..Default::default()
+        };
+        assert_eq!(
+            stream.transport_security_notice(),
+            Some(ValidationCode::HysteriaTransportRequiresTls)
+        );
+        stream
+            .select_security(Security::Tls)
+            .expect("hysteria runs over TLS");
+        assert_eq!(stream.transport_security_notice(), None);
+    }
+
+    /// The MASQUE ALPN advisory is one predicate: the model pass reports the
+    /// warning and the TLS block renders it from the same call.
+    #[test]
+    fn masque_alpn_h2_and_h3_is_the_predicate_the_model_reports() {
+        let mut stream = StreamModel {
+            network: Network::Masque,
+            security: Security::Tls,
+            tls_settings: Some(TlsModel {
+                alpn: vec!["h2".into(), "h3".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(stream.masque_alpn_prefers_http3());
+        for alpn in [vec!["h2".to_string()], vec!["h3".to_string()], vec![]] {
+            stream.tls_settings = Some(TlsModel {
+                alpn,
+                ..Default::default()
+            });
+            assert!(
+                !stream.masque_alpn_prefers_http3(),
+                "only the pair makes MASQUE pick HTTP/3 unseen"
+            );
+        }
+        // The rule belongs to the MASQUE transport over TLS; another
+        // transport's identical ALPN list means nothing.
+        stream.tls_settings = Some(TlsModel {
+            alpn: vec!["h2".into(), "h3".into()],
+            ..Default::default()
+        });
+        stream.network = Network::Ws;
+        assert!(!stream.masque_alpn_prefers_http3());
+        stream.network = Network::Masque;
+        stream.security = Security::None;
+        assert!(!stream.masque_alpn_prefers_http3());
     }
 
     /// Every transport's diagnostic path names the block its own wire form

@@ -150,8 +150,9 @@ pub enum ValidationCode {
     /// UUID (common/uuid/uuid.go) — dialing a *different* account. Broccoli
     /// deliberately diverges with a UUID-only policy (the one definition is
     /// `is_canonical_uuid`, which the import `check_uuid`, the finalmask
-    /// validator, and the UI UUID field validator all call). Empty ids stay
-    /// out of scope (draft state; the editor requires them).
+    /// validator, and the UI UUID field validator all call). The empty id has
+    /// its own code ([`Self::VlessIdRequired`] / [`Self::VmessIdRequired`]) and
+    /// is not this rule's concern.
     SettingsIdNotUuid,
     // ---- transport-security formats (validate_stream) ----
     /// REALITY client `publicKey` (stored in the profile's `password`
@@ -1154,24 +1155,26 @@ pub enum ValidationCode {
     /// (infra/conf/transport_internet.go:266-276). Error tier.
     XdriveH3CongestionBrutal,
 
-    // ---- draft requirements ----
+    // ---- protocol-settings required values (validate_outbound) ----
     //
-    // The rules below judge a *server draft*: the empty field a fresh draft
-    // starts from, the value a widget can only judge while the user types it.
-    // Every one of them is a value the wire accepts — Xray builds a config
-    // with an empty VLESS id as readily as it builds an empty string — so no
-    // model sweep emits them and no stored profile is refused for carrying
-    // them. The editor's own sweep emits them so a draft rule has an identity
-    // (code + tier) instead of a rendered sentence. Their messages name the
-    // field the user is looking at, so none carries a wire path.
+    // The empty-value states a *server draft* starts from. They used to be
+    // the editor's own draft requirements; the model sweep owns them now, so
+    // the editor's Save gate, `validate_settings`, generation and the
+    // share-link grammar's `validate_outbound` call all refuse the same
+    // profile with the same message. Each finding carries the wire path of
+    // the field it judges. Error tier like every other model rule: a profile
+    // with no endpoint to dial is not a configuration the user can apply.
     /// The profile's protocol tag and its `settings` block name different
     /// protocols: serde binds the two independently, so a hand-edited state
-    /// file can disagree, and every model rule reads one of them.
+    /// file can disagree, and every model rule reads one of them. Carries no
+    /// path — the pair is wrong, not a field.
     ProtocolSettingsMismatch,
-    /// A server address field is empty (`settings.address`). An outbound
-    /// dialing the empty host fails every connection.
+    /// A server address field is empty (`settings.address`), whitespace-only
+    /// included. An outbound dialing the empty host fails every connection.
     ServerAddressRequired,
-    /// A server port field is zero (`settings.port`).
+    /// A server port field is zero (`settings.port`), for the protocols with
+    /// no dedicated completeness code (SOCKS, HTTP, Hysteria). VLESS and VMess
+    /// report port 0 as [`Self::SettingsPortZero`].
     ServerPortRequired,
     /// VLESS `settings.id` is empty. Xray builds the config and the handler
     /// rejects every connection for lack of a user id.
@@ -1181,8 +1184,9 @@ pub enum ValidationCode {
     /// encryption"). The *value* grammar is [`Self::VlessEncryptionUnsupported`];
     /// this code is the missing-value state.
     VlessEncryptionRequired,
-    /// VLESS `settings.reverse.tag` is set but empty: the reverse tag is the
-    /// outbound's own tag on the wire, and an empty one cannot be routed to.
+    /// VLESS `settings.reverse.tag` is set but empty (whitespace-only
+    /// included): the reverse tag is the outbound's own tag on the wire, and
+    /// an empty one cannot be routed to.
     VlessReverseTagRequired,
     /// VMess `settings.id` is empty — the same missing-user state as
     /// [`Self::VlessIdRequired`].

@@ -160,29 +160,6 @@ fn server_reference_paths(
 
 // ---------- editor validation sweep ----------
 
-/// A server draft's address field must carry something: a fresh draft starts
-/// empty and the editor refuses to commit it. Protocols whose model rule
-/// judges the address themselves (Trojan/Shadowsocks completeness) do not
-/// reach here.
-fn require_address(blocking: &mut Vec<ValidationIssue>, address: &str) {
-    if address.trim().is_empty() {
-        blocking.push(ValidationIssue::error(
-            ValidationCode::ServerAddressRequired,
-        ));
-    }
-}
-
-/// Empty-address / port-0 draft essentials for the protocols with no model
-/// rule for them (the VLESS/VMess port-0 and non-UUID-id pushes are the
-/// model's `SettingsPortZero` / `SettingsIdNotUuid` instead — one message
-/// channel per value).
-fn require_remote(blocking: &mut Vec<ValidationIssue>, address: &str, port: u16) {
-    require_address(blocking, address);
-    if port == 0 {
-        blocking.push(ValidationIssue::error(ValidationCode::ServerPortRequired));
-    }
-}
-
 fn runnable_fragment() -> Fragment {
     Fragment {
         length: Some(Int32Range::single(100)),
@@ -218,12 +195,14 @@ const DNS_RULE_ACTION_OPTIONS: [&str; DNS_OUT_ACTIONS.len() + 1] = [
     DNS_OUT_ACTIONS[3],
 ];
 
-/// One full editor validation sweep, as findings: the model rules for the
-/// outbound, its stream security and the transport's own blocks, plus the
-/// draft requirements the editor owns — the empty state a fresh draft starts
-/// from, and the value only the widget being typed in can judge. Nothing here
-/// is rendered; [`EditorValidationFindings::render`] turns a sweep into the
-/// strings the lists and the inline verdicts show, once per (draft
+/// One full editor validation sweep, as findings: the model's
+/// `validate_outbound` verdict — protocol settings, stream security and the
+/// transport's own blocks — plus the block verdicts that same model pass
+/// calls (finalmask, sockopt, ECH sockopt). The sweep mints no rule of its
+/// own: every finding the editor gates on has a model code and a wire path,
+/// so the Save gate, generation and the importer answer one verdict. Nothing
+/// here is rendered; [`EditorValidationFindings::render`] turns a sweep into
+/// the strings the lists and the inline verdicts show, once per (draft
 /// generation, language).
 #[derive(Default)]
 struct EditorValidationFindings {
@@ -341,126 +320,20 @@ fn sockopt_findings_for(profile: &ServerProfile) -> (Verdict, Verdict) {
 }
 
 fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindings {
-    let mut blocking: Vec<ValidationIssue> = Vec::new();
-    let mut advisory: Vec<ValidationIssue> = Vec::new();
     let (stream_sockopt, ech_sockopt) = sockopt_findings_for(profile);
     let finalmask = finalmask_findings(profile);
-    if profile.outbound.protocol != profile.outbound.settings.protocol() {
-        return EditorValidationFindings {
-            blocking: vec![ValidationIssue::error(
-                ValidationCode::ProtocolSettingsMismatch,
-            )],
-            advisory,
-            finalmask,
-            stream_sockopt,
-            ech_sockopt,
-        };
-    }
-
-    match &profile.outbound.settings {
-        ProtocolSettings::Vless(settings) => {
-            // Port 0, out-of-vocab flow/encryption, and non-UUID ids are
-            // model rules below; only the empty-address draft requirement and
-            // the empty-value "must choose" states are editor rules (the
-            // model deliberately accepts "" as the default/empty state).
-            require_address(&mut blocking, &settings.address);
-            if settings.id.is_empty() {
-                blocking.push(ValidationIssue::error(ValidationCode::VlessIdRequired));
-            }
-            if settings.encryption.is_empty() {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::VlessEncryptionRequired,
-                ));
-            }
-            if settings
-                .reverse
-                .as_ref()
-                .is_some_and(|reverse| reverse.tag.trim().is_empty())
-            {
-                blocking.push(ValidationIssue::error(
-                    ValidationCode::VlessReverseTagRequired,
-                ));
-            }
-        }
-        ProtocolSettings::Vmess(settings) => {
-            // Port 0, non-UUID ids, and the security vocabulary are model
-            // rules below; the empty-address draft requirement and the
-            // empty-id "required" state are editor rules.
-            require_address(&mut blocking, &settings.address);
-            if settings.id.is_empty() {
-                blocking.push(ValidationIssue::error(ValidationCode::VmessIdRequired));
-            }
-        }
-        ProtocolSettings::Trojan(_) => {
-            // Server essentials (empty address/password, port 0) are model
-            // rules below — the editor pushes were duplicates of the same
-            // predicates on the same values.
-        }
-        ProtocolSettings::Shadowsocks(_) => {
-            // Method vocabulary, SS-2022 key material, and server essentials
-            // (address/password/port) are model rules below — the editor
-            // pushes were duplicates; the level range is a model invariant
-            // too.
-        }
-        ProtocolSettings::Socks(settings) => {
-            require_remote(&mut blocking, &settings.address, settings.port);
-        }
-        ProtocolSettings::Http(settings) => {
-            require_remote(&mut blocking, &settings.address, settings.port);
-        }
-        ProtocolSettings::Wireguard(_) => {
-            // Key material, the reserved bytes, and the peer essentials
-            // (public key, endpoint, pre-shared key) are model rules below —
-            // the editor pushes were the same predicates on the same values,
-            // from a verdict this list already merges.
-        }
-        ProtocolSettings::Freedom(_) => {
-            // The fragment and noises blocks are model rules below
-            // (validate_outbound) whose old editor shapes were both stricter
-            // and looser than the core's, so the editor keeps no copy.
-            // finalRules actions are a model rule below (validate_outbound).
-        }
-        ProtocolSettings::Blackhole(_) => {
-            // The response type is a model invariant reported below.
-        }
-        ProtocolSettings::Dns(_) => {
-            // The rule actions are a model rule below (validate_outbound).
-        }
-        ProtocolSettings::Loopback(settings) => {
-            if settings.inbound_tag.trim().is_empty() {
-                blocking.push(ValidationIssue::error(ValidationCode::LoopbackTagRequired));
-            }
-        }
-        ProtocolSettings::Hysteria(settings) => {
-            require_remote(&mut blocking, &settings.address, settings.port);
-            // version is a model invariant reported below.
-        }
-        ProtocolSettings::Masque(_) => {
-            // Address/port requiredness, the transport/TLS pair, mux, and the
-            // remote-DNS list are model rules below — one message channel.
-        }
-    }
-    // Model validation pass: protocol + stream + transport security in one
-    // sweep. Its blocking findings join the editor's own draft requirements;
-    // its advisory ones render amber in the warnings list instead of the
-    // error list — the verdict answers which is which.
+    // The model pass owns every rule the editor gates on — protocol
+    // settings (missing address/port/id/encryption, the reverse tag, the
+    // protocol/settings mismatch), stream security, transport security and
+    // the transport's own blocks. Its advisory findings render amber in the
+    // warnings list instead of the error list; the verdict answers which is
+    // which. The three block verdicts above are the same pass's per-block
+    // calls, kept apart only so the tabs can render them inline.
     let model = validate_outbound(&profile.outbound);
-    blocking.extend(model.blocking().cloned());
-    advisory.extend(model.advisory().cloned());
-
-    // The stream sweep: every rule it used to re-derive lives in the model
-    // pass above — header-map JSON values (`HeaderValuesNotStrings`, one path
-    // per transport), the fromMitm ALPN interaction (`TlsFromMitmAlpnShort`),
-    // and the certificate-file-or-PEM presence rule
-    // (`TlsCertificateRequired`, its path naming the offending row) — so a
-    // stream value has exactly one message channel here. What stays editor-only
-    // is the draft-requirement tier above — the empty "not chosen yet" states,
-    // which the model treats as the valid default — plus the inline hints the
-    // field editors draw beside a value for the row the user is editing.
 
     EditorValidationFindings {
-        blocking,
-        advisory,
+        blocking: model.blocking().cloned().collect(),
+        advisory: model.advisory().cloned().collect(),
         finalmask,
         stream_sockopt,
         ech_sockopt,
@@ -5182,35 +5055,17 @@ impl ServersScreen {
             }
         });
         ui.separator();
-        if st.security == Security::Reality
-            && st.network != Network::Hysteria
-            && !st.network.supports_reality()
-        {
-            ui.colored_label(
-                status_colors_of(ui).err,
-                validation_message(&ValidationCode::RealityRequiresTransport, lang),
-            );
-        }
-        if st.network == Network::Hysteria && st.security != Security::Tls {
+        // The transport-security pair notice: one model verdict
+        // (`transport_security_notice`), the same refusal the security
+        // selector disables options with, so the two tabs cannot disagree.
+        // Hysteria and MASQUE are repaired by selecting TLS, so their notice
+        // carries the switch button; REALITY's conflict is with the transport
+        // itself and keeps its label-only notice.
+        if let Some(code) = st.transport_security_notice() {
             ui.horizontal(|ui| {
-                ui.colored_label(
-                    status_colors_of(ui).err,
-                    t(lang, Key::SrvHysteriaRequiresTls),
-                );
-                if ui.small_button(t(lang, Key::SrvSwitchToTls)).clicked()
-                    && st.select_security(Security::Tls).is_ok()
-                {
-                    changed = true;
-                }
-            });
-        }
-        if st.network == Network::Masque && st.security != Security::Tls {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    status_colors_of(ui).err,
-                    validation_message(&ValidationCode::MasqueTransportRequiresTls, lang),
-                );
-                if ui.small_button(t(lang, Key::SrvSwitchToTls)).clicked()
+                ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
+                if code != ValidationCode::RealityRequiresTransport
+                    && ui.small_button(t(lang, Key::SrvSwitchToTls)).clicked()
                     && st.select_security(Security::Tls).is_ok()
                 {
                     changed = true;
@@ -6278,24 +6133,11 @@ impl ServersScreen {
         ech_sockopt_errors: &[String],
     ) -> bool {
         let mut changed = false;
-        // MASQUE runs only over TLS, so its transport narrows the selector to
-        // that one mode exactly as the hysteria transport does.
-        let masque_transport = st.network == Network::Masque;
-        if st.network == Network::Hysteria && st.security != Security::Tls {
-            ui.colored_label(
-                status_colors_of(ui).err,
-                t(lang, Key::SrvHysteria2RequiresTlsSelectBelow),
-            );
-        } else if masque_transport && st.security != Security::Tls {
-            ui.colored_label(
-                status_colors_of(ui).err,
-                validation_message(&ValidationCode::MasqueTransportRequiresTls, lang),
-            );
-        } else if st.security == Security::Reality && !st.network.supports_reality() {
-            ui.colored_label(
-                status_colors_of(ui).err,
-                validation_message(&ValidationCode::RealityRequiresTransport, lang),
-            );
+        // The transport-security pair notice: the model's own verdict for the
+        // pair the stream currently carries, so the label, the selector's
+        // disabled options and `select_security` all read one rule.
+        if let Some(code) = st.transport_security_notice() {
+            ui.colored_label(status_colors_of(ui).err, validation_message(&code, lang));
         }
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvSecurity));
@@ -6305,28 +6147,17 @@ impl ServersScreen {
                     Security::Tls => "tls",
                     Security::Reality => "reality",
                 };
-                let allowed = if st.network == Network::Hysteria || masque_transport {
-                    sec == Security::Tls
-                } else {
-                    sec != Security::Reality || st.network.supports_reality()
-                };
+                // The selector's disabled state is the model's refusal, not a
+                // second copy of the pair predicates.
+                let refusal = st.can_select_security(sec).err();
                 let response = ui
-                    .add_enabled_ui(allowed, |ui| ui.selectable_label(st.security == sec, label))
+                    .add_enabled_ui(refusal.is_none(), |ui| {
+                        ui.selectable_label(st.security == sec, label)
+                    })
                     .inner;
-                let response = if allowed {
-                    response
-                } else if st.network == Network::Hysteria {
-                    response.on_disabled_hover_text(t(lang, Key::SrvHysteria2RequiresTls))
-                } else if masque_transport {
-                    response.on_disabled_hover_text(validation_message(
-                        &ValidationCode::MasqueTransportRequiresTls,
-                        lang,
-                    ))
-                } else {
-                    response.on_disabled_hover_text(validation_message(
-                        &ValidationCode::RealityRequiresTransport,
-                        lang,
-                    ))
+                let response = match refusal {
+                    Some(code) => response.on_disabled_hover_text(validation_message(&code, lang)),
+                    None => response,
                 };
                 if response.clicked() && st.security != sec && st.select_security(sec).is_ok() {
                     changed = true;
@@ -6336,16 +6167,16 @@ impl ServersScreen {
         ui.separator();
         match st.security {
             Security::Tls => {
+                // The MASQUE ALPN advisory is the model's warning
+                // (`masque_alpn_prefers_http3`, reported by
+                // `validate_masque_stream`), read before the settings block is
+                // taken out of the stream below.
+                let alpn_warning = st
+                    .masque_alpn_prefers_http3()
+                    .then(|| validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang));
                 let had_settings = st.tls_settings.is_some();
                 let mut s = st.tls_settings.take().unwrap_or_default();
                 let tool_working = self.tool_job.is_some();
-                // The MASQUE transport dials HTTP/2 only when `h2` is present
-                // and `h3` is absent, so the pair silently picks HTTP/3; the
-                // model warning fires for the same pair.
-                let alpn_warning = (masque_transport
-                    && s.alpn.iter().any(|protocol| protocol == "h2")
-                    && s.alpn.iter().any(|protocol| protocol == "h3"))
-                .then(|| validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang));
                 changed |= tls_editor::tls_fields_editor(
                     ui,
                     lang,
@@ -7912,7 +7743,7 @@ mod tests {
         basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
         editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
         fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        sockopt_findings, status_colors_of, status_toast_expired, xmux_section,
+        sockopt_findings, status_colors_of, status_toast_expired, validate_outbound, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -7960,6 +7791,25 @@ mod tests {
     /// has run yet.
     fn draft_for(profile: &ServerProfile) -> ProfileDraft {
         ProfileDraft::existing(profile).expect("the fixture serializes")
+    }
+
+    /// Install `profile` as the selected editor's draft, compared against
+    /// `source`, behind the editor's back: no memo covers the new generation,
+    /// so the next frame sweeps it.
+    fn install_draft(
+        screen: &mut ServersScreen,
+        profile: &ServerProfile,
+        source: serde_json::Value,
+    ) {
+        let generation = screen
+            .existing
+            .draft
+            .as_ref()
+            .map_or(1, |draft| draft.generation.wrapping_add(1));
+        let mut draft = draft_for(profile);
+        draft.baseline = source;
+        draft.generation = generation;
+        screen.existing.draft = Some(draft);
     }
 
     /// The borrowed draft identity a tab entry point takes, for the tests that
@@ -9452,15 +9302,101 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn invalid_new_server_draft_cannot_commit() {
         let invalid = ServerProfile::new("incomplete", OutboundModel::new(Protocol::Vless));
-        assert!(
-            !editor_validation_findings(&invalid).blocking.is_empty(),
-            "a fresh VLESS draft must not be committable"
+        let findings = editor_validation_findings(&invalid);
+        // The refusal is the model's verdict, not an editor-minted copy: a
+        // fresh VLESS draft's missing address and id come back as
+        // `validate_outbound` findings with their wire paths.
+        let model = validate_outbound(&invalid.outbound);
+        assert_eq!(
+            findings.blocking,
+            model.blocking().cloned().collect::<Vec<_>>(),
+            "the editor's blocking half is the model sweep"
+        );
+        for (code, path) in [
+            (ValidationCode::ServerAddressRequired, "settings.address"),
+            (ValidationCode::VlessIdRequired, "settings.id"),
+        ] {
+            let issue = finding(&findings.blocking, code);
+            assert_eq!(issue.path.as_deref(), Some(path), "{issue:?}");
+        }
+        // `new()` normalizes the empty encryption to `none`; the missing-value
+        // rule fires once a draft clears the field, and it is the model's.
+        let mut cleared = invalid;
+        let ProtocolSettings::Vless(settings) = &mut cleared.outbound.settings else {
+            unreachable!()
+        };
+        settings.encryption.clear();
+        let cleared = editor_validation_findings(&cleared);
+        let issue = finding(&cleared.blocking, ValidationCode::VlessEncryptionRequired);
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("settings.encryption"),
+            "{issue:?}"
         );
 
         let valid = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
         let findings = editor_validation_findings(&valid);
         assert!(findings.blocking.is_empty());
         assert!(findings.advisory.is_empty());
+    }
+
+    /// The model's required-value findings are the rendered Save gate: an
+    /// edited VLESS draft with an empty address and id paints the model's
+    /// messages in the error list and takes Validate-and-save dark while
+    /// Discard stays live.
+    #[test]
+    fn empty_vless_address_and_id_block_the_rendered_save_gate() {
+        let clean = {
+            let mut profile = ServerProfile::new("vless", OutboundModel::new(Protocol::Vless));
+            let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings else {
+                unreachable!()
+            };
+            settings.address = "1.2.3.4".into();
+            settings.port = 443;
+            settings.id = "b831381d-6324-4d53-ad4f-8cda48b30811".into();
+            settings.encryption = "none".into();
+            profile
+        };
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(clean.clone());
+        rig.servers.active = Some(clean.id.clone());
+        let mut harness = wide_servers_harness(rig);
+        harness.run();
+
+        let mut empty = clean.clone();
+        {
+            let ProtocolSettings::Vless(settings) = &mut empty.outbound.settings else {
+                unreachable!()
+            };
+            settings.address.clear();
+            settings.id.clear();
+        }
+        install_draft(
+            &mut harness.state_mut().0,
+            &empty,
+            serde_json::to_value(&clean).unwrap(),
+        );
+        harness.run();
+
+        let blocking = editor_blocking(&harness);
+        for (code, path) in [
+            (ValidationCode::ServerAddressRequired, "settings.address"),
+            (ValidationCode::VlessIdRequired, "settings.id"),
+        ] {
+            let issue = finding(&blocking, code);
+            assert_eq!(issue.path.as_deref(), Some(path), "the model owns the rule");
+            let message = validation_issue_message(&issue, Language::En);
+            let bullet = t_fmt(Language::En, Key::ErrorBullet, &[&message]);
+            assert!(
+                harness.query_by_label(bullet.as_str()).is_some(),
+                "the error list must render {message:?}"
+            );
+        }
+        assert_eq!(
+            action_row_disabled(&harness),
+            (true, false),
+            "a draft the model refuses must not be saveable"
+        );
     }
 
     /// One-channel regression guard:
@@ -10059,6 +9995,108 @@ Authentication: ML-KEM-768, Post-Quantum
                 "the Basic tab must render only its memoized verdicts, not re-validate"
             );
         }
+    }
+
+    /// The security tab's pair notice and disabled options are the model's
+    /// verdict (`transport_security_notice` / `can_select_security`): a
+    /// Hysteria stream without TLS paints the model's message above the row
+    /// and disables the modes the model refuses, while TLS stays selectable.
+    #[test]
+    fn security_tab_renders_the_model_pair_verdict_and_disables_refused_modes() {
+        let notice =
+            validation_message(&ValidationCode::HysteriaTransportRequiresTls, Language::En);
+        let mut stream = StreamModel {
+            network: Network::Hysteria,
+            security: Security::None,
+            ..Default::default()
+        };
+        {
+            let mut screen = ServersScreen::default();
+            let mut harness = Harness::new_ui(|ui| {
+                let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
+            });
+            harness.run();
+            assert!(
+                harness.query_by_label(notice.as_str()).is_some(),
+                "the notice must be the model's own message"
+            );
+            for refused in ["none", "reality"] {
+                assert!(
+                    harness.get_by_label(refused).accesskit_node().is_disabled(),
+                    "{refused} must be disabled on the hysteria transport"
+                );
+            }
+            assert!(
+                !harness.get_by_label("tls").accesskit_node().is_disabled(),
+                "TLS is the one mode the transport runs"
+            );
+        }
+
+        // Selecting the accepted pair clears the notice; the refused modes
+        // stay disabled because they are still refusals for this transport.
+        stream
+            .select_security(Security::Tls)
+            .expect("hysteria runs over TLS");
+        let mut screen = ServersScreen::default();
+        let mut harness = Harness::new_ui(|ui| {
+            let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(notice.as_str()).is_none(),
+            "a pair the model accepts renders no notice"
+        );
+        assert!(
+            !harness.get_by_label("tls").accesskit_node().is_disabled(),
+            "TLS stays selectable"
+        );
+    }
+
+    /// The transport tab's pair notice is that same model verdict: a MASQUE
+    /// stream without TLS paints the model's message and its "Switch to TLS"
+    /// button repairs the pair through `select_security`.
+    #[test]
+    fn transport_tab_renders_the_model_pair_notice_and_switches_to_tls() {
+        let notice = validation_message(&ValidationCode::MasqueTransportRequiresTls, Language::En);
+        let switch = t(Language::En, Key::SrvSwitchToTls);
+        let stream = Rc::new(RefCell::new(StreamModel {
+            network: Network::Masque,
+            security: Security::None,
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = Harness::new_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().transport_tab(
+                ui,
+                Language::En,
+                &mut stream_for_ui.borrow_mut(),
+                0,
+                TransportTabCtx {
+                    target: None,
+                    masked: false,
+                    protocol: Protocol::Masque,
+                    mux: None,
+                },
+            );
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(notice.as_str()).is_some(),
+            "the notice must be the model's own message"
+        );
+        harness.get_by_label(switch).click();
+        harness.run();
+        assert_eq!(
+            stream.borrow().security,
+            Security::Tls,
+            "the switch button repairs the pair through the model"
+        );
+        assert!(
+            harness.query_by_label(notice.as_str()).is_none(),
+            "the accepted pair renders no notice"
+        );
     }
 
     #[test]
@@ -13035,20 +13073,6 @@ Authentication: ML-KEM-768, Post-Quantum
     /// enablement reds this test.
     #[test]
     fn editor_action_row_renders_the_gate_fact_combinations() {
-        fn install(screen: &mut ServersScreen, profile: &ServerProfile, source: serde_json::Value) {
-            let generation = screen
-                .existing
-                .draft
-                .as_ref()
-                .map_or(1, |draft| draft.generation.wrapping_add(1));
-            let mut draft = draft_for(profile);
-            draft.baseline = source;
-            draft.generation = generation;
-            // Installed behind the editor's back: no memo covers the new
-            // generation, so the next frame sweeps it.
-            screen.existing.draft = Some(draft);
-        }
-
         let clean = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(clean.clone());
@@ -13065,7 +13089,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The same draft with an edit behind it: both controls are live.
         let mut edited = clean.clone();
         edited.name = "Tokyo edited".into();
-        install(
+        install_draft(
             &mut harness.state_mut().0,
             &edited,
             serde_json::to_value(&clean).unwrap(),
@@ -13081,7 +13105,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // itself still matches its source, so Save must refuse (committing
         // it would leave the unsaved text behind) while Discard stays live,
         // or the user would be stuck with the error text.
-        install(
+        install_draft(
             &mut harness.state_mut().0,
             &clean,
             serde_json::to_value(&clean).unwrap(),
@@ -13107,7 +13131,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The edit plus a blocking finding: Discard stays, Save goes dark.
         let mut blocked = edited;
         blocked.outbound.stream.finalmask = Some(bad_finalmask_model());
-        install(
+        install_draft(
             &mut harness.state_mut().0,
             &blocked,
             serde_json::to_value(&clean).unwrap(),

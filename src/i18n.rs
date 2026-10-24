@@ -1179,7 +1179,6 @@ keys! {
     SrvPreservedOverLimit 0,
     SrvSwitchAwayReality 0,
     SrvHysteriaSelectsTls 0,
-    SrvHysteriaRequiresTls 0,
     SrvSwitchToTls 0,
     SrvUseVersion2 0,
     SrvRewriteHost 0,
@@ -1431,8 +1430,6 @@ keys! {
     SrvGenerateWgHint 0,
     SrvGenerateMldsa65Hint 0,
     SrvRandomHexHint 0,
-    SrvHysteria2RequiresTls 0,
-    SrvHysteria2RequiresTlsSelectBelow 0,
     SrvOnlyHysteria2 0,
     SrvMasquerade 0,
     SrvUseAuto 0,
@@ -4288,7 +4285,6 @@ mod en {
             Key::SrvPreservedOverLimit => "Preserved over-limit downloadSettings JSON",
             Key::SrvSwitchAwayReality => "Switch away from REALITY before choosing this transport",
             Key::SrvHysteriaSelectsTls => "Hysteria2 requires TLS. Selecting it switches to TLS",
-            Key::SrvHysteriaRequiresTls => "Hysteria2 requires TLS.",
             Key::SrvSwitchToTls => "Switch to TLS",
             Key::SrvUseVersion2 => "Use version 2",
             Key::SrvRewriteHost => "rewrite Host",
@@ -4624,8 +4620,6 @@ mod en {
             Key::SrvGenerateWgHint => "Runs xray wg in the background.",
             Key::SrvGenerateMldsa65Hint => "Runs xray mldsa65 in the background.",
             Key::SrvRandomHexHint => "random hex",
-            Key::SrvHysteria2RequiresTls => "Hysteria2 requires TLS",
-            Key::SrvHysteria2RequiresTlsSelectBelow => "Hysteria2 requires TLS. Select TLS below.",
             Key::SrvOnlyHysteria2 => "Xray supports only Hysteria version 2.",
             Key::SrvMasquerade => "masquerade",
             Key::SrvUseAuto => "Use auto",
@@ -6658,12 +6652,16 @@ mod tests {
 
         let mut hysteria = OutboundModel::new(Protocol::Hysteria);
         // `new()` normalizes version=2 and security=Tls via enforce_invariants;
-        // force every violation explicitly so all three rules fire.
+        // force every violation explicitly so all three rules fire. The
+        // endpoint is filled in: the missing-address/port rules are not under
+        // test here and would add their own messages to the pinned list.
         {
             let ProtocolSettings::Hysteria(settings) = &mut hysteria.settings else {
                 unreachable!()
             };
             settings.version = 1;
+            settings.address = "hysteria.example.com".into();
+            settings.port = 443;
         }
         hysteria.stream.network = Network::Hysteria;
         hysteria.stream.security = Security::None;
