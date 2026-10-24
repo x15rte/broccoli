@@ -6920,6 +6920,7 @@ mod tests {
             code: ValidationCode::MuxWithVisionFlow,
             path: Some("mux".into()),
             severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
         };
         assert_eq!(
             validation_message(&mux_issue.code, Language::En),
@@ -6950,6 +6951,7 @@ mod tests {
                 code: ValidationCode::ServerNameImplausible,
                 path: Some(path.into()),
                 severity: Severity::Warning,
+                target: crate::model::validation::FindingTarget::Document,
             };
             let rendered = validation_issue_message(&issue, Language::En);
             assert!(rendered.starts_with(&format!("{path}: ")), "{rendered}");
@@ -6973,6 +6975,7 @@ mod tests {
             code: ValidationCode::RealityFingerprintUntested("ios".into()),
             path: Some("stream.realitySettings.fingerprint".into()),
             severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
         };
         let rendered = validation_issue_message(&issue, Language::En);
         for needle in ["ios", "chrome", "firefox", "safari"] {
@@ -7007,6 +7010,7 @@ mod tests {
             code: ValidationCode::FinalmaskUdpMaskNotLast("udphop".into()),
             path: Some("finalmask.udp[0]".into()),
             severity: Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         };
         assert_eq!(
             validation_issue_message(&not_last, Language::En),
@@ -7017,6 +7021,7 @@ mod tests {
             code: ValidationCode::FinalmaskUdpHopIntervalTransportConflict,
             path: None,
             severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
         };
         assert_eq!(
             validation_issue_message(&interval, Language::En),
@@ -7296,6 +7301,7 @@ mod tests {
                     code,
                     path: None,
                     severity: Severity::Error,
+                    target: crate::model::validation::FindingTarget::Document,
                 },
                 Language::En,
             )

@@ -55,6 +55,12 @@ pub(crate) struct UiTestRig {
     /// test may seed the model directly — without the shell's dirty hook —
     /// and still have the screen read the verdict for what it seeded.
     pub(crate) safety: crate::model::safety::SafetyVerdicts,
+    /// The validation verdict the frame publishes: the whole-model settings
+    /// walk, rebuilt in [`UiTestRig::ctx`] exactly as the shell's generation
+    /// fills it, so a seeded model is judged by the same pass the Apply gate
+    /// runs. The API port is the fixed test port — the walk's collision rule
+    /// only needs one concrete port, and no test drives the control plane.
+    pub(crate) verdict: crate::model::validation::Verdict,
     /// The frame's requests, as the shell owns them: the rig hands the same
     /// bundle to every `ctx()` and tests read the fields a screen set.
     pub(crate) requests: crate::ui::FrameRequests,
@@ -114,6 +120,7 @@ impl Default for UiTestRig {
             connect_blocked_reason: None,
             config_error: None,
             safety: Default::default(),
+            verdict: Default::default(),
             requests: crate::ui::FrameRequests::default(),
             probe_feedback: Default::default(),
             stats: None,
@@ -152,6 +159,10 @@ impl Default for UiTestRig {
 /// size, so a screen test lays out the width a user's window can actually
 /// have. A test that needs another width asks for one explicitly.
 pub(crate) const DEFAULT_TEST_VIEWPORT: egui::Vec2 = egui::Vec2::new(900.0, 600.0);
+
+/// The control-plane port the rig hands the settings walk: any concrete port
+/// serves the listener-collision rule, and no screen test binds it.
+pub(crate) const TEST_API_PORT: u16 = 19999;
 
 /// One screen's frame entry: the signature every screen presents, so the
 /// shared rig can drive any of them without a per-test closure.
@@ -281,6 +292,11 @@ impl UiTestRig {
             latency_generation: self.latency_generation,
         };
         self.safety = crate::model::safety::SafetyVerdicts::of(&self.servers, &self.settings);
+        self.verdict = crate::model::validation::validate_settings(
+            &self.settings,
+            &self.servers,
+            TEST_API_PORT,
+        );
         UiCtx::new(
             UiCtxParts {
                 servers: &mut self.servers,
@@ -293,6 +309,7 @@ impl UiTestRig {
                 requests: &mut self.requests,
                 model_generation: &mut self.model_generation,
                 safety: &self.safety,
+                verdict: &self.verdict,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
                 operation: self.operation,

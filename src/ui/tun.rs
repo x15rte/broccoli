@@ -2,7 +2,7 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
-use crate::model::validation::{ValidationCode, tun_gateway_verdict, tun_leak_misconfig_tun_off};
+use crate::model::validation::{FindingTarget, ValidationCode};
 use crate::model::{Mode, emit, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
@@ -33,17 +33,15 @@ pub struct TunScreen {
     validation: Option<ValidationCache>,
 }
 
-/// One generation of the TUN screen's per-generation verdicts: the
+/// One generation of the TUN screen's per-generation presentation: the
 /// pre-rendered privacy-warning message for the "tun" finding of the shell's
-/// assessment ("TUN mode with no DNS configuration"), the inline validation
-/// error for a gateway list without an IPv4 entry, and the unrouted-family
-/// advisory rendered under the leak-block switch — all computed once per
-/// model generation.
+/// safety assessment ("TUN mode with no DNS configuration") and the
+/// takeover state. The validation rules the settings walk publishes (the
+/// gateway requirement, the unrouted-family advisory) are *not* cached here:
+/// the screen asks `ctx.verdict.for_target(FindingTarget::Tun)` for them.
 struct ValidationCache {
     generation: u64,
     tun_warning: Option<String>,
-    gateway_error: Option<String>,
-    leak_warning: Option<String>,
     /// The DNS leak block is emitted and its DNS half is on: the only state
     /// in which turning the takeover off can stall name resolution.
     dns_leak_block_on: bool,
@@ -122,6 +120,10 @@ impl TunScreen {
         // read from the live model at rebuild time, so no second key is
         // needed for it.
         let lang = ctx.settings.language;
+        // The published generation verdict: the TUN rules are asked by
+        // structural target below, so the screen never re-runs a predicate the
+        // settings walk already judged.
+        let verdict = ctx.verdict;
         let generation = *ctx.model_generation;
         if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
             // The shell's verdict for this generation: the privacy finding
@@ -132,10 +134,6 @@ impl TunScreen {
                 tun_warning: findings
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
-                gateway_error: tun_gateway_verdict(ctx.settings)
-                    .map(|code| validation_message(&code, lang)),
-                leak_warning: tun_leak_misconfig_tun_off(ctx.settings)
-                    .then(|| validation_message(&ValidationCode::TunLeakMisconfigTunOff, lang)),
                 dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
                     && ctx.settings.tun.leak_blocks_dns(),
             });
@@ -144,14 +142,16 @@ impl TunScreen {
             Some(cache) => cache.tun_warning.as_deref(),
             None => unreachable!("validation is built when absent, above"),
         };
-        let gateway_error = match &self.validation {
-            Some(cache) => cache.gateway_error.as_deref(),
-            None => unreachable!("validation is built when absent, above"),
-        };
-        let leak_warning = match &self.validation {
-            Some(cache) => cache.leak_warning.as_deref(),
-            None => unreachable!("validation is built when absent, above"),
-        };
+        // The model's own TUN findings, rendered as their code's message
+        // (the switch and the gateway editor are the locations).
+        let gateway_error = verdict
+            .for_target(FindingTarget::Tun)
+            .find(|issue| issue.code == ValidationCode::TunIpv4GatewayRequired)
+            .map(|issue| validation_message(&issue.code, lang));
+        let leak_warning = verdict
+            .for_target(FindingTarget::Tun)
+            .find(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff)
+            .map(|issue| validation_message(&issue.code, lang));
         let dns_leak_block_on = match &self.validation {
             Some(cache) => cache.dns_leak_block_on,
             None => unreachable!("validation is built when absent, above"),
@@ -251,7 +251,7 @@ impl TunScreen {
             // pass renders, never a second sentence. A plain label consumes
             // no auto-id slot, so the section's widget ids do not shift when
             // it appears or clears.
-            if let Some(message) = leak_warning {
+            if let Some(message) = leak_warning.as_deref() {
                 ui.label(
                     egui::RichText::new(message)
                         .small()
@@ -295,7 +295,7 @@ impl TunScreen {
             // screen mirrors that verdict exactly where the user can fix it.
             // A plain label consumes no egui auto-id slot, so the section's
             // widget ids never shift when the error appears or clears.
-            if let Some(error) = gateway_error {
+            if let Some(error) = gateway_error.as_deref() {
                 ui.label(
                     egui::RichText::new(error)
                         .small()
@@ -774,6 +774,62 @@ mod tests {
             harness.state().1.settings.tun.auto_system_wfp_block_leak,
             vec!["bogus".to_string(), TUN_LEAK_MISCONFIG_TUN.to_string()],
             "turning the DNS half off must remove every spelling of it"
+        );
+    }
+
+    /// The two settings-verdict rules this screen renders — the IPv4 gateway
+    /// requirement and the unrouted-family advisory — come from the published
+    /// generation verdict, asked by [`FindingTarget::Tun`]. The screen shows
+    /// the code's message while the model carries the fault, and the fixed
+    /// model clears both.
+    #[test]
+    fn the_screen_renders_the_verdicts_tun_findings() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.gateway.clear();
+        rig.settings.tun.auto_system_wfp_block_leak = vec![TUN_LEAK_DNS.into()];
+        let mut harness = leak_harness(rig);
+
+        let gateway = validation_message(&ValidationCode::TunIpv4GatewayRequired, Language::En);
+        let advisory = validation_message(&ValidationCode::TunLeakMisconfigTunOff, Language::En);
+        assert!(
+            harness
+                .query_all_by_label(gateway.as_str())
+                .next()
+                .is_some(),
+            "a cleared gateway list must render the model's gateway finding: {gateway}"
+        );
+        assert!(
+            harness
+                .query_all_by_label(advisory.as_str())
+                .next()
+                .is_some(),
+            "a switched-off family half must render the model's advisory: {advisory}"
+        );
+
+        {
+            let rig = &mut harness.state_mut().1;
+            rig.settings.tun.gateway = crate::model::TunCfg::default().gateway;
+            rig.settings
+                .tun
+                .auto_system_wfp_block_leak
+                .push(TUN_LEAK_MISCONFIG_TUN.into());
+            rig.edit();
+        }
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label(gateway.as_str())
+                .next()
+                .is_none(),
+            "re-adding an IPv4 gateway must clear the finding"
+        );
+        assert!(
+            harness
+                .query_all_by_label(advisory.as_str())
+                .next()
+                .is_none(),
+            "re-enabling the half must clear the advisory"
         );
     }
 

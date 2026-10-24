@@ -25,6 +25,7 @@ pub(crate) mod test_rig;
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
+use crate::model::validation::Verdict;
 use crate::model::{ServerProfile, ServersFile, Settings};
 use crate::probe_verdict::{dead_verdict_line, warn_summary};
 use crate::rt::{
@@ -134,6 +135,13 @@ pub struct UiCtx<'a> {
     pub connect_blocked_reason: &'a Option<String>,
     /// The shell's per-generation safety verdict (see [`UiCtxParts`]).
     pub safety: &'a SafetyVerdicts,
+    /// The validation verdict of the generation that filled
+    /// [`Self::config_error`], published by reference: the whole-model walk
+    /// ran once, and a screen asks its own row with
+    /// [`Verdict::for_target`] instead of re-deriving a rule or matching a
+    /// path. An edit inside the persist throttle is judged by the generation
+    /// it would commit (ADR-0084).
+    pub verdict: &'a Verdict,
     /// The shell's stored config-generation error for the current model
     /// revision — its generator text is excerpt-bounded by the generation
     /// boundary before any label or log can see it, and its raw-override
@@ -238,6 +246,9 @@ pub(crate) struct UiCtxParts<'a> {
     /// generation: one instance every screen reads its own slice of, instead
     /// of each running the assessment itself.
     pub(crate) safety: &'a SafetyVerdicts,
+    /// The shell's published validation verdict (the generation's whole-model
+    /// findings), projected into [`UiCtx::verdict`].
+    pub(crate) verdict: &'a Verdict,
     /// The shell's stored config-generation error (the same value the
     /// top-bar config chip renders), projected into [`UiCtx::config_error`].
     pub(crate) config_error: &'a Option<String>,
@@ -295,6 +306,7 @@ impl<'a> UiCtx<'a> {
             requests,
             model_generation,
             safety,
+            verdict,
             connect_blocked_reason,
             config_error,
             operation,
@@ -355,6 +367,7 @@ impl<'a> UiCtx<'a> {
             model_generation,
             busy: gate::BusyWindow::from_operation(operation),
             safety,
+            verdict,
             connect_blocked_reason,
             config_error,
             is_elevated,

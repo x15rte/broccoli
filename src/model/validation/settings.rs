@@ -5,37 +5,16 @@
 
 use super::outbound::{validate_outbound, validate_sniffing};
 use super::{
-    ValidationCode, ValidationIssue, Verdict, excerpt, issue, validate_finalmask, warning,
+    FindingTarget, ValidationCode, ValidationIssue, Verdict, excerpt, issue, validate_finalmask,
+    warning,
 };
 use crate::model::dns::parse_pool_cidr;
 use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
-    LocalInboundProtocol, Sniffing, TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN,
-    listen_endpoints_conflict,
+    LocalInboundProtocol, TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN, listen_endpoints_conflict,
 };
 use crate::model::{ServerProfile, ServersFile, Settings, TunCfg, emit, vocabulary_holds};
 use std::collections::{BTreeMap, BTreeSet};
-
-/// The verdict one row's sniffing editor renders, or `None` when the row is
-/// appliable: the first item [`validate_sniffing`] refuses, from the same
-/// vocabulary the walk records in full. Every finding of that vocabulary
-/// shares one code, so a row shows the same message whichever item is
-/// refused. `emitted` is the row's own gate
-/// ([`emit::local_inbound_emitted`], [`emit::dokodemo_emitted`]): a row that
-/// never reaches the wire is judged by nothing.
-pub fn sniffing_row_verdict(
-    emitted: bool,
-    sniffing: &Sniffing,
-    prefix: &str,
-) -> Option<ValidationCode> {
-    if !emitted {
-        return None;
-    }
-    validate_sniffing(sniffing, prefix)
-        .into_iter()
-        .next()
-        .map(|finding| finding.code)
-}
 
 /// Validate a listen address: always a concrete IP literal.
 pub fn validate_listen_address(s: &str) -> Result<(), ValidationCode> {
@@ -160,7 +139,10 @@ pub fn noise_script_issues(script: Option<&str>, noise_items: usize) -> Vec<Vali
 // (a profile's display name, an inbound label) as their path; findings
 // whose message already names the offender carry none. Generation renders
 // a path-carrying finding as `"{location}: {rule message}"` — the same
-// bytes the pre-pass generator emitted.
+// bytes the pre-pass generator emitted. The same findings carry the row they
+// judge as their [`FindingTarget`], which is what a screen asks with
+// [`Verdict::for_target`]; the path is presentation only and stays unchanged
+// so the rendered text keeps its bytes.
 
 /// True when a local inbound's "require authentication" intent never
 /// reaches the wire: password mode with an empty account list. SOCKS
@@ -432,11 +414,13 @@ fn profile_set_verdict(
 
     for profile in profiles {
         let location = profile_display_name(profile);
+        let target = FindingTarget::Profile(profile.id.clone());
         for finding in validate_outbound(&profile.outbound) {
             issues.push(ValidationIssue {
                 code: finding.code,
                 path: Some(location.clone()),
                 severity: finding.severity,
+                target: target.clone(),
             });
         }
     }
@@ -535,9 +519,11 @@ impl<'a> SettingsWalk<'a> {
     /// universe.
     fn balancers(&mut self) {
         for (index, balancer) in self.settings.routing.balancers.iter().enumerate() {
+            let target = FindingTarget::Balancer(index);
             if balancer.tag.trim().is_empty() {
-                self.issues
-                    .push(issue(ValidationCode::BalancerTagMissing(index + 1), None));
+                self.issues.push(
+                    issue(ValidationCode::BalancerTagMissing(index + 1), None).at(target.clone()),
+                );
                 // The remaining checks would name a tag that does not exist.
                 continue;
             }
@@ -546,27 +532,36 @@ impl<'a> SettingsWalk<'a> {
                 .iter()
                 .all(|selector| selector.trim().is_empty())
             {
-                self.issues.push(issue(
-                    ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             if !self.balancer_tags.insert(balancer.tag.clone()) {
-                self.issues.push(issue(
-                    ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             if !balancer.fallback_tag.is_empty()
                 && !self.outbound_tags.contains(&balancer.fallback_tag)
             {
-                self.issues.push(issue(
-                    ValidationCode::BalancerFallbackMissing(
-                        excerpt(&balancer.tag),
-                        excerpt(&balancer.fallback_tag),
-                    ),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::BalancerFallbackMissing(
+                            excerpt(&balancer.tag),
+                            excerpt(&balancer.fallback_tag),
+                        ),
+                        None,
+                    )
+                    .at(target),
+                );
             }
         }
     }
@@ -579,21 +574,28 @@ impl<'a> SettingsWalk<'a> {
             if !emit::local_inbound_emitted(entry) {
                 continue;
             }
+            let target = FindingTarget::LocalInbound(index);
             if let Some(code) = local_inbound_auth_verdict(entry) {
-                self.issues.push(issue(code, None));
+                self.issues.push(issue(code, None).at(target.clone()));
             }
             if entry.port == 0 {
-                self.issues.push(issue(
-                    ValidationCode::LocalInboundPortZero(excerpt(&entry.tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::LocalInboundPortZero(excerpt(&entry.tag)),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             let listen_valid = validate_listen_address(&entry.listen).is_ok();
             if !listen_valid {
-                self.issues.push(issue(
-                    ValidationCode::ListenAddressInvalid,
-                    Some(format!("local inbound {:?}", excerpt(&entry.tag))),
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::ListenAddressInvalid,
+                        Some(format!("local inbound {:?}", excerpt(&entry.tag))),
+                    )
+                    .at(target.clone()),
+                );
             }
             // Inbound sniffing vocabulary: Xray refuses the whole config at
             // load on an unknown destOverride protocol, so this gates
@@ -607,6 +609,7 @@ impl<'a> SettingsWalk<'a> {
                     code: finding.code,
                     path: Some(format!("local inbound {:?}", excerpt(&entry.tag))),
                     severity: finding.severity,
+                    target: target.clone(),
                 });
             }
             // The listener-side mask the core builds for this inbound. A
@@ -622,6 +625,7 @@ impl<'a> SettingsWalk<'a> {
                         code: finding.code,
                         path: Some(path),
                         severity: finding.severity,
+                        target: target.clone(),
                     });
                 }
             }
@@ -638,10 +642,13 @@ impl<'a> SettingsWalk<'a> {
                 ));
             }
             if !self.inbound_tags.insert(entry.tag.clone()) {
-                self.issues.push(issue(
-                    ValidationCode::InboundTagDuplicated(excerpt(&entry.tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::InboundTagDuplicated(excerpt(&entry.tag)),
+                        None,
+                    )
+                    .at(target),
+                );
             }
         }
     }
@@ -655,17 +662,22 @@ impl<'a> SettingsWalk<'a> {
             if !emit::dokodemo_emitted(inbound) {
                 continue;
             }
+            let target = FindingTarget::Dokodemo(index);
             if inbound.tag.is_empty() {
-                self.issues
-                    .push(issue(ValidationCode::DokodemoTagMissing(index + 1), None));
+                self.issues.push(
+                    issue(ValidationCode::DokodemoTagMissing(index + 1), None).at(target.clone()),
+                );
             }
             let tag = inbound.tag.clone();
             let mode = inbound.network_mode();
             if let Err(error) = &mode {
-                self.issues.push(warning(
-                    ValidationCode::DokodemoNetworkInvalid(excerpt(&tag), excerpt(error)),
-                    None,
-                ));
+                self.issues.push(
+                    warning(
+                        ValidationCode::DokodemoNetworkInvalid(excerpt(&tag), excerpt(error)),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             // Same sniffing gate as the local endpoints above.
             for finding in
@@ -675,27 +687,34 @@ impl<'a> SettingsWalk<'a> {
                     code: finding.code,
                     path: Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
                     severity: finding.severity,
+                    target: target.clone(),
                 });
             }
             match mode {
                 Ok(DokodemoNetwork::Unix) => {
                     let path = inbound.unix_socket_path.trim();
                     if path.is_empty() {
-                        self.issues.push(issue(
-                            ValidationCode::DokodemoUnixSocketRequired(excerpt(&tag)),
-                            None,
-                        ));
+                        self.issues.push(
+                            issue(
+                                ValidationCode::DokodemoUnixSocketRequired(excerpt(&tag)),
+                                None,
+                            )
+                            .at(target.clone()),
+                        );
                     } else {
                         let normalized = normalize_windows_socket_path(path);
                         match self.unix_listeners.get(&normalized) {
-                            Some(other) => self.issues.push(issue(
-                                ValidationCode::DokodemoUnixSocketConflict(
-                                    excerpt(&tag),
-                                    excerpt(other),
-                                    excerpt(path),
-                                ),
-                                None,
-                            )),
+                            Some(other) => self.issues.push(
+                                issue(
+                                    ValidationCode::DokodemoUnixSocketConflict(
+                                        excerpt(&tag),
+                                        excerpt(other),
+                                        excerpt(path),
+                                    ),
+                                    None,
+                                )
+                                .at(target.clone()),
+                            ),
                             None => {
                                 self.unix_listeners.insert(normalized, tag.clone());
                             }
@@ -704,17 +723,20 @@ impl<'a> SettingsWalk<'a> {
                 }
                 Ok(DokodemoNetwork::Tcp | DokodemoNetwork::Udp | DokodemoNetwork::TcpUdp) => {
                     if inbound.listen_port == 0 {
-                        self.issues.push(warning(
-                            ValidationCode::DokodemoPortZero(excerpt(&tag)),
-                            None,
-                        ));
+                        self.issues.push(
+                            warning(ValidationCode::DokodemoPortZero(excerpt(&tag)), None)
+                                .at(target.clone()),
+                        );
                     }
                     let listen_valid = validate_listen_address(&inbound.listen).is_ok();
                     if !listen_valid {
-                        self.issues.push(issue(
-                            ValidationCode::ListenAddressInvalid,
-                            Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
-                        ));
+                        self.issues.push(
+                            issue(
+                                ValidationCode::ListenAddressInvalid,
+                                Some(format!("dokodemo inbound {:?}", excerpt(&tag))),
+                            )
+                            .at(target.clone()),
+                        );
                     }
                     if listen_valid && inbound.listen_port != 0 {
                         let protocols =
@@ -746,10 +768,9 @@ impl<'a> SettingsWalk<'a> {
                 }
             }
             if !self.inbound_tags.insert(tag.clone()) {
-                self.issues.push(issue(
-                    ValidationCode::InboundTagDuplicated(excerpt(&tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(ValidationCode::InboundTagDuplicated(excerpt(&tag)), None).at(target),
+                );
             }
         }
     }
@@ -764,7 +785,7 @@ impl<'a> SettingsWalk<'a> {
     /// adapter DNS pins.
     fn tun(&mut self) {
         if let Some(code) = tun_gateway_verdict(self.settings) {
-            self.issues.push(issue(code, None));
+            self.issues.push(issue(code, None).at(FindingTarget::Tun));
         }
         // The generator writes the leak key exactly while the TUN inbound and
         // the DNS module are both present (`emit::dns_inbound_emitted`, the model
@@ -780,22 +801,29 @@ impl<'a> SettingsWalk<'a> {
         if emit::dns_inbound_emitted(self.settings) {
             let leak = &self.settings.tun.auto_system_wfp_block_leak;
             if !leak.is_empty() && self.settings.tun.auto_system_routing_table.is_empty() {
-                self.issues
-                    .push(issue(ValidationCode::TunLeakRoutingTableRequired, None));
+                self.issues.push(
+                    issue(ValidationCode::TunLeakRoutingTableRequired, None).at(FindingTarget::Tun),
+                );
             }
             for (index, value) in leak.iter().enumerate() {
                 if !vocabulary_holds(&[TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN], value) {
-                    self.issues.push(issue(
-                        ValidationCode::TunLeakValueUnknown(excerpt(value)),
-                        Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
-                    ));
+                    self.issues.push(
+                        issue(
+                            ValidationCode::TunLeakValueUnknown(excerpt(value)),
+                            Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
+                        )
+                        .at(FindingTarget::Tun),
+                    );
                 }
             }
             if tun_leak_misconfig_tun_off(self.settings) {
-                self.issues.push(warning(
-                    ValidationCode::TunLeakMisconfigTunOff,
-                    Some("tun.autoSystemWfpBlockLeak".into()),
-                ));
+                self.issues.push(
+                    warning(
+                        ValidationCode::TunLeakMisconfigTunOff,
+                        Some("tun.autoSystemWfpBlockLeak".into()),
+                    )
+                    .at(FindingTarget::Tun),
+                );
             }
         }
     }
@@ -875,41 +903,54 @@ impl<'a> SettingsWalk<'a> {
             self.issues.push(issue(code, Some("routing.script".into())));
         }
         for (index, rule) in self.settings.routing.rules.iter().enumerate() {
+            let target = FindingTarget::Rule(index);
             if let Some(error) = rule.target_error() {
-                self.issues.push(issue(
-                    ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
+                        None,
+                    )
+                    .at(target),
+                );
                 // The reference checks below would name an unresolved target.
                 continue;
             }
             if !rule.outbound_tag.is_empty() && !self.outbound_tags.contains(&rule.outbound_tag) {
-                self.issues.push(issue(
-                    ValidationCode::RoutingRuleOutboundMissing(
-                        index + 1,
-                        excerpt(&rule.outbound_tag),
-                    ),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::RoutingRuleOutboundMissing(
+                            index + 1,
+                            excerpt(&rule.outbound_tag),
+                        ),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             if !rule.balancer_tag.is_empty() && !self.balancer_tags.contains(&rule.balancer_tag) {
-                self.issues.push(issue(
-                    ValidationCode::RoutingRuleBalancerMissing(
-                        index + 1,
-                        excerpt(&rule.balancer_tag),
-                    ),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::RoutingRuleBalancerMissing(
+                            index + 1,
+                            excerpt(&rule.balancer_tag),
+                        ),
+                        None,
+                    )
+                    .at(target.clone()),
+                );
             }
             if let Some(tag) = rule
                 .inbound_tag
                 .iter()
                 .find(|tag| !self.inbound_tags.contains(*tag))
             {
-                self.issues.push(issue(
-                    ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
-                    None,
-                ));
+                self.issues.push(
+                    issue(
+                        ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
+                        None,
+                    )
+                    .at(target),
+                );
             }
         }
     }
@@ -1023,30 +1064,6 @@ mod tests {
     use crate::model::validation::Severity;
     use crate::model::validation::tests::{codes, finding};
     use serde_json::{Map, json};
-    /// The verdict one row's sniffing editor renders: the vocabulary's first
-    /// finding, and only for a row that reaches the wire. Every finding of
-    /// that vocabulary shares one code, so the row's message does not depend
-    /// on which item is refused.
-    #[test]
-    fn sniffing_row_verdict_names_the_first_finding_of_an_emitted_row() {
-        let junk = Sniffing {
-            dest_override: vec!["tcp".into(), "nope".into()],
-            ..Default::default()
-        };
-        assert_eq!(
-            sniffing_row_verdict(true, &junk, "localInbounds[0].sniffing"),
-            Some(ValidationCode::SniffingDestOverrideInvalid)
-        );
-        // A row that never reaches the wire is judged by nothing.
-        assert_eq!(
-            sniffing_row_verdict(false, &junk, "localInbounds[0].sniffing"),
-            None
-        );
-        assert_eq!(
-            sniffing_row_verdict(true, &Sniffing::default(), "localInbounds[0].sniffing"),
-            None
-        );
-    }
 
     /// The verdict one local endpoint's authentication editor renders, and
     /// with it the walk's rule: "require authentication" ticked on an emitted
@@ -1444,6 +1461,100 @@ mod tests {
             balancer < rule && rule < server && server < pool_cidr && pool_cidr < pool_size,
             "rules must stay in the generator's order: {found:#?}"
         );
+    }
+
+    #[test]
+    fn every_walk_finding_carries_the_target_of_the_row_it_judges() {
+        use crate::model::routing::{Balancer, Rule};
+
+        // One finding in every row family the walk names.
+        let mut freedom = OutboundModel::new(Protocol::Freedom);
+        freedom.send_through = Some("10.0.0.0/33".into());
+        let mut settings = Settings {
+            mode: Mode::Tun,
+            ..Default::default()
+        };
+        settings.local_inbounds[1].listen = "not-an-address".into();
+        settings.dokodemo.push(crate::model::inbound::DokodemoCfg {
+            tag: "in-doko-a".into(),
+            enabled: true,
+            network: "tcp".into(),
+            listen: "also-not-an-address".into(),
+            listen_port: 10810,
+            ..Default::default()
+        });
+        settings.tun.gateway.clear();
+        settings.routing.rules = vec![
+            Rule {
+                outbound_tag: DIRECT_OUTBOUND_TAG.into(),
+                ..Default::default()
+            },
+            Rule {
+                outbound_tag: "missing-outbound".into(),
+                ..Default::default()
+            },
+        ];
+        settings.routing.balancers = vec![Balancer::default()];
+        let servers = ServersFile {
+            profiles: vec![named_profile("aaaaaaaa11111111", "edge", freedom)],
+            ..Default::default()
+        };
+        let verdict = validate_settings(&settings, &servers, 10853);
+
+        // The row's own target answers with the row's finding, and a row
+        // without one answers nothing.
+        let codes_at = |target: FindingTarget| -> Vec<ValidationCode> {
+            verdict
+                .for_target(target)
+                .map(|issue| issue.code.clone())
+                .collect()
+        };
+        assert!(
+            codes_at(FindingTarget::Profile("aaaaaaaa11111111".into()))
+                .contains(&ValidationCode::SendThroughInvalid)
+        );
+        assert_eq!(
+            codes_at(FindingTarget::Profile("bbbbbbbb22222222".into())),
+            Vec::new(),
+            "a profile id that judged nothing owns no finding"
+        );
+        assert!(
+            codes_at(FindingTarget::LocalInbound(1))
+                .contains(&ValidationCode::ListenAddressInvalid)
+        );
+        assert!(
+            codes_at(FindingTarget::LocalInbound(0)).is_empty(),
+            "the valid endpoint owns nothing"
+        );
+        assert!(
+            codes_at(FindingTarget::Dokodemo(0)).contains(&ValidationCode::ListenAddressInvalid)
+        );
+        assert!(codes_at(FindingTarget::Tun).contains(&ValidationCode::TunIpv4GatewayRequired));
+        assert!(
+            codes_at(FindingTarget::Rule(1))
+                .iter()
+                .any(|code| matches!(code, ValidationCode::RoutingRuleOutboundMissing(2, _)))
+        );
+        assert!(
+            codes_at(FindingTarget::Rule(0)).is_empty(),
+            "the rule whose references resolve owns nothing"
+        );
+        assert!(
+            codes_at(FindingTarget::Balancer(0)).contains(&ValidationCode::BalancerTagMissing(1))
+        );
+        assert!(codes_at(FindingTarget::Balancer(1)).is_empty());
+
+        // Every finding the walk produced is found at exactly the target it
+        // carries: the query and the field cannot disagree.
+        for issue in verdict.iter() {
+            assert!(
+                verdict
+                    .for_target(issue.target.clone())
+                    .any(|found| std::ptr::eq(found, issue)),
+                "{issue:?} must be reachable at {:?}",
+                issue.target
+            );
+        }
     }
 
     #[test]

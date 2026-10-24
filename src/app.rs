@@ -9,7 +9,7 @@ use crate::links::excerpt;
 use crate::model::inbound::API_INBOUND_TAG;
 use crate::model::safety::{SafetyFinding, SafetyVerdicts};
 use crate::model::settings::{Language, Mode};
-use crate::model::validation::ValidationIssue;
+use crate::model::validation::{ValidationIssue, Verdict};
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
     AppMessage, ApplyIntent, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState,
@@ -407,6 +407,17 @@ pub struct BroccoliApp {
     /// assessment runs once per edit generation instead of once per consumer.
     /// `None` until the first refresh.
     safety_cache: Option<SafetyCache>,
+    /// The validation verdict of the generation that filled `config_error`,
+    /// stored beside it: the same generation's whole-model findings, kept
+    /// structured so a screen can ask [`Verdict::for_target`] for its own row
+    /// instead of re-deriving a rule the pass already ran. It is memoized —
+    /// one instance behind a reference, projected through [`cached_verdict`]
+    /// — so no frame pass runs the settings walk, which needs the ephemeral
+    /// control-plane port. An edit inside the persist throttle is judged by
+    /// the generation it would commit, exactly like `config_error`: the
+    /// previous generation's findings stay published until the persist step
+    /// regenerates (ADR-0084). `None` until the boot generation.
+    generation_verdict: Option<GenerationVerdict>,
     /// A state file (settings.json / servers.json) held valid JSON that
     /// could not be loaded — an unknown `security`/`network` value, a field
     /// of the wrong type, etc. The file is left intact for the user to fix.
@@ -811,11 +822,12 @@ impl BroccoliApp {
         // Baseline for the changes-pending gate: before any apply the gate
         // compares against the config a fresh Connect would apply — the one
         // generated from the just-loaded state.
-        let generated_candidate = generate_runtime_candidate(&servers, &settings, lang);
+        let (generated_candidate, generation_verdict) =
+            generate_runtime_candidate(&servers, &settings, lang);
         let config_error = generated_candidate.as_ref().err().cloned();
         let applied_candidate = generated_candidate
             .ok()
-            .map(|(candidate, _)| normalize_candidate_for_compare(candidate));
+            .map(normalize_candidate_for_compare);
         let applied_dns_takeover = settings.dns_takeover;
 
         let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(EVT_CHANNEL_CAPACITY);
@@ -912,6 +924,10 @@ impl BroccoliApp {
             raw_override_verdict: None,
             connect_block_cache: None,
             safety_cache: None,
+            generation_verdict: Some(GenerationVerdict {
+                generation: 0,
+                verdict: generation_verdict,
+            }),
             pending_safety_ack: None,
             state_error,
             persistence_error,
@@ -1134,12 +1150,11 @@ impl BroccoliApp {
                             // current model state (revision match: no edit
                             // landed since the commit); refresh the baseline
                             // the changes-pending gate compares against.
+                            let (candidate, verdict) =
+                                generate_runtime_candidate(&self.servers, &self.settings, lang);
+                            self.record_generation_verdict(verdict);
                             self.applied_candidate =
-                                generate_runtime_candidate(&self.servers, &self.settings, lang)
-                                    .ok()
-                                    .map(|(candidate, _)| {
-                                        normalize_candidate_for_compare(candidate)
-                                    });
+                                candidate.ok().map(normalize_candidate_for_compare);
                             self.applied_dns_takeover = self.settings.dns_takeover;
                         }
                         self.config_dirty = !settles_current;
@@ -1622,6 +1637,26 @@ impl BroccoliApp {
         );
     }
 
+    /// Publish one generation's verdict: the field every screen reads this
+    /// frame through [`cached_verdict`]. A regeneration at the same model
+    /// generation that produced the same findings (an apply click, the apply
+    /// settle) keeps the existing instance, so a screen that borrowed it does
+    /// not see a spurious rebuild. Only the generation paths — boot, the
+    /// config persist, the two commit paths, the settle — call this; a frame
+    /// never runs the settings walk.
+    fn record_generation_verdict(&mut self, verdict: Verdict) {
+        if matches!(
+            &self.generation_verdict,
+            Some(cache) if cache.generation == self.model_generation && cache.verdict == verdict
+        ) {
+            return;
+        }
+        self.generation_verdict = Some(GenerationVerdict {
+            generation: self.model_generation,
+            verdict,
+        });
+    }
+
     /// The terminal message a Connect or Apply attempt fails with while the
     /// managed core cannot run: no tree, a stale tree (its release metadata
     /// names another build), or a tree that failed verification. The message
@@ -1767,16 +1802,23 @@ impl BroccoliApp {
             self.record_generation_failure(reason.clone());
             return Err(reason);
         }
-        let (config, advisories) =
-            match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-                Ok(generated) => generated,
-                Err(message) => {
-                    self.record_generation_failure(message.clone());
-                    return Err(message);
-                }
-            };
+        let (generated, verdict) = generate_runtime_candidate(&self.servers, &self.settings, lang);
+        let config = match generated {
+            Ok(config) => {
+                // The advisory log is rendered from the local verdict before
+                // it is published (one render, no second walk, no borrow of
+                // the shell's field).
+                self.log_config_advisories(&verdict, lang);
+                self.record_generation_verdict(verdict);
+                config
+            }
+            Err(message) => {
+                self.record_generation_verdict(verdict);
+                self.record_generation_failure(message.clone());
+                return Err(message);
+            }
+        };
         self.config_error = None;
-        self.log_config_advisories(&advisories, lang);
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
@@ -1924,8 +1966,13 @@ impl BroccoliApp {
         if kind == PersistKind::Config {
             self.config_revision = self.config_revision.wrapping_add(1);
             self.apply_result = None;
-            match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-                Ok((config, _)) => {
+            let (generated, verdict) =
+                generate_runtime_candidate(&self.servers, &self.settings, lang);
+            // The verdict moves with `config_error`: both describe this one
+            // generation of the persisted model.
+            self.record_generation_verdict(verdict);
+            match generated {
+                Ok(config) => {
                     self.config_error = None;
                     // The gate is derived, not sticky: an edit reverted to the
                     // applied state (or the startup baseline) drops "changes
@@ -2003,16 +2050,20 @@ impl BroccoliApp {
             self.record_generation_failure(reason);
             return;
         }
-        let (config, advisories) =
-            match generate_runtime_candidate(&self.servers, &self.settings, lang) {
-                Ok(generated) => generated,
-                Err(message) => {
-                    self.record_generation_failure(message);
-                    return;
-                }
-            };
+        let (generated, verdict) = generate_runtime_candidate(&self.servers, &self.settings, lang);
+        let config = match generated {
+            Ok(config) => {
+                self.log_config_advisories(&verdict, lang);
+                self.record_generation_verdict(verdict);
+                config
+            }
+            Err(message) => {
+                self.record_generation_verdict(verdict);
+                self.record_generation_failure(message);
+                return;
+            }
+        };
         self.config_error = None;
-        self.log_config_advisories(&advisories, lang);
         let want_tun = self.settings.mode == crate::model::Mode::Tun;
         if self.send_command(CoreCmd::Apply {
             value: config,
@@ -2034,8 +2085,8 @@ impl BroccoliApp {
     /// document drops. The apply paths call this at the user's own action;
     /// the edit-time recompute does not, because the same finding on every
     /// keystroke-throttled frame would bury the log.
-    fn log_config_advisories(&mut self, advisories: &[ValidationIssue], lang: Language) {
-        for line in config_advisory_lines(advisories, lang) {
+    fn log_config_advisories(&mut self, verdict: &Verdict, lang: Language) {
+        for line in config_advisory_lines(verdict.advisory(), lang) {
             self.push_keyed_log(Key::LogConfigWarning, line);
         }
     }
@@ -2267,6 +2318,7 @@ impl eframe::App for BroccoliApp {
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
+                    verdict: cached_verdict(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2324,6 +2376,7 @@ impl eframe::App for BroccoliApp {
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
+                    verdict: cached_verdict(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2362,6 +2415,7 @@ impl eframe::App for BroccoliApp {
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
+                    verdict: cached_verdict(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2562,13 +2616,19 @@ fn tun_outbound_interface_block_reason(
     }
 }
 
+/// One runtime candidate plus the verdict of the generation that judged it:
+/// `Ok` is the document the core would receive, `Err` the excerpt-bounded
+/// generation text. The verdict is returned either way — a blocking finding
+/// stays structured for the screens even when generation refused the model,
+/// where previously only the flattened error text survived.
 fn generate_runtime_candidate(
     servers: &ServersFile,
     settings: &Settings,
     lang: Language,
-) -> Result<(serde_json::Value, Vec<ValidationIssue>), String> {
-    let (config, advisories) =
-        r#gen::generate_with_advisories(servers, settings).map_err(|error| {
+) -> (Result<serde_json::Value, String>, Verdict) {
+    let (result, verdict) = r#gen::generate_with_verdict(servers, settings);
+    let result = result
+        .map_err(|error| {
             // Generation errors can echo user-editable content
             // (raw-override text, model fields) into every surface that shows
             // this message — the startup baseline and edit-time config chips,
@@ -2577,17 +2637,23 @@ fn generate_runtime_candidate(
             // shared 48-char bound here, before it can reach a UI label or the
             // rotating log.
             t_fmt(lang, Key::GenerationFailed, &[&excerpt(&error.text(lang))])
-        })?;
-    validate_raw_override_candidate(settings, &config, lang)?;
-    Ok((config, advisories))
+        })
+        .and_then(|config| {
+            validate_raw_override_candidate(settings, &config, lang)?;
+            Ok(config)
+        });
+    (result, verdict)
 }
 
 /// The log lines a generation's advisory findings produce: one per finding,
 /// each rendering the finding's own text through the log key. A free function
 /// so the rendering is testable without an `eframe` context.
-fn config_advisory_lines(advisories: &[ValidationIssue], lang: Language) -> Vec<String> {
+fn config_advisory_lines<'a>(
+    advisories: impl IntoIterator<Item = &'a ValidationIssue>,
+    lang: Language,
+) -> Vec<String> {
     advisories
-        .iter()
+        .into_iter()
         .map(|issue| {
             t_fmt(
                 lang,
@@ -2643,6 +2709,28 @@ fn cached_safety(cache: &Option<SafetyCache>) -> &SafetyVerdicts {
         .as_ref()
         .map(|cache| &cache.verdicts)
         .unwrap_or(&NO_SAFETY)
+}
+
+/// One generation's whole-model validation verdict, stamped with the model
+/// generation it judged: the cache the shell publishes to every screen.
+struct GenerationVerdict {
+    generation: u64,
+    verdict: Verdict,
+}
+
+/// The empty projection [`cached_verdict`] hands back before the boot
+/// generation fills the field.
+static NO_VERDICT: Verdict = Verdict::EMPTY;
+
+/// Project the published generation verdict out of the field. A free function
+/// over it (like [`cached_safety`]): the frame's `UiCtxParts` literal borrows
+/// it side by side with `&mut` model borrows, which only compile while the
+/// borrow stays field-disjoint.
+fn cached_verdict(cache: &Option<GenerationVerdict>) -> &Verdict {
+    cache
+        .as_ref()
+        .map(|cache| &cache.verdict)
+        .unwrap_or(&NO_VERDICT)
 }
 
 /// Render the hazard-acknowledgment confirmation: every finding's
@@ -2778,6 +2866,7 @@ fn validate_raw_override_candidate(
             code: crate::model::validation::ValidationCode::OutboundProxySettingsRemoved,
             path: Some(format!("outbounds[{index}]")),
             severity: crate::model::validation::Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         };
         return Err(crate::i18n::validation_issue_message(&issue, lang));
     }
@@ -2786,6 +2875,7 @@ fn validate_raw_override_candidate(
             code: crate::model::validation::ValidationCode::FinalmaskQuicHopMoved,
             path: Some(path),
             severity: crate::model::validation::Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         };
         return Err(crate::i18n::validation_issue_message(&issue, lang));
     }
@@ -3240,9 +3330,9 @@ mod safety_tests {
             // between the text and the core.
             let mut overridden = settings.clone();
             overridden.raw_override = Some(config.to_string());
-            let message =
-                generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En)
-                    .expect_err("the retired key must gate the candidate");
+            let (generated, _) =
+                generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En);
+            let message = generated.expect_err("the retired key must gate the candidate");
             assert!(
                 message.contains("streamSettings.sockopt.dialerProxy"),
                 "{key} = {value}: {message}"
@@ -3354,7 +3444,9 @@ mod safety_tests {
         let mut overridden = settings;
         overridden.raw_override = Some(config.to_string());
         assert!(
-            generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En).is_err(),
+            generate_runtime_candidate(&ServersFile::default(), &overridden, Language::En)
+                .0
+                .is_err(),
             "the retired hop key must gate the candidate"
         );
     }
@@ -3403,8 +3495,9 @@ mod safety_tests {
             raw_override: Some(format!(r#"{{"a": "{hostile}""#)), // unterminated string
             ..Default::default()
         };
-        let error = generate_runtime_candidate(&ServersFile::default(), &settings, Language::En)
-            .expect_err("hostile raw override must fail generation");
+        let (generated, _) =
+            generate_runtime_candidate(&ServersFile::default(), &settings, Language::En);
+        let error = generated.expect_err("hostile raw override must fail generation");
         // Exact shape: template + excerpt of the raw generation error text
         // (recovered by generating without the shared boundary).
         let raw_gen_error = crate::r#gen::generate(&ServersFile::default(), &settings)
@@ -4656,6 +4749,7 @@ mod config_advisory_tests {
             code,
             path: Some(path.into()),
             severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
         }
     }
 
@@ -4693,7 +4787,63 @@ mod config_advisory_tests {
 
     #[test]
     fn a_generation_without_findings_logs_nothing() {
-        assert!(config_advisory_lines(&[], Language::En).is_empty());
+        assert!(config_advisory_lines(std::iter::empty(), Language::En).is_empty());
+    }
+}
+
+/// The published generation verdict (contract): the generation call the
+/// boot/persist paths make returns the model's findings beside its result, so
+/// a blocking edit is visible to the screens through the published reference
+/// even though generation refused the document and only the error text
+/// survives on `config_error`. This is the shell's seam — the full app needs
+/// an `eframe` context, so the publish/project cycle is exercised here and
+/// the screens' use of the reference is covered by the TUN/inbounds UI
+/// suites.
+#[cfg(test)]
+mod generation_verdict_tests {
+    use super::{GenerationVerdict, cached_verdict, generate_runtime_candidate};
+    use crate::model::settings::Language;
+    use crate::model::validation::{FindingTarget, ValidationCode};
+    use crate::model::{Mode, ServersFile, Settings, TunCfg};
+
+    #[test]
+    fn a_blocking_edit_is_published_beside_the_generation_error() {
+        // Before the first generation nothing is published, so a screen asks
+        // an empty verdict rather than a stale one.
+        assert!(
+            cached_verdict(&None)
+                .for_target(FindingTarget::Tun)
+                .next()
+                .is_none()
+        );
+
+        // The edit a blocking TUN gateway produces: generation refuses the
+        // document, and the verdict still names the row that caused it.
+        let settings = Settings {
+            mode: Mode::Tun,
+            tun: TunCfg {
+                gateway: Vec::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (generated, verdict) =
+            generate_runtime_candidate(&ServersFile::default(), &settings, Language::En);
+        assert!(
+            generated.is_err(),
+            "a TUN config without an IPv4 gateway must refuse generation"
+        );
+
+        let published = GenerationVerdict {
+            generation: 1,
+            verdict,
+        };
+        assert!(
+            cached_verdict(&Some(published))
+                .for_target(FindingTarget::Tun)
+                .any(|issue| issue.code == ValidationCode::TunIpv4GatewayRequired),
+            "the blocking finding must survive the generation failure"
+        );
     }
 }
 /// The derived config-apply gate (contract): the chip is up exactly while the

@@ -129,7 +129,8 @@ pub fn generate_with_api_port(
     settings: &Settings,
     api_port: u16,
 ) -> Result<Value, GenerateError> {
-    generate_reporting(servers, settings, api_port, &mut Vec::new())
+    let mut verdict = Verdict::EMPTY;
+    generate_reporting(servers, settings, api_port, &mut verdict)
 }
 
 /// [`generate`] with the model's advisory findings: the document is emitted
@@ -142,20 +143,38 @@ pub fn generate_with_advisories(
     servers: &ServersFile,
     settings: &Settings,
 ) -> Result<(Value, Vec<ValidationIssue>), GenerateError> {
-    let api_port = pick_ephemeral_api_port()?;
-    let mut advisories = Vec::new();
-    let value = generate_reporting(servers, settings, api_port, &mut advisories)?;
-    Ok((value, advisories))
+    let (result, verdict) = generate_with_verdict(servers, settings);
+    result.map(|value| (value, verdict.advisory().cloned().collect()))
 }
 
-/// The generation itself, with the advisory half of the settings verdict
-/// collected into `advisories` instead of dropped: one pass, so a caller that
-/// wants the findings pays no second walk.
+/// The generation and the verdict that judged it — the entry point a shell
+/// stores per model generation. `Ok` carries the document beside the verdict;
+/// `Err` carries the failure beside the same verdict, so a blocking finding
+/// survives the failure path instead of being consumed by the error. A
+/// generation that fails before the model pass (no free API port, an
+/// unparsable raw override) publishes [`Verdict::EMPTY`]: nothing judged the
+/// model.
+pub fn generate_with_verdict(
+    servers: &ServersFile,
+    settings: &Settings,
+) -> (Result<Value, GenerateError>, Verdict) {
+    let api_port = match pick_ephemeral_api_port() {
+        Ok(port) => port,
+        Err(error) => return (Err(error), Verdict::EMPTY),
+    };
+    let mut verdict = Verdict::EMPTY;
+    let result = generate_reporting(servers, settings, api_port, &mut verdict);
+    (result, verdict)
+}
+
+/// The generation itself, with the settings verdict collected into `verdict`
+/// before any rule can refuse the document: one pass, so a caller that wants
+/// the findings pays no second walk, and the findings survive the `Err`.
 fn generate_reporting(
     servers: &ServersFile,
     settings: &Settings,
     api_port: u16,
-    advisories: &mut Vec<ValidationIssue>,
+    verdict: &mut Verdict,
 ) -> Result<Value, GenerateError> {
     if api_port == 0 {
         return Err(GenerateError::InvalidModel(Diag::new(
@@ -166,10 +185,9 @@ fn generate_reporting(
         return serde_json::from_str(raw).map_err(GenerateError::RawOverride);
     }
 
-    let verdict = validate_settings(settings, servers, api_port);
-    advisories.extend(verdict.advisory().cloned());
-    if let Some(error) = invalid_model_error(verdict) {
-        return Err(error);
+    *verdict = validate_settings(settings, servers, api_port);
+    if let Some(finding) = verdict.blocking().next() {
+        return Err(GenerateError::InvalidFinding(Box::new(finding.clone())));
     }
     // Health engine: the ordinary observatory (user-selected, or emitted for
     // a balancer that reads live health data) or the burst observatory. A core
@@ -1199,6 +1217,7 @@ mod error_text_tests {
             code: code.clone(),
             path: Some(path.into()),
             severity: Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         }));
         assert_eq!(
             error.text(Language::En),
@@ -1212,6 +1231,7 @@ mod error_text_tests {
             code: ValidationCode::FinalmaskUnknownUdpMask(Some("bogus".into())),
             path: Some(path.into()),
             severity: Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         }));
         let text = scoped.text(Language::En);
         assert!(text.starts_with(&format!("{path}: ")), "{text}");
@@ -1222,6 +1242,7 @@ mod error_text_tests {
             code,
             path: None,
             severity: Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         }));
         assert_eq!(
             whole_model.text(Language::En),
@@ -1230,6 +1251,7 @@ mod error_text_tests {
                     code: ValidationCode::StreamOneNoDownload,
                     path: None,
                     severity: Severity::Error,
+                    target: crate::model::validation::FindingTarget::Document,
                 },
                 Language::En
             )

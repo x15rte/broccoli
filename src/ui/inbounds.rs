@@ -11,8 +11,8 @@ use crate::model::inbound::{
 };
 use crate::model::settings::Language;
 use crate::model::validation::{
-    local_inbound_auth_verdict, normalize_windows_socket_path, sniffing_row_verdict,
-    validate_finalmask, validate_listen_address,
+    FindingTarget, ValidationCode, Verdict, normalize_windows_socket_path, validate_finalmask,
+    validate_listen_address,
 };
 use crate::model::{
     Account, DokodemoCfg, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, LocalInboundCfg,
@@ -38,35 +38,30 @@ pub struct InboundsScreen {
 }
 
 /// One generation of the inbounds validation references: the listener
-/// snapshot plus every derived verdict (collisions, routing reference counts,
-/// tag errors, LAN-exposure posture, auth traps). Rows borrow these while
-/// their editors are open — no per-frame rebuilds or clones.
+/// snapshot plus every derived verdict the model pass does not publish per
+/// row (draft-level collisions, routing reference counts, the row-label tag
+/// errors, LAN-exposure posture, the row-local mask findings). Rows borrow
+/// these while their editors are open — no per-frame rebuilds or clones. The
+/// rules the settings walk reports are *not* cached here: the row asks
+/// `ctx.verdict.for_target(..)` for those.
 struct ValidationCache {
     /// The model generation these verdicts were derived from.
     generation: u64,
     non_loopback: bool,
     /// One collision verdict per local endpoint list entry, in list order.
     local_collisions: Vec<Option<String>>,
-    /// One auth-trap verdict per local endpoint list entry, in list order:
-    /// password-mode HTTP with zero accounts is un-appliable at any bind.
-    /// The model verdict pass enforces the same rule, and the row renders
-    /// the same code's message.
-    local_auth_errors: Vec<Option<String>>,
-    /// One sniffing-vocabulary verdict per local endpoint list entry, in
-    /// list order. The model verdict pass enforces the same rule; the row
-    /// renders the shared model message (same code), so the row and the
-    /// gate never disagree.
-    local_sniffing_errors: Vec<Option<String>>,
     /// Every listener-mask finding per local endpoint list entry, in list
-    /// order — the same `validate_finalmask` pass the settings gate runs, so
-    /// a malformed `filter` rule reads identically in the row and at apply.
+    /// order — the same `validate_finalmask` pass the settings gate runs,
+    /// rendered with the row-local mask path rather than the document path
+    /// the walk prefixes, so a malformed `filter` rule reads as its own field
+    /// in the row and identically to the gate's message at apply.
     local_filter_errors: Vec<Vec<String>>,
     doko_collisions: Vec<Option<String>>,
     doko_references: Vec<usize>,
+    /// One row-label verdict per dokodemo entry, in list order: the empty tag,
+    /// a tag a builtin/reserved listener took, and a duplicate among the
+    /// dokodemo list — including disabled entries, which the walk skips.
     doko_tag_errors: Vec<Option<String>>,
-    /// One sniffing-vocabulary verdict per dokodemo entry, in list order
-    /// (same shared gate/message as `local_sniffing_errors`).
-    doko_sniffing_errors: Vec<Option<String>>,
     /// i18n'd exposure warnings from the shell's verdict, pre-rendered at
     /// the same generation cadence as the collisions. Each listen field
     /// renders its own entry as the amber warning channel; the paths mirror
@@ -102,6 +97,11 @@ impl InboundsScreen {
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
         let lang = ctx.settings.language;
+        // The published generation verdict: the model rules the rows render
+        // are asked here, by structural target, instead of re-derived per
+        // row. The reference is copied out before the model is borrowed
+        // mutably below.
+        let verdict = ctx.verdict;
         // The validation references are rebuilt when the model generation
         // moves — the frame after any edit — and never on idle repaint
         // frames; the cache validates its own row correspondence.
@@ -118,25 +118,9 @@ impl InboundsScreen {
                 local_collisions: (0..ctx.settings.local_inbounds.len())
                     .map(|index| listener_collision(&snapshot, lang, ListenerKey::Local(index)))
                     .collect(),
-                local_auth_errors: (0..ctx.settings.local_inbounds.len())
-                    .map(|index| {
-                        local_inbound_auth_verdict(&ctx.settings.local_inbounds[index])
-                            .map(|code| validation_message(&code, lang))
-                    })
-                    .collect(),
-                local_sniffing_errors: (0..ctx.settings.local_inbounds.len())
-                    .map(|index| {
-                        sniffing_row_error(
-                            lang,
-                            emit::local_inbound_emitted(&ctx.settings.local_inbounds[index]),
-                            &ctx.settings.local_inbounds[index].sniffing,
-                            &format!("localInbounds[{index}].sniffing"),
-                        )
-                    })
-                    .collect(),
                 // A disabled listener reaches neither the wire nor the
                 // settings walk, so its mask verdict must stay off the row
-                // for the same reason its sniffing verdict does.
+                // for the same reason the walk judges no row it drops.
                 local_filter_errors: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
                         let entry = &ctx.settings.local_inbounds[index];
@@ -166,16 +150,6 @@ impl InboundsScreen {
                     .collect(),
                 doko_tag_errors: (0..ctx.settings.dokodemo.len())
                     .map(|index| dokodemo_tag_error(ctx.settings, lang, index))
-                    .collect(),
-                doko_sniffing_errors: (0..ctx.settings.dokodemo.len())
-                    .map(|index| {
-                        sniffing_row_error(
-                            lang,
-                            emit::dokodemo_emitted(&ctx.settings.dokodemo[index]),
-                            &ctx.settings.dokodemo[index].sniffing,
-                            &format!("dokodemo[{index}].sniffing"),
-                        )
-                    })
                     .collect(),
                 local_warnings: (0..ctx.settings.local_inbounds.len())
                     .map(|index| {
@@ -317,13 +291,31 @@ impl InboundsScreen {
                         if auth_pw {
                             changed |= accounts_editor(ui, lang, &mut entry.accounts, masked);
                         }
-                        // The shared gate verdict, rendered under the accounts
-                        // editor it qualifies: password-mode HTTP with zero
-                        // accounts authenticates nobody on the wire, so the row
-                        // cannot apply at any bind (the model auth-trap rule).
-                        inline_error(ui, validation.local_auth_errors[i].as_deref());
+                        // The model's own row finding, rendered under the
+                        // accounts editor it qualifies: password-mode HTTP with
+                        // zero accounts authenticates nobody on the wire, so
+                        // the row cannot apply at any bind.
+                        inline_error(
+                            ui,
+                            row_finding(
+                                verdict,
+                                lang,
+                                FindingTarget::LocalInbound(i),
+                                &ValidationCode::LocalInboundAuthRequiresAccounts,
+                            )
+                            .as_deref(),
+                        );
                         changed |= sniffing_editor(ui, lang, &mut entry.sniffing, fakedns_on);
-                        inline_error(ui, validation.local_sniffing_errors[i].as_deref());
+                        inline_error(
+                            ui,
+                            row_finding(
+                                verdict,
+                                lang,
+                                FindingTarget::LocalInbound(i),
+                                &ValidationCode::SniffingDestOverrideInvalid,
+                            )
+                            .as_deref(),
+                        );
                         changed |= local_filter_editor(ui, lang, entry);
                         for message in &validation.local_filter_errors[i] {
                             inline_error(ui, Some(message));
@@ -542,7 +534,16 @@ impl InboundsScreen {
                             .collect();
                     }
                     changed |= sniffing_editor(ui, lang, &mut d.sniffing, fakedns_on);
-                    inline_error(ui, validation.doko_sniffing_errors[i].as_deref());
+                    inline_error(
+                        ui,
+                        row_finding(
+                            verdict,
+                            lang,
+                            FindingTarget::Dokodemo(i),
+                            &ValidationCode::SniffingDestOverrideInvalid,
+                        )
+                        .as_deref(),
+                    );
                 });
                 ui.separator();
             }
@@ -921,6 +922,11 @@ fn listener_collision(
     }
 }
 
+/// The row-label tag verdict for one dokodemo entry. This is the screen's own
+/// check, not a re-derivation of a walk rule: it names the tag problem in the
+/// row's vocabulary (`DokodemoTagMissing`/`Builtin`/`Duplicate`), judges
+/// entries the walk drops (a disabled row still shows its label fault), and
+/// answers "which label is wrong" rather than "is this document appliable".
 fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Option<String> {
     let tag = settings.dokodemo.get(index)?.tag.trim();
     if tag.is_empty() {
@@ -954,17 +960,20 @@ fn dokodemo_tag_error(settings: &Settings, lang: Language, index: usize) -> Opti
     None
 }
 
-/// The inline validation error for one row's sniffing block, or `None` when
-/// the row is appliable: the model's own verdict for that row, rendered.
-/// `sniffing_row_verdict` owns the vocabulary and the emission gate, so the
-/// row and the Apply/Connect gate cannot disagree about it.
-fn sniffing_row_error(
+/// One row's finding of `code` from the published generation verdict,
+/// rendered as the code's own message. The model reported it for this
+/// structural target, so the row only asks and renders: the finding's path is
+/// the document's location text, which the row itself already is.
+fn row_finding(
+    verdict: &Verdict,
     lang: Language,
-    emitted: bool,
-    sniffing: &Sniffing,
-    prefix: &str,
+    target: FindingTarget,
+    code: &ValidationCode,
 ) -> Option<String> {
-    sniffing_row_verdict(emitted, sniffing, prefix).map(|code| validation_message(&code, lang))
+    verdict
+        .for_target(target)
+        .find(|issue| &issue.code == code)
+        .map(|issue| validation_message(&issue.code, lang))
 }
 
 fn inline_error(ui: &mut egui::Ui, error: Option<&str>) {
@@ -1105,6 +1114,50 @@ mod listener_validation_tests {
             &ValidationCode::LocalInboundAuthRequiresAccounts,
             Language::En,
         )
+    }
+
+    /// The sniffing vocabulary's own message, rendered through the code the
+    /// walk publishes.
+    fn sniffing_override_error() -> String {
+        validation_message(&ValidationCode::SniffingDestOverrideInvalid, Language::En)
+    }
+
+    /// The row asks the published verdict for its sniffing finding: an
+    /// emitted row carrying an unknown `destOverride` item renders the model's
+    /// message, and clearing the item clears it on the next frame.
+    #[test]
+    fn emitted_row_renders_the_verdicts_sniffing_finding() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.local_inbounds[0].sniffing.enabled = true;
+            rig.settings.local_inbounds[0].sniffing.dest_override = vec!["nope".into()];
+        }
+        let mut harness = harness_for(rig.clone());
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(sniffing_override_error().as_str())
+                .is_some(),
+            "the row must render the finding the settings walk published"
+        );
+
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.local_inbounds[0]
+                .sniffing
+                .dest_override
+                .clear();
+            rig.edit();
+        }
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(sniffing_override_error().as_str())
+                .is_none(),
+            "clearing the refused item must clear the row finding"
+        );
     }
 
     #[test]
@@ -1466,9 +1519,8 @@ mod listener_validation_tests {
             .get_by_role_and_label(egui::accesskit::Role::Button, "+ account")
             .click();
         harness.run();
-        // The model mutation lands at the end of the click frame; the
-        // verdict cache rebuilds one frame later (the mutation hook moved the
-        // generation).
+        // The model mutation lands at the end of the click frame; the rig's
+        // published verdict is rebuilt from the model on the next frame.
         harness.run();
         assert!(
             harness

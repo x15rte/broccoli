@@ -7039,6 +7039,7 @@ mod tests {
             code: crate::model::validation::ValidationCode::StreamOneNoDownload,
             path: Some("stream.xhttpSettings".into()),
             severity: crate::model::validation::Severity::Error,
+            target: crate::model::validation::FindingTarget::Document,
         };
         let bare = LinkError::InvalidModel {
             prefix: None,

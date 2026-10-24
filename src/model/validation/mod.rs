@@ -2,12 +2,14 @@
 //! exporter, the config generator, and the editor.
 //!
 //! Pure model checks: no i18n here. Every issue carries a [`ValidationCode`],
-//! an optional wire path, and its [`Severity`] tier; callers render codes
-//! through `crate::i18n::validation_message`. Each pass returns a [`Verdict`],
-//! which answers the tier questions (`blocking`, `advisory`, `first_blocking`)
-//! so no caller re-filters findings by severity. One pass per model, no
-//! short-circuit — a single `validate_outbound` call surfaces every protocol,
-//! stream, and transport-security problem.
+//! an optional wire path, the [`FindingTarget`] row it judges, and its
+//! [`Severity`] tier; callers render codes through
+//! `crate::i18n::validation_message`. Each pass returns a [`Verdict`], which
+//! answers the tier questions (`blocking`, `advisory`, `first_blocking`) and
+//! the is-it-this-row question ([`Verdict::for_target`]) so no caller
+//! re-filters findings by severity or re-derives which row a finding names.
+//! One pass per model, no short-circuit — a single `validate_outbound` call
+//! surfaces every protocol, stream, and transport-security problem.
 //!
 //! The passes nest, and which one a gate asks is the gate's scope:
 //!
@@ -34,9 +36,9 @@
 //! vocabularies, and `settings.rs` the settings-level verdict with its
 //! per-field queries. This module holds the taxonomy and the vocabulary more
 //! than one scope reads ([`ValidationCode`], [`Severity`],
-//! [`ValidationIssue`], [`Verdict`], their constructors), and re-exports every
-//! scope item, so `crate::model::validation::X` stays the one path a caller
-//! imports.
+//! [`ValidationIssue`], [`FindingTarget`], [`Verdict`], their constructors),
+//! and re-exports every scope item, so `crate::model::validation::X` stays
+//! the one path a caller imports.
 
 use crate::links::{excerpt, excerpt_debug};
 use crate::model::stream::Network;
@@ -1215,27 +1217,71 @@ pub enum Severity {
     Warning,
 }
 
-/// One validation finding: a rule, the wire path that failed (absent for
-/// whole-model findings), and its advisory tier. Every non-warning rule is
-/// [`Severity::Error`]; only the new configuration-warning rules are
+/// Where one finding lives in the model: the structural locator a consumer
+/// asks its own row's verdict with ([`Verdict::for_target`]).
+///
+/// [`Self::Document`] is every finding about the configuration rather than
+/// one editable row — and every editor/import-scope finding, which judges a
+/// profile in isolation and has no settings document to point into. The
+/// payload is the row's own identity: the profile id for [`Self::Profile`],
+/// the list index for every other row. It is deliberately *not* the rendered
+/// location text, which stays in [`ValidationIssue::path`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindingTarget {
+    /// The configuration as a whole (or a scope that judges no row).
+    Document,
+    /// The profile with this `ServerProfile::id`.
+    Profile(String),
+    /// `settings.local_inbounds[index]`.
+    LocalInbound(usize),
+    /// `settings.dokodemo[index]`.
+    Dokodemo(usize),
+    /// The TUN block (`settings.tun`).
+    Tun,
+    /// `settings.routing.rules[index]`.
+    Rule(usize),
+    /// `settings.routing.balancers[index]`.
+    Balancer(usize),
+}
+
+/// One validation finding: a rule, the rendered location the generator
+/// prefixes (absent for whole-model findings), the structural row it judges
+/// ([`ValidationIssue::target`]), and its advisory tier. Every non-warning
+/// rule is [`Severity::Error`]; only the new configuration-warning rules are
 /// [`Severity::Warning`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationIssue {
     pub code: ValidationCode,
+    /// The rendered location text — a profile's display name, an inbound
+    /// label, a wire path — which the generator prefixes as
+    /// `"{path}: {message}"`. Presentation only: a consumer that needs to know
+    /// which row a finding belongs to asks [`Self::target`].
     pub path: Option<String>,
     pub severity: Severity,
+    /// The row this finding judges, for consumers that own one.
+    pub target: FindingTarget,
 }
 
 impl ValidationIssue {
     /// An error-tier finding with no wire path: the rule is about the profile
     /// as a whole, or its message names the field the user is looking at, so
-    /// no path is prefixed.
+    /// no path is prefixed and the finding is scoped to the document.
     pub fn error(code: ValidationCode) -> Self {
         ValidationIssue {
             code,
             path: None,
             severity: Severity::Error,
+            target: FindingTarget::Document,
         }
+    }
+
+    /// Point this finding at the row it judges. The whole-model walk applies
+    /// it at each insert, so a screen can ask
+    /// [`Verdict::for_target`] instead of matching codes and re-deriving
+    /// which row a path names.
+    pub fn at(mut self, target: FindingTarget) -> Self {
+        self.target = target;
+        self
     }
 }
 
@@ -1266,8 +1312,23 @@ impl PartialEq<[ValidationIssue]> for Verdict {
 }
 
 impl Verdict {
+    /// No finding: the resting value of a cache that has not been filled, and
+    /// the verdict a generation that failed before the model pass publishes.
+    pub const EMPTY: Verdict = Verdict { issues: Vec::new() };
+
     fn from_issues(issues: Vec<ValidationIssue>) -> Self {
         Self { issues }
+    }
+
+    /// The findings scoped to `target`, in pass order — the query a screen
+    /// asks its own row. Equality is the whole comparison
+    /// ([`FindingTarget::Profile`] matches by id, every index by position), so
+    /// the caller states which row it owns and never re-derives the rule, the
+    /// gate, or the path.
+    pub fn for_target(&self, target: FindingTarget) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(move |issue| issue.target == target)
     }
 
     /// The blocking findings — [`Severity::Error`] — in pass order: what
@@ -1339,6 +1400,7 @@ fn issue(code: ValidationCode, path: Option<String>) -> ValidationIssue {
         code,
         path,
         severity: Severity::Error,
+        target: FindingTarget::Document,
     }
 }
 
@@ -1347,6 +1409,7 @@ fn warning(code: ValidationCode, path: Option<String>) -> ValidationIssue {
         code,
         path,
         severity: Severity::Warning,
+        target: FindingTarget::Document,
     }
 }
 
@@ -1473,9 +1536,9 @@ pub use outbound::{
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
     dns_script_issues, inbound_auth_trap, local_inbound_auth_verdict, lua_script_path_issue,
-    noise_script_issues, routing_script_issues, sniffing_row_verdict, tun_gateway_verdict,
-    tun_ipv4_gateway, tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address,
-    validate_profiles, validate_settings,
+    noise_script_issues, routing_script_issues, tun_gateway_verdict, tun_ipv4_gateway,
+    tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address, validate_profiles,
+    validate_settings,
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
