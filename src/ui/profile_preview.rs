@@ -3,7 +3,7 @@ use egui::{ScrollArea, TextEdit, TextStyle, Ui};
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::rt::{AppMessage, CoreCmd, CorePhase, JobKind, RuntimeEntryView, RuntimeStateView};
-use crate::ui::UiCtx;
+use crate::ui::ProfilePreviewCtx;
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
 
@@ -65,7 +65,7 @@ impl ProfilePreviewScreen {
         self.pending_request.cancel();
     }
 
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut ProfilePreviewCtx) {
         let lang = ctx.settings.language;
         ui.heading(t(lang, Key::Preview));
 
@@ -138,7 +138,7 @@ impl ProfilePreviewScreen {
     fn runtime_tab(
         &mut self,
         ui: &mut Ui,
-        ctx: &mut UiCtx,
+        ctx: &mut ProfilePreviewCtx,
         lang: crate::model::settings::Language,
     ) {
         // The runtime-state read runs regardless of the busy window, which is
@@ -152,7 +152,7 @@ impl ProfilePreviewScreen {
         let refresh = egui::Button::new(t(lang, Key::RuntimeRefresh));
         if ui.add_enabled(gate.enabled, refresh).clicked() {
             let (reply, receiver) = tokio::sync::oneshot::channel();
-            if !ctx.send(CoreCmd::ListRuntimeState { reply }) {
+            if !ctx.hooks.send(CoreCmd::ListRuntimeState { reply }) {
                 self.runtime = Some(Err(DiagError::from(Diag::new(Key::RuntimeChannelClosed))));
             } else {
                 self.pending_request = Request::reply(receiver);

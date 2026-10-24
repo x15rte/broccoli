@@ -58,7 +58,7 @@ use crate::ui::request::{Request, Terminal};
 use crate::ui::status::{StatusColors, status_colors_of};
 use crate::ui::widgets;
 use crate::ui::{
-    FeedbackLevel, UiCtx, format_latency_probe_feedback, format_single_latency_probe_feedback,
+    FeedbackLevel, ServersCtx, format_latency_probe_feedback, format_single_latency_probe_feedback,
 };
 
 pub(crate) mod finalmask_editors;
@@ -2074,10 +2074,6 @@ pub struct ServersScreen {
     /// [`LeaveAction`]): the modal renders while this is `Some`, and the
     /// commit handlers clear it once the staged action resolves.
     leave_pending: Option<LeaveAction>,
-    /// Set once when a staged Quit may proceed (all dirty drafts committed
-    /// via Save, or discarded); consumed by the app shell via
-    /// [`ServersScreen::take_quit_resume`].
-    quit_resume: bool,
     status: Option<StatusLine>,
     /// When the current status toast was set; the toast auto-clears once
     /// [`STATUS_TOAST_AUTO_CLEAR`] has elapsed (see `show_status_toast`).
@@ -2259,7 +2255,7 @@ impl ServersScreen {
         origin: ProfileValidationOrigin,
         profiles: Vec<ServerProfile>,
         draft_target: Option<ToolTarget>,
-        ctx: &mut UiCtx<'_>,
+        ctx: &mut ServersCtx<'_>,
     ) -> Result<(), String> {
         if self.profile_validation_request.is_pending() {
             return Err(t(lang, Key::SrvValidationAlreadyRunning).into());
@@ -2289,7 +2285,7 @@ impl ServersScreen {
         self.profile_validation_origin = Some(origin);
         self.profile_validation_count = count;
         self.profile_validation_report = None;
-        if !ctx.send(CoreCmd::ValidateProfiles {
+        if !ctx.hooks.send(CoreCmd::ValidateProfiles {
             request: Box::new(ProfileValidationRequest {
                 origin,
                 lang,
@@ -2317,7 +2313,7 @@ impl ServersScreen {
         Ok(())
     }
 
-    fn poll_profile_validation(&mut self, lang: Language, uictx: &mut UiCtx) {
+    fn poll_profile_validation(&mut self, lang: Language, uictx: &mut ServersCtx) {
         // Per-frame poll of the request's own reply channel: the runtime
         // pokes the repaint after every send, so the terminal is picked up
         // on the next frame. A closed channel without a terminal means the
@@ -2424,7 +2420,7 @@ impl ServersScreen {
                         }
                         self.profile_validation_report = None;
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndAdded)));
-                        uictx.mark_dirty();
+                        uictx.hooks.mark_dirty();
                         // The leave modal's Save committed the add draft:
                         // resume the staged action. CloseAdd is fully
                         // resolved; Quit proceeds once no dirty draft
@@ -2446,7 +2442,7 @@ impl ServersScreen {
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
                                 } else {
-                                    self.quit_resume = true;
+                                    uictx.hooks.request_quit_resume();
                                 }
                             }
                             _ => {}
@@ -2467,7 +2463,7 @@ impl ServersScreen {
                         self.existing.draft = None;
                         self.profile_validation_report = None;
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndSaved)));
-                        uictx.mark_dirty();
+                        uictx.hooks.mark_dirty();
                         // The leave modal's Save committed the existing
                         // draft: resume the staged action. Select switches
                         // now; Quit proceeds when no dirty draft remains
@@ -2488,7 +2484,7 @@ impl ServersScreen {
                                 {
                                     self.leave_pending = Some(LeaveAction::Quit);
                                 } else {
-                                    self.quit_resume = true;
+                                    uictx.hooks.request_quit_resume();
                                 }
                             }
                             _ => {}
@@ -2521,7 +2517,7 @@ impl ServersScreen {
                     // guarded like any other (a dirty draft stages the
                     // leave modal instead).
                     self.guard_select(first_id);
-                    uictx.mark_dirty();
+                    uictx.hooks.mark_dirty();
                 }
                 self.invalidate_import_preview();
                 self.profile_validation_report = report;
@@ -2916,7 +2912,7 @@ impl ServersScreen {
         self.revealed_existing = false;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
         self.poll_profile_validation(lang, ctx);
         self.poll_import_parse(lang);
@@ -2954,7 +2950,7 @@ impl ServersScreen {
 
     // ---------- left: profile list ----------
 
-    fn show_list(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    fn show_list(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
         ui.add_space(4.0);
         ui.heading(t(lang, Key::ScreenServers));
@@ -3277,7 +3273,7 @@ impl ServersScreen {
             if let Some(id) = default {
                 ctx.servers.activate(&id);
             }
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
 
         // apply deferred list actions (needs &mut profiles)
@@ -3307,7 +3303,7 @@ impl ServersScreen {
                 // The active profile is the list's first row (the config's
                 // default route), so choosing it moves it there.
                 ctx.servers.activate(&id);
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             Some(ListAction::Reorder { id, gap }) => {
                 if let Some(from) = ctx.servers.profiles.iter().position(|p| p.id == id) {
@@ -3321,7 +3317,7 @@ impl ServersScreen {
                         if let Some(first) = ctx.servers.profiles.first().map(|p| p.id.clone()) {
                             ctx.servers.activate(&first);
                         }
-                        ctx.mark_dirty();
+                        ctx.hooks.mark_dirty();
                     }
                 }
             }
@@ -3335,7 +3331,7 @@ impl ServersScreen {
                     // selection change (the copy is already inserted; the
                     // guard only defers the selection).
                     self.guard_select(copy.id);
-                    ctx.mark_dirty();
+                    ctx.hooks.mark_dirty();
                 }
             }
             Some(ListAction::Export(id)) => {
@@ -3381,7 +3377,7 @@ impl ServersScreen {
             None => {}
         }
     }
-    fn consume_latency_probe_result(&mut self, ctx: &mut UiCtx) {
+    fn consume_latency_probe_result(&mut self, ctx: &mut ServersCtx) {
         let Some(single) = self.pending_latency_probe else {
             return;
         };
@@ -3431,13 +3427,6 @@ impl ServersScreen {
         }
         self.gate(DraftKind::Add, false)
             .is_some_and(|gate| gate.changed_from_source)
-    }
-
-    /// True exactly once when a staged Quit may proceed (all dirty drafts
-    /// committed via Save, or discarded). Consumed by the app shell, which
-    /// then runs its normal quit path.
-    pub fn take_quit_resume(&mut self) -> bool {
-        std::mem::take(&mut self.quit_resume)
     }
 
     /// Guard a selection switch to `id`: when a draft holds uncommitted
@@ -3506,7 +3495,7 @@ impl ServersScreen {
     /// Discard resolution of the leave modal: drop the staged action's
     /// draft(s) (existing draft → revert + buffer clear; add draft → drop +
     /// evict; Quit discards both), then perform the action.
-    fn discard_leave_action(&mut self, action: LeaveAction) {
+    fn discard_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
         match action {
             LeaveAction::Select(id) => {
                 self.discard_existing_draft();
@@ -3516,7 +3505,7 @@ impl ServersScreen {
             LeaveAction::Quit => {
                 self.discard_existing_draft();
                 self.add.close(&mut self.seeded_buffers);
-                self.quit_resume = true;
+                uictx.hooks.request_quit_resume();
             }
         }
     }
@@ -3526,7 +3515,7 @@ impl ServersScreen {
     /// draft) and keep the action staged — the commit handler resumes it on
     /// success or clears it on rejection. Failure to start clears the
     /// staged action and shows the status error.
-    fn save_leave_action(&mut self, action: LeaveAction, lang: Language, uictx: &mut UiCtx) {
+    fn save_leave_action(&mut self, action: LeaveAction, lang: Language, uictx: &mut ServersCtx) {
         let busy = uictx.busy.is_held();
         let mut staged = None;
         for kind in [DraftKind::Existing, DraftKind::Add] {
@@ -3547,7 +3536,7 @@ impl ServersScreen {
             match action {
                 LeaveAction::Select(id) => self.selected = Some(id),
                 LeaveAction::CloseAdd => {}
-                LeaveAction::Quit => self.quit_resume = true,
+                LeaveAction::Quit => uictx.hooks.request_quit_resume(),
             }
             return;
         };
@@ -3588,7 +3577,7 @@ impl ServersScreen {
     pub fn show_leave_modal(
         &mut self,
         egui_ctx: &egui::Context,
-        uictx: &mut UiCtx,
+        uictx: &mut ServersCtx,
         servers_screen_rendered: bool,
     ) {
         if self.leave_pending.is_none() {
@@ -3639,7 +3628,7 @@ impl ServersScreen {
     fn leave_confirmation(
         &mut self,
         ui: &mut egui::Ui,
-        uictx: &mut UiCtx,
+        uictx: &mut ServersCtx,
         add_gate: Option<DraftGate>,
     ) -> Option<LeaveDecision> {
         let lang = uictx.settings.language;
@@ -3690,7 +3679,7 @@ impl ServersScreen {
     /// Resolve the staged action with the answer the question got. The action
     /// resolves only through the question's buttons; a dismissal reaches this
     /// as Cancel, which clears it without performing it.
-    fn resolve_leave(&mut self, decision: LeaveDecision, uictx: &mut UiCtx) {
+    fn resolve_leave(&mut self, decision: LeaveDecision, uictx: &mut ServersCtx) {
         let lang = uictx.settings.language;
         // The question renders only while an action is staged, so the take
         // never comes up empty here.
@@ -3703,7 +3692,7 @@ impl ServersScreen {
             }
             LeaveDecision::Discard => {
                 if let Some(action) = action {
-                    self.discard_leave_action(action);
+                    self.discard_leave_action(action, uictx);
                 }
             }
             // Cancel: change nothing beyond clearing the staged action.
@@ -3909,7 +3898,7 @@ fn server_list_row(
 impl ServersScreen {
     // ---------- editor (right side) ----------
 
-    fn show_editor(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    fn show_editor(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
         // Borrow the selected id instead of cloning the 36-char String on
         // every repaint (see show_list). The borrow is confined to the
@@ -4123,7 +4112,7 @@ impl ServersScreen {
                             &mut draft.profile,
                             &ctx.servers.profiles,
                             AdvancedTabCtx {
-                                set_key: (*ctx.model_generation, ctx.servers.profiles.len()),
+                                set_key: (ctx.hooks.model_generation(), ctx.servers.profiles.len()),
                                 finalmask_errors,
                                 stream_sockopt_errors,
                                 dialer_proxy_options: &mut self.existing.chain_options,
@@ -6786,7 +6775,7 @@ impl ServersScreen {
 
     // ---------- dialogs ----------
 
-    fn show_add_draft(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
+    fn show_add_draft(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
         let Some(mut draft) = self.add.take() else {
             return;
         };
@@ -6938,7 +6927,7 @@ impl ServersScreen {
                                         &uictx.servers.profiles,
                                         AdvancedTabCtx {
                                             set_key: (
-                                                *uictx.model_generation,
+                                                uictx.hooks.model_generation(),
                                                 uictx.servers.profiles.len(),
                                             ),
                                             finalmask_errors,
@@ -7168,7 +7157,7 @@ impl ServersScreen {
         self.slot_mut(kind).probe.show_output = !close_requested && !close_clicked;
     }
 
-    fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
+    fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
         let lang = uictx.settings.language;
         for kind in [DraftKind::Existing, DraftKind::Add] {
             self.probe_output_window(ctx, lang, kind);
@@ -7447,7 +7436,7 @@ impl ServersScreen {
                 // weight; the row loop would never re-insert it
                 // because the id no longer renders.
                 self.latency_badges.remove(&deleted_id);
-                uictx.mark_dirty();
+                uictx.hooks.mark_dirty();
             }
             if declined || decision.is_some() {
                 self.delete_pending = None;
@@ -7951,7 +7940,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     ProfileValidationOrigin::Import,
                     vec![tokyo.clone()],
                     None,
-                    &mut ctx,
+                    &mut ctx.servers(),
                 )
                 .expect("an idle screen accepts a validation request");
         }
@@ -7985,7 +7974,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     .send(Err(DiagError::from(reject)))
                     .expect("the request's channel stays open for the screen");
                 assert!(screen.profile_validation_request.is_pending());
-                screen.poll_profile_validation(Language::En, &mut rig.ctx());
+                screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
                 assert_eq!(
                     screen.profile_validation_report.as_deref(),
                     Some(reject_text.as_str()),
@@ -8012,7 +8001,7 @@ Authentication: ML-KEM-768, Post-Quantum
         screen.profile_validation_request = Request::reply(rx);
         drop(tx);
 
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
 
         assert_eq!(
             screen.profile_validation_report.as_deref(),
@@ -8049,7 +8038,7 @@ Authentication: ML-KEM-768, Post-Quantum
             draft_target: None,
         }))
         .unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert!(
             !screen.profile_validation_request.is_pending()
                 && screen.profile_validation_origin.is_none()
@@ -8073,7 +8062,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .arg_message(Diag::new(Key::OperationApplyConfig));
         let reject_text = reject.text(Language::En);
         tx.send(Err(DiagError::from(reject))).unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert_eq!(
             screen.profile_validation_report.as_deref(),
             Some(reject_text.as_str()),
@@ -11816,7 +11805,7 @@ Authentication: ML-KEM-768, Post-Quantum
     /// real paint path of the preview (virtualized rows, truncated labels) and
     /// checks the formatted rows survive into the next frame.
     fn render_servers_frame(screen: &mut ServersScreen, rig: &mut UiTestRig) {
-        let _harness = Harness::new_ui(|ui| screen.show(ui, &mut rig.ctx()));
+        let _harness = Harness::new_ui(|ui| screen.show(ui, &mut rig.ctx().servers()));
     }
 
     /// The import preview is formatted once per parse result, not per frame:
@@ -12501,7 +12490,7 @@ Authentication: ML-KEM-768, Post-Quantum
             }),
         }))
         .unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert!(
             screen.leave_pending.is_none(),
             "a staged Select must clear when the add commit switches immediately"
@@ -12789,7 +12778,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     // window, is not rendered this frame.
                     state
                         .0
-                        .show_leave_modal(ui.ctx(), &mut state.1.ctx(), false);
+                        .show_leave_modal(ui.ctx(), &mut state.1.ctx().servers(), false);
                 },
                 (ServersScreen::default(), rig),
             );
@@ -12883,7 +12872,7 @@ Authentication: ML-KEM-768, Post-Quantum
             }),
         }))
         .unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert!(
             screen.leave_pending.is_none(),
             "a rejected validation must cancel the staged leave action"
@@ -12932,13 +12921,13 @@ Authentication: ML-KEM-768, Post-Quantum
             }),
         }))
         .unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert_eq!(
             screen.leave_pending,
             Some(LeaveAction::Quit),
             "the quit must stay staged while the add draft is dirty"
         );
-        assert!(!screen.take_quit_resume(), "the quit must not resume yet");
+        assert!(!rig.requests.quit_resume, "the quit must not resume yet");
         assert!(
             screen.existing.draft.is_none(),
             "the existing draft must be committed"
@@ -12959,17 +12948,21 @@ Authentication: ML-KEM-768, Post-Quantum
             }),
         }))
         .unwrap();
-        screen.poll_profile_validation(Language::En, &mut rig.ctx());
+        screen.poll_profile_validation(Language::En, &mut rig.ctx().servers());
         assert!(
             screen.leave_pending.is_none(),
             "the staged quit must clear on the final commit"
         );
         assert!(
-            screen.take_quit_resume(),
+            rig.requests.quit_resume,
             "the quit must resume once nothing is dirty"
         );
         assert!(
-            !screen.take_quit_resume(),
+            std::mem::take(&mut rig.requests.quit_resume),
+            "the shell's drain must observe the resume"
+        );
+        assert!(
+            !rig.requests.quit_resume,
             "the resume flag must be single-shot"
         );
         assert_eq!(
@@ -12990,7 +12983,7 @@ Authentication: ML-KEM-768, Post-Quantum
         screen.existing.draft = Some(draft);
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
         screen.add.draft = Some(rendered_add_draft(&add, true));
-        screen.discard_leave_action(LeaveAction::Quit);
+        screen.discard_leave_action(LeaveAction::Quit, &mut rig.ctx().servers());
         assert!(
             screen.existing.draft.is_none(),
             "Quit discard must drop the existing draft"
@@ -13000,7 +12993,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Quit discard must drop the add draft"
         );
         assert!(
-            screen.take_quit_resume(),
+            rig.requests.quit_resume,
             "Quit discard must resume the quit"
         );
     }
@@ -13018,7 +13011,10 @@ Authentication: ML-KEM-768, Post-Quantum
         // Select discard reverts the existing draft but keeps the add draft.
         let add = ServerProfile::new("New VLESS server", OutboundModel::new(Protocol::Vless));
         screen.add.draft = Some(ProfileDraft::add(add.clone()));
-        screen.discard_leave_action(LeaveAction::Select("osaka-target-id".into()));
+        screen.discard_leave_action(
+            LeaveAction::Select("osaka-target-id".into()),
+            &mut rig.ctx().servers(),
+        );
         assert!(
             screen.existing.draft.is_none(),
             "Select discard must drop the existing draft"

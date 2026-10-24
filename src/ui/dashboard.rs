@@ -10,7 +10,7 @@ use crate::ui::status::{
     PhaseBadgeWording, StatusColors, phase_badge_color, phase_badge_text, status_colors_of,
 };
 use crate::ui::widgets;
-use crate::ui::{PhaseAction, TerminalErrorView, UiCtx};
+use crate::ui::{DashboardCtx, PhaseAction, TerminalErrorView};
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
 /// (a 1 Hz stats tick — the only way the history ring changes).
@@ -141,7 +141,7 @@ impl DashboardScreen {
     /// stats generation advanced — a stats tick is the only way the history
     /// ring changes. The cached generation is the rebuild key the tests pin:
     /// an idle frame reuses the series it already holds.
-    fn plot_series(&mut self, ctx: &UiCtx<'_>) -> &PlotCache {
+    fn plot_series(&mut self, ctx: &DashboardCtx<'_>) -> &PlotCache {
         let generation = ctx.stats_generation;
         if !self
             .plot_cache
@@ -177,9 +177,9 @@ impl DashboardScreen {
     /// per-row lookups or formatting on idle frames. The model generation is
     /// the edit signal (a rename or an added profile); the latency generation
     /// carries the observatory and probe results the rows render.
-    fn latency_rows(&mut self, ctx: &UiCtx<'_>) -> &GridCache {
+    fn latency_rows(&mut self, ctx: &DashboardCtx<'_>) -> &GridCache {
         let key = (
-            *ctx.model_generation,
+            ctx.hooks.model_generation(),
             ctx.latency_generation,
             ctx.settings.language,
         );
@@ -204,7 +204,7 @@ impl DashboardScreen {
     /// generation contract as the plot and latency caches). The rows are
     /// the dynamic tag set from the core's `inbound>>>` counters — no
     /// coupling to the generated config.
-    fn inbound_cache(&mut self, ctx: &UiCtx<'_>) -> &InboundCache {
+    fn inbound_cache(&mut self, ctx: &DashboardCtx<'_>) -> &InboundCache {
         let key = (
             ctx.stats_generation,
             ctx.settings.traffic_unit,
@@ -298,9 +298,9 @@ impl DashboardScreen {
     /// repaint frames. The status word inside each endpoint caption is
     /// phase-derived, so the phase is part of the key with its own
     /// payload-inclusive equality.
-    fn header_cache(&mut self, ctx: &UiCtx<'_>) -> &HeaderCache {
+    fn header_cache(&mut self, ctx: &DashboardCtx<'_>) -> &HeaderCache {
         let lang = ctx.settings.language;
-        let generation = *ctx.model_generation;
+        let generation = ctx.hooks.model_generation();
         let stale = match &self.header_cache {
             Some(cache) => {
                 cache.lang != lang
@@ -351,7 +351,7 @@ impl DashboardScreen {
             .expect("header cache populated above")
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut DashboardCtx) {
         egui::ScrollArea::vertical()
             .id_salt("dashboard-scroll")
             .auto_shrink([false, false])
@@ -367,7 +367,7 @@ impl DashboardScreen {
                 if let Some(error) = ctx.terminal_error {
                     let actions = terminal_error_block(ui, ctx.settings.language, error);
                     if actions.open_core_setup {
-                        ctx.request_open_core_setup();
+                        ctx.hooks.request_open_core_setup();
                     }
                     if actions.apply_leak_remedy {
                         turn_off_leak_block_and_retry(ctx);
@@ -386,7 +386,7 @@ impl DashboardScreen {
                     match action {
                         PhaseAction::Disconnect | PhaseAction::CancelRetry => {
                             if ui.button(action.label(lang)).clicked() {
-                                ctx.request_stop();
+                                ctx.hooks.request_stop();
                             }
                         }
                         PhaseAction::Connect => {
@@ -408,7 +408,7 @@ impl DashboardScreen {
                                 )
                                 .clicked()
                             {
-                                ctx.request_connect();
+                                ctx.hooks.request_connect();
                             }
                             if let Some(error) = ctx.config_error.as_deref() {
                                 ui.colored_label(status_colors_of(ui).err, error);
@@ -450,7 +450,7 @@ impl DashboardScreen {
                             .clicked()
                             && ctx.settings.set_mode(Mode::Off)
                         {
-                            ctx.mark_dirty();
+                            ctx.hooks.mark_dirty();
                         }
                         let tun = ui
                             .selectable_label(mode == Mode::Tun, t(lang, Key::Tun))
@@ -460,7 +460,7 @@ impl DashboardScreen {
                                 t(lang, Key::DashboardTunHoverNotElevated)
                             });
                         if tun.clicked() && ctx.settings.set_mode(Mode::Tun) {
-                            ctx.mark_dirty();
+                            ctx.hooks.mark_dirty();
                         }
                     },
                 );
@@ -508,7 +508,7 @@ impl DashboardScreen {
                                     // moves it there.
                                     let id = ctx.servers.profiles[index].id.clone();
                                     ctx.servers.activate(&id);
-                                    ctx.mark_dirty();
+                                    ctx.hooks.mark_dirty();
                                 }
                             });
                     },
@@ -600,7 +600,7 @@ impl DashboardScreen {
                                     ctx.settings.traffic_unit = value;
                                     // Display preference: persisted, but
                                     // never raises the Apply gate.
-                                    ctx.mark_ui_dirty();
+                                    ctx.hooks.mark_ui_dirty();
                                 }
                             }
                         });
@@ -790,7 +790,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
 /// One pass over profiles + observatory: per-row lookup, latency formatting,
 /// and detail truncation for the latency grid. Run only when the grid's
 /// generation key changes, never per frame.
-fn build_latency_rows(ctx: &UiCtx<'_>) -> Vec<LatencyRow> {
+fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
     let lang = ctx.settings.language;
     ctx.servers
         .profiles
@@ -1017,10 +1017,10 @@ struct TerminalErrorActions {
 /// and retry the start. The commit path re-checks the hazards, so a
 /// switched-off DNS half still shows what it reopens before a tunnel comes up
 /// without it.
-fn turn_off_leak_block_and_retry(ctx: &mut UiCtx) {
+fn turn_off_leak_block_and_retry(ctx: &mut DashboardCtx) {
     ctx.settings.tun.auto_system_wfp_block_leak.clear();
-    ctx.mark_dirty();
-    ctx.request_connect();
+    ctx.hooks.mark_dirty();
+    ctx.hooks.request_connect();
 }
 
 /// Render the terminal error block: the failure's headline and the captured
@@ -1354,7 +1354,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -1394,7 +1394,7 @@ mod tests {
             .build_ui_state(
                 move |ui, screen: &mut DashboardScreen| {
                     let mut rig = rig.borrow_mut();
-                    screen.show(ui, &mut rig.ctx())
+                    screen.show(ui, &mut rig.ctx().dashboard())
                 },
                 DashboardScreen::default(),
             )
@@ -1570,7 +1570,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -1608,7 +1608,7 @@ mod tests {
             .build_ui_state(
                 move |ui, screen: &mut DashboardScreen| {
                     let mut rig = rig.borrow_mut();
-                    screen.show(ui, &mut rig.ctx())
+                    screen.show(ui, &mut rig.ctx().dashboard())
                 },
                 DashboardScreen::default(),
             );
@@ -1654,7 +1654,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -1767,7 +1767,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -1847,7 +1847,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -1935,7 +1935,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -2098,7 +2098,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -2114,7 +2114,7 @@ mod tests {
             .next()
             .expect("idle frames keep the memoized truncation");
 
-        let rows = build_latency_rows(&rig.borrow_mut().ctx());
+        let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].cell, LatencyCell::DeadObservatory));
         assert_eq!(rows[0].detail_short, long_error[..60]);
@@ -2143,7 +2143,7 @@ mod tests {
             rig.latency_generation += 1;
         }
 
-        let rows = build_latency_rows(&rig.borrow_mut().ctx());
+        let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].cell, LatencyCell::DeadObservatory));
         let combined = format!(
@@ -2175,7 +2175,7 @@ mod tests {
             rig.latency_generation += 1;
         }
 
-        let rows = build_latency_rows(&rig.borrow_mut().ctx());
+        let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows[0].detail_short, "connection refused");
         assert_eq!(rows[0].detail_full, "connection refused");
         assert!(!rows[0].detail_truncated);
@@ -2212,7 +2212,7 @@ mod tests {
             rig.latency_generation += 1;
         }
 
-        let rows = build_latency_rows(&rig.borrow_mut().ctx());
+        let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0].cell, LatencyCell::DeadObservatory));
         assert_eq!(
@@ -2250,7 +2250,7 @@ mod tests {
             rig.latency_generation += 1;
         }
 
-        let rows = build_latency_rows(&rig.borrow_mut().ctx());
+        let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].detail_full,
@@ -2418,7 +2418,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );
@@ -2454,7 +2454,7 @@ mod tests {
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
-                screen.show(ui, &mut rig.ctx())
+                screen.show(ui, &mut rig.ctx().dashboard())
             },
             DashboardScreen::default(),
         );

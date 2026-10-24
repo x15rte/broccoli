@@ -164,33 +164,34 @@ pub(crate) const DEFAULT_TEST_VIEWPORT: egui::Vec2 = egui::Vec2::new(900.0, 600.
 /// serves the listener-collision rule, and no screen test binds it.
 pub(crate) const TEST_API_PORT: u16 = 19999;
 
-/// One screen's frame entry: the signature every screen presents, so the
-/// shared rig can drive any of them without a per-test closure.
+/// One screen's frame entry: each screen assembles its own slice from the
+/// rig, exactly as the app assembles it from [`UiCtx`], so the shared rig can
+/// drive any screen without a per-test closure.
 pub(crate) trait ScreenShow {
-    fn show_frame(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>);
+    fn show_frame(&mut self, ui: &mut egui::Ui, rig: &mut UiTestRig);
 }
 
 macro_rules! screen_show {
-    ($($screen:ty),* $(,)?) => {
+    ($($screen:ty => $slice:ident),* $(,)?) => {
         $(impl ScreenShow for $screen {
-            fn show_frame(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
-                self.show(ui, ctx);
+            fn show_frame(&mut self, ui: &mut egui::Ui, rig: &mut UiTestRig) {
+                self.show(ui, &mut rig.ctx().$slice());
             }
         })*
     };
 }
 
 screen_show!(
-    crate::ui::about::AboutScreen,
-    crate::ui::dashboard::DashboardScreen,
-    crate::ui::dns::DnsScreen,
-    crate::ui::inbounds::InboundsScreen,
-    crate::ui::logs::LogsScreen,
-    crate::ui::profile_preview::ProfilePreviewScreen,
-    crate::ui::routing::RoutingScreen,
-    crate::ui::servers::ServersScreen,
-    crate::ui::settings::SettingsScreen,
-    crate::ui::tun::TunScreen,
+    crate::ui::about::AboutScreen => about,
+    crate::ui::dashboard::DashboardScreen => dashboard,
+    crate::ui::dns::DnsScreen => dns,
+    crate::ui::inbounds::InboundsScreen => inbounds,
+    crate::ui::logs::LogsScreen => logs,
+    crate::ui::profile_preview::ProfilePreviewScreen => profile_preview,
+    crate::ui::routing::RoutingScreen => routing,
+    crate::ui::servers::ServersScreen => servers,
+    crate::ui::settings::SettingsScreen => settings,
+    crate::ui::tun::TunScreen => tun,
 );
 
 /// Drive one screen over the shared rig through a kittest harness: the
@@ -212,7 +213,7 @@ pub(crate) fn screen_harness_at<S: ScreenShow + 'static>(
     screen: S,
 ) -> Harness<'static, (S, UiTestRig)> {
     Harness::builder().with_size(size).build_ui_state(
-        |ui, state: &mut (S, UiTestRig)| state.0.show_frame(ui, &mut state.1.ctx()),
+        |ui, state: &mut (S, UiTestRig)| state.0.show_frame(ui, &mut state.1),
         (screen, rig),
     )
 }
@@ -234,9 +235,11 @@ where
 {
     Harness::builder().with_size(size).build_ui_state(
         move |ui, state: &mut (crate::ui::servers::ServersScreen, UiTestRig)| {
-            state.0.show(ui, &mut state.1.ctx());
+            state.0.show(ui, &mut state.1.ctx().servers());
             // The screen just rendered, so its dialogs own their questions.
-            state.0.show_leave_modal(ui.ctx(), &mut state.1.ctx(), true);
+            state
+                .0
+                .show_leave_modal(ui.ctx(), &mut state.1.ctx().servers(), true);
             tail(&mut state.0, &mut state.1, ui);
         },
         (crate::ui::servers::ServersScreen::default(), rig),

@@ -1,13 +1,13 @@
 //! Settings screen: core knobs, update buttons, and the
 //! raw-JSON forward-compat hatch.
 //!
-//! Xray-facing edits mutate `ctx.settings` + `ctx.mark_dirty()`; the shell
-//! saves those edits, while global appearance zoom uses egui's persisted UI
-//! memory. Apply now or Connect updates Xray.
+//! Xray-facing edits mutate `ctx.settings` + `ctx.hooks.mark_dirty()`; the
+//! shell saves those edits, while global appearance zoom uses egui's
+//! persisted UI memory. Apply now or Connect updates Xray.
 
 use egui::{Color32, RichText, Ui};
 
-use super::{CoreSetupMount, UiCtx, show_core_setup, status::status_colors_of, widgets};
+use super::{CoreSetupMount, SettingsCtx, show_core_setup, status::status_colors_of, widgets};
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt};
 use crate::links::excerpt;
@@ -358,17 +358,8 @@ pub struct SettingsScreen {
     /// `CoreCmd::CleanUp`; unlike the two exit actions below, this one keeps
     /// the app running.
     network_cleanup_modal: bool,
-    /// Whether full cleanup was confirmed; consumed by the shell
-    /// ([`Self::take_cleanup_request`]) so the app can stash it for `main`
-    /// and quit through the normal shutdown path.
-    cleanup_request: bool,
     /// Whether the Reset modal is open.
     reset_modal: bool,
-    /// Whether Reset was confirmed; consumed by the shell
-    /// ([`Self::take_reset_request`]) so the app can quit with the exit wipe
-    /// that restores a fresh install's defaults while keeping the server
-    /// list.
-    reset_request: bool,
     /// In-flight `Validate with core` run (one per click): the runtime's
     /// terminal verdict lands on this request's reply channel and is polled
     /// every frame the raw-override header renders.
@@ -398,7 +389,7 @@ struct LevelRowCache {
 }
 
 impl SettingsScreen {
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         // The shell already wraps this screen in a vertical ScrollArea.
         self.appearance_section(ui, ctx);
         self.privacy_section(ui, ctx);
@@ -488,7 +479,7 @@ impl SettingsScreen {
         });
     }
 
-    fn appearance_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn appearance_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         const SCALE_PRESETS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
         let lang = ctx.settings.language;
@@ -542,7 +533,7 @@ impl SettingsScreen {
                     ctx.settings.language = language;
                     // Display preference: persisted, but never raises the
                     // Apply gate.
-                    ctx.mark_ui_dirty();
+                    ctx.hooks.mark_ui_dirty();
                 }
             });
 
@@ -595,7 +586,7 @@ impl SettingsScreen {
                 {
                     ctx.settings.accent_color = None;
                     apply_accent(ui.ctx(), None);
-                    ctx.mark_ui_dirty();
+                    ctx.hooks.mark_ui_dirty();
                 }
                 // Picker starts at the accent actually in effect, read from
                 // the live visuals: `apply_accent` writes the custom accent to
@@ -616,7 +607,7 @@ impl SettingsScreen {
                     if ctx.settings.accent_color != Some(rgba) {
                         ctx.settings.accent_color = Some(rgba);
                         apply_accent(ui.ctx(), Some(rgba));
-                        ctx.mark_ui_dirty();
+                        ctx.hooks.mark_ui_dirty();
                     }
                 }
             });
@@ -626,7 +617,7 @@ impl SettingsScreen {
     /// The Privacy group: what the Servers screen hides on its own. The
     /// credentials are always masked until revealed; this switch decides
     /// whether the server information takes part in that masking too.
-    fn privacy_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn privacy_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsPrivacy), |ui| {
             if ui
@@ -639,12 +630,12 @@ impl SettingsScreen {
             {
                 // Display preference: persisted, but never raises the Apply
                 // gate — the value never reaches the generated configuration.
-                ctx.mark_ui_dirty();
+                ctx.hooks.mark_ui_dirty();
             }
         });
     }
 
-    fn core_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn core_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsCore), |ui| {
             ui.horizontal(|ui| {
@@ -663,7 +654,7 @@ impl SettingsScreen {
                     });
                 if lvl != ctx.settings.log_level {
                     ctx.settings.log_level = lvl;
-                    ctx.mark_dirty();
+                    ctx.hooks.mark_dirty();
                 }
             });
             // Xray maps loglevel "none" to both log types off
@@ -682,7 +673,7 @@ impl SettingsScreen {
                 .on_disabled_hover_text(t(lang, Key::SettingsAccessLogHint))
                 .changed()
             {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             ui.label(RichText::new(t(lang, Key::SettingsEnvVars)).weak());
             if widgets::kv_table(
@@ -692,7 +683,7 @@ impl SettingsScreen {
                 "XRAY_*",
                 t(lang, Key::ValueLower),
             ) {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             ui.label(RichText::new(t(lang, Key::SettingsPolicyLevels)).weak());
             let mut changed = false;
@@ -778,7 +769,7 @@ impl SettingsScreen {
                 changed = true;
             }
             if changed {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
         });
     }
@@ -786,15 +777,15 @@ impl SettingsScreen {
     /// The permanent mount of the shared core setup surface: the same
     /// component the startup dialog shows, available in every core state —
     /// installed and verified, missing, stale, or failed verification.
-    fn core_setup_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn core_setup_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsCoreSetup), |ui| {
             ui.set_max_width(680.0);
-            let _ = show_core_setup(ui, ctx, CoreSetupMount::Settings);
+            let _ = show_core_setup(ui, &mut ctx.core_setup_surface(), CoreSetupMount::Settings);
         });
     }
 
-    fn updates_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn updates_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsUpdates), |ui| {
             ui.set_max_width(680.0);
@@ -810,7 +801,7 @@ impl SettingsScreen {
                 {
                     // Fire-and-forget: the runtime does the fetch off the UI
                     // thread and emits exactly one terminal event.
-                    ctx.send(CoreCmd::CheckUpdate);
+                    ctx.hooks.send(CoreCmd::CheckUpdate);
                 }
                 match &ctx.update_check {
                     UpdateCheckState::Idle => {}
@@ -846,12 +837,13 @@ impl SettingsScreen {
     /// actions, listed before the full cleanup) and "Clean Up and Exit…".
     /// Reset opens a modal that confirms restoring a
     /// fresh install's defaults while keeping the server list; cleanup opens
-    /// the full-cleanup modal. Confirmed exit requests are exposed via
-    /// [`Self::take_reset_request`] / [`Self::take_cleanup_request`]; the
-    /// shell stashes them for `main` and quits through the normal shutdown
-    /// path, so the filesystem actions run only after the app has fully
-    /// shut down.
-    fn cleanup_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    /// the full-cleanup modal. Confirmed exit actions raise
+    /// [`crate::ui::FrameHooks::request_reset`] /
+    /// [`crate::ui::FrameHooks::request_cleanup_exit`];
+    /// the shell stashes them for `main` and quits through the normal
+    /// shutdown path, so the filesystem actions run only after the app has
+    /// fully shut down.
+    fn cleanup_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsCleanup), |ui| {
             ui.set_max_width(680.0);
@@ -889,13 +881,13 @@ impl SettingsScreen {
             // name is the effective one the TUN settings derive, because a
             // cleanup has no staged config to read it from.
             let adapter_name = ctx.settings.tun.effective_name().to_owned();
-            ctx.send(CoreCmd::CleanUp { adapter_name });
+            ctx.hooks.send(CoreCmd::CleanUp { adapter_name });
         }
-        if self.reset_modal {
-            self.show_reset_modal(ui.ctx(), lang);
+        if self.reset_modal && self.show_reset_modal(ui.ctx(), lang) {
+            ctx.hooks.request_reset();
         }
-        if self.cleanup_modal {
-            self.show_cleanup_modal(ui.ctx(), lang);
+        if self.cleanup_modal && self.show_cleanup_modal(ui.ctx(), lang) {
+            ctx.hooks.request_cleanup_exit();
         }
     }
 
@@ -940,9 +932,11 @@ impl SettingsScreen {
     }
 
     /// The cleanup confirmation — rendered in the main window, which it dims
-    /// and blocks — with exactly two actions. Choosing full cleanup
-    /// records the request and closes it; Cancel just closes it.
-    fn show_cleanup_modal(&mut self, ctx: &egui::Context, lang: Language) {
+    /// and blocks — with exactly two actions. Choosing full cleanup raises
+    /// the request and closes it; Cancel just closes it. Returns whether the
+    /// user confirmed.
+    fn show_cleanup_modal(&mut self, ctx: &egui::Context, lang: Language) -> bool {
+        let mut confirmed = false;
         let mut resolved = false;
         let declined = popup::modal(
             ctx,
@@ -961,7 +955,7 @@ impl SettingsScreen {
                     .on_hover_text(t(lang, Key::SettingsCleanupFullHint))
                     .clicked()
                 {
-                    self.cleanup_request = true;
+                    confirmed = true;
                     resolved = true;
                 }
                 ui.add_space(8.0);
@@ -974,14 +968,16 @@ impl SettingsScreen {
         if declined || resolved {
             self.cleanup_modal = false;
         }
+        confirmed
     }
 
     /// The reset confirmation — rendered in the main window, which it dims and
-    /// blocks — with exactly two actions. Confirming records the
-    /// request and closes it; Cancel just closes it. Reset keeps the
-    /// server list: the exit wipe clears generated configs and
-    /// logs but preserves servers and the core.
-    fn show_reset_modal(&mut self, ctx: &egui::Context, lang: Language) {
+    /// blocks — with exactly two actions. Confirming raises the request and
+    /// closes it; Cancel just closes it. Reset keeps the server list: the exit
+    /// wipe clears generated configs and logs but preserves servers and the
+    /// core. Returns whether the user confirmed.
+    fn show_reset_modal(&mut self, ctx: &egui::Context, lang: Language) -> bool {
+        let mut confirmed = false;
         let mut resolved = false;
         let declined = popup::modal(
             ctx,
@@ -995,7 +991,7 @@ impl SettingsScreen {
                 .on_hover_text(t(lang, Key::SettingsResetDetail));
                 ui.add_space(10.0);
                 if ui.button(t(lang, Key::SettingsResetConfirm)).clicked() {
-                    self.reset_request = true;
+                    confirmed = true;
                     resolved = true;
                 }
                 ui.add_space(8.0);
@@ -1008,21 +1004,7 @@ impl SettingsScreen {
         if declined || resolved {
             self.reset_modal = false;
         }
-    }
-
-    /// Consume a confirmed full-cleanup request, if any. The shell calls
-    /// this after `show` each frame, stashes the request for `main`, and
-    /// quits through the normal shutdown path.
-    pub(crate) fn take_cleanup_request(&mut self) -> bool {
-        std::mem::take(&mut self.cleanup_request)
-    }
-
-    /// Consume a confirmed reset-to-default request, if any. The shell calls
-    /// this after `show` each frame, stashes the request for `main`, and
-    /// quits through the normal shutdown path so the exit wipe
-    /// runs after the app has fully shut down.
-    pub(crate) fn take_reset_request(&mut self) -> bool {
-        std::mem::take(&mut self.reset_request)
+        confirmed
     }
 
     /// Per-file optional HTTPS URLs for geoip.dat/geosite.dat plus the cron
@@ -1030,7 +1012,7 @@ impl SettingsScreen {
     /// config block — the pinned core downloads and reloads the dats itself.
     /// The provenance status line and the Restore action live at
     /// the bottom of this section; see [`Self::geodata_provenance_ui`].
-    fn geodata_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn geodata_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsGeodata), |ui| {
             // Job drivers first so the status row below is current: drain a
@@ -1066,7 +1048,7 @@ impl SettingsScreen {
                     },
                 )
             {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             let geosite_url = self
                 .geosite_url_buf
@@ -1089,7 +1071,7 @@ impl SettingsScreen {
                     },
                 )
             {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             let cron = self
                 .geodata_cron_buf
@@ -1111,7 +1093,7 @@ impl SettingsScreen {
                     },
                 )
             {
-                ctx.mark_dirty();
+                ctx.hooks.mark_dirty();
             }
             self.geodata_provenance_ui(ui, lang);
         });
@@ -1198,7 +1180,7 @@ impl SettingsScreen {
         }
     }
 
-    fn advanced_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn advanced_section(&mut self, ui: &mut Ui, ctx: &mut SettingsCtx) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::SettingsAdvanced), |ui| {
             widgets::section(ui, t(lang, Key::SettingsPingTest), |ui| {
@@ -1210,7 +1192,7 @@ impl SettingsScreen {
                         "https://www.google.com/generate_204",
                     )
                 }) {
-                    ctx.mark_dirty();
+                    ctx.hooks.mark_dirty();
                 }
             });
             if ctx.settings.raw_override.is_some() {
@@ -1296,13 +1278,10 @@ impl SettingsScreen {
                             // cannot answer, so no request is installed: the
                             // screen keeps its idle state and the next click
                             // (or the runtime's return) starts clean.
-                            let sent = ctx
-                                .cmd
-                                .send(CoreCmd::TestConfig {
-                                    config: v.clone(),
-                                    reply,
-                                })
-                                .is_ok();
+                            let sent = ctx.hooks.send(CoreCmd::TestConfig {
+                                config: v.clone(),
+                                reply,
+                            });
                             if sent {
                                 self.test_pending = Request::reply(receiver);
                             }
@@ -1322,13 +1301,13 @@ impl SettingsScreen {
                                 |text| ctx.settings.raw_override = Some(text.to_owned()),
                             )
                         {
-                            ctx.mark_dirty();
+                            ctx.hooks.mark_dirty();
                         }
                         if ctx.settings.raw_override.is_some()
                             && ui.button(t(lang, Key::SettingsDisableOverride)).clicked()
                         {
                             ctx.settings.raw_override = None;
-                            ctx.mark_dirty();
+                            ctx.hooks.mark_dirty();
                         }
                     });
                     // Per-frame poll of the in-flight validation verdict:
@@ -1505,7 +1484,7 @@ mod tests {
         let mut harness = Harness::builder()
             .with_pixels_per_point(1.5)
             .build_ui_state(
-                |ui, screen| screen.appearance_section(ui, &mut rig.ctx()),
+                |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
                 SettingsScreen::default(),
             );
 
@@ -1533,7 +1512,7 @@ mod tests {
 
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.appearance_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1571,7 +1550,7 @@ mod tests {
     fn appearance_language_list_is_english_only_and_persists() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.appearance_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1594,7 +1573,7 @@ mod tests {
     fn appearance_accent_row_exposes_picker_and_reset() {
         let mut rig = UiTestRig::default();
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.appearance_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1677,7 +1656,7 @@ mod tests {
     fn geodata_section_binds_url_fields_and_persists() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1750,7 +1729,7 @@ mod tests {
     fn ping_test_section_binds_url_field_and_persists() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.advanced_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.advanced_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1796,7 +1775,7 @@ mod tests {
     fn updates_section_idle_shows_only_the_check_button() {
         let mut rig = UiTestRig::default();
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1820,7 +1799,7 @@ mod tests {
             ..Default::default()
         };
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1850,7 +1829,7 @@ mod tests {
             ..Default::default()
         };
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1873,7 +1852,7 @@ mod tests {
             ..Default::default()
         };
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1890,7 +1869,7 @@ mod tests {
             ..Default::default()
         };
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1910,7 +1889,7 @@ mod tests {
     fn updates_section_idle_click_sends_one_check_update_command() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.updates_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1933,7 +1912,7 @@ mod tests {
     fn cleanup_section_renders_the_clean_up_and_exit_button() {
         let mut rig = UiTestRig::default();
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.cleanup_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1963,7 +1942,7 @@ mod tests {
     fn cleanup_section_renders_the_network_cleanup_button() {
         let mut rig = UiTestRig::default();
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.cleanup_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -1983,8 +1962,10 @@ mod tests {
     fn network_cleanup_modal_confirm_sends_one_clean_up_command() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Network State…")
@@ -2021,8 +2002,10 @@ mod tests {
     fn network_cleanup_modal_cancel_sends_nothing() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up Network State…")
@@ -2045,8 +2028,10 @@ mod tests {
     fn cleanup_modal_opens_with_the_two_actions() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up and Exit…")
@@ -2067,8 +2052,10 @@ mod tests {
     fn cleanup_modal_cancel_closes_without_a_cleanup_request() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up and Exit…")
@@ -2081,7 +2068,7 @@ mod tests {
         drop(harness);
 
         assert!(
-            !screen.take_cleanup_request(),
+            !rig.requests.cleanup,
             "Cancel must not record a cleanup request"
         );
         assert!(!screen.cleanup_modal, "Cancel must close the modal");
@@ -2091,8 +2078,10 @@ mod tests {
     fn cleanup_modal_full_cleanup_records_the_request_and_closes() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Clean Up and Exit…")
@@ -2105,7 +2094,7 @@ mod tests {
         drop(harness);
 
         assert!(
-            screen.take_cleanup_request(),
+            rig.requests.cleanup,
             "Full cleanup must record the request for the shell"
         );
         assert!(
@@ -2118,8 +2107,10 @@ mod tests {
     fn reset_modal_confirm_records_the_request_and_closes() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Reset to default…")
@@ -2144,7 +2135,7 @@ mod tests {
         drop(harness);
 
         assert!(
-            screen.take_reset_request(),
+            rig.requests.reset,
             "Reset to default must record the request for the shell"
         );
         assert!(!screen.reset_modal, "confirming must close the reset modal");
@@ -2154,8 +2145,10 @@ mod tests {
     fn reset_modal_cancel_closes_without_a_request() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder()
-            .build_ui_state(|ui, _state| screen.cleanup_section(ui, &mut rig.ctx()), ());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
+            (),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "Reset to default…")
@@ -2168,7 +2161,7 @@ mod tests {
         drop(harness);
 
         assert!(
-            !screen.take_reset_request(),
+            !rig.requests.reset,
             "Cancel must not record a reset request"
         );
         assert!(!screen.reset_modal, "Cancel must close the reset modal");
@@ -2178,7 +2171,7 @@ mod tests {
     fn geodata_section_url_only_edit_marks_dirty_and_commits() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -2215,7 +2208,7 @@ mod tests {
     fn geodata_section_shows_validation_errors() {
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -2280,7 +2273,7 @@ mod tests {
     fn geodata_section_empty_is_unconfigured() {
         let mut rig = UiTestRig::default();
         let harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
 
@@ -2395,7 +2388,7 @@ mod tests {
         };
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             screen,
         );
         harness.run();
@@ -2450,7 +2443,7 @@ mod tests {
         rig.settings.geodata.geoip_url = Some("https://example.com/geoip.dat".into());
         rig.settings.geodata.geosite_url = Some("https://example.com/geosite.dat".into());
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             screen,
         );
         harness.run();
@@ -2517,7 +2510,7 @@ mod tests {
         set_mtime(&core.join("geosite.dat"), first);
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
         // The builder frames already ran the section; whether the first
@@ -2582,7 +2575,7 @@ mod tests {
         let _appdata = AppDataRedirect::to(temporary.path());
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
         harness.run_steps(3);
@@ -2710,7 +2703,7 @@ mod tests {
 
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.geodata_section(ui, &mut rig.ctx()),
+            |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
         harness.run();
@@ -2923,7 +2916,7 @@ mod tests {
         let rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
-                state.0.advanced_section(ui, &mut state.1.ctx());
+                state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
             (screen, rig),
         );
@@ -2996,7 +2989,7 @@ mod tests {
         let rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
-                state.0.advanced_section(ui, &mut state.1.ctx());
+                state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
             (screen, rig),
         );
@@ -3055,7 +3048,7 @@ mod tests {
         let rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
-                state.0.advanced_section(ui, &mut state.1.ctx());
+                state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
             (screen, rig),
         );
@@ -3115,7 +3108,7 @@ mod tests {
         let rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
-                state.0.advanced_section(ui, &mut state.1.ctx());
+                state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
             (screen, rig),
         );
@@ -3176,7 +3169,7 @@ mod tests {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(800.0, 1000.0))
             .build_ui_state(
-                |ui, screen| screen.core_section(ui, &mut rig.ctx()),
+                |ui, screen| screen.core_section(ui, &mut rig.ctx().settings()),
                 SettingsScreen::default(),
             );
 

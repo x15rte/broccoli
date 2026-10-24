@@ -305,7 +305,8 @@ pub struct BroccoliApp {
     ui_ctx_snapshot: UiCtxSnapshot,
     /// Set when a drained event invalidates the snapshot; the next `ui()`
     /// frame rebuilds it exactly once per actual input change (the snapshot's
-    /// `same_inputs` compare decides; a no-op invalidation rebuilds nothing).
+    /// derived whole-value equality decides; a no-op invalidation rebuilds
+    /// nothing).
     ui_ctx_dirty: bool,
     /// Monotonic per-input generations for screens' memoization keys
     /// (dashboard plot/latency-grid caches): `stats_generation` bumps once
@@ -686,8 +687,8 @@ fn quit_or_stage_leave(servers: &mut ServersScreen, ctx: &egui::Context) -> bool
 /// Consume a resolved staged Quit: true exactly once after the leave modal
 /// has cleared the action (all dirty drafts saved or discarded) and no quit
 /// is already in flight. The caller then runs its normal quit path.
-fn quit_resume_ready(servers: &mut ServersScreen, quitting: bool) -> bool {
-    !quitting && servers.take_quit_resume()
+fn quit_resume_ready(requests: &mut ui::FrameRequests, quitting: bool) -> bool {
+    !quitting && std::mem::take(&mut requests.quit_resume)
 }
 
 impl BroccoliApp {
@@ -2096,7 +2097,7 @@ impl BroccoliApp {
     /// Rebuild the generation-gated UI-context snapshot.
     /// Runs only when a drained event changed its inputs — never on idle
     /// frames — so a no-op rebuild (e.g. the initial `State(Stopped)` drain)
-    /// is skipped: the snapshot's own `same_inputs` compare is the gate.
+    /// is skipped: the snapshot's own derived equality is the gate.
     fn rebuild_ui_ctx_snapshot(&mut self) {
         let candidate = UiCtxSnapshot {
             transport: self.active_transport,
@@ -2111,7 +2112,7 @@ impl BroccoliApp {
             stats_generation: self.stats_generation,
             latency_generation: self.latency_generation,
         };
-        if !self.ui_ctx_snapshot.same_inputs(&candidate) {
+        if self.ui_ctx_snapshot != candidate {
             self.ui_ctx_snapshot = candidate;
         }
         self.ui_ctx_dirty = false;
@@ -2327,16 +2328,20 @@ impl eframe::App for BroccoliApp {
                 UiCtxView::Live { snapshot },
             );
             match self.screen {
-                Screen::Dashboard => self.dashboard.show(ui, &mut uictx),
-                Screen::Servers => self.servers_ui.show(ui, &mut uictx),
-                Screen::ProfilePreview => self.profile_preview.show(ui, &mut uictx),
-                Screen::Routing => scroll(ui, |ui| self.routing.show(ui, &mut uictx)),
-                Screen::Dns => scroll(ui, |ui| self.dns.show(ui, &mut uictx)),
-                Screen::Inbounds => scroll(ui, |ui| self.inbounds.show(ui, &mut uictx)),
-                Screen::Tun => scroll(ui, |ui| self.tun.show(ui, &mut uictx)),
-                Screen::Logs => self.logs_ui.show(ui, &mut uictx),
-                Screen::Settings => scroll(ui, |ui| self.settings_ui.show(ui, &mut uictx)),
-                Screen::About => scroll(ui, |ui| self.about.show(ui, &mut uictx)),
+                Screen::Dashboard => self.dashboard.show(ui, &mut uictx.dashboard()),
+                Screen::Servers => self.servers_ui.show(ui, &mut uictx.servers()),
+                Screen::ProfilePreview => {
+                    self.profile_preview.show(ui, &mut uictx.profile_preview())
+                }
+                Screen::Routing => scroll(ui, |ui| self.routing.show(ui, &mut uictx.routing())),
+                Screen::Dns => scroll(ui, |ui| self.dns.show(ui, &mut uictx.dns())),
+                Screen::Inbounds => scroll(ui, |ui| self.inbounds.show(ui, &mut uictx.inbounds())),
+                Screen::Tun => scroll(ui, |ui| self.tun.show(ui, &mut uictx.tun())),
+                Screen::Logs => self.logs_ui.show(ui, &mut uictx.logs()),
+                Screen::Settings => {
+                    scroll(ui, |ui| self.settings_ui.show(ui, &mut uictx.settings()))
+                }
+                Screen::About => scroll(ui, |ui| self.about.show(ui, &mut uictx.about())),
             }
             // The reveal is transient by contract: the screen the user left hides
             // its values again before it is next entered.
@@ -2384,7 +2389,7 @@ impl eframe::App for BroccoliApp {
                 },
                 UiCtxView::Onboarding { snapshot },
             );
-            self.wizard.show(&ctx, &mut uictx);
+            self.wizard.show(&ctx, &mut uictx.wizard());
         }
 
         // Hazard acknowledgment confirmation: rendered in the main window,
@@ -2423,10 +2428,13 @@ impl eframe::App for BroccoliApp {
                 },
                 UiCtxView::Live { snapshot },
             );
-            self.servers_ui
-                .show_leave_modal(&ctx, &mut uictx, self.screen == Screen::Servers);
+            self.servers_ui.show_leave_modal(
+                &ctx,
+                &mut uictx.servers(),
+                self.screen == Screen::Servers,
+            );
         }
-        if quit_resume_ready(&mut self.servers_ui, self.quitting) {
+        if quit_resume_ready(&mut requests, self.quitting) {
             self.quit_impl(&ctx, None);
         }
 
@@ -2487,9 +2495,9 @@ impl eframe::App for BroccoliApp {
         // the app (core stopped). Clean Up and Exit wipes the whole app-data
         // root; Reset to default… wipes everything except the server list
         // and the core.
-        if self.settings_ui.take_cleanup_request() {
+        if requests.cleanup {
             self.quit_with_cleanup(&ctx);
-        } else if self.settings_ui.take_reset_request() {
+        } else if requests.reset {
             self.quit_with_reset(&ctx);
         }
 
@@ -4684,7 +4692,7 @@ mod unsaved_changes_tests {
             "cancelling must keep the draft"
         );
         assert!(
-            !quit_resume_ready(&mut harness.state_mut().0, false),
+            !quit_resume_ready(&mut harness.state_mut().1.requests, false),
             "cancelling must not resume the deferred quit"
         );
     }
@@ -4712,11 +4720,11 @@ mod unsaved_changes_tests {
             .click();
         harness.run();
         assert!(
-            quit_resume_ready(&mut harness.state_mut().0, false),
+            quit_resume_ready(&mut harness.state_mut().1.requests, false),
             "a resolved staged quit must resume the quit"
         );
         assert!(
-            !quit_resume_ready(&mut harness.state_mut().0, false),
+            !quit_resume_ready(&mut harness.state_mut().1.requests, false),
             "the resume flag must fire exactly once"
         );
 
@@ -4729,7 +4737,7 @@ mod unsaved_changes_tests {
             .click();
         harness.run();
         assert!(
-            !quit_resume_ready(&mut harness.state_mut().0, true),
+            !quit_resume_ready(&mut harness.state_mut().1.requests, true),
             "a quit already in flight must never re-enter"
         );
     }

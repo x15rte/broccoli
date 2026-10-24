@@ -6,7 +6,7 @@ use crate::model::validation::{FindingTarget, ValidationCode};
 use crate::model::{Mode, emit, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
-use crate::ui::UiCtx;
+use crate::ui::TunCtx;
 use crate::ui::inbounds::sniffing_editor;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
@@ -110,7 +110,7 @@ impl TunScreen {
         self.next_refresh_at = Some(std::time::Instant::now() + REFRESH_INTERVAL);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TunCtx) {
         self.poll_ifaces(ui);
 
         // The privacy warning is rebuilt when the model generation moves —
@@ -124,7 +124,7 @@ impl TunScreen {
         // structural target below, so the screen never re-runs a predicate the
         // settings walk already judged.
         let verdict = ctx.verdict;
-        let generation = *ctx.model_generation;
+        let generation = ctx.hooks.model_generation();
         if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
             // The shell's verdict for this generation: the privacy finding
             // is the one slice of it this screen renders.
@@ -407,7 +407,7 @@ impl TunScreen {
         });
 
         if changed {
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
 
         ui.add_space(8.0);
@@ -475,8 +475,8 @@ mod tests {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
         rig.settings.tun.auto_outbounds_interface = setting.to_string();
-        let mut harness =
-            Harness::builder().build_ui_state(|ui, screen| screen.show(ui, &mut rig.ctx()), screen);
+        let mut harness = Harness::builder()
+            .build_ui_state(|ui, screen| screen.show(ui, &mut rig.ctx().tun()), screen);
         harness.run();
 
         let down = t_fmt(Language::En, Key::TunAutoOutboundsDown, &[&setting]);
@@ -511,7 +511,7 @@ mod tests {
         });
         rig.phase = phase;
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.show(ui, &mut rig.ctx()),
+            |ui, screen| screen.show(ui, &mut rig.ctx().tun()),
             TunScreen::default(),
         );
         harness.run();
@@ -536,7 +536,7 @@ mod tests {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen| screen.show(ui, &mut rig.ctx()),
+            |ui, screen| screen.show(ui, &mut rig.ctx().tun()),
             TunScreen::default(),
         );
         harness.run();
@@ -652,7 +652,7 @@ mod tests {
         screen.next_refresh_at = Some(std::time::Instant::now() + REFRESH_INTERVAL * 1_000);
         let mut rig = UiTestRig::default();
         let mut harness = Harness::builder().build_ui_state(
-            |ui, screen: &mut TunScreen| screen.show(ui, &mut rig.ctx()),
+            |ui, screen: &mut TunScreen| screen.show(ui, &mut rig.ctx().tun()),
             screen,
         );
         harness.run();

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Galley, Image, Rect, RichText, Ui, Vec2, pos2};
 
-use super::UiCtx;
+use super::AboutCtx;
 use super::status::status_colors_of;
 use super::widgets;
 use crate::i18n::{Key, t, t_fmt};
@@ -106,7 +106,7 @@ impl AboutScreen {
         galley
     }
 
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut AboutCtx) {
         let lang = ctx.settings.language;
         if self.facts.as_ref().is_some_and(|f| f.language != lang) {
             self.facts = None;

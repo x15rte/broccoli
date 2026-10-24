@@ -10,7 +10,7 @@ use crate::model::dns::{
 use crate::model::settings::Language;
 use crate::model::validation::dns_script_issues;
 use crate::model::{DnsServer, FakeDnsPool};
-use crate::ui::{UiCtx, widgets};
+use crate::ui::{DnsCtx, widgets};
 use egui::{DragValue, RichText, Ui};
 use serde_json::{Map, Value};
 
@@ -63,20 +63,20 @@ fn row_caption(i: usize, srv: &DnsServer, lang: Language) -> ServerRowCaption {
 }
 
 impl DnsScreen {
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut DnsCtx) {
         let mut changed = false;
         self.servers_section(ui, ctx, &mut changed);
         self.hosts_section(ui, ctx, &mut changed);
         self.global_section(ui, ctx, &mut changed);
         self.fakedns_section(ui, ctx, &mut changed);
         if changed {
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
     }
 
     // ---------- servers ----------
 
-    fn servers_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, changed: &mut bool) {
+    fn servers_section(&mut self, ui: &mut Ui, ctx: &mut DnsCtx, changed: &mut bool) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::DnsSectionServers), |ui| {
             let mut delete: Option<usize> = None;
@@ -202,7 +202,7 @@ impl DnsScreen {
 
     // ---------- hosts ----------
 
-    fn hosts_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, changed: &mut bool) {
+    fn hosts_section(&mut self, ui: &mut Ui, ctx: &mut DnsCtx, changed: &mut bool) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::DnsSectionHosts), |ui| {
             let buf = self
@@ -223,7 +223,7 @@ impl DnsScreen {
 
     // ---------- global ----------
 
-    fn global_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, changed: &mut bool) {
+    fn global_section(&mut self, ui: &mut Ui, ctx: &mut DnsCtx, changed: &mut bool) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::DnsSectionGlobal), |ui| {
             let dns = &mut ctx.settings.dns;
@@ -318,7 +318,7 @@ impl DnsScreen {
             // same text. The state it reads beside the path (the fallback
             // flags and the servers' matchers) changes only through this
             // screen, so the model generation is the revision the memo needs.
-            let revision = *ctx.model_generation;
+            let revision = ctx.hooks.model_generation();
             let servers = &dns.servers;
             let disable_fallback = dns.disable_fallback;
             let disable_fallback_if_match = dns.disable_fallback_if_match;
@@ -349,7 +349,7 @@ impl DnsScreen {
 
     // ---------- fakeDNS ----------
 
-    fn fakedns_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, changed: &mut bool) {
+    fn fakedns_section(&mut self, ui: &mut Ui, ctx: &mut DnsCtx, changed: &mut bool) {
         let lang = ctx.settings.language;
         widgets::section(ui, t(lang, Key::DnsSectionFakedns), |ui| {
             let fd = &mut ctx.settings.dns.fakedns;
@@ -824,7 +824,7 @@ mod tests {
                     // Same outer scroll wrapper as app.rs's screen dispatch.
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
-                        .show(ui, |ui| screen.show(ui, &mut rig.ctx()));
+                        .show(ui, |ui| screen.show(ui, &mut rig.ctx().dns()));
                 },
                 (),
             );

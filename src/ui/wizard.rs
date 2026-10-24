@@ -2,7 +2,7 @@
 //! Xray core.
 
 use crate::i18n::{Key, t};
-use crate::ui::{CoreSetupMount, UiCtx, show_core_setup};
+use crate::ui::{CoreSetupCtx, CoreSetupMount, show_core_setup};
 
 #[derive(Default)]
 pub struct WizardScreen {
@@ -13,7 +13,7 @@ pub struct WizardScreen {
 }
 
 impl WizardScreen {
-    pub fn show(&mut self, ctx: &egui::Context, uictx: &mut UiCtx) {
+    pub fn show(&mut self, ctx: &egui::Context, uictx: &mut CoreSetupCtx) {
         if self.done {
             return;
         }

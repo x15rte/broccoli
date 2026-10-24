@@ -115,96 +115,401 @@ impl PhaseAction {
 /// [`UiCtxSnapshot`], so a frame assembles this struct at
 /// reference-copy cost through [`UiCtx::new`]; the snapshot itself is rebuilt
 /// only when a drained event changes its inputs.
+///
+/// This struct is the frame's assembler, not a screen's context: a screen is
+/// handed one of the narrow slice types below ([`DashboardCtx`],
+/// [`ServersCtx`], …). A slice names exactly the inputs its screen reads and
+/// mutates, so a screen cannot reach a field it did not ask for and cannot
+/// obtain the raw command sender at all.
 pub struct UiCtx<'a> {
-    pub servers: &'a mut ServersFile,
-    pub settings: &'a mut Settings,
-    pub cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
-    pub phase: &'a CorePhase,
+    servers: &'a mut ServersFile,
+    settings: &'a mut Settings,
+    cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
+    phase: &'a CorePhase,
     /// The transport the live phase owns: `Some` while a launch is starting
-    /// or running (the backend it manages), `None` in every other phase. The
-    /// runtime publishes it with the phase itself, so a screen asking "is the
-    /// TUN active" reads one fact instead of deriving it from the mode
-    /// setting and the phase together.
-    pub transport: Option<CoreTransport>,
+    /// or running (the backend it manages), `None` in every other phase.
+    transport: Option<CoreTransport>,
     /// The busy window: the runtime-owned mutually-exclusive
-    /// lifecycle/update transaction. Screens gate their controls on this
-    /// value instead of deriving the window from their own inputs.
-    pub(crate) busy: gate::BusyWindow,
-    /// Persistent reason Connect is disabled. Screens must use this instead of
-    /// deriving capability from `phase` or managed-core presence alone.
-    pub connect_blocked_reason: &'a Option<String>,
-    /// The shell's per-generation safety verdict (see [`UiCtxParts`]).
-    pub safety: &'a SafetyVerdicts,
-    /// The validation verdict of the generation that filled
-    /// [`Self::config_error`], published by reference: the whole-model walk
-    /// ran once, and a screen asks its own row with
-    /// [`Verdict::for_target`] instead of re-deriving a rule or matching a
-    /// path. An edit inside the persist throttle is judged by the generation
-    /// it would commit (ADR-0084).
-    pub verdict: &'a Verdict,
-    /// The shell's stored config-generation error for the current model
-    /// revision — its generator text is excerpt-bounded by the generation
-    /// boundary before any label or log can see it, and its raw-override
-    /// validation failures are fixed catalog strings — or `None` when the
-    /// last generation succeeded. Screens render this where they used to run
-    /// the generator themselves: generating a candidate binds the ephemeral
-    /// control-plane port, so it stays on the shell's boot and persist paths.
-    pub config_error: &'a Option<String>,
-    pub stats: &'a Option<StatsTick>,
-    pub stats_history: &'a VecDeque<StatsTick>,
-    pub observatory: &'a [OutboundStatusView],
-    /// The app's log ring: `LogLine` entries, newest last, capped by the app.
-    pub logs: &'a VecDeque<LogLine>,
-    /// Monotonic push count of the app's log ring: the Logs
-    /// screen keys its memoized filtered view on this plus the ring length,
-    /// so the identity changes exactly when the ring's content changes —
-    /// even when empty lines rotate through a full ring.
-    pub logs_generation: u64,
-    pub core_version: &'a Option<String>,
-    /// The installed tree's own version and its last verification failure,
-    /// for the core setup surface.
-    pub(crate) core_setup: &'a CoreSetupState,
-    /// The terminal message the content area renders, and the compact chip
-    /// the status zone carries while one stands.
+    /// lifecycle/update transaction.
+    busy: gate::BusyWindow,
+    connect_blocked_reason: &'a Option<String>,
+    safety: &'a SafetyVerdicts,
+    verdict: &'a Verdict,
+    config_error: &'a Option<String>,
+    stats: &'a Option<StatsTick>,
+    stats_history: &'a VecDeque<StatsTick>,
+    observatory: &'a [OutboundStatusView],
+    logs: &'a VecDeque<LogLine>,
+    logs_generation: u64,
+    core_version: &'a Option<String>,
+    core_setup: &'a CoreSetupState,
+    terminal_error: &'a Option<TerminalErrorView>,
+    download: &'a DownloadState,
+    update_check: &'a UpdateCheckState,
+    is_elevated: bool,
+    probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
+    requests: &'a mut FrameRequests,
+    model_generation: &'a mut u64,
+    stats_generation: u64,
+    latency_generation: u64,
+}
+
+/// The frame's mutation and send seam: the shell-owned request bundle, the
+/// runtime command sender, and the model's edit generation behind one value.
+///
+/// Every slice that mutates, requests, or sends holds one and delegates, and
+/// [`UiCtx`] delegates to the same implementation — so the sender has one
+/// gate ([`FrameHooks::send`]) and the shell's optimistic busy mirror cannot
+/// be skipped by a screen wiring its own copy. A reply-carrying command is
+/// still built by the screen with its own reply channel; only the send comes
+/// through here.
+pub(crate) struct FrameHooks<'a> {
+    requests: &'a mut FrameRequests,
+    cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
+    model_generation: &'a mut u64,
+}
+
+/// The one construction point for a [`FrameHooks`] borrowing a frame's three
+/// values, so [`UiCtx`] and every slice producer wire the same fields.
+fn hooks_of<'a>(
+    requests: &'a mut FrameRequests,
+    cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
+    model_generation: &'a mut u64,
+) -> FrameHooks<'a> {
+    FrameHooks {
+        requests,
+        cmd,
+        model_generation,
+    }
+}
+
+impl<'a> FrameHooks<'a> {
+    /// Re-borrow the seam for a helper call: same requests, sender and
+    /// generation, shorter lifetime.
+    pub(crate) fn reborrow(&mut self) -> FrameHooks<'_> {
+        FrameHooks {
+            requests: self.requests,
+            cmd: self.cmd,
+            model_generation: self.model_generation,
+        }
+    }
+
+    /// Record a model edit: the persist request for the config pipeline, and
+    /// the generation bump every screen's cache keys on. One hook, so no
+    /// mutation site can change the model without invalidating the caches
+    /// derived from it.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.requests.dirty = true;
+        self.bump_model_generation();
+    }
+
+    /// Persist a display-only preference (traffic unit, language, accent):
+    /// saved to settings.json like any edit, but without entering the
+    /// config-apply pipeline — no "changes pending" chip, no Apply now.
+    pub(crate) fn mark_ui_dirty(&mut self) {
+        self.requests.ui_dirty = true;
+        self.bump_model_generation();
+    }
+
+    fn bump_model_generation(&mut self) {
+        *self.model_generation = self.model_generation.wrapping_add(1);
+    }
+
+    /// The model's edit generation, for a screen's per-frame cache key.
+    pub(crate) fn model_generation(&self) -> u64 {
+        *self.model_generation
+    }
+
+    /// Whether the runtime control channel is closed (the runtime thread is
+    /// gone). The one read of the sender that is not a send.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.cmd.is_closed()
+    }
+
+    /// Fire-and-forget command send, recording the busy-window head start a
+    /// command that opens a job asks for. Screens send through this rather
+    /// than a raw channel, so the shell's optimistic mirror cannot be skipped
+    /// by one call site. The control channel is closed only once the runtime
+    /// thread has exited; a command dropped then is logged here, and the
+    /// core-setup surface renders the closed channel next to the buttons it
+    /// explains, so a user-initiated action can never vanish silently.
+    /// `true` when the command reached the runtime.
+    pub(crate) fn send(&mut self, cmd: CoreCmd) -> bool {
+        let kind = cmd.job_kind();
+        let sent = self.cmd.send(cmd).is_ok();
+        if !sent {
+            tracing::warn!("core command not sent: runtime control channel is closed");
+            return false;
+        }
+        // The mirror only for a command the runtime actually received: a
+        // command that never arrived has no bookend coming to release it, and
+        // the busy window it would pin never opens.
+        if let Some(kind) = kind {
+            self.requests.mirror_operation = Some(kind);
+        }
+        true
+    }
+
+    /// Request Connect through the shell so every screen shares persistence,
+    /// recovery, listener, and runtime-operation gates.
+    pub(crate) fn request_connect(&mut self) {
+        self.requests.connect = true;
+    }
+
+    /// Request Disconnect/Cancel through the shell so the runtime listener is
+    /// stopped through the normal operation path.
+    pub(crate) fn request_stop(&mut self) {
+        self.requests.stop = true;
+    }
+
+    /// Request a fresh pinned-payload verification of the installed core.
+    pub(crate) fn request_core_verify(&mut self) {
+        self.requests.verify_core = true;
+    }
+
+    /// Open the managed core directory in the shell's file browser.
+    pub(crate) fn request_open_core_folder(&mut self) {
+        self.requests.open_core_folder = true;
+    }
+
+    /// Open the Settings screen, where the core setup surface stays mounted
+    /// in every core state.
+    pub(crate) fn request_open_core_setup(&mut self) {
+        self.requests.open_core_setup = true;
+    }
+
+    /// Confirm the exit-time full cleanup: the shell stashes it for `main`
+    /// and quits through the normal shutdown path.
+    pub(crate) fn request_cleanup_exit(&mut self) {
+        self.requests.cleanup = true;
+    }
+
+    /// Confirm the exit-time reset to a fresh install's defaults (keeping the
+    /// server list): the shell stashes it for `main` and quits normally.
+    pub(crate) fn request_reset(&mut self) {
+        self.requests.reset = true;
+    }
+
+    /// A staged Quit is resolved (all dirty drafts saved or discarded): the
+    /// shell runs its normal quit path this frame.
+    pub(crate) fn request_quit_resume(&mut self) {
+        self.requests.quit_resume = true;
+    }
+}
+
+/// About: its own language and the verified core version.
+pub struct AboutCtx<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) core_version: &'a Option<String>,
+}
+
+/// Dashboard: lifecycle facts, the stats/observatory inputs behind its
+/// memoized caches, and the server list it switches the active profile in.
+pub struct DashboardCtx<'a> {
+    pub(crate) servers: &'a mut ServersFile,
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) transport: Option<CoreTransport>,
+    pub(crate) stats: &'a Option<StatsTick>,
+    pub(crate) stats_history: &'a VecDeque<StatsTick>,
+    pub(crate) observatory: &'a [OutboundStatusView],
+    pub(crate) download: &'a DownloadState,
     pub(crate) terminal_error: &'a Option<TerminalErrorView>,
-    pub download: &'a DownloadState,
-    /// Renderable state of the on-demand update check.
-    pub update_check: &'a UpdateCheckState,
-    pub is_elevated: bool,
+    pub(crate) connect_blocked_reason: &'a Option<String>,
+    pub(crate) config_error: &'a Option<String>,
+    pub(crate) is_elevated: bool,
+    pub(crate) stats_generation: u64,
+    pub(crate) latency_generation: u64,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Profile preview: the phase it labels and gates on, the busy window, and
+/// the runtime-state read it sends.
+pub struct ProfilePreviewCtx<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) busy: gate::BusyWindow,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Routing: the settings tree it edits, the server list its caches read, the
+/// generation's safety verdict, the phase/window its live-only controls gate
+/// on, and the send seam its trial-rule and balancer controls use.
+pub struct RoutingCtx<'a> {
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) servers: &'a ServersFile,
+    pub(crate) safety: &'a SafetyVerdicts,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) busy: gate::BusyWindow,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// DNS: the settings tree it edits; every finding it renders comes from that
+/// tree alone.
+pub struct DnsCtx<'a> {
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Inbounds: the listener settings it edits, the generation's safety and
+/// validation verdicts, and the edit hook.
+pub struct InboundsCtx<'a> {
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) safety: &'a SafetyVerdicts,
+    pub(crate) verdict: &'a Verdict,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// TUN: the mode/takeover settings it edits, the transport the live backend
+/// owns, the phase it labels, elevation, and the generation verdicts.
+pub struct TunCtx<'a> {
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) safety: &'a SafetyVerdicts,
+    pub(crate) verdict: &'a Verdict,
+    pub(crate) transport: Option<CoreTransport>,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) is_elevated: bool,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Logs: the ring and its identity, the phase/window the logger restart gates
+/// on, and the send seam.
+pub struct LogsCtx<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) logs: &'a VecDeque<LogLine>,
+    pub(crate) logs_generation: u64,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) busy: gate::BusyWindow,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Settings: the settings tree it edits, the update-check state it renders,
+/// the core-setup inputs its mounted surface reads, and the requests its
+/// exit-time modals raise.
+pub struct SettingsCtx<'a> {
+    pub(crate) settings: &'a mut Settings,
+    pub(crate) busy: gate::BusyWindow,
+    pub(crate) update_check: &'a UpdateCheckState,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) core_version: &'a Option<String>,
+    pub(crate) core_setup: &'a CoreSetupState,
+    pub(crate) download: &'a DownloadState,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+impl<'a> SettingsCtx<'a> {
+    /// The mounted core-setup surface's inputs. One borrow of this slice's
+    /// fields, so the shared surface reads exactly the same value here and in
+    /// the first-run wizard.
+    pub(crate) fn core_setup_surface(&mut self) -> CoreSetupCtx<'_> {
+        CoreSetupCtx {
+            settings: &*self.settings,
+            phase: self.phase,
+            core_version: self.core_version,
+            core_setup: self.core_setup,
+            download: self.download,
+            busy: self.busy,
+            hooks: self.hooks.reborrow(),
+        }
+    }
+}
+
+/// The shared pinned-core setup surface (the first-run wizard and the
+/// Settings section): the languages and versions it prints, the download
+/// progress it renders, and the install/verify/folder requests it raises.
+pub struct CoreSetupCtx<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) phase: &'a CorePhase,
+    pub(crate) core_version: &'a Option<String>,
+    pub(crate) core_setup: &'a CoreSetupState,
+    pub(crate) download: &'a DownloadState,
+    pub(crate) busy: gate::BusyWindow,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+/// Servers: the model it edits, the language/reference lookups it reads from
+/// settings, the window its probe gate reads, the parked probe outcome, and
+/// the send/edit/quit seams.
+pub struct ServersCtx<'a> {
+    pub(crate) servers: &'a mut ServersFile,
+    pub(crate) settings: &'a Settings,
+    pub(crate) busy: gate::BusyWindow,
     /// Outcome slot of the one single-flight latency probe: the shell parks
     /// the drained result here and the servers screen adopts it through its
-    /// `ShellParked` request — the app-owned screen-feedback slot that
-    /// replaced the request/response bus. A result landing while the user
-    /// is elsewhere waits in the slot until the servers screen takes it;
-    /// the single slot is exact because the probe is single-flight and the
-    /// UI pending gate holds until the take.
+    /// `ShellParked` request. A result landing while the user is elsewhere
+    /// waits in the slot until the servers screen takes it; the single slot
+    /// is exact because the probe is single-flight and the UI pending gate
+    /// holds until the take.
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
-    /// The frame's requests, owned by the shell and drained once after the
-    /// screens ran: settings edit hooks write into it (see
-    /// [`FrameRequests`]).
-    pub(crate) requests: &'a mut FrameRequests,
-    /// The model's edit generation: bumped by every mutation hook
-    /// ([`UiCtx::mark_dirty`] and [`UiCtx::mark_ui_dirty`]), so a screen's
-    /// per-frame cache keyed on it re-derives in the frame after any edit —
-    /// including edits inside the persist throttle window, which the
-    /// persist-time [`UiCtx::config_revision`] cannot cover.
-    pub(crate) model_generation: &'a mut u64,
-    /// Monotonic per-input generations for screens' memoization keys
-    /// (dashboard plot and latency-grid caches): `stats_generation` advances
-    /// once per stats tick, `latency_generation` once per observatory tick
-    /// and once per consumed latency-probe result, all bumped by the app's
-    /// event drain.
-    pub stats_generation: u64,
-    pub latency_generation: u64,
+    pub(crate) hooks: FrameHooks<'a>,
+}
+
+impl<'a> ServersCtx<'a> {
+    /// Launch an isolated one-shot probe over every server profile (probe
+    /// scope "all"). No settings mutation or dirty marker is involved. The
+    /// outcome is single-flight: the app parks it in the probe-feedback
+    /// slot and the servers screen takes it — pairing is structural, no
+    /// correlation id.
+    pub fn request_latency_probe(&mut self) -> Result<(), String> {
+        let profiles = self.servers.profiles.clone();
+        if profiles.is_empty() {
+            let lang = self.settings.language;
+            return Err(t(lang, Key::LatencyRequiresProfile).to_string());
+        }
+        self.send_latency_probe(profiles)
+    }
+
+    /// Launch an isolated one-shot probe over one server profile (probe
+    /// scope "one"). Any profiles the probed profile chains through
+    /// (`sockopt.dialerProxy`) ride along in the probe child so the
+    /// referenced outbounds exist; the probed profile stays first and its
+    /// status is the reported one. Unresolvable targets are left out —
+    /// builtins resolve inside the child, anything else fails loudly at
+    /// config generation, exactly like the all-profile probe.
+    pub fn request_latency_probe_for(&mut self, profile: ServerProfile) -> Result<(), String> {
+        // The chain a probe child needs is a graph question, not a walk over
+        // the model: the same resolution the generator and the validation
+        // pass use, so a hop a builtin resolves and a dangling reference are
+        // read the same way everywhere.
+        let graph = crate::model::dial::DialGraph::for_profiles(&self.servers.profiles);
+        let mut chain = vec![profile];
+        chain.extend(graph.dependencies(&chain[0].tag()).into_iter().cloned());
+        self.send_latency_probe(chain)
+    }
+
+    /// Send one isolated one-shot probe over the given profile list.
+    fn send_latency_probe(&mut self, profiles: Vec<ServerProfile>) -> Result<(), String> {
+        let probe_url = self.settings.ping_test_probe_url().to_owned();
+        let lang = self.settings.language;
+        // The probe carries the TUN outbound interface setting and the TUN
+        // adapter's own name so its dials can bypass the capture and its
+        // resolution exclude the adapter. Whether either is *used* is the
+        // runtime's decision — its own backend's transport ownership — so the
+        // request does not re-derive it from the mode setting: one decision,
+        // taken where the live backend is known.
+        let tun_outbound_interface = Some(self.settings.tun.auto_outbounds_interface.clone());
+        let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
+        let sent = self.hooks.send(CoreCmd::ProbeLatency {
+            profiles,
+            probe_url,
+            tun_outbound_interface,
+            tun_adapter_name,
+        });
+        if sent {
+            Ok(())
+        } else {
+            Err(t(lang, Key::LatencyCoreUnavailable).to_string())
+        }
+    }
 }
 
 /// The shell-owned requests one frame's screens raise: the lifecycle and
-/// setup actions the shell performs after the frame, the two persist
-/// requests, and the optimistic busy-window mirror for a command a screen
-/// sent. One value the shell owns and drains once, instead of seven `&mut
-/// bool` fields every screen can alias — the request vocabulary is one type,
-/// and a new request is one field here rather than a new borrow in every
-/// construction site.
+/// setup actions the shell performs after the frame, the persist requests,
+/// the exit/quit confirmations, and the optimistic busy-window mirror for a
+/// command a screen sent. One value the shell owns and drains once, instead
+/// of a pile of `&mut bool` fields every screen can alias — the request
+/// vocabulary is one type, and a new request is one field here rather than a
+/// new borrow in every construction site.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct FrameRequests {
     pub(crate) connect: bool,
@@ -220,6 +525,15 @@ pub(crate) struct FrameRequests {
     /// while the busy window is open, exactly as its own sends do. The
     /// runtime's bookends stay the authority; this is the head start.
     pub(crate) mirror_operation: Option<JobKind>,
+    /// Settings confirmed "Clean Up and Exit…": the shell stashes it for
+    /// `main` and quits through the normal shutdown path.
+    pub(crate) cleanup: bool,
+    /// Settings confirmed "Reset to default…": same exit path, with the exit
+    /// wipe that keeps the server list.
+    pub(crate) reset: bool,
+    /// A staged Quit resolved (all dirty server drafts saved or discarded):
+    /// the shell runs its normal quit path.
+    pub(crate) quit_resume: bool,
 }
 
 /// Per-frame borrows and scalars every [`UiCtx::new`] construction site
@@ -247,14 +561,14 @@ pub(crate) struct UiCtxParts<'a> {
     /// of each running the assessment itself.
     pub(crate) safety: &'a SafetyVerdicts,
     /// The shell's published validation verdict (the generation's whole-model
-    /// findings), projected into [`UiCtx::verdict`].
+    /// findings), projected into each screen's slice.
     pub(crate) verdict: &'a Verdict,
     /// The shell's stored config-generation error (the same value the
-    /// top-bar config chip renders), projected into [`UiCtx::config_error`].
+    /// top-bar config chip renders), projected into each screen's slice.
     pub(crate) config_error: &'a Option<String>,
     /// The raw window the shell drained from the runtime's operation
-    /// bookends: [`UiCtx::new`] derives [`UiCtx::busy`] from it once per
-    /// frame, and screens read the window through that value.
+    /// bookends: [`UiCtx::new`] derives the frame's busy window from it once
+    /// per frame, and screens read the window through their slice's value.
     pub(crate) operation: Option<JobKind>,
     pub(crate) is_elevated: bool,
 }
@@ -268,6 +582,23 @@ pub(crate) enum UiCtxView<'a> {
     /// The first-run wizard never surfaces live runtime inputs: stats and
     /// observatory are blanked even if the snapshot holds stale values.
     Onboarding { snapshot: &'a UiCtxSnapshot },
+}
+
+impl<'a> UiCtxView<'a> {
+    /// The snapshot this presentation draws its runtime inputs from. Adding
+    /// a snapshot input never edits a presentation arm: both arms carry the
+    /// same snapshot, and [`UiCtx::new`] reads each input from this one
+    /// accessor.
+    fn snapshot(&self) -> &'a UiCtxSnapshot {
+        match self {
+            Self::Live { snapshot } | Self::Onboarding { snapshot } => snapshot,
+        }
+    }
+
+    /// Whether the presentation surfaces the snapshot's live runtime inputs.
+    fn live(&self) -> bool {
+        matches!(self, Self::Live { .. })
+    }
 }
 
 /// Blanked stats for onboarding contexts: a `'static` resting value so the
@@ -312,53 +643,22 @@ impl<'a> UiCtx<'a> {
             operation,
             is_elevated,
         } = parts;
+        let snapshot = view.snapshot();
         let idle_observatory: &'a [OutboundStatusView] = &[];
-        let (
-            phase,
-            transport,
-            stats,
-            observatory,
-            core_version,
-            core_setup,
-            terminal_error,
-            download,
-            update_check,
-            stats_generation,
-            latency_generation,
-        ) = match view {
-            UiCtxView::Live { snapshot } => (
-                &snapshot.phase,
-                snapshot.transport,
-                &snapshot.stats,
-                &snapshot.observatory[..],
-                &snapshot.core_version,
-                &snapshot.core_setup,
-                &snapshot.terminal_error,
-                &snapshot.download,
-                &snapshot.update_check,
-                snapshot.stats_generation,
-                snapshot.latency_generation,
-            ),
-            UiCtxView::Onboarding { snapshot } => (
-                &snapshot.phase,
-                snapshot.transport,
-                &BLANK_STATS,
-                idle_observatory,
-                &snapshot.core_version,
-                &snapshot.core_setup,
-                &snapshot.terminal_error,
-                &snapshot.download,
-                &snapshot.update_check,
-                snapshot.stats_generation,
-                snapshot.latency_generation,
-            ),
+        // The one presentation difference: onboarding blanks the two live
+        // runtime inputs. Every other input reads from the snapshot below, so
+        // adding an input touches only this struct literal.
+        let (stats, observatory) = if view.live() {
+            (&snapshot.stats, &snapshot.observatory[..])
+        } else {
+            (&BLANK_STATS, idle_observatory)
         };
         Self {
             servers,
             settings,
             cmd,
-            phase,
-            transport,
+            phase: &snapshot.phase,
+            transport: snapshot.transport,
             stats_history,
             logs,
             logs_generation,
@@ -373,142 +673,199 @@ impl<'a> UiCtx<'a> {
             is_elevated,
             stats,
             observatory,
-            core_version,
-            core_setup,
-            terminal_error,
-            download,
-            update_check,
-            stats_generation,
-            latency_generation,
+            core_version: &snapshot.core_version,
+            core_setup: &snapshot.core_setup,
+            terminal_error: &snapshot.terminal_error,
+            download: &snapshot.download,
+            update_check: &snapshot.update_check,
+            stats_generation: snapshot.stats_generation,
+            latency_generation: snapshot.latency_generation,
         }
     }
 
-    /// Record a model edit: the persist request for the config pipeline, and
-    /// the generation bump every screen's cache keys on. One hook, so no
-    /// mutation site can change the model without invalidating the caches
-    /// derived from it.
+    /// The frame's hooks over this context's own fields. Slice producers use
+    /// the same [`hooks_of`] constructor, so there is one hooks value shape.
+    pub(crate) fn hooks(&mut self) -> FrameHooks<'_> {
+        hooks_of(self.requests, self.cmd, self.model_generation)
+    }
+
+    /// Record a model edit — delegates to [`FrameHooks::mark_dirty`], the one
+    /// implementation.
     pub fn mark_dirty(&mut self) {
-        self.requests.dirty = true;
-        self.bump_model_generation();
+        self.hooks().mark_dirty();
     }
 
-    /// Persist a display-only preference (traffic unit, language, accent):
-    /// saved to settings.json like any edit, but without entering the
-    /// config-apply pipeline — no "changes pending" chip, no Apply now.
+    /// Persist a display-only preference — delegates to
+    /// [`FrameHooks::mark_ui_dirty`].
     pub fn mark_ui_dirty(&mut self) {
-        self.requests.ui_dirty = true;
-        self.bump_model_generation();
+        self.hooks().mark_ui_dirty();
     }
 
-    fn bump_model_generation(&mut self) {
-        *self.model_generation = self.model_generation.wrapping_add(1);
-    }
-
-    /// Request Connect through the shell so every screen shares persistence,
-    /// recovery, listener, and runtime-operation gates.
-    pub fn request_connect(&mut self) {
-        self.requests.connect = true;
-    }
-
-    /// Request Disconnect/Cancel through the shell so the runtime listener is
-    /// stopped through the normal operation path.
-    pub fn request_stop(&mut self) {
-        self.requests.stop = true;
-    }
-
-    /// Request a fresh pinned-payload verification of the installed core (the
-    /// core setup surface's Verify action). The shell runs the pass and
-    /// records the verdict; re-verification never touches the core itself.
-    pub fn request_core_verify(&mut self) {
-        self.requests.verify_core = true;
-    }
-
-    /// Open the managed core directory in the shell's file browser.
-    pub fn request_open_core_folder(&mut self) {
-        self.requests.open_core_folder = true;
-    }
-
-    /// Open the Settings screen, where the core setup surface stays mounted
-    /// in every core state.
-    pub fn request_open_core_setup(&mut self) {
-        self.requests.open_core_setup = true;
-    }
-
-    /// Fire-and-forget command send, recording the busy-window head start a
-    /// command that opens a job asks for. Screens send through this rather
-    /// than the raw channel, so the shell's optimistic mirror cannot be
-    /// skipped by one call site. The control channel is closed only once the
-    /// runtime thread has exited; a command dropped then is logged here, and
-    /// the core-setup surface renders the closed channel next to the buttons
-    /// it explains, so a user-initiated action can never vanish silently.
-    /// `true` when the command reached the runtime.
+    /// Send a command through the one seam — delegates to
+    /// [`FrameHooks::send`].
     pub fn send(&mut self, cmd: CoreCmd) -> bool {
-        let kind = cmd.job_kind();
-        let sent = self.cmd.send(cmd).is_ok();
-        if !sent {
-            tracing::warn!("core command not sent: runtime control channel is closed");
-            return false;
-        }
-        // The mirror only for a command the runtime actually received: a
-        // command that never arrived has no bookend coming to release it, and
-        // the busy window it would pin never opens.
-        if let Some(kind) = kind {
-            self.requests.mirror_operation = Some(kind);
-        }
-        true
-    }
-    /// Launch an isolated one-shot probe over every server profile (probe
-    /// scope "all"). No settings mutation or dirty marker is involved. The
-    /// outcome is single-flight: the app parks it in the probe-feedback
-    /// slot and the servers screen takes it — pairing is structural, no
-    /// correlation id.
-    pub fn request_latency_probe(&mut self) -> Result<(), String> {
-        let profiles = self.servers.profiles.clone();
-        if profiles.is_empty() {
-            let lang = self.settings.language;
-            return Err(t(lang, Key::LatencyRequiresProfile).to_string());
-        }
-        self.send_latency_probe(profiles)
+        self.hooks().send(cmd)
     }
 
-    /// Launch an isolated one-shot probe over one server profile (probe
-    /// scope "one"). Any profiles the probed profile chains
-    /// through (`sockopt.dialerProxy`) ride along in
-    /// the probe child so the referenced outbounds exist; the probed profile
-    /// stays first and its status is the reported one. Unresolvable targets
-    /// are left out — builtins resolve inside the child, anything else fails
-    /// loudly at config generation, exactly like the all-profile probe.
-    pub fn request_latency_probe_for(&mut self, profile: ServerProfile) -> Result<(), String> {
-        // The chain a probe child needs is a graph question, not a walk over
-        // the model: the same resolution the generator and the validation
-        // pass use, so a hop a builtin resolves and a dangling reference are
-        // read the same way everywhere.
-        let graph = crate::model::dial::DialGraph::for_profiles(&self.servers.profiles);
-        let mut chain = vec![profile];
-        chain.extend(graph.dependencies(&chain[0].tag()).into_iter().cloned());
-        self.send_latency_probe(chain)
+    /// Request Connect — delegates to [`FrameHooks::request_connect`].
+    pub fn request_connect(&mut self) {
+        self.hooks().request_connect();
     }
 
-    /// Send one isolated one-shot probe over the given profile list.
-    fn send_latency_probe(&mut self, profiles: Vec<ServerProfile>) -> Result<(), String> {
-        let probe_url = self.settings.ping_test_probe_url().to_owned();
-        let lang = self.settings.language;
-        // The probe carries the TUN outbound interface setting and the TUN
-        // adapter's own name so its dials can bypass the capture and its
-        // resolution exclude the adapter. Whether either is *used* is the
-        // runtime's decision — its own backend's transport ownership — so the
-        // request does not re-derive it from the mode setting: one decision,
-        // taken where the live backend is known.
-        let tun_outbound_interface = Some(self.settings.tun.auto_outbounds_interface.clone());
-        let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
-        self.cmd
-            .send(CoreCmd::ProbeLatency {
-                profiles,
-                probe_url,
-                tun_outbound_interface,
-                tun_adapter_name,
-            })
-            .map_err(|_| t(lang, Key::LatencyCoreUnavailable).to_string())
+    /// Request Disconnect/Cancel — delegates to [`FrameHooks::request_stop`].
+    pub fn request_stop(&mut self) {
+        self.hooks().request_stop();
+    }
+
+    /// Run a pinned-payload verification — delegates to
+    /// [`FrameHooks::request_core_verify`].
+    pub fn request_core_verify(&mut self) {
+        self.hooks().request_core_verify();
+    }
+
+    /// Open the managed core directory — delegates to
+    /// [`FrameHooks::request_open_core_folder`].
+    pub fn request_open_core_folder(&mut self) {
+        self.hooks().request_open_core_folder();
+    }
+
+    /// Open the core setup surface — delegates to
+    /// [`FrameHooks::request_open_core_setup`].
+    pub fn request_open_core_setup(&mut self) {
+        self.hooks().request_open_core_setup();
+    }
+
+    /// The About screen's slice.
+    pub(crate) fn about(&mut self) -> AboutCtx<'_> {
+        AboutCtx {
+            settings: &*self.settings,
+            core_version: self.core_version,
+        }
+    }
+
+    /// The Dashboard screen's slice.
+    pub(crate) fn dashboard(&mut self) -> DashboardCtx<'_> {
+        DashboardCtx {
+            servers: &mut *self.servers,
+            settings: &mut *self.settings,
+            phase: self.phase,
+            transport: self.transport,
+            stats: self.stats,
+            stats_history: self.stats_history,
+            observatory: self.observatory,
+            download: self.download,
+            terminal_error: self.terminal_error,
+            connect_blocked_reason: self.connect_blocked_reason,
+            config_error: self.config_error,
+            is_elevated: self.is_elevated,
+            stats_generation: self.stats_generation,
+            latency_generation: self.latency_generation,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Profile preview screen's slice.
+    pub(crate) fn profile_preview(&mut self) -> ProfilePreviewCtx<'_> {
+        ProfilePreviewCtx {
+            settings: &*self.settings,
+            phase: self.phase,
+            busy: self.busy,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Routing screen's slice.
+    pub(crate) fn routing(&mut self) -> RoutingCtx<'_> {
+        RoutingCtx {
+            settings: &mut *self.settings,
+            servers: &*self.servers,
+            safety: self.safety,
+            phase: self.phase,
+            busy: self.busy,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The DNS screen's slice.
+    pub(crate) fn dns(&mut self) -> DnsCtx<'_> {
+        DnsCtx {
+            settings: &mut *self.settings,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Inbounds screen's slice.
+    pub(crate) fn inbounds(&mut self) -> InboundsCtx<'_> {
+        InboundsCtx {
+            settings: &mut *self.settings,
+            safety: self.safety,
+            verdict: self.verdict,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The TUN screen's slice.
+    pub(crate) fn tun(&mut self) -> TunCtx<'_> {
+        TunCtx {
+            settings: &mut *self.settings,
+            safety: self.safety,
+            verdict: self.verdict,
+            transport: self.transport,
+            phase: self.phase,
+            is_elevated: self.is_elevated,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Logs screen's slice.
+    pub(crate) fn logs(&mut self) -> LogsCtx<'_> {
+        LogsCtx {
+            settings: &*self.settings,
+            logs: self.logs,
+            logs_generation: self.logs_generation,
+            phase: self.phase,
+            busy: self.busy,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Settings screen's slice.
+    pub(crate) fn settings(&mut self) -> SettingsCtx<'_> {
+        SettingsCtx {
+            settings: &mut *self.settings,
+            busy: self.busy,
+            update_check: self.update_check,
+            phase: self.phase,
+            core_version: self.core_version,
+            core_setup: self.core_setup,
+            download: self.download,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The Servers screen's slice.
+    pub(crate) fn servers(&mut self) -> ServersCtx<'_> {
+        ServersCtx {
+            servers: &mut *self.servers,
+            settings: &*self.settings,
+            busy: self.busy,
+            probe_feedback: &mut *self.probe_feedback,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
+    }
+
+    /// The first-run wizard's slice: exactly the shared core-setup surface's
+    /// inputs, which is all it renders.
+    pub(crate) fn wizard(&mut self) -> CoreSetupCtx<'_> {
+        CoreSetupCtx {
+            settings: &*self.settings,
+            phase: self.phase,
+            core_version: self.core_version,
+            core_setup: self.core_setup,
+            download: self.download,
+            busy: self.busy,
+            hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
+        }
     }
 }
 
@@ -517,6 +874,13 @@ impl<'a> UiCtx<'a> {
 /// them — never per frame. [`UiCtx`] borrows from it at reference-copy
 /// cost; the first-run wizard reuses the same snapshot instead of building
 /// a second one.
+///
+/// The comparison is whole-value: each field's own `PartialEq` is its
+/// published equality rule (`CorePhase` compares payload-inclusively,
+/// `TerminalErrorView` compares its rendered text, …), so a new input is
+/// compared by construction and no hand-written list can drift from the
+/// fields it claims to cover.
+#[derive(PartialEq)]
 pub(crate) struct UiCtxSnapshot {
     pub(crate) phase: CorePhase,
     pub(crate) transport: Option<CoreTransport>,
@@ -534,30 +898,8 @@ pub(crate) struct UiCtxSnapshot {
     pub(crate) latency_generation: u64,
 }
 
-impl UiCtxSnapshot {
-    /// True when `other` carries the same inputs as this snapshot. The app
-    /// skips no-op rebuilds with this (e.g. the initial `State(Stopped)`
-    /// drain, duplicate events), so the snapshot is replaced only when an
-    /// input actually changed. Every compared type publishes its own
-    /// equality rule, so "did this input change" has one definition per type
-    /// and no copy here to drift from it.
-    pub(crate) fn same_inputs(&self, other: &UiCtxSnapshot) -> bool {
-        self.stats_generation == other.stats_generation
-            && self.latency_generation == other.latency_generation
-            && self.observatory == other.observatory
-            && self.core_version == other.core_version
-            && self.core_setup == other.core_setup
-            && self.terminal_error == other.terminal_error
-            && self.stats == other.stats
-            && self.phase == other.phase
-            && self.transport == other.transport
-            && self.download == other.download
-            && self.update_check == other.update_check
-    }
-}
-
 /// Whether a core setup source is currently owned by the runtime.
-pub(crate) fn core_setup_busy(ctx: &UiCtx<'_>) -> bool {
+pub(crate) fn core_setup_busy(ctx: &CoreSetupCtx<'_>) -> bool {
     matches!(&ctx.download, DownloadState::Working { .. }) || ctx.busy.is_held()
 }
 
@@ -635,7 +977,7 @@ pub(crate) struct CoreSetupOutcome {
 /// explains how the installed version is read and accepted.
 pub(crate) fn show_core_setup(
     ui: &mut egui::Ui,
-    ctx: &mut UiCtx<'_>,
+    ctx: &mut CoreSetupCtx<'_>,
     mount: CoreSetupMount,
 ) -> CoreSetupOutcome {
     let show_continue = matches!(mount, CoreSetupMount::Dialog);
@@ -770,7 +1112,7 @@ pub(crate) fn show_core_setup(
                 .on_disabled_hover_text(verify_disabled_reason)
                 .clicked()
             {
-                ctx.request_core_verify();
+                ctx.hooks.request_core_verify();
             }
             if ui
                 .add_enabled(
@@ -780,7 +1122,7 @@ pub(crate) fn show_core_setup(
                 .on_disabled_hover_text(install_disabled_reason)
                 .clicked()
             {
-                ctx.send(CoreCmd::UpdateCore);
+                ctx.hooks.send(CoreCmd::UpdateCore);
             }
             if ui
                 .add_enabled(
@@ -793,24 +1135,24 @@ pub(crate) fn show_core_setup(
                     .add_filter(t(lang, Key::ShellXrayArchiveFilter), &["zip"])
                     .pick_file()
             {
-                ctx.send(CoreCmd::ImportCoreArchive(path));
+                ctx.hooks.send(CoreCmd::ImportCoreArchive(path));
             }
             if ui
                 .button(t(lang, Key::CoreSetupOpenFolder))
                 .on_hover_text(sys::paths::core_dir().display().to_string())
                 .clicked()
             {
-                ctx.request_open_core_folder();
+                ctx.hooks.request_open_core_folder();
             }
         });
     });
 
     // A closed control channel means the runtime thread is gone: the
     // actions above — and the update check rendered just below this surface
-    // in Settings — cannot reach it. [`UiCtx::send`] logs the dropped
+    // in Settings — cannot reach it. [`FrameHooks::send`] logs the dropped
     // command; this line is the on-screen half, in the same status-line
     // idiom as the core state row above.
-    if ctx.cmd.is_closed() {
+    if ctx.hooks.is_closed() {
         ui.add_space(6.0);
         ui.colored_label(
             colors.err,
@@ -1017,20 +1359,21 @@ pub(crate) fn format_single_latency_probe_feedback(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, UiCtxSnapshot,
-        format_latency_probe_feedback, format_single_latency_probe_feedback, show_core_setup,
+        AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, TerminalErrorView,
+        UiCtxSnapshot, format_latency_probe_feedback, format_single_latency_probe_feedback,
+        show_core_setup,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ProtocolSettings, ServerProfile};
     use crate::rt::{
-        CoreCmd, CorePhase, DownloadState, LatencyProbeResult, OutboundStatusView, ProbeFailure,
-        StatsTick,
+        CoreCmd, CorePhase, CoreTransport, DownloadState, JobKind, LatencyProbeResult,
+        OutboundStatusView, ProbeFailure, StatsTick,
     };
     use crate::sys;
     use crate::sys::selfupd::UpdateCheckState;
-    use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::{UiTestRig, screen_harness};
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
 
     /// Render the shared surface over one rig state and hand back the
@@ -1038,7 +1381,7 @@ mod tests {
     fn core_setup_harness(rig: UiTestRig) -> Harness<'static, UiTestRig> {
         Harness::new_ui_state(
             |ui, rig: &mut UiTestRig| {
-                let _ = show_core_setup(ui, &mut rig.ctx(), CoreSetupMount::Settings);
+                let _ = show_core_setup(ui, &mut rig.ctx().wizard(), CoreSetupMount::Settings);
             },
             rig,
         )
@@ -1260,6 +1603,7 @@ mod tests {
             "https://observatory.example/generate_204".into();
         let profile = ServerProfile::new("probe", OutboundModel::new(Protocol::Freedom));
         rig.ctx()
+            .servers()
             .request_latency_probe_for(profile)
             .expect("probe request must be accepted");
         let command = rig._cmd_rx.try_recv().expect("one command must be queued");
@@ -1278,6 +1622,7 @@ mod tests {
             "https://observatory.example/generate_204".into();
         let profile = ServerProfile::new("probe", OutboundModel::new(Protocol::Freedom));
         rig.ctx()
+            .servers()
             .request_latency_probe_for(profile)
             .expect("probe request must be accepted");
         let command = rig._cmd_rx.try_recv().expect("one command must be queued");
@@ -1831,6 +2176,7 @@ mod tests {
         rig.servers.profiles.push(middle.clone());
         rig.servers.profiles.push(leaf.clone());
         rig.ctx()
+            .servers()
             .request_latency_probe_for(main.clone())
             .expect("probe request");
         let cmd = rig._cmd_rx.try_recv().expect("probe command");
@@ -1848,6 +2194,7 @@ mod tests {
         let profile = ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(profile.clone());
         rig.ctx()
+            .servers()
             .request_latency_probe_for(profile.clone())
             .expect("single-profile probe request");
         let cmd = rig._cmd_rx.try_recv().expect("probe request must be sent");
@@ -1875,6 +2222,7 @@ mod tests {
             OutboundModel::new(Protocol::Freedom),
         ));
         rig.ctx()
+            .servers()
             .request_latency_probe()
             .expect("all-profile probe request");
         let cmd = rig._cmd_rx.try_recv().expect("probe request must be sent");
@@ -1905,16 +2253,16 @@ mod tests {
     }
 
     /// The UI-context snapshot's memoization key
-    /// (`BroccoliApp::rebuild_ui_ctx_snapshot`'s gate): an unchanged input
-    /// set schedules no rebuild — the idle-frame invariant — and one changed
-    /// value in any input family flips the predicate. A log line changes
-    /// none of these inputs, so a drained `CoreEvt::Log` can never force a
-    /// rebuild.
+    /// (`BroccoliApp::rebuild_ui_ctx_snapshot`'s gate): the derived
+    /// whole-value equality sees an unchanged input set — the idle-frame
+    /// invariant — and one changed value in any input family. A log line
+    /// changes none of these inputs, so a drained `CoreEvt::Log` can never
+    /// force a rebuild.
     #[test]
     fn ui_ctx_snapshot_rebuilds_only_when_an_input_changes() {
         let resting = resting_snapshot();
         assert!(
-            resting.same_inputs(&resting_snapshot()),
+            resting == resting_snapshot(),
             "an unchanged input set must schedule no rebuild"
         );
 
@@ -1937,6 +2285,13 @@ mod tests {
                 "phase",
                 UiCtxSnapshot {
                     phase: CorePhase::Running,
+                    ..resting_snapshot()
+                },
+            ),
+            (
+                "transport",
+                UiCtxSnapshot {
+                    transport: Some(CoreTransport::Tun),
                     ..resting_snapshot()
                 },
             ),
@@ -1982,6 +2337,17 @@ mod tests {
                 },
             ),
             (
+                "terminal error",
+                UiCtxSnapshot {
+                    terminal_error: Some(TerminalErrorView {
+                        text: "core failed".to_string(),
+                        output: String::new(),
+                        leak_remedy: false,
+                    }),
+                    ..resting_snapshot()
+                },
+            ),
+            (
                 "download",
                 UiCtxSnapshot {
                     download: DownloadState::Done("core.zip".to_string()),
@@ -1998,9 +2364,83 @@ mod tests {
         ];
         for (input, changed) in changed_inputs {
             assert!(
-                !resting.same_inputs(&changed),
+                resting != changed,
                 "a changed {input} input must schedule a rebuild"
             );
         }
+    }
+
+    /// The per-screen slices are the whole screen surface: each screen
+    /// receives exactly its own slice through the shared rig, a small screen
+    /// reads the inputs its slice names, and a mutating or sending screen
+    /// lands its effect in the frame's request bundle and the one command
+    /// seam — not in any raw field it could reach around them.
+    #[test]
+    fn screen_slices_deliver_their_inputs_and_effects() {
+        // A small screen: the About slice names the language and the verified
+        // core version, and the screen renders the version it was handed.
+        let rig = UiTestRig {
+            core_version: Some("26.9.9".into()),
+            ..Default::default()
+        };
+        let mut harness = screen_harness(rig, crate::ui::about::AboutScreen::default());
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("26.9.9").is_some(),
+            "the About slice must carry the verified core version"
+        );
+
+        // A mutating screen: the add-listener edit lands as the frame's
+        // dirty request through the slice's hooks, and bumps the generation
+        // the screens' caches key on.
+        let mut harness = crate::ui::test_rig::screen_harness_at(
+            egui::vec2(900.0, 2400.0),
+            UiTestRig::default(),
+            crate::ui::inbounds::InboundsScreen::default(),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::AddSocks),
+            )
+            .click();
+        harness.run();
+        let (_, rig) = harness.state();
+        assert!(
+            rig.requests.dirty,
+            "an Inbounds edit must reach the shell as the dirty request"
+        );
+        assert_eq!(
+            rig.model_generation, 1,
+            "the same edit must bump the model generation the caches key on"
+        );
+
+        // A sending screen: the logger restart reaches the runtime channel
+        // and asks the shell for the same busy-window head start its own
+        // sends take — the raw sender is unreachable from the slice.
+        let rig = UiTestRig {
+            phase: CorePhase::Running,
+            ..Default::default()
+        };
+        let mut harness = screen_harness(rig, crate::ui::logs::LogsScreen::default());
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::LogsRestartLogger),
+            )
+            .click();
+        harness.run();
+        let (_, rig) = harness.state_mut();
+        assert!(
+            matches!(rig._cmd_rx.try_recv(), Ok(CoreCmd::RestartLogger { .. })),
+            "the Logs slice must send the restart through the command seam"
+        );
+        assert_eq!(
+            rig.requests.mirror_operation,
+            Some(JobKind::LoggerRestart),
+            "the send must carry the shell's optimistic busy mirror"
+        );
     }
 }

@@ -18,7 +18,7 @@ use crate::model::{
     Account, DokodemoCfg, FinalmaskModel, FinalmaskTcpMask, FinalmaskUdpMask, LocalInboundCfg,
     LocalInboundProtocol, Settings, Sniffing,
 };
-use crate::ui::UiCtx;
+use crate::ui::InboundsCtx;
 use crate::ui::servers::finalmask_editors::filter_settings_editor;
 use crate::ui::widgets;
 use serde_json::Map;
@@ -95,7 +95,7 @@ impl InboundsScreen {
         self.revealed = false;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut InboundsCtx) {
         let lang = ctx.settings.language;
         // The published generation verdict: the model rules the rows render
         // are asked here, by structural target, instead of re-derived per
@@ -105,7 +105,7 @@ impl InboundsScreen {
         // The validation references are rebuilt when the model generation
         // moves — the frame after any edit — and never on idle repaint
         // frames; the cache validates its own row correspondence.
-        let generation = *ctx.model_generation;
+        let generation = ctx.hooks.model_generation();
         if !matches!(&self.validation, Some(cache) if cache.is_current(generation, ctx.settings)) {
             let snapshot = listeners(ctx.settings, lang);
             // The shell's verdict for this generation: the exposure warnings
@@ -355,7 +355,7 @@ impl InboundsScreen {
             changed = true;
         }
         if changed {
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
 
         // ---- Dokodemo-door ----
@@ -562,7 +562,7 @@ impl InboundsScreen {
             changed = true;
         }
         if changed {
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
     }
 }
@@ -1384,7 +1384,7 @@ mod listener_validation_tests {
             .build_ui_state(
                 move |ui, screen: &mut InboundsScreen| {
                     let mut rig = rig.borrow_mut();
-                    screen.show(ui, &mut rig.ctx())
+                    screen.show(ui, &mut rig.ctx().inbounds())
                 },
                 InboundsScreen::default(),
             )

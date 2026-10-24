@@ -19,7 +19,7 @@ use crate::ui::gate::{Rung, verdict};
 use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
-use crate::ui::{UiCtx, widgets};
+use crate::ui::{RoutingCtx, widgets};
 use egui::{DragValue, RichText, Ui};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -132,11 +132,11 @@ enum BalancerControlAction {
     Clear,
 }
 
-/// Snapshot of the live-core control channel taken before the balancer
-/// editor runs, so the per-balancer controls can be drawn while the
-/// settings tree is mutably borrowed.
+/// Snapshot of the live-core control seam taken before the balancer editor
+/// runs, so the per-balancer controls can be drawn while the settings tree is
+/// mutably borrowed.
 struct RuntimeControl<'a> {
-    cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
+    hooks: crate::ui::FrameHooks<'a>,
     running: bool,
     /// The busy window: an exclusive job holds it.
     busy: bool,
@@ -603,7 +603,7 @@ impl RoutingScreen {
 }
 
 impl RoutingScreen {
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx) {
         let lang = ctx.settings.language;
         self.poll_geodata_load(lang);
         // The absent-geo-tag advisory compares every rule row against the
@@ -618,7 +618,7 @@ impl RoutingScreen {
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
         // rebuilt only when the routing model changed, never per frame.
         self.refresh_view_cache(
-            *ctx.model_generation,
+            ctx.hooks.model_generation(),
             lang,
             ctx.servers,
             ctx.settings,
@@ -640,7 +640,7 @@ impl RoutingScreen {
             // One edit = one generation change: the hook moves the shared
             // generation the view cache gates on, so the next frame rebuilds
             // the tag vectors and rule rows exactly once.
-            ctx.mark_dirty();
+            ctx.hooks.mark_dirty();
         }
         self.test_route_dialog(ui, ctx);
         self.trial_rule_dialog(ui, ctx);
@@ -737,7 +737,7 @@ impl RoutingScreen {
     /// rules the core holds and is applied before a queued removal's next tag
     /// goes out; a failure leaves the count untouched and surfaces the error
     /// as feedback.
-    fn consume_trial_results(&mut self, ctx: &mut UiCtx, lang: Language) {
+    fn consume_trial_results(&mut self, ctx: &mut RoutingCtx, lang: Language) {
         if let Some(terminal) = self.trial.pending_add.poll() {
             match terminal {
                 Terminal::Answered(Ok(outcome)) => {
@@ -811,15 +811,12 @@ impl RoutingScreen {
     /// — the runtime channel is gone, so no later send could succeed — and
     /// surfaces the existing runtime-channel sentence instead of leaving the
     /// queue silently pending.
-    fn start_queued_trial_removal(&mut self, ctx: &mut UiCtx, lang: Language) {
+    fn start_queued_trial_removal(&mut self, ctx: &mut RoutingCtx, lang: Language) {
         let Some(rule_tag) = self.trial.remove_queue.pop_front() else {
             return;
         };
         let (reply, receiver) = oneshot::channel();
-        let sent = ctx
-            .cmd
-            .send(CoreCmd::RemoveTrialRule { reply, rule_tag })
-            .is_ok();
+        let sent = ctx.hooks.send(CoreCmd::RemoveTrialRule { reply, rule_tag });
         if sent {
             self.trial.pending_inventory = Request::reply(receiver);
         } else {
@@ -850,7 +847,7 @@ impl RoutingScreen {
     /// Trial-rule requests are free queries — the runtime answers them while a
     /// job holds the busy window, so nothing here refuses on the window — and
     /// the ladder is asked without one.
-    fn trial_gate(&self, ctx: &UiCtx, lang: Language) -> (bool, Option<&'static str>) {
+    fn trial_gate(&self, ctx: &RoutingCtx, lang: Language) -> (bool, Option<&'static str>) {
         let gate = verdict(
             matches!(ctx.phase, CorePhase::Running),
             false,
@@ -883,7 +880,7 @@ impl RoutingScreen {
     /// permissive — for the rest of the phase, so no frame re-issues the
     /// two-RPC read. [`RoutingScreen::invalidate_trial_rules`] forgets the
     /// attempt, so the next phase reads again.
-    fn request_live_out_tags(&mut self, ctx: &mut UiCtx) {
+    fn request_live_out_tags(&mut self, ctx: &mut RoutingCtx) {
         if self.trial.live_out_tags.is_some()
             || self.trial.pending_live_out.is_pending()
             || self.trial.live_out_requested
@@ -894,18 +891,20 @@ impl RoutingScreen {
         // turn into a per-frame retry either.
         self.trial.live_out_requested = true;
         let (reply, receiver) = oneshot::channel();
-        if ctx.send(CoreCmd::ListRuntimeState { reply }) {
+        if ctx.hooks.send(CoreCmd::ListRuntimeState { reply }) {
             self.trial.pending_live_out = Request::reply(receiver);
         }
     }
 
     /// One trial-rule action the section can send through the runtime.
-    fn send_trial_request(&mut self, action: TrialAction, ctx: &mut UiCtx, lang: Language) {
+    fn send_trial_request(&mut self, action: TrialAction, ctx: &mut RoutingCtx, lang: Language) {
         let (reply, receiver) = oneshot::channel();
         self.trial.feedback = None;
         let sent = match action {
-            TrialAction::List => ctx.send(CoreCmd::ListTrialRules { reply }),
-            TrialAction::Remove(rule_tag) => ctx.send(CoreCmd::RemoveTrialRule { reply, rule_tag }),
+            TrialAction::List => ctx.hooks.send(CoreCmd::ListTrialRules { reply }),
+            TrialAction::Remove(rule_tag) => {
+                ctx.hooks.send(CoreCmd::RemoveTrialRule { reply, rule_tag })
+            }
         };
         if sent {
             self.trial.pending_inventory = Request::reply(receiver);
@@ -914,7 +913,7 @@ impl RoutingScreen {
         }
     }
 
-    fn trial_rules_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, lang: Language) {
+    fn trial_rules_section(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx, lang: Language) {
         ui.separator();
         ui.heading(t(lang, Key::TrialRulesSection));
         ui.label(t(lang, Key::TrialRulesExplain));
@@ -1102,7 +1101,7 @@ impl RoutingScreen {
         Ok(())
     }
 
-    fn trial_rule_dialog(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn trial_rule_dialog(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx) {
         let lang = ctx.settings.language;
         if !self.trial.open {
             return;
@@ -1235,14 +1234,10 @@ impl RoutingScreen {
                     };
                     self.trial.pending_add_tag = Some(rule.rule_tag.clone());
                     self.trial.pending_add_target = Some(target_tag);
-                    if ctx
-                        .cmd
-                        .send(CoreCmd::AddTrialRule {
-                            reply,
-                            rule: Box::new(rule),
-                        })
-                        .is_err()
-                    {
+                    if !ctx.hooks.send(CoreCmd::AddTrialRule {
+                        reply,
+                        rule: Box::new(rule),
+                    }) {
                         self.trial.pending_add_tag = None;
                         self.trial.pending_add_target = None;
                         self.trial.feedback =
@@ -1468,9 +1463,15 @@ impl RoutingScreen {
     /// the apply gate's own rule: the core refuses a script beside rules or a
     /// domain strategy (infra/conf/router.go:94-96), and the app never drops
     /// the user's rules to make the script fit.
-    fn script_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, lang: Language, changed: &mut bool) {
+    fn script_section(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &mut RoutingCtx,
+        lang: Language,
+        changed: &mut bool,
+    ) {
         widgets::section(ui, t(lang, Key::RoutingScriptSection), |ui| {
-            let revision = *ctx.model_generation;
+            let revision = ctx.hooks.model_generation();
             let routing = &mut ctx.settings.routing;
             let rules = routing.rules.len();
             let domain_strategy = &routing.domain_strategy;
@@ -1501,7 +1502,7 @@ impl RoutingScreen {
     fn builtin_section(
         &mut self,
         ui: &mut Ui,
-        ctx: &mut UiCtx,
+        ctx: &mut RoutingCtx,
         lang: Language,
         changed: &mut bool,
     ) {
@@ -1532,7 +1533,13 @@ impl RoutingScreen {
 
     // ---------- rules ----------
 
-    fn rules_section(&mut self, ui: &mut Ui, ctx: &mut UiCtx, lang: Language, changed: &mut bool) {
+    fn rules_section(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &mut RoutingCtx,
+        lang: Language,
+        changed: &mut bool,
+    ) {
         widgets::section(ui, t(lang, Key::RoutingRulesSection), |ui| {
             let mut delete: Option<usize> = None;
             let mut swap: Option<(usize, usize)> = None;
@@ -2370,7 +2377,7 @@ impl RoutingScreen {
         &mut self,
         ui: &mut Ui,
         lang: Language,
-        control: &RuntimeControl<'_>,
+        control: &mut RuntimeControl<'_>,
         tag: &str,
     ) {
         ui.separator();
@@ -2547,14 +2554,10 @@ impl RoutingScreen {
             match action {
                 BalancerControlAction::Refresh => {
                     let (reply, rx) = oneshot::channel();
-                    if control
-                        .cmd
-                        .send(CoreCmd::GetBalancerInfo {
-                            reply,
-                            balancer_tag: tag.to_string(),
-                        })
-                        .is_err()
-                    {
+                    if !control.hooks.send(CoreCmd::GetBalancerInfo {
+                        reply,
+                        balancer_tag: tag.to_string(),
+                    }) {
                         state.feedback =
                             Some((false, t(lang, Key::RuntimeChannelClosed).to_string()));
                     } else {
@@ -2565,15 +2568,11 @@ impl RoutingScreen {
                 }
                 BalancerControlAction::Set(target) => {
                     let (reply, rx) = oneshot::channel();
-                    if control
-                        .cmd
-                        .send(CoreCmd::SetBalancerOverride {
-                            reply,
-                            balancer_tag: tag.to_string(),
-                            target: target.clone(),
-                        })
-                        .is_err()
-                    {
+                    if !control.hooks.send(CoreCmd::SetBalancerOverride {
+                        reply,
+                        balancer_tag: tag.to_string(),
+                        target: target.clone(),
+                    }) {
                         state.feedback =
                             Some((false, t(lang, Key::RuntimeChannelClosed).to_string()));
                     } else {
@@ -2585,14 +2584,10 @@ impl RoutingScreen {
                 }
                 BalancerControlAction::Clear => {
                     let (reply, rx) = oneshot::channel();
-                    if control
-                        .cmd
-                        .send(CoreCmd::ClearBalancerOverride {
-                            reply,
-                            balancer_tag: tag.to_string(),
-                        })
-                        .is_err()
-                    {
+                    if !control.hooks.send(CoreCmd::ClearBalancerOverride {
+                        reply,
+                        balancer_tag: tag.to_string(),
+                    }) {
                         state.feedback =
                             Some((false, t(lang, Key::RuntimeChannelClosed).to_string()));
                     } else {
@@ -2609,7 +2604,7 @@ impl RoutingScreen {
     fn balancers_section(
         &mut self,
         ui: &mut Ui,
-        ctx: &mut UiCtx,
+        ctx: &mut RoutingCtx,
         lang: Language,
         changed: &mut bool,
     ) {
@@ -2618,11 +2613,10 @@ impl RoutingScreen {
         // balancer must not run on idle frames. The cache
         // borrow is per-index below (usize copy), because the section
         // closure captures `self` uniquely for `balancer_editor`.
-        let control_cmd = ctx.cmd.clone();
         let control_running = matches!(ctx.phase, CorePhase::Running);
         let control_busy = ctx.busy.is_held();
-        let runtime_control = RuntimeControl {
-            cmd: &control_cmd,
+        let mut runtime_control = RuntimeControl {
+            hooks: ctx.hooks.reborrow(),
             running: control_running,
             busy: control_busy,
         };
@@ -2734,7 +2728,12 @@ impl RoutingScreen {
                             if let Some(tag) = requested_tag {
                                 rename = Some((i, tag));
                             }
-                            self.balancer_runtime_controls(ui, lang, &runtime_control, &bal.tag);
+                            self.balancer_runtime_controls(
+                                ui,
+                                lang,
+                                &mut runtime_control,
+                                &bal.tag,
+                            );
                         }
                     });
                 }
@@ -3083,7 +3082,7 @@ impl RoutingScreen {
     fn observability_section(
         &mut self,
         ui: &mut Ui,
-        ctx: &mut UiCtx,
+        ctx: &mut RoutingCtx,
         lang: Language,
         changed: &mut bool,
     ) {
@@ -3320,7 +3319,7 @@ impl RoutingScreen {
         }
     }
 
-    fn test_route_dialog(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    fn test_route_dialog(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx) {
         if !self.test_open {
             return;
         }
@@ -3553,7 +3552,7 @@ impl RoutingScreen {
                         // clears exactly this request.
                         let (reply, receiver) = oneshot::channel();
                         self.test_result = None;
-                        if !ctx.send(CoreCmd::TestRoute { reply, request }) {
+                        if !ctx.hooks.send(CoreCmd::TestRoute { reply, request }) {
                             let error = DiagError::from(Diag::new(Key::RuntimeChannelClosed));
                             self.test_result = Some(Err(error));
                         } else {
@@ -5800,7 +5799,7 @@ mod trial_rules_consume_tests {
     fn consume(screen: &mut RoutingScreen, lang: Language) {
         let mut rig = UiTestRig::default();
         let mut ctx = rig.ctx();
-        screen.consume_trial_results(&mut ctx, lang);
+        screen.consume_trial_results(&mut ctx.routing(), lang);
     }
 
     fn seed_add(
@@ -6139,9 +6138,9 @@ mod trial_live_out_tests {
         let mut screen = RoutingScreen::default();
         {
             let mut ctx = rig.ctx();
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
             assert!(screen.trial.pending_live_out.is_pending());
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
         }
         assert!(
             !screen.trial_busy(),
@@ -6174,7 +6173,7 @@ mod trial_live_out_tests {
         // A set that is already known is never read again.
         {
             let mut ctx = rig.ctx();
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
         }
         assert!(!screen.trial.pending_live_out.is_pending());
         assert!(
@@ -6189,7 +6188,7 @@ mod trial_live_out_tests {
         let mut screen = RoutingScreen::default();
         {
             let mut ctx = rig.ctx();
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
         }
         match rig._cmd_rx.try_recv() {
             Ok(CoreCmd::ListRuntimeState { reply }) => reply
@@ -6210,7 +6209,7 @@ mod trial_live_out_tests {
         // read.
         {
             let mut ctx = rig.ctx();
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
         }
         assert!(!screen.trial.pending_live_out.is_pending());
         assert!(
@@ -6222,7 +6221,7 @@ mod trial_live_out_tests {
         screen.invalidate_trial_rules();
         {
             let mut ctx = rig.ctx();
-            screen.request_live_out_tags(&mut ctx);
+            screen.request_live_out_tags(&mut ctx.routing());
         }
         assert!(screen.trial.pending_live_out.is_pending());
     }
@@ -6256,7 +6255,7 @@ mod routing_control_render_tests {
             .with_size(egui::vec2(900.0, 1600.0))
             .build_ui_state(
                 |ui, state: &mut (RoutingScreen, UiTestRig)| {
-                    state.0.show(ui, &mut state.1.ctx());
+                    state.0.show(ui, &mut state.1.ctx().routing());
                 },
                 state,
             );

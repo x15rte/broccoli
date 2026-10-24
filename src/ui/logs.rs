@@ -1,7 +1,7 @@
 //! Logs screen: merged GUI + core log viewer with level/text
 //! filtering, stick-to-bottom autoscroll, and clipboard/folder escapes.
 //!
-//! The buffer itself lives in the app (`UiCtx::logs`, already ring-capped);
+//! The buffer itself lives in the app (already ring-capped);
 //! this screen only filters and renders it — "Clear view" hides lines locally
 //! and never touches the underlying buffer.
 
@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 use egui::{Color32, RichText, ScrollArea, TextEdit, TextStyle, Ui};
 
-use super::UiCtx;
+use super::LogsCtx;
 use crate::diag::DiagError;
 use crate::i18n::{Key, LogLevel, t, t_fmt};
 use crate::model::settings::Language;
@@ -857,7 +857,7 @@ impl Default for LogsScreen {
 }
 
 impl LogsScreen {
-    pub fn show(&mut self, ui: &mut Ui, ctx: &mut UiCtx) {
+    pub fn show(&mut self, ui: &mut Ui, ctx: &mut LogsCtx) {
         // Consume the logger-restart reply for the in-flight request, if it
         // has landed. A send failure leaves the request idle, so a pending
         // request here always has a runtime job behind it.
@@ -954,7 +954,7 @@ impl LogsScreen {
             if restart.clicked() {
                 let (reply, receiver) = tokio::sync::oneshot::channel();
                 self.logger_restart_feedback = None;
-                if !ctx.send(CoreCmd::RestartLogger { reply }) {
+                if !ctx.hooks.send(CoreCmd::RestartLogger { reply }) {
                     self.logger_restart_feedback =
                         Some((false, t(lang, Key::RuntimeChannelClosed).into()));
                 } else {
@@ -1602,7 +1602,7 @@ mod tests {
             .build_ui_state(
                 move |ui, screen: &mut LogsScreen| {
                     let mut rig = rig_handle.borrow_mut();
-                    screen.show(ui, &mut rig.ctx())
+                    screen.show(ui, &mut rig.ctx().logs())
                 },
                 LogsScreen::default(),
             );
@@ -1722,7 +1722,7 @@ mod tests {
             .build_ui_state(
                 move |ui, screen: &mut LogsScreen| {
                     let mut rig = rig.borrow_mut();
-                    screen.show(ui, &mut rig.ctx())
+                    screen.show(ui, &mut rig.ctx().logs())
                 },
                 LogsScreen::default(),
             );
@@ -2706,7 +2706,8 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| screen.show(ui, &mut rig.ctx()));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| screen.show(ui, &mut rig.ctx().logs()));
             },
         );
         // A headless run has no renderer to apply texture deltas to; drop
@@ -3017,7 +3018,7 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
         let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                screen.show(ui, &mut rig.ctx());
+                screen.show(ui, &mut rig.ctx().logs());
 
                 // First frame: the view is built and the virtualized layout
                 // was measured.
@@ -3033,7 +3034,7 @@ mod tests {
                 // which forces the full re-measure); the measured layout is
                 // untouched on top of that.
                 let (width_before, heights_before) = (plan.measured_width(), plan.heights().len());
-                screen.show(ui, &mut rig.ctx());
+                screen.show(ui, &mut rig.ctx().logs());
                 assert_eq!(
                     screen.last_layout,
                     LayoutPass::None,
@@ -3052,7 +3053,7 @@ mod tests {
     /// Run one headless full frame of the Logs screen.
     fn run_frame(ctx: &egui::Context, screen: &mut LogsScreen, rig: &mut UiTestRig) {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| screen.show(ui, &mut rig.ctx()));
+            egui::CentralPanel::default().show(ctx, |ui| screen.show(ui, &mut rig.ctx().logs()));
         });
         // A headless run has no renderer to apply texture deltas to; drop
         // them explicitly instead of panicking in the TexturesDelta guard.
@@ -3460,7 +3461,8 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| screen.show(ui, &mut rig.ctx()));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| screen.show(ui, &mut rig.ctx().logs()));
             },
         );
         // A headless run has no renderer to apply texture deltas to; drop
