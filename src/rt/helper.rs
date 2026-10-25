@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::supervisor::Job;
 use crate::diag::{Diag, DiagArg, DiagError, DiagResult};
 use crate::i18n::Key;
 use base64::Engine as _;
@@ -48,11 +49,6 @@ use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     ReadFile,
-};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Pipes::{
@@ -1336,89 +1332,9 @@ fn config_from_wire(encoded: &str) -> Result<Vec<u8>, DiagError> {
 // Elevated server
 // ---------------------------------------------------------------------------
 
-struct Job(HANDLE);
-
-// SAFETY: the wrapped `HANDLE` is an opaque kernel-object reference with value
-// semantics — no process memory is dereferenced through it, and every Win32
-// call used on it (`SetInformationJobObject`, `AssignProcessToJobObject`,
-// `TerminateJobObject`, `CloseHandle`) carries no thread affinity; the kernel
-// serializes access. Ownership is exclusive: the handle is created by
-// `CreateJobObjectW` and closed exactly once in `Drop`, on whatever thread
-// drops the value, so moving a `Job` between threads cannot race a close or
-// alias a second owner. (`Sync` is not needed: the job is only ever owned,
-// never shared by reference across threads.)
-unsafe impl Send for Job {}
-
-impl Job {
-    fn new_kill_on_close() -> windows::core::Result<Self> {
-        // SAFETY: `None` means default security attributes and
-        // `PCWSTR::null()` means an anonymous (name-less) job object, so no
-        // string needs to be valid. The windows crate maps the NULL-handle
-        // failure to `Err`, so `Ok(job)` is a valid job handle; ownership of
-        // it moves into the wrapper built by `configure`.
-        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
-        Self::configure(job)
-    }
-
-    /// Take ownership of `job`, apply the kill-on-close limit, and hand back
-    /// the wrapper. The wrapper is built *before* the fallible configuration,
-    /// so every error path drops it here and `Drop` closes the handle — a
-    /// failed setup cannot leak it.
-    fn configure(job: HANDLE) -> windows::core::Result<Self> {
-        let job = Self(job);
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: `job.0` is the valid job handle the wrapper above now owns
-        // and keeps open for the call. `info` is fully initialized (defaulted,
-        // then `LimitFlags` set) and lives on this stack frame for the
-        // duration of the call; the length is exactly
-        // `size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()`, so the kernel
-        // reads one complete, valid structure. Failure is mapped to `Err`;
-        // the `?` drops the wrapper on that path, closing the handle exactly
-        // once.
-        unsafe {
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        }?;
-        Ok(job)
-    }
-
-    fn assign(&self, process: HANDLE) -> windows::core::Result<()> {
-        // SAFETY: `self.0` is a valid job handle kept open for `self`'s
-        // lifetime; `process` is the raw process handle of the just-spawned
-        // xray child (`child.as_raw_handle()`), valid while the `Child` value
-        // still owns it — which it does for the duration of the call. The API
-        // reports failure as an error (mapped to `Err`) and never leaves
-        // partial state.
-        unsafe { AssignProcessToJobObject(self.0, process) }
-    }
-
-    fn terminate(&self) {
-        // SAFETY: `self.0` is a valid open job handle; `TerminateJobObject`
-        // is thread-safe and the boolean failure is deliberately ignored
-        // because this is a best-effort fallback (the child kill and
-        // KILL_ON_JOB_CLOSE back it up). The handle stays valid after the
-        // call and is closed once in `Drop`.
-        unsafe {
-            let _ = TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is the handle from `CreateJobObjectW`, never
-        // closed before; `Drop` runs exactly once and `Job` is the exclusive
-        // owner, so the handle is closed exactly once.
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
+// The kill-on-close Job Object wrapper is shared with the direct supervisor
+// ([`super::supervisor::Job`]): one handle lifetime and one failed-setup path
+// for every managed-core spawn, whichever process mode launches it.
 
 struct WatchedParent(HANDLE);
 
@@ -5584,48 +5500,5 @@ mod tests {
         let _ = taken.child.wait();
         *current.lock().expect("probe slot lock") = Some(taken);
         assert!(!child_is_live_current(&current, pid));
-    }
-
-    /// The helper's job wrapper uses the same construction path as the
-    /// runtime's: the wrapper is built before the fallible configuration, so
-    /// a failed setup drops it and closes the handle instead of leaking it.
-    /// An event handle is a valid kernel handle that is not a job object,
-    /// which makes the configuration fail without a mock.
-    #[test]
-    fn failed_job_setup_closes_the_handle_it_owned() {
-        use super::Job;
-        use windows::Win32::Foundation::GetHandleInformation;
-        use windows::Win32::System::Threading::CreateEventW;
-        use windows::core::PCWSTR;
-
-        let event = {
-            // SAFETY: no security attributes and a name-less event, so no
-            // pointer argument is dereferenced; the returned handle is
-            // checked and owned by this test.
-            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
-        }
-        .expect("create a probe event handle");
-        let mut flags = 0u32;
-        // SAFETY: `event` is the live handle this test owns and `flags` is a
-        // valid out-parameter.
-        let valid_before = unsafe { GetHandleInformation(event, &mut flags) };
-        assert!(
-            valid_before.is_ok(),
-            "the probe handle must start out valid"
-        );
-
-        let setup = Job::configure(event);
-        assert!(
-            setup.is_err(),
-            "an event handle cannot be configured as a job object"
-        );
-        // SAFETY: the handle value is the one this test still owns (the failed
-        // construction was supposed to close it); the call only reports
-        // whether it is still open and writes `flags`.
-        let valid_after = unsafe { GetHandleInformation(event, &mut flags) };
-        assert!(
-            valid_after.is_err(),
-            "the failed setup must close the handle it owned"
-        );
     }
 }

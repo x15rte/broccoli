@@ -874,14 +874,14 @@ fn prepare_record(
     existing: Option<Record>,
     fresh: Record,
     views: &[AdapterView],
-    api: Option<SetInterfaceDnsSettingsFn>,
+    api: SetInterfaceDnsSettingsFn,
 ) -> Result<(Record, usize, Option<DiagError>), DiagError> {
     let Some(existing) = existing else {
         return Ok((fresh, 0, None));
     };
     let (mut carried, dropped) = split_record(existing, &fresh);
     let (restored, residual, restore_error) =
-        restore_entries(&dropped, |entry| restore_entry(views, entry, api));
+        restore_entries(&dropped, |entry| restore_entry(views, entry, Some(api)));
     carried.extend(residual);
     Ok((
         merge(Some(Record { entries: carried }), fresh),
@@ -936,7 +936,7 @@ fn engage_with(
     let views = enumerate()?;
     let fresh = plan(&views, tun_if_index, tun_name, targets);
     let (record, restored, restore_error) =
-        prepare_record(read_record(record_path)?, fresh, &views, Some(api))?;
+        prepare_record(read_record(record_path)?, fresh, &views, api)?;
     if record.entries.is_empty() {
         remove_record(record_path)?;
         return Ok(TakeoverCounts {
@@ -1005,8 +1005,7 @@ fn reconcile_with(
     let views = enumerate()?;
     let fresh = plan(&views, tun_if_index, tun_name, targets);
     let existing = read_record(record_path)?;
-    let (record, restored, restore_error) =
-        prepare_record(existing.clone(), fresh, &views, Some(api))?;
+    let (record, restored, restore_error) = prepare_record(existing.clone(), fresh, &views, api)?;
     if record.entries.is_empty() {
         remove_record(record_path)?;
         return Ok(TakeoverCounts {

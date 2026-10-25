@@ -19,11 +19,12 @@ const RELEASE_REPO: &str = "x15rte/broccoli";
 /// HTTP timeout for one update-check request.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Cap on a fetched body. The repository's `Cargo.toml` is a few hundred
-/// bytes, so a larger response is not the file this check asks for; streaming
-/// under a cap keeps an intercepting proxy or a compromised endpoint from
-/// allocating its whole body in the GUI process.
-const MAX_UPDATE_BODY_BYTES: usize = 8 * 1024;
+/// Cap on a fetched body. The repository's `Cargo.toml` is the largest file
+/// this check reads and grows with every dependency or release pin, so the cap
+/// leaves an order of magnitude of headroom: a response past it is not the file
+/// the check asks for. Streaming under the cap keeps an intercepting proxy or a
+/// compromised endpoint from allocating its whole body in the GUI process.
+const MAX_UPDATE_BODY_BYTES: usize = 64 * 1024;
 
 /// Default-branch guesses, in order. GitHub's default branch is normally
 /// `main`; `master` is the historical default of older repositories.
@@ -446,6 +447,23 @@ mod tests {
         assert!(
             at_cap.push(b"a").is_err(),
             "the first byte over the cap must be refused"
+        );
+    }
+
+    #[test]
+    fn the_cap_leaves_room_for_the_file_the_check_fetches() {
+        // The check fetches this repository's `Cargo.toml`; the cap must stay
+        // well above the file it exists to guard, or the feature fails
+        // permanently once a dependency or release pin grows the file.
+        let fetched = include_str!("../../Cargo.toml");
+        assert!(
+            fetched.len() < MAX_UPDATE_BODY_BYTES,
+            "the update-check cap must exceed the fetched Cargo.toml ({} bytes)",
+            fetched.len()
+        );
+        assert!(
+            fetched.len() * 2 < MAX_UPDATE_BODY_BYTES,
+            "the cap must leave headroom for the file to grow"
         );
     }
 

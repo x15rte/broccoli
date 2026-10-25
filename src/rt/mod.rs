@@ -874,6 +874,12 @@ const READY_POLL: Duration = Duration::from_millis(250);
 const DNS_IN_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// Hard kill fallback when a core ignores a stop request.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on joining the direct child's output pumps after its `wait`
+/// resolved. A pipe inherited by a surviving grandchild keeps a pump blocked
+/// at a read with no EOF, and the exit handler (the tail scan, restart, and
+/// DNS flush behind it) must not wait on that; the helper's reader join uses
+/// the same window for the same reason.
+const OUTPUT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 /// Wintun `WintunCreateAdapter`'s internal device-interface wait is 15 000 ms
 /// (`WaitForInterface`, WireGuard wintun `api/adapter.c`, with the create
 /// preamble before it). A TUN core that is unresponsive to the graceful close
@@ -1613,7 +1619,16 @@ impl Runtime {
                     let code = match status {
                         Some(Ok(exit)) => {
                             if let Some(child) = self.lifecycle.backend.child_mut() {
-                                child.drain_output().await;
+                                // Bounded: a grandchild may hold a pipe open,
+                                // and this loop must still reach the exit
+                                // handler. A timeout leaves the remaining
+                                // pumps detached; their handles are dropped
+                                // with the backend.
+                                let _ = tokio::time::timeout(
+                                    OUTPUT_DRAIN_WINDOW,
+                                    child.drain_output(),
+                                )
+                                .await;
                             }
                             exit.code()
                         }

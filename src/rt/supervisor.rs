@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows::core::PCWSTR;
 
@@ -185,6 +185,18 @@ impl Job {
         // the duration of the call. The API reports failure as an error
         // (mapped to `Err`) and never leaves partial state.
         unsafe { AssignProcessToJobObject(self.0, process) }
+    }
+
+    /// Kill every process in the job. A best-effort fallback on the elevated
+    /// helper's teardown path: the child kill and `KILL_ON_JOB_CLOSE` back it
+    /// up, so the boolean failure is deliberately dropped. The handle stays
+    /// valid after the call and is closed once in `Drop`.
+    pub(crate) fn terminate(&self) {
+        // SAFETY: `self.0` is a valid open job handle; `TerminateJobObject`
+        // is thread-safe and the handle is not closed until `Drop`.
+        unsafe {
+            let _ = TerminateJobObject(self.0, 1);
+        }
     }
 }
 
