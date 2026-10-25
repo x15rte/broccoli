@@ -123,10 +123,10 @@ impl Draft<String> {
 ///
 /// The key is compared by reference, so an idle frame neither clones the key
 /// nor re-derives the value; only a rebuild clones the live key into the
-/// slot. A caller that needs the key back reads [`Self::key`]. The value must
-/// not contain the key — screens that need that shape keep a plain struct
-/// (the dashboard's header cache keys on a payload-carrying phase, the
-/// settings screen's on a name list, and both compare those in place).
+/// slot. The value must not contain the key — screens that need that shape
+/// keep a plain struct (the dashboard's header cache keys on a
+/// payload-carrying phase, the settings screen's on a name list, and both
+/// compare those in place).
 pub struct Memo<K, V> {
     slot: Option<(K, V)>,
 }
@@ -150,16 +150,6 @@ impl<K: Clone + PartialEq, V> Memo<K, V> {
             // `get` fills the slot on a miss, so a miss cannot reach here.
             None => unreachable!("a Memo fills its slot before it is read"),
         }
-    }
-
-    /// The key the held value was built for, `None` before the first build.
-    pub fn key(&self) -> Option<&K> {
-        self.slot.as_ref().map(|(key, _)| key)
-    }
-
-    /// The held value, if one was built.
-    pub fn value(&self) -> Option<&V> {
-        self.slot.as_ref().map(|(_, value)| value)
     }
 }
 
@@ -1597,6 +1587,42 @@ pub(crate) fn parse_positive_probe_interval(
 mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable as _};
+
+    /// The one comparison every memoized screen row relies on: an unchanged
+    /// key rebuilds nothing (an idle frame does no work), and a changed key
+    /// rebuilds exactly once.
+    #[test]
+    fn memo_builds_once_per_key_change() {
+        let mut memo: Memo<u64, String> = Memo::default();
+        let mut builds = 0u32;
+
+        {
+            let held = memo.get(&1, || {
+                builds += 1;
+                "first".to_owned()
+            });
+            assert_eq!(held, "first");
+        }
+        assert_eq!(builds, 1, "the first frame seeds the value");
+
+        {
+            let held = memo.get(&1, || {
+                builds += 1;
+                "ignored".to_owned()
+            });
+            assert_eq!(held, "first");
+        }
+        assert_eq!(builds, 1, "an unchanged key rebuilds nothing");
+
+        {
+            let held = memo.get(&2, || {
+                builds += 1;
+                "second".to_owned()
+            });
+            assert_eq!(held, "second");
+        }
+        assert_eq!(builds, 2, "a changed key rebuilds exactly once");
+    }
 
     #[test]
     fn parse_positive_probe_interval_rejects_zero_and_malformed() {

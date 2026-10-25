@@ -126,8 +126,25 @@ mod tests {
         dir
     }
 
+    /// The names left in `dir`, sorted: what a write leaves behind is the
+    /// target and nothing else, whatever staging strategy it used.
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list the scratch dir")
+            .map(|entry| {
+                entry
+                    .expect("read one entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn write_atomic_replaces_content_and_leaves_no_temp() {
+    fn write_atomic_replaces_content_and_leaves_only_the_target() {
         let dir = scratch_dir("replace");
         let path = dir.join("state.json");
         std::fs::write(&path, b"old").expect("seed");
@@ -135,7 +152,7 @@ mod tests {
         write_atomic(&path, b"new").expect("write");
 
         assert_eq!(std::fs::read(&path).expect("read"), b"new");
-        assert!(!temp_path(&path).exists(), "the temp must be renamed away");
+        assert_eq!(entries(&dir), ["state.json"], "no staged bytes may remain");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -147,6 +164,7 @@ mod tests {
         write_atomic(&path, b"first").expect("write");
 
         assert_eq!(std::fs::read(&path).expect("read"), b"first");
+        assert_eq!(entries(&dir), ["state.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -160,8 +178,9 @@ mod tests {
 
         write_atomic(&path, b"bytes").expect_err("the rename must fail");
 
-        assert!(
-            !temp_path(&path).exists(),
+        assert_eq!(
+            entries(&dir),
+            ["state.json"],
             "a failed write must not strand the staged bytes"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -179,12 +198,16 @@ mod tests {
         write_atomic(&path, b"new").expect("write");
 
         assert_eq!(std::fs::read(&path).expect("read"), b"new");
-        assert!(!temp_path(&path).exists(), "the temp must be renamed away");
+        assert_eq!(
+            entries(&dir),
+            ["state.json"],
+            "the stranded plaintext must be gone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn write_atomic_refuses_a_staging_entry_it_cannot_replace() {
+    fn write_atomic_refuses_an_unreplaceable_staging_entry() {
         let dir = scratch_dir("blocked-temp");
         let path = dir.join("state.json");
         std::fs::write(&path, b"old").expect("seed");
@@ -194,7 +217,11 @@ mod tests {
 
         write_atomic(&path, b"new").expect_err("the staging entry cannot be replaced");
 
-        assert_eq!(std::fs::read(&path).expect("read"), b"old");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"old",
+            "a refused write must leave the target untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -221,7 +248,11 @@ mod tests {
         copy_atomic(&from, &to).expect("copy");
 
         assert_eq!(std::fs::read(&to).expect("read"), b"pristine");
-        assert!(!temp_path(&to).exists());
+        assert_eq!(
+            entries(&dir),
+            ["managed.dat", "pristine.dat"],
+            "no staged bytes may remain"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
