@@ -123,6 +123,12 @@ const LIFECYCLE_SEND_WINDOW: Duration = Duration::from_millis(4000);
 /// Upper bound for settling a previous TUN session's wintun teardown before
 /// spawning the replacement core (see `clean_leftover_tun_adapter`).
 const TUN_CLEAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for joining the core's per-stream output readers before the exit
+/// record is written. The readers end at pipe EOF once the child is gone —
+/// usually within milliseconds — but a pipe inherited by a surviving
+/// grandchild can hold one open, and the exit event (the app's tail-scan
+/// signal and restart trigger) must not wait on that.
+const OUTPUT_READER_JOIN_WINDOW: Duration = Duration::from_secs(2);
 /// Periodic backstop for the network watcher. Interface, route, and registry
 /// notifications cover the usual changes; the timeout catches a change no
 /// notification reports.
@@ -585,7 +591,12 @@ struct LoadedProtectedDirectory {
     /// Word storage for the self-relative descriptor written by
     /// [`load_protected_directory`]. A descriptor embeds pointer fields, so
     /// it must be read at an 8-byte-aligned address; `Vec<u8>` only
-    /// guarantees 1-byte alignment by contract.
+    /// guarantees 1-byte alignment by contract. `Vec<u64>` supplies that
+    /// alignment, and the self-relative layout carries it inward: the
+    /// descriptor header and every embedded ACL header are DWORD-sized, and
+    /// each ACE's `AceSize` is DWORD-rounded, so the DACL and every ACE (and
+    /// with it `SidStart` at offset 8) sit on DWORD boundaries from this
+    /// base. Every ACE/SID read below cites this rule.
     words: Vec<u64>,
     /// Number of descriptor bytes initialized at the base of `words`.
     byte_len: usize,
@@ -812,9 +823,10 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
     }
     // SAFETY: `loaded.dacl` is only dereferenced after the `dacl_present` and
     // `dacl.is_null()` checks above, so it points at the DACL inside the
-    // valid, 8-byte-aligned descriptor storage (fully initialized by
-    // `GetFileSecurityW`); its header (AceCount at offset 2) is therefore
-    // initialized too.
+    // valid descriptor storage (fully initialized by `GetFileSecurityW`); the
+    // storage's alignment rule (see `LoadedProtectedDirectory::words`) puts
+    // the ACL on its DWORD boundary, so this typed header read is sound and
+    // `AceCount` (offset 2) is initialized too.
     let ace_count = unsafe { (*loaded.dacl).AceCount };
     if ace_count != 2 {
         return Err(DiagError::new(
@@ -843,16 +855,20 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
         }
         // SAFETY: `ace.sid` points at the `SidStart` of the ACE — an embedded,
         // well-formed SID (its length fits the ACE's `AceSize`) inside the
-        // live DACL buffer; `system.psid()` is the well-known SYSTEM SID
-        // built above. EqualSid only reads both.
+        // live DACL buffer, whose DWORD alignment rule (see
+        // `LoadedProtectedDirectory::words`) covers the ACE and its
+        // `SidStart`; `system.psid()` is the well-known SYSTEM SID built
+        // above. EqualSid only reads both.
         if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
             if saw_system {
                 return Err(DiagError::new(Diag::new(Key::HelperAceSystemRepeated)));
             }
             saw_system = true;
-            // SAFETY: as above — `ace.sid` is the embedded SID in the live
-            // DACL buffer and `administrators.psid()` is the well-known
-            // Administrators SID built above; EqualSid only reads them.
+            // SAFETY: as above — `ace.sid` is the embedded SID in the
+            // DWORD-aligned live DACL buffer (see
+            // `LoadedProtectedDirectory::words`) and `administrators.psid()`
+            // is the well-known Administrators SID built above; EqualSid only
+            // reads them.
         } else if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
             if saw_administrators {
                 return Err(DiagError::new(Diag::new(
@@ -891,8 +907,10 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
         return false;
     }
     // SAFETY: `loaded.dacl` is non-null and valid here (checked above); it
-    // points at the DACL inside the live, 8-byte-aligned storage written by
-    // `load_protected_directory`.
+    // points at the DACL inside the live storage written by
+    // `load_protected_directory`, and the storage's alignment rule (see
+    // `LoadedProtectedDirectory::words`) puts the ACL on its DWORD boundary
+    // for this typed header read.
     if unsafe { (*loaded.dacl).AceCount } != 3 {
         return false;
     }
@@ -930,7 +948,8 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
             return false;
         }
         if ace.ace_flags != 0 {
-            // SAFETY: `ace.sid` points into the live DACL buffer and `own_sid`
+            // SAFETY: `ace.sid` points into the DWORD-aligned live DACL
+            // buffer (see `LoadedProtectedDirectory::words`) and `own_sid`
             // into the current user's owned SID storage; EqualSid only reads
             // both.
             if !unsafe { EqualSid(ace.sid, own_sid) }.is_ok() {
@@ -939,17 +958,19 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
             extra_aces += 1;
             continue;
         }
-        // SAFETY: `ace.sid` is the embedded SID in the live DACL buffer and
-        // `system` is the well-known SID built above; EqualSid only reads both.
+        // SAFETY: `ace.sid` is the embedded SID in the DWORD-aligned live DACL
+        // buffer (see `LoadedProtectedDirectory::words`) and `system` is the
+        // well-known SID built above; EqualSid only reads both.
         if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
             if saw_system {
                 return false;
             }
             saw_system = true;
         } else {
-            // SAFETY: `ace.sid` is still the embedded SID in the live DACL
-            // buffer and `administrators` is the other well-known SID built
-            // above; EqualSid only reads both.
+            // SAFETY: `ace.sid` is still the embedded SID in the DWORD-aligned
+            // live DACL buffer (see `LoadedProtectedDirectory::words`) and
+            // `administrators` is the other well-known SID built above;
+            // EqualSid only reads both.
             if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
                 if saw_administrators {
                     return false;
@@ -1334,26 +1355,36 @@ impl Job {
         // `PCWSTR::null()` means an anonymous (name-less) job object, so no
         // string needs to be valid. The windows crate maps the NULL-handle
         // failure to `Err`, so `Ok(job)` is a valid job handle; ownership of
-        // it moves into the `Job` wrapper, whose `Drop` closes it exactly once.
+        // it moves into the wrapper built by `configure`.
         let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+        Self::configure(job)
+    }
+
+    /// Take ownership of `job`, apply the kill-on-close limit, and hand back
+    /// the wrapper. The wrapper is built *before* the fallible configuration,
+    /// so every error path drops it here and `Drop` closes the handle — a
+    /// failed setup cannot leak it.
+    fn configure(job: HANDLE) -> windows::core::Result<Self> {
+        let job = Self(job);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: `job` is the valid job handle created above and stays open
-        // for the call. `info` is fully initialized (defaulted, then
-        // `LimitFlags` set) and lives on this stack frame for the duration of
-        // the call; the length is exactly
+        // SAFETY: `job.0` is the valid job handle the wrapper above now owns
+        // and keeps open for the call. `info` is fully initialized (defaulted,
+        // then `LimitFlags` set) and lives on this stack frame for the
+        // duration of the call; the length is exactly
         // `size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()`, so the kernel
-        // reads one complete, valid structure. Failure is mapped to `Err` and
-        // propagated with `?`; the handle remains valid on either path.
+        // reads one complete, valid structure. Failure is mapped to `Err`;
+        // the `?` drops the wrapper on that path, closing the handle exactly
+        // once.
         unsafe {
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         }?;
-        Ok(Self(job))
+        Ok(job)
     }
 
     fn assign(&self, process: HANDLE) -> windows::core::Result<()> {
@@ -2034,8 +2065,13 @@ fn helper_start(
         child.stdout.take().map(|stream| Box::new(stream) as _),
         child.stderr.take().map(|stream| Box::new(stream) as _),
     ];
+    // Each reader signals once its pipe reached EOF, and the exit reaper
+    // waits on those signals (bounded) before reporting the exit: the app's
+    // tail scan and any restart read the log lines the readers write.
+    let (reader_done, readers_finished) = std::sync::mpsc::channel::<()>();
     for stream in streams.into_iter().flatten() {
         let writer = Arc::clone(writer);
+        let reader_done = reader_done.clone();
         std::thread::spawn(move || {
             // Capped like the direct-mode pump: an over-long xray line must
             // not grow an unbounded buffer in the elevated helper either
@@ -2047,8 +2083,11 @@ fn helper_start(
                     &serde_json::json!({"event":"log","line":line.trim_end()}),
                 );
             }
+            let _ = reader_done.send(());
         });
     }
+    // The reaper observes the disconnect once every reader has signalled.
+    drop(reader_done);
 
     // CreateProcess has consumed the staged payload paths; release the
     // deny-write/delete locks so the staged core's geodata updater can swap
@@ -2297,6 +2336,17 @@ fn helper_start(
             // non-reparse secure-stage entries (payload locks were released
             // at spawn).
             drop(finished);
+            // Join the pipe readers before the exit record, bounded. The
+            // child is gone, so the readers end at EOF once they have moved
+            // its final lines; `Disconnected` means every reader signalled,
+            // and a reader held open past the window reports anyway.
+            let join_deadline = Instant::now() + OUTPUT_READER_JOIN_WINDOW;
+            loop {
+                let remaining = join_deadline.saturating_duration_since(Instant::now());
+                if readers_finished.recv_timeout(remaining).is_err() {
+                    break;
+                }
+            }
             send_event(&writer, &serde_json::json!({"event":"exit","code":code}));
             send_event(
                 &writer,
@@ -5534,5 +5584,48 @@ mod tests {
         let _ = taken.child.wait();
         *current.lock().expect("probe slot lock") = Some(taken);
         assert!(!child_is_live_current(&current, pid));
+    }
+
+    /// The helper's job wrapper uses the same construction path as the
+    /// runtime's: the wrapper is built before the fallible configuration, so
+    /// a failed setup drops it and closes the handle instead of leaking it.
+    /// An event handle is a valid kernel handle that is not a job object,
+    /// which makes the configuration fail without a mock.
+    #[test]
+    fn failed_job_setup_closes_the_handle_it_owned() {
+        use super::Job;
+        use windows::Win32::Foundation::GetHandleInformation;
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::PCWSTR;
+
+        let event = {
+            // SAFETY: no security attributes and a name-less event, so no
+            // pointer argument is dereferenced; the returned handle is
+            // checked and owned by this test.
+            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+        }
+        .expect("create a probe event handle");
+        let mut flags = 0u32;
+        // SAFETY: `event` is the live handle this test owns and `flags` is a
+        // valid out-parameter.
+        let valid_before = unsafe { GetHandleInformation(event, &mut flags) };
+        assert!(
+            valid_before.is_ok(),
+            "the probe handle must start out valid"
+        );
+
+        let setup = Job::configure(event);
+        assert!(
+            setup.is_err(),
+            "an event handle cannot be configured as a job object"
+        );
+        // SAFETY: the handle value is the one this test still owns (the failed
+        // construction was supposed to close it); the call only reports
+        // whether it is still open and writes `flags`.
+        let valid_after = unsafe { GetHandleInformation(event, &mut flags) };
+        assert!(
+            valid_after.is_err(),
+            "the failed setup must close the handle it owned"
+        );
     }
 }

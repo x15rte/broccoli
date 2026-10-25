@@ -145,26 +145,36 @@ impl Job {
         // `PCWSTR::null()` means an anonymous (name-less) job object, so no
         // string needs to be valid. The windows crate maps the NULL-handle
         // failure to `Err`, so `Ok(job)` is a valid job handle; ownership of
-        // it moves into the `Job` wrapper, whose `Drop` closes it exactly once.
+        // it moves into the `Job` wrapper built by `configure`.
         let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+        Self::configure(job)
+    }
+
+    /// Take ownership of `job`, apply the kill-on-close limit, and hand back
+    /// the wrapper. The wrapper is built *before* the fallible configuration,
+    /// so every error path drops it here and `Drop` closes the handle — a
+    /// failed setup cannot leak it.
+    fn configure(job: HANDLE) -> windows::core::Result<Job> {
+        let job = Job(job);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: `job` is the valid job handle created above and stays open
-        // for the call. `info` is fully initialized (defaulted, then
-        // `LimitFlags` set) and lives on this stack frame for the duration of
-        // the call; the length is exactly
+        // SAFETY: `job.0` is the valid job handle the wrapper above now owns
+        // and keeps open for the call. `info` is fully initialized (defaulted,
+        // then `LimitFlags` set) and lives on this stack frame for the
+        // duration of the call; the length is exactly
         // `size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()`, so the kernel
-        // reads one complete, valid structure. Failure is mapped to `Err` and
-        // propagated with `?`; the handle remains valid on either path.
+        // reads one complete, valid structure. Failure is mapped to `Err`;
+        // the `?` drops the wrapper on that path, closing the handle exactly
+        // once.
         unsafe {
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         }?;
-        Ok(Job(job))
+        Ok(job)
     }
 
     pub(crate) fn assign(&self, process: HANDLE) -> windows::core::Result<()> {
@@ -867,6 +877,48 @@ mod tests {
             lines.lock().expect("line sink").as_slice(),
             ["final-line"].as_slice(),
             "the child's final write must reach the sink before the drain returns"
+        );
+    }
+
+    /// A failed job setup must not leak the handle it took ownership of: the
+    /// wrapper is built before the fallible configuration call, so its `Drop`
+    /// closes the handle on the error path. An event handle is a valid kernel
+    /// handle that is not a job object, which makes the configuration fail
+    /// without a mock.
+    #[test]
+    fn failed_job_setup_closes_the_handle_it_owned() {
+        use windows::Win32::Foundation::GetHandleInformation;
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::PCWSTR;
+
+        let event = {
+            // SAFETY: no security attributes and a name-less event, so no
+            // pointer argument is dereferenced; the returned handle is
+            // checked and owned by this test.
+            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+        }
+        .expect("create a probe event handle");
+        let mut flags = 0u32;
+        // SAFETY: `event` is the live handle this test owns and `flags` is a
+        // valid out-parameter.
+        let valid_before = unsafe { GetHandleInformation(event, &mut flags) };
+        assert!(
+            valid_before.is_ok(),
+            "the probe handle must start out valid"
+        );
+
+        let setup = Job::configure(event);
+        assert!(
+            setup.is_err(),
+            "an event handle cannot be configured as a job object"
+        );
+        // SAFETY: the handle value is the one this test still owns (the failed
+        // construction was supposed to close it); the call only reports
+        // whether it is still open and writes `flags`.
+        let valid_after = unsafe { GetHandleInformation(event, &mut flags) };
+        assert!(
+            valid_after.is_err(),
+            "the failed setup must close the handle it owned"
         );
     }
 }

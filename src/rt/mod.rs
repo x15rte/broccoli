@@ -517,10 +517,10 @@ pub struct TrialRuleAddOutcome {
     pub rules: Option<Vec<(String, String)>>,
 }
 
-/// GUI-relevant slice of `SysStatsResponse`, defaulting to zeros when the
-/// core is unreachable so the 1 Hz tick never drops stats over a transient
-/// `GetSysStats` failure.
-#[derive(Debug, Clone, Copy, Default)]
+/// GUI-relevant slice of `SysStatsResponse`. [`Runtime::stats_poll`] drops the
+/// whole sample when this RPC fails, the same shape as the traffic sweeps, so
+/// there is no zeroed fallback to mistake for a real reading.
+#[derive(Debug, Clone, Copy)]
 struct SysStatsSnapshot {
     uptime_secs: u64,
     goroutines: u64,
@@ -905,6 +905,11 @@ const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// queue without bound (CWE-400/770); 2048 slots cover many frames
 /// of GUI drain, and lifecycle events stay rare enough that they never starve.
 pub const EVT_CHANNEL_CAPACITY: usize = 2048;
+/// Nominal period of the 1 Hz stats tick. The ticker schedules it and — more
+/// importantly for the figures — it is also the normalizer for the first
+/// sample after a start, which has no measured predecessor. A tick delayed
+/// past the period normalizes by its actual elapsed span instead.
+const STATS_TICK_PERIOD: Duration = Duration::from_secs(1);
 /// Build one select-loop ticker with `MissedTickBehavior::Delay`.
 ///
 /// Tokio's default `Burst` fires the next tick instantly after an overrun.
@@ -993,6 +998,11 @@ struct Runtime {
     /// Cumulative inbound (listener traffic) counters, one baseline per tag,
     /// with the same eviction rule as `prev_traffic` (`fold_into`).
     prev_inbound_traffic: HashMap<String, (u64, u64)>,
+    /// Instant the last published stats sample was taken, the start of the
+    /// interval the next sample's counters cover. `None` before the first
+    /// sample after a start (or an exit cleared the baselines), where
+    /// [`STATS_TICK_PERIOD`] is the normalizer.
+    prev_stats_at: Option<Instant>,
     rng: u64,
     http: Option<reqwest::Client>,
     /// On-demand update check in flight: gates duplicate
@@ -1090,6 +1100,7 @@ impl Runtime {
             output_ring: Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_RING))),
             prev_traffic: HashMap::new(),
             prev_inbound_traffic: HashMap::new(),
+            prev_stats_at: None,
             // xorshift64* state must be non-zero.
             rng: seed | 1,
             http: None,
@@ -1531,7 +1542,7 @@ impl Runtime {
         // cycle would monopolize the runtime thread.
         let mut ready_tick = ticker(READY_POLL);
         let mut dns_tick = ticker(DNS_IN_RETRY_INTERVAL);
-        let mut stats_tick = ticker(Duration::from_secs(1));
+        let mut stats_tick = ticker(STATS_TICK_PERIOD);
         let mut obs_tick = ticker(Duration::from_secs(5));
         let mut house_tick = ticker(Duration::from_millis(500));
         let mut cleanup_tick = ticker(CLEANUP_TICK);
@@ -1591,11 +1602,23 @@ impl Runtime {
                 }
                 status = async {
                     match self.lifecycle.backend.slot.as_mut() {
-                        Some(Backend::Direct(child)) => child.wait().await.ok(),
+                        Some(Backend::Direct(child)) => Some(child.wait().await),
                         _ => unreachable!(),
                     }
                 }, if matches!(self.lifecycle.backend.slot, Some(Backend::Direct(_))) => {
-                    let code = status.and_then(|s| s.code());
+                    // A resolved `wait` means the child is reaped and its
+                    // pipes are at EOF, which is exactly when
+                    // `Child::drain_output` may join the pumps: do it before
+                    // the exit handler composes diagnostics from the output.
+                    let code = match status {
+                        Some(Ok(exit)) => {
+                            if let Some(child) = self.lifecycle.backend.child_mut() {
+                                child.drain_output().await;
+                            }
+                            exit.code()
+                        }
+                        _ => None,
+                    };
                     self.on_core_exit(code).await;
                 }
                 ev = async {
@@ -1620,6 +1643,10 @@ impl Runtime {
                             // Pipe EOF is watchdog ownership release, but it is
                             // not an Xray Exit acknowledgement. Never launch a
                             // rollback/restart against possibly occupied ports.
+                            // Capture both backend facts beside this read:
+                            // `force_release` clears them, and the DNS flush
+                            // below must know this helper owned the TUN.
+                            let was_tun = self.lifecycle.backend.is_tun_owned();
                             let active = self.lifecycle.backend.is_alive() || self.lifecycle.exit_policy.stopping();
                             self.lifecycle.backend.force_release();
                             self.app_log(Diag::new(Key::RtLogHelperDisconnected));
@@ -1632,6 +1659,14 @@ impl Runtime {
                                         DiagError::new(Diag::new(Key::RtLogHelperDisconnected)),
                                     ),
                                 );
+                            }
+                            if was_tun {
+                                // The helper died while owning the TUN; the
+                                // adapter is gone too, so the next boot must
+                                // not serve answers cached before the switch.
+                                // This is the caller's flush by design — see
+                                // `on_unconfirmed_backend_loss`.
+                                self.flush_dns_cache();
                             }
                             if active {
                                 self.on_unconfirmed_backend_loss();
@@ -2566,6 +2601,9 @@ impl Runtime {
         self.lifecycle.core_update.clear_last_error();
         self.prev_traffic.clear();
         self.prev_inbound_traffic.clear();
+        // A new sample interval starts with the first poll of the next core;
+        // the gap across the restart must not dilute its rates.
+        self.prev_stats_at = None;
         // The previous core's listeners died with it: a start never inherits a
         // pending add. Only the TUN branch below arms any, from the config
         // that core will run — a direct child never owns the adapter whose
@@ -3112,18 +3150,22 @@ impl Runtime {
         }
     }
 
+    /// Settle a backend lost without an exit acknowledgement (helper/pipe
+    /// EOF): cancel a foreign in-flight operation, drain the cancelled
+    /// rollbacks, and land the phase.
+    ///
+    /// The resolver-cache flush is *not* here: it depends on TUN ownership,
+    /// which `force_release` below clears, so the caller — the only place
+    /// that can still read `is_tun_owned()` — captures the fact before its
+    /// release and runs the flush itself (see the pipe-EOF arm). A future
+    /// caller that releases a TUN-owning backend must do the same.
     fn on_unconfirmed_backend_loss(&mut self) {
         // Same invariant as on_core_exit: a foreign in-flight user operation
         // must not be silently dropped when the helper transport dies.
         self.cancel_exclusive_for_exit(&Diag::new(Key::RtReasonHelperDisconnected));
         self.lifecycle.gate_backend_alive = false;
         let explicit_stop = self.lifecycle.exit_policy.is_explicit_stop();
-        let was_tun = self.lifecycle.backend.is_tun_owned();
         self.lifecycle.backend.force_release();
-        if was_tun {
-            // Helper died while owning the TUN; the adapter is gone too.
-            self.flush_dns_cache();
-        }
         self.lifecycle.exit_policy.finish();
 
         if let Some(reason) = self.lifecycle.pending_transition.drain_failure() {
@@ -3168,6 +3210,9 @@ impl Runtime {
         }
         self.prev_traffic.clear();
         self.prev_inbound_traffic.clear();
+        // A new sample interval starts with the first poll of the next core;
+        // the gap across the restart must not dilute its rates.
+        self.prev_stats_at = None;
         let tail = self.output_tail(START_FAILURE_EXCERPT_LINES);
         let leak_install = policy::leak_block_install_message(&tail);
 
@@ -3608,12 +3653,40 @@ impl Runtime {
     /// Fold one `query_traffic` response into the per-tag baseline, evicting
     /// tags absent from the response so `prev_traffic` stays bounded by the
     /// live outbound set across config churn. Returns the tag-sorted
-    /// per-outbound deltas and the aggregate counters.
+    /// per-outbound bytes/s and the aggregate bytes/s, normalized by the
+    /// `elapsed` span the counters covered ([`Self::per_second`]).
     fn fold_traffic(
         &mut self,
         rows: Vec<(String, u64, u64)>,
+        elapsed: Duration,
     ) -> (Vec<(String, u64, u64)>, u64, u64) {
-        Self::fold_into(&mut self.prev_traffic, rows)
+        Self::fold_into(&mut self.prev_traffic, rows, elapsed)
+    }
+
+    /// Convert one cumulative-counter delta into the per-second figure every
+    /// rate surface renders. The deltas are measured over whatever span
+    /// actually elapsed between samples — a delayed or overrun tick spans
+    /// more than the nominal period — so dividing by that span is what makes
+    /// the value bytes/s. Rounds to the nearest byte and floors at zero; a
+    /// non-positive span (only reachable from a hand-built caller, never from
+    /// a monotonic [`Instant`] pair) keeps the raw delta instead of
+    /// manufacturing an infinite rate.
+    fn per_second(delta: u64, elapsed: Duration) -> u64 {
+        let secs = elapsed.as_secs_f64();
+        if secs > 0.0 && secs.is_finite() {
+            ((delta as f64) / secs).round().max(0.0) as u64
+        } else {
+            delta
+        }
+    }
+
+    /// The span the counters of the sample taken at `at` cover: since the last
+    /// published sample, or the nominal tick period for the first sample after
+    /// a start (there is no measured predecessor). Read-only; only a published
+    /// sample advances `prev_stats_at`.
+    fn stats_interval(&self, at: Instant) -> Duration {
+        self.prev_stats_at
+            .map_or(STATS_TICK_PERIOD, |prev| at.saturating_duration_since(prev))
     }
 
     /// Sum one raw traffic response into the cumulative aggregate totals
@@ -3635,7 +3708,8 @@ impl Runtime {
     }
 
     /// Fold one `query_inbound_traffic` response into the inbound baseline,
-    /// with the same eviction/delta semantics as [`Self::fold_traffic`].
+    /// with the same eviction/delta semantics as [`Self::fold_traffic`], the
+    /// deltas normalized to bytes/s over `elapsed`.
     ///
     /// The totals ride the same fold: it writes every returned tag's counters
     /// back into the baseline, so they are one lookup per delta row — no
@@ -3646,8 +3720,13 @@ impl Runtime {
     /// response through a `BTreeMap`
     /// ([`grpc::GrpcClient::query_inbound_traffic`]), so a tag never repeats
     /// within one sweep.
-    fn fold_inbound_traffic(&mut self, rows: Vec<(String, u64, u64)>) -> InboundFold {
-        let (per_inbound, up, down) = Self::fold_into(&mut self.prev_inbound_traffic, rows);
+    fn fold_inbound_traffic(
+        &mut self,
+        rows: Vec<(String, u64, u64)>,
+        elapsed: Duration,
+    ) -> InboundFold {
+        let (per_inbound, up, down) =
+            Self::fold_into(&mut self.prev_inbound_traffic, rows, elapsed);
         let per_inbound_totals = per_inbound
             .iter()
             .map(|(tag, _, _)| {
@@ -3668,14 +3747,16 @@ impl Runtime {
 
     /// Shared fold core: evict baselines for tags the response no longer
     /// reports; a tag that keeps appearing keeps its previous baseline, so
-    /// deltas below are unchanged for live tags, and its baseline entry
-    /// holds that row's cumulative counters when the fold returns. The
-    /// returned list is tag-sorted; a live tag's entry is updated in place
-    /// (the key already exists, so re-inserting it would re-allocate the tag
-    /// for nothing).
+    /// deltas are unchanged for live tags, and its baseline entry holds that
+    /// row's cumulative counters when the fold returns. The returned list is
+    /// tag-sorted; a live tag's entry is updated in place (the key already
+    /// exists, so re-inserting it would re-allocate the tag for nothing).
+    /// Every returned rate is the row's counter delta normalized by
+    /// `elapsed` ([`Self::per_second`]).
     fn fold_into(
         baseline: &mut HashMap<String, (u64, u64)>,
         rows: Vec<(String, u64, u64)>,
+        elapsed: Duration,
     ) -> (Vec<(String, u64, u64)>, u64, u64) {
         let seen: HashSet<&str> = rows.iter().map(|(tag, _, _)| tag.as_str()).collect();
         baseline.retain(|tag, _| seen.contains(tag.as_str()));
@@ -3690,10 +3771,10 @@ impl Runtime {
                 }
             };
             // saturating: a counter reset (core restart) yields 0, not wraparound.
-            let up_rate = cum_up.saturating_sub(prev_up);
-            let down_rate = cum_down.saturating_sub(prev_down);
-            up += up_rate;
-            down += down_rate;
+            let up_rate = Self::per_second(cum_up.saturating_sub(prev_up), elapsed);
+            let down_rate = Self::per_second(cum_down.saturating_sub(prev_down), elapsed);
+            up = up.saturating_add(up_rate);
+            down = down.saturating_add(down_rate);
             per_tag.push((tag, up_rate, down_rate));
         }
         per_tag.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3704,19 +3785,30 @@ impl Runtime {
         // Reset backoff after a stable minute.
         self.lifecycle.backoff.maybe_reset(Instant::now());
 
-        // Both sweeps hit the same loopback channel; a failure means the core
+        // The counters this sample will read have been accumulating since the
+        // last published sample; that measured span — not the nominal tick —
+        // is what turns their deltas into bytes/s.
+        let at = Instant::now();
+        let elapsed = self.stats_interval(at);
+
+        // Every sweep hits the same loopback channel; a failure means the core
         // is unreachable or restarting — drop the whole sample (the exit
-        // watch handles state).
+        // watch handles state). All three run before any fold so a dropped
+        // sample also leaves every baseline untouched: the next successful
+        // sample then covers the full span since the last published one.
         let Ok(rows) = self.grpc.query_traffic().await else {
             return;
         };
-        // The outbound sweep feeds only the per-outbound views; its
-        // aggregate is deliberately not surfaced (see below).
-        let (per_outbound, _, _) = self.fold_traffic(rows);
-
         let Ok(inbound_rows) = self.grpc.query_inbound_traffic().await else {
             return;
         };
+        let Ok(sys_stats) = self.grpc.get_sys_stats().await else {
+            return;
+        };
+
+        // The outbound sweep feeds only the per-outbound views; its
+        // aggregate is deliberately not surfaced (see below).
+        let (per_outbound, _, _) = self.fold_traffic(rows, elapsed);
         // Aggregate rates and totals come from the same inbound (listener)
         // response the dashboard table renders, so the session totals line
         // and the aggregate rates match the table by construction:
@@ -3732,21 +3824,19 @@ impl Runtime {
             per_inbound_totals,
             up,
             down,
-        } = self.fold_inbound_traffic(inbound_rows);
+        } = self.fold_inbound_traffic(inbound_rows, elapsed);
 
-        let sys = self
-            .grpc
-            .get_sys_stats()
-            .await
-            .map(|r| SysStatsSnapshot {
-                uptime_secs: u64::from(r.uptime),
-                goroutines: u64::from(r.num_goroutine),
-                alloc_bytes: r.alloc,
-                sys_bytes: r.sys,
-                live_objects: r.live_objects,
-                num_gc: u64::from(r.num_gc),
-            })
-            .unwrap_or_default();
+        let sys = SysStatsSnapshot {
+            uptime_secs: u64::from(sys_stats.uptime),
+            goroutines: u64::from(sys_stats.num_goroutine),
+            alloc_bytes: sys_stats.alloc,
+            sys_bytes: sys_stats.sys,
+            live_objects: sys_stats.live_objects,
+            num_gc: u64::from(sys_stats.num_gc),
+        };
+
+        // Only a published sample advances the interval's start.
+        self.prev_stats_at = Some(at);
 
         self.emit(CoreEvt::Stats(StatsTick {
             up,
@@ -4209,7 +4299,7 @@ mod tests {
         let live: Vec<(String, u64, u64)> = (0..5u64)
             .map(|i| (format!("tag-{i}"), 110 + i, 220 + i))
             .collect();
-        let (per_outbound, up, down) = runtime.fold_traffic(live);
+        let (per_outbound, up, down) = runtime.fold_traffic(live, Duration::from_secs(1));
         assert_eq!(runtime.prev_traffic.len(), 5, "stale tags must be evicted");
         for i in 0..5u64 {
             let tag = format!("tag-{i}");
@@ -4234,7 +4324,7 @@ mod tests {
         let again: Vec<(String, u64, u64)> = (0..5u64)
             .map(|i| (format!("tag-{i}"), 130 + i, 240 + i))
             .collect();
-        let (_, up, down) = runtime.fold_traffic(again);
+        let (_, up, down) = runtime.fold_traffic(again, Duration::from_secs(1));
         assert_eq!(runtime.prev_traffic.len(), 5);
         assert_eq!(up, 5 * 20);
         assert_eq!(down, 5 * 20);
@@ -4246,7 +4336,7 @@ mod tests {
         runtime.prev_traffic.insert("a".to_string(), (1000, 2000));
         runtime.prev_traffic.insert("b".to_string(), (3000, 4000));
         let rows = vec![("a".to_string(), 1010, 2020), ("b".to_string(), 3030, 4030)];
-        let (per_outbound, up, down) = runtime.fold_traffic(rows);
+        let (per_outbound, up, down) = runtime.fold_traffic(rows, Duration::from_secs(1));
         assert_eq!(runtime.prev_traffic.len(), 2, "stable set is a no-op");
         assert_eq!(up, 10 + 30);
         assert_eq!(down, 20 + 30);
@@ -4257,10 +4347,70 @@ mod tests {
         // One more identical-set poll: deltas stay incremental from the new
         // baselines, still no eviction.
         let rows = vec![("a".to_string(), 1030, 2060), ("b".to_string(), 3050, 4070)];
-        let (_, up, down) = runtime.fold_traffic(rows);
+        let (_, up, down) = runtime.fold_traffic(rows, Duration::from_secs(1));
         assert_eq!(runtime.prev_traffic.len(), 2);
         assert_eq!(up, 20 + 20);
         assert_eq!(down, 40 + 40);
+    }
+
+    /// The fold turns cumulative-counter deltas into the bytes/s the GUI
+    /// renders, using the span the counters actually covered: 3,000 bytes
+    /// over 15 s is 200 B/s, while a one-second sample is already a rate and
+    /// stays unchanged. Per-tag rows and aggregates normalize the same way.
+    #[test]
+    fn traffic_deltas_normalize_by_the_measured_interval() {
+        let mut baseline = std::collections::HashMap::new();
+        let (per_tag, up, down) = Runtime::fold_into(
+            &mut baseline,
+            vec![("edge".to_string(), 3_000, 1_500)],
+            Duration::from_secs(15),
+        );
+        assert_eq!(
+            per_tag,
+            vec![("edge".to_string(), 200, 100)],
+            "3,000 B over 15 s is 200 B/s; 1,500 B down is 100 B/s"
+        );
+        assert_eq!((up, down), (200, 100));
+
+        // The next sample advances the baseline by 300 B each way over 1 s.
+        let (per_tag, up, down) = Runtime::fold_into(
+            &mut baseline,
+            vec![("edge".to_string(), 3_300, 1_800)],
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            per_tag,
+            vec![("edge".to_string(), 300, 300)],
+            "a one-second sample is unchanged"
+        );
+        assert_eq!((up, down), (300, 300));
+    }
+
+    /// The first sample after a start has no measured predecessor, so it
+    /// normalizes by the nominal tick period the ticker schedules; later
+    /// samples use the span actually measured (a delayed tick must not
+    /// inflate the rate).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_interval_uses_the_nominal_period_before_the_first_sample() {
+        let mut runtime = runtime();
+        let at = Instant::now();
+        assert_eq!(
+            runtime.stats_interval(at),
+            super::STATS_TICK_PERIOD,
+            "the first sample keeps the nominal-tick reading"
+        );
+
+        runtime.prev_stats_at = Some(at);
+        assert_eq!(
+            runtime.stats_interval(at + Duration::from_secs(3)),
+            Duration::from_secs(3),
+            "a delayed tick normalizes by its measured span"
+        );
+        assert_eq!(
+            runtime.stats_interval(at),
+            Duration::ZERO,
+            "a non-monotonic instant saturates instead of panicking"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4273,7 +4423,7 @@ mod tests {
             ("socks".to_string(), 1010, 2020),
             ("tun".to_string(), 500, 600),
         ];
-        let fold = runtime.fold_inbound_traffic(rows);
+        let fold = runtime.fold_inbound_traffic(rows, Duration::from_secs(1));
 
         assert_eq!(
             fold.per_inbound,
@@ -4296,7 +4446,7 @@ mod tests {
         // One more poll reporting only "tun": "socks" is evicted, and the
         // totals follow the surviving tag set.
         let rows = vec![("tun".to_string(), 600, 700)];
-        let fold = runtime.fold_inbound_traffic(rows);
+        let fold = runtime.fold_inbound_traffic(rows, Duration::from_secs(1));
         assert_eq!(fold.per_inbound, vec![("tun".to_string(), 100, 100)]);
         assert_eq!(fold.per_inbound_totals, vec![("tun".to_string(), 600, 700)]);
         assert_eq!(fold.up, 100);
@@ -4324,7 +4474,7 @@ mod tests {
             ("tun".to_string(), 600, 700),
             ("socks".to_string(), 1_010, 2_020),
         ];
-        let fold = runtime.fold_inbound_traffic(rows);
+        let fold = runtime.fold_inbound_traffic(rows, Duration::from_secs(1));
         assert_eq!(
             fold.per_inbound,
             vec![("socks".to_string(), 10, 20), ("tun".to_string(), 600, 700)],
@@ -4392,7 +4542,7 @@ mod tests {
         let mut runtime = runtime();
         let rows = vec![("a".to_string(), 1010, 2020), ("b".to_string(), 3030, 4030)];
         let (total_up, total_down) = Runtime::aggregate_totals(&rows);
-        let fold = runtime.fold_inbound_traffic(rows);
+        let fold = runtime.fold_inbound_traffic(rows, Duration::from_secs(1));
         let (sum_up, sum_down) = fold
             .per_inbound_totals
             .iter()
