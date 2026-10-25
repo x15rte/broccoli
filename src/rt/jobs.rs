@@ -374,6 +374,10 @@ struct Record {
     /// settled. Only one apply can be in flight (the exclusive rule), so a
     /// verdict that reads this always reads its own.
     apply_revision: Option<u64>,
+    /// The exact bytes the accepted apply wrote to the candidate path,
+    /// parked after the write and taken by the completion that stages them
+    /// for the helper. Never re-read from disk: the path is user-writable.
+    apply_candidate: Option<Vec<u8>>,
 }
 
 impl Record {
@@ -388,6 +392,7 @@ impl Record {
             cancel_requested: false,
             sidecar: None,
             apply_revision: None,
+            apply_candidate: None,
         }
     }
 
@@ -748,6 +753,23 @@ impl JobRegistry {
         self.exclusive
             .as_ref()
             .and_then(|record| record.apply_revision)
+    }
+
+    /// Parks the exact candidate bytes the accepted apply wrote on the
+    /// exclusive record, so the completion stages what the write produced
+    /// instead of re-reading the user-writable path.
+    pub(crate) fn set_apply_candidate(&mut self, bytes: Vec<u8>) {
+        if let Some(record) = &mut self.exclusive {
+            record.apply_candidate = Some(bytes);
+        }
+    }
+
+    /// Takes the parked candidate bytes (a second take finds `None`). The
+    /// record's release drops them with the rest of the record.
+    pub(crate) fn take_apply_candidate(&mut self) -> Option<Vec<u8>> {
+        self.exclusive
+            .as_mut()
+            .and_then(|record| record.apply_candidate.take())
     }
 
     /// Whether the exclusive occupant is under a keep-slot cancellation
@@ -1743,6 +1765,36 @@ mod tests {
         );
         registry.finish_exclusive();
         assert_eq!(registry.stop_plan(), StopPlan::Idle);
+    }
+
+    /// The candidate bytes ride the apply record: parked at the write, taken
+    /// exactly once by the completion that stages them, and cleared with the
+    /// record.
+    #[test]
+    fn apply_candidate_bytes_live_with_the_apply_record() {
+        let bookends: Bookends = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = recorder_registry(&bookends);
+        assert_eq!(registry.take_apply_candidate(), None);
+
+        registry.try_begin(JobKind::ApplyConfig).unwrap();
+        assert_eq!(
+            registry.take_apply_candidate(),
+            None,
+            "the record carries no bytes until the write parks them"
+        );
+        registry.set_apply_candidate(b"{\"log\":{}}".to_vec());
+        assert_eq!(
+            registry.take_apply_candidate(),
+            Some(b"{\"log\":{}}".to_vec())
+        );
+        assert_eq!(
+            registry.take_apply_candidate(),
+            None,
+            "a second take finds nothing"
+        );
+
+        registry.finish_exclusive();
+        assert_eq!(registry.take_apply_candidate(), None);
     }
 
     /// The apply verdict's identity lives on the job that owns it: the begin

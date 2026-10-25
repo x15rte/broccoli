@@ -1354,11 +1354,11 @@ fn config_written_through_the_apply_path_is_user_only() {
         });
         let candidate = crate::rt::apply::write_candidate(&config).expect("write candidate config");
         assert!(
-            candidate.starts_with(crate::sys::paths::config_dir()),
+            candidate.path.starts_with(crate::sys::paths::config_dir()),
             "candidate must live in the config dir"
         );
         assert_user_only_dacl(&crate::sys::paths::config_dir());
-        assert_state_file_user_only(&candidate);
+        assert_state_file_user_only(&candidate.path);
         crate::rt::apply::commit().expect("commit the candidate config");
         assert_state_file_user_only(&crate::sys::paths::config_dir().join("config.json"));
     });

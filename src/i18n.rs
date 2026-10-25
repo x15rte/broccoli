@@ -5932,7 +5932,7 @@ mod en {
             Key::RtFrameApplyRejected => "The app rejected the config apply",
             Key::RtFrameCandidateWriteFailed => "The app could not write the candidate config",
             Key::RtFrameApplyCaptureFailed => {
-                "The config passed validation. The app could not capture its bytes"
+                "The config passed validation. The app could not bind it to the bytes it validated"
             }
             Key::RtFrameApplyCommitFailed => {
                 "The config passed validation. The app could not commit it"

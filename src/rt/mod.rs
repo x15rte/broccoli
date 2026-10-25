@@ -2090,8 +2090,8 @@ impl Runtime {
         // blocking pool. The exclusive record stays held across the await, and
         // a write failure still settles the operation right here — no
         // validation task ever starts.
-        let path = match apply::write_candidate_offloaded(value).await {
-            Ok(path) => path,
+        let candidate = match apply::write_candidate_offloaded(value).await {
+            Ok(candidate) => candidate,
             Err(error) => {
                 self.emit(CoreEvt::ApplyResult {
                     ok: false,
@@ -2105,6 +2105,10 @@ impl Runtime {
                 return;
             }
         };
+        // The exact bytes the write produced travel with the job: the
+        // completion stages these, never a re-read of the user-writable path.
+        self.jobs.set_apply_candidate(candidate.bytes);
+        let path = candidate.path;
         let task = tokio::spawn(async move {
             let (ok, output) = apply::validate(&path).await;
             ExclusiveOutcome::ApplyValidated {
@@ -2124,7 +2128,7 @@ impl Runtime {
         // The candidate write is a create/write/fsync leg, so it runs on the
         // blocking pool. The exclusive record stays held across the await.
         let path = match apply::write_candidate_offloaded(value).await {
-            Ok(path) => path,
+            Ok(candidate) => candidate.path,
             Err(error) => {
                 // Pre-spawn reject: the task never began, so the rejection is
                 // the terminal result — take the reply the begin parked for it
@@ -2363,16 +2367,45 @@ impl Runtime {
             self.release_exclusive();
             return;
         }
-        // Capture the exact candidate bytes the apply gate validated BEFORE
-        // the commit rename, so any helper start later stages precisely what
-        // xray -test accepted — never a re-read of the user-writable active
-        // path at elevated time. A candidate
-        // that cannot be captured cannot be committed: fail closed instead
-        // of promoting bytes the runtime could not bind to the start. The
-        // capture read and the commit rename are filesystem legs, so both run
-        // on the blocking pool (see the `apply` module).
-        let validated_bytes = match apply::read_candidate_offloaded().await {
-            Ok(bytes) => bytes,
+        // The bytes the candidate write produced are parked on the apply
+        // record, so a helper start later stages exactly what `xray -test`
+        // validated — never a re-read of the user-writable active path at
+        // elevated time. A record without them cannot commit: fail closed
+        // instead of promoting bytes the runtime could not bind to the start.
+        // The commit rename is a filesystem leg, so it runs on the blocking
+        // pool (see the `apply` module).
+        let validated_bytes = match self.jobs.take_apply_candidate() {
+            Some(bytes) => bytes,
+            None => {
+                self.emit(CoreEvt::ApplyResult {
+                    ok: false,
+                    output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
+                        Key::RtFrameApplyCaptureFailed,
+                    )))),
+                    revision,
+                });
+                self.release_exclusive();
+                return;
+            }
+        };
+        // The file the commit will promote must still be the bytes the write
+        // produced — and so the bytes the gate tested. A rewrite between the
+        // write and here fails the apply rather than promoting one artefact
+        // while the helper stages another.
+        let candidate_digest = crate::digest::sha256_hex(&validated_bytes);
+        match apply::candidate_holds_digest_offloaded(candidate_digest).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.emit(CoreEvt::ApplyResult {
+                    ok: false,
+                    output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
+                        Key::RtFrameApplyCaptureFailed,
+                    )))),
+                    revision,
+                });
+                self.release_exclusive();
+                return;
+            }
             Err(error) => {
                 self.emit(CoreEvt::ApplyResult {
                     ok: false,
@@ -2384,7 +2417,7 @@ impl Runtime {
                 self.release_exclusive();
                 return;
             }
-        };
+        }
         if let Err(error) = apply::commit_offloaded().await {
             self.emit(CoreEvt::ApplyResult {
                 ok: false,

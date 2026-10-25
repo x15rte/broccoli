@@ -545,12 +545,24 @@ where
     })?
 }
 
+/// The candidate artefact: the path it was written to, and the exact bytes
+/// written. A caller that hands the configuration to the elevated helper
+/// passes [`Self::bytes`]; it must never re-read [`Self::path`], which the
+/// same user can rewrite between validation and staging.
+pub struct Candidate {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
 /// Durably serialize `v` as pretty JSON to `config.candidate.json`, and write
 /// the sidecar stamp naming the build that produced it. The stamp is written
 /// with the configuration it describes — never apart from it.
-pub fn write_candidate(v: &serde_json::Value) -> Result<PathBuf, DiagError> {
-    write_candidate_bytes(v)?;
-    Ok(candidate_path())
+pub fn write_candidate(v: &serde_json::Value) -> Result<Candidate, DiagError> {
+    let bytes = write_candidate_bytes(v)?;
+    Ok(Candidate {
+        path: candidate_path(),
+        bytes,
+    })
 }
 
 /// [`write_candidate`] returning the exact bytes written, so a caller that
@@ -570,8 +582,29 @@ fn write_candidate_bytes(v: &serde_json::Value) -> Result<Vec<u8>, DiagError> {
 }
 
 /// [`write_candidate`], off the executor (see [`on_blocking_pool`]).
-pub async fn write_candidate_offloaded(v: serde_json::Value) -> Result<PathBuf, DiagError> {
+pub async fn write_candidate_offloaded(v: serde_json::Value) -> Result<Candidate, DiagError> {
     on_blocking_pool(move || write_candidate(&v)).await
+}
+
+/// Lowercase hex SHA-256 of the file at `path`.
+fn sha256_file(path: &Path) -> Result<String, DiagError> {
+    let mut file = std::fs::File::open(path)
+        .diag_with(Diag::new(Key::ApplyFileReadFailed).arg(path.display()))?;
+    crate::digest::sha256_reader(&mut file)
+        .diag_with(Diag::new(Key::ApplyFileReadFailed).arg(path.display()))
+}
+
+/// Whether the candidate file still hashes to `expected` — the digest of the
+/// bytes the write produced, and so the bytes the gate tested. The completion
+/// checks it before committing: a rewrite in between fails the apply instead
+/// of promoting one artefact while the helper stages another.
+pub fn candidate_holds_digest(expected: &str) -> Result<bool, DiagError> {
+    Ok(sha256_file(&candidate_path())?.eq_ignore_ascii_case(expected))
+}
+
+/// [`candidate_holds_digest`], off the executor (see [`on_blocking_pool`]).
+pub async fn candidate_holds_digest_offloaded(expected: String) -> Result<bool, DiagError> {
+    on_blocking_pool(move || candidate_holds_digest(&expected)).await
 }
 
 /// Create or replace one artefact, flushed to disk before anything promotes
@@ -667,20 +700,6 @@ pub async fn rollback_offloaded() -> Result<(), DiagError> {
     on_blocking_pool(rollback).await
 }
 
-/// The validated candidate's exact bytes. The apply gate captures them before
-/// the commit rename so any later helper start stages precisely what
-/// `xray -test` accepted — never a re-read of the user-writable active path
-/// at elevated time.
-fn read_candidate() -> Result<Vec<u8>, DiagError> {
-    let path = candidate_path();
-    std::fs::read(&path).diag_with(Diag::new(Key::ApplyFileReadFailed).arg(path.display()))
-}
-
-/// [`read_candidate`], off the executor (see [`on_blocking_pool`]).
-pub async fn read_candidate_offloaded() -> Result<Vec<u8>, DiagError> {
-    on_blocking_pool(read_candidate).await
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -714,6 +733,36 @@ mod tests {
             &json!({ "outbounds": [], "inbounds": [] }).to_string()
         ));
         assert!(!carries_health_extension("{not json"));
+    }
+
+    /// The write hands its bytes back with the path: the completion stages
+    /// what the write produced, never a re-read of the user-writable file.
+    /// The digest guard is what lets the completion prove the file it commits
+    /// is still those bytes.
+    #[test]
+    fn the_candidate_carries_the_bytes_it_wrote() {
+        crate::sys::appdata::with_appdata(|| {
+            std::fs::create_dir_all(config_dir()).expect("create config dir");
+            let value = json!({"log": {"loglevel": "warning"}});
+            let candidate = write_candidate(&value).expect("write the candidate pair");
+            assert_eq!(
+                std::fs::read(&candidate.path).expect("read the candidate"),
+                candidate.bytes,
+                "the path must hold exactly the bytes the caller carries"
+            );
+            let digest = crate::digest::sha256_hex(&candidate.bytes);
+            assert!(
+                super::candidate_holds_digest(&digest).expect("hash the candidate"),
+                "the committed file must still match the written bytes"
+            );
+
+            // A rewrite after the write makes the guarded commit refuse.
+            std::fs::write(&candidate.path, br#"{"forged":true}"#).expect("swap the file");
+            assert!(
+                !super::candidate_holds_digest(&digest).expect("hash the swapped file"),
+                "a swapped candidate must not match the validated digest"
+            );
+        });
     }
 
     /// The candidate pair and the stamp are written together, and commit

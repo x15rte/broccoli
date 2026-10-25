@@ -16,7 +16,6 @@ use std::time::{Duration, SystemTime};
 use crate::diag::{Diag, DiagError, DiagResult};
 use crate::r#gen::keys;
 use crate::i18n::Key;
-use sha2::{Digest, Sha256};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
 
 use super::paths::{broccoli_root, core_dir};
@@ -1445,19 +1444,7 @@ async fn stream_download(
 }
 
 fn sha256_reader(reader: &mut impl std::io::Read) -> Result<String, DiagError> {
-    let mut hasher = Sha256::new();
-    // digest 0.11 dropped the `io::Write` impl this used to hash through, so
-    // the bytes are fed explicitly. The buffer is heap-allocated to keep the
-    // 64 KiB off the stack, as in the helper's `sha256_handle`.
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).diag(Key::CoreDlHashingFailed)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(crate::digest::hex(&hasher.finalize()))
+    crate::digest::sha256_reader(reader).diag(Key::CoreDlHashingFailed)
 }
 
 /// sha256 of `file` as lowercase hex.
