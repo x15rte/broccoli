@@ -13,7 +13,7 @@
 use std::error::Error as _;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek as _, SeekFrom, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -26,7 +26,6 @@ use super::supervisor::Job;
 use crate::diag::{Diag, DiagArg, DiagError, DiagResult};
 use crate::i18n::Key;
 use base64::Engine as _;
-use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
@@ -39,10 +38,11 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
+    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
-    SECURITY_DESCRIPTOR_CONTROL, TOKEN_QUERY, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, SECURITY_DESCRIPTOR_CONTROL, TOKEN_QUERY, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -738,7 +738,9 @@ struct ValidatedAce {
     /// `AceType`; `0` is `ACCESS_ALLOWED_ACE_TYPE`, the only type whose fields
     /// the callers compare.
     ace_type: u8,
-    /// `AceFlags`; the strict shapes the callers accept carry `0`.
+    /// `AceFlags`; the strict shape the verifier accepts carries the
+    /// container+object inheritance bits, and the repairable shapes accept
+    /// those or none.
     ace_flags: u8,
     /// `Mask`, meaningful only for the allow-ACEs (`ace_type == 0`).
     mask: u32,
@@ -846,7 +848,10 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
         let Some(ace) = validated_ace(raw_ace.cast(), loaded.bytes()) else {
             return Err(DiagError::new(Diag::new(Key::HelperAceMalformed)));
         };
-        if ace.ace_type != 0 || ace.ace_flags != 0 || ace.mask != FILE_ALL_ACCESS.0 {
+        if ace.ace_type != 0
+            || ace.ace_flags != (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8
+            || ace.mask != FILE_ALL_ACCESS.0
+        {
             return Err(DiagError::new(Diag::new(Key::HelperAceNotFullControl)));
         }
         // SAFETY: `ace.sid` points at the `SidStart` of the ACE — an embedded,
@@ -882,14 +887,22 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
     Ok(())
 }
 
-/// True when `path`'s only deviation from the strict protected shape is one
-/// extra full-control allow-ACE next to an intact SYSTEM + Administrators
-/// pair — exactly what Explorer's "permanently get access" prompt adds to a
-/// folder a user clicked into. Only an elevated process (or the user
-/// granting themselves access first) can create such a state, so repairing
-/// it restores the invariant without helping any attacker. Any read
-/// problem, and every other deviation, reports false: the caller then fails
-/// closed on the original verification error.
+/// True when `path`'s DACL is a shape the helper may repair into the strict
+/// protected one, rather than one it must refuse. Two shapes qualify:
+///
+/// * the two protected principals with full control, carrying either the
+///   current inheritance flags or, on a directory an older build created,
+///   none — so the first start after the update rewrites it;
+/// * either of those plus one Explorer-added full-control allow-ACE for the
+///   current user, which is what "permanently get access" writes to a folder
+///   a user clicked into.
+///
+/// Only an elevated process (or the user granting themselves access first)
+/// can create a qualifying state, and repair only ever replaces the DACL
+/// with the strict shape, so accepting a stale shape cannot weaken it. Any
+/// read problem, a foreign or duplicated principal, another mask, or
+/// unexpected ACE flags reports false: the caller then fails closed on the
+/// original verification error.
 fn dacl_deviation_is_benign(path: &Path) -> bool {
     let Ok(loaded) = load_protected_directory(path) else {
         return false;
@@ -907,13 +920,14 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
     // `load_protected_directory`, and the storage's alignment rule (see
     // `LoadedProtectedDirectory::words`) puts the ACL on its DWORD boundary
     // for this typed header read.
-    if unsafe { (*loaded.dacl).AceCount } != 3 {
+    let ace_count = u32::from(unsafe { (*loaded.dacl).AceCount });
+    if !(2..=3).contains(&ace_count) {
         return false;
     }
-    // The extra ACE must belong to the current user: Explorer adds the SID
-    // of whoever clicks "Continue", and only an elevated process or that
-    // same user could have created the deviation. A well-known or foreign
-    // SID is not the documented shape and stays fail-closed.
+    // A qualifying extra ACE must belong to the current user: Explorer adds
+    // the SID of whoever clicks "Continue", and only an elevated process or
+    // that same user could have created the deviation. A well-known or
+    // foreign SID is not a documented shape and stays fail-closed.
     let Ok(own) = current_process_user_sid() else {
         return false;
     };
@@ -924,14 +938,15 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
     let Ok(administrators) = Sid::well_known(WinBuiltinAdministratorsSid) else {
         return false;
     };
-    let mut saw_system = false;
-    let mut saw_administrators = false;
-    let mut extra_aces = 0u32;
-    for index in 0..3 {
+    let inheritance = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8;
+    let mut system_flags = None;
+    let mut administrators_flags = None;
+    let mut user_aces = 0u32;
+    for index in 0..ace_count {
         let mut raw_ace = std::ptr::null_mut();
         // SAFETY: `loaded.dacl` is the valid, non-null DACL from the loader;
-        // `index` is within the AceCount (== 3) just verified; `raw_ace` is a
-        // valid out-parameter and the return is checked.
+        // `index` is within the AceCount just verified; `raw_ace` is a valid
+        // out-parameter and the return is checked.
         if unsafe { GetAce(loaded.dacl, index, &mut raw_ace) }.is_err() {
             return false;
         }
@@ -943,41 +958,46 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
         if ace.ace_type != 0 || ace.mask != FILE_ALL_ACCESS.0 {
             return false;
         }
-        if ace.ace_flags != 0 {
-            // SAFETY: `ace.sid` points into the DWORD-aligned live DACL
-            // buffer (see `LoadedProtectedDirectory::words`) and `own_sid`
-            // into the current user's owned SID storage; EqualSid only reads
-            // both.
-            if !unsafe { EqualSid(ace.sid, own_sid) }.is_ok() {
+        // SAFETY: `ace.sid` points into the DWORD-aligned live DACL buffer
+        // (see `LoadedProtectedDirectory::words`), and the system,
+        // administrators, and own-user SIDs are owned storage alive for the
+        // call; EqualSid only reads both sides.
+        let (is_system, is_administrators, is_user) = unsafe {
+            (
+                EqualSid(ace.sid, system.psid()).is_ok(),
+                EqualSid(ace.sid, administrators.psid()).is_ok(),
+                EqualSid(ace.sid, own_sid).is_ok(),
+            )
+        };
+        let is_administrators = !is_system && is_administrators;
+        let is_user = !is_system && !is_administrators && is_user;
+        // The two protected principals are ours to shape: this app writes
+        // them with the inheritance flags, and an older build wrote them
+        // without. The Explorer-added ACE below is not: Windows' permission
+        // dialog lets the user pick any inheritance scope, so its flags are
+        // left alone.
+        let principal_flags_ok = ace.ace_flags == 0 || ace.ace_flags == inheritance;
+        if is_system {
+            if !principal_flags_ok || system_flags.replace(ace.ace_flags).is_some() {
                 return false;
             }
-            extra_aces += 1;
-            continue;
-        }
-        // SAFETY: `ace.sid` is the embedded SID in the DWORD-aligned live DACL
-        // buffer (see `LoadedProtectedDirectory::words`) and `system` is the
-        // well-known SID built above; EqualSid only reads both.
-        if unsafe { EqualSid(ace.sid, system.psid()) }.is_ok() {
-            if saw_system {
+        } else if is_administrators {
+            if !principal_flags_ok || administrators_flags.replace(ace.ace_flags).is_some() {
                 return false;
             }
-            saw_system = true;
+        } else if is_user {
+            user_aces += 1;
+            if user_aces > 1 {
+                return false;
+            }
         } else {
-            // SAFETY: `ace.sid` is still the embedded SID in the DWORD-aligned
-            // live DACL buffer (see `LoadedProtectedDirectory::words`) and
-            // `administrators` is the other well-known SID built above;
-            // EqualSid only reads both.
-            if unsafe { EqualSid(ace.sid, administrators.psid()) }.is_ok() {
-                if saw_administrators {
-                    return false;
-                }
-                saw_administrators = true;
-            } else {
-                return false;
-            }
+            return false;
         }
     }
-    saw_system && saw_administrators && extra_aces == 1
+    matches!(
+        (system_flags, administrators_flags),
+        (Some(system), Some(administrators)) if system == administrators
+    )
 }
 
 /// Rewrite `path`'s DACL to the strict SYSTEM + Administrators shape. Only
@@ -1001,10 +1021,11 @@ fn repair_protected_directory_dacl(path: &Path) -> Result<(), DiagError> {
     Ok(())
 }
 
-/// Verify `path`'s strict protected DACL; when the only deviation is a
-/// benign extra ACE (a user clicked into the folder and Explorer granted
-/// them permanent access), repair the DACL in place and re-verify. Any
-/// other deviation still fails closed, exactly as before.
+/// Verify `path`'s strict protected DACL; when the deviation is one of the
+/// repairable shapes — a directory an older build created without
+/// inheritance flags, optionally with the Explorer-granted user ACE — repair
+/// the DACL in place and re-verify. Any other deviation still fails closed,
+/// exactly as before.
 fn ensure_protected_directory(path: &Path) -> Result<(), DiagError> {
     if let Err(first) = verify_protected_directory(path) {
         if !dacl_deviation_is_benign(path) {
@@ -1204,19 +1225,7 @@ impl Drop for SecureRuntimeStage {
 fn sha256_handle(file: &mut File) -> Result<String, DiagError> {
     file.seek(SeekFrom::Start(0))
         .diag(Key::HelperHashRewindFailed)?;
-    let mut hasher = Sha256::new();
-    // One-shot hash of a user-sized staged config: keep the 64 KiB read
-    // buffer off the elevated helper's serve-loop stack.
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).diag(Key::HelperHashReadFailed)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let digest = hasher.finalize();
-    Ok(crate::digest::hex(&digest))
+    crate::digest::sha256_reader(file).diag(Key::HelperHashReadFailed)
 }
 
 /// SHA-256 hex of in-memory `bytes`, the expected digest a staged copy is
@@ -3859,11 +3868,11 @@ mod tests {
     use crate::sys::security::Sid;
     use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE};
     use windows::Win32::Security::{
-        ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, InitializeAcl,
-        InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        SECURITY_DESCRIPTOR, SetFileSecurityW, SetSecurityDescriptorControl,
-        SetSecurityDescriptorDacl, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
-        WinLocalSystemSid,
+        ACE_FLAGS, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetFileSecurityW,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, WinBuiltinAdministratorsSid,
+        WinBuiltinUsersSid, WinLocalSystemSid,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ALL_ACCESS, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
@@ -4447,20 +4456,26 @@ mod tests {
     #[repr(align(8))]
     struct AlignedAcl([u8; 512]);
 
+    /// The principal ACE flags of the strict protected shape: SYSTEM and
+    /// Administrators inherit to what the helper creates inside.
+    const STRICT_FLAGS: ACE_FLAGS = ACE_FLAGS(CONTAINER_INHERIT_ACE.0 | OBJECT_INHERIT_ACE.0);
+
     /// Build a probe DACL on `dir`: SYSTEM + Administrators (strict), plus
-    /// each SID in `extra_sids` as a full-control ACE carrying
-    /// Explorer-style inheritance flags, optionally omitting the
-    /// Administrators ACE. Mirrors what Explorer's "permanently get access"
-    /// prompt writes to a folder a user clicked into. The kernel collapses
-    /// duplicate-SID ACEs on apply, so callers must pass distinct SIDs.
+    /// each SID in `extra_sids` as a full-control ACE carrying `extra_flags`
+    /// (Windows' permission dialog can grant any scope), optionally omitting
+    /// the Administrators ACE. `principal_flags` is what the two protected
+    /// principals' ACEs carry: the strict inheritance set for the current
+    /// shape, `0` for the pre-inheritance shape an older build left behind.
+    /// Mirrors what Explorer's "permanently get access" prompt writes to a
+    /// folder a user clicked into. The kernel collapses duplicate-SID ACEs on
+    /// apply, so callers must pass distinct SIDs.
     fn write_probe_dacl(
         dir: &std::path::Path,
         extra_sids: &[PSID],
+        extra_flags: ACE_FLAGS,
         omit_administrators: bool,
+        principal_flags: ACE_FLAGS,
     ) -> windows::core::Result<()> {
-        use windows::Win32::Security::{
-            AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE,
-        };
         let system = Sid::well_known(WinLocalSystemSid)?;
         let administrators = Sid::well_known(WinBuiltinAdministratorsSid)?;
         let mut acl_storage = AlignedAcl([0; 512]);
@@ -4470,18 +4485,24 @@ mod tests {
         // the writes; every call's return is checked by `?`.
         unsafe {
             InitializeAcl(acl, acl_storage.0.len() as u32, ACL_REVISION)?;
-            AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS.0, system.psid())?;
+            AddAccessAllowedAceEx(
+                acl,
+                ACL_REVISION,
+                principal_flags,
+                FILE_ALL_ACCESS.0,
+                system.psid(),
+            )?;
             if !omit_administrators {
-                AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS.0, administrators.psid())?;
-            }
-            for sid in extra_sids {
                 AddAccessAllowedAceEx(
                     acl,
                     ACL_REVISION,
-                    CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    principal_flags,
                     FILE_ALL_ACCESS.0,
-                    *sid,
+                    administrators.psid(),
                 )?;
+            }
+            for sid in extra_sids {
+                AddAccessAllowedAceEx(acl, ACL_REVISION, extra_flags, FILE_ALL_ACCESS.0, *sid)?;
             }
         }
         let mut descriptor = SECURITY_DESCRIPTOR::default();
@@ -4539,12 +4560,14 @@ mod tests {
         std::fs::create_dir(&dir).expect("create probe dir");
         let own = current_process_user_sid().expect("current user SID");
         let own_sid = own.psid();
-        write_probe_dacl(&dir, &[], false).expect("apply strict probe DACL");
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply strict probe DACL");
         assert!(
             verify_protected_directory(&dir).is_ok(),
             "strict 2-ACE shape must verify"
         );
-        write_probe_dacl(&dir, &[own_sid], false).expect("apply user-ACE probe DACL");
+        write_probe_dacl(&dir, &[own_sid], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply user-ACE probe DACL");
         assert!(
             verify_protected_directory(&dir).is_err(),
             "3-ACE shape must fail strict verification"
@@ -4558,11 +4581,51 @@ mod tests {
             verify_protected_directory(&dir).is_ok(),
             "repaired directory must verify strictly"
         );
+        // Windows' permission dialog can grant the user a folder-only scope
+        // (container inheritance without object inheritance). That ACE is
+        // still the Explorer deviation and must repair, not fail closed.
+        write_probe_dacl(&dir, &[own_sid], CONTAINER_INHERIT_ACE, false, STRICT_FLAGS)
+            .expect("apply folder-only user ACE");
+        assert!(
+            dacl_deviation_is_benign(&dir),
+            "a folder-only user ACE must stay repairable"
+        );
+        ensure_protected_directory(&dir).expect("folder-only user ACE must repair");
         // The repair leaves the strict SYSTEM+Admins-only DACL, which an
         // unelevated token cannot delete, so restore the user ACE first or
         // every run leaks a probe dir into the system temp directory
         // (hundreds accumulated via PID reuse collisions).
-        write_probe_dacl(&dir, &[own_sid], false).expect("restore probe user ACE");
+        write_probe_dacl(&dir, &[own_sid], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("restore probe user ACE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_inheritance_dacl_shape_is_repaired_on_first_start() {
+        let dir = probe_dir("legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create probe dir");
+        let own = current_process_user_sid().expect("current user SID");
+        let own_sid = own.psid();
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, ACE_FLAGS(0))
+            .expect("apply legacy probe DACL");
+        assert!(
+            verify_protected_directory(&dir).is_err(),
+            "the pre-inheritance shape must fail strict verification"
+        );
+        assert!(
+            dacl_deviation_is_benign(&dir),
+            "the pre-inheritance shape must be repairable"
+        );
+        ensure_protected_directory(&dir).expect("legacy shape must repair in place");
+        assert!(
+            verify_protected_directory(&dir).is_ok(),
+            "the repaired directory must verify strictly"
+        );
+        // The strict DACL leaves an unelevated token no delete right:
+        // restore a user ACE first, as the benign-deviation test does.
+        write_probe_dacl(&dir, &[own_sid], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("restore probe user ACE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4576,8 +4639,10 @@ mod tests {
         let users = Sid::well_known(WinBuiltinUsersSid).expect("Users SID");
         let users = users.psid();
         // Two extra ACEs: not the single Explorer-style grant.
-        write_probe_dacl(&dir, &[], false).expect("apply strict probe DACL");
-        write_probe_dacl(&dir, &[own_sid, users], false).expect("apply 4-ACE probe DACL");
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply strict probe DACL");
+        write_probe_dacl(&dir, &[own_sid, users], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply 4-ACE probe DACL");
         assert!(
             !dacl_deviation_is_benign(&dir),
             "4-ACE shape must not be benign"
@@ -4587,8 +4652,10 @@ mod tests {
             "4-ACE deviation must stay fail-closed"
         );
         // Three ACEs but missing Administrators: also not benign.
-        write_probe_dacl(&dir, &[], false).expect("apply strict probe DACL");
-        write_probe_dacl(&dir, &[own_sid, users], true).expect("apply admins-less probe DACL");
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply strict probe DACL");
+        write_probe_dacl(&dir, &[own_sid, users], STRICT_FLAGS, true, STRICT_FLAGS)
+            .expect("apply admins-less probe DACL");
         assert!(
             !dacl_deviation_is_benign(&dir),
             "admins-less shape must not be benign"
@@ -4600,8 +4667,10 @@ mod tests {
         // Three ACEs but the extra ACE belongs to a well-known SID (Users),
         // not the current user: the documented deviation shape is Explorer
         // granting *the user* access, so this must stay fail-closed too.
-        write_probe_dacl(&dir, &[], false).expect("apply strict probe DACL");
-        write_probe_dacl(&dir, &[users], false).expect("apply Users-ACE probe DACL");
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply strict probe DACL");
+        write_probe_dacl(&dir, &[users], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply Users-ACE probe DACL");
         assert!(
             !dacl_deviation_is_benign(&dir),
             "foreign-SID extra ACE must not be benign"

@@ -18,7 +18,8 @@
 //!   parent's inheritable ACEs;
 //! * the helper pipe, the helper's secure-stage directory, and the elevation
 //!   token file want a protected DACL naming SYSTEM + Administrators (full
-//!   control) plus zero or more extra principals;
+//!   control) plus zero or more extra principals, with container+object
+//!   inheritance so the staged tree's children carry the same DACL;
 //! * objects owned by a principal that a medium-integrity process may not
 //!   outrank prefer the Administrators group as owner/group, falling back to
 //!   the creator's own user SID when the calling token cannot assign
@@ -292,15 +293,21 @@ impl Sid {
 /// See [`with_protected_descriptor`] for ordering and flags.
 type ExtraGrant<'a> = (&'a Sid, u32);
 
+/// The inheritance flags every ACE of a protected descriptor carries:
+/// container and object inheritance, so a directory's children inherit the
+/// protected DACL rather than the creating token's default.
+pub(crate) const PROTECTED_ACE_FLAGS: ACE_FLAGS =
+    ACE_FLAGS(CONTAINER_INHERIT_ACE.0 | OBJECT_INHERIT_ACE.0);
+
 /// Build an absolute, initialized `SECURITY_DESCRIPTOR` over an ACL of
 /// allow-ACEs and hand its pointer to `operation`, which runs (and must
 /// consume the descriptor) while the descriptor and its buffers are alive.
 ///
 /// * `owner` — when `Some`, the SID becomes both owner and group; when
 ///   `None` both stay unset and the kernel assigns the creator.
-/// * `ace_flags` — ACE inheritance flags for every appended ACE (0 for
-///   kernel objects like mutexes, pipes, and files; container+object
-///   inheritance for directories).
+/// * `ace_flags` — ACE inheritance flags for every appended ACE (`0` for a
+///   plain ACE that grants only on the object itself; container+object
+///   inheritance when directories must hand the grant to their children).
 /// * `protected` — when true, `SE_DACL_PROTECTED` is set so the parent's
 ///   inheritable ACEs never leak into the protected object.
 /// * `grants` — allow-ACEs appended in order, each granting `access` to one
@@ -424,8 +431,10 @@ pub fn with_user_restricted_attributes<T>(
 /// Build an absolute protected descriptor — SYSTEM and Administrators get
 /// `FILE_ALL_ACCESS`, then each `(sid, access)` entry in `extras` is appended
 /// as a further allow-ACE, in order; `SE_DACL_PROTECTED` is always set and
-/// no ACE carries inheritance flags (kernel objects: pipes, files, and
-/// directories whose children need no further access). `owner`, when `Some`,
+/// every ACE carries [`PROTECTED_ACE_FLAGS`], so a file or subdirectory
+/// created inside a protected directory inherits the same DACL instead of
+/// the creating token's default. The flags are inert on objects with no
+/// children (pipes, files). `owner`, when `Some`,
 /// becomes both owner and group: callers pass the Administrators SID (not
 /// the creator's user SID), so a medium-integrity process cannot reclaim
 /// WRITE_DAC through owner rights — or the creator's own user SID when the
@@ -445,7 +454,7 @@ pub fn with_protected_descriptor<T>(
     ];
     build_descriptor(
         owner,
-        ACE_FLAGS(0),
+        PROTECTED_ACE_FLAGS,
         true,
         base.into_iter().chain(extras.iter().copied()),
         operation,
@@ -549,10 +558,11 @@ mod tests {
         Vec<(u8, u8, u32, PSID)>,
     );
 
-    /// Read a descriptor built in memory back through the Win32 accessors:
-    /// control bits, owner/group SIDs, and the ordered allow-ACE list
-    /// (type, flags, access mask, SID). All returned pointers are valid only
-    /// while the descriptor is alive.
+    /// Read a descriptor in the caller's storage back through the Win32
+    /// accessors: control bits, owner/group SIDs, and the ordered allow-ACE
+    /// list (type, flags, access mask, SID). Accepts an absolute descriptor
+    /// (built by this module) or a self-relative one (`GetFileSecurityW`).
+    /// All returned pointers are valid only while the descriptor is alive.
     fn readback(descriptor: PSECURITY_DESCRIPTOR) -> Readback {
         // SAFETY: `descriptor` is the initialized, alive absolute security
         // descriptor built by the helpers; the Win32 accessors read it
@@ -840,7 +850,11 @@ mod tests {
                     3,
                     "protected DACL must grant SYSTEM, Administrators, and the client"
                 );
-                assert!(aces.iter().all(|ace| ace.0 == 0 && ace.1 == 0));
+                // Every protected ACE inherits to children, so a file
+                // created inside a protected directory carries this DACL
+                // rather than the creating token's default.
+                let inherit = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8;
+                assert!(aces.iter().all(|ace| ace.0 == 0 && ace.1 == inherit));
                 assert_eq!(aces[0].2, FILE_ALL_ACCESS.0);
                 assert!(same_sid(aces[0].3, system.psid()));
                 assert_eq!(aces[1].2, FILE_ALL_ACCESS.0);
@@ -886,7 +900,11 @@ mod tests {
                 2,
                 "protected DACL must grant exactly SYSTEM and Administrators"
             );
-            assert_eq!(aces[0].1, 0);
+            assert_eq!(
+                aces[0].1,
+                (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8,
+                "a staged file's ACE inherits to what the helper creates"
+            );
             assert_eq!(aces[0].2, FILE_ALL_ACCESS.0);
             assert!(same_sid(aces[0].3, system.psid()));
             assert_eq!(aces[1].2, FILE_ALL_ACCESS.0);
