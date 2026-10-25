@@ -317,6 +317,8 @@ fn downloads_and_reloads_geodata_without_restart() {
     });
     let config = runnable_config(socks_port, api_port, Some(geodata), Some(routing));
     let geoip_path = isolated.path().join("broccoli/core/geoip.dat");
+    let bundled_geoip = std::fs::read(&geoip_path).expect("read copied geoip.dat");
+    let bundled_sha = sha256_hex(&bundled_geoip);
     let mtime_before = std::fs::metadata(&geoip_path)
         .expect("copied geoip.dat")
         .modified()
@@ -403,6 +405,18 @@ fn downloads_and_reloads_geodata_without_restart() {
         saw_error.is_none(),
         "core entered an error phase: {:?}",
         saw_error
+    );
+    // A failed reload performs the same download-and-swap and then restores
+    // the bundled bytes without an error phase, so the settle above cannot
+    // tell success from rollback. The file's content can: a reload that
+    // accepted the download leaves the downloaded payload in place, while a
+    // rejected one puts the bundled digest back.
+    let settled = std::fs::read(&geoip_path).expect("read geoip.dat after the reload settled");
+    assert_ne!(
+        sha256_hex(&settled),
+        bundled_sha,
+        "the downloaded geoip.dat must still be in place after the reloads settle; \
+         the bundled bytes mean the reload rejected the download and rolled it back"
     );
     assert!(
         process_alive(core_pid),

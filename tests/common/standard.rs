@@ -22,8 +22,9 @@
 //!
 //! - A sentence holds at most [`SENTENCE_WORD_CAP`] words, or at most
 //!   [`INSTRUCTION_WORD_CAP`] when its first word is an imperative verb
-//!   (`IMPERATIVE_VERBS`). Sentences split on `.`, `!`, and `?`; an ellipsis
-//!   is not a terminator.
+//!   (`IMPERATIVE_VERBS`). Sentences split on `!` and `?`, and on a `.` only
+//!   when whitespace or the end of the text follows, so an address, a version,
+//!   or a decimal stays inside its sentence.
 //! - No semicolons and no contractions: the `n't` family, `'re`, `'ve`,
 //!   `'ll`, `'d`, `'m`, and the fixed `'s` forms `it's`, `that's`, `there's`,
 //!   `here's`, `what's`, `who's`, `let's`.
@@ -720,11 +721,44 @@ fn length_findings(text: &str) -> Vec<Finding> {
     findings
 }
 
-/// Splits on sentence-ending punctuation; an ellipsis is not a terminator.
-fn sentences(text: &str) -> impl Iterator<Item = &str> {
-    text.split(['.', '!', '?'])
+/// Splits on sentence-ending punctuation. A period ends a sentence only when
+/// whitespace or the end of the text follows, so an address literal
+/// (`127.0.0.1`), a version (`1.2`), or a decimal stays inside its sentence —
+/// the same rule the log profile reads with. An exclamation mark or question
+/// mark always ends one, and a `{...}` placeholder is skipped whole so its own
+/// punctuation is never read as one.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut split = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '{' => {
+                for (_, next) in chars.by_ref() {
+                    if next == '}' {
+                        break;
+                    }
+                }
+            }
+            '!' | '?' => {
+                split.push(&text[start..index + c.len_utf8()]);
+                start = index + c.len_utf8();
+            }
+            '.' if chars.peek().is_none_or(|(_, next)| next.is_whitespace()) => {
+                split.push(&text[start..index + 1]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < text.len() {
+        split.push(&text[start..]);
+    }
+    split
+        .into_iter()
         .map(str::trim)
         .filter(|sentence| !sentence.is_empty())
+        .collect()
 }
 
 /// Whether the first word of the sentence, lowercased and stripped of

@@ -82,9 +82,25 @@ fn app_boots_and_every_screen_renders() {
 fn dashboard_shows_core_state_badge() {
     let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
     h.run();
-    // Stopped badge is always present on a fresh boot (top bar + dashboard).
-    assert!(h.get_all_by_label("Stopped").next().is_some());
-    assert!(h.get_all_by_label("TUN").next().is_some());
+    // A backoff phase renders a badge wording only the dashboard uses: the top
+    // bar reads "Retrying (attempt N)" and the nav rail repeats the screen
+    // names, so the dashboard's own "Retry #N" pins the badge itself instead
+    // of any frame text.
+    h.state().inject_event(CoreEvt::State {
+        phase: CorePhase::Backoff { attempt: 3 },
+        transport: None,
+    });
+    h.run();
+    assert!(
+        h.get_all_by_label("Retry #3").next().is_some(),
+        "the dashboard's own badge must render the retry wording"
+    );
+    // The dashboard's TUN row reads "TUN: {state}", unlike the bare "TUN" the
+    // nav rail and the top-bar mode caption render.
+    assert!(
+        h.get_all_by_label("TUN: off").next().is_some(),
+        "the dashboard's own TUN status row must render"
+    );
     assert!(
         h.query_by_label("Test latency now").is_none(),
         "Dashboard must not expose a redundant snapshot-read action"
@@ -375,9 +391,13 @@ fn delete_first_digit_of_non_loopback_listen_keeps_focus() {
     h.run();
 
     common::dismiss_wizard(&mut h);
-    if let Some(node) = h.get_all_by_label("Inbounds").next() {
-        node.click();
-    }
+    // The nav rail item is a button: a nav regression must fail here rather
+    // than silently skip the click and fail on a missing field later.
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        Screen::Inbounds.label(Language::En),
+    )
+    .click();
     h.run();
 
     // The first list row is the default SOCKS entry (in-socks):
@@ -456,9 +476,13 @@ fn typing_partial_listen_address_keeps_input_focus() {
     h.run();
 
     common::dismiss_wizard(&mut h);
-    if let Some(node) = h.get_all_by_label("Inbounds").next() {
-        node.click();
-    }
+    // The nav rail item is a button: a nav regression must fail here rather
+    // than silently skip the click and fail on a missing field later.
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        Screen::Inbounds.label(Language::En),
+    )
+    .click();
     h.run();
 
     // The first list row's listen address field (default value; the HTTP row

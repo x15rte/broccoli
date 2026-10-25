@@ -139,9 +139,17 @@ async fn trial_rules_roundtrip_against_live_core() {
 
     // A payload carrying a balancer with an existing tag is rejected in
     // append mode (the app never sends balancers — the core would
-    // otherwise treat a duplicate tag as an error).
+    // otherwise treat a duplicate tag as an error). The rule tag is fresh, so
+    // the duplicate rule tag proved below cannot be the reason: only the
+    // already-registered balancer tag can reject this payload.
+    let balancer_rule = Rule {
+        rule_tag: "trial-e2e-balancer".into(),
+        outbound_tag: "direct".into(),
+        domain: vec!["example.com".into()],
+        ..Default::default()
+    };
     let with_balancer = pb::xray::app::router::Config {
-        rule: vec![trial_rule_to_pb(&rule).expect("convert trial rule")],
+        rule: vec![trial_rule_to_pb(&balancer_rule).expect("convert balancer trial rule")],
         balancing_rule: vec![pb::xray::app::router::BalancingRule {
             tag: "lb".into(),
             outbound_selector: vec!["direct".into()],

@@ -243,6 +243,17 @@ fn cap_counts_each_sentence_of_a_string() {
 }
 
 #[test]
+fn a_dotted_token_keeps_its_sentence_together() {
+    // An address literal or a version splits only where the prose does: a
+    // period inside the token does not end the sentence, so the word cap is
+    // still measured over the whole sentence.
+    let address = padded_sentence("The core listens on 127.0.0.1", SENTENCE_WORD_CAP + 1);
+    assert_eq!(hard_rules(&address), vec![RULE_SENTENCE_LENGTH]);
+    let version = padded_sentence("The update installs core 1.2", SENTENCE_WORD_CAP + 1);
+    assert_eq!(hard_rules(&version), vec![RULE_SENTENCE_LENGTH]);
+}
+
+#[test]
 fn semicolons_fail() {
     assert_eq!(
         hard_rules("Remove the panel; then restart."),

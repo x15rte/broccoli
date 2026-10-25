@@ -4284,9 +4284,15 @@ fn sniffing_projection_appends_fakedns_once() {
         wire["destOverride"],
         json!(["http", "tls", "quic", "fakedns"])
     );
-    // dedup: repeated projection does not append a second "fakedns"
-    let again = cfg.to_wire(true).expect("still emitted");
-    assert_eq!(again, wire);
+    // dedup: an override that already lists "fakedns" gains no second copy
+    let already_listed = Sniffing {
+        dest_override: vec!["http".into(), "fakedns".into()],
+        ..Default::default()
+    };
+    let wire = already_listed
+        .to_wire(true)
+        .expect("a listed fakedns is still emitted");
+    assert_eq!(wire["destOverride"], json!(["http", "fakedns"]));
 
     let without_trio = cfg.to_wire(false).expect("still emitted");
     assert_eq!(without_trio["destOverride"], json!(["http", "tls", "quic"]));

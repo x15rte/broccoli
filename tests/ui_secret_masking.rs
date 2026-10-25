@@ -36,6 +36,9 @@ mod common;
 const SENTINEL_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 /// The endpoint the editor masks only while the Privacy setting asks for it.
 const SENTINEL_ADDRESS: &str = "masked-host.invalid";
+/// The stand-in a masked field with a value renders (`widgets::MASKED_RUN`);
+/// block-finding bullets also use `•`, so the full run is the masking proof.
+const MASKED_STAND_IN: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
 
 /// Boot the real app with one VLESS profile carrying [`SENTINEL_ID`] and
 /// [`SENTINEL_ADDRESS`], and open the Servers screen with it selected. An empty
@@ -170,8 +173,9 @@ fn credentials_render_masked_and_the_reveal_is_transient() {
         "the editor must not render the profile's uuid while it is masked"
     );
     assert!(
-        // The masked stand-in's bullet glyphs, wherever the frame renders them.
-        tree_contains(&h, "\u{2022}"),
+        // The stand-in run itself, not the single bullet glyph a blocking
+        // finding renders.
+        tree_contains(&h, MASKED_STAND_IN),
         "the masked row must render the stand-in in the credential's place"
     );
 
@@ -234,7 +238,7 @@ fn hiding_server_information_masks_the_endpoint_and_keeps_the_verdict() {
         "a masked field must keep rendering its verdict"
     );
     assert!(
-        tree_contains(&h, "\u{2022}"),
+        tree_contains(&h, MASKED_STAND_IN),
         "the masked endpoint must render the stand-in"
     );
 
@@ -263,7 +267,7 @@ fn inbound_accounts_mask_and_the_reveal_rides_the_listeners_header() {
         "the account credentials must not render while they are masked"
     );
     assert!(
-        tree_contains(&h, "\u{2022}"),
+        tree_contains(&h, MASKED_STAND_IN),
         "the masked rows must render the stand-in"
     );
     assert!(

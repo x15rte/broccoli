@@ -386,21 +386,36 @@ fn route_test_dialog_hides_user_field_and_unix_network() {
         "the route-test dialog must not offer the inbound-user email field"
     );
 
-    // Scan every combo of the open dialog (inbound tag, then network):
-    // opening each popup in turn renders its options, and opening the next
-    // combo closes the previous popup.
-    let combo_count = h.get_all_by_role(Role::ComboBox).count();
-    for index in 0..combo_count {
-        h.get_all_by_role(Role::ComboBox)
-            .nth(index)
-            .expect("dialog combo")
-            .click();
-        h.run();
-        assert!(
-            h.query_by_label("unix").is_none(),
-            "no route-test combo may offer the unix network"
-        );
-    }
+    // The dialog owns exactly the inbound-tag and network combos. Scoping the
+    // query to the dialog keeps the assertion about the dialog itself, and a
+    // zero-combo dialog fails here instead of making the open-each loop
+    // vacuous.
+    let title = t(Language::En, Key::TestRouteWindow);
+    let dialog_combos = h
+        .get_by_label(title)
+        .get_all_by_role(Role::ComboBox)
+        .count();
+    assert_eq!(
+        dialog_combos, 2,
+        "the route-test dialog must expose the inbound-tag and network combos"
+    );
+
+    // Open the network combo (the second of the two): its option list must
+    // render a known network while never offering the hidden `unix`.
+    h.get_by_label(title)
+        .get_all_by_role(Role::ComboBox)
+        .nth(1)
+        .expect("the route-test dialog's network combo")
+        .click();
+    h.run();
+    assert!(
+        h.query_by_label("tcp").is_some(),
+        "the network combo must open with its known options"
+    );
+    assert!(
+        h.query_by_label("unix").is_none(),
+        "no route-test combo may offer the unix network"
+    );
 }
 
 /// Two balancers, both with a selector matching the built-in `direct` tag so
