@@ -135,6 +135,12 @@ pub struct UiCtx<'a> {
     connect_blocked_reason: &'a Option<String>,
     safety: &'a SafetyVerdicts,
     verdict: &'a Verdict,
+    /// The generation [`Self::verdict`] judged. It is the publish stamp, not
+    /// the current edit generation: a throttled persist publishes a verdict
+    /// after the edit frame, at the generation the edit left behind, so the
+    /// two can disagree until publication. Screens whose memoized rows carry
+    /// verdict content key on this value.
+    verdict_generation: u64,
     config_error: &'a Option<String>,
     stats: &'a Option<StatsTick>,
     stats_history: &'a VecDeque<StatsTick>,
@@ -357,6 +363,10 @@ pub struct InboundsCtx<'a> {
     pub(crate) settings: &'a mut Settings,
     pub(crate) safety: &'a SafetyVerdicts,
     pub(crate) verdict: &'a Verdict,
+    /// The generation `verdict` judged — the row-cache key, because the
+    /// persist can publish a verdict at a generation whose edit frame already
+    /// rendered against the previous one.
+    pub(crate) verdict_generation: u64,
     pub(crate) hooks: FrameHooks<'a>,
 }
 
@@ -366,6 +376,8 @@ pub struct TunCtx<'a> {
     pub(crate) settings: &'a mut Settings,
     pub(crate) safety: &'a SafetyVerdicts,
     pub(crate) verdict: &'a Verdict,
+    /// The generation `verdict` judged (see [`InboundsCtx::verdict_generation`]).
+    pub(crate) verdict_generation: u64,
     pub(crate) transport: Option<CoreTransport>,
     pub(crate) phase: &'a CorePhase,
     pub(crate) is_elevated: bool,
@@ -563,6 +575,12 @@ pub(crate) struct UiCtxParts<'a> {
     /// The shell's published validation verdict (the generation's whole-model
     /// findings), projected into each screen's slice.
     pub(crate) verdict: &'a Verdict,
+    /// The generation `verdict` judged, carried beside it so a slice can key
+    /// its memoized rows on the verdict's own stamp: the persist that
+    /// publishes a verdict runs after the edit frame and republishes at the
+    /// edit generation, so an edit-generation key would let the pre-edit
+    /// verdict pass for the post-edit one.
+    pub(crate) verdict_generation: u64,
     /// The shell's stored config-generation error (the same value the
     /// top-bar config chip renders), projected into each screen's slice.
     pub(crate) config_error: &'a Option<String>,
@@ -638,6 +656,7 @@ impl<'a> UiCtx<'a> {
             model_generation,
             safety,
             verdict,
+            verdict_generation,
             connect_blocked_reason,
             config_error,
             operation,
@@ -668,6 +687,7 @@ impl<'a> UiCtx<'a> {
             busy: gate::BusyWindow::from_operation(operation),
             safety,
             verdict,
+            verdict_generation,
             connect_blocked_reason,
             config_error,
             is_elevated,
@@ -756,6 +776,7 @@ impl<'a> UiCtx<'a> {
             settings: &mut *self.settings,
             safety: self.safety,
             verdict: self.verdict,
+            verdict_generation: self.verdict_generation,
             hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
         }
     }
@@ -766,6 +787,7 @@ impl<'a> UiCtx<'a> {
             settings: &mut *self.settings,
             safety: self.safety,
             verdict: self.verdict,
+            verdict_generation: self.verdict_generation,
             transport: self.transport,
             phase: self.phase,
             is_elevated: self.is_elevated,
@@ -1093,11 +1115,18 @@ pub(crate) fn show_core_setup(
             {
                 ctx.hooks.send(CoreCmd::ImportCoreArchive(path));
             }
-            if ui
-                .button(t(lang, Key::CoreSetupOpenFolder))
-                .on_hover_text(sys::paths::core_dir().display().to_string())
-                .clicked()
-            {
+            // `core_dir()` reads `%APPDATA%` and mints two paths, and egui
+            // evaluates `on_hover_text` arguments eagerly: the tooltip is
+            // attached only on the frames the button is actually hovered
+            // (the routing/logs hover precedent), so an idle repaint builds
+            // no path text.
+            let open_folder = ui.button(t(lang, Key::CoreSetupOpenFolder));
+            let open_folder = if open_folder.hovered() {
+                open_folder.on_hover_text(sys::paths::core_dir().display().to_string())
+            } else {
+                open_folder
+            };
+            if open_folder.clicked() {
                 ctx.hooks.request_open_core_folder();
             }
         });

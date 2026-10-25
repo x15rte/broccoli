@@ -1258,11 +1258,20 @@ impl RoutingScreen {
     /// across frames; an insert is a real mutation, but the map's own length
     /// is the size the tests read — idle frames never insert, so they never
     /// grow it.
+    ///
+    /// The hit path allocates nothing: `entry(tag.to_string())` builds and
+    /// drops a `String` on every frame a balancer editor is open, so the
+    /// probe borrows the map first and only the miss mints the key.
     fn balancer_runtime_state<'a>(
         runtime: &'a mut BTreeMap<String, BalancerRuntimeUi>,
         tag: &str,
     ) -> &'a mut BalancerRuntimeUi {
-        runtime.entry(tag.to_string()).or_default()
+        if !runtime.contains_key(tag) {
+            runtime.insert(tag.to_string(), BalancerRuntimeUi::default());
+        }
+        runtime
+            .get_mut(tag)
+            .expect("balancer runtime state exists after the insert above")
     }
 
     /// Evict-absent: drop balancer-runtime entries whose

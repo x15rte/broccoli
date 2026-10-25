@@ -2320,6 +2320,7 @@ impl eframe::App for BroccoliApp {
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
                     verdict: cached_verdict(&self.generation_verdict),
+                    verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2382,6 +2383,7 @@ impl eframe::App for BroccoliApp {
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
                     verdict: cached_verdict(&self.generation_verdict),
+                    verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2421,6 +2423,7 @@ impl eframe::App for BroccoliApp {
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
                     verdict: cached_verdict(&self.generation_verdict),
+                    verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
                     config_error: &self.config_error,
                     operation,
@@ -2739,6 +2742,18 @@ fn cached_verdict(cache: &Option<GenerationVerdict>) -> &Verdict {
         .as_ref()
         .map(|cache| &cache.verdict)
         .unwrap_or(&NO_VERDICT)
+}
+
+/// The generation the published verdict judged — [`cached_verdict`]'s stamp,
+/// handed to the screens beside it. A verdict-backed row cache keys on this
+/// value rather than on the edit generation: the persist is throttled, so the
+/// frame after an edit renders the previous verdict at the new edit
+/// generation, and the publish that follows stamps that same generation — an
+/// edit-generation key would never see the change. Zero before the boot
+/// generation fills the field; the row caches start empty, so it only has to
+/// differ from a stamp they could hold.
+fn cached_verdict_generation(cache: &Option<GenerationVerdict>) -> u64 {
+    cache.as_ref().map_or(0, |cache| cache.generation)
 }
 
 /// Render the hazard-acknowledgment confirmation: every finding's

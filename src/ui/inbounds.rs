@@ -47,6 +47,13 @@ pub struct InboundsScreen {
 struct ValidationCache {
     /// The model generation these verdicts were derived from.
     generation: u64,
+    /// The generation the shell's published verdict judged when this cache
+    /// was built. A separate key from `generation`: the persist publishes a
+    /// verdict after the edit frame, stamped with the edit generation, so
+    /// verdict-backed rows must rebuild when either moved — the edit's own
+    /// frame sees the earlier verdict's generation, and the publish that
+    /// follows stamps a generation an edit-keyed cache already holds.
+    verdict_generation: u64,
     non_loopback: bool,
     /// One collision verdict per local endpoint list entry, in list order.
     local_collisions: Vec<Option<String>>,
@@ -57,7 +64,13 @@ struct ValidationCache {
     /// in the row and identically to the gate's message at apply.
     local_filter_errors: Vec<Vec<String>>,
     doko_collisions: Vec<Option<String>>,
-    doko_references: Vec<usize>,
+    /// The delete control's disabled tooltip (`Key::InboundsUsedByRules`) and
+    /// the visible caption under the row (`Key::InboundsDeleteBlocked`), one
+    /// per dokodemo entry, `Some` exactly while a routing rule references the
+    /// entry. Formatted with the reference count here, once per rebuild, so a
+    /// referenced row repaints without formatting either text.
+    doko_used_by_rules: Vec<Option<String>>,
+    doko_delete_blocked: Vec<Option<String>>,
     /// One row-label verdict per dokodemo entry, in list order: the empty tag,
     /// a tag a builtin/reserved listener took, and a duplicate among the
     /// dokodemo list — including disabled entries, which the walk skips.
@@ -80,17 +93,22 @@ struct ValidationCache {
 }
 
 impl ValidationCache {
-    /// Whether these verdicts still describe `settings` at `generation`.
+    /// Whether these verdicts still describe `settings` at the frame's two
+    /// generations.
     ///
-    /// Two conditions, both the cache's own: it was derived from the current
+    /// Three conditions, all the cache's own: it was derived from the current
     /// model generation (the mutation hook moves it, so an edit inside the
-    /// persist throttle window is covered), and it holds exactly one entry
-    /// per rendered row — the render indexes these vectors by the live list
-    /// index, so a row count that outgrew them would be an out-of-bounds
-    /// read, and the cache states that precondition itself rather than
-    /// trusting every caller to fold the counts into a key.
-    fn is_current(&self, generation: u64, settings: &Settings) -> bool {
+    /// persist throttle window is covered), from the verdict the shell
+    /// published at `verdict_generation` (a separate stamp — the publish that
+    /// follows a throttled edit lands at a generation an edit-keyed cache
+    /// already holds), and it holds exactly one entry per rendered row — the
+    /// render indexes these vectors by the live list index, so a row count
+    /// that outgrew them would be an out-of-bounds read, and the cache states
+    /// that precondition itself rather than trusting every caller to fold the
+    /// counts into a key.
+    fn is_current(&self, generation: u64, verdict_generation: u64, settings: &Settings) -> bool {
         self.generation == generation
+            && self.verdict_generation == verdict_generation
             && self.local_collisions.len() == settings.local_inbounds.len()
             && self.doko_collisions.len() == settings.dokodemo.len()
     }
@@ -110,18 +128,45 @@ impl InboundsScreen {
         // row. The reference is copied out before the model is borrowed
         // mutably below.
         let verdict = ctx.verdict;
-        // The validation references are rebuilt when the model generation
-        // moves — the frame after any edit — and never on idle repaint
-        // frames; the cache validates its own row correspondence.
+        // Its own stamp, beside the edit generation: the persist publishes a
+        // verdict after the edit frame, so the two keys move independently.
+        let verdict_generation = ctx.verdict_generation;
+        // The validation references are rebuilt when either generation moves
+        // — the frame after any edit, and the frame the throttled persist
+        // publishes — and never on idle repaint frames; the cache validates
+        // its own row correspondence.
         let generation = ctx.hooks.model_generation();
-        if !matches!(&self.validation, Some(cache) if cache.is_current(generation, ctx.settings)) {
+        if !matches!(
+            &self.validation,
+            Some(cache) if cache.is_current(generation, verdict_generation, ctx.settings)
+        ) {
             let snapshot = listeners(ctx.settings, lang);
             // The shell's verdict for this generation: the exposure warnings
             // below are the one slice of it this screen renders, and the
             // assessment itself runs once per generation in the shell.
             let findings = ctx.safety;
+            let doko_references: Vec<usize> = ctx
+                .settings
+                .dokodemo
+                .iter()
+                .map(|entry| ctx.settings.routing.inbound_reference_count(&entry.tag))
+                .collect();
+            // Both texts the delete control needs are pure functions of the
+            // reference count: format them with every other row verdict, so
+            // a referenced row repaints without building either.
+            let doko_used_by_rules = doko_references
+                .iter()
+                .map(|count| (*count != 0).then(|| t_fmt(lang, Key::InboundsUsedByRules, &[count])))
+                .collect();
+            let doko_delete_blocked = doko_references
+                .iter()
+                .map(|count| {
+                    (*count != 0).then(|| t_fmt(lang, Key::InboundsDeleteBlocked, &[count]))
+                })
+                .collect();
             self.validation = Some(ValidationCache {
                 generation,
+                verdict_generation,
                 non_loopback: any_non_loopback_listen(ctx.settings),
                 local_collisions: (0..ctx.settings.local_inbounds.len())
                     .map(|index| listener_collision(&snapshot, lang, ListenerKey::Local(index)))
@@ -150,12 +195,8 @@ impl InboundsScreen {
                 doko_collisions: (0..ctx.settings.dokodemo.len())
                     .map(|index| listener_collision(&snapshot, lang, ListenerKey::Dokodemo(index)))
                     .collect(),
-                doko_references: ctx
-                    .settings
-                    .dokodemo
-                    .iter()
-                    .map(|entry| ctx.settings.routing.inbound_reference_count(&entry.tag))
-                    .collect(),
+                doko_used_by_rules,
+                doko_delete_blocked,
                 doko_tag_errors: (0..ctx.settings.dokodemo.len())
                     .map(|index| dokodemo_tag_error(ctx.settings, lang, index))
                     .collect(),
@@ -385,7 +426,12 @@ impl InboundsScreen {
         let mut changed = false;
         widgets::section(ui, t(lang, Key::InboundsSectionDokodemo), |ui| {
             for (i, d) in ctx.settings.dokodemo.iter_mut().enumerate() {
-                let reference_count = validation.doko_references[i];
+                // Both strings below are formatted once per cache rebuild
+                // (see [`ValidationCache::doko_used_by_rules`]); the row only
+                // borrows them, so a referenced row's repaint allocates
+                // nothing.
+                let used_by_rules = validation.doko_used_by_rules[i].as_deref();
+                let delete_blocked = validation.doko_delete_blocked[i].as_deref();
                 // Hash the tag to an owned salt first: the closure captures
                 // `d` mutably as a whole (the network editor takes &mut d),
                 // which borrowck rejects while `&d.tag` is live as the salt.
@@ -399,30 +445,25 @@ impl InboundsScreen {
                         changed |= ui.checkbox(&mut d.enabled, "").changed();
                         let delete = ui
                             .add_enabled(
-                                reference_count == 0,
+                                delete_blocked.is_none(),
                                 egui::Button::new(t(lang, Key::DeleteRow)),
                             )
-                            .on_hover_text(t(lang, Key::InboundsDeleteDokodemo))
-                            .on_disabled_hover_text(t_fmt(
-                                lang,
-                                Key::InboundsUsedByRules,
-                                &[&reference_count],
-                            ));
+                            .on_hover_text(t(lang, Key::InboundsDeleteDokodemo));
+                        let delete = match used_by_rules {
+                            Some(reason) => delete.on_disabled_hover_text(reason),
+                            None => delete,
+                        };
                         if delete.clicked() {
                             remove = Some(i);
                         }
                     });
                     inline_error(ui, validation.doko_tag_errors[i].as_deref());
                     inline_error(ui, validation.doko_collisions[i].as_deref());
-                    if reference_count != 0 {
+                    if let Some(caption) = delete_blocked {
                         ui.label(
-                            egui::RichText::new(t_fmt(
-                                lang,
-                                Key::InboundsDeleteBlocked,
-                                &[&reference_count],
-                            ))
-                            .small()
-                            .color(ui.visuals().warn_fg_color),
+                            egui::RichText::new(caption)
+                                .small()
+                                .color(ui.visuals().warn_fg_color),
                         );
                     }
 
@@ -1110,11 +1151,12 @@ mod listener_validation_tests {
         InboundsScreen, ListenerKey, dokodemo_tag_error, listener_collision, listeners,
         normalize_windows_socket_path,
     };
-    use crate::i18n::validation_message;
+    use crate::i18n::{Key, t, t_fmt, validation_message};
     use crate::model::settings::Language;
     use crate::model::validation::ValidationCode;
-    use crate::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Settings};
+    use crate::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Rule, Settings};
     use crate::ui::test_rig::UiTestRig;
+    use egui_kittest::kittest::NodeT as _;
     use egui_kittest::{Harness, kittest::Queryable as _};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1650,5 +1692,135 @@ mod listener_validation_tests {
             "unticking Require auth must clear the row error"
         );
         assert_eq!(rig.borrow().settings.local_inbounds[1].auth, "noauth");
+    }
+
+    /// The row caches key on the published verdict's own generation, not on
+    /// the edit generation. The persist is throttled, so the shell publishes a
+    /// generation's verdict *after* that generation's edit frame already
+    /// rendered against the previous verdict; the model generation stays put
+    /// while the verdict's stamp advances. Every frame here moves only the
+    /// stamp, so a cache keyed on the edit generation would keep the first
+    /// verdict forever.
+    #[test]
+    fn rows_follow_a_verdict_republished_without_a_model_edit() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.local_inbounds[0].sniffing.enabled = true;
+            rig.settings.local_inbounds[0].sniffing.dest_override = vec!["nope".into()];
+        }
+        let mut harness = harness_for(rig.clone());
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(sniffing_override_error().as_str())
+                .is_some(),
+            "the first published verdict's finding must render on the row"
+        );
+
+        // The throttled persist publishes the corrected generation: no model
+        // edit, only the verdict's own stamp moves.
+        {
+            let mut rig = rig.borrow_mut();
+            assert_eq!(rig.model_generation, 0, "the edit generation stays put");
+            rig.settings.local_inbounds[0]
+                .sniffing
+                .dest_override
+                .clear();
+            let published = rig.model_generation + 1;
+            rig.publish_verdict_at(published);
+        }
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(sniffing_override_error().as_str())
+                .is_none(),
+            "the row must follow the verdict published at the newer generation"
+        );
+
+        // And back: a later publish that reports the fault again reaches the
+        // row without an edit.
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.local_inbounds[0].sniffing.dest_override = vec!["nope".into()];
+            let published = rig.model_generation + 2;
+            rig.publish_verdict_at(published);
+        }
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(sniffing_override_error().as_str())
+                .is_some(),
+            "the row must follow a finding the newer verdict carries"
+        );
+    }
+
+    /// A dokodemo row a routing rule references renders the caption that
+    /// explains its blocked delete, and its delete control is disabled. Both
+    /// texts are rendered from the validation cache's pre-formatted strings
+    /// (`Key::InboundsDeleteBlocked` / `Key::InboundsUsedByRules`), so the
+    /// assertions pin the text the row paints.
+    #[test]
+    fn a_referenced_dokodemo_row_renders_the_delete_block_and_disables_delete() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.dokodemo.push(DokodemoCfg {
+                tag: "in-doko-referenced".into(),
+                enabled: true,
+                listen_port: 12345,
+                ..Default::default()
+            });
+            rig.settings.routing.rules.push(Rule {
+                inbound_tag: vec!["in-doko-referenced".into()],
+                ..Rule::new()
+            });
+        }
+        let mut harness = harness_for(rig.clone());
+        harness.run();
+
+        let caption = t_fmt(Language::En, Key::InboundsDeleteBlocked, &[&1_usize]);
+        assert!(
+            harness.query_by_label(caption.as_str()).is_some(),
+            "a referenced dokodemo row must state why it cannot be deleted: {caption}"
+        );
+
+        // The dokodemo row is the only list row whose control is the shared
+        // delete button (`Key::DeleteRow`; the local endpoint rows use
+        // `Key::RemoveEndpoint`), and the referenced row's is disabled.
+        let deletes: Vec<_> = harness
+            .get_all_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::DeleteRow),
+            )
+            .collect();
+        assert_eq!(deletes.len(), 1, "one delete control for the dokodemo row");
+        assert!(
+            deletes[0].accesskit_node().is_disabled(),
+            "a referenced dokodemo row's delete is disabled"
+        );
+
+        // Dropping the reference republishes the verdict; the cache rebuild
+        // clears the caption and re-enables the control without a model edit.
+        {
+            let mut rig = rig.borrow_mut();
+            rig.settings.routing.rules.clear();
+            let published = rig.model_generation + 1;
+            rig.publish_verdict_at(published);
+        }
+        harness.run();
+        assert!(
+            harness.query_by_label(caption.as_str()).is_none(),
+            "an unreferenced row must drop the delete-block caption"
+        );
+        assert!(
+            harness
+                .get_all_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::DeleteRow),
+                )
+                .all(|node| !node.accesskit_node().is_disabled()),
+            "every delete control is enabled once no rule references the row"
+        );
     }
 }

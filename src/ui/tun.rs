@@ -41,6 +41,11 @@ pub struct TunScreen {
 /// the screen asks `ctx.verdict.for_target(FindingTarget::Tun)` for them.
 struct ValidationCache {
     generation: u64,
+    /// The generation the shell's published verdict judged. A separate key:
+    /// the persist publishes after the edit frame and stamps the edit
+    /// generation, so an edit-generation key would keep the previous
+    /// verdict's finding when the publish arrives.
+    verdict_generation: u64,
     tun_warning: Option<String>,
     /// The model's TUN findings, rendered at the cache's generation cadence:
     /// the gateway requirement and the leak block's unrouted-family advisory.
@@ -117,24 +122,29 @@ impl TunScreen {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TunCtx) {
         self.poll_ifaces(ui);
 
-        // The privacy warning is rebuilt when the model generation moves —
-        // the frame after any edit, never on idle repaint frames (the inbounds
-        // ValidationCache precedent) — so the verdict lags an edit by at most
-        // one frame, exactly like the inbounds posture banner. The mode is
-        // read from the live model at rebuild time, so no second key is
-        // needed for it.
+        // The privacy warning is rebuilt when the model generation or the
+        // published verdict's own generation moves — never on idle repaint
+        // frames (the inbounds ValidationCache precedent) — so the verdict
+        // lags an edit by at most one publish. The mode is read from the live
+        // model at rebuild time, so no second key is needed for it.
         let lang = ctx.settings.language;
         // The published generation verdict: the TUN rules are asked by
         // structural target below, so the screen never re-runs a predicate the
         // settings walk already judged.
         let verdict = ctx.verdict;
+        let verdict_generation = ctx.verdict_generation;
         let generation = ctx.hooks.model_generation();
-        if !matches!(&self.validation, Some(cache) if cache.generation == generation) {
+        if !matches!(
+            &self.validation,
+            Some(cache) if cache.generation == generation
+                && cache.verdict_generation == verdict_generation
+        ) {
             // The shell's verdict for this generation: the privacy finding
             // is the one slice of it this screen renders.
             let findings = ctx.safety;
             self.validation = Some(ValidationCache {
                 generation,
+                verdict_generation,
                 tun_warning: findings
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
@@ -842,6 +852,44 @@ mod tests {
                 .next()
                 .is_none(),
             "re-enabling the half must clear the advisory"
+        );
+    }
+
+    /// The TUN cache keys on the published verdict's own generation beside the
+    /// edit generation: the persist is throttled, so the verdict is published
+    /// after its edit frame, stamped with a generation that frame already
+    /// held. Only the stamp moves here — no model edit — so an edit-keyed
+    /// cache would keep the first finding.
+    #[test]
+    fn the_screen_follows_a_verdict_republished_without_a_model_edit() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.gateway.clear();
+        let mut harness = leak_harness(rig);
+
+        let gateway = validation_message(&ValidationCode::TunIpv4GatewayRequired, Language::En);
+        assert!(
+            harness
+                .query_all_by_label(gateway.as_str())
+                .next()
+                .is_some(),
+            "the first published verdict's finding must render: {gateway}"
+        );
+
+        {
+            let rig = &mut harness.state_mut().1;
+            assert_eq!(rig.model_generation, 0, "the edit generation stays put");
+            rig.settings.tun.gateway = crate::model::TunCfg::default().gateway;
+            let published = rig.model_generation + 1;
+            rig.publish_verdict_at(published);
+        }
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label(gateway.as_str())
+                .next()
+                .is_none(),
+            "the screen must follow the verdict published at the newer generation"
         );
     }
 

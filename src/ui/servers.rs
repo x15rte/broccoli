@@ -223,19 +223,40 @@ struct EditorValidationFindings {
 }
 
 /// The rendered form of one sweep: one `path: message` string per finding, in
-/// the sweep's order. Rebuilt when the draft generation or the language
-/// moves, so no paint path renders a finding.
+/// the sweep's order, and the two list halves already composed with their
+/// bullet. Rebuilt when the draft generation or the language moves, so no
+/// paint path renders or formats a finding.
 #[derive(Default)]
 struct EditorValidationRender {
+    /// The blocked-save list's lines: the bullet composed with each blocking
+    /// finding's message here, once per (draft generation, language), so the
+    /// list paints stored strings instead of formatting per frame.
     blocking: Vec<String>,
+    /// The warnings list's lines, bulleted like `blocking`.
     advisory: Vec<String>,
     finalmask: Vec<String>,
     stream_sockopt: Vec<String>,
     ech_sockopt: Vec<String>,
     /// The Basic tab's inline outbound verdicts: the blocking findings whose
     /// code the tab renders itself — the public-endpoint transport-security
-    /// rules and the freedom fragment and noise blocks.
+    /// rules and the freedom fragment and noise blocks. Inline text stays
+    /// bare: the tab renders the message itself, without the list's bullet.
     basic_inline: Vec<String>,
+}
+
+/// Render one finding list as the editor's list lines: the shared bullet
+/// composed with the finding's message, once per (draft generation,
+/// language).
+fn render_bulleted<'a>(
+    findings: impl Iterator<Item = &'a ValidationIssue>,
+    lang: Language,
+) -> Vec<String> {
+    findings
+        .map(|issue| {
+            let message = validation_issue_message(issue, lang);
+            t_fmt(lang, Key::ErrorBullet, &[&message])
+        })
+        .collect()
 }
 
 /// Render one finding list through the shared i18n seam.
@@ -268,8 +289,8 @@ impl EditorValidationFindings {
     /// The strings the editor shows for this sweep, in its own order.
     fn render(&self, lang: Language) -> EditorValidationRender {
         EditorValidationRender {
-            blocking: render_findings(self.blocking.iter(), lang),
-            advisory: render_findings(self.advisory.iter(), lang),
+            blocking: render_bulleted(self.blocking.iter(), lang),
+            advisory: render_bulleted(self.advisory.iter(), lang),
             finalmask: render_findings(self.finalmask.iter(), lang),
             stream_sockopt: render_findings(self.stream_sockopt.iter(), lang),
             ech_sockopt: render_findings(self.ech_sockopt.iter(), lang),
@@ -4178,10 +4199,7 @@ impl ServersScreen {
                 .max_height(140.0)
                 .show(ui, |ui| {
                     for error in validation_errors {
-                        ui.colored_label(
-                            status_colors_of(ui).err,
-                            t_fmt(lang, Key::ErrorBullet, &[error]),
-                        );
+                        ui.colored_label(status_colors_of(ui).err, error);
                     }
                 });
             // The retired `proxySettings` finding's other way out: a user who
@@ -4209,10 +4227,7 @@ impl ServersScreen {
                 .max_height(140.0)
                 .show(ui, |ui| {
                     for warning in validation_warnings {
-                        ui.colored_label(
-                            status_colors_of(ui).warn,
-                            t_fmt(lang, Key::ErrorBullet, &[warning]),
-                        );
+                        ui.colored_label(status_colors_of(ui).warn, warning);
                     }
                 });
         }
@@ -6964,10 +6979,7 @@ impl ServersScreen {
                             t(lang, Key::SrvCompleteRequired),
                         );
                         for error in errors {
-                            ui.colored_label(
-                                status_colors_of(ui).err,
-                                t_fmt(lang, Key::ErrorBullet, &[&error]),
-                            );
+                            ui.colored_label(status_colors_of(ui).err, error);
                         }
                     }
                     // Configuration warnings never gate Validate-and-add;
@@ -6979,10 +6991,7 @@ impl ServersScreen {
                             t(lang, Key::SrvConfigurationWarningsHeader),
                         );
                         for warning in warnings {
-                            ui.colored_label(
-                                status_colors_of(ui).warn,
-                                t_fmt(lang, Key::ErrorBullet, &[&warning]),
-                            );
+                            ui.colored_label(status_colors_of(ui).warn, warning);
                         }
                     }
                     if core_busy {
@@ -9935,15 +9944,17 @@ Authentication: ML-KEM-768, Post-Quantum
             basic_tab_inline_verdict(&public_endpoint.code),
             "the Basic tab must own the public-endpoint rule"
         );
+        let message = validation_issue_message(&public_endpoint, Language::En);
         assert!(
             rendered
                 .blocking
-                .contains(&validation_issue_message(&public_endpoint, Language::En))
+                .contains(&t_fmt(Language::En, Key::ErrorBullet, &[&message])),
+            "the error list holds the bulleted line the panel paints"
         );
         let inline = rendered.basic_inline;
         assert_eq!(
             inline,
-            vec![validation_issue_message(&public_endpoint, Language::En)],
+            vec![message],
             "the Basic tab's verdict is the error list's finding, rendered the same"
         );
         let mut screen = ServersScreen::default();

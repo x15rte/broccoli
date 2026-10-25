@@ -98,6 +98,13 @@ pub(crate) struct UiTestRig {
     /// rig's one route to the mutation hook, so the caches a screen derived
     /// from the old model are invalidated exactly as they are in the app.
     pub(crate) model_generation: u64,
+    /// The generation the rig publishes its verdict at. `None` follows
+    /// [`Self::model_generation`], so a test that edits the model needs no
+    /// extra step. [`Self::publish_verdict_at`] pins it independently, which
+    /// is how a test models the shell's throttled republication: the persist
+    /// runs after the edit frame, so a verdict can arrive stamped with a
+    /// generation whose edit frame already rendered against the previous one.
+    pub(crate) verdict_generation: Option<u64>,
     pub(crate) stats_generation: u64,
     pub(crate) latency_generation: u64,
     /// Staging store for [`UiTestRig::ctx`]: the runtime inputs are
@@ -136,6 +143,7 @@ impl Default for UiTestRig {
             operation: None,
             is_elevated: false,
             model_generation: 0,
+            verdict_generation: None,
             stats_generation: 0,
             latency_generation: 0,
             snapshot: UiCtxSnapshot {
@@ -272,6 +280,15 @@ impl UiTestRig {
         self.ctx().hooks().mark_dirty();
     }
 
+    /// Publish the next frames' verdict at `generation` without moving the
+    /// model generation — the shell's throttled republication, modelled from
+    /// the screen's side. The verdict content still follows the seeded model;
+    /// only its stamp is pinned, so a test can render a verdict the previous
+    /// frame's cache had no reason to expect.
+    pub(crate) fn publish_verdict_at(&mut self, generation: u64) {
+        self.verdict_generation = Some(generation);
+    }
+
     /// Assemble the UiCtx the screen under test receives — through
     /// [`UiCtx::new`], the same single constructor the app shell uses, with
     /// the same two bundles: [`UiCtxParts`] over the rig's fields and a
@@ -300,6 +317,7 @@ impl UiTestRig {
             &self.servers,
             TEST_API_PORT,
         );
+        let verdict_generation = self.verdict_generation.unwrap_or(self.model_generation);
         UiCtx::new(
             UiCtxParts {
                 servers: &mut self.servers,
@@ -313,6 +331,7 @@ impl UiTestRig {
                 model_generation: &mut self.model_generation,
                 safety: &self.safety,
                 verdict: &self.verdict,
+                verdict_generation,
                 connect_blocked_reason: &self.connect_blocked_reason,
                 config_error: &self.config_error,
                 operation: self.operation,
