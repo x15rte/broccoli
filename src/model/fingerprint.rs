@@ -144,7 +144,7 @@ pub const REALITY_EDITOR_OPTIONS: &[&str] = &["", "chrome", "firefox", "safari"]
 /// it, but upstream's REALITY scenarios no longer exercise it, so it
 /// warrants the advisory. Compared under [`vocabulary_holds`], the fold the
 /// core applies — Xray lowercases the fingerprint before its checks
-/// (conf/transport_security.go client branch).
+/// (infra/conf/transport_security.go client branch).
 pub fn reality_fingerprint_outside_known_good(name: &str) -> bool {
     !vocabulary_holds(REALITY_EDITOR_OPTIONS, name)
 }
@@ -163,7 +163,7 @@ pub fn reality_import_supported(name: &str) -> bool {
 /// The wire-validation accept-set: the full canonical vocabulary (editor
 /// table plus wire-only names). Compared under [`vocabulary_holds`], the fold
 /// the core applies to the value before it looks the name up
-/// (conf/transport_security.go), so a hand-written casing of a table name
+/// (infra/conf/transport_security.go), so a hand-written casing of a table name
 /// stays accepted.
 pub fn wire_validation_supported(name: &str) -> bool {
     FINGERPRINTS
@@ -176,7 +176,7 @@ pub fn wire_validation_supported(name: &str) -> bool {
 /// the server editor's REALITY inline verdict): [`wire_validation_supported`]
 /// minus [`REALITY_REJECTED_FINGERPRINTS`], with the exclusion compared under
 /// the same fold — Xray lowercases the fingerprint before its checks
-/// (conf/transport_security.go client branch). Wire-only names such as
+/// (infra/conf/transport_security.go client branch). Wire-only names such as
 /// `randomizedalpn` are accepted here even though the editor never offers
 /// them.
 pub fn reality_wire_supported(name: &str) -> bool {

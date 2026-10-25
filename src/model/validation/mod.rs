@@ -100,7 +100,7 @@ pub enum ValidationCode {
     // ---- protocol-settings vocabulary / required values (validate_outbound) ----
     /// VLESS `settings.flow` outside {``, `xtls-rprx-vision`,
     /// `xtls-rprx-vision-udp443`}: Xray's conf load rejects unknown flows
-    /// (conf/vless.go), mirroring the share-link import grammar.
+    /// (infra/conf/vless.go), mirroring the share-link import grammar.
     VlessFlowUnsupported,
     /// VLESS `settings.encryption` other than `` / `none` / a canonical
     /// `mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<parts…>` with
@@ -109,7 +109,7 @@ pub enum ValidationCode {
     /// base64 key, and the padding tokens must satisfy the core's padding
     /// grammar (proxy/vless/encryption/common.go:223-257). Xray's conf load
     /// panics on an all-padding value and rejects every other malformed
-    /// encryption (conf/vless.go). `` stays accepted — the state seam's
+    /// encryption (infra/conf/vless.go). `` stays accepted — the state seam's
     /// default, which emit normalization renders `none` on the wire.
     VlessEncryptionUnsupported,
     /// Shadowsocks `settings.method` outside Xray's AEAD + 2022 + legacy
@@ -136,12 +136,12 @@ pub enum ValidationCode {
     /// empty zero value is `auto`'s own spelling and stays silent.
     VmessSecurityUnsupported,
     /// Trojan `settings` missing essentials — empty `address` / `password`,
-    /// port 0 — that Xray's conf build rejects (conf/trojan.go). One rule,
+    /// port 0 — that Xray's conf build rejects (infra/conf/trojan.go). One rule,
     /// path-disambiguated.
     TrojanSettingsIncomplete,
     /// Shadowsocks `settings` missing essentials — empty `address` /
     /// `password`, port 0 — that Xray's conf build rejects
-    /// (conf/shadowsocks.go). One rule, path-disambiguated.
+    /// (infra/conf/shadowsocks.go). One rule, path-disambiguated.
     ShadowsocksSettingsIncomplete,
     /// VLESS/VMess `settings.port` of 0: Xray accepts it (`run -test`
     /// passes — live repro 2026-09-05, Xray 26.7.28) but dial :0 can never
@@ -160,31 +160,31 @@ pub enum ValidationCode {
     /// REALITY client `publicKey` (stored in the profile's `password`
     /// field, the upstream alias) is not an unpadded base64url string
     /// decoding to 32 bytes — Xray's conf build refuses it, empty included
-    /// (conf/transport_security.go, client branch).
+    /// (infra/conf/transport_security.go, client branch).
     RealityPublicKeyInvalid,
     /// REALITY `shortId` is not an even-length hex value of at most 16
     /// characters — Xray hex-decodes it into 8 bytes and Go rejects
-    /// odd-length or non-hex input (conf/transport_security.go). Empty is
+    /// odd-length or non-hex input (infra/conf/transport_security.go). Empty is
     /// the model default and stays valid.
     RealityShortIdInvalid,
     /// REALITY `spiderX` is not a URL path beginning with `/` — Xray's conf
     /// build rejects the missing slash, and unparseable paths break its
-    /// query rewriter (conf/transport_security.go). Empty stays valid —
+    /// query rewriter (infra/conf/transport_security.go). Empty stays valid —
     /// Xray defaults it to `/`.
     RealitySpiderXInvalid,
     /// REALITY `mldsa65Verify` is not an unpadded base64url string decoding
     /// to the 1952-byte ML-DSA-65 public key
-    /// (conf/transport_security.go). Empty stays valid (no post-quantum
+    /// (infra/conf/transport_security.go). Empty stays valid (no post-quantum
     /// verification key).
     RealityMldsa65Invalid,
     /// TLS `fingerprint` outside the wire-valid uTLS vocabulary
-    /// (conf/transport_security.go TLSConfig.Build; the vocabulary table is
+    /// (infra/conf/transport_security.go TLSConfig.Build; the vocabulary table is
     /// `crate::model::fingerprint`). `unsafe` and `hellogolang` stay legal
     /// on the TLS block — they resolve to native Go TLS there.
     TlsFingerprintUnsupported,
     /// REALITY `fingerprint` = `unsafe`/`hellogolang` or outside the
     /// wire-valid uTLS vocabulary — the conf build rejects both classes
-    /// explicitly (conf/transport_security.go, client branch).
+    /// explicitly (infra/conf/transport_security.go, client branch).
     RealityFingerprintUnsupported,
     /// REALITY `fingerprint` wire-valid but outside the known-good set the
     /// editor offers (empty — the uTLS Chrome_Auto default — plus `chrome`,
@@ -200,7 +200,7 @@ pub enum ValidationCode {
     /// TLS `pinnedPeerCertSha256` holds an entry that is not a 32-byte
     /// SHA-256 fingerprint written as hex (colons optional, entries
     /// comma-separated) — Xray's conf build errors on non-hex or
-    /// wrong-length entries (conf/transport_security.go).
+    /// wrong-length entries (infra/conf/transport_security.go).
     PinnedPeerCertSha256Invalid,
     /// TLS `alpn` carries `fromMitm` alongside other names: Xray's conf build
     /// refuses the list (`infra/conf/transport_security.go`: only one element
@@ -806,11 +806,12 @@ pub enum ValidationCode {
     /// configuration warning (Severity::Warning).
     SockoptTproxySilentOff,
     /// mKCP `mtu` outside the documented [576, 1460] or `tti` outside the
-    /// documented [10, 100] (docs mkcp.md; values outside Xray's hard load
-    /// bounds — mtu ≥ 21, tti 10..=1000 — are refused separately as
-    /// [`KcpRangeInvalid`]). The wire works — this is docs-soft advisory
-    /// only (Severity::Warning); the value is legal, just
-    /// outside the band Xray's documentation recommends.
+    /// documented [10, 100] (mkcp docs,
+    /// https://xtls.github.io/config/transports/mkcp.html; values outside
+    /// Xray's hard load bounds — mtu ≥ 21, tti 10..=1000 — are refused
+    /// separately as [`KcpRangeInvalid`]). The wire works — this is
+    /// docs-soft advisory only (Severity::Warning); the value is legal,
+    /// just outside the band Xray's documentation recommends.
     KcpRangeSoft,
     /// mKCP `mtu` below 21 or `tti` outside [10, 1000]: Xray's
     /// KCPConfig.Build refuses the config at load ("Mtu must be at least
@@ -847,10 +848,10 @@ pub enum ValidationCode {
     /// Mux `concurrency`, while `mux.enabled`, naming a value Xray
     /// silently reinterprets: `0` runs as 8, values above 128 clamp to
     /// 128, and any negative other than the documented `-1` TCP-direct
-    /// escape disables mux entirely (proxy outbound handler; docs
-    /// outbound.md MuxObject bounds [1, 128]). The config loads and the
-    /// wire works — advisory (Severity::Warning); the message
-    /// names the effective behavior.
+    /// escape disables mux entirely (proxy outbound handler; outbound docs
+    /// https://xtls.github.io/config/outbound.html#muxobject, MuxObject
+    /// bounds [1, 128]). The config loads and the wire works — advisory
+    /// (Severity::Warning); the message names the effective behavior.
     MuxConcurrencyReinterpreted,
     /// Mux XUDP knobs (`xudpConcurrency` / `xudpProxyUDP443`) set while
     /// `mux.enabled` is false: Xray reads the knobs only inside the
@@ -871,13 +872,13 @@ pub enum ValidationCode {
     // gates).
     /// Trojan `settings.flow` (removed-feature load error): Xray's
     /// TrojanClientConfig.Build refuses a non-empty flow with
-    /// PrintRemovedFeatureError (conf/trojan.go), and its deprecation note
+    /// PrintRemovedFeatureError (infra/conf/trojan.go), and its deprecation note
     /// points to VLESS with a vision flow.
     TrojanFlowRemoved,
     /// mKCP `stream.kcpSettings.seed` / `.header` (removed-feature load
     /// error): KCPConfig.Build refuses a set seed or header object with
     /// PrintRemovedFeatureError naming the finalmask UDP masks as the
-    /// migration (conf/transport_method.go). JSON `null` is the Go zero
+    /// migration (infra/conf/transport_method.go). JSON `null` is the Go zero
     /// shape and stays silent.
     KcpSeedHeaderRemoved,
     /// mKCP `stream.kcpSettings.headerType`: never an Xray JSON key (the
@@ -886,23 +887,23 @@ pub enum ValidationCode {
     /// (Severity::Warning).
     KcpHeaderTypeIgnored,
     /// VMess `settings.alterId` / `settings.aid` (inert): the legacy
-    /// alterId field is gone from Xray's conf struct (conf/vmess.go has no
+    /// alterId field is gone from Xray's conf struct (infra/conf/vmess.go has no
     /// such field — VMess is AEAD-only) and any carried value is silently
     /// ignored — advisory (Severity::Warning).
     VmessAlterIdIgnored,
     /// VLESS `settings.seed` (inert): VLessOutboundConfig still parses the
     /// key but the Build assignment is commented out upstream
-    /// (conf/vless.go), so the carried value is silently dropped — advisory
+    /// (infra/conf/vless.go), so the carried value is silently dropped — advisory
     /// (Severity::Warning).
     VlessSeedIgnored,
     /// Freedom `settings.noise` (removed-feature load error): Xray's
     /// FreedomConfig.Build refuses a non-null singular `noise` object with
     /// PrintRemovedFeatureError naming the `noises` array as the migration
-    /// (conf/freedom.go). JSON `null` is the Go zero shape and stays
+    /// (infra/conf/freedom.go). JSON `null` is the Go zero shape and stays
     /// silent. The modeled `noises` field is never affected.
     FreedomNoiseRemoved,
     /// Freedom `settings.domainStrategy` outside Xray's strategy
-    /// vocabulary (conf/freedom.go Build switch — the same ten
+    /// vocabulary (infra/conf/freedom.go Build switch — the same ten
     /// case-insensitive values as the outbound `targetStrategy` rule):
     /// freedom reads `domainStrategy` whenever `targetStrategy` is empty,
     /// so in-vocabulary values work on the wire and stay silent; every
@@ -924,7 +925,7 @@ pub enum ValidationCode {
     /// `serverNames`, `shortIds`, `mldsa65Seed`) carried on a client
     /// profile: a client REALITY build never reads them, and a set
     /// dest/target flips REALITYConfig.Build onto the server branch
-    /// (conf/transport_security.go), so an outbound carrying them cannot
+    /// (infra/conf/transport_security.go), so an outbound carrying them cannot
     /// behave as a client. They are carried verbatim and Xray accepts the
     /// config — advisory (Severity::Warning; refusal could
     /// false-positive on tooling that deliberately carries server-form

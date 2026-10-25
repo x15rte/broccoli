@@ -2698,7 +2698,7 @@ pub struct StreamModel {
 impl StreamModel {
     /// The `headers` map of the selected transport, with the wire path the
     /// rule reports it under: only these transports' settings declare one,
-    /// and Xray types each as `map[string]string` (`conf/transport_method.go`).
+    /// and Xray types each as `map[string]string` (`infra/conf/transport_method.go`).
     pub fn transport_headers(&self) -> Option<(&Map<String, Value>, &'static str)> {
         match self.network {
             Network::Xhttp => self

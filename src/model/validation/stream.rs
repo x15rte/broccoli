@@ -70,7 +70,7 @@ pub fn server_name_implausible(value: &str) -> bool {
 
 /// True when a VLESS `flow` is acceptable on the wire —
 /// empty (the default) or one of the two vision (XRV) variants. Xray's conf
-/// build rejects every other flow (conf/vless.go).
+/// build rejects every other flow (infra/conf/vless.go).
 pub(super) fn vless_flow_supported(flow: &str) -> bool {
     flow.is_empty() || is_vision_flow(flow)
 }
@@ -248,7 +248,7 @@ pub fn server_max_header_bytes_ok(value: i32) -> bool {
 /// Predicate shared with the share-link grammar's sid check:
 /// true when the REALITY `shortId` is empty (the default) or an even-length
 /// hex value of at most 16 characters — the exact set Xray hex-decodes into
-/// its 8-byte short id without error (conf/transport_security.go; Go's
+/// its 8-byte short id without error (infra/conf/transport_security.go; Go's
 /// hex.Decode rejects odd-length and non-hex input).
 pub fn reality_short_id_valid(value: &str) -> bool {
     value.is_empty()
@@ -261,7 +261,7 @@ pub fn reality_short_id_valid(value: &str) -> bool {
 /// true when the REALITY `spiderX` is empty (Xray defaults it to `/`) or a
 /// URL path beginning with `/` with no control characters — the shape Xray's
 /// conf build accepts and its query rewriter can parse
-/// (conf/transport_security.go client branch).
+/// (infra/conf/transport_security.go client branch).
 pub fn reality_spider_x_valid(value: &str) -> bool {
     value.is_empty()
         || (value.starts_with('/')
@@ -273,7 +273,7 @@ pub fn reality_spider_x_valid(value: &str) -> bool {
 /// keygen guard: true when the REALITY `mldsa65Verify` is
 /// empty (no post-quantum verification key) or an unpadded base64url string
 /// decoding to the 1952-byte ML-DSA-65 public key
-/// (conf/transport_security.go client branch).
+/// (infra/conf/transport_security.go client branch).
 pub fn reality_mldsa65_verify_valid(value: &str) -> bool {
     value.is_empty()
         || URL_SAFE_NO_PAD
@@ -285,7 +285,7 @@ pub fn reality_mldsa65_verify_valid(value: &str) -> bool {
 /// true when `pinnedPeerCertSha256` is empty or every comma-separated entry
 /// (whitespace-trimmed, colons stripped) is exactly 64 hex digits — 32
 /// bytes of SHA-256 fingerprint, the shape Xray's conf build decodes
-/// (conf/transport_security.go).
+/// (infra/conf/transport_security.go).
 pub fn pinned_peer_cert_sha256_valid(value: &str) -> bool {
     value
         .split(',')
@@ -497,7 +497,7 @@ pub const TPROXY_MODES: &[&str] = &["off", "redirect", "tproxy"];
 
 /// The target-domain-strategy vocabulary: every value Xray's outbound
 /// `targetStrategy` switch and freedom `domainStrategy` switch accept
-/// (infra/conf/xray.go OutboundDetectorConfig.Build and conf/freedom.go read
+/// (infra/conf/xray.go OutboundDetectorConfig.Build and infra/conf/freedom.go read
 /// the same word list). Comparison folds case — Xray lowercases the value
 /// before switching — and empty is the wire default (`asis`), which the
 /// rules that judge a strategy check themselves. The strategy combos alias
@@ -529,7 +529,7 @@ pub(super) fn target_strategy_supported(strategy: &str) -> bool {
 /// value names one of the strategies Xray's FreedomConfig.Build switch
 /// accepts — the very same word list as the outbound `targetStrategy`
 /// rule, compared the same case-insensitive way (Xray lowercases before
-/// switching, conf/freedom.go). Empty is separately legal (the wire
+/// switching, infra/conf/freedom.go). Empty is separately legal (the wire
 /// default `asis`).
 pub(super) fn freedom_domain_strategy_supported(strategy: &str) -> bool {
     target_strategy_supported(strategy)
@@ -782,7 +782,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             // mKCP `seed`/`header` — KCPConfig.Build refuses a set
             // seed or header object with PrintRemovedFeatureError naming
             // the finalmask UDP masks as the migration
-            // (conf/transport_method.go).
+            // (infra/conf/transport_method.go).
             for (wire_key, path) in [
                 ("seed", "stream.kcpSettings.seed"),
                 ("header", "stream.kcpSettings.header"),
@@ -808,7 +808,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             // Hysteria `congestion`/`up`/`down`/`udphop` — HysteriaConfig
             // still parses the legacy QUIC knobs, logs an upstream warning
             // ("congestion & up & down & udphop move to finalmask/quicParams")
-            // and discards them (conf/transport_method.go); the config
+            // and discards them (infra/conf/transport_method.go); the config
             // loads and runs without the knobs — advisory.
             for (wire_key, path) in [
                 ("congestion", "stream.hysteriaSettings.congestion"),
@@ -829,7 +829,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             // serverNames, shortIds, mldsa65Seed) carried on a client
             // profile: a client REALITY build never reads them, and a set
             // dest/target flips REALITYConfig.Build onto the server branch
-            // (conf/transport_security.go), so an outbound carrying them
+            // (infra/conf/transport_security.go), so an outbound carrying them
             // cannot behave as a client. They are carried verbatim and the
             // config loads — advisory (a profile may deliberately hold
             // server-form material for tooling).
@@ -855,7 +855,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         }
         // REALITY client formats: the fingerprint vocabulary and the
         // key/SPX shapes. All Error findings mirror Xray conf-load rejections
-        // (conf/transport_security.go), so they gate save/apply exactly like
+        // (infra/conf/transport_security.go), so they gate save/apply exactly like
         // an import refusal. Fingerprint vocabulary is the canonical table in
         // `crate::model::fingerprint`; REALITY excludes exactly
         // `unsafe`/`hellogolang`.
@@ -1079,9 +1079,10 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         // KCPConfig.Build load-refuses mtu < 21 and tti outside [10, 1000]
         // (infra/conf/transport_method.go) — Error tier below, sharing the
         // import grammar's hard bounds (kcp_mtu_hard_ok /
-        // kcp_tti_hard_ok). The docs (mkcp.md) merely recommend
-        // mtu 576-1460 / tti 10-100, so values Xray accepts outside that
-        // band stay a docs-soft Warning.
+        // kcp_tti_hard_ok). Xray's mkcp docs
+        // (https://xtls.github.io/config/transports/mkcp.html) merely
+        // recommend mtu 576-1460 / tti 10-100, so values Xray accepts
+        // outside that band stay a docs-soft Warning.
         if let Some(kcp) = stream.kcp_settings.as_ref() {
             if kcp.mtu.is_some_and(|mtu| !kcp_mtu_hard_ok(mtu)) {
                 issues.push(issue(
@@ -5212,7 +5213,7 @@ mod tests {
     #[test]
     fn kcp_seed_and_header_extras_are_refused_and_header_type_warns() {
         // KCPConfig.Build refuses a set `seed` or `header` object
-        // with PrintRemovedFeatureError (conf/transport_method.go). Both
+        // with PrintRemovedFeatureError (infra/conf/transport_method.go). Both
         // wire keys, any case, fire the removal Error with per-key paths.
         for (key, path, value) in [
             ("seed", "stream.kcpSettings.seed", json!("s3cret")),
@@ -5294,7 +5295,7 @@ mod tests {
         // Server-form keys carried on a client REALITY block are
         // never read by the client build, and a set dest/target flips
         // REALITYConfig.Build onto the server branch
-        // (conf/transport_security.go) — carried verbatim, so the model
+        // (infra/conf/transport_security.go) — carried verbatim, so the model
         // warns (advisory; refusal could false-positive on tooling that
         // deliberately carries server-form material).
         let quiet = || StreamModel {
@@ -5600,7 +5601,7 @@ mod tests {
     // Tests beside the existing pins:
     // each code fires on a crafted block with its wire path and severity,
     // and is absent on the canonical value. Sources: Xray conf-load
-    // rejections (conf/transport_security.go) — Errors gate exactly like an
+    // rejections (infra/conf/transport_security.go) — Errors gate exactly like an
     // import refusal — and the class-E version-string drop (tls/config.go),
     // which warns. Fingerprint expectations derive from the canonical table
     // in `crate::model::fingerprint`, never from a duplicated literal list.

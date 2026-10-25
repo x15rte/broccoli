@@ -70,7 +70,9 @@ fn xudp_proxy_udp443_supported(value: &str) -> bool {
 /// enabled with a `concurrency` value Xray silently changes the meaning
 /// of — `0` runs as 8, values above 128 clamp to 128, and any negative
 /// other than the documented `-1` TCP-direct escape disables mux entirely
-/// (proxy outbound handler; docs outbound.md MuxObject bounds [1, 128]).
+/// (proxy outbound handler; outbound docs
+/// https://xtls.github.io/config/outbound.html#muxobject, MuxObject bounds
+/// [1, 128]).
 /// Disabled blocks never fire: Xray reads `concurrency` only inside the
 /// `Enabled` branch, so an out-of-band value there is a dead knob, not a
 /// reinterpretation. `-1` and 1..=128 never fire.
@@ -1245,7 +1247,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     // leaves the field nil/empty and stays silent.
     match &o.settings {
         ProtocolSettings::Trojan(settings) => {
-            // Trojan `flow` — conf/trojan.go refuses a non-empty flow
+            // Trojan `flow` — infra/conf/trojan.go refuses a non-empty flow
             // (PrintRemovedFeatureError); the empty string is the zero
             // value and stays silent. Xray's own deprecation note moves
             // Trojan users to VLESS with a vision flow.
@@ -1262,7 +1264,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         }
         ProtocolSettings::Vmess(settings) => {
             // VMess `alterId`/`aid` — the legacy alterId field is gone
-            // from conf/vmess.go (VMess is AEAD-only), so Xray silently
+            // from infra/conf/vmess.go (VMess is AEAD-only), so Xray silently
             // ignores any carried value.
             for wire_key in ["alterId", "aid"] {
                 if extra_has_key(&settings.extra, wire_key) {
@@ -1276,7 +1278,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
         ProtocolSettings::Vless(settings) => {
             // VLESS `seed` — parsed-but-inert upstream: the conf struct
             // keeps the field but Build never assigns it (the assignment is
-            // commented out, conf/vless.go), so Xray silently drops the
+            // commented out, infra/conf/vless.go), so Xray silently drops the
             // carried value.
             if extra_has_key(&settings.extra, "seed") {
                 issues.push(warning(
@@ -1286,7 +1288,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             }
         }
         ProtocolSettings::Freedom(settings) => {
-            // Freedom singular `noise` — conf/freedom.go refuses a
+            // Freedom singular `noise` — infra/conf/freedom.go refuses a
             // non-nil NoiseConfig with PrintRemovedFeatureError naming the
             // `noises` array as the migration. The modeled `noises` field
             // is never affected.
@@ -1299,7 +1301,7 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
             // Freedom `domainStrategy` is unmodeled (only
             // `targetStrategy` is), so any carried value lives in `extra` —
             // yet Xray reads it whenever targetStrategy is empty. Only
-            // out-of-vocabulary values fail: conf/freedom.go lowercases and
+            // out-of-vocabulary values fail: infra/conf/freedom.go lowercases and
             // switches over the ten strategies, refusing everything else at
             // load; non-string values fail Go's `string` unmarshal the same
             // way. In-vocabulary values work on the wire and stay silent.
@@ -3301,7 +3303,7 @@ mod tests {
     #[test]
     fn trojan_flow_extra_is_refused_like_the_removed_feature() {
         // Xray's TrojanClientConfig.Build refuses a non-empty
-        // `flow` with PrintRemovedFeatureError (conf/trojan.go) — any case
+        // `flow` with PrintRemovedFeatureError (infra/conf/trojan.go) — any case
         // variant binds the same field, so the extra scan must refuse it
         // exactly like the masterKeyLog scans.
         for key in ["flow", "FLOW", "Flow"] {
@@ -3341,7 +3343,7 @@ mod tests {
 
     #[test]
     fn vmess_alter_id_and_aid_extras_warn_as_inert() {
-        // conf/vmess.go has no alterId/aid field (VMess is
+        // infra/conf/vmess.go has no alterId/aid field (VMess is
         // AEAD-only), so Xray silently ignores any carried value — the
         // import grammar refuses both spellings; the model scan is the
         // state-path counterpart and stays advisory.
@@ -3389,7 +3391,7 @@ mod tests {
     fn vless_seed_extra_warns_as_inert() {
         // The VLESS conf struct still parses `seed` but Build never
         // assigns it — the assignment is commented out upstream
-        // (conf/vless.go) — so Xray silently drops any carried value and the
+        // (infra/conf/vless.go) — so Xray silently drops any carried value and the
         // model warns.
         for key in ["seed", "SEED"] {
             let mut outbound = vless_canonical();
@@ -3422,7 +3424,7 @@ mod tests {
 
     #[test]
     fn freedom_singular_noise_extra_is_refused_and_the_noises_field_stays_legal() {
-        // conf/freedom.go refuses a non-null singular `noise`
+        // infra/conf/freedom.go refuses a non-null singular `noise`
         // object with PrintRemovedFeatureError naming `noises` as the
         // migration. Null is the Go zero shape and stays silent, and the
         // modeled plural `noises` field is the legal spelling — it never
@@ -3475,7 +3477,7 @@ mod tests {
     #[test]
     fn freedom_domain_strategy_extra_outside_the_vocabulary_is_refused() {
         // Xray's freedom Build lowercases `domainStrategy` and
-        // switches over the ten strategies (conf/freedom.go) — values in the
+        // switches over the ten strategies (infra/conf/freedom.go) — values in the
         // vocabulary work on the wire in any case and stay silent; every
         // other non-null value refuses the outbound at load (non-string
         // JSON shapes included — Go's `string` unmarshal fails them).
