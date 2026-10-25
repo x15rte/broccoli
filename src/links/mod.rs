@@ -62,18 +62,20 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, percent_encode};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diag::Diag;
+use crate::excerpt::{excerpt, excerpt_debug};
 use crate::i18n::{Key, t_fmt, validation_issue_message};
 use crate::model::Int32Range;
+use crate::model::addr;
 use crate::model::outbound::{
     HttpSettings, HysteriaSettings, OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings,
     SocksSettings, TrojanSettings, VlessSettings, VmessSettings, WireguardPeer, WireguardSettings,
@@ -307,74 +309,50 @@ fn lossy(field: &str, key: Key) -> LinkError {
 
 // ---------- percent / base64 helpers ----------
 
+/// encodeURIComponent's unescaped set: the unreserved characters plus the
+/// sub-delimiters JavaScript leaves alone. Uppercase `%XX` escapes fall out
+/// of the crate's byte-wise encoder.
+const PCT_UNESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
 /// encodeURIComponent-compatible percent-encoding.
 fn pct_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'!'
-            | b'~'
-            | b'*'
-            | b'\''
-            | b'('
-            | b')' => out.push(b as char),
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
+    percent_encode(s.as_bytes(), PCT_UNESCAPED).to_string()
 }
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Strict percent-decoding (no `+` translation — for userinfo/fragment).
+/// Strict percent-decoding (no `+` translation — for userinfo/fragment/query
+/// values alike; canonical output writes a literal `+` as `%2B`).
+///
+/// The crate's decoder is intentionally lenient (it passes a malformed escape
+/// through untouched), so the escape grammar is checked first to keep the
+/// three distinct diagnostics for a truncated escape, a non-hex escape, and a
+/// decoded byte sequence that is not UTF-8.
 fn pct_decode(s: &str) -> Result<String, LinkError> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            if i + 3 > b.len() {
-                return Err(malformed(
-                    Diag::new(Key::LinkPercentTruncated).arg(excerpt_debug(s)),
-                ));
-            }
-            let hi = hex_val(b[i + 1]).ok_or_else(|| {
-                malformed(Diag::new(Key::LinkPercentEscape).arg(excerpt_debug(s)))
-            })?;
-            let lo = hex_val(b[i + 2]).ok_or_else(|| {
-                malformed(Diag::new(Key::LinkPercentEscape).arg(excerpt_debug(s)))
-            })?;
-            out.push(hi << 4 | lo);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
+    let bytes = s.as_bytes();
+    for (index, _) in s.match_indices('%') {
+        let Some(escape) = bytes.get(index + 1..index + 3) else {
+            return Err(malformed(
+                Diag::new(Key::LinkPercentTruncated).arg(excerpt_debug(s)),
+            ));
+        };
+        if !escape.iter().all(u8::is_ascii_hexdigit) {
+            return Err(malformed(
+                Diag::new(Key::LinkPercentEscape).arg(excerpt_debug(s)),
+            ));
         }
     }
-    String::from_utf8(out)
+    percent_decode_str(s)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
         .map_err(|_| malformed(Diag::new(Key::LinkPercentUtf8).arg(excerpt_debug(s))))
-}
-
-/// Query fields use the same strict percent-decoding as every other #716 URL
-/// component. In particular, `+` is a literal plus (and canonical output
-/// writes it as `%2B`); form-url-encoded `+`-as-space is not part of #716.
-fn form_decode(s: &str) -> Result<String, LinkError> {
-    pct_decode(s)
 }
 
 /// Bound on base64 payloads in share links: link bodies are structurally
@@ -392,39 +370,12 @@ pub const MAX_LINK_LEN: usize = 1 << 20; // 1 MiB
 /// enforces the same bound as defense in depth.
 pub const MAX_BULK_LEN: usize = 4 * MAX_LINK_LEN; // 4 MiB
 
-/// Maximum characters of attacker-controlled input embedded in a rendered
-/// diagnostic. Errors must never echo the full raw input; the bounded
-/// echo surfaces listed on [`excerpt`] all share this one bound. Public
-/// through `crate::excerpt`, so a test asserting the bound reads it here
-/// instead of copying the number.
-pub const MAX_ERROR_EXCERPT_CHARS: usize = 48;
-
 /// Maximum bytes of a decoded profile name derived from a `#fragment`.
 /// Names are persisted in `servers.json` and laid out every frame by the
 /// dashboard/server list, so an unbounded fragment would be a one-time
 /// multi-second layout followed by permanently retained per-frame cost
 /// (LINK-002). Fragment names above this bound are rejected at import.
 const MAX_PROFILE_NAME_LEN: usize = 512;
-
-/// Canonical crate-wide bound for attacker-controlled text in diagnostics:
-/// the first [`MAX_ERROR_EXCERPT_CHARS`] characters, truncated on a UTF-8
-/// boundary with a trailing `…`. Every surface that echoes user-editable
-/// text bounds it here: share-link parse errors, parameterized
-/// `model::validation::ValidationCode` payloads, state-load semantic
-/// errors, raw-override generation and parse errors, and the dashboard's
-/// echoed generation errors. A hostile value can never inflate rendered
-/// error text; identity below the bound keeps short values byte-identical.
-pub fn excerpt(s: &str) -> String {
-    match s.char_indices().nth(MAX_ERROR_EXCERPT_CHARS) {
-        Some((end, _)) => format!("{}…", &s[..end]),
-        None => s.to_owned(),
-    }
-}
-
-/// Debug-escaped bounded excerpt, for `{:?}`-style error embeds.
-pub(crate) fn excerpt_debug(s: &str) -> String {
-    format!("{:?}", excerpt(s))
-}
 
 /// Character-class precheck for one base64 engine alphabet (no allocation).
 /// Padded engines additionally admit `=`; no-pad engines reject it. This is a
@@ -492,13 +443,13 @@ fn parse_query(query: &str) -> Result<Query, LinkError> {
             continue;
         }
         let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = form_decode(raw_key)?;
+        let key = pct_decode(raw_key)?;
         if !keys.insert(key.clone()) {
             return Err(malformed(
                 Diag::new(Key::LinkQueryDuplicate).arg(excerpt_debug(&key)),
             ));
         }
-        values.push((key, form_decode(raw_value)?));
+        values.push((key, pct_decode(raw_value)?));
     }
     Ok(Query(values))
 }
@@ -724,15 +675,6 @@ fn parse_host_port_default(
             validate_host(&host, scheme)?;
             Ok((host, default_port))
         }
-    }
-}
-
-/// `host:port`, re-bracketing IPv6.
-fn host_port(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
     }
 }
 
@@ -2101,7 +2043,7 @@ fn vless_link(p: &ServerProfile, s: &VlessSettings) -> Result<String, LinkError>
     Ok(format!(
         "vless://{}@{}?{}{}",
         pct_encode(&s.id),
-        host_port(&s.address, s.port),
+        addr::format_host_port(&s.address, s.port),
         render_query(&q),
         fragment_suffix(&p.name),
     ))
@@ -2115,7 +2057,7 @@ fn trojan_link(p: &ServerProfile, s: &TrojanSettings) -> Result<String, LinkErro
     Ok(format!(
         "trojan://{}@{}?{}{}",
         pct_encode(&s.password),
-        host_port(&s.address, s.port),
+        addr::format_host_port(&s.address, s.port),
         render_query(&q),
         fragment_suffix(&p.name),
     ))
@@ -2447,7 +2389,7 @@ fn vmess_link(profile: &ServerProfile, settings: &VmessSettings) -> Result<Strin
     Ok(format!(
         "vmess://{}@{}{}{}",
         pct_encode(&settings.id),
-        host_port(&settings.address, settings.port),
+        addr::format_host_port(&settings.address, settings.port),
         query,
         fragment_suffix(&profile.name),
     ))
@@ -2554,7 +2496,7 @@ fn ss_link(p: &ServerProfile, s: &ShadowsocksSettings) -> Result<String, LinkErr
     Ok(format!(
         "ss://{}@{}{}",
         userinfo,
-        host_port(&s.address, s.port),
+        addr::format_host_port(&s.address, s.port),
         fragment_suffix(&p.name),
     ))
 }
@@ -2901,7 +2843,7 @@ fn parse_wireguard(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfil
         peers: vec![WireguardPeer {
             public_key,
             pre_shared_key,
-            endpoint: host_port(&host, port),
+            endpoint: addr::format_host_port(&host, port),
             keep_alive,
             ..Default::default()
         }],
@@ -4018,6 +3960,7 @@ pub fn qr_color_image(s: &str) -> Option<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::excerpt::MAX_ERROR_EXCERPT_CHARS;
     use crate::model::FinalmaskTcpMask;
     use crate::model::inbound::DNS_OUTBOUND_TAG;
     use crate::model::validation::ValidationCode;
@@ -6742,46 +6685,6 @@ mod tests {
     }
 
     // ----- input-size caps and error redaction -----
-
-    /// The bound is a character count, so 48 CJK characters (144 bytes) fit
-    /// whole and only the 49th is elided. Indexing by bytes would cut this
-    /// input at 16 characters.
-    #[test]
-    fn excerpt_keeps_forty_eight_cjk_characters() {
-        let exact: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS);
-        assert_eq!(excerpt(&exact), exact, "the bound itself is not a cut");
-
-        let over: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
-        let kept: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS);
-        assert_eq!(excerpt(&over), format!("{kept}…"));
-    }
-
-    /// The cut never splits a 4-byte emoji: the ellipsis follows the 48th
-    /// whole character even when the string continues with another one.
-    #[test]
-    fn excerpt_cuts_after_a_whole_emoji_at_the_bound() {
-        let exact: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS);
-        assert_eq!(excerpt(&exact), exact);
-
-        let over: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
-        let kept: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS);
-        assert_eq!(excerpt(&over), format!("{kept}…"));
-        assert_eq!(
-            excerpt(&over).chars().count(),
-            MAX_ERROR_EXCERPT_CHARS + 1,
-            "the bound counts characters, not bytes"
-        );
-
-        // Mixed widths: byte 48 would land inside an emoji, so a byte-indexed
-        // cut would walk back and lose four characters.
-        let mixed = format!("a{}", "🦀".repeat(MAX_ERROR_EXCERPT_CHARS));
-        let kept = format!("a{}", "🦀".repeat(MAX_ERROR_EXCERPT_CHARS - 1));
-        assert_eq!(excerpt(&mixed), format!("{kept}…"));
-
-        // ASCII stays byte-identical to the previous byte-index semantics.
-        let ascii = "a".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
-        assert_eq!(excerpt(&ascii), format!("{}…", "a".repeat(48)));
-    }
 
     #[test]
     fn parse_link_rejects_overlong_line_before_parsing() {

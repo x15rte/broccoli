@@ -5,8 +5,6 @@
 //! reports the owning PID of every TCP endpoint, so the app can compare the
 //! listener's owner against the child PID it spawned.
 
-use std::alloc::Layout;
-use std::mem::align_of;
 use std::net::Ipv4Addr;
 
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
@@ -14,6 +12,8 @@ use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 use windows::Win32::Networking::WinSock::AF_INET;
+
+use super::aligned::AlignedBuffer;
 
 /// `MIB_TCP_STATE_LISTEN`: only LISTEN rows prove a bound listener.
 const MIB_TCP_STATE_LISTEN: u32 = 2;
@@ -55,21 +55,13 @@ pub fn tcp_table() -> Option<Vec<TcpRow>> {
         return None;
     }
 
-    let Ok(layout) = Layout::from_size_align(size as usize, align_of::<MIB_TCPTABLE_OWNER_PID>())
-    else {
-        return None;
-    };
-    // SAFETY: `layout` has nonzero size (the API reported the required bytes)
-    // and a valid alignment; `alloc` returns a suitably aligned pointer, or
-    // null on allocation failure.
-    let raw = unsafe { std::alloc::alloc(layout) };
-    if raw.is_null() {
-        return None;
-    }
+    let buffer = AlignedBuffer::<MIB_TCPTABLE_OWNER_PID>::zeroed(size as usize)?;
+    let raw = buffer.as_mut_ptr();
 
-    // SAFETY: `raw` is valid for `layout` (allocated above, not yet freed) and
-    // aligned for `MIB_TCPTABLE_OWNER_PID`, so the API may write the table
-    // into it; `size` is the capacity the API itself requested.
+    // SAFETY: `buffer` is an `AlignedBuffer` covering the bytes the API just
+    // requested, zeroed and aligned for `MIB_TCPTABLE_OWNER_PID`, so the API
+    // may write the table into it; `size` is the capacity the API itself
+    // requested.
     let status = unsafe {
         GetExtendedTcpTable(
             Some(raw.cast()),
@@ -80,16 +72,16 @@ pub fn tcp_table() -> Option<Vec<TcpRow>> {
             0,
         )
     };
-    let rows = if status == NO_ERROR.0 {
+    if status == NO_ERROR.0 {
         // SAFETY: on NO_ERROR the API initialized the buffer as a
         // `MIB_TCPTABLE_OWNER_PID` — `dwNumEntries` followed by that many rows
         // packed immediately after the header — and the buffer covers the size
         // the API requested, so every row lies inside the allocation.
-        let header = unsafe { &*raw.cast::<MIB_TCPTABLE_OWNER_PID>() };
+        let header = unsafe { &*raw };
         let count = header.dwNumEntries as usize;
         // SAFETY: `header.table.as_ptr()` points at the first row; the API
         // wrote `count` packed rows (the `[T; 1]` field is the flexible-array
-        // pattern), all within the `layout`-sized allocation above.
+        // pattern), all within the `AlignedBuffer`-sized allocation above.
         let slice = unsafe { std::slice::from_raw_parts(header.table.as_ptr(), count) };
         Some(
             slice
@@ -106,11 +98,7 @@ pub fn tcp_table() -> Option<Vec<TcpRow>> {
         )
     } else {
         None
-    };
-    // SAFETY: `raw` is the pointer `alloc(layout)` returned and has not been
-    // freed; this deallocates it exactly once.
-    unsafe { std::alloc::dealloc(raw, layout) };
-    rows
+    }
 }
 
 /// Whether the loopback TCP listener on `port` is owned by `expected_pid` —

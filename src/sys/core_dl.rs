@@ -5,7 +5,6 @@
 //! replaced with sibling-directory renames; `core.bak` is the rollback point
 //! and is recovered on the next launch if a process dies between the renames.
 
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Seek as _, SeekFrom, Write as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
@@ -810,25 +809,6 @@ fn verify_pinned_archive(file: &Path, expected: &str) -> Result<(), DiagError> {
     Ok(())
 }
 
-/// RAII ownership of `download_core`'s unique staging directory. The tree is
-/// removed when the guard drops, so an aborted download future cleans up just
-/// like a completed or failed one. A missing directory is tolerated (removal
-/// is a no-op), which makes double-drop and early failures safe.
-#[must_use]
-struct StagingGuard(PathBuf);
-
-impl StagingGuard {
-    fn new(path: PathBuf) -> Self {
-        Self(path)
-    }
-}
-
-impl Drop for StagingGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Download and install the one stable Xray release compiled into this Broccoli
 /// binary. Network metadata and same-channel digest sidecars never select or
 /// authenticate code. The returned version has no leading `v`.
@@ -836,15 +816,15 @@ pub async fn download_core(
     client: &reqwest::Client,
     progress: impl Fn(u64, u64, &Diag) + Send,
 ) -> Result<String, DiagError> {
-    let work = std::env::temp_dir().join(format!(
-        "broccoli-core-dl-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir_all(&work)
-        .diag_with(Diag::new(Key::CoreDlDirectoryCreateFailed).arg(work.display()))?;
-    let zip_path = work.join(ZIP_ASSET);
-    let _staging = StagingGuard::new(work);
+    // The temp directory owns its tree: a completed, failed, or aborted
+    // download future drops it and removes the staging files either way.
+    let work = tempfile::Builder::new()
+        .prefix("broccoli-core-dl-")
+        .tempdir()
+        .diag_with(
+            Diag::new(Key::CoreDlDirectoryCreateFailed).arg(std::env::temp_dir().display()),
+        )?;
+    let zip_path = work.path().join(ZIP_ASSET);
     // Only the install transaction touches the managed tree, and it owns the
     // presence-cache invalidation; a download or pin-verify failure before it
     // leaves the tree unchanged, so the cached presence stays valid.
@@ -911,7 +891,7 @@ pub fn install_pinned_core_archive(zip: &Path) -> Result<String, DiagError> {
             geosite_sha256,
             version: version.clone(),
         };
-        write_json_synced(&staging.join(RELEASE_DIGEST_FILE), &metadata)?;
+        write_json_atomic(&staging.join(RELEASE_DIGEST_FILE), &metadata)?;
         drop(open_verified_core_at(&staging, VerifyScope::Full)?);
         commit_staging(&root, &staging, |dir| {
             drop(open_verified_core_at(dir, VerifyScope::Full)?);
@@ -1227,13 +1207,16 @@ fn managed_geo_data_matches_pins(core: &Path) -> bool {
 /// - a pair member whose bytes do not match its compiled pin bails naming
 ///   the file and both hashes, before any managed file is touched;
 /// - managed DATs that already match the pins are a no-op;
-/// - otherwise each managed file is replaced atomically: bytes are
-///   streamed into a uniquely named sibling temp file, flushed, then
-///   renamed over the managed name (Windows `MOVEFILE_REPLACE_EXISTING`,
-///   the repo's rename semantics), so there is never a window where the
-///   managed file is missing. The temp file is removed on failure. When a
-///   running core holds deny-write handles, the rename fails with a
-///   sharing violation, which propagates for the UI to surface.
+/// - otherwise each managed file is replaced atomically through
+///   [`crate::sys::durable::copy_file_atomic`], fed the handle the pin was
+///   verified through: bytes are streamed into the fixed-name sibling temp
+///   file, flushed, then renamed over the managed name (Windows
+///   `MOVEFILE_REPLACE_EXISTING`, the repo's rename semantics), so there is
+///   never a window where the managed file is missing, and a swap by path
+///   between verification and copy cannot change the bytes. A failed copy
+///   removes its temp. When a running core holds deny-write handles, the
+///   rename fails with a sharing violation, which propagates for the UI to
+///   surface.
 ///
 /// A transaction invalidates the presence cache on every return path — the
 /// already-pinned no-op, a failed restore that may have replaced one file
@@ -1242,6 +1225,10 @@ fn managed_geo_data_matches_pins(core: &Path) -> bool {
 pub fn restore_pristine_geo_data(core: &Path) -> Result<(), DiagError> {
     let _presence = PresenceInvalidation;
     let pristine_dir = core.join(PRISTINE_DIR);
+    // Open every source once and keep the handle: the bytes hashed against
+    // the compiled pin are the bytes copied, so a swap by path between the
+    // two passes cannot slip a different file through the pin.
+    let mut verified = Vec::with_capacity(GEO_DATA_PAIR.len());
     for (payload, expected) in GEO_DATA_PAIR {
         let source = pristine_dir.join(payload);
         if !is_ordinary_file(&source) {
@@ -1249,7 +1236,9 @@ pub fn restore_pristine_geo_data(core: &Path) -> Result<(), DiagError> {
                 Diag::new(Key::CoreDlRestoreUnavailable).arg(source.display()),
             ));
         }
-        let actual = sha256_hex(&source)?;
+        let mut file = File::open(&source)
+            .diag_with(Diag::new(Key::CoreDlFileOpenFailed).arg(source.display()))?;
+        let actual = sha256_reader(&mut file)?;
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(DiagError::new(
                 Diag::new(Key::CoreDlPristineMismatch)
@@ -1258,37 +1247,20 @@ pub fn restore_pristine_geo_data(core: &Path) -> Result<(), DiagError> {
                     .arg(&actual),
             ));
         }
+        file.seek(SeekFrom::Start(0))
+            .diag_with(Diag::new(Key::CoreDlPayloadRewindFailed).arg(payload))?;
+        verified.push((payload, source, file));
     }
     if managed_geo_data_matches_pins(core) {
         return Ok(());
     }
-    for (payload, _) in GEO_DATA_PAIR {
-        let source = pristine_dir.join(payload);
+    for (payload, source, file) in verified {
         let managed = core.join(payload);
-        let temp = core.join(format!(
-            "{payload}.restore-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let result = (|| -> Result<(), DiagError> {
-            let mut input = File::open(&source)
-                .diag_with(Diag::new(Key::CoreDlFileOpenFailed).arg(source.display()))?;
-            let mut output = File::create(&temp)
-                .diag_with(Diag::new(Key::CoreDlFileCreateFailed).arg(temp.display()))?;
-            std::io::copy(&mut input, &mut output)
-                .diag_with(Diag::new(Key::CoreDlFileCopyFailed).arg(temp.display()))?;
-            output
-                .sync_all()
-                .diag_with(Diag::new(Key::CoreDlFileFlushFailed).arg(temp.display()))?;
-            fs::rename(&temp, &managed).diag_with(
-                Diag::new(Key::CoreDlFileReplaceFailed)
-                    .arg(managed.display())
-                    .arg(source.display()),
-            )
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-            return result;
-        }
+        crate::sys::durable::copy_file_atomic(file, &managed).diag_with(
+            Diag::new(Key::CoreDlFileReplaceFailed)
+                .arg(managed.display())
+                .arg(source.display()),
+        )?;
     }
     Ok(())
 }
@@ -1485,12 +1457,7 @@ fn sha256_reader(reader: &mut impl std::io::Read) -> Result<String, DiagError> {
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = hasher.finalize();
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    Ok(output)
+    Ok(crate::digest::hex(&hasher.finalize()))
 }
 
 /// sha256 of `file` as lowercase hex.
@@ -1500,14 +1467,10 @@ fn sha256_hex(file: &Path) -> Result<String, DiagError> {
     sha256_reader(&mut file)
 }
 
-fn write_json_synced<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), DiagError> {
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), DiagError> {
     let encoded = serde_json::to_vec_pretty(value).diag(Key::CoreDlMetadataSerializeFailed)?;
-    let mut file =
-        File::create(path).diag_with(Diag::new(Key::CoreDlFileCreateFailed).arg(path.display()))?;
-    file.write_all(&encoded)
-        .diag_with(Diag::new(Key::CoreDlFileWriteFailed).arg(path.display()))?;
-    file.sync_all()
-        .diag_with(Diag::new(Key::CoreDlFileFlushFailed).arg(path.display()))
+    crate::sys::durable::write_atomic(path, &encoded)
+        .diag_with(Diag::new(Key::CoreDlFileWriteFailed).arg(path.display()))
 }
 
 /// Extract whitelisted files from the release zip into `dest` (flat).
@@ -2012,97 +1975,6 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "the caller must not wait for the stalled syscall"
-        );
-    }
-
-    #[test]
-    fn staging_guard_removes_tree_on_drop() {
-        // A completed or failed download both end the guarded scope; the tree,
-        // partial zip included, must be gone either way.
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let dir = temporary.path().join("broccoli-core-dl-dropped");
-        fs::create_dir_all(&dir).expect("create staged directory");
-        fs::write(dir.join(ZIP_ASSET), b"partial download").expect("write partial zip");
-        {
-            let _guard = super::StagingGuard::new(dir.clone());
-            assert!(
-                dir.exists(),
-                "staging tree must exist while the guard is alive"
-            );
-        }
-        assert!(
-            !dir.exists(),
-            "dropping the guard must remove the staging tree"
-        );
-    }
-
-    #[test]
-    fn staging_guard_drop_tolerates_missing_directory() {
-        // A dir that was never created, and a second drop over an already
-        // removed path, are both no-ops: cleanup never panics.
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let dir = temporary.path().join("broccoli-core-dl-never-created");
-        drop(super::StagingGuard::new(dir.clone()));
-        assert!(!dir.exists());
-        drop(super::StagingGuard::new(dir));
-    }
-
-    #[tokio::test]
-    async fn aborted_download_future_removes_staging_dir() {
-        // Abort mid-flight (the CoreCmd::Stop / shutdown path): the staging
-        // dir plus partial zip must not survive the dropped future.
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let dir = temporary.path().join("broccoli-core-dl-aborted");
-        fs::create_dir_all(&dir).expect("create staged directory");
-        fs::write(dir.join(ZIP_ASSET), b"partial download").expect("write partial zip");
-        let staged = dir.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let _guard = super::StagingGuard::new(staged);
-            started_tx
-                .send(())
-                .expect("staging task receiver must be alive");
-            // Stand-in for the in-flight download: never completes on its own.
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        });
-        started_rx.await.expect("staging task must start");
-        handle.abort();
-        handle
-            .await
-            .expect_err("aborted task must not complete normally");
-        assert!(
-            !dir.exists(),
-            "aborting the download task must remove its staging dir"
-        );
-    }
-
-    #[tokio::test]
-    async fn aborted_download_with_open_partial_file_removes_staging_dir() {
-        // The worst Windows case: the abort lands while stream_download still
-        // holds the partial zip open. The handle drops with the future, and
-        // the guard's removal must then succeed.
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let dir = temporary.path().join("broccoli-core-dl-aborted-open");
-        fs::create_dir_all(&dir).expect("create staged directory");
-        let staged = dir.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let partial = staged.join(ZIP_ASSET);
-            let _guard = super::StagingGuard::new(staged);
-            let _file = fs::File::create(&partial).expect("create partial zip");
-            started_tx
-                .send(())
-                .expect("staging task receiver must be alive");
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        });
-        started_rx.await.expect("staging task must start");
-        handle.abort();
-        handle
-            .await
-            .expect_err("aborted task must not complete normally");
-        assert!(
-            !dir.exists(),
-            "aborting the download task must remove its staging dir even with an open partial file"
         );
     }
 }

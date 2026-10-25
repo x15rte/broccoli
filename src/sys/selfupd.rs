@@ -84,83 +84,26 @@ pub fn release_url() -> Option<String> {
     github_url(RELEASE_REPO, "/releases/latest")
 }
 
-/// A parsed `MAJOR.MINOR.PATCH` version with an optional pre-release suffix
-/// (e.g. `1.2.3-alpha.1`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Version {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    pre: Option<String>,
-}
+/// A `MAJOR.MINOR.PATCH` version with optional pre-release and build
+/// metadata (e.g. `1.2.3-alpha.1`), as parsed by SemVer 2.0.0.
+pub use semver::Version;
 
-impl Version {
-    /// Parse a `MAJOR.MINOR.PATCH[-(pre)]` version string (also tolerates
-    /// `+build` metadata, which does not affect precedence).
-    pub fn parse(text: &str) -> Option<Version> {
-        let (core, pre) = match text.split_once('-') {
-            Some((core, pre)) => {
-                // Build metadata (`1.2.3-alpha+build`) does not affect
-                // precedence; drop it from the suffix.
-                let pre = pre.split_once('+').map_or(pre, |(pre, _)| pre);
-                if pre.is_empty() {
-                    return None;
-                }
-                (core, Some(pre.to_string()))
-            }
-            None => (text.split_once('+').map_or(text, |(core, _)| core), None),
-        };
-        let mut parts = core.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(Version {
-            major,
-            minor,
-            patch,
-            pre,
-        })
-    }
-
-    /// Strict-greater comparison: the numeric triple
-    /// decides first; on equal triples, a version without a pre-release is
-    /// greater than one with a pre-release; otherwise `self` is not greater.
-    pub fn is_newer_than(&self, other: &Version) -> bool {
-        match self.major.cmp(&other.major) {
-            std::cmp::Ordering::Greater => return true,
-            std::cmp::Ordering::Less => return false,
-            std::cmp::Ordering::Equal => {}
-        }
-        match self.minor.cmp(&other.minor) {
-            std::cmp::Ordering::Greater => return true,
-            std::cmp::Ordering::Less => return false,
-            std::cmp::Ordering::Equal => {}
-        }
-        match self.patch.cmp(&other.patch) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => self.pre.is_none() && other.pre.is_some(),
-        }
-    }
-}
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if let Some(pre) = &self.pre {
-            write!(f, "-{pre}")?;
-        }
-        Ok(())
-    }
+/// Strict-greater precedence: `candidate` is a newer release than `current`.
+///
+/// `cmp_precedence` is the SemVer ordering — the numeric triple first, then a
+/// release outranks its own pre-releases, then pre-release identifiers compare
+/// numerically and then lexically — so `1.0.0-beta` is newer than
+/// `1.0.0-alpha`. Build metadata never affects precedence.
+fn is_newer_than(candidate: &Version, current: &Version) -> bool {
+    candidate.cmp_precedence(current) == std::cmp::Ordering::Greater
 }
 
 /// Recoverable failure parsing a Cargo.toml `[package]` version. Every
 /// variant degrades to the check-failed UI state; nothing here panics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionParseError {
+    /// The document is not valid TOML at all (for example a duplicate key).
+    MalformedDocument(String),
     /// The document has no `[package]` section.
     NoPackageSection,
     /// The `[package]` section has no `version` key.
@@ -175,6 +118,9 @@ pub enum VersionParseError {
 impl fmt::Display for VersionParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MalformedDocument(detail) => {
+                write!(f, "Cargo.toml is not valid TOML: {detail}")
+            }
             Self::NoPackageSection => write!(f, "no [package] section in Cargo.toml"),
             Self::NoVersionKey => write!(f, "[package] has no version key"),
             Self::UnsupportedVersion => {
@@ -191,64 +137,25 @@ impl std::error::Error for VersionParseError {}
 
 /// Extracts the `[package]` version from Cargo.toml text.
 ///
-/// Tolerates surrounding whitespace and comments; ignores every other
-/// section including `[workspace.package]`; treats
-/// `version = { workspace = true }` as unparseable. Missing or malformed
-/// content is a recoverable error — callers degrade to the failed state.
+/// The manifest is read as TOML, so comments and whitespace are the parser's
+/// concern; every other section (including `[workspace.package]`) is simply
+/// not consulted. A non-string `version` (e.g.
+/// `version = { workspace = true }`) is unparseable by design. Missing,
+/// duplicated, or malformed content is a recoverable error — callers degrade
+/// to the failed state.
 pub fn parse_package_version(cargo_toml: &str) -> Result<Version, VersionParseError> {
-    let mut in_package = false;
-    let mut saw_package = false;
-    for line in cargo_toml.lines() {
-        let line = strip_comment(line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            let header = line.trim_matches(['[', ']']).trim();
-            in_package = header == "package";
-            saw_package |= in_package;
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "version" {
-            continue;
-        }
-        return parse_version_value(value.trim());
-    }
-    if saw_package {
-        Err(VersionParseError::NoVersionKey)
-    } else {
-        Err(VersionParseError::NoPackageSection)
-    }
-}
-
-/// Cuts a `#` comment, honoring double-quoted strings (a `#` inside a
-/// version string must survive).
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    for (index, ch) in line.char_indices() {
-        match ch {
-            '"' => in_string = !in_string,
-            '#' if !in_string => return &line[..index],
-            _ => {}
-        }
-    }
-    line
-}
-
-fn parse_version_value(value: &str) -> Result<Version, VersionParseError> {
-    let Some(inner) = value
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
+    let document: toml::Table = toml::from_str(cargo_toml)
+        .map_err(|error| VersionParseError::MalformedDocument(error.to_string()))?;
+    let Some(package) = document.get("package").and_then(toml::Value::as_table) else {
+        return Err(VersionParseError::NoPackageSection);
+    };
+    let Some(value) = package.get("version") else {
+        return Err(VersionParseError::NoVersionKey);
+    };
+    let Some(value) = value.as_str() else {
         return Err(VersionParseError::UnsupportedVersion);
     };
-    Version::parse(inner).ok_or_else(|| VersionParseError::MalformedVersion(inner.to_string()))
+    Version::parse(value).map_err(|_| VersionParseError::MalformedVersion(value.to_string()))
 }
 
 /// The compiled broccoli version, from Cargo metadata at compile time.
@@ -279,7 +186,7 @@ pub enum UpdateCheckState {
 /// Reduces a fetched remote version to the terminal check state against the
 /// compiled version (pure and unit-testable).
 pub fn check_outcome(remote: Version) -> UpdateCheckState {
-    if remote.is_newer_than(&compiled_version()) {
+    if is_newer_than(&remote, &compiled_version()) {
         UpdateCheckState::UpdateAvailable { version: remote }
     } else {
         UpdateCheckState::UpToDate { version: remote }
@@ -409,8 +316,8 @@ pub async fn check_for_update(client: &reqwest::Client) -> Result<Version, Updat
 mod tests {
     use super::{
         BodyCap, MAX_UPDATE_BODY_BYTES, RELEASE_REPO, UpdateCheckError, UpdateCheckState, Version,
-        VersionParseError, check_outcome, github_url, parse_package_version, release_url,
-        repository_url, split_repo,
+        VersionParseError, check_outcome, github_url, is_newer_than, parse_package_version,
+        release_url, repository_url, split_repo,
     };
 
     #[test]
@@ -613,21 +520,36 @@ version = \"1.0.0\"
 
     #[test]
     fn strict_greater_comparison() {
-        let v = |text: &str| Version::parse(text).unwrap_or_else(|| panic!("{text}"));
-        assert!(v("1.2.4").is_newer_than(&v("1.2.3")));
-        assert!(v("1.3.0").is_newer_than(&v("1.2.9")));
-        assert!(v("2.0.0").is_newer_than(&v("1.9.9")));
-        assert!(!v("1.2.3").is_newer_than(&v("1.2.4")));
-        assert!(!v("1.2.3").is_newer_than(&v("1.2.3")));
+        let v = |text: &str| Version::parse(text).unwrap_or_else(|_| panic!("{text}"));
+        assert!(is_newer_than(&v("1.2.4"), &v("1.2.3")));
+        assert!(is_newer_than(&v("1.3.0"), &v("1.2.9")));
+        assert!(is_newer_than(&v("2.0.0"), &v("1.9.9")));
+        assert!(!is_newer_than(&v("1.2.3"), &v("1.2.4")));
+        assert!(!is_newer_than(&v("1.2.3"), &v("1.2.3")));
         // Equal triples: a release is greater than its pre-release.
-        assert!(v("1.2.3").is_newer_than(&v("1.2.3-alpha.1")));
-        assert!(!v("1.2.3-alpha.1").is_newer_than(&v("1.2.3")));
-        // Equal triples with pre-releases on both sides: not greater, even
-        // when the suffix strings would order one ahead.
-        assert!(!v("1.2.3-beta.1").is_newer_than(&v("1.2.3-alpha.1")));
-        assert!(!v("1.2.3-alpha.1").is_newer_than(&v("1.2.3-beta.1")));
+        assert!(is_newer_than(&v("1.2.3"), &v("1.2.3-alpha.1")));
+        assert!(!is_newer_than(&v("1.2.3-alpha.1"), &v("1.2.3")));
+        // Pre-release identifiers compare by SemVer precedence, so a later
+        // identifier is newer — not just "different from the release".
+        assert!(is_newer_than(&v("1.0.0-beta"), &v("1.0.0-alpha")));
+        assert!(is_newer_than(&v("1.2.3-beta.1"), &v("1.2.3-alpha.1")));
+        assert!(!is_newer_than(&v("1.2.3-alpha.1"), &v("1.2.3-beta.1")));
+        assert!(is_newer_than(&v("1.2.3-rc.2"), &v("1.2.3-rc.1")));
+        // Numeric pre-release identifiers compare numerically.
+        assert!(is_newer_than(&v("1.2.3-alpha.10"), &v("1.2.3-alpha.9")));
+        // Build metadata never affects precedence.
+        assert!(!is_newer_than(&v("1.2.3+build.2"), &v("1.2.3+build.1")));
         // Pre-release comparisons still follow the numeric triple.
-        assert!(v("1.2.4-alpha.1").is_newer_than(&v("1.2.3-beta.9")));
+        assert!(is_newer_than(&v("1.2.4-alpha.1"), &v("1.2.3-beta.9")));
+    }
+
+    #[test]
+    fn duplicate_keys_in_a_package_section_are_rejected() {
+        let toml = "[package]\nversion = \"1.0.0\"\nversion = \"2.0.0\"\n";
+        assert!(matches!(
+            parse_package_version(toml),
+            Err(VersionParseError::MalformedDocument(_))
+        ));
     }
 
     #[test]

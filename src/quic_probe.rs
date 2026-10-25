@@ -15,7 +15,6 @@
 //! server that answers QUIC at all completes the handshake and reveals its
 //! certificate.
 
-use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,9 +24,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use sha2::{Digest, Sha256};
 use x509_parser::prelude::{GeneralName, X509Certificate, parse_x509_certificate};
 
+use crate::digest::sha256_hex;
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::settings::Language;
 use crate::tls_ping::{CertRow, Transcript};
@@ -121,9 +120,12 @@ impl ServerCertVerifier for AcceptAllVerifier {
 /// either. `budget` bounds DNS plus the handshake; a set `stop` flag (a
 /// cancelled request) abandons the capture immediately instead of waiting
 /// out that budget, and the caller — which sees the same flag — discards the
-/// verdict this returns for it. Returns the transcript on success; the
-/// panel's `tls_probe_*` parsers consume it exactly like `xray tls ping`
-/// output.
+/// verdict this returns for it. The flag stays a plain shared boolean because
+/// it is the UI request worker's cross-thread stop signal, owned by the
+/// caller that started this blocking thread; the runtime-internal cancels
+/// use `rt::cancel::Cancel` instead. Returns the transcript on
+/// success; the panel's `tls_probe_*` parsers consume it exactly like
+/// `xray tls ping` output.
 pub fn run(
     lang: Language,
     args: &[String],
@@ -307,15 +309,6 @@ fn render_capture(host: &str, port: u16, sni: &str, chain: &[Vec<u8>]) -> String
     .render()
 }
 
-fn sha256_hex(der: &[u8]) -> String {
-    let digest = Sha256::digest(der);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 fn parse_cert(der: &[u8]) -> Option<X509Certificate<'_>> {
     parse_x509_certificate(der).ok().map(|(_, cert)| cert)
 }
@@ -350,69 +343,41 @@ fn cert_allowed_domains(der: &[u8]) -> Option<String> {
     Some(names.join(", "))
 }
 
-/// Renders an encoded IP SAN (4 or 16 bytes) as text.
+/// Renders an encoded IP SAN (4 or 16 bytes) as text. The address types' own
+/// `Display` is the rendering, so an IPv6 SAN prints canonically
+/// (`2001:db8::1`) instead of a hand-joined group list.
 fn render_ip_bytes(bytes: &[u8]) -> String {
     match bytes {
-        [a, b, c, d] => format!("{a}.{b}.{c}.{d}"),
-        bytes if bytes.len() == 16 => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
-            .collect::<Vec<_>>()
-            .join(":"),
-        _ => hex_bytes(bytes),
+        [a, b, c, d] => Ipv4Addr::from([*a, *b, *c, *d]).to_string(),
+        bytes => match <[u8; 16]>::try_from(bytes) {
+            Ok(octets) => Ipv6Addr::from(octets).to_string(),
+            Err(_) => crate::digest::hex(bytes),
+        },
     }
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Splits the probe domain into (host, port): "host" defaults to port 443
-/// (mirroring the core's SplitHostPort); "host:port" splits on the last
-/// colon; a bare IPv6 literal without brackets is kept whole; "[v6]:port"
-/// splits normally.
+/// Splits the probe domain into (host, port): the shared host grammar keeps a
+/// bare IP literal whole and a bracketed host a host; a missing port defaults
+/// to [`DEFAULT_QUIC_PORT`] (mirroring the core's SplitHostPort).
 fn split_host_port(domain: &str) -> Result<(String, u16), String> {
     let domain = domain.trim();
     if domain.is_empty() {
         return Err("domain is empty".into());
     }
-    if domain.starts_with('[') {
-        let Some((rest, port)) = domain.rsplit_once(']') else {
-            return Err("unbalanced '[' in domain".into());
-        };
-        let host = rest.trim_start_matches('[');
-        if host.is_empty() {
-            return Err("empty host".into());
-        }
-        if port.is_empty() {
-            return Ok((host.to_string(), DEFAULT_QUIC_PORT));
-        }
-        let port = port
-            .strip_prefix(':')
-            .ok_or_else(|| format!("expected ':port' after ']' in {domain:?}"))?;
-        let port: u16 = port.parse().map_err(|_| format!("invalid port {port:?}"))?;
-        return Ok((host.to_string(), port));
-    }
-    match domain.rsplit_once(':') {
-        Some((host, _)) if host.contains(':') => {
-            // Bare IPv6 literal without brackets; treat the whole as host.
-            Ok((domain.to_string(), DEFAULT_QUIC_PORT))
-        }
-        Some((host, port)) => {
-            if host.is_empty() {
-                return Err("empty host".into());
-            }
-            let port: u16 = port.parse().map_err(|_| format!("invalid port {port:?}"))?;
-            Ok((host.to_string(), port))
-        }
-        None => Ok((domain.to_string(), DEFAULT_QUIC_PORT)),
-    }
+    let Some(host_port) = crate::model::addr::split(domain) else {
+        return Err(if domain.starts_with('[') {
+            format!("expected ':port' after ']' in {domain:?}")
+        } else if domain.starts_with(':') {
+            "empty host".into()
+        } else {
+            format!("unexpected brackets in {domain:?}")
+        });
+    };
+    let port = match host_port.port {
+        Some(text) => text.parse().map_err(|_| format!("invalid port {text:?}"))?,
+        None => DEFAULT_QUIC_PORT,
+    };
+    Ok((host_port.host.to_string(), port))
 }
 
 #[cfg(test)]
@@ -583,6 +548,8 @@ mod tests {
 
     #[test]
     fn sha256_hex_matches_sha2_direct() {
+        use sha2::{Digest as _, Sha256};
+
         let der = make_cert("h.example.com", &["h.example.com".into()]);
         let digest = Sha256::digest(&der);
         let expected: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -597,7 +564,7 @@ mod tests {
                 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x01,
             ]),
-            "2001:0db8:0000:0000:0000:0000:0000:0001"
+            "2001:db8::1"
         );
         assert_eq!(render_ip_bytes(&[0xab]), "ab");
     }

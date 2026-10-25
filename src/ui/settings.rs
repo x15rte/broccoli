@@ -9,8 +9,8 @@ use egui::{Color32, RichText, Ui};
 
 use super::{CoreSetupMount, SettingsCtx, show_core_setup, status::status_colors_of, widgets};
 use crate::diag::{Diag, DiagError};
+use crate::excerpt::excerpt;
 use crate::i18n::{Key, t, t_fmt};
-use crate::links::excerpt;
 use crate::model::PolicyLevelCfg;
 use crate::model::settings::{Language, geodata_cron_error, geodata_url_error};
 use crate::rt::{CoreCmd, JobKind, TestConfigReply};
@@ -290,9 +290,9 @@ impl GeoDataProvenanceState {
 
     /// Rebuild the rendered status caption when the provenance result or
     /// the language changed; idle frames only compare the memo key.
-    /// The update time renders as the SystemTime Debug string —
-    /// the same representation the routing screen's geodata tooltip shows
-    /// for these files' mtimes (the repo's only mtime display precedent).
+    /// The update time renders as the UTC calendar text the routing
+    /// screen's geodata tooltip also shows for these files' mtimes
+    /// ([`crate::ui::utc_timestamp`]) — the repo's only mtime display.
     fn refresh_caption(&mut self, lang: Language) {
         let Some(result) = &self.result else {
             self.caption = None;
@@ -310,11 +310,11 @@ impl GeoDataProvenanceState {
                 t(lang, Key::SettingsGeodataProvenanceRelease).to_owned()
             }
             sys::core_dl::GeoDataProvenance::UserManaged { updated } => match updated {
-                Some(modified) => t_fmt(
-                    lang,
-                    Key::SettingsGeodataProvenanceUserOn,
-                    &[&format!("{modified:?}")],
-                ),
+                Some(modified) => {
+                    let modified = crate::ui::utc_timestamp(*modified)
+                        .unwrap_or_else(|| t(lang, Key::GeodataModifiedUnavailable).to_owned());
+                    t_fmt(lang, Key::SettingsGeodataProvenanceUserOn, &[&modified])
+                }
                 None => t(lang, Key::SettingsGeodataProvenanceUserUnknown).to_owned(),
             },
             sys::core_dl::GeoDataProvenance::NoCore => return,
@@ -367,10 +367,9 @@ pub struct SettingsScreen {
     /// Latest core validation verdict, rendered under the raw-override
     /// header; replaced on every new click and every terminal.
     test_verdict: Option<(bool, String)>,
-    /// UI-scale caption (`"{:.0}%"`), cached on the zoom factor — the
-    /// appearance combo re-formats it every frame otherwise.
-    /// `None` until the first appearance frame.
-    zoom_caption: Option<(f32, String)>,
+    /// UI-scale caption (`"{:.0}%"`), memoized on the zoom factor — the
+    /// appearance combo would re-format it every frame otherwise.
+    zoom_caption: widgets::Memo<f32, String>,
     /// Per-user-level policy headers, pre-rendered at the model-generation
     /// cadence — each `CollapsingHeader::new(t_fmt(...))` used to format
     /// per level per frame. `None` until the first frame.
@@ -489,14 +488,9 @@ impl SettingsScreen {
             // The zoom caption formats "{:.0}%" from the factor; cache it on
             // the factor so idle frames don't re-format (the factor only
             // changes through this very combo).
-            if !matches!(&self.zoom_caption, Some((factor, _)) if *factor == current_zoom) {
-                self.zoom_caption = Some((current_zoom, format!("{:.0}%", current_zoom * 100.0)));
-            }
-            let zoom_caption = &self
+            let zoom_caption = self
                 .zoom_caption
-                .as_ref()
-                .expect("zoom label populated above")
-                .1;
+                .get(&current_zoom, || format!("{:.0}%", current_zoom * 100.0));
             egui::ComboBox::from_label(t(lang, Key::SettingsUiScale))
                 .selected_text(zoom_caption)
                 .show_ui(ui, |ui| {
@@ -682,6 +676,7 @@ impl SettingsScreen {
                 &mut ctx.settings.env,
                 "XRAY_*",
                 t(lang, Key::ValueLower),
+                t(lang, Key::AddKvRow),
             ) {
                 ctx.hooks.mark_dirty();
             }
@@ -2447,10 +2442,12 @@ mod tests {
             screen,
         );
         harness.run();
+        let stamp =
+            crate::ui::utc_timestamp(geosite_time).expect("an epoch-second fixture renders");
         let expected_caption = t_fmt(
             Language::En,
             Key::SettingsGeodataProvenanceUserOn,
-            &[&format!("{geosite_time:?}")],
+            &[&stamp],
         );
         assert!(
             harness.query_by_label(&expected_caption).is_some(),
@@ -2519,10 +2516,11 @@ mod tests {
         // runs on the UI thread: the worker is the only hash path besides
         // the spawn-failure fallback.
         run_until_provenance_known(&mut harness, "first provenance query");
+        let stamp = crate::ui::utc_timestamp(first).expect("an epoch-second fixture renders");
         let expected = t_fmt(
             Language::En,
             Key::SettingsGeodataProvenanceUserOn,
-            &[&format!("{first:?}")],
+            &[&stamp],
         );
         assert!(
             harness.query_by_label(&expected).is_some(),
@@ -2557,10 +2555,11 @@ mod tests {
             harness.run();
             std::thread::sleep(Duration::from_millis(5));
         }
+        let stamp = crate::ui::utc_timestamp(later).expect("an epoch-second fixture renders");
         let refreshed = t_fmt(
             Language::En,
             Key::SettingsGeodataProvenanceUserOn,
-            &[&format!("{later:?}")],
+            &[&stamp],
         );
         assert!(
             harness.query_by_label(&refreshed).is_some(),
@@ -2630,6 +2629,7 @@ mod tests {
             updated: Some(time),
         });
         screen.geodata_provenance.refresh_caption(Language::En);
+        let stamp = crate::ui::utc_timestamp(time).expect("an epoch-second fixture renders");
         assert_eq!(
             screen
                 .geodata_provenance
@@ -2640,7 +2640,7 @@ mod tests {
             t_fmt(
                 Language::En,
                 Key::SettingsGeodataProvenanceUserOn,
-                &[&format!("{time:?}")]
+                &[&stamp]
             )
         );
         // Both files unreadable/missing → the no-time wording.

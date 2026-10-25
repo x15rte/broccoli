@@ -14,27 +14,16 @@ use crate::ui::{DashboardCtx, PhaseAction, TerminalErrorView};
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
 /// (a 1 Hz stats tick — the only way the history ring changes).
-struct PlotCache {
-    stats_generation: u64,
+struct PlotSeries {
     up: Vec<egui_plot::PlotPoint>,
     down: Vec<egui_plot::PlotPoint>,
-}
-
-/// The memoized latency grid: one pass over profiles + observatory per
-/// generation change, zero per-row lookups or formatting on idle frames.
-/// The language is part of the key because the cached captions are
-/// localized.
-struct GridCache {
-    key: (u64, u64, Language),
-    rows: Vec<LatencyRow>,
 }
 
 /// The memoized listener-traffic table, session totals line, sys-stats
 /// memory line and the stats-block captions: formatted once per stats tick,
 /// traffic-unit or language change, zero per-frame formatting on idle
-/// frames — the same generation contract as the plot and latency caches.
-struct InboundCache {
-    key: (u64, TrafficUnit, Language),
+/// frames — the same generation contract as the plot and latency memos.
+struct InboundTexts {
     /// `(tag, up label, down label, up total label, down total label)` —
     /// per-tag rates and cumulative totals are formatted once per rebuild.
     rows: Vec<(String, String, String, String, String)>,
@@ -123,14 +112,15 @@ impl LatencyCell {
 pub struct DashboardScreen {
     /// Throughput-plot series, rebuilt only when the stats generation
     /// advances.
-    plot_cache: Option<PlotCache>,
+    plot_cache: widgets::Memo<u64, PlotSeries>,
     /// Latency-grid rows, rebuilt only when `(model generation,
-    /// latency_generation, language)` advances.
-    grid_cache: Option<GridCache>,
+    /// latency_generation, language)` advances. The language is part of the
+    /// key because the cached captions are localized.
+    grid_cache: widgets::Memo<(u64, u64, Language), Vec<LatencyRow>>,
     /// Listener-traffic rows, the session totals and the memory line,
     /// rebuilt only when the stats generation, the traffic unit or the
     /// language changes.
-    inbound_cache: Option<InboundCache>,
+    inbound_cache: widgets::Memo<(u64, TrafficUnit, Language), InboundTexts>,
     /// Header-row labels (phase badge, endpoint rows), rebuilt only when a
     /// phase/endpoint/persist/language/core-start change moved them.
     header_cache: Option<HeaderCache>,
@@ -141,35 +131,24 @@ impl DashboardScreen {
     /// stats generation advanced — a stats tick is the only way the history
     /// ring changes. The cached generation is the rebuild key the tests pin:
     /// an idle frame reuses the series it already holds.
-    fn plot_series(&mut self, ctx: &DashboardCtx<'_>) -> &PlotCache {
-        let generation = ctx.stats_generation;
-        if !self
-            .plot_cache
-            .as_ref()
-            .is_some_and(|cache| cache.stats_generation == generation)
-        {
+    fn plot_series(&mut self, ctx: &DashboardCtx<'_>) -> &PlotSeries {
+        self.plot_cache.get(&ctx.stats_generation, || {
             let n = ctx.stats_history.len();
-            let up = ctx
-                .stats_history
-                .iter()
-                .enumerate()
-                .map(|(i, s)| egui_plot::PlotPoint::new(i as f64 - n as f64, s.up as f64))
-                .collect();
-            let down = ctx
-                .stats_history
-                .iter()
-                .enumerate()
-                .map(|(i, s)| egui_plot::PlotPoint::new(i as f64 - n as f64, s.down as f64))
-                .collect();
-            self.plot_cache = Some(PlotCache {
-                stats_generation: generation,
-                up,
-                down,
-            });
-        }
-        self.plot_cache
-            .as_ref()
-            .expect("plot cache populated above")
+            PlotSeries {
+                up: ctx
+                    .stats_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| egui_plot::PlotPoint::new(i as f64 - n as f64, s.up as f64))
+                    .collect(),
+                down: ctx
+                    .stats_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| egui_plot::PlotPoint::new(i as f64 - n as f64, s.down as f64))
+                    .collect(),
+            }
+        })
     }
 
     /// The latency grid's memoized rows for this frame: one pass per
@@ -177,25 +156,13 @@ impl DashboardScreen {
     /// per-row lookups or formatting on idle frames. The model generation is
     /// the edit signal (a rename or an added profile); the latency generation
     /// carries the observatory and probe results the rows render.
-    fn latency_rows(&mut self, ctx: &DashboardCtx<'_>) -> &GridCache {
+    fn latency_rows(&mut self, ctx: &DashboardCtx<'_>) -> &[LatencyRow] {
         let key = (
             ctx.hooks.model_generation(),
             ctx.latency_generation,
             ctx.settings.language,
         );
-        if !self
-            .grid_cache
-            .as_ref()
-            .is_some_and(|cache| cache.key == key)
-        {
-            self.grid_cache = Some(GridCache {
-                key,
-                rows: build_latency_rows(ctx),
-            });
-        }
-        self.grid_cache
-            .as_ref()
-            .expect("grid cache populated above")
+        self.grid_cache.get(&key, || build_latency_rows(ctx))
     }
 
     /// The listener-traffic rows, session totals line and sys-stats memory
@@ -204,17 +171,13 @@ impl DashboardScreen {
     /// generation contract as the plot and latency caches). The rows are
     /// the dynamic tag set from the core's `inbound>>>` counters — no
     /// coupling to the generated config.
-    fn inbound_cache(&mut self, ctx: &DashboardCtx<'_>) -> &InboundCache {
+    fn inbound_texts(&mut self, ctx: &DashboardCtx<'_>) -> &InboundTexts {
         let key = (
             ctx.stats_generation,
             ctx.settings.traffic_unit,
             ctx.settings.language,
         );
-        if !self
-            .inbound_cache
-            .as_ref()
-            .is_some_and(|cache| cache.key == key)
-        {
+        self.inbound_cache.get(&key, || {
             let lang = ctx.settings.language;
             let unit = ctx.settings.traffic_unit;
             // t_fmt takes &[&dyn Display]; a bare `&str` element does not
@@ -279,17 +242,13 @@ impl DashboardScreen {
                 }
                 None => (Vec::new(), None, None, None),
             };
-            self.inbound_cache = Some(InboundCache {
-                key,
+            InboundTexts {
                 rows,
                 memory,
                 uptime,
                 goroutines,
-            });
-        }
-        self.inbound_cache
-            .as_ref()
-            .expect("inbound cache populated above")
+            }
+        })
     }
 
     /// The header-row labels for this frame (phase badge, per-endpoint
@@ -607,7 +566,7 @@ impl DashboardScreen {
                     ui.separator();
                     // The cache reads the current unit internally, so a
                     // same-frame unit change applies immediately.
-                    let inbound_cache = self.inbound_cache(ctx);
+                    let inbound_texts = self.inbound_texts(ctx);
                     if ctx.stats.is_some() {
                         // Uptime/goroutines/memory captions ride the inbound
                         // cache's stats-tick rebuild. The
@@ -615,13 +574,13 @@ impl DashboardScreen {
                         // (ui::topbar); the sys-stats surface costs no
                         // extra RPCs — the 1 Hz tick already fetches the
                         // whole struct.
-                        if let Some(uptime) = &inbound_cache.uptime {
+                        if let Some(uptime) = &inbound_texts.uptime {
                             ui.label(uptime);
                         }
-                        if let Some(goroutines) = &inbound_cache.goroutines {
+                        if let Some(goroutines) = &inbound_texts.goroutines {
                             ui.label(goroutines);
                         }
-                        if let Some(memory) = &inbound_cache.memory {
+                        if let Some(memory) = &inbound_texts.memory {
                             ui.label(memory);
                         }
                     } else {
@@ -641,7 +600,7 @@ impl DashboardScreen {
                 // uptime/goroutines/memory.
                 let lang = ctx.settings.language;
                 let unit = ctx.settings.traffic_unit;
-                let plot_cache = self.plot_series(ctx);
+                let series = self.plot_series(ctx);
                 // Explicit global id: `PlotMemory` is keyed by it, so the
                 // chart's bounds are observable from tests (and the id no
                 // longer shifts when the surrounding layout changes).
@@ -674,11 +633,11 @@ impl DashboardScreen {
                     .show(ui, |plot| {
                         plot.line(egui_plot::Line::new(
                             t(lang, Key::PlotUp),
-                            egui_plot::PlotPoints::Borrowed(&plot_cache.up),
+                            egui_plot::PlotPoints::Borrowed(&series.up),
                         ));
                         plot.line(egui_plot::Line::new(
                             t(lang, Key::PlotDown),
-                            egui_plot::PlotPoints::Borrowed(&plot_cache.down),
+                            egui_plot::PlotPoints::Borrowed(&series.down),
                         ));
                     });
                 ui.separator();
@@ -700,11 +659,22 @@ impl DashboardScreen {
                             ui.strong(t(lang, Key::GridDetail));
                             ui.end_row();
                             let colors = status_colors_of(ui);
-                            for row in &grid.rows {
+                            for row in grid {
                                 ui.label(&row.name);
                                 ui.monospace(&row.tag);
                                 latency_cell(ui, &row.cell, colors, lang);
-                                let response = ui.label(&row.detail_short);
+                                // The row's detail is pre-truncated to 60
+                                // chars (the memoized grid's per-frame
+                                // galley stays bounded); `Label::truncate`
+                                // clamps it to the column's width instead of
+                                // painting over the next one, and a detail
+                                // the rebuild cut short keeps its full text
+                                // on hover.
+                                let response = ui.add(
+                                    egui::Label::new(&row.detail_short)
+                                        .truncate()
+                                        .show_tooltip_when_elided(true),
+                                );
                                 if row.detail_truncated {
                                     response.on_hover_text(&row.detail_full);
                                 }
@@ -719,7 +689,7 @@ impl DashboardScreen {
                 // report a row, so the empty table is explained in place; an
                 // empty table with a listener configured is the first tick
                 // arriving late, not a gap, and stays silent.
-                let inbound_rows = &self.inbound_cache(ctx).rows;
+                let inbound_rows = &self.inbound_texts(ctx).rows;
                 let no_listener_hint =
                     inbound_rows.is_empty() && missing_inbound_listener(ctx.phase, ctx.settings);
                 if !inbound_rows.is_empty() || no_listener_hint {
@@ -754,7 +724,10 @@ impl DashboardScreen {
     }
 }
 
-const LATENCY_BAR_SIZE: egui::Vec2 = egui::Vec2::new(56.0, 5.0);
+/// Width of a latency cell's bar.
+const LATENCY_BAR_WIDTH: f32 = 56.0;
+/// Height of a latency cell's bar: a hairline against the row's text.
+const LATENCY_BAR_HEIGHT: f32 = 5.0;
 /// The delay at which a latency bar is full: the same point the latency
 /// color turns red.
 const LATENCY_BAR_FULL_MS: f32 = 1000.0;
@@ -762,22 +735,28 @@ const LATENCY_BAR_FULL_MS: f32 = 1000.0;
 const LATENCY_BAR_MIN_FRACTION: f32 = 0.06;
 
 /// A latency cell: a short bar scaled to the delay beside its text. A cell
-/// with no delay shows the empty track.
+/// with no delay shows the empty track, and only a measured delay colors
+/// the fill, so a dead row's red text does not paint a bar.
 fn latency_cell(ui: &mut egui::Ui, cell: &LatencyCell, colors: StatusColors, lang: Language) {
     let presentation = cell.presentation(colors, ui.visuals().text_color(), lang);
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(LATENCY_BAR_SIZE, egui::Sense::hover());
-        let radius = LATENCY_BAR_SIZE.y / 2.0;
-        ui.painter()
-            .rect_filled(rect, radius, ui.visuals().widgets.inactive.bg_fill);
-        if let Some(ms) = presentation.delay_ms {
-            let fraction = (ms as f32 / LATENCY_BAR_FULL_MS).clamp(LATENCY_BAR_MIN_FRACTION, 1.0);
-            let filled = egui::Rect::from_min_size(
-                rect.min,
-                egui::vec2(rect.width() * fraction, rect.height()),
-            );
-            ui.painter().rect_filled(filled, radius, presentation.color);
-        }
+        let fraction = presentation.delay_ms.map_or(0.0, |ms| {
+            (ms as f32 / LATENCY_BAR_FULL_MS).clamp(LATENCY_BAR_MIN_FRACTION, 1.0)
+        });
+        // A cell with no delay fills the track with the track's own color:
+        // `ProgressBar` paints its fill at least the corner radius wide, and
+        // that stub must not show as a mark on an unmeasured row.
+        let fill = if presentation.delay_ms.is_some() {
+            presentation.color
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        ui.add(
+            egui::ProgressBar::new(fraction)
+                .desired_width(LATENCY_BAR_WIDTH)
+                .desired_height(LATENCY_BAR_HEIGHT)
+                .fill(fill),
+        );
         ui.colored_label(presentation.color, presentation.text);
     });
 }
@@ -1152,8 +1131,8 @@ mod tests {
         truncate_chars, tun_status, y_axis_label_for,
     };
     use crate::diag::Diag;
+    use crate::excerpt::excerpt;
     use crate::i18n::{Key, t, t_fmt};
-    use crate::links::excerpt;
     use crate::model::settings::{Language, TrafficUnit};
     use crate::model::{
         DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Mode, OutboundModel, Protocol,
@@ -1946,13 +1925,8 @@ mod tests {
         harness.run();
         let seeded_generation = rig.borrow().stats_generation;
         assert_eq!(
-            harness
-                .state()
-                .plot_cache
-                .as_ref()
-                .unwrap()
-                .stats_generation,
-            seeded_generation,
+            harness.state().plot_cache.key(),
+            Some(&seeded_generation),
             "the first render must seed the plot cache from the live stats generation"
         );
         harness
@@ -1972,16 +1946,25 @@ mod tests {
         // -> the plot cache keeps its generation key and its series
         // allocation (a per-frame rebuild would replace the `up` vector),
         // and the grid keeps its memoized values.
-        let (idle_generation, idle_series) = {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
-            (cache.stats_generation, cache.up.as_ptr())
-        };
+        let idle_generation = harness.state().plot_cache.key().copied();
+        let idle_series = harness
+            .state()
+            .plot_cache
+            .value()
+            .expect("the first render seeds the plot series")
+            .up
+            .as_ptr();
         harness.run_steps(30);
         {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
-            assert_eq!(cache.stats_generation, idle_generation);
+            assert_eq!(harness.state().plot_cache.key().copied(), idle_generation);
             assert_eq!(
-                cache.up.as_ptr(),
+                harness
+                    .state()
+                    .plot_cache
+                    .value()
+                    .expect("the idle frames keep the plot series")
+                    .up
+                    .as_ptr(),
                 idle_series,
                 "idle frames must not rebuild the plot series"
             );
@@ -2000,24 +1983,34 @@ mod tests {
         let ticked_generation = rig.borrow().stats_generation;
         harness.run();
         let ticked_series = {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
             assert_eq!(
-                cache.stats_generation, ticked_generation,
+                harness.state().plot_cache.key(),
+                Some(&ticked_generation),
                 "one stats tick must rebuild the plot series exactly once"
             );
+            let series = harness
+                .state()
+                .plot_cache
+                .value()
+                .expect("the tick rebuilds the plot series");
             assert_eq!(
-                cache.up.len(),
+                series.up.len(),
                 2,
                 "the rebuilt series must cover the seeded entry plus the ticked one"
             );
-            cache.up.as_ptr()
+            series.up.as_ptr()
         };
         harness.run_steps(10);
         {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
-            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(harness.state().plot_cache.key(), Some(&ticked_generation));
             assert_eq!(
-                cache.up.as_ptr(),
+                harness
+                    .state()
+                    .plot_cache
+                    .value()
+                    .expect("frames after the tick keep the plot series")
+                    .up
+                    .as_ptr(),
                 ticked_series,
                 "frames after the tick must not rebuild again"
             );
@@ -2044,10 +2037,15 @@ mod tests {
         );
         harness.run_steps(10);
         {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
-            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(harness.state().plot_cache.key(), Some(&ticked_generation));
             assert_eq!(
-                cache.up.as_ptr(),
+                harness
+                    .state()
+                    .plot_cache
+                    .value()
+                    .expect("an observatory tick keeps the plot series")
+                    .up
+                    .as_ptr(),
                 ticked_series,
                 "an observatory tick must not rebuild the plot series"
             );
@@ -2061,10 +2059,15 @@ mod tests {
             .next()
             .expect("a persist-generation bump rebuilds the grid rows");
         {
-            let cache = harness.state().plot_cache.as_ref().unwrap();
-            assert_eq!(cache.stats_generation, ticked_generation);
+            assert_eq!(harness.state().plot_cache.key(), Some(&ticked_generation));
             assert_eq!(
-                cache.up.as_ptr(),
+                harness
+                    .state()
+                    .plot_cache
+                    .value()
+                    .expect("a model change keeps the plot series")
+                    .up
+                    .as_ptr(),
                 ticked_series,
                 "a model change must not rebuild the plot series"
             );

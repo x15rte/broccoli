@@ -13,6 +13,8 @@
 
 use std::time::{Duration, Instant};
 
+use md5::Digest as _;
+
 use crate::r#gen::keys;
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -50,93 +52,19 @@ impl Drop for DevInfoGuard {
     }
 }
 
-/// RFC 1321 MD5. Used only to derive xray's deterministic wintun instance
-/// GUID from the adapter name; not a security primitive here.
-fn md5(input: &[u8]) -> [u8; 16] {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    const K: [u32; 64] = [
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
-        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
-        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
-        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
-        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
-        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
-        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
-        0xeb86d391,
-    ];
-
-    let (mut a0, mut b0, mut c0, mut d0) = (
-        0x6745_2301u32,
-        0xefcd_ab89u32,
-        0x98ba_dcfeu32,
-        0x1032_5476u32,
-    );
-
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut msg = input.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut m = [0u32; 16];
-        for (word, bytes) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
-            *word = u32::from_le_bytes(*bytes);
-        }
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        for i in 0..64 {
-            let (f, g) = if i < 16 {
-                ((b & c) | (!b & d), i)
-            } else if i < 32 {
-                ((d & b) | (!d & c), (5 * i + 1) % 16)
-            } else if i < 48 {
-                (b ^ c ^ d, (3 * i + 5) % 16)
-            } else {
-                (c ^ (b | !d), (7 * i) % 16)
-            };
-            let next = b.wrapping_add(
-                f.wrapping_add(a)
-                    .wrapping_add(K[i])
-                    .wrapping_add(m[g])
-                    .rotate_left(S[i]),
-            );
-            a = d;
-            d = c;
-            c = b;
-            b = next;
-        }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&a0.to_le_bytes());
-    out[4..8].copy_from_slice(&b0.to_le_bytes());
-    out[8..12].copy_from_slice(&c0.to_le_bytes());
-    out[12..16].copy_from_slice(&d0.to_le_bytes());
-    out
-}
-
 /// The wintun adapter instance GUID xray derives for an adapter name:
 /// `md5(name)` with the first three fields little-endian (the `windows.GUID`
 /// layout in xray's `tun_windows.go`).
 pub fn adapter_guid(name: &str) -> GUID {
-    let d = md5(name.as_bytes());
+    let digest: [u8; 16] = md5::Md5::digest(name.as_bytes()).into();
     GUID {
-        data1: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
-        data2: u16::from_le_bytes([d[4], d[5]]),
-        data3: u16::from_le_bytes([d[6], d[7]]),
-        data4: [d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]],
+        data1: u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]),
+        data2: u16::from_le_bytes([digest[4], digest[5]]),
+        data3: u16::from_le_bytes([digest[6], digest[7]]),
+        data4: [
+            digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14],
+            digest[15],
+        ],
     }
 }
 
@@ -195,20 +123,8 @@ fn instance_id_of(devinfo: HDEVINFO, data: &SP_DEVINFO_DATA) -> Result<Option<St
 
 /// Canonical `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` form of a GUID.
 fn format_guid(guid: &GUID) -> String {
-    format!(
-        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        guid.data1,
-        guid.data2,
-        guid.data3,
-        guid.data4[0],
-        guid.data4[1],
-        guid.data4[2],
-        guid.data4[3],
-        guid.data4[4],
-        guid.data4[5],
-        guid.data4[6],
-        guid.data4[7],
-    )
+    let uuid = uuid::Uuid::from_fields(guid.data1, guid.data2, guid.data3, &guid.data4);
+    format!("{{{uuid:X}}}")
 }
 
 /// Whether an instance ID (`SWD\WINTUN\{GUID}`) belongs to the adapter name's
@@ -387,18 +303,6 @@ pub fn staged_tun_adapter_name(config_json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(digest: [u8; 16]) -> String {
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    #[test]
-    fn md5_known_vectors() {
-        assert_eq!(hex(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(hex(md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(hex(md5(b"tun0")), "b7e39bd8fa6ded9b1ba0bac340ca2c1c");
-        assert_eq!(hex(md5(b"broccoli0")), "54c81dc2f203a0ae84d29c7ac601c070");
-    }
 
     #[test]
     fn adapter_guid_matches_observed_instances() {

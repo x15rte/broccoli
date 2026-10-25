@@ -279,6 +279,13 @@ impl LogGate {
 /// next drain cycle picks it up within milliseconds. The value comes back
 /// ([`HandOff`]) when the window ran out or the receiver is gone, so each hop
 /// decides for itself what an undeliverable value means.
+///
+/// The wait is composed from `try_send` plus the retry sleep because std has
+/// no bounded synchronous send on a stable toolchain — `SyncSender::send`
+/// blocks without a deadline (and would deadlock the runtime thread against
+/// the GUI thread's join on shutdown), while `send_timeout` is still nightly
+/// — and the sender here is the std channel the GUI thread drains, outside
+/// any async send primitive.
 pub(crate) fn hand_within<T>(
     mut value: T,
     window: Duration,

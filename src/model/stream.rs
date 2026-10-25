@@ -8,7 +8,7 @@ use super::{
     Int32Range, fold_eq, fold_lower, skip_empty_map, skip_empty_str, skip_empty_vec, skip_false,
     skip_zero_u32,
 };
-use crate::links::excerpt;
+use crate::excerpt::excerpt;
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};

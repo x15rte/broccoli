@@ -348,45 +348,23 @@ pub fn sweep_stale_probe_dirs() -> std::io::Result<usize> {
 
 /// The sweep body behind [`sweep_stale_probe_dirs`], with the base directory,
 /// the clock and the age bound injected so the naming contract and the age
-/// comparison are unit-testable.
+/// comparison are unit-testable. The rules themselves are the shared
+/// [`sweep`](super::sweep::sweep) ones; this binds the caller's own naming
+/// contract and directory kind.
 fn cleanup_stale_probe_dirs(
     dir: &Path,
     now: std::time::SystemTime,
     max_age: Duration,
 ) -> std::io::Result<usize> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        // Best-effort housekeeping: an entry that races away or cannot be
-        // inspected must not abort the sweep of the remaining entries.
-        let Ok(entry) = entry else { continue };
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(PROBE_TEMP_PREFIX) {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        // A directory stamped in the future (clock skew) counts as recent
-        // and is kept — the sweep must never delete a probe that may be
-        // live.
-        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-        if age >= max_age && std::fs::remove_dir_all(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    super::sweep::sweep(
+        dir,
+        now,
+        max_age,
+        // The probe's temp dirs carry no filename suffix: the prefix is the
+        // whole naming contract.
+        super::sweep::Matcher::directories(PROBE_TEMP_PREFIX, ""),
+        None,
+    )
 }
 
 #[cfg(test)]

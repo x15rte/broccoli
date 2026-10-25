@@ -19,6 +19,11 @@ audit-as-crates-io = false
 [policy.wgpu-hal]
 audit-as-crates-io = false
 
+[[exemptions.md-5]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "RustCrypto MD5 with default features off (no oid), used only to derive xray's deterministic wintun adapter GUID; the digest algorithm is not a security primitive here."
+
 [[exemptions.nix]]
 version = "0.31.3"
 criteria = "safe-to-deploy"

@@ -552,40 +552,17 @@ impl InboundsScreen {
                     // editors only: the section-wide `changed` flag is set by
                     // any row's any field (a keystroke in row 0 would
                     // otherwise rebuild every seeded row's map every frame).
-                    let mut map_changed = false;
-                    let mut del: Option<usize> = None;
-                    for (j, (k, v)) in rows.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(k)
-                                        .desired_width(70.0)
-                                        .hint_text("53"),
-                                )
-                                .changed()
-                                || ui
-                                    .add(
-                                        egui::TextEdit::singleline(v)
-                                            .desired_width(170.0)
-                                            .hint_text("8.8.8.8:53"),
-                                    )
-                                    .changed()
-                            {
-                                map_changed = true;
-                            }
-                            if ui.button(t(lang, Key::DeleteRow)).clicked() {
-                                del = Some(j);
-                            }
-                        });
-                    }
-                    if let Some(j) = del {
-                        rows.remove(j);
-                        map_changed = true;
-                    }
-                    if ui.button(t(lang, Key::InboundsAddPortMapping)).clicked() {
-                        rows.push((String::new(), String::new()));
-                        map_changed = true;
-                    }
+                    // The rows are the shared two-column table, so the
+                    // editor's layout (key width, delete pinning, add row) is
+                    // the one `kv_table` documents.
+                    let map_changed = widgets::kv_table(
+                        ui,
+                        lang,
+                        rows,
+                        "53",
+                        "8.8.8.8:53",
+                        t(lang, Key::InboundsAddPortMapping),
+                    );
                     if map_changed {
                         changed = true;
                         d.port_map = rows
@@ -1133,11 +1110,8 @@ pub(crate) fn sniffing_editor(
             &mut s.ips_excluded,
             "1.2.3.0/24",
         );
-        changed |= crate::ui::routing::opt_bool(
-            ui,
-            t(lang, Key::SniffingMetadataOnly),
-            &mut s.metadata_only,
-        );
+        changed |=
+            widgets::opt_bool_flag(ui, t(lang, Key::SniffingMetadataOnly), &mut s.metadata_only);
         changed |= ui
             .checkbox(&mut s.route_only, t(lang, Key::SniffingRouteOnly))
             .changed();

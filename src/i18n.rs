@@ -132,7 +132,7 @@
 //! "Apply to server": installing a pin is not the configuration action, and
 //! the phrase stays.
 
-use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+use crate::model::safety::{HazardClass, SafetyCode};
 use crate::model::settings::Language;
 use crate::model::stream::Network;
 use crate::model::validation::{ValidationCode, ValidationIssue};
@@ -2516,461 +2516,474 @@ fn fill_message_template(template: &str, args: &[&dyn std::fmt::Display]) -> Str
     fill_placeholders(template, args)
 }
 
-/// The locale template of one model-validation rule. Exhaustive over
-/// [`ValidationCode`], so a code forgotten here is a compile error. Where the
-/// underlying text is unchanged it reuses the existing `Key` table entry;
-/// parameterized rules (e.g. `FinalmaskPortListInvalid(..)`) return the
-/// static template that [`validation_message`] fills with the code-carried
-/// value. Private: rendering goes through [`validation_message`], so no
-/// caller can receive a template and forget the payload.
-fn validation_template(code: &ValidationCode, lang: Language) -> &'static str {
+/// Resolve one model-validation rule to the locale key whose template renders
+/// it and the values that template interpolates, in template order. One arm
+/// per code returns both together, so a rule's key and its payload cannot
+/// drift onto different codes the way parallel matches could. Exhaustive over
+/// [`ValidationCode`], so a code forgotten here is a compile error; where the
+/// underlying text is unchanged the key reuses the existing table entry.
+///
+/// The values are the code's own payload, Debug-quoted exactly where the
+/// pre-pass generator used `{:?}` and rendered where the message names another
+/// rule's text (the sniffing/listen codes carry inner messages, one text per
+/// rule, never re-derived). A rule that starts carrying a payload without
+/// stating it here fails loudly: [`validation_message`] fills every code
+/// through [`fill_message_template`], whose placeholder-count assertion covers
+/// the whole universe.
+fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) {
     use ValidationCode::*;
     match code {
-        XhttpDepthExceeded => t(lang, Key::SrvDownloadNestingExceeds),
-        TransportSettingsMissing(network) => match network {
-            Network::Xhttp => t(lang, Key::SrvXhttpSettingsMissing),
-            Network::Kcp => t(lang, Key::SrvKcpSettingsMissing),
-            Network::Grpc => t(lang, Key::SrvGrpcSettingsMissing),
-            Network::Ws => t(lang, Key::SrvWsSettingsMissing),
-            Network::Httpupgrade => t(lang, Key::SrvHttpupgradeSettingsMissing),
-            Network::Hysteria => t(lang, Key::SrvHysteriaTransportSettingsMissing),
-            Network::Masque => t(lang, Key::SrvMasqueSettingsMissing),
-            Network::Xdrive => t(lang, Key::SrvXdriveSettingsMissing),
-            Network::Raw => {
-                debug_assert!(false, "TransportSettingsMissing cannot name raw");
-                t(lang, Key::SrvXhttpSettingsMissing)
-            }
-        },
-        HeaderValuesNotStrings(network) => match network {
-            // The rule is the same one the share-link grammar applies, so the
-            // text is reused rather than duplicated.
-            Network::Xhttp => t(lang, Key::LinkXhttpHeaderValues),
-            Network::Ws => t(lang, Key::LinkWsHeaderValues),
-            Network::Httpupgrade => t(lang, Key::LinkHttpupgradeHeaderValues),
-            Network::Masque => t(lang, Key::SrvMasqueHeaderValues),
-            _ => {
-                debug_assert!(false, "HeaderValuesNotStrings cannot name {network:?}");
-                t(lang, Key::LinkWsHeaderValues)
-            }
-        },
-        HysteriaTransportRequiresTls => t(lang, Key::SrvHysteriaTransportTls),
-        HysteriaTransportVersion => t(lang, Key::SrvHysteriaVersion),
-        MasqueTransportRequiresMasqueOutbound => t(lang, Key::SrvMasqueOutboundTransport),
-        MasqueOutboundRequiresMasqueTransport => t(lang, Key::SrvMasqueTransportMissing),
-        MasqueTransportRequiresTls => t(lang, Key::SrvMasqueTransportTls),
-        MasqueSettingsIncomplete => t(lang, Key::SrvMasqueSettingsIncomplete),
-        MasqueRemoteDnsInvalid => t(lang, Key::SrvMasqueRemoteDns),
-        MasquePathInvalid => t(lang, Key::SrvMasquePathInvalid),
-        MasqueHostInvalid => t(lang, Key::SrvMasqueHostInvalid),
-        MasqueHeaderInvalid(_) => t(lang, Key::SrvMasqueHeaderInvalid),
-        MasqueReservedHeader(_) => t(lang, Key::SrvMasqueReservedHeader),
-        MasqueAuthorizationConflict => t(lang, Key::SrvMasqueAuthorizationConflict),
-        MasqueUserColon => t(lang, Key::SrvMasqueUserColon),
-        MasqueAlpnPrefersHttp3 => t(lang, Key::SrvMasqueAlpnHttp3),
-        MasqueWarpPrivateKeyInvalid => t(lang, Key::SrvMasqueWarpPrivateKeyInvalid),
-        MasqueWarpPublicKeyInvalid => t(lang, Key::SrvMasqueWarpPublicKeyInvalid),
-        MasqueWarpAddressInvalid => t(lang, Key::SrvMasqueWarpAddressInvalid),
-        MasqueWarpAddressShape => t(lang, Key::SrvMasqueWarpAddressShape),
-        MasqueWarpCredentialsConflict => t(lang, Key::SrvMasqueWarpCredentialsConflict),
-        XdriveServiceUnsupported(_) => t(lang, Key::SrvXdriveServiceUnsupported),
-        XdriveServiceMissing => t(lang, Key::SrvXdriveServiceMissing),
-        XdriveDriveSecretsInvalid => t(lang, Key::SrvXdriveDriveSecrets),
-        XdriveTemplateMissing => t(lang, Key::SrvXdriveTemplateObject),
-        XdriveRemoteFolderRequired => t(lang, Key::SrvXdriveRemoteFolderRequired),
-        XdriveTemplateOperationUrlRequired(_) => t(lang, Key::SrvXdriveOperationUrl),
-        XdriveTemplateNamesRegexInvalid => t(lang, Key::SrvXdriveNamesRegexInvalid),
-        XdriveTemplateAuthTypeUnsupported(_) => t(lang, Key::SrvXdriveAuthTypeUnsupported),
-        XdriveTemplateTokenUrlRequired => t(lang, Key::SrvXdriveTokenUrlRequired),
-        XdriveTemplateHeaderValuesNotStrings => t(lang, Key::SrvXdriveHeaderValues),
-        XdriveScalarClamped => t(lang, Key::SrvXdriveScalarClamped),
-        XdriveRequiresVless => t(lang, Key::SrvXdriveRequiresVless),
-        XdriveVlessFlowUnsupported => t(lang, Key::SrvXdriveVlessFlow),
-        XdriveVlessEncryptionRequired => t(lang, Key::SrvXdriveVlessEncryption),
-        XdriveMuxRequired => t(lang, Key::SrvXdriveMuxRequired),
-        XdriveMuxConcurrencyNegative => t(lang, Key::SrvXdriveMuxConcurrencyNegative),
-        XdriveMuxXudpProxyUdp443Skip => t(lang, Key::SrvXdriveMuxXudpSkip),
-        XdriveVlessTestpreUnsupported => t(lang, Key::SrvXdriveTestpre),
-        XdriveDriveServiceRenamed => t(lang, Key::SrvXdriveDriveRenamed),
-        XdriveH3MaskNotNoise(_) => t(lang, Key::SrvXdriveH3MaskNotNoise),
-        XdriveH3CongestionBrutal => t(lang, Key::SrvXdriveH3BrutalCongestion),
-        RealityRequiresTransport => t(lang, Key::SrvRealityRequiresTransport),
-        RealitySettingsMissing => t(lang, Key::SrvRealitySettingsMissing),
-        TlsSettingsMissing => t(lang, Key::SrvTlsSettingsMissing),
-        StreamOneNoDownload => t(lang, Key::SrvStreamOneNoDownload),
-        MasterKeyLogNotSupported => t(lang, Key::SrvMasterKeyLogNotSupported),
-        OutboundProxySettingsRemoved => t(lang, Key::SrvProxySettingsRemoved),
-        TlsAllowInsecureRemoved => t(lang, Key::SrvAllowInsecureRemoved),
-        ShadowsocksLevelRange => t(lang, Key::SrvShadowsocksLevelRangeShort),
-        BlackholeResponseInvalid => t(lang, Key::SrvBlackholeResponseInvalidShort),
-        BlackholeCustomResponseDataInvalid => t(lang, Key::SrvBlackholeCustomDataInvalid),
-        VisionRequiresTlsOrReality => t(lang, Key::OutboundVisionRequiresTls),
-        PublicVlessRequiresTlsOrEncryption => t(lang, Key::OutboundPublicVlessNeedsTls),
-        PublicTrojanRequiresTlsOrReality => t(lang, Key::OutboundPublicTrojanNeedsTls),
-        ListenAddressInvalid => t(lang, Key::ListenAddressInvalid),
-        MuxWithVisionFlow => t(lang, Key::OutboundMuxWithVisionFlow),
-        ServerNameImplausible => t(lang, Key::OutboundServerNameImplausible),
-        VlessFlowUnsupported => t(lang, Key::OutboundVlessFlowUnsupported),
-        VlessEncryptionUnsupported => t(lang, Key::OutboundVlessEncryptionUnsupported),
-        ShadowsocksMethodUnsupported => t(lang, Key::OutboundShadowsocksMethodUnsupported),
-        Shadowsocks2022KeyInvalid => t(lang, Key::OutboundShadowsocks2022KeyInvalid),
-        TrojanSettingsIncomplete => t(lang, Key::OutboundTrojanSettingsIncomplete),
-        ShadowsocksSettingsIncomplete => t(lang, Key::OutboundShadowsocksSettingsIncomplete),
-        SettingsPortZero => t(lang, Key::OutboundSettingsPortZero),
-        SettingsIdNotUuid => t(lang, Key::OutboundSettingsIdNotUuid),
-        RealityPublicKeyInvalid => t(lang, Key::OutboundRealityPublicKeyInvalid),
-        RealityShortIdInvalid => t(lang, Key::OutboundRealityShortIdInvalid),
-        RealitySpiderXInvalid => t(lang, Key::OutboundRealitySpiderXInvalid),
-        RealityMldsa65Invalid => t(lang, Key::OutboundRealityMldsa65Invalid),
-        TlsFingerprintUnsupported => t(lang, Key::OutboundTlsFingerprintUnsupported),
-        RealityFingerprintUnsupported => t(lang, Key::OutboundRealityFingerprintUnsupported),
-        RealityFingerprintUntested(_) => t(lang, Key::OutboundRealityFingerprintUntested),
-        PinnedPeerCertSha256Invalid => t(lang, Key::OutboundPinnedPeerCertSha256Invalid),
-        TlsVersionRangeInvalid => t(lang, Key::OutboundTlsVersionRangeInvalid),
-        TlsMinExceedsMax => t(lang, Key::SrvMinVersionExceedsMax),
-        XhttpModeUnsupported => t(lang, Key::SrvXhttpModeUnsupported),
-        XhttpPaddingBytesInvalid => t(lang, Key::SrvXhttpPaddingBytesInvalid),
-        XhttpPaddingPlacementInvalid => t(lang, Key::SrvXhttpPaddingPlacementInvalid),
-        XhttpPaddingMethodInvalid => t(lang, Key::SrvXhttpPaddingMethodInvalid),
-        XhttpUplinkDataPlacementInvalid => t(lang, Key::SrvXhttpUplinkPlacementInvalid),
-        XhttpUplinkDataPlacementRequiresPacketUp => t(lang, Key::SrvXhttpUplinkPlacementPacketUp),
-        XhttpUplinkHttpMethodRequiresPacketUp => t(lang, Key::SrvXhttpUplinkMethodPacketUp),
-        XhttpSessionIdPlacementInvalid => t(lang, Key::SrvXhttpSessionPlacementInvalid),
-        XhttpSeqPlacementInvalid => t(lang, Key::SrvXhttpSeqPlacementInvalid),
-        XhttpSessionIdLengthRequired => t(lang, Key::SrvXhttpSessionLengthRequired),
-        XhttpSessionIdTableInvalid => t(lang, Key::SrvXhttpSessionTableInvalid),
-        XmuxLimitsExclusive => t(lang, Key::SrvXmuxLimitsExclusive),
-        XhttpExtraShadowsSettings(_) => t(lang, Key::XhttpExtraShadowsSettings),
-        SniffingDestOverrideInvalid => t(lang, Key::SniffingDestOverrideInvalid),
-        OutboundTargetStrategyInvalid => t(lang, Key::OutboundTargetStrategyInvalid),
-        SockoptTproxySilentOff => t(lang, Key::SockoptTproxySilentOff),
-        KcpRangeSoft => t(lang, Key::KcpRangeSoft),
-        KcpRangeInvalid => t(lang, Key::KcpRangeInvalid),
-        XhttpServerMaxHeaderBytesInvalid => t(lang, Key::XhttpServerMaxHeaderBytesInvalid),
-        GrpcNegativeClamp => t(lang, Key::GrpcNegativeClamp),
-        MuxXudpProxyUdp443Unsupported => t(lang, Key::OutboundMuxXudpProxyUdp443Unsupported),
-        MuxConcurrencyReinterpreted => t(lang, Key::OutboundMuxConcurrencyReinterpreted),
-        MuxXudpKnobsInert => t(lang, Key::OutboundMuxXudpKnobsInert),
-        TrojanFlowRemoved => t(lang, Key::OutboundTrojanFlowRemoved),
-        KcpSeedHeaderRemoved => t(lang, Key::KcpSeedHeaderRemoved),
-        KcpHeaderTypeIgnored => t(lang, Key::KcpHeaderTypeIgnored),
-        VmessAlterIdIgnored => t(lang, Key::OutboundVmessAlterIdIgnored),
-        VlessSeedIgnored => t(lang, Key::OutboundVlessSeedIgnored),
-        FreedomNoiseRemoved => t(lang, Key::OutboundFreedomNoiseRemoved),
-        FreedomDomainStrategyUnsupported => t(lang, Key::OutboundFreedomDomainStrategyUnsupported),
-        FreedomAddressPortStrategyUnsupported => {
-            t(lang, Key::OutboundFreedomAddressPortStrategyUnsupported)
+        XhttpDepthExceeded => (Key::SrvDownloadNestingExceeds, Vec::new()),
+        TransportSettingsMissing(network) => (
+            match network {
+                Network::Xhttp => Key::SrvXhttpSettingsMissing,
+                Network::Kcp => Key::SrvKcpSettingsMissing,
+                Network::Grpc => Key::SrvGrpcSettingsMissing,
+                Network::Ws => Key::SrvWsSettingsMissing,
+                Network::Httpupgrade => Key::SrvHttpupgradeSettingsMissing,
+                Network::Hysteria => Key::SrvHysteriaTransportSettingsMissing,
+                Network::Masque => Key::SrvMasqueSettingsMissing,
+                Network::Xdrive => Key::SrvXdriveSettingsMissing,
+                Network::Raw => {
+                    debug_assert!(false, "TransportSettingsMissing cannot name raw");
+                    Key::SrvXhttpSettingsMissing
+                }
+            },
+            Vec::new(),
+        ),
+        HeaderValuesNotStrings(network) => (
+            match network {
+                // The rule is the same one the share-link grammar applies, so the
+                // text is reused rather than duplicated.
+                Network::Xhttp => Key::LinkXhttpHeaderValues,
+                Network::Ws => Key::LinkWsHeaderValues,
+                Network::Httpupgrade => Key::LinkHttpupgradeHeaderValues,
+                Network::Masque => Key::SrvMasqueHeaderValues,
+                _ => {
+                    debug_assert!(false, "HeaderValuesNotStrings cannot name {network:?}");
+                    Key::LinkWsHeaderValues
+                }
+            },
+            Vec::new(),
+        ),
+        HysteriaTransportRequiresTls => (Key::SrvHysteriaTransportTls, Vec::new()),
+        HysteriaTransportVersion => (Key::SrvHysteriaVersion, Vec::new()),
+        MasqueTransportRequiresMasqueOutbound => (Key::SrvMasqueOutboundTransport, Vec::new()),
+        MasqueOutboundRequiresMasqueTransport => (Key::SrvMasqueTransportMissing, Vec::new()),
+        MasqueTransportRequiresTls => (Key::SrvMasqueTransportTls, Vec::new()),
+        MasqueSettingsIncomplete => (Key::SrvMasqueSettingsIncomplete, Vec::new()),
+        MasqueRemoteDnsInvalid => (Key::SrvMasqueRemoteDns, Vec::new()),
+        MasquePathInvalid => (Key::SrvMasquePathInvalid, Vec::new()),
+        MasqueHostInvalid => (Key::SrvMasqueHostInvalid, Vec::new()),
+        MasqueHeaderInvalid(arg) => (Key::SrvMasqueHeaderInvalid, vec![arg.clone()]),
+        MasqueReservedHeader(arg) => (Key::SrvMasqueReservedHeader, vec![arg.clone()]),
+        MasqueAuthorizationConflict => (Key::SrvMasqueAuthorizationConflict, Vec::new()),
+        MasqueUserColon => (Key::SrvMasqueUserColon, Vec::new()),
+        MasqueAlpnPrefersHttp3 => (Key::SrvMasqueAlpnHttp3, Vec::new()),
+        MasqueWarpPrivateKeyInvalid => (Key::SrvMasqueWarpPrivateKeyInvalid, Vec::new()),
+        MasqueWarpPublicKeyInvalid => (Key::SrvMasqueWarpPublicKeyInvalid, Vec::new()),
+        MasqueWarpAddressInvalid => (Key::SrvMasqueWarpAddressInvalid, Vec::new()),
+        MasqueWarpAddressShape => (Key::SrvMasqueWarpAddressShape, Vec::new()),
+        MasqueWarpCredentialsConflict => (Key::SrvMasqueWarpCredentialsConflict, Vec::new()),
+        XdriveServiceUnsupported(arg) => {
+            (Key::SrvXdriveServiceUnsupported, vec![format!("{arg:?}")])
         }
-        FreedomFinalRulesIgnored => t(lang, Key::OutboundFreedomFinalRulesIgnored),
-        RealityServerFormKeysInert => t(lang, Key::OutboundRealityServerFormKeysInert),
-        HysteriaQuicKnobsMoved => t(lang, Key::HysteriaQuicKnobsMoved),
-        SockoptDomainStrategyInvalid => t(lang, Key::SockoptDomainStrategyInvalid),
-        SockoptAddressPortStrategyInvalid => t(lang, Key::SockoptAddressPortStrategyInvalid),
-        SockoptTcpFastOpenType => t(lang, Key::SockoptTcpFastOpenType),
-        SockoptKeepaliveSigns => t(lang, Key::SockoptKeepaliveSigns),
-        SockoptCustomOptRequired => t(lang, Key::SockoptCustomOptRequired),
-        SockoptCustomTypeInvalid => t(lang, Key::SockoptCustomTypeInvalid),
-        FinalmaskQuicCongestionInvalid => t(lang, Key::FinalmaskQuicCongestionInvalid),
-        FinalmaskQuicBbrProfileInvalid => t(lang, Key::FinalmaskQuicBbrProfileInvalid),
-        FinalmaskQuicBandwidthTooSmall => t(lang, Key::FinalmaskQuicBandwidthTooSmall),
-        FinalmaskQuicBandwidthSyntax => t(lang, Key::FinalmaskQuicBandwidthSyntax),
-        FinalmaskQuicBandwidthNonFinite => t(lang, Key::FinalmaskQuicBandwidthNonFinite),
-        FinalmaskQuicBandwidthTooLarge => t(lang, Key::FinalmaskQuicBandwidthTooLarge),
-        FinalmaskQuicBandwidthUnitInvalid(_) => t(lang, Key::FinalmaskQuicBandwidthUnitInvalid),
-        FinalmaskQuicForceBrutalNeedsUp => t(lang, Key::FinalmaskQuicForceBrutalNeedsUp),
-        FinalmaskQuicHopMoved => t(lang, Key::FinalmaskQuicHopMoved),
-        FinalmaskUdpHopModeInvalid => t(lang, Key::FinalmaskUdpHopModeInvalid),
-        FinalmaskUdpHopIntervalTooSmall => t(lang, Key::FinalmaskUdpHopIntervalTooSmall),
-        FinalmaskUdpHopSockoptRetired => t(lang, Key::FinalmaskUdpHopSockoptRetired),
-        FinalmaskUdpHopIpInvalid => t(lang, Key::FinalmaskUdpHopIpInvalid),
-        FinalmaskUdpMaskNotLast(_) => t(lang, Key::FinalmaskUdpMaskNotLast),
+        XdriveServiceMissing => (Key::SrvXdriveServiceMissing, Vec::new()),
+        XdriveDriveSecretsInvalid => (Key::SrvXdriveDriveSecrets, Vec::new()),
+        XdriveTemplateMissing => (Key::SrvXdriveTemplateObject, Vec::new()),
+        XdriveRemoteFolderRequired => (Key::SrvXdriveRemoteFolderRequired, Vec::new()),
+        XdriveTemplateOperationUrlRequired(arg) => (Key::SrvXdriveOperationUrl, vec![arg.clone()]),
+        XdriveTemplateNamesRegexInvalid => (Key::SrvXdriveNamesRegexInvalid, Vec::new()),
+        XdriveTemplateAuthTypeUnsupported(arg) => {
+            (Key::SrvXdriveAuthTypeUnsupported, vec![format!("{arg:?}")])
+        }
+        XdriveTemplateTokenUrlRequired => (Key::SrvXdriveTokenUrlRequired, Vec::new()),
+        XdriveTemplateHeaderValuesNotStrings => (Key::SrvXdriveHeaderValues, Vec::new()),
+        XdriveScalarClamped => (Key::SrvXdriveScalarClamped, Vec::new()),
+        XdriveRequiresVless => (Key::SrvXdriveRequiresVless, Vec::new()),
+        XdriveVlessFlowUnsupported => (Key::SrvXdriveVlessFlow, Vec::new()),
+        XdriveVlessEncryptionRequired => (Key::SrvXdriveVlessEncryption, Vec::new()),
+        XdriveMuxRequired => (Key::SrvXdriveMuxRequired, Vec::new()),
+        XdriveMuxConcurrencyNegative => (Key::SrvXdriveMuxConcurrencyNegative, Vec::new()),
+        XdriveMuxXudpProxyUdp443Skip => (Key::SrvXdriveMuxXudpSkip, Vec::new()),
+        XdriveVlessTestpreUnsupported => (Key::SrvXdriveTestpre, Vec::new()),
+        XdriveDriveServiceRenamed => (Key::SrvXdriveDriveRenamed, Vec::new()),
+        XdriveH3MaskNotNoise(arg) => (Key::SrvXdriveH3MaskNotNoise, vec![arg.clone()]),
+        XdriveH3CongestionBrutal => (Key::SrvXdriveH3BrutalCongestion, Vec::new()),
+        RealityRequiresTransport => (Key::SrvRealityRequiresTransport, Vec::new()),
+        RealitySettingsMissing => (Key::SrvRealitySettingsMissing, Vec::new()),
+        TlsSettingsMissing => (Key::SrvTlsSettingsMissing, Vec::new()),
+        StreamOneNoDownload => (Key::SrvStreamOneNoDownload, Vec::new()),
+        MasterKeyLogNotSupported => (Key::SrvMasterKeyLogNotSupported, Vec::new()),
+        OutboundProxySettingsRemoved => (Key::SrvProxySettingsRemoved, Vec::new()),
+        TlsAllowInsecureRemoved => (Key::SrvAllowInsecureRemoved, Vec::new()),
+        ShadowsocksLevelRange => (Key::SrvShadowsocksLevelRangeShort, Vec::new()),
+        BlackholeResponseInvalid => (Key::SrvBlackholeResponseInvalidShort, Vec::new()),
+        BlackholeCustomResponseDataInvalid => (Key::SrvBlackholeCustomDataInvalid, Vec::new()),
+        VisionRequiresTlsOrReality => (Key::OutboundVisionRequiresTls, Vec::new()),
+        PublicVlessRequiresTlsOrEncryption => (Key::OutboundPublicVlessNeedsTls, Vec::new()),
+        PublicTrojanRequiresTlsOrReality => (Key::OutboundPublicTrojanNeedsTls, Vec::new()),
+        ListenAddressInvalid => (Key::ListenAddressInvalid, Vec::new()),
+        MuxWithVisionFlow => (Key::OutboundMuxWithVisionFlow, Vec::new()),
+        ServerNameImplausible => (Key::OutboundServerNameImplausible, Vec::new()),
+        VlessFlowUnsupported => (Key::OutboundVlessFlowUnsupported, Vec::new()),
+        VlessEncryptionUnsupported => (Key::OutboundVlessEncryptionUnsupported, Vec::new()),
+        ShadowsocksMethodUnsupported => (Key::OutboundShadowsocksMethodUnsupported, Vec::new()),
+        Shadowsocks2022KeyInvalid => (Key::OutboundShadowsocks2022KeyInvalid, Vec::new()),
+        TrojanSettingsIncomplete => (Key::OutboundTrojanSettingsIncomplete, Vec::new()),
+        ShadowsocksSettingsIncomplete => (Key::OutboundShadowsocksSettingsIncomplete, Vec::new()),
+        SettingsPortZero => (Key::OutboundSettingsPortZero, Vec::new()),
+        SettingsIdNotUuid => (Key::OutboundSettingsIdNotUuid, Vec::new()),
+        RealityPublicKeyInvalid => (Key::OutboundRealityPublicKeyInvalid, Vec::new()),
+        RealityShortIdInvalid => (Key::OutboundRealityShortIdInvalid, Vec::new()),
+        RealitySpiderXInvalid => (Key::OutboundRealitySpiderXInvalid, Vec::new()),
+        RealityMldsa65Invalid => (Key::OutboundRealityMldsa65Invalid, Vec::new()),
+        TlsFingerprintUnsupported => (Key::OutboundTlsFingerprintUnsupported, Vec::new()),
+        RealityFingerprintUnsupported => (Key::OutboundRealityFingerprintUnsupported, Vec::new()),
+        RealityFingerprintUntested(arg) => {
+            (Key::OutboundRealityFingerprintUntested, vec![arg.clone()])
+        }
+        PinnedPeerCertSha256Invalid => (Key::OutboundPinnedPeerCertSha256Invalid, Vec::new()),
+        TlsVersionRangeInvalid => (Key::OutboundTlsVersionRangeInvalid, Vec::new()),
+        TlsMinExceedsMax => (Key::SrvMinVersionExceedsMax, Vec::new()),
+        XhttpModeUnsupported => (Key::SrvXhttpModeUnsupported, Vec::new()),
+        XhttpPaddingBytesInvalid => (Key::SrvXhttpPaddingBytesInvalid, Vec::new()),
+        XhttpPaddingPlacementInvalid => (Key::SrvXhttpPaddingPlacementInvalid, Vec::new()),
+        XhttpPaddingMethodInvalid => (Key::SrvXhttpPaddingMethodInvalid, Vec::new()),
+        XhttpUplinkDataPlacementInvalid => (Key::SrvXhttpUplinkPlacementInvalid, Vec::new()),
+        XhttpUplinkDataPlacementRequiresPacketUp => {
+            (Key::SrvXhttpUplinkPlacementPacketUp, Vec::new())
+        }
+        XhttpUplinkHttpMethodRequiresPacketUp => (Key::SrvXhttpUplinkMethodPacketUp, Vec::new()),
+        XhttpSessionIdPlacementInvalid => (Key::SrvXhttpSessionPlacementInvalid, Vec::new()),
+        XhttpSeqPlacementInvalid => (Key::SrvXhttpSeqPlacementInvalid, Vec::new()),
+        XhttpSessionIdLengthRequired => (Key::SrvXhttpSessionLengthRequired, Vec::new()),
+        XhttpSessionIdTableInvalid => (Key::SrvXhttpSessionTableInvalid, Vec::new()),
+        XmuxLimitsExclusive => (Key::SrvXmuxLimitsExclusive, Vec::new()),
+        XhttpExtraShadowsSettings(arg) => (Key::XhttpExtraShadowsSettings, vec![arg.clone()]),
+        SniffingDestOverrideInvalid => (Key::SniffingDestOverrideInvalid, Vec::new()),
+        OutboundTargetStrategyInvalid => (Key::OutboundTargetStrategyInvalid, Vec::new()),
+        SockoptTproxySilentOff => (Key::SockoptTproxySilentOff, Vec::new()),
+        KcpRangeSoft => (Key::KcpRangeSoft, Vec::new()),
+        KcpRangeInvalid => (Key::KcpRangeInvalid, Vec::new()),
+        XhttpServerMaxHeaderBytesInvalid => (Key::XhttpServerMaxHeaderBytesInvalid, Vec::new()),
+        GrpcNegativeClamp => (Key::GrpcNegativeClamp, Vec::new()),
+        MuxXudpProxyUdp443Unsupported => (Key::OutboundMuxXudpProxyUdp443Unsupported, Vec::new()),
+        MuxConcurrencyReinterpreted => (Key::OutboundMuxConcurrencyReinterpreted, Vec::new()),
+        MuxXudpKnobsInert => (Key::OutboundMuxXudpKnobsInert, Vec::new()),
+        TrojanFlowRemoved => (Key::OutboundTrojanFlowRemoved, Vec::new()),
+        KcpSeedHeaderRemoved => (Key::KcpSeedHeaderRemoved, Vec::new()),
+        KcpHeaderTypeIgnored => (Key::KcpHeaderTypeIgnored, Vec::new()),
+        VmessAlterIdIgnored => (Key::OutboundVmessAlterIdIgnored, Vec::new()),
+        VlessSeedIgnored => (Key::OutboundVlessSeedIgnored, Vec::new()),
+        FreedomNoiseRemoved => (Key::OutboundFreedomNoiseRemoved, Vec::new()),
+        FreedomDomainStrategyUnsupported => {
+            (Key::OutboundFreedomDomainStrategyUnsupported, Vec::new())
+        }
+        FreedomAddressPortStrategyUnsupported => (
+            Key::OutboundFreedomAddressPortStrategyUnsupported,
+            Vec::new(),
+        ),
+        FreedomFinalRulesIgnored => (Key::OutboundFreedomFinalRulesIgnored, Vec::new()),
+        RealityServerFormKeysInert => (Key::OutboundRealityServerFormKeysInert, Vec::new()),
+        HysteriaQuicKnobsMoved => (Key::HysteriaQuicKnobsMoved, Vec::new()),
+        SockoptDomainStrategyInvalid => (Key::SockoptDomainStrategyInvalid, Vec::new()),
+        SockoptAddressPortStrategyInvalid => (Key::SockoptAddressPortStrategyInvalid, Vec::new()),
+        SockoptTcpFastOpenType => (Key::SockoptTcpFastOpenType, Vec::new()),
+        SockoptKeepaliveSigns => (Key::SockoptKeepaliveSigns, Vec::new()),
+        SockoptCustomOptRequired => (Key::SockoptCustomOptRequired, Vec::new()),
+        SockoptCustomTypeInvalid => (Key::SockoptCustomTypeInvalid, Vec::new()),
+        FinalmaskQuicCongestionInvalid => (Key::FinalmaskQuicCongestionInvalid, Vec::new()),
+        FinalmaskQuicBbrProfileInvalid => (Key::FinalmaskQuicBbrProfileInvalid, Vec::new()),
+        FinalmaskQuicBandwidthTooSmall => (Key::FinalmaskQuicBandwidthTooSmall, Vec::new()),
+        FinalmaskQuicBandwidthSyntax => (Key::FinalmaskQuicBandwidthSyntax, Vec::new()),
+        FinalmaskQuicBandwidthNonFinite => (Key::FinalmaskQuicBandwidthNonFinite, Vec::new()),
+        FinalmaskQuicBandwidthTooLarge => (Key::FinalmaskQuicBandwidthTooLarge, Vec::new()),
+        FinalmaskQuicBandwidthUnitInvalid(arg) => {
+            (Key::FinalmaskQuicBandwidthUnitInvalid, vec![arg.clone()])
+        }
+        FinalmaskQuicForceBrutalNeedsUp => (Key::FinalmaskQuicForceBrutalNeedsUp, Vec::new()),
+        FinalmaskQuicHopMoved => (Key::FinalmaskQuicHopMoved, Vec::new()),
+        FinalmaskUdpHopModeInvalid => (Key::FinalmaskUdpHopModeInvalid, Vec::new()),
+        FinalmaskUdpHopIntervalTooSmall => (Key::FinalmaskUdpHopIntervalTooSmall, Vec::new()),
+        FinalmaskUdpHopSockoptRetired => (Key::FinalmaskUdpHopSockoptRetired, Vec::new()),
+        FinalmaskUdpHopIpInvalid => (Key::FinalmaskUdpHopIpInvalid, Vec::new()),
+        FinalmaskUdpMaskNotLast(arg) => (Key::FinalmaskUdpMaskNotLast, vec![arg.clone()]),
         FinalmaskUdpHopIntervalTransportConflict => {
-            t(lang, Key::FinalmaskUdpHopIntervalTransportConflict)
+            (Key::FinalmaskUdpHopIntervalTransportConflict, Vec::new())
         }
-        FinalmaskQuicReceiveWindowTooSmall => t(lang, Key::FinalmaskQuicReceiveWindowTooSmall),
-        FinalmaskQuicMaxIdleTimeoutInvalid => t(lang, Key::FinalmaskQuicMaxIdleTimeoutInvalid),
-        FinalmaskQuicKeepAlivePeriodInvalid => t(lang, Key::FinalmaskQuicKeepAlivePeriodInvalid),
+        FinalmaskQuicReceiveWindowTooSmall => (Key::FinalmaskQuicReceiveWindowTooSmall, Vec::new()),
+        FinalmaskQuicMaxIdleTimeoutInvalid => (Key::FinalmaskQuicMaxIdleTimeoutInvalid, Vec::new()),
+        FinalmaskQuicKeepAlivePeriodInvalid => {
+            (Key::FinalmaskQuicKeepAlivePeriodInvalid, Vec::new())
+        }
         FinalmaskQuicMaxIncomingStreamsInvalid => {
-            t(lang, Key::FinalmaskQuicMaxIncomingStreamsInvalid)
+            (Key::FinalmaskQuicMaxIncomingStreamsInvalid, Vec::new())
         }
-        FinalmaskPortNumberRange => t(lang, Key::FinalmaskPortNumberRange),
-        FinalmaskPortEnvNameRequired => t(lang, Key::FinalmaskPortEnvNameRequired),
-        FinalmaskPortListInvalid(_) => t(lang, Key::FinalmaskPortListInvalid),
-        FinalmaskBytesValueRequired(_) => t(lang, Key::FinalmaskBytesValueRequired),
-        FinalmaskArrayByteSyntax => t(lang, Key::FinalmaskArrayByteSyntax),
-        FinalmaskStrByteSyntax => t(lang, Key::FinalmaskStrByteSyntax),
-        FinalmaskHexByteSyntax => t(lang, Key::FinalmaskHexByteSyntax),
-        FinalmaskBase64ByteSyntax => t(lang, Key::FinalmaskBase64ByteSyntax),
-        FinalmaskUnknownByteSyntax(_) => t(lang, Key::FinalmaskUnknownByteSyntax),
-        FinalmaskTransformOpRequired => t(lang, Key::FinalmaskTransformOpRequired),
-        FinalmaskTransformArgRequired => t(lang, Key::FinalmaskTransformArgRequired),
-        FinalmaskTransformArgExclusive => t(lang, Key::FinalmaskTransformArgExclusive),
-        FinalmaskVarNameInvalid => t(lang, Key::FinalmaskVarNameInvalid),
-        FinalmaskCustomItemExclusive => t(lang, Key::FinalmaskCustomItemExclusive),
-        FinalmaskRandRangeInvalid => t(lang, Key::FinalmaskRandRangeInvalid),
-        FinalmaskXmcProfilesRequired => t(lang, Key::FinalmaskXmcProfilesRequired),
-        FinalmaskXmcPasswordRequired => t(lang, Key::FinalmaskXmcPasswordRequired),
-        FinalmaskXmcUsernameInvalid => t(lang, Key::FinalmaskXmcUsernameInvalid),
-        FinalmaskXmcUuidInvalid => t(lang, Key::FinalmaskXmcUuidInvalid),
-        FinalmaskXmcTexturesRequired => t(lang, Key::FinalmaskXmcTexturesRequired),
-        FinalmaskPacketsFirstNotZero => t(lang, Key::FinalmaskPacketsFirstNotZero),
-        FinalmaskPacketsSyntax => t(lang, Key::FinalmaskPacketsSyntax),
-        FinalmaskLengthsStartAboveZero => t(lang, Key::FinalmaskLengthsStartAboveZero),
-        FinalmaskUnknownTcpMask(_) => t(lang, Key::FinalmaskUnknownTcpMask),
-        FinalmaskUdpHeaderModeInvalid => t(lang, Key::FinalmaskUdpHeaderModeInvalid),
-        FinalmaskMkcpHeaderInvalid => t(lang, Key::FinalmaskMkcpHeaderInvalid),
-        FinalmaskNoisePacketExclusive => t(lang, Key::FinalmaskNoisePacketExclusive),
-        FinalmaskNoiseScriptConflict => t(lang, Key::FinalmaskNoiseScriptConflict),
-        FinalmaskNoiseExpPacketNotString => t(lang, Key::FinalmaskNoiseExpPacketNotString),
-        FinalmaskNoiseExpEmpty => t(lang, Key::FinalmaskNoiseExpEmpty),
-        FinalmaskNoiseExpTrailingText(_) => t(lang, Key::FinalmaskNoiseExpTrailingText),
-        FinalmaskNoiseExpUnknownToken(_) => t(lang, Key::FinalmaskNoiseExpUnknownToken),
-        FinalmaskNoiseExpMissingSize(_) => t(lang, Key::FinalmaskNoiseExpMissingSize),
-        FinalmaskNoiseExpSizeInvalid(_) => t(lang, Key::FinalmaskNoiseExpSizeInvalid),
-        FinalmaskNoiseExpBytesInvalid(_) => t(lang, Key::FinalmaskNoiseExpBytesInvalid),
-        FinalmaskNoiseExpArgumentNotAllowed(_) => t(lang, Key::FinalmaskNoiseExpArgumentNotAllowed),
-        FinalmaskSalamanderPacketSize => t(lang, Key::FinalmaskSalamanderPacketSize),
-        FinalmaskXdnsShapeRetired => t(lang, Key::FinalmaskXdnsShapeRetired),
-        FinalmaskXdnsDomainsEmpty => t(lang, Key::FinalmaskXdnsDomainsEmpty),
-        FinalmaskXdnsDomainTypesInvalid => t(lang, Key::FinalmaskXdnsDomainTypesInvalid),
-        FinalmaskXdnsDomainNameInvalid => t(lang, Key::FinalmaskXdnsDomainNameInvalid),
-        FinalmaskXdnsDomainLimitInvalid => t(lang, Key::FinalmaskXdnsDomainLimitInvalid),
-        FinalmaskXdnsDomainCapacityInvalid => t(lang, Key::FinalmaskXdnsDomainCapacityInvalid),
-        FinalmaskXdnsResolversEmpty => t(lang, Key::FinalmaskXdnsResolversEmpty),
-        FinalmaskXdnsResolverAddrInvalid => t(lang, Key::FinalmaskXdnsResolverAddrInvalid),
-        FinalmaskXdnsResolverAddrsEmpty => t(lang, Key::FinalmaskXdnsResolverAddrsEmpty),
-        FinalmaskXdnsAddrSchemeUnknown(_) => t(lang, Key::FinalmaskXdnsAddrSchemeUnknown),
-        FinalmaskXdnsHttpsRequiresTls => t(lang, Key::FinalmaskXdnsHttpsRequiresTls),
-        FinalmaskXdnsWorkerInvalid => t(lang, Key::FinalmaskXdnsWorkerInvalid),
-        FinalmaskXdnsExtraPollInvalid => t(lang, Key::FinalmaskXdnsExtraPollInvalid),
-        FinalmaskXicmpIpInvalid => t(lang, Key::FinalmaskXicmpIpInvalid),
-        FinalmaskFilterIpRuleInvalid(_) => t(lang, Key::FinalmaskFilterIpRuleInvalid),
-        FinalmaskFilterOnOutbound => t(lang, Key::FinalmaskFilterOnOutbound),
-        FinalmaskRealmScheme => t(lang, Key::FinalmaskRealmScheme),
-        FinalmaskRealmHostRequired => t(lang, Key::FinalmaskRealmHostRequired),
-        FinalmaskRealmTokenBeforeAt => t(lang, Key::FinalmaskRealmTokenBeforeAt),
-        FinalmaskRealmIdInPath => t(lang, Key::FinalmaskRealmIdInPath),
-        FinalmaskRealmUrlSyntax(_) => t(lang, Key::FinalmaskRealmUrlSyntax),
-        FinalmaskRealmStunRequired => t(lang, Key::FinalmaskRealmStunRequired),
-        FinalmaskRealmStunFormat => t(lang, Key::FinalmaskRealmStunFormat),
-        FinalmaskRealmAllowInsecureRemoved => t(lang, Key::FinalmaskRealmAllowInsecureRemoved),
-        FinalmaskRealmFingerprintUnknown => t(lang, Key::FinalmaskRealmFingerprintUnknown),
-        FinalmaskRealmAlpnFromMitm => t(lang, Key::FinalmaskRealmAlpnFromMitm),
-        FinalmaskRealmCertRequired => t(lang, Key::FinalmaskRealmCertRequired),
-        FinalmaskRealmEchKeysBase64 => t(lang, Key::FinalmaskRealmEchKeysBase64),
-        FinalmaskUnknownUdpMask(_) => t(lang, Key::FinalmaskUnknownUdpMask),
+        FinalmaskPortNumberRange => (Key::FinalmaskPortNumberRange, Vec::new()),
+        FinalmaskPortEnvNameRequired => (Key::FinalmaskPortEnvNameRequired, Vec::new()),
+        FinalmaskPortListInvalid(arg) => (Key::FinalmaskPortListInvalid, vec![arg.clone()]),
+        FinalmaskBytesValueRequired(arg) => (Key::FinalmaskBytesValueRequired, vec![arg.clone()]),
+        FinalmaskArrayByteSyntax => (Key::FinalmaskArrayByteSyntax, Vec::new()),
+        FinalmaskStrByteSyntax => (Key::FinalmaskStrByteSyntax, Vec::new()),
+        FinalmaskHexByteSyntax => (Key::FinalmaskHexByteSyntax, Vec::new()),
+        FinalmaskBase64ByteSyntax => (Key::FinalmaskBase64ByteSyntax, Vec::new()),
+        FinalmaskUnknownByteSyntax(arg) => (Key::FinalmaskUnknownByteSyntax, vec![arg.clone()]),
+        FinalmaskTransformOpRequired => (Key::FinalmaskTransformOpRequired, Vec::new()),
+        FinalmaskTransformArgRequired => (Key::FinalmaskTransformArgRequired, Vec::new()),
+        FinalmaskTransformArgExclusive => (Key::FinalmaskTransformArgExclusive, Vec::new()),
+        FinalmaskVarNameInvalid => (Key::FinalmaskVarNameInvalid, Vec::new()),
+        FinalmaskCustomItemExclusive => (Key::FinalmaskCustomItemExclusive, Vec::new()),
+        FinalmaskRandRangeInvalid => (Key::FinalmaskRandRangeInvalid, Vec::new()),
+        FinalmaskXmcProfilesRequired => (Key::FinalmaskXmcProfilesRequired, Vec::new()),
+        FinalmaskXmcPasswordRequired => (Key::FinalmaskXmcPasswordRequired, Vec::new()),
+        FinalmaskXmcUsernameInvalid => (Key::FinalmaskXmcUsernameInvalid, Vec::new()),
+        FinalmaskXmcUuidInvalid => (Key::FinalmaskXmcUuidInvalid, Vec::new()),
+        FinalmaskXmcTexturesRequired => (Key::FinalmaskXmcTexturesRequired, Vec::new()),
+        FinalmaskPacketsFirstNotZero => (Key::FinalmaskPacketsFirstNotZero, Vec::new()),
+        FinalmaskPacketsSyntax => (Key::FinalmaskPacketsSyntax, Vec::new()),
+        FinalmaskLengthsStartAboveZero => (Key::FinalmaskLengthsStartAboveZero, Vec::new()),
+        FinalmaskUnknownTcpMask(arg) => (
+            Key::FinalmaskUnknownTcpMask,
+            vec![
+                arg.as_deref()
+                    .map(|value| format!("Some({value:?})"))
+                    .unwrap_or_else(|| "None".into()),
+            ],
+        ),
+        FinalmaskUdpHeaderModeInvalid => (Key::FinalmaskUdpHeaderModeInvalid, Vec::new()),
+        FinalmaskMkcpHeaderInvalid => (Key::FinalmaskMkcpHeaderInvalid, Vec::new()),
+        FinalmaskNoisePacketExclusive => (Key::FinalmaskNoisePacketExclusive, Vec::new()),
+        FinalmaskNoiseScriptConflict => (Key::FinalmaskNoiseScriptConflict, Vec::new()),
+        FinalmaskNoiseExpPacketNotString => (Key::FinalmaskNoiseExpPacketNotString, Vec::new()),
+        FinalmaskNoiseExpEmpty => (Key::FinalmaskNoiseExpEmpty, Vec::new()),
+        FinalmaskNoiseExpTrailingText(arg) => {
+            (Key::FinalmaskNoiseExpTrailingText, vec![arg.clone()])
+        }
+        FinalmaskNoiseExpUnknownToken(arg) => {
+            (Key::FinalmaskNoiseExpUnknownToken, vec![arg.clone()])
+        }
+        FinalmaskNoiseExpMissingSize(arg) => (Key::FinalmaskNoiseExpMissingSize, vec![arg.clone()]),
+        FinalmaskNoiseExpSizeInvalid(arg) => (Key::FinalmaskNoiseExpSizeInvalid, vec![arg.clone()]),
+        FinalmaskNoiseExpBytesInvalid(arg) => {
+            (Key::FinalmaskNoiseExpBytesInvalid, vec![arg.clone()])
+        }
+        FinalmaskNoiseExpArgumentNotAllowed(arg) => {
+            (Key::FinalmaskNoiseExpArgumentNotAllowed, vec![arg.clone()])
+        }
+        FinalmaskSalamanderPacketSize => (Key::FinalmaskSalamanderPacketSize, Vec::new()),
+        FinalmaskXdnsShapeRetired => (Key::FinalmaskXdnsShapeRetired, Vec::new()),
+        FinalmaskXdnsDomainsEmpty => (Key::FinalmaskXdnsDomainsEmpty, Vec::new()),
+        FinalmaskXdnsDomainTypesInvalid => (Key::FinalmaskXdnsDomainTypesInvalid, Vec::new()),
+        FinalmaskXdnsDomainNameInvalid => (Key::FinalmaskXdnsDomainNameInvalid, Vec::new()),
+        FinalmaskXdnsDomainLimitInvalid => (Key::FinalmaskXdnsDomainLimitInvalid, Vec::new()),
+        FinalmaskXdnsDomainCapacityInvalid => (Key::FinalmaskXdnsDomainCapacityInvalid, Vec::new()),
+        FinalmaskXdnsResolversEmpty => (Key::FinalmaskXdnsResolversEmpty, Vec::new()),
+        FinalmaskXdnsResolverAddrInvalid => (Key::FinalmaskXdnsResolverAddrInvalid, Vec::new()),
+        FinalmaskXdnsResolverAddrsEmpty => (Key::FinalmaskXdnsResolverAddrsEmpty, Vec::new()),
+        FinalmaskXdnsAddrSchemeUnknown(arg) => {
+            (Key::FinalmaskXdnsAddrSchemeUnknown, vec![arg.clone()])
+        }
+        FinalmaskXdnsHttpsRequiresTls => (Key::FinalmaskXdnsHttpsRequiresTls, Vec::new()),
+        FinalmaskXdnsWorkerInvalid => (Key::FinalmaskXdnsWorkerInvalid, Vec::new()),
+        FinalmaskXdnsExtraPollInvalid => (Key::FinalmaskXdnsExtraPollInvalid, Vec::new()),
+        FinalmaskXicmpIpInvalid => (Key::FinalmaskXicmpIpInvalid, Vec::new()),
+        FinalmaskFilterIpRuleInvalid(arg) => (Key::FinalmaskFilterIpRuleInvalid, vec![arg.clone()]),
+        FinalmaskFilterOnOutbound => (Key::FinalmaskFilterOnOutbound, Vec::new()),
+        FinalmaskRealmScheme => (Key::FinalmaskRealmScheme, Vec::new()),
+        FinalmaskRealmHostRequired => (Key::FinalmaskRealmHostRequired, Vec::new()),
+        FinalmaskRealmTokenBeforeAt => (Key::FinalmaskRealmTokenBeforeAt, Vec::new()),
+        FinalmaskRealmIdInPath => (Key::FinalmaskRealmIdInPath, Vec::new()),
+        FinalmaskRealmUrlSyntax(arg) => (Key::FinalmaskRealmUrlSyntax, vec![arg.clone()]),
+        FinalmaskRealmStunRequired => (Key::FinalmaskRealmStunRequired, Vec::new()),
+        FinalmaskRealmStunFormat => (Key::FinalmaskRealmStunFormat, Vec::new()),
+        FinalmaskRealmAllowInsecureRemoved => (Key::FinalmaskRealmAllowInsecureRemoved, Vec::new()),
+        FinalmaskRealmFingerprintUnknown => (Key::FinalmaskRealmFingerprintUnknown, Vec::new()),
+        FinalmaskRealmAlpnFromMitm => (Key::FinalmaskRealmAlpnFromMitm, Vec::new()),
+        FinalmaskRealmCertRequired => (Key::FinalmaskRealmCertRequired, Vec::new()),
+        FinalmaskRealmEchKeysBase64 => (Key::FinalmaskRealmEchKeysBase64, Vec::new()),
+        FinalmaskUnknownUdpMask(arg) => (
+            Key::FinalmaskUnknownUdpMask,
+            vec![
+                arg.as_deref()
+                    .map(|value| format!("Some({value:?})"))
+                    .unwrap_or_else(|| "None".into()),
+            ],
+        ),
         // Editor rules that moved into the model pass: the error-list text
         // keeps the existing key (its bytes are the editor's contract).
-        SendThroughInvalid => t(lang, Key::SrvSendThroughInvalidShort),
-        FreedomFinalRuleInvalid => t(lang, Key::SrvFreedomFinalRuleInvalid),
-        DnsRuleActionInvalid => t(lang, Key::SrvDnsRuleActionInvalidShort),
-        WireguardRemoteDnsInvalid => t(lang, Key::SrvWgRemoteDnsInvalid),
-        WireguardDomainStrategyRetired => t(lang, Key::SrvWgDomainStrategyRetired),
+        SendThroughInvalid => (Key::SrvSendThroughInvalidShort, Vec::new()),
+        FreedomFinalRuleInvalid => (Key::SrvFreedomFinalRuleInvalid, Vec::new()),
+        DnsRuleActionInvalid => (Key::SrvDnsRuleActionInvalidShort, Vec::new()),
+        WireguardRemoteDnsInvalid => (Key::SrvWgRemoteDnsInvalid, Vec::new()),
+        WireguardDomainStrategyRetired => (Key::SrvWgDomainStrategyRetired, Vec::new()),
         // Settings-level verdict rules (validate_settings /
         // validate_profiles). Parameterized rules return the template that
         // validation_issue_message fills with the code-carried values.
-        ActiveProfileMissing(_) => t(lang, Key::SettingsActiveProfileMissing),
-        ActiveProfileAmbiguous(_, _) => t(lang, Key::SettingsActiveProfileAmbiguous),
-        ProfilesRequired => t(lang, Key::SettingsProfilesRequired),
-        ProfileIdEmpty(_) => t(lang, Key::SettingsProfileIdEmpty),
-        ProfileIdDuplicated(_, _, _) => t(lang, Key::SettingsProfileIdDuplicated),
-        ProfileTagEmpty(_, _) => t(lang, Key::SettingsProfileTagEmpty),
-        ProfileTagInvalid(_, _, _) => t(lang, Key::SettingsProfileTagInvalid),
-        ProfileTagReserved(_, _, _) => t(lang, Key::SettingsProfileTagReserved),
-        ProfileTagDuplicated(_, _, _, _, _) => t(lang, Key::SettingsProfileTagDuplicated),
-        OutboundChainMissing(_, _) => t(lang, Key::SettingsOutboundChainMissing),
-        OutboundChainCycle(_) => t(lang, Key::SettingsOutboundChainCycle),
-        BalancerTagMissing(_) => t(lang, Key::SettingsBalancerNoTag),
-        BalancerSelectorMissing(_) => t(lang, Key::SettingsBalancerNoSelector),
-        BalancerTagDuplicated(_) => t(lang, Key::SettingsBalancerTagDuplicated),
-        BalancerFallbackMissing(_, _) => t(lang, Key::SettingsBalancerFallbackMissing),
-        LocalInboundAuthRequiresAccounts => t(lang, Key::InboundsAuthRequiresAccounts),
-        LocalInboundPortZero(_) => t(lang, Key::SettingsLocalInboundPortZero),
-        InboundTagDuplicated(_) => t(lang, Key::SettingsInboundTagDuplicated),
-        DokodemoTagMissing(_) => t(lang, Key::SettingsDokodemoTagMissing),
-        DokodemoNetworkInvalid(_, _) => t(lang, Key::SettingsDokodemoNetworkInvalid),
-        DokodemoUnixSocketRequired(_) => t(lang, Key::SettingsDokodemoUnixSocketRequired),
-        DokodemoUnixSocketConflict(_, _, _) => t(lang, Key::SettingsDokodemoUnixSocketConflict),
-        DokodemoPortZero(_) => t(lang, Key::SettingsDokodemoPortZero),
-        TunIpv4GatewayRequired => t(lang, Key::SettingsTunIpv4GatewayRequired),
-        TunLeakRoutingTableRequired => t(lang, Key::SettingsTunLeakRoutingTableRequired),
-        TunLeakValueUnknown(_) => t(lang, Key::SettingsTunLeakValueUnknown),
-        TunLeakMisconfigTunOff => t(lang, Key::SettingsTunLeakMisconfigTunOff),
-        ListenerConflict(_, _, _, _) => t(lang, Key::SettingsListenerConflict),
-        RoutingRuleTarget(_, _) => t(lang, Key::SettingsRoutingRuleTarget),
-        RoutingRuleOutboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleOutboundMissing),
-        RoutingRuleBalancerMissing(_, _) => t(lang, Key::SettingsRoutingRuleBalancerMissing),
-        RoutingRuleInboundMissing(_, _) => t(lang, Key::SettingsRoutingRuleInboundMissing),
-        DnsServerAddressMissing(_) => t(lang, Key::SettingsDnsServerAddressMissing),
-        DnsBootstrapNotResolvable => t(lang, Key::SettingsDnsBootstrapNotResolvable),
-        LuaScriptPathRequired => t(lang, Key::SettingsLuaScriptPathRequired),
-        LuaScriptPathNotLua => t(lang, Key::SettingsLuaScriptPathNotLua),
-        DnsScriptFallbackConflict => t(lang, Key::SettingsDnsScriptFallbackConflict),
-        DnsScriptServerConflict(..) => t(lang, Key::SettingsDnsScriptServerConflict),
-        RoutingScriptRulesConflict => t(lang, Key::SettingsRoutingScriptRulesConflict),
-        RoutingScriptStrategyConflict => t(lang, Key::SettingsRoutingScriptStrategyConflict),
-        FakeDnsPoolCidrInvalid(_) => t(lang, Key::SettingsFakeDnsPoolCidrInvalid),
-        FakeDnsPoolSizeInvalid(_) => t(lang, Key::SettingsFakeDnsPoolSizeInvalid),
-        FakeDnsPoolCapacityExceeded(_, _, _) => t(lang, Key::SettingsFakeDnsPoolCapacityExceeded),
-        GeodataUrlInvalid(_) => t(lang, Key::SettingsGeodataUrlInvalid),
-        GeodataCronInvalid => t(lang, Key::SettingsGeodataCronInvalid),
+        ActiveProfileMissing(id) => (Key::SettingsActiveProfileMissing, vec![format!("{id:?}")]),
+        ActiveProfileAmbiguous(id, count) => (
+            Key::SettingsActiveProfileAmbiguous,
+            vec![format!("{id:?}"), count.to_string()],
+        ),
+        ProfilesRequired => (Key::SettingsProfilesRequired, Vec::new()),
+        ProfileIdEmpty(index) => (Key::SettingsProfileIdEmpty, vec![index.to_string()]),
+        ProfileIdDuplicated(first, second, id) => (
+            Key::SettingsProfileIdDuplicated,
+            vec![first.to_string(), second.to_string(), format!("{id:?}")],
+        ),
+        ProfileTagEmpty(index, id) => (
+            Key::SettingsProfileTagEmpty,
+            vec![index.to_string(), format!("{id:?}")],
+        ),
+        ProfileTagInvalid(index, id, tag) => (
+            Key::SettingsProfileTagInvalid,
+            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")],
+        ),
+        ProfileTagReserved(index, id, tag) => (
+            Key::SettingsProfileTagReserved,
+            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")],
+        ),
+        ProfileTagDuplicated(first, first_id, second, second_id, tag) => (
+            Key::SettingsProfileTagDuplicated,
+            vec![
+                first.to_string(),
+                format!("{first_id:?}"),
+                second.to_string(),
+                format!("{second_id:?}"),
+                format!("{tag:?}"),
+            ],
+        ),
+        OutboundChainMissing(source, target) => (
+            Key::SettingsOutboundChainMissing,
+            vec![format!("{source:?}"), format!("{target:?}")],
+        ),
+        OutboundChainCycle(path) => (Key::SettingsOutboundChainCycle, vec![path.clone()]),
+        BalancerTagMissing(index) => (Key::SettingsBalancerNoTag, vec![index.to_string()]),
+        BalancerSelectorMissing(tag) => (Key::SettingsBalancerNoSelector, vec![format!("{tag:?}")]),
+        BalancerTagDuplicated(tag) => {
+            (Key::SettingsBalancerTagDuplicated, vec![format!("{tag:?}")])
+        }
+        BalancerFallbackMissing(tag, fallback) => (
+            Key::SettingsBalancerFallbackMissing,
+            vec![format!("{tag:?}"), format!("{fallback:?}")],
+        ),
+        LocalInboundAuthRequiresAccounts => (Key::InboundsAuthRequiresAccounts, Vec::new()),
+        LocalInboundPortZero(tag) => (Key::SettingsLocalInboundPortZero, vec![format!("{tag:?}")]),
+        InboundTagDuplicated(tag) => (Key::SettingsInboundTagDuplicated, vec![tag.clone()]),
+        DokodemoTagMissing(index) => (Key::SettingsDokodemoTagMissing, vec![index.to_string()]),
+        DokodemoNetworkInvalid(tag, error) => (
+            Key::SettingsDokodemoNetworkInvalid,
+            vec![format!("{tag:?}"), error.clone()],
+        ),
+        DokodemoUnixSocketRequired(tag) => (
+            Key::SettingsDokodemoUnixSocketRequired,
+            vec![format!("{tag:?}")],
+        ),
+        DokodemoUnixSocketConflict(tag, other, path) => (
+            Key::SettingsDokodemoUnixSocketConflict,
+            vec![
+                format!("{tag:?}"),
+                format!("{other:?}"),
+                format!("{path:?}"),
+            ],
+        ),
+        DokodemoPortZero(tag) => (Key::SettingsDokodemoPortZero, vec![format!("{tag:?}")]),
+        TunIpv4GatewayRequired => (Key::SettingsTunIpv4GatewayRequired, Vec::new()),
+        TunLeakRoutingTableRequired => (Key::SettingsTunLeakRoutingTableRequired, Vec::new()),
+        TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![arg.clone()]),
+        TunLeakMisconfigTunOff => (Key::SettingsTunLeakMisconfigTunOff, Vec::new()),
+        ListenerConflict(current, other, address, port) => (
+            Key::SettingsListenerConflict,
+            vec![
+                current.clone(),
+                other.clone(),
+                address.clone(),
+                port.to_string(),
+            ],
+        ),
+        RoutingRuleTarget(index, error) => (
+            Key::SettingsRoutingRuleTarget,
+            vec![index.to_string(), error.clone()],
+        ),
+        RoutingRuleOutboundMissing(index, tag) => (
+            Key::SettingsRoutingRuleOutboundMissing,
+            vec![index.to_string(), format!("{tag:?}")],
+        ),
+        RoutingRuleBalancerMissing(index, tag) => (
+            Key::SettingsRoutingRuleBalancerMissing,
+            vec![index.to_string(), format!("{tag:?}")],
+        ),
+        RoutingRuleInboundMissing(index, tag) => (
+            Key::SettingsRoutingRuleInboundMissing,
+            vec![index.to_string(), format!("{tag:?}")],
+        ),
+        DnsServerAddressMissing(index) => (
+            Key::SettingsDnsServerAddressMissing,
+            vec![index.to_string()],
+        ),
+        DnsBootstrapNotResolvable => (Key::SettingsDnsBootstrapNotResolvable, Vec::new()),
+        LuaScriptPathRequired => (Key::SettingsLuaScriptPathRequired, Vec::new()),
+        LuaScriptPathNotLua => (Key::SettingsLuaScriptPathNotLua, Vec::new()),
+        DnsScriptFallbackConflict => (Key::SettingsDnsScriptFallbackConflict, Vec::new()),
+        DnsScriptServerConflict(index, field) => (
+            Key::SettingsDnsScriptServerConflict,
+            vec![index.to_string(), field.clone()],
+        ),
+        RoutingScriptRulesConflict => (Key::SettingsRoutingScriptRulesConflict, Vec::new()),
+        RoutingScriptStrategyConflict => (Key::SettingsRoutingScriptStrategyConflict, Vec::new()),
+        FakeDnsPoolCidrInvalid(index) => {
+            (Key::SettingsFakeDnsPoolCidrInvalid, vec![index.to_string()])
+        }
+        FakeDnsPoolSizeInvalid(index) => {
+            (Key::SettingsFakeDnsPoolSizeInvalid, vec![index.to_string()])
+        }
+        FakeDnsPoolCapacityExceeded(index, size, pool) => (
+            Key::SettingsFakeDnsPoolCapacityExceeded,
+            vec![index.to_string(), size.to_string(), pool.clone()],
+        ),
+        GeodataUrlInvalid(file) => (
+            Key::SettingsGeodataUrlInvalid,
+            vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()],
+        ),
+        GeodataCronInvalid => (
+            Key::SettingsGeodataCronInvalid,
+            vec![t(lang, Key::GeodataCronNotFiveFields).to_string()],
+        ),
         // Draft requirements: the editor's own rules, each rendering the
         // message the editor has always shown for that field.
-        ProtocolSettingsMismatch => t(lang, Key::SrvProtocolSettingsMismatch),
-        ServerAddressRequired => t(lang, Key::SrvAddressRequired),
-        ServerPortRequired => t(lang, Key::SrvPortRequired),
-        VlessIdRequired => t(lang, Key::SrvVlessIdUuid),
-        VlessEncryptionRequired => t(lang, Key::SrvVlessEncryptionInvalid),
-        VlessReverseTagRequired => t(lang, Key::SrvVlessReverseTagRequired),
-        VmessIdRequired => t(lang, Key::SrvVmessIdUuid),
-        VmessSecurityUnsupported => t(lang, Key::SrvVmessSecurityUnsupported),
-        WireguardSecretKeyInvalid => t(lang, Key::SrvWgSecretInvalid),
-        WireguardReservedKeyBytes => t(lang, Key::SrvWgReservedThreeBytes),
-        WireguardPeersRequired => t(lang, Key::SrvWgAtLeastOnePeer),
-        WireguardPeerPublicKeyRequired => t(lang, Key::SrvWgPeerPublicKeyRequired),
-        WireguardPeerEndpointRequired => t(lang, Key::SrvWgPeerEndpointRequired),
-        WireguardPresharedKeyInvalid => t(lang, Key::SrvWgPresharedInvalid),
-        FreedomFragmentInvalid => t(lang, Key::SrvFreedomFragmentInvalid),
-        FreedomNoiseInvalid => t(lang, Key::SrvFreedomNoiseInvalid),
-        LoopbackTagRequired => t(lang, Key::SrvLoopbackTagRequired),
-        TlsFromMitmAlpnShort => t(lang, Key::SrvFromMitmOnlyAlpnShort),
-        TlsCertificateRequired => t(lang, Key::SrvTlsCertFileOrPem),
-    }
-}
-
-/// The values one model-validation rule's template interpolates, in template
-/// order: the code's own payload, Debug-quoted exactly where the pre-pass
-/// generator used `{:?}` and rendered where the message names another rule's
-/// text (the sniffing/listen codes carry inner messages, one text per rule,
-/// never re-derived).
-///
-/// Every parameterized arm is listed here, and [`validation_message`] fills
-/// *every* code — including the ones this match does not list — through
-/// [`fill_message_template`], whose placeholder-count assertion therefore
-/// covers the whole universe: a rule that starts carrying a payload without
-/// stating it above fails loudly in the tests that render it instead of
-/// shipping a sentence with braces in it.
-fn validation_args(code: &ValidationCode, lang: Language) -> Vec<String> {
-    match code {
-        ValidationCode::FinalmaskPortListInvalid(arg)
-        | ValidationCode::FinalmaskBytesValueRequired(arg)
-        | ValidationCode::FinalmaskUnknownByteSyntax(arg)
-        | ValidationCode::FinalmaskRealmUrlSyntax(arg)
-        | ValidationCode::FinalmaskQuicBandwidthUnitInvalid(arg)
-        | ValidationCode::FinalmaskUdpMaskNotLast(arg)
-        | ValidationCode::FinalmaskNoiseExpTrailingText(arg)
-        | ValidationCode::FinalmaskNoiseExpUnknownToken(arg)
-        | ValidationCode::FinalmaskNoiseExpMissingSize(arg)
-        | ValidationCode::FinalmaskNoiseExpSizeInvalid(arg)
-        | ValidationCode::FinalmaskNoiseExpBytesInvalid(arg)
-        | ValidationCode::FinalmaskNoiseExpArgumentNotAllowed(arg)
-        | ValidationCode::XhttpExtraShadowsSettings(arg)
-        | ValidationCode::TunLeakValueUnknown(arg)
-        | ValidationCode::MasqueHeaderInvalid(arg)
-        | ValidationCode::MasqueReservedHeader(arg)
-        | ValidationCode::FinalmaskXdnsAddrSchemeUnknown(arg)
-        | ValidationCode::RealityFingerprintUntested(arg) => vec![arg.clone()],
-        ValidationCode::XdriveServiceUnsupported(arg)
-        | ValidationCode::XdriveTemplateAuthTypeUnsupported(arg) => {
-            vec![format!("{arg:?}")]
-        }
-        ValidationCode::XdriveH3MaskNotNoise(arg) => vec![arg.clone()],
-        ValidationCode::XdriveTemplateOperationUrlRequired(arg) => vec![arg.clone()],
-        ValidationCode::FinalmaskFilterIpRuleInvalid(arg) => vec![arg.clone()],
-        ValidationCode::FinalmaskUnknownTcpMask(arg)
-        | ValidationCode::FinalmaskUnknownUdpMask(arg) => vec![
-            arg.as_deref()
-                .map(|value| format!("Some({value:?})"))
-                .unwrap_or_else(|| "None".into()),
-        ],
-        ValidationCode::ActiveProfileMissing(id) => vec![format!("{id:?}")],
-        ValidationCode::ActiveProfileAmbiguous(id, count) => {
-            vec![format!("{id:?}"), count.to_string()]
-        }
-        ValidationCode::ProfileIdEmpty(index) | ValidationCode::DokodemoTagMissing(index) => {
-            vec![index.to_string()]
-        }
-        ValidationCode::ProfileIdDuplicated(first, second, id) => {
-            vec![first.to_string(), second.to_string(), format!("{id:?}")]
-        }
-        ValidationCode::ProfileTagEmpty(index, id) => vec![index.to_string(), format!("{id:?}")],
-        ValidationCode::ProfileTagInvalid(index, id, tag)
-        | ValidationCode::ProfileTagReserved(index, id, tag) => {
-            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")]
-        }
-        ValidationCode::ProfileTagDuplicated(first, first_id, second, second_id, tag) => vec![
-            first.to_string(),
-            format!("{first_id:?}"),
-            second.to_string(),
-            format!("{second_id:?}"),
-            format!("{tag:?}"),
-        ],
-        ValidationCode::OutboundChainMissing(source, target) => {
-            vec![format!("{source:?}"), format!("{target:?}")]
-        }
-        ValidationCode::OutboundChainCycle(path) => vec![path.clone()],
-        ValidationCode::BalancerTagMissing(index)
-        | ValidationCode::DnsServerAddressMissing(index)
-        | ValidationCode::FakeDnsPoolCidrInvalid(index)
-        | ValidationCode::FakeDnsPoolSizeInvalid(index) => vec![index.to_string()],
-        ValidationCode::BalancerSelectorMissing(tag)
-        | ValidationCode::BalancerTagDuplicated(tag)
-        | ValidationCode::LocalInboundPortZero(tag)
-        | ValidationCode::DokodemoUnixSocketRequired(tag)
-        | ValidationCode::DokodemoPortZero(tag) => vec![format!("{tag:?}")],
-        ValidationCode::BalancerFallbackMissing(tag, fallback) => {
-            vec![format!("{tag:?}"), format!("{fallback:?}")]
-        }
-        ValidationCode::InboundTagDuplicated(tag) => vec![tag.clone()],
-        ValidationCode::DokodemoNetworkInvalid(tag, error) => {
-            vec![format!("{tag:?}"), error.clone()]
-        }
-        ValidationCode::DokodemoUnixSocketConflict(tag, other, path) => vec![
-            format!("{tag:?}"),
-            format!("{other:?}"),
-            format!("{path:?}"),
-        ],
-        ValidationCode::ListenerConflict(current, other, address, port) => vec![
-            current.clone(),
-            other.clone(),
-            address.clone(),
-            port.to_string(),
-        ],
-        ValidationCode::RoutingRuleTarget(index, error) => {
-            vec![index.to_string(), error.clone()]
-        }
-        ValidationCode::RoutingRuleOutboundMissing(index, tag)
-        | ValidationCode::RoutingRuleBalancerMissing(index, tag)
-        | ValidationCode::RoutingRuleInboundMissing(index, tag) => {
-            vec![index.to_string(), format!("{tag:?}")]
-        }
-        ValidationCode::FakeDnsPoolCapacityExceeded(index, size, pool) => {
-            vec![index.to_string(), size.to_string(), pool.clone()]
-        }
-        ValidationCode::DnsScriptServerConflict(index, field) => {
-            vec![index.to_string(), field.clone()]
-        }
-        ValidationCode::GeodataUrlInvalid(file) => {
-            vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()]
-        }
-        ValidationCode::GeodataCronInvalid => {
-            vec![t(lang, Key::GeodataCronNotFiveFields).to_string()]
-        }
-        _ => Vec::new(),
+        ProtocolSettingsMismatch => (Key::SrvProtocolSettingsMismatch, Vec::new()),
+        ServerAddressRequired => (Key::SrvAddressRequired, Vec::new()),
+        ServerPortRequired => (Key::SrvPortRequired, Vec::new()),
+        VlessIdRequired => (Key::SrvVlessIdUuid, Vec::new()),
+        VlessEncryptionRequired => (Key::SrvVlessEncryptionInvalid, Vec::new()),
+        VlessReverseTagRequired => (Key::SrvVlessReverseTagRequired, Vec::new()),
+        VmessIdRequired => (Key::SrvVmessIdUuid, Vec::new()),
+        VmessSecurityUnsupported => (Key::SrvVmessSecurityUnsupported, Vec::new()),
+        WireguardSecretKeyInvalid => (Key::SrvWgSecretInvalid, Vec::new()),
+        WireguardReservedKeyBytes => (Key::SrvWgReservedThreeBytes, Vec::new()),
+        WireguardPeersRequired => (Key::SrvWgAtLeastOnePeer, Vec::new()),
+        WireguardPeerPublicKeyRequired => (Key::SrvWgPeerPublicKeyRequired, Vec::new()),
+        WireguardPeerEndpointRequired => (Key::SrvWgPeerEndpointRequired, Vec::new()),
+        WireguardPresharedKeyInvalid => (Key::SrvWgPresharedInvalid, Vec::new()),
+        FreedomFragmentInvalid => (Key::SrvFreedomFragmentInvalid, Vec::new()),
+        FreedomNoiseInvalid => (Key::SrvFreedomNoiseInvalid, Vec::new()),
+        LoopbackTagRequired => (Key::SrvLoopbackTagRequired, Vec::new()),
+        TlsFromMitmAlpnShort => (Key::SrvFromMitmOnlyAlpnShort, Vec::new()),
+        TlsCertificateRequired => (Key::SrvTlsCertFileOrPem, Vec::new()),
     }
 }
 
 /// Render one model-validation rule as the sentence the user reads: the
 /// locale template with the code-carried values interpolated. The one public
-/// renderer — the template lookup and the payload match are both inside, so a
-/// caller cannot pick half of the rule's text.
+/// renderer — the key lookup and the payload match both live in
+/// [`validation_text`], so a caller cannot pick half of the rule's text.
 pub fn validation_message(code: &ValidationCode, lang: Language) -> String {
-    let template = validation_template(code, lang);
-    let args = validation_args(code, lang);
+    let (key, args) = validation_text(code, lang);
     let args: Vec<&dyn std::fmt::Display> = args
         .iter()
         .map(|arg| arg as &dyn std::fmt::Display)
         .collect();
-    fill_message_template(template, &args)
+    fill_message_template(t(lang, key), &args)
 }
 
 /// Render a validation finding as `"path: message"` (path omitted when the
@@ -2999,7 +3012,9 @@ fn safety_template(code: &SafetyCode, lang: Language) -> &'static str {
 
 /// Render one safety hazard as the sentence the user reads: the template with
 /// the code-carried value (the exposed listen address, the unmatched balancer
-/// tag) interpolated. The one renderer for a hazard's text.
+/// tag) interpolated. The one renderer for a hazard's text; the finding's path
+/// is deliberately not prefixed, so callers render the field context
+/// themselves (inline placement or dialog rows).
 pub fn safety_message(code: &SafetyCode, lang: Language) -> String {
     let payload = match code {
         SafetyCode::SocksListenerExposed(listen)
@@ -3012,13 +3027,6 @@ pub fn safety_message(code: &SafetyCode, lang: Language) -> String {
         }
     };
     fill_message_template(safety_template(code, lang), &[payload])
-}
-
-/// Fully rendered message for one safety finding. The finding path is
-/// deliberately NOT prefixed — callers render the field context themselves
-/// (inline placement or dialog rows).
-pub fn safety_finding_message(finding: &SafetyFinding, lang: Language) -> String {
-    safety_message(&finding.code, lang)
 }
 
 /// Hazard class label for dialog and inline summaries.
@@ -7201,7 +7209,7 @@ mod tests {
 
     #[test]
     fn safety_messages_render_payload_and_hazard_labels() {
-        use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+        use crate::model::safety::{HazardClass, SafetyCode};
         use crate::model::settings::Language;
         let lang = Language::En;
         for (code, expected) in [
@@ -7221,35 +7229,16 @@ mod tests {
                  authentication).",
             ),
         ] {
-            let finding = SafetyFinding {
-                path: "socks.listen".into(),
-                class: HazardClass::Exposure,
-                code,
-            };
-            assert_eq!(safety_finding_message(&finding, lang), expected);
+            assert_eq!(safety_message(&code, lang), expected);
         }
         assert_eq!(hazard_class_label(HazardClass::Exposure, lang), "Exposure");
         assert_eq!(
-            safety_finding_message(
-                &SafetyFinding {
-                    path: "tun".into(),
-                    class: HazardClass::Privacy,
-                    code: SafetyCode::TunDnsUnprotected,
-                },
-                lang,
-            ),
+            safety_message(&SafetyCode::TunDnsUnprotected, lang),
             "TUN mode has no DNS leak block. DNS can leave the tunnel and reach a resolver \
              outside it."
         );
         assert_eq!(
-            safety_finding_message(
-                &SafetyFinding {
-                    path: "routing.balancers[0]".into(),
-                    class: HazardClass::Breakage,
-                    code: SafetyCode::BalancerSelectorNoMatch("bal".into()),
-                },
-                lang,
-            ),
+            safety_message(&SafetyCode::BalancerSelectorNoMatch("bal".into()), lang),
             "Balancer bal has no selector that matches any outbound tag. The balancer \
              cannot carry traffic."
         );

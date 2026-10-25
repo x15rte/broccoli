@@ -96,18 +96,13 @@ pub(super) fn finalmask_move_buttons(
     move_to: &mut Option<(usize, usize)>,
     remove: &mut Option<usize>,
 ) {
-    if ui
-        .add_enabled(index > 0, egui::Button::new(t(lang, Key::SrvUp)))
-        .clicked()
-    {
-        *move_to = Some((index, index - 1));
-    }
-    if ui
-        .add_enabled(index + 1 < len, egui::Button::new(t(lang, Key::SrvDown)))
-        .clicked()
-    {
-        *move_to = Some((index, index + 1));
-    }
+    crate::ui::widgets::move_buttons(
+        ui,
+        index,
+        len,
+        crate::ui::widgets::MoveLabels::words(t(lang, Key::SrvUp), t(lang, Key::SrvDown)),
+        move_to,
+    );
     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
         *remove = Some(index);
     }

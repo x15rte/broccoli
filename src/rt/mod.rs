@@ -5,6 +5,7 @@
 //! event send is followed by an egui repaint request.
 
 pub mod apply;
+pub mod cancel;
 pub mod dns_in;
 mod events;
 pub mod grpc;
@@ -12,12 +13,14 @@ pub mod helper;
 pub mod jobs;
 mod latency;
 mod lifecycle;
+mod line;
 mod policy;
 mod profiles;
 mod readiness;
 mod seat;
 mod state;
 pub mod supervisor;
+pub mod sweep;
 
 use policy::{
     CANDIDATE_RETRY_DELAY, DNS_IN_ADD_ATTEMPTS, ExitBranch, PreReadinessFailure, READY_TIMEOUT,
@@ -26,6 +29,7 @@ use policy::{
     spend_retry_attempt, update_retries_bind_race,
 };
 
+use self::cancel::Cancel;
 use self::events::{AppLogSink, EventStream};
 use self::lifecycle::Lifecycle;
 use self::readiness::Poll;
@@ -41,7 +45,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Per-RPC bound for the graceful TUN-close `RemoveInbound` call (3 s),
@@ -794,7 +798,7 @@ impl SpawnConfigSource {
 }
 
 /// Why a helper-connect attempt ended without a pipe: an abort raised by the
-/// shared cancel flag (Stop/Shutdown won the race with the UAC prompt or the
+/// shared cancel signal (Stop/Shutdown won the race with the UAC prompt or the
 /// handshake — not a failure), or the connect error itself.
 pub enum HelperConnectFailure {
     /// The launch was cancelled; the runtime must not report an Error phase.
@@ -823,8 +827,8 @@ fn cancelled_cleanup() -> ExclusiveOutcome {
 
 /// The UAC prompt cannot be cancelled, but an accepted prompt must not turn
 /// into a pipe connection after Stop/Shutdown has cancelled this launch.
-fn connect_after_helper_launch<T>(cancel: &AtomicBool, connect: impl FnOnce() -> T) -> Option<T> {
-    (!cancel.load(Ordering::Acquire)).then(connect)
+fn connect_after_helper_launch<T>(cancel: &Cancel, connect: impl FnOnce() -> T) -> Option<T> {
+    (!cancel.is_cancelled()).then(connect)
 }
 
 /// Mark kept by [`should_emit_download_progress`] before the first snapshot:
@@ -1009,7 +1013,6 @@ struct Runtime {
     /// sample after a start (or an exit cleared the baselines), where
     /// [`STATS_TICK_PERIOD`] is the normalizer.
     prev_stats_at: Option<Instant>,
-    rng: u64,
     http: Option<reqwest::Client>,
     /// On-demand update check in flight: gates duplicate
     /// `CheckUpdate` commands so every accepted click yields exactly one
@@ -1019,7 +1022,7 @@ struct Runtime {
     /// exclusive occupant (apply, test config, update core, latency probe,
     /// profile validation, and the lifecycle transitions) carries the
     /// runtime's whole operation
-    /// state on its record — kind, cancel flag, keep-slot flag,
+    /// state on its record — kind, cancel signal, keep-slot flag,
     /// pollable task, per-kind sidecar, and the apply revision. Concurrent
     /// query records (route test, balancer, trial rules, logger restart,
     /// runtime state) abort on the Stop/Shutdown drain.
@@ -1077,11 +1080,6 @@ impl Runtime {
         evt: SyncSender<CoreEvt>,
         repaint: egui::Context,
     ) -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 32))
-            .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            ^ u64::from(std::process::id());
         // Every registry busy-window bookend (exclusive begin `Some(kind)`,
         // release `None`) rides this side channel into the runtime; the
         // begin/release wrappers below drain it onto the GUI event queue
@@ -1107,8 +1105,6 @@ impl Runtime {
             prev_traffic: HashMap::new(),
             prev_inbound_traffic: HashMap::new(),
             prev_stats_at: None,
-            // xorshift64* state must be non-zero.
-            rng: seed | 1,
             http: None,
             update_check_busy: Arc::new(AtomicBool::new(false)),
             jobs: JobRegistry::with_busy_sink(move |bookend| {
@@ -1359,8 +1355,8 @@ impl Runtime {
     /// and its kind's cancellation facts:
     ///
     /// - `Abort` aborts the task and settles the kind's exactly-one terminal.
-    /// - `Cooperative` raises the worker's cancel flag; the worker observes it
-    ///   between units of work and its own terminal releases the record.
+    /// - `Cooperative` raises the worker's cancel signal; the worker observes
+    ///   it between units of work and its own terminal releases the record.
     /// - `KeepSlot` records the keep-slot cancellation of a worker without a
     ///   flag boundary; the worker finishes on its own and its landing
     ///   releases the record.
@@ -1524,16 +1520,6 @@ impl Runtime {
                 .join("\n"),
             Err(_) => String::new(),
         }
-    }
-
-    fn next_rand(&mut self) -> u64 {
-        // xorshift64*
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        x
     }
 
     // -- main loop -----------------------------------------------------------
@@ -2162,7 +2148,7 @@ impl Runtime {
     /// its parked reply were begun by the runner). The worker walks the
     /// profiles on the runtime's own executor, so the scratch write, the
     /// guard and the `xray -test` child all live with the record: cancelling
-    /// is cooperative (the worker observes the record's cancel flag between
+    /// is cooperative (the worker observes the record's cancel signal between
     /// profiles), and the exit path waits for its exactly-one terminal.
     fn begin_profile_validation_work(&mut self, request: ProfileValidationRequest) {
         let cancel = self
@@ -2236,7 +2222,7 @@ impl Runtime {
             ExclusiveOutcome::CleanUpLaunched(result) => match result {
                 Ok((pipe, events)) => self.arm_cleanup(Some(pipe), Some(events)),
                 Err(error) => match error.error() {
-                    // A launch aborted by the shared cancel flag is not a
+                    // A launch aborted by the shared cancel signal is not a
                     // failure: Stop/Shutdown already owns terminal state.
                     None => self.release_exclusive(),
                     Some(error) => self.fail_cleanup(
@@ -2248,7 +2234,8 @@ impl Runtime {
                 let mut pipe = match result {
                     Ok(pipe) => pipe,
                     Err(error) => {
-                        // A connect aborted by the shared cancel flag is not a
+                        // A connect aborted by the shared cancel signal is not
+                        // a
                         // failure: Stop/Shutdown already owns terminal state,
                         // and the launch must never turn into an Error phase.
                         let Some(error) = error.error() else {
@@ -2840,17 +2827,16 @@ impl Runtime {
 
         let pipe_id = uuid::Uuid::new_v4().simple().to_string();
         let token = uuid::Uuid::new_v4().simple().to_string();
-        // The shared cancel flag of the exclusive record: the blocking
-        // connector owns a clone and polls it between bounded pipe attempts
-        // (the flag flips on Stop/Shutdown/exit cancels, exactly as the
+        // The shared cancel signal of the exclusive record: the blocking
+        // connector owns it and observes it between bounded pipe attempts
+        // (the signal flips on Stop/Shutdown/exit cancels, exactly as the
         // ceremony's per-operation flag did).
-        let cancel = match self.jobs.exclusive_cancel_flag() {
+        let task_cancel = match self.jobs.exclusive_cancel_flag() {
             Some(flag) => flag,
             None => unreachable!("helper startup owns a lifecycle operation"),
         };
-        let task_cancel = Arc::clone(&cancel);
         let task = tokio::task::spawn_blocking(move || {
-            if task_cancel.load(Ordering::Acquire) {
+            if task_cancel.is_cancelled() {
                 return cancelled_helper_connect();
             }
             // `_credentials` must stay alive through the connect attempt: the
@@ -2877,7 +2863,7 @@ impl Runtime {
                 // A connect that resolved after Stop/Shutdown raised the flag
                 // is cancelled: the pipe (when one was opened) is dropped
                 // here, and the helper sees its watched parent close.
-                Some(_) if task_cancel.load(Ordering::Acquire) => cancelled_helper_connect(),
+                Some(_) if task_cancel.is_cancelled() => cancelled_helper_connect(),
                 Some(result) => ExclusiveOutcome::HelperConnected(
                     result.map_err(|error| HelperConnectFailure::Failed(error.into())),
                 ),
@@ -2906,16 +2892,15 @@ impl Runtime {
         }
         let pipe_id = uuid::Uuid::new_v4().simple().to_string();
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let cancel = match self.jobs.exclusive_cancel_flag() {
+        let task_cancel = match self.jobs.exclusive_cancel_flag() {
             Some(flag) => flag,
             None => {
                 self.fail_cleanup(DiagError::new(Diag::new(Key::RtLogCleanUpFailed)));
                 return;
             }
         };
-        let task_cancel = Arc::clone(&cancel);
         let task = tokio::task::spawn_blocking(move || {
-            if task_cancel.load(Ordering::Acquire) {
+            if task_cancel.is_cancelled() {
                 return cancelled_cleanup();
             }
             // `_credentials` must stay alive through the connect attempt: the
@@ -2937,7 +2922,7 @@ impl Runtime {
                 // A connect that resolved after Stop/Shutdown raised the flag
                 // is cancelled: the pipe (when one was opened) is dropped here,
                 // and the helper sees its watched parent close.
-                Some(Ok(mut pipe)) if !task_cancel.load(Ordering::Acquire) => {
+                Some(Ok(mut pipe)) if !task_cancel.is_cancelled() => {
                     // A command that cannot be written drops the pipe, which
                     // ends the helper this request launched.
                     if let Err(error) = pipe.cleanup(&adapter_name) {
@@ -2948,7 +2933,7 @@ impl Runtime {
                     let events = pipe.take_events();
                     ExclusiveOutcome::CleanUpLaunched(Ok((pipe, events)))
                 }
-                Some(Err(error)) if !task_cancel.load(Ordering::Acquire) => {
+                Some(Err(error)) if !task_cancel.is_cancelled() => {
                     ExclusiveOutcome::CleanUpLaunched(Err(HelperConnectFailure::Failed(
                         error.into(),
                     )))
@@ -3365,8 +3350,10 @@ impl Runtime {
                 self.settle_config_failure(failure);
             }
             ExitBranch::Backoff => {
-                // Any other unexpected exit: exponential backoff with jitter.
-                let jitter_ms = self.next_rand() % 250;
+                // Any other unexpected exit: exponential backoff with jitter,
+                // a millisecond value in `0..250` so two instances that exit
+                // together do not retry in lockstep.
+                let jitter_ms = fastrand::u64(0..250);
                 let (attempt, delay_ms) = self.lifecycle.backoff.next(Instant::now(), jitter_ms);
                 self.app_log(
                     Diag::new(Key::RtLogCoreExitBackoff)
@@ -4134,6 +4121,7 @@ mod tests {
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ProtocolSettings, ServerProfile};
+    use crate::rt::cancel::Cancel;
     use crate::rt::jobs::{ExclusiveSidecar, JobKind};
     use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect, with_appdata_async};
 
@@ -6395,8 +6383,8 @@ mod tests {
                     .jobs
                     .exclusive_cancel_flag()
                     .expect("the record still occupies")
-                    .load(Ordering::SeqCst),
-                "Stop must raise the worker's cooperative cancel flag"
+                    .is_cancelled(),
+                "Stop must raise the worker's cooperative cancel signal"
             );
             flush_bookends(&mut runtime);
             assert!(
@@ -6552,9 +6540,7 @@ mod tests {
             // A worker past its validation child: it ends only on the
             // cooperative cancel, exactly like a real run observing the flag
             // at its next profile boundary.
-            while !cancel.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
+            cancel.cancelled().await;
             ExclusiveOutcome::ProfileValidation(Err(crate::rt::profiles::validation_cancelled()))
         }));
         let run = tokio::spawn(runtime.run());
@@ -8193,10 +8179,10 @@ mod tests {
 
     #[test]
     fn cancellation_after_uac_returns_never_opens_helper_pipe() {
-        let cancelled = AtomicBool::new(false);
+        let cancelled = Cancel::new();
         // This is the interleaving after ShellExecuteW returns but before the
         // connector could open/auth the per-launch pipe.
-        cancelled.store(true, Ordering::Release);
+        cancelled.cancel();
         let connector_called = AtomicBool::new(false);
         let result = connect_after_helper_launch(&cancelled, || {
             connector_called.store(true, Ordering::Release);
@@ -8855,7 +8841,7 @@ mod tests {
                 r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{}"}}"#,
                 env!("CARGO_PKG_VERSION"),
                 crate::sys::core_dl::pinned_release_version(),
-                super::apply::sha256_hex(stored)
+                crate::digest::sha256_hex(stored)
             );
             std::fs::write(super::apply::meta_path(), stamp).expect("write this build's stamp");
             assert!(

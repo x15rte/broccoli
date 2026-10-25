@@ -150,9 +150,11 @@ pub(crate) trait QuerySeat: Send + 'static {
     /// The registry-reject flavor.
     const BUSY: BusyReject;
 
-    /// Availability and validation, run at the point [`QuerySeat::GATE`]
-    /// declares; `Err` is the rejection text delivered on the reply channel.
-    fn gate(&self, runtime: &Runtime) -> Result<Self::Prepared, DiagError>;
+    /// The seat's own payload validation, run at the point
+    /// [`QuerySeat::GATE`] declares; `Err` is the rejection text delivered on
+    /// the reply channel. The core-running availability check is the shared
+    /// runner's, beside the gate, so no seat can spell (or forget) it.
+    fn gate(&self) -> Result<Self::Prepared, DiagError>;
 
     /// The RPC call, run on the runtime's executor; the error text is the
     /// terminal verdict.
@@ -250,11 +252,11 @@ pub(crate) struct CancelPlan {
     /// "cancelled" for a rule the core already has (an append-mode retry
     /// would duplicate it). Such a task is left to its own terminal.
     pub runs_to_terminal: bool,
-    /// The worker polls the record's cancel flag between units of work: the
-    /// profile validation checks it before the first profile and between
+    /// The worker observes the record's cancel signal between units of work:
+    /// the profile validation checks it before the first profile and between
     /// profiles. A worker without such a boundary finishes on its own; its
     /// landing reads the keep-slot flag instead.
-    pub polls_flag: bool,
+    pub observes: bool,
     /// An unexpected core exit (or TUN helper transport loss) must cancel the
     /// in-flight task and settle its terminal — the user operations whose
     /// result would otherwise be silently dropped. Task-less busy slots are
@@ -263,10 +265,10 @@ pub(crate) struct CancelPlan {
 }
 
 impl CancelPlan {
-    const fn new(runs_to_terminal: bool, polls_flag: bool, cancel_on_exit: bool) -> Self {
+    const fn new(runs_to_terminal: bool, observes: bool, cancel_on_exit: bool) -> Self {
         CancelPlan {
             runs_to_terminal,
-            polls_flag,
+            observes,
             cancel_on_exit,
         }
     }
@@ -438,8 +440,8 @@ pub(crate) fn deliver_cancel_terminal(
             ProbeFailure::plain(Diag::new(Key::ProbeCancelled).arg_message(reason.clone())),
         ),
         // Defensive: an active validation is cancelled cooperatively (its
-        // worker polls the cancel flag) and is outside the exit-cancel set,
-        // so no path reaches this arm today. The terminal is kept so a
+        // worker observes the cancel signal) and is outside the exit-cancel
+        // set, so no path reaches this arm today. The terminal is kept so a
         // future wiring change degrades to a delivered verdict rather than a
         // panic in the select loop.
         JobKind::ValidateProfiles => deliver_profile_reply(
@@ -502,10 +504,7 @@ impl QuerySeat for RouteTestSeat {
     const GATE: GateOrder = GateOrder::BusyFirst;
     const BUSY: BusyReject = BusyReject::Logged;
 
-    fn gate(&self, runtime: &Runtime) -> Result<router_cmd::RoutingContext, DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<router_cmd::RoutingContext, DiagError> {
         routing_context(&self.request)
             .map_err(|error| DiagError::new(Diag::new(Key::SeatInvalidRouteTest)).caused_by(error))
     }
@@ -534,10 +533,7 @@ impl QuerySeat for BalancerInfoSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Text;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         if self.balancer_tag.is_empty() {
             return Err(DiagError::from(Diag::new(Key::SeatBalancerTagRequired)));
         }
@@ -567,10 +563,7 @@ impl QuerySeat for SetBalancerOverrideSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Text;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         if self.balancer_tag.is_empty() {
             return Err(DiagError::from(Diag::new(Key::SeatBalancerTagRequired)));
         }
@@ -602,10 +595,7 @@ impl QuerySeat for ClearBalancerOverrideSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Text;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         if self.balancer_tag.is_empty() {
             return Err(DiagError::from(Diag::new(Key::SeatBalancerTagRequired)));
         }
@@ -636,10 +626,7 @@ impl QuerySeat for RestartLoggerSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Text;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         Ok(())
     }
 
@@ -664,10 +651,7 @@ impl QuerySeat for AddTrialRuleSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
 
-    fn gate(&self, runtime: &Runtime) -> Result<router_cfg::RoutingRule, DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<router_cfg::RoutingRule, DiagError> {
         trial_rule_to_pb(&self.rule)
             .map_err(|error| DiagError::new(Diag::new(Key::SeatInvalidTrialRule)).caused_by(error))
     }
@@ -710,10 +694,7 @@ impl QuerySeat for RemoveTrialRuleSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         if self.rule_tag.is_empty() {
             return Err(DiagError::from(Diag::new(Key::SeatRuleTagRequired)));
         }
@@ -745,10 +726,7 @@ impl QuerySeat for ListTrialRulesSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         Ok(())
     }
 
@@ -774,10 +752,7 @@ impl QuerySeat for ListRuntimeStateSeat {
     const GATE: GateOrder = GateOrder::AvailabilityFirst;
     const BUSY: BusyReject = BusyReject::Impossible;
 
-    fn gate(&self, runtime: &Runtime) -> Result<(), DiagError> {
-        if !matches!(runtime.lifecycle.phase, CorePhase::Running) {
-            return Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)));
-        }
+    fn gate(&self) -> Result<(), DiagError> {
         Ok(())
     }
 
@@ -796,6 +771,19 @@ impl QuerySeat for ListRuntimeStateSeat {
 }
 
 impl Runtime {
+    /// The availability half of every query gate: the core must be running for
+    /// the request's RPC to have a target. Checked by the shared runner at the
+    /// point the seat's [`GateOrder`] declares, so a busy-first seat still
+    /// reports the held window ahead of "core is not running" and no seat
+    /// restates the phase rule.
+    fn query_available(&self) -> Result<(), DiagError> {
+        if matches!(self.lifecycle.phase, CorePhase::Running) {
+            Ok(())
+        } else {
+            Err(DiagError::from(Diag::new(Key::SeatCoreNotRunning)))
+        }
+    }
+
     /// Run one accepted query job: the reply guard (exactly-one terminal on
     /// every death path), the conflict check with its seat-declared reject
     /// flavor, the availability gate, the `grpc`/`repaint` clones, the spawn,
@@ -813,8 +801,10 @@ impl Runtime {
         // Availability-first seats reject before a record exists. The
         // busy-first seat checks the window first and runs its gate after
         // the begin below, where a gate rejection finishes the record again.
+        // Both arms pair the shared core-running check with the seat's own
+        // payload validation.
         let prepared = if Seat::GATE == GateOrder::AvailabilityFirst {
-            match seat.gate(self) {
+            match self.query_available().and_then(|()| seat.gate()) {
                 Ok(prepared) => Some(prepared),
                 Err(error) => return self.reject_query::<Seat>(guard, error),
             }
@@ -831,7 +821,7 @@ impl Runtime {
             Some(prepared) => prepared,
             // Busy-first: the gate runs after the begin, so a rejection
             // finishes the record again before answering.
-            None => match seat.gate(self) {
+            None => match self.query_available().and_then(|()| seat.gate()) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     // A query id addresses a concurrent record, so the

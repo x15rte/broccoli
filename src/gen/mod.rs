@@ -18,8 +18,8 @@ use crate::model::validation::{
     ValidationIssue, Verdict, tun_ipv4_gateway, validate_profiles, validate_settings,
 };
 use crate::model::{
-    DEFAULT_DOMAIN_STRATEGY, DnsCfg, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile,
-    Settings, TunCfg,
+    DEFAULT_DOMAIN_STRATEGY, ProtocolSettings, RoutingCfg, ServerProfile, ServersFile, Settings,
+    TunCfg,
 };
 use serde_json::{Map, Value, json};
 use std::error::Error;
@@ -91,7 +91,7 @@ impl Error for GenerateError {
 /// Build the full Xray config from GUI state.
 /// `settings.raw_override` = Some(text) → parsed and returned VERBATIM.
 pub fn generate(servers: &ServersFile, settings: &Settings) -> Result<Value, GenerateError> {
-    generate_with_api_port(servers, settings, pick_ephemeral_api_port()?)
+    generate_picking_port(servers, settings).0
 }
 
 /// Bind `127.0.0.1:0` to let the OS choose a free loopback port, read it, and
@@ -141,6 +141,17 @@ pub fn generate_with_api_port(
 /// unparsable raw override) publishes [`Verdict::EMPTY`]: nothing judged the
 /// model.
 pub fn generate_with_verdict(
+    servers: &ServersFile,
+    settings: &Settings,
+) -> (Result<Value, GenerateError>, Verdict) {
+    generate_picking_port(servers, settings)
+}
+
+/// Pick the ephemeral API port and run the reporting body: the one place a
+/// production entry point combines the two, so `generate` and
+/// `generate_with_verdict` cannot disagree about the failure shape (a port
+/// failure publishes [`Verdict::EMPTY`] beside its error).
+fn generate_picking_port(
     servers: &ServersFile,
     settings: &Settings,
 ) -> (Result<Value, GenerateError>, Verdict) {
@@ -236,7 +247,7 @@ fn generate_reporting(
     // without the other would leave the dial on the OS resolver or deadlock
     // it inside the module (the DoH dial needs the very chain the query is
     // for).
-    let mut dns_wire = dns(&settings.dns, emission.fakedns);
+    let mut dns_wire = settings.dns.to_wire();
     if let Some(bootstrap) = emission.bootstrap_server()
         && let Some(object) = dns_wire.as_mut().and_then(Value::as_object_mut)
     {
@@ -929,12 +940,6 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &emit::Emission) -> Vec<Value>
         }));
     }
     rules
-}
-
-/// dns object, or None when effectively empty. Strips the GUI-only `fakedns`
-/// group; fakeDns trio (2/3): appends {"address":"fakedns"} when enabled.
-fn dns(cfg: &DnsCfg, fakedns: bool) -> Option<Value> {
-    cfg.to_wire(fakedns)
 }
 
 #[cfg(test)]

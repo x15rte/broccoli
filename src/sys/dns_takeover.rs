@@ -33,7 +33,6 @@
 //! skips the takeover; the capture/restore record still works, and a record
 //! from a build that had the export is repaired through the registry.
 
-use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -43,7 +42,7 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, FARPROC, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GAA_FLAG_SKIP_ANYCAST,
     GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, GetIfEntry2, IF_TYPE_SOFTWARE_LOOPBACK,
-    MIB_IF_ROW2,
+    IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -51,7 +50,8 @@ use windows::core::{GUID, HSTRING, PCSTR, PWSTR};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
 
-use super::netif::{AdapterBuffer, sockaddr_ip};
+use super::aligned::AlignedBuffer;
+use super::netif::sockaddr_ip;
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
 
@@ -275,10 +275,10 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
     // SAFETY: See the identical two-call sizing in `netif::enumerate`: the
     // first call passes a null buffer and reports the required size, the
-    // second passes the base of an allocation made for exactly that size and
-    // aligned to `align_of::<IP_ADAPTER_ADDRESSES_LH>()`, so the chain the
-    // API writes stays inside it. Every node is reached only through the
-    // null-terminated `Next` links the API wrote, and the unicast and DNS
+    // second passes the base of an `AlignedBuffer` allocated for exactly that
+    // size and aligned to `align_of::<IP_ADAPTER_ADDRESSES_LH>()`, so the
+    // chain the API writes stays inside it. Every node is reached only through
+    // the null-terminated `Next` links the API wrote, and the unicast and DNS
     // server chains hang off those nodes in the same allocation.
     unsafe {
         let mut size: u32 = 0;
@@ -286,10 +286,10 @@ fn enumerate() -> Result<Vec<AdapterView>, DiagError> {
         if rc != windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW.0 || size == 0 {
             return Err(DiagError::new(Diag::new(Key::DnsTakeoverEnumerateFailed)));
         }
-        let Some(buffer) = AdapterBuffer::allocate(size as usize) else {
+        let Some(buffer) = AlignedBuffer::<IP_ADAPTER_ADDRESSES_LH>::zeroed(size as usize) else {
             return Err(DiagError::new(Diag::new(Key::DnsTakeoverEnumerateFailed)));
         };
-        let head = buffer.head();
+        let head = buffer.as_mut_ptr();
         let rc = GetAdaptersAddresses(0, flags, None, Some(head), &mut size);
         if rc != 0 {
             return Err(DiagError::new(Diag::new(Key::DnsTakeoverEnumerateFailed)));
@@ -779,20 +779,14 @@ fn read_record(record_path: &Path) -> Result<Option<Record>, DiagError> {
         .map_err(|_| record_error())
 }
 
-/// Persist the capture. The bytes go through a `File` that is flushed with
-/// `sync_all` before the rename, and the write goes through a sibling
-/// temporary file, so a crash mid-write cannot leave a truncated record and
-/// a power loss cannot leave the rename pointing at unflushed data. The
-/// record is the only way back to the original servers once an adapter has
-/// been pointed at the tunnel.
+/// Persist the capture through [`crate::sys::durable::write_atomic`]: the bytes
+/// are flushed to a sibling temp file and renamed over the record, so a crash
+/// mid-write cannot leave a truncated record and a power loss cannot leave the
+/// rename pointing at unflushed data. The record is the only way back to the
+/// original servers once an adapter has been pointed at the tunnel.
 fn write_record(record_path: &Path, record: &Record) -> Result<(), DiagError> {
     let bytes = serde_json::to_vec(record).map_err(|_| record_error())?;
-    let temporary = record_path.with_extension("json.tmp");
-    let mut file = std::fs::File::create(&temporary).map_err(|_| record_error())?;
-    file.write_all(&bytes).map_err(|_| record_error())?;
-    file.sync_all().map_err(|_| record_error())?;
-    drop(file);
-    std::fs::rename(&temporary, record_path).map_err(|_| record_error())
+    crate::sys::durable::write_atomic(record_path, &bytes).map_err(|_| record_error())
 }
 
 /// Merge a fresh capture with the record an earlier session left. For an

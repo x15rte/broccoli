@@ -534,33 +534,30 @@ pub enum MasqueWarpAddressFamily {
 
 /// The family of one WARP address when it is the shape the core accepts.
 pub fn masque_warp_address_family(entry: &str) -> Option<MasqueWarpAddressFamily> {
-    let (address, is_prefix) = match entry.split_once('/') {
-        Some((address, length)) => (address, Some(length)),
-        None => (entry, None),
-    };
-    let family = match address.split_once('%') {
-        // `netip.ParsePrefix` refuses a zone outright, so a zone is only
-        // legal on the bare-address form the core also tries.
-        Some((address, zone)) if is_prefix.is_none() && !zone.is_empty() => {
-            address.parse::<std::net::Ipv6Addr>().ok()?;
+    if let Ok(net) = entry.parse::<ipnet::IpNet>() {
+        return Some(if net.addr().is_ipv4() {
+            MasqueWarpAddressFamily::V4
+        } else {
             MasqueWarpAddressFamily::V6
+        });
+    }
+    // `netip.ParsePrefix` refuses a zone outright, so a zone is only legal
+    // on the bare-address form the core also tries.
+    if entry.contains('/') {
+        return None;
+    }
+    let address = match entry.split_once('%') {
+        Some((address, zone)) if !zone.is_empty() => {
+            address.parse::<std::net::Ipv6Addr>().ok()?;
+            return Some(MasqueWarpAddressFamily::V6);
         }
         Some(_) => return None,
-        None => match address.parse::<std::net::IpAddr>().ok()? {
-            std::net::IpAddr::V4(_) => MasqueWarpAddressFamily::V4,
-            std::net::IpAddr::V6(_) => MasqueWarpAddressFamily::V6,
-        },
+        None => entry,
     };
-    if let Some(length) = is_prefix {
-        let max = match family {
-            MasqueWarpAddressFamily::V4 => 32,
-            MasqueWarpAddressFamily::V6 => 128,
-        };
-        if length.parse::<u8>().ok().is_none_or(|length| length > max) {
-            return None;
-        }
+    match address.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(_) => Some(MasqueWarpAddressFamily::V4),
+        std::net::IpAddr::V6(_) => Some(MasqueWarpAddressFamily::V6),
     }
-    Some(family)
 }
 
 /// True when one WARP key is the shape the core's WARP key decoder accepts:
@@ -976,16 +973,15 @@ pub struct OutboundModel {
 /// Mirror Xray's `requiresTransportSecurity` private endpoint predicate
 /// (`infra/conf/xray.go` + `common/geodata/consts.go`).
 pub fn endpoint_requires_transport_security(address: &str) -> bool {
-    fn prefix_v4(address: u32, network: u32, prefix: u32) -> bool {
-        let mask = u32::MAX << (32 - prefix);
-        address & mask == network & mask
+    fn prefix_v4(address: std::net::Ipv4Addr, network: u32, prefix: u8) -> bool {
+        ipnet::Ipv4Net::new(std::net::Ipv4Addr::from(network), prefix)
+            .is_ok_and(|net| net.contains(&address))
     }
-    fn prefix_v6(address: u128, network: u128, prefix: u32) -> bool {
-        let mask = u128::MAX << (128 - prefix);
-        address & mask == network & mask
+    fn prefix_v6(address: std::net::Ipv6Addr, network: u128, prefix: u8) -> bool {
+        ipnet::Ipv6Net::new(std::net::Ipv6Addr::from(network), prefix)
+            .is_ok_and(|net| net.contains(&address))
     }
     fn private_v4(address: std::net::Ipv4Addr) -> bool {
-        let value = u32::from(address);
         [
             (0x0000_0000, 8),
             (0x0a00_0000, 8),
@@ -1003,7 +999,7 @@ pub fn endpoint_requires_transport_security(address: &str) -> bool {
             (0xe000_0000, 3),
         ]
         .into_iter()
-        .any(|(network, prefix)| prefix_v4(value, network, prefix))
+        .any(|(network, prefix)| prefix_v4(address, network, prefix))
     }
 
     if address.is_empty() {
@@ -1032,7 +1028,6 @@ pub fn endpoint_requires_transport_security(address: &str) -> bool {
                 if let Some(ipv4) = ip.to_ipv4_mapped() {
                     private_v4(ipv4)
                 } else {
-                    let value = u128::from(ip);
                     [
                         (0_u128, 127),
                         (0xfc00_u128 << 112, 7),
@@ -1040,7 +1035,7 @@ pub fn endpoint_requires_transport_security(address: &str) -> bool {
                         (0xff00_u128 << 112, 8),
                     ]
                     .into_iter()
-                    .any(|(network, prefix)| prefix_v6(value, network, prefix))
+                    .any(|(network, prefix)| prefix_v6(ip, network, prefix))
                 }
             }
         };

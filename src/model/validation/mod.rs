@@ -40,14 +40,14 @@
 //! and re-exports every scope item, so `crate::model::validation::X` stays
 //! the one path a caller imports.
 
-use crate::links::{excerpt, excerpt_debug};
+use crate::excerpt::{excerpt, excerpt_debug};
 use crate::model::stream::Network;
 use serde_json::{Map, Value};
 
 /// Every rejection the model layer knows, keyed by rule rather than by
 /// rendered message. Order-independent; parameterized rules carry the value
 /// that the message interpolates — always the bounded form from
-/// `crate::links::excerpt` (at most `crate::links::MAX_ERROR_EXCERPT_CHARS`
+/// `crate::excerpt::excerpt` (at most `crate::excerpt::MAX_ERROR_EXCERPT_CHARS`
 /// characters of the source value, plus an optional trailing `…`). Bounding
 /// happens at construction, so a hostile import input can never inflate a
 /// rendered message and no render site needs its own truncation.
@@ -1470,21 +1470,26 @@ fn cidr_rule_valid(rule: &str) -> bool {
         Some((address, prefix)) => (address, Some(prefix)),
         None => (rule, None),
     };
-    let Some(max_prefix) = address_width(address) else {
+    let Some(address) = rule_ip_address(address) else {
         return false;
     };
-    match prefix {
-        None | Some("") => true,
-        Some(prefix) => {
-            prefix.bytes().all(|byte| byte.is_ascii_digit())
-                && prefix.parse::<u32>().is_ok_and(|bits| bits <= max_prefix)
-        }
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    if prefix.is_empty() {
+        return true;
     }
+    if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    prefix
+        .parse::<u8>()
+        .is_ok_and(|prefix| ipnet::IpNet::new(address, prefix).is_ok())
 }
 
-/// The family width `net.ParseAddress` produces for an IP literal: 32 for
-/// IPv4, 128 for IPv6, and `None` for everything else (domains included).
-fn address_width(address: &str) -> Option<u32> {
+/// The address half of one IP rule: `ParseAddress` strips one bracket pair
+/// and trims non-alphanumeric edges before the IP literal parse.
+fn rule_ip_address(address: &str) -> Option<std::net::IpAddr> {
     let mut address = address;
     if let Some(inner) = address
         .strip_prefix('[')
@@ -1498,10 +1503,7 @@ fn address_width(address: &str) -> Option<u32> {
     {
         address = address.trim();
     }
-    address
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| if ip.is_ipv4() { 32 } else { 128 })
+    address.parse::<std::net::IpAddr>().ok()
 }
 
 /// The vision (XRV) flow spellings Xray's XRV servers accept, in display

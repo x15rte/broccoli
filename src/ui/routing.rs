@@ -1559,20 +1559,16 @@ impl RoutingScreen {
                 for (i, rule) in rules.iter_mut().enumerate() {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(i > 0, egui::Button::new("▲").small())
-                                .on_hover_text(t(lang, Key::RoutingMoveUp))
-                                .clicked()
-                            {
-                                swap = Some((i, i - 1));
-                            }
-                            if ui
-                                .add_enabled(i + 1 < n, egui::Button::new("▼").small())
-                                .on_hover_text(t(lang, Key::RoutingMoveDown))
-                                .clicked()
-                            {
-                                swap = Some((i, i + 1));
-                            }
+                            widgets::move_buttons(
+                                ui,
+                                i,
+                                n,
+                                widgets::MoveLabels::glyphs(
+                                    t(lang, Key::RoutingMoveUp),
+                                    t(lang, Key::RoutingMoveDown),
+                                ),
+                                &mut swap,
+                            );
                             let row = &self
                                 .view_cache
                                 .as_ref()
@@ -1877,15 +1873,16 @@ impl RoutingScreen {
 
         // attrs: map key → regexp matched against HTTP sniff headers.
         ui.label(RichText::new(t(lang, Key::Attrs)).small().weak());
-        let attrs = self
-            .attrs_buf
-            .begin_keyed(rule.rule_tag.as_str(), || kv_from_map(&rule.attrs));
+        let attrs = self.attrs_buf.begin_keyed(rule.rule_tag.as_str(), || {
+            widgets::kv_rows_from_json(&rule.attrs)
+        });
         if widgets::kv_table(
             ui,
             lang,
             attrs,
             t(lang, Key::AttrsKeyHint),
             t(lang, Key::AttrsValueHint),
+            t(lang, Key::AddKvRow),
         ) {
             rule.attrs = map_from_kv(attrs);
             changed = true;
@@ -1914,15 +1911,16 @@ impl RoutingScreen {
                     0..=86_400,
                 );
                 ui.label(RichText::new(t(lang, Key::Headers)).small().weak());
-                let headers = self
-                    .headers_buf
-                    .begin_keyed(rule.rule_tag.as_str(), || kv_from_map(&wh.headers));
+                let headers = self.headers_buf.begin_keyed(rule.rule_tag.as_str(), || {
+                    widgets::kv_rows_from_json(&wh.headers)
+                });
                 if widgets::kv_table(
                     ui,
                     lang,
                     headers,
                     t(lang, Key::HeadersKeyHint),
                     t(lang, Key::HeadersValueHint),
+                    t(lang, Key::AddKvRow),
                 ) {
                     wh.headers = map_from_kv(headers);
                     changed = true;
@@ -2210,7 +2208,7 @@ impl RoutingScreen {
                     .weak(),
                 );
                 // The modified-time hover needs two String builds (path
-                // display + SystemTime debug) plus a `t_fmt`; egui
+                // display + UTC calendar text) plus a `t_fmt`; egui
                 // evaluates `on_hover_text` arguments eagerly on every
                 // open-menu frame, so the tooltip is attached only on
                 // the frames the label is actually hovered.
@@ -2222,8 +2220,7 @@ impl RoutingScreen {
                     let modified = catalog
                         .metadata
                         .modified
-                        .as_ref()
-                        .map(|modified| format!("{modified:?}"))
+                        .and_then(crate::ui::utc_timestamp)
                         .unwrap_or_else(|| t(lang, Key::GeodataModifiedUnavailable).to_owned());
                     codes_bytes.on_hover_text(t_fmt(
                         lang,
@@ -3013,13 +3010,14 @@ impl RoutingScreen {
                             &mut cost.r#match,
                             t(lang, Key::MatchHint),
                         );
-                        changed |= opt_f64(
+                        changed |= widgets::opt_num_with(
                             ui,
-                            lang,
                             t(lang, Key::Weight),
                             &mut cost.value,
                             0.0..=10.0,
                             0.5,
+                            Some(t(lang, Key::Auto)),
+                            0.01,
                         );
                         if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
                             del_cost = Some(ci);
@@ -3074,13 +3072,14 @@ impl RoutingScreen {
                     .small()
                     .weak(),
             );
-            changed |= opt_f64(
+            changed |= widgets::opt_num_with(
                 ui,
-                lang,
                 t(lang, Key::Tolerance),
                 &mut s.tolerance,
                 0.0..=1.0,
                 0.5,
+                Some(t(lang, Key::Auto)),
+                0.01,
             );
         });
         changed
@@ -3474,6 +3473,7 @@ impl RoutingScreen {
                             &mut self.test_attrs,
                             t(lang, Key::TestAttrKeyHint),
                             t(lang, Key::TestAttrValueHint),
+                            t(lang, Key::AddKvRow),
                         );
                     });
 
@@ -5089,22 +5089,11 @@ fn rule_target_line(lang: Language, r: &Rule) -> String {
     }
 }
 
-pub(crate) fn kv_from_map(m: &Map<String, Value>) -> Vec<(String, String)> {
-    m.iter()
-        .map(|(k, v)| {
-            let s = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            (k.clone(), s)
-        })
-        .collect()
-}
-
-pub(crate) fn map_from_kv(kv: &[(String, String)]) -> Map<String, Value> {
-    kv.iter()
-        .filter(|(k, _)| !k.trim().is_empty())
-        .map(|(k, v)| (k.trim().to_string(), Value::String(v.trim().to_string())))
+/// The edited attrs/headers rows back into the model: every value is opaque
+/// text for these tables, unlike the hosts table's comma lists.
+fn map_from_kv(kv: &[(String, String)]) -> Map<String, Value> {
+    widgets::kv_rows_trimmed(kv)
+        .map(|(k, v)| (k, Value::String(v)))
         .collect()
 }
 /// Xray routing PortList grammar (`infra/conf/common.go`): a
@@ -5147,46 +5136,6 @@ fn ip_list_error(lang: Language, items: &[String]) -> Option<String> {
         .iter()
         .any(|item| !ip_rule_valid(item))
         .then(|| t(lang, Key::RoutingIpListInvalid).to_string())
-}
-
-/// Checkbox-gated DragValue for `Option<f64>`; enabling picks `default_on`.
-fn opt_f64(
-    ui: &mut Ui,
-    lang: Language,
-    label: &str,
-    v: &mut Option<f64>,
-    range: std::ops::RangeInclusive<f64>,
-    default_on: f64,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let mut on = v.is_some();
-        if ui.checkbox(&mut on, "").changed() {
-            *v = on.then_some(default_on);
-            changed = true;
-        }
-        if let Some(x) = v.as_mut() {
-            if ui.add(DragValue::new(x).range(range).speed(0.01)).changed() {
-                changed = true;
-            }
-        } else {
-            ui.label(RichText::new(t(lang, Key::Auto)).weak());
-        }
-    });
-    changed
-}
-
-/// Checkbox over `Option<bool>`: checked = Some(true), unchecked = None
-/// (absent and false are equivalent for these core flags).
-pub(crate) fn opt_bool(ui: &mut Ui, label: &str, v: &mut Option<bool>) -> bool {
-    let mut on = v.unwrap_or(false);
-    if ui.checkbox(&mut on, label).changed() {
-        *v = if on { Some(true) } else { None };
-        true
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]

@@ -121,25 +121,7 @@ pub fn dns_out_action_supported(action: &str) -> bool {
 pub fn send_through_supported(value: &str) -> bool {
     matches!(value, "origin" | "srcip")
         || value.parse::<std::net::IpAddr>().is_ok()
-        || value.parse::<cidr_shim::Cidr>().is_ok()
-}
-
-/// Minimal CIDR parse shim so the sendThrough rule needs no extra dep.
-mod cidr_shim {
-    pub struct Cidr;
-    impl std::str::FromStr for Cidr {
-        type Err = ();
-        fn from_str(s: &str) -> Result<Self, ()> {
-            let (ip, len) = s.split_once('/').ok_or(())?;
-            ip.parse::<std::net::IpAddr>().map_err(|_| ())?;
-            let n: u8 = len.parse().map_err(|_| ())?;
-            let max = if ip.contains(':') { 128 } else { 32 };
-            if n > max {
-                return Err(());
-            }
-            Ok(Cidr)
-        }
-    }
+        || value.parse::<ipnet::IpNet>().is_ok()
 }
 
 /// True when a sniffing `destOverride` item names one

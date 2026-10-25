@@ -1615,8 +1615,8 @@ mod tests {
     fn oversized_profile_identity_fields_render_bounded_findings() {
         // A hand-edited state file can carry multi-KB ids and names; every
         // parameterized payload and the per-profile finding path are bounded
-        // with `links::excerpt` at construction (the enum's own contract), so
-        // no render site can be inflated by them.
+        // with `crate::excerpt::excerpt` at construction (the enum's own
+        // contract), so no render site can be inflated by them.
         use crate::i18n::validation_issue_message;
         use crate::model::settings::Language;
 
@@ -1643,7 +1643,7 @@ mod tests {
             .expect("the profile's own rule must fire");
         let path = scoped.path.as_deref().expect("profile findings are scoped");
         assert!(
-            path.chars().count() <= crate::links::MAX_ERROR_EXCERPT_CHARS + 1,
+            path.chars().count() <= crate::excerpt::MAX_ERROR_EXCERPT_CHARS + 1,
             "the profile location must be excerpted: {path:?}"
         );
         for issue in &issues {

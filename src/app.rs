@@ -2,10 +2,10 @@
 //! first-run wizard.
 
 use crate::diag::Diag;
+use crate::excerpt::excerpt;
 use crate::r#gen::{self, keys};
 use crate::i18n::{Key, LogLevel, t, t_fmt};
 use crate::icon::{IconAssets, IconPresentation, classify};
-use crate::links::excerpt;
 use crate::model::inbound::API_INBOUND_TAG;
 use crate::model::safety::{SafetyFinding, SafetyVerdicts};
 use crate::model::settings::{Language, Mode};
@@ -2784,7 +2784,7 @@ fn show_safety_ack_modal(
                     ui.strong(&finding.path);
                     ui.label(crate::i18n::hazard_class_label(finding.class.clone(), lang));
                 });
-                ui.add(egui::Label::new(crate::i18n::safety_finding_message(finding, lang)).wrap());
+                ui.add(egui::Label::new(crate::i18n::safety_message(&finding.code, lang)).wrap());
                 ui.add_space(6.0);
             }
             ui.add_space(6.0);
@@ -4469,7 +4469,7 @@ mod safety_ack_tests {
         ];
         let expected_messages: Vec<String> = findings
             .iter()
-            .map(|finding| crate::i18n::safety_finding_message(finding, Language::En))
+            .map(|finding| crate::i18n::safety_message(&finding.code, Language::En))
             .collect();
         let decision = Rc::new(Cell::new(None));
         let decision_for_ui = Rc::clone(&decision);

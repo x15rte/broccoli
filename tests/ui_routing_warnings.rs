@@ -15,8 +15,8 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::{Key, safety_finding_message, t, t_fmt};
-use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+use broccoli::i18n::{Key, safety_message, t, t_fmt};
+use broccoli::model::safety::SafetyCode;
 use broccoli::model::settings::{Language, Settings};
 use broccoli::model::{Balancer, OutboundModel, RoutingCfg, Rule, ServerProfile, ServersFile};
 use broccoli::ui::Screen;
@@ -35,12 +35,10 @@ mod common;
 /// The expected inline message for one balancer breakage finding, rendered
 /// through the i18n renderer the UI itself consumes.
 fn breakage_message(tag: &str) -> String {
-    let finding = SafetyFinding {
-        path: String::new(),
-        class: HazardClass::Breakage,
-        code: SafetyCode::BalancerSelectorNoMatch(tag.into()),
-    };
-    safety_finding_message(&finding, Language::En)
+    safety_message(
+        &SafetyCode::BalancerSelectorNoMatch(tag.into()),
+        Language::En,
+    )
 }
 
 /// The inline PortList grammar error text, as the field itself renders it.

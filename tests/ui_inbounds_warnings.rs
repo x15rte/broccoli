@@ -14,8 +14,8 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::{Key, safety_finding_message, t, validation_issue_message};
-use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+use broccoli::i18n::{Key, safety_message, t, validation_issue_message};
+use broccoli::model::safety::SafetyCode;
 use broccoli::model::settings::{Language, Settings};
 use broccoli::model::validation::{ValidationCode, validate_finalmask};
 use broccoli::model::{
@@ -36,12 +36,7 @@ mod common;
 /// The expected inline message for one exposure finding, rendered through
 /// the i18n renderer the UI itself consumes.
 fn exposure_message(code: SafetyCode) -> String {
-    let finding = SafetyFinding {
-        path: String::new(),
-        class: HazardClass::Exposure,
-        code,
-    };
-    safety_finding_message(&finding, Language::En)
+    safety_message(&code, Language::En)
 }
 
 /// Boot through the shared fixture against `settings` persisted into the temp

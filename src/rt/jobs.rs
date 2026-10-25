@@ -8,7 +8,7 @@
 //! so a terminal can never be delivered to the wrong kind. Concurrent jobs
 //! (the control-plane queries) run alongside each other and only reject
 //! while an exclusive job holds the window. Every record carries a kind,
-//! an abort handle, and a cancel flag — a query whose mutation pair must
+//! an abort handle, and a cancel signal — a query whose mutation pair must
 //! reach its own terminal registers the handle without making it abortable
 //! ([`super::seat::cancel_plan`]) — and [`ReplyGuard`]
 //! delivers exactly one terminal result per query job over a per-request
@@ -34,15 +34,13 @@
 //! `Restart` when it acts, `ImportCoreArchive` runs as `UpdateCore`;
 //! `CheckUpdate` and `SetObservatory` are not jobs.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::diag::{Diag, DiagError};
 
 use super::ApplyOutput;
+use super::cancel::Cancel;
 
 /// Terminal verdict of one accepted `CoreCmd::TestConfig`: `Ok((accepted,
 /// output))` when the core ran the validation, `Err` when it never did
@@ -344,7 +342,7 @@ impl<T> Drop for ReplyGuard<T> {
     }
 }
 
-/// One tracked job: its id, kind, shared cancel flag, and the abort handle
+/// One tracked job: its id, kind, shared cancel signal, and the abort handle
 /// of the task running it (once the task reports in via
 /// [`JobRegistry::set_abort`]). The exclusive record additionally carries
 /// the runtime's whole operation state: the pollable task handle the
@@ -354,7 +352,7 @@ impl<T> Drop for ReplyGuard<T> {
 struct Record {
     id: u64,
     kind: JobKind,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancel,
     abort: Option<AbortHandle>,
     /// A task that must be left to its own terminal under every cancel path
     /// (registered with [`JobRegistry::set_abort_keep_running`]): the handle
@@ -383,7 +381,7 @@ impl Record {
         Record {
             id,
             kind,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Cancel::new(),
             abort: None,
             keep_running: false,
             task: None,
@@ -393,18 +391,15 @@ impl Record {
         }
     }
 
-    /// Sets the cancel flag and aborts the task if its handle was
-    /// registered. Mirror of today's flag-only cancels (the helper
-    /// connector check) plus the uniform abort of the migration drain.
-    /// Store/load pair uses Release/Acquire like the ceremony's flags
-    /// (`rt/mod.rs` cancel paths): workers poll the flag with Acquire
-    /// loads between blocking attempts.
+    /// Raises the record's cancel and aborts the task if its handle was
+    /// registered. The signal is the workers' shared boundary: a blocking
+    /// worker reads it between attempts, an async one awaits it.
     ///
     /// A record registered via
-    /// [`JobRegistry::set_abort_keep_running`] only gets the flag: its task
+    /// [`JobRegistry::set_abort_keep_running`] only gets the signal: its task
     /// must reach its own terminal.
     fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
         if self.keep_running {
             return;
         }
@@ -413,12 +408,12 @@ impl Record {
         }
     }
 
-    /// Cooperative keep-slot cancel: raises the worker's cancel flag — a
-    /// worker that owns an on-disk artifact polls it between units of work —
-    /// and records the keep-slot flag, aborting nothing. The record keeps
-    /// occupying until the worker's own terminal lands.
+    /// Cooperative keep-slot cancel: raises the worker's cancel signal — a
+    /// worker that owns an on-disk artifact observes it between units of
+    /// work — and records the keep-slot flag, aborting nothing. The record
+    /// keeps occupying until the worker's own terminal lands.
     fn request_cooperative_cancel(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
         self.cancel_requested = true;
     }
 }
@@ -438,7 +433,7 @@ pub(crate) enum StopPlan {
     /// An abortable task: abort it and settle the kind's exactly-one
     /// terminal.
     Abort { kind: JobKind },
-    /// A worker that polls its cancel flag: raise the flag and leave the
+    /// A worker that observes its cancel signal: raise it and leave the
     /// record held until the worker's own terminal.
     Cooperative { kind: JobKind },
     /// A worker with no flag boundary: record the keep-slot cancellation and
@@ -461,7 +456,7 @@ impl StopPlan {
 
 /// The job registry: at most one exclusive job plus any number
 /// of concurrent jobs. The exclusive record carries the runtime's whole
-/// operation state — pollable task, cancel flag, keep-slot flag,
+/// operation state — pollable task, cancel signal, keep-slot flag,
 /// per-kind sidecar, apply revision — and is only ever released by the explicit
 /// [`JobRegistry::finish_concurrent`]/[`JobRegistry::finish_exclusive`],
 /// which the
@@ -571,7 +566,7 @@ impl JobRegistry {
         self.exclusive.as_ref().map(|record| record.kind)
     }
 
-    /// Sets the cancel flag and aborts the task of one record. Does NOT
+    /// Raises the cancel signal and aborts the task of one record. Does NOT
     /// remove it and emits nothing — the caller owns the release (the
     /// concurrent one, or [`JobRegistry::finish_exclusive`]) and the
     /// terminal timing.
@@ -592,7 +587,7 @@ impl JobRegistry {
     /// Like [`JobRegistry::set_abort`] for a task that must be left to its
     /// own terminal (see [`super::seat::cancel_plan`]): the handle still
     /// evidences completion to the lazy sweep, but no cancel path aborts the
-    /// task — Stop/Shutdown raise the record's cancel flag only, and the
+    /// task — Stop/Shutdown raise the record's cancel signal only, and the
     /// task's own reply guard delivers its terminal.
     pub fn set_abort_keep_running(&mut self, id: u64, abort: AbortHandle) {
         if let Some(record) = self.find_mut(id) {
@@ -601,15 +596,15 @@ impl JobRegistry {
         }
     }
 
-    /// The shared cancel flag of a record, for the worker to poll.
-    pub fn cancel_flag(&self, id: u64) -> Option<Arc<AtomicBool>> {
+    /// The shared cancel signal of a record, for the worker to observe.
+    pub fn cancel_flag(&self, id: u64) -> Option<Cancel> {
         match self.exclusive.as_ref().filter(|record| record.id == id) {
-            Some(record) => Some(Arc::clone(&record.cancel)),
+            Some(record) => Some(record.cancel.clone()),
             None => self
                 .concurrent
                 .iter()
                 .find(|record| record.id == id)
-                .map(|record| Arc::clone(&record.cancel)),
+                .map(|record| record.cancel.clone()),
         }
     }
 
@@ -619,7 +614,7 @@ impl JobRegistry {
         self.concurrent.len() + usize::from(self.exclusive.is_some())
     }
 
-    /// Sets the cancel flag and aborts every record. Does not remove
+    /// Raises the cancel signal and aborts every record. Does not remove
     /// anything and emits nothing: the Stop/Shutdown drain composes
     /// cancel + terminal + finish per record; non-abortable jobs keep
     /// their cancel-requested-until-terminal flag semantics.
@@ -701,7 +696,7 @@ impl JobRegistry {
             .and_then(|record| record.sidecar.take())
     }
 
-    /// Requests cancellation of the exclusive occupant (cancel flag +
+    /// Requests cancellation of the exclusive occupant (cancel signal +
     /// abort). Does NOT remove it and emits nothing — the caller owns the
     /// terminal and the release timing.
     pub fn cancel_exclusive_record(&mut self) {
@@ -710,12 +705,10 @@ impl JobRegistry {
         }
     }
 
-    /// The shared cancel flag of the exclusive record, for a worker to
-    /// poll between blocking attempts (helper connector).
-    pub fn exclusive_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
-        self.exclusive
-            .as_ref()
-            .map(|record| Arc::clone(&record.cancel))
+    /// The shared cancel signal of the exclusive record, for a worker to
+    /// observe between blocking attempts (helper connector).
+    pub fn exclusive_cancel_flag(&self) -> Option<Cancel> {
+        self.exclusive.as_ref().map(|record| record.cancel.clone())
     }
 
     /// Flag-only keep-slot cancel of the exclusive occupant: sets
@@ -728,7 +721,7 @@ impl JobRegistry {
     }
 
     /// Cooperative keep-slot cancel of the exclusive occupant: raises the
-    /// worker's cancel flag (polled between units of work) alongside the
+    /// worker's cancel signal (observed between units of work) alongside the
     /// keep-slot flag, aborts nothing, removes nothing, emits nothing. The
     /// worker delivers its exactly-one terminal and only that terminal
     /// releases the record.
@@ -788,7 +781,7 @@ impl JobRegistry {
         if !plan.runs_to_terminal {
             return StopPlan::Abort { kind };
         }
-        if plan.polls_flag {
+        if plan.observes {
             StopPlan::Cooperative { kind }
         } else {
             StopPlan::KeepSlot { kind }
@@ -853,7 +846,6 @@ impl Default for JobRegistry {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     use parking_lot::Mutex;
     use tokio::sync::oneshot::error::TryRecvError;
@@ -1030,14 +1022,14 @@ mod tests {
         let mut registry = recorder_registry(&bookends);
         let probe = registry.try_begin(JobKind::LatencyProbe).unwrap();
         let flag = registry.cancel_flag(probe).unwrap();
-        assert!(!flag.load(Ordering::SeqCst));
+        assert!(!flag.is_cancelled());
 
         assert!(registry.try_begin(JobKind::Stop).is_ok());
 
         assert_eq!(registry.busy_kind(), Some(JobKind::Stop));
         assert!(
-            flag.load(Ordering::SeqCst),
-            "preempted record's cancel flag must be set"
+            flag.is_cancelled(),
+            "preempted record's cancel must be raised"
         );
         assert_eq!(
             bookends.lock().as_slice(),
@@ -1244,7 +1236,7 @@ mod tests {
         // timing.
         assert_eq!(registry.busy_kind(), Some(JobKind::LatencyProbe));
         assert_eq!(registry.in_flight(), 1);
-        assert!(registry.cancel_flag(id).unwrap().load(Ordering::SeqCst));
+        assert!(registry.cancel_flag(id).unwrap().is_cancelled());
         assert_eq!(bookends.lock().as_slice(), &[Some(JobKind::LatencyProbe)]);
 
         registry.finish_exclusive();
@@ -1268,7 +1260,7 @@ mod tests {
         let exclusive = registry.try_begin(JobKind::LatencyProbe).unwrap();
         let flags = [exclusive, first, second].map(|id| registry.cancel_flag(id).unwrap());
         for flag in &flags {
-            assert!(!flag.load(Ordering::SeqCst));
+            assert!(!flag.is_cancelled());
         }
 
         registry.abort_all();
@@ -1276,7 +1268,7 @@ mod tests {
         // Every record is flagged (and aborted), but none is removed and
         // no bookend beyond the begin one is emitted.
         for flag in &flags {
-            assert!(flag.load(Ordering::SeqCst));
+            assert!(flag.is_cancelled());
         }
         assert_eq!(registry.in_flight(), 3);
         assert_eq!(registry.busy_kind(), Some(JobKind::LatencyProbe));
@@ -1495,8 +1487,8 @@ mod tests {
             !registry
                 .cancel_flag(id)
                 .expect("record still occupies")
-                .load(Ordering::SeqCst),
-            "the flag-only cancel must not set the worker cancel flag"
+                .is_cancelled(),
+            "the flag-only cancel must not raise the worker cancel signal"
         );
         assert_eq!(
             bookends.lock().as_slice(),
@@ -1533,10 +1525,7 @@ mod tests {
             !probe.is_finished(),
             "abort_all must not abort the keep-slot install record"
         );
-        assert!(
-            query_abort.load(Ordering::SeqCst),
-            "concurrent records still drain"
-        );
+        assert!(query_abort.is_cancelled(), "concurrent records still drain");
         assert_eq!(registry.busy_kind(), Some(JobKind::UpdateCore));
         assert!(registry.is_cancel_requested());
 
@@ -1571,7 +1560,7 @@ mod tests {
 
         registry.abort_all();
 
-        assert!(flag.load(Ordering::SeqCst), "the drain raises the flag");
+        assert!(flag.is_cancelled(), "the drain raises the flag");
         assert!(
             !task.is_finished(),
             "abort_all must not abort a record that runs to its own terminal"
@@ -1624,9 +1613,9 @@ mod tests {
     fn cancel_plan_truth_table() {
         use crate::rt::seat::{CancelPlan, cancel_plan};
 
-        let expect = |runs_to_terminal: bool, polls_flag: bool, cancel_on_exit: bool| CancelPlan {
+        let expect = |runs_to_terminal: bool, observes: bool, cancel_on_exit: bool| CancelPlan {
             runs_to_terminal,
-            polls_flag,
+            observes,
             cancel_on_exit,
         };
         // The kinds that own an artifact a hard abort would strand.
@@ -1658,13 +1647,13 @@ mod tests {
         ] {
             assert_eq!(cancel_plan(kind), expect(false, false, false), "{kind:?}");
         }
-        // Only a worker that runs to its terminal may be flagged instead of
+        // Only a worker that runs to its terminal may be signalled instead of
         // aborted.
         for kind in ALL_KINDS {
             let plan = cancel_plan(kind);
             assert!(
-                !plan.polls_flag || plan.runs_to_terminal,
-                "{kind:?}: a polling worker must be one a hard abort cannot interrupt"
+                !plan.observes || plan.runs_to_terminal,
+                "{kind:?}: a worker that observes its cancel must be one a hard abort cannot interrupt"
             );
         }
     }

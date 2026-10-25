@@ -11,6 +11,7 @@
 //! - [`DurationMs`] — Go `time.Duration` strings ("10s", "1m30s"),
 //!   infra/conf/cfgcommon/duration/duration.go.
 
+pub mod addr;
 pub mod dial;
 pub mod dns;
 pub mod emit;
@@ -59,7 +60,7 @@ pub use stream::{
 };
 pub use validation::{ValidationCode, ValidationIssue};
 
-use crate::links::excerpt;
+use crate::excerpt::excerpt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -342,22 +343,7 @@ where
 /// next to the live file. The writer handle is closed by then, so the removal
 /// is not blocked by the open file.
 fn write_state_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let tmp = state_temp_file(path);
-    let result = flush_and_replace(&tmp, path, bytes);
-    if result.is_err() {
-        discard_state_temp(&tmp);
-    }
-    result
-}
-
-/// [`write_state_atomic`]'s fallible body: a partial file stays behind on any
-/// error, so the caller owns dropping it.
-fn flush_and_replace(tmp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut file = File::create(tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::sys::durable::write_atomic(path, bytes).map_err(Into::into)
 }
 
 /// Crash-durable atomic save of a state file. Fails closed: the app-data
@@ -385,7 +371,7 @@ pub(crate) fn save_state<T: Serialize>(name: &str, value: &T) -> anyhow::Result<
         // A kill between the temp write and the rename can strand a
         // full-plaintext `<file>.tmp`; the write path truncates and renames
         // that temp away, so the skip has to clear it instead.
-        discard_state_temp(&state_temp_file(&path));
+        crate::sys::durable::discard_temp(&crate::sys::durable::temp_path(&path));
         return Ok(());
     }
     write_state_atomic(&path, &bytes)
@@ -405,30 +391,6 @@ fn state_file_holds(path: &Path, bytes: &[u8]) -> bool {
     file.take(bytes.len() as u64 + 1)
         .read_to_end(&mut existing)
         .is_ok_and(|_| existing == bytes)
-}
-
-/// The sibling temp file one atomic write of `path` stages through.
-fn state_temp_file(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
-}
-
-/// Best-effort removal of a staged state temp file: it holds the full
-/// plaintext state (passwords, UUIDs, the WireGuard key), so neither a failed
-/// write nor a skipped one may leave it beside the live file. An absent temp
-/// is the normal case.
-fn discard_state_temp(tmp: &Path) {
-    match std::fs::remove_file(tmp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::debug!(
-                "removing the state temp file {} failed: {error}",
-                tmp.display()
-            );
-        }
-    }
 }
 
 // ---------- wipe-then-delete of `.broken-*` quarantines ----------

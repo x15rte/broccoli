@@ -2,7 +2,7 @@
 //! serialize byte-identical (as parsed Values), incl. extra-map passthrough.
 
 use super::*;
-use crate::links::excerpt;
+use crate::excerpt::excerpt;
 use crate::sys::appdata::with_appdata;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -630,7 +630,7 @@ fn off_stale_options_round_trip_and_strip_from_the_wire() {
         Value::Null,
         "cleared TTL must be stored as null"
     );
-    let wire = cfg.to_wire(false).expect("seeded config has a wire form");
+    let wire = cfg.to_wire().expect("seeded config has a wire form");
     assert!(
         wire.get("serveStale").is_none() && wire.get("serveExpiredTTL").is_none(),
         "off/null stale options must not reach the wire: {wire}"
@@ -1221,7 +1221,7 @@ fn an_unchanged_state_file_is_left_alone() {
 
         // A kill between the temp write and the rename strands a
         // full-plaintext temp file, which the skipped save must clear.
-        let stranded = state_temp_file(&path);
+        let stranded = crate::sys::durable::temp_path(&path);
         std::fs::write(&stranded, b"stale plaintext").expect("strand a state temp file");
         servers.save().expect("a skipped save still succeeds");
         assert!(

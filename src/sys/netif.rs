@@ -16,8 +16,6 @@
 //! (see `xray_outbound_heuristic`), so only the fixed-name branches are
 //! pure over the enumeration.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::mem::align_of;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
@@ -29,6 +27,8 @@ use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
 };
+
+use super::aligned::AlignedBuffer;
 
 /// One network interface and its unicast addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,58 +45,6 @@ pub struct NetIf {
     /// IfOperStatusUp` as reported by `GetAdaptersAddresses`).
     pub up: bool,
     pub ips: Vec<String>,
-}
-
-/// Owns the `GetAdaptersAddresses` output buffer. The buffer is allocated
-/// with an explicit `Layout` aligned to `align_of::<IP_ADAPTER_ADDRESSES_LH>()`
-/// (the struct contains 8-byte fields) and freed with the same layout on
-/// drop — a `Vec<u8>` (alignment 1) cast to `*mut IP_ADAPTER_ADDRESSES_LH`
-/// would be UB by contract and would only work via allocator over-alignment.
-///
-/// `pub(crate)` because [`dns_takeover`](crate::sys::dns_takeover) walks the
-/// same API and uses the same aligned-allocation discipline instead of
-/// duplicating it.
-pub(crate) struct AdapterBuffer {
-    ptr: *mut u8,
-    layout: Layout,
-}
-
-impl AdapterBuffer {
-    /// Allocate `size` bytes aligned for `IP_ADAPTER_ADDRESSES_LH`, zeroed so
-    /// no uninitialized byte is ever observed. `None` on zero size, an
-    /// unrepresentable layout, or allocation failure — all are best-effort
-    /// enumeration failures.
-    pub(crate) fn allocate(size: usize) -> Option<Self> {
-        if size == 0 {
-            return None;
-        }
-        let layout = Layout::from_size_align(size, align_of::<IP_ADAPTER_ADDRESSES_LH>()).ok()?;
-        // SAFETY: `layout` has a non-zero size (checked above) and a
-        // power-of-two alignment, so `alloc_zeroed` returns a pointer valid
-        // for `layout.size()` bytes of zeroed memory with `layout.align()`,
-        // or null on allocation failure (filtered out below).
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return None;
-        }
-        Some(Self { ptr, layout })
-    }
-
-    /// The buffer reinterpreted as the head of the adapter linked list. The
-    /// cast is sound because the allocation's alignment (from the layout) is
-    /// at least `align_of::<IP_ADAPTER_ADDRESSES_LH>()`.
-    pub(crate) fn head(&self) -> *mut IP_ADAPTER_ADDRESSES_LH {
-        self.ptr as *mut IP_ADAPTER_ADDRESSES_LH
-    }
-}
-
-impl Drop for AdapterBuffer {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` was returned by `alloc_zeroed` with exactly this
-        // `layout` (stored verbatim at allocation time); it is non-null and
-        // has not been freed or reallocated, so the dealloc matches.
-        unsafe { dealloc(self.ptr, self.layout) }
-    }
 }
 
 /// List non-loopback, non-tunnel interfaces with their unicast IPs.
@@ -134,10 +82,10 @@ fn enumerate(exclude_tunnel: bool) -> Option<Vec<NetIf>> {
     // SAFETY: the family argument is 0 (`AF_UNSPEC`, every family), `flags`
     // is a valid flag set, and the adapter buffer argument is null with
     // `size` reporting 0 — the documented sizing call, which writes only the
-    // required size. The second call passes `head`, the base of an
-    // allocation made for exactly that size and aligned to at least
-    // `align_of::<IP_ADAPTER_ADDRESSES_LH>()` (`AdapterBuffer` records the
-    // layout it allocated and deallocates with it on every exit path), so the
+    // required size. The second call passes the base of an `AlignedBuffer`
+    // allocated for exactly that size and aligned to
+    // `align_of::<IP_ADAPTER_ADDRESSES_LH>()` (the buffer owns the layout it
+    // allocated and frees it with the same layout on every exit path), so the
     // chain the API writes stays inside the allocation. Every node is then
     // only reached through the null-terminated `Next` links the API wrote,
     // each dereference carrying its own SAFETY note below.
@@ -151,10 +99,10 @@ fn enumerate(exclude_tunnel: bool) -> Option<Vec<NetIf>> {
         }
         // Aligned heap buffer (not `Vec<u8>`): the adapter structs contain
         // 8-byte fields, and the walk must not rely on allocator
-        // over-alignment. `AdapterBuffer` deallocs with the same layout on
-        // every exit path (early returns, error branches, and the loop).
-        let buf = AdapterBuffer::allocate(size as usize)?;
-        let head = buf.head();
+        // over-alignment. `AlignedBuffer` frees with the same layout on every
+        // exit path (early returns, error branches, and the loop).
+        let buf = AlignedBuffer::<IP_ADAPTER_ADDRESSES_LH>::zeroed(size as usize)?;
+        let head = buf.as_mut_ptr();
         let rc = GetAdaptersAddresses(0, flags, None, Some(head), &mut size);
         if rc != 0 {
             return None;

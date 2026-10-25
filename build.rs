@@ -99,41 +99,57 @@ fn require_token(template: &str, token: &str, source: &str) -> Result<(), io::Er
     }
 }
 
-#[cfg(not(test))]
+/// The value of one key under `[package.metadata.broccoli.release]`.
+///
+/// The whole manifest goes through the TOML parser, so comments and
+/// surrounding whitespace need no handling here, and a duplicate key is
+/// rejected as the invalid document it is. The value's TOML type decides
+/// whether it is usable: `version = { workspace = true }` is an inline table
+/// and is refused exactly like any other non-string value.
 fn release_metadata_value(manifest: &str, key: &str) -> Result<String, io::Error> {
-    let mut in_release = false;
-    let mut found = None;
-    for raw_line in manifest.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') {
-            in_release = line == "[package.metadata.broccoli.release]";
-            continue;
-        }
-        if !in_release || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((candidate, value)) = line.split_once('=') else {
-            continue;
-        };
-        if candidate.trim() != key {
-            continue;
-        }
-        let value = value.trim();
-        let Some(value) = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-        else {
-            return Err(invalid_data(format!(
-                "Cargo release metadata `{key}` must be a quoted string"
-            )));
-        };
-        if found.replace(value.to_owned()).is_some() {
-            return Err(invalid_data(format!(
-                "Cargo release metadata `{key}` is declared more than once"
-            )));
+    let document: toml::Table = toml::from_str(manifest)
+        .map_err(|error| invalid_data(format!("Cargo.toml is not valid TOML: {error}")))?;
+    let value = document
+        .get("package")
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("broccoli"))
+        .and_then(|broccoli| broccoli.get("release"))
+        .and_then(|release| release.get(key));
+    let Some(value) = value else {
+        return Err(invalid_data(format!(
+            "Cargo release metadata `{key}` is missing"
+        )));
+    };
+    let Some(value) = value.as_str() else {
+        return Err(invalid_data(format!(
+            "Cargo release metadata `{key}` must be a quoted string"
+        )));
+    };
+    Ok(value.to_owned())
+}
+
+/// Whether one release metadata value has the shape its consumer relies on:
+/// the xray version is `v` plus three numeric fields, the archive is the
+/// Windows build, and every digest is 64 lowercase hex characters.
+fn release_metadata_is_valid(key: &str, value: &str) -> bool {
+    match key {
+        "xray_version" => value.strip_prefix('v').is_some_and(|version| {
+            let mut fields = version.split('.');
+            let three_numeric_fields = (0..3).all(|_| {
+                fields.next().is_some_and(|field| {
+                    !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            });
+            three_numeric_fields && fields.next().is_none()
+        }),
+        "xray_archive" => value == "Xray-windows-64.zip",
+        _ => {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }
     }
-    found.ok_or_else(|| invalid_data(format!("Cargo release metadata `{key}` is missing")))
 }
 
 #[cfg(not(test))]
@@ -150,23 +166,7 @@ fn emit_xray_release_metadata() -> Result<(), io::Error> {
     ];
     for (environment, key) in values {
         let value = release_metadata_value(&manifest, key)?;
-        let valid = match key {
-            "xray_version" => value.strip_prefix('v').is_some_and(|version| {
-                let fields: Vec<_> = version.split('.').collect();
-                fields.len() == 3
-                    && fields.iter().all(|field| {
-                        !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-            }),
-            "xray_archive" => value == "Xray-windows-64.zip",
-            _ => {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }
-        };
-        if !valid {
+        if !release_metadata_is_valid(key, &value) {
             return Err(invalid_data(format!(
                 "Cargo release metadata `{key}` is invalid"
             )));
@@ -592,7 +592,8 @@ mod tests {
 
     use super::{
         BuildError, BuildMode, ProtocResolution, ProtocVerification, missing_proto,
-        parse_protoc_version, rc_path, resolve_protoc, vendored_protoc_path, verify_protoc,
+        parse_protoc_version, rc_path, release_metadata_is_valid, release_metadata_value,
+        resolve_protoc, vendored_protoc_path, verify_protoc,
     };
 
     fn resolution(mode: BuildMode) -> ProtocResolution<'static> {
@@ -844,6 +845,133 @@ mod tests {
         // protobuf-src build-dependency out of this target's link graph, so
         // the decision must be None here even when the feature cfg is on.
         assert_eq!(vendored_protoc_path(), None);
+    }
+
+    #[test]
+    fn release_metadata_reads_values_through_the_toml_parser() {
+        let manifest = r#"
+# leading comment
+[package]
+name = "broccoli"
+version = "0.4.0"
+
+[package.metadata.broccoli.release]
+# a comment between pins
+target = "x86_64-pc-windows-msvc"
+xray_version = "v26.10.21" # trailing comment
+xray_archive = "Xray-windows-64.zip"
+xray_sha256 = "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
+"#;
+        assert_eq!(
+            release_metadata_value(manifest, "xray_version").unwrap(),
+            "v26.10.21"
+        );
+        assert_eq!(
+            release_metadata_value(manifest, "xray_archive").unwrap(),
+            "Xray-windows-64.zip"
+        );
+        assert_eq!(
+            release_metadata_value(manifest, "xray_sha256").unwrap(),
+            "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
+        );
+    }
+
+    #[test]
+    fn release_metadata_rejects_a_non_string_value() {
+        let manifest = r#"
+[package.metadata.broccoli.release]
+xray_version = { workspace = true }
+"#;
+        let error = release_metadata_value(manifest, "xray_version").unwrap_err();
+        assert!(
+            error.to_string().contains("must be a quoted string"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn release_metadata_rejects_a_duplicate_key() {
+        let manifest = r#"
+[package.metadata.broccoli.release]
+xray_archive = "Xray-windows-64.zip"
+xray_archive = "Xray-windows-64.zip"
+"#;
+        let error = release_metadata_value(manifest, "xray_archive").unwrap_err();
+        assert!(
+            error.to_string().contains("not valid TOML"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn release_metadata_reports_a_missing_key_or_section() {
+        let without_key = "[package.metadata.broccoli.release]\ntarget = \"x\"\n";
+        let error = release_metadata_value(without_key, "xray_version").unwrap_err();
+        assert!(error.to_string().contains("is missing"), "error: {error}");
+
+        let without_section = "[package]\nversion = \"0.4.0\"\n";
+        let error = release_metadata_value(without_section, "xray_version").unwrap_err();
+        assert!(error.to_string().contains("is missing"), "error: {error}");
+    }
+
+    #[test]
+    fn release_metadata_validation_pins_each_value_shape() {
+        assert!(release_metadata_is_valid("xray_version", "v26.10.21"));
+        for bad in [
+            "26.10.21",
+            "v26.10",
+            "v26.10.21.0",
+            "v26..21",
+            "v26.10.x",
+            "v",
+        ] {
+            assert!(
+                !release_metadata_is_valid("xray_version", bad),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(release_metadata_is_valid(
+            "xray_archive",
+            "Xray-windows-64.zip"
+        ));
+        assert!(!release_metadata_is_valid("xray_archive", "Xray.zip"));
+        let digest = "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827";
+        assert!(release_metadata_is_valid("xray_sha256", digest));
+        assert!(!release_metadata_is_valid("xray_sha256", &digest[..63]));
+        assert!(!release_metadata_is_valid(
+            "xray_sha256",
+            "FC58C39EE2F2717B4C54D28D374362389E5319B20AE44AEA76EA45A5243EC827"
+        ));
+        assert!(!release_metadata_is_valid(
+            "xray_sha256",
+            "gc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
+        ));
+    }
+
+    #[test]
+    fn the_shipped_manifest_carries_every_release_pin() {
+        // The build script reads this exact file at compile time; every pin
+        // it exports must be present and valid in it.
+        let manifest = fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
+        for (key, expected_prefix) in [
+            ("xray_version", "v"),
+            ("xray_archive", "Xray-"),
+            ("xray_sha256", ""),
+            ("xray_executable_sha256", ""),
+            ("wintun_sha256", ""),
+            ("geoip_sha256", ""),
+            ("geosite_sha256", ""),
+        ] {
+            let value = release_metadata_value(&manifest, key).expect("shipped release pin");
+            assert!(
+                value.starts_with(expected_prefix),
+                "`{key}` must start with {expected_prefix:?}, got {value:?}"
+            );
+            assert!(
+                release_metadata_is_valid(key, &value),
+                "`{key}` must pass its shape check, got {value:?}"
+            );
+        }
     }
 
     #[cfg(windows)]

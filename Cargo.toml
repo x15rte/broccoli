@@ -120,7 +120,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 anyhow = "1"
-thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 url = "2"
@@ -128,6 +127,19 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.17"
 human-panic = "2"
+# The generic encoders the app's own seams share instead of each re-deriving
+# them: percent-encoding for the share-link grammar, ipnet for the CIDR rules,
+# toml and semver for the release metadata (human-panic already compiles toml
+# and embed-resource's build graph carries semver), hex for one digest
+# spelling, md-5 for xray's deterministic wintun instance GUID, fastrand for
+# the backoff jitter (tempfile already compiles it).
+percent-encoding = "2"
+ipnet = "2"
+toml = "1"
+semver = "1"
+fastrand = "2"
+hex = "0.4"
+md-5 = { version = "0.11", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
@@ -136,6 +148,11 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 tonic-prost-build = "0.14"
 embed-resource = "3"
 which = "8"
+# Cargo.toml release metadata is read through the same parser the app uses for
+# the update check, and its version through `semver`, so the manifest grammar
+# has one owner across the build script and the binary.
+toml = "1"
+semver = "1"
 protobuf-src = { version = "2", optional = true } # vendored-protoc fallback, see build.rs
 
 # build.rs hosts unit tests under `cargo test --test build`; the test target
@@ -161,6 +178,8 @@ parking_lot = "0.12"
 tonic-prost-build = "0.14"
 embed-resource = "3"
 which = "8"
+toml = "1"
+semver = "1"
 
 # Debug builds carry line tables only: panic and test backtraces still print
 # `file:line`, while the dependency graph skips type and variable debug info.

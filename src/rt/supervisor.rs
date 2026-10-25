@@ -464,42 +464,29 @@ where
 /// of the line is consumed and discarded, so the reader never buffers more
 /// than the cap plus one [`BufReader`] chunk. A trailing `\r` (CRLF) is
 /// stripped like `BufReader::lines()` did. Returns `None` at EOF.
+///
+/// The truncation rule itself is [`super::line::Line`], shared with the
+/// helper's synchronous reader; this function only supplies the async I/O.
 async fn read_capped_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let keep = MAX_LINE_BYTES - TRUNCATED_MARKER.len();
-    let mut line: Vec<u8> = Vec::with_capacity(keep.min(256));
+    use super::line::{Line, Step};
+
+    let mut line = Line::new();
     loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            // EOF: a partial final line is still a line.
-            return Ok(if line.is_empty() {
-                None
-            } else {
-                Some(finish_line(line))
-            });
-        }
-        if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
-            let take = pos.min(keep.saturating_sub(line.len()));
-            line.extend_from_slice(&available[..take]);
-            reader.consume(pos + 1);
-            if take < pos {
-                // Content between the budget and the newline was cut.
-                line.truncate(keep);
-                line.extend_from_slice(TRUNCATED_MARKER.as_bytes());
+        match line.take(reader.fill_buf().await?) {
+            Step::Eof => return Ok((!line.is_empty()).then(|| line.finish())),
+            Step::More { consume } => reader.consume(consume),
+            Step::Done { consume } => {
+                reader.consume(consume);
+                return Ok(Some(line.finish()));
             }
-            return Ok(Some(finish_line(line)));
-        }
-        let take = available.len().min(keep.saturating_sub(line.len()));
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if line.len() >= keep {
-            // The line continues past the cap: skip the rest, mark the cut.
-            skip_rest_of_line(reader).await?;
-            line.truncate(keep);
-            line.extend_from_slice(TRUNCATED_MARKER.as_bytes());
-            return Ok(Some(finish_line(line)));
+            Step::Cut { consume } => {
+                reader.consume(consume);
+                skip_rest_of_line(reader).await?;
+                return Ok(Some(line.finish()));
+            }
         }
     }
 }
@@ -522,18 +509,6 @@ where
         let len = available.len();
         reader.consume(len);
     }
-}
-
-/// Strip a trailing `\r` (CRLF) and decode lossily — the old
-/// `BufReader::lines()` required valid UTF-8 and silently killed the pump on
-/// the first invalid byte; lossy decoding keeps the stream flowing. The
-/// decoded string is bounded by a constant factor of the cap (each invalid
-/// byte becomes a 3-byte replacement char), never unbounded.
-fn finish_line(mut line: Vec<u8>) -> String {
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    String::from_utf8_lossy(&line).into_owned()
 }
 
 #[cfg(test)]

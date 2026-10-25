@@ -64,7 +64,7 @@ fn default_query_strategy_is_omitted_from_wire_but_others_are_emitted() {
         ..Default::default()
     };
     assert!(
-        cfg.to_wire(false)
+        cfg.to_wire()
             .expect("dns wire")
             .get("queryStrategy")
             .is_none()
@@ -73,7 +73,7 @@ fn default_query_strategy_is_omitted_from_wire_but_others_are_emitted() {
     // ...and any other strategy is emitted verbatim.
     cfg.query_strategy = "useip4".into();
     assert_eq!(
-        cfg.to_wire(false).expect("dns wire")["queryStrategy"],
+        cfg.to_wire().expect("dns wire")["queryStrategy"],
         json!("useip4")
     );
 }

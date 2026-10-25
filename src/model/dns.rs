@@ -3,6 +3,7 @@
 //! three coordinated pieces (top-level fakeDns + {"address":"fakedns"}
 //! server + "fakedns" sniffing destOverride) in the generator.
 
+use super::addr;
 use super::{skip_empty_map, skip_empty_str, skip_empty_vec, skip_false};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
@@ -384,7 +385,8 @@ impl DnsCfg {
     /// Wire form of the top-level `dns` object, or None when effectively
     /// empty. Strips the GUI-only `fakedns` group; fakeDns trio (2/3):
     /// appends {"address":"fakedns"} (deduped) when enabled.
-    pub fn to_wire(&self, fakedns: bool) -> Option<Value> {
+    pub fn to_wire(&self) -> Option<Value> {
+        let fakedns = self.fakedns.enabled;
         let mut v = serde_json::to_value(self).expect(
             "model serialization is infallible: DnsCfg/DnsServer/FakeDnsCfg fields are \
              ints, bools, strings, and string-keyed Value maps only",
@@ -459,7 +461,7 @@ impl DnsCfg {
     /// config — no servers, hosts, or other settings, and fakeDNS disabled.
     /// Mirrors the generator's emission decision exactly.
     pub fn is_effectively_empty(&self) -> bool {
-        self.to_wire(self.fakedns.enabled).is_none()
+        self.to_wire().is_none()
     }
 }
 
@@ -469,11 +471,9 @@ impl DnsCfg {
 /// Returns `(bits, host_bits)`; `host_bits` may exceed 63 — then any i64
 /// pool size fits the subnet.
 pub(crate) fn parse_pool_cidr(s: &str) -> Option<(u32, u32)> {
-    let (ip, prefix) = s.split_once('/')?;
-    let ip: std::net::IpAddr = ip.parse().ok()?;
-    let (bits, max_prefix) = if ip.is_ipv4() { (32, 32) } else { (128, 128) };
-    let prefix: u32 = prefix.parse().ok()?;
-    (prefix <= max_prefix).then(|| (bits, bits - prefix))
+    let net: ipnet::IpNet = s.parse().ok()?;
+    let bits = if net.addr().is_ipv4() { 32 } else { 128 };
+    Some((bits, bits - u32::from(net.prefix_len())))
 }
 
 /// True when `s` is a valid fakeDNS pool CIDR (see [`parse_pool_cidr`]).
@@ -491,15 +491,12 @@ pub(crate) struct ScopedBootstrap {
 
 /// Host part of a `scheme://host[:port][/path]` endpoint.
 pub(crate) fn scheme_host(rest: &str) -> &str {
-    // Bracketed IPv6 literals contain colons; unbracket first.
-    if let Some(host) = rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
-        return host.0;
-    }
-    // Unbracketed IPv6 literal without a port is a bare host.
-    if rest.parse::<std::net::IpAddr>().is_ok() {
-        return rest;
-    }
-    rest.split([':', '/']).next().unwrap_or(rest)
+    // The DNS address grammar ends the endpoint at the path; `?` and `#` are
+    // not separators here, unlike a URL authority.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    addr::split(authority)
+        .map(|host_port| host_port.host)
+        .unwrap_or(authority)
 }
 
 /// The scoped `+local` bootstrap DNS server a proxy-server resolver address
@@ -532,33 +529,33 @@ pub(crate) fn scoped_bootstrap_endpoint(
         Some(("tcp", rest)) => ("tcp+local", rest.to_string(), scheme_host(rest).to_string()),
         None => {
             // A bare address is UDP DNS on `fallback_port` (53 when none is
-            // configured), bootstrapped over TCP on that port. A whole
-            // address that parses as an IP literal wins over the port split:
-            // an IPv6 literal's colons would otherwise read as a port. The
-            // endpoint text brackets such a host, as the core's address
-            // grammar does.
-            let (host, port) = if address.parse::<std::net::IpAddr>().is_ok() {
-                (address, fallback_port.unwrap_or(53).to_string())
-            } else {
-                match address.rsplit_once(':') {
-                    Some((host, port))
-                        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-                    {
-                        (host, port.to_string())
-                    }
-                    _ => (address, fallback_port.unwrap_or(53).to_string()),
+            // configured), bootstrapped over TCP on that port. The shared
+            // split keeps a bare IP literal whole (an IPv6 literal's colons
+            // would otherwise read as a port) and only a non-empty all-digit
+            // port is used; the endpoint text re-brackets such a host, as the
+            // core's address grammar does.
+            let fallback = fallback_port.unwrap_or(53);
+            let (host, port) = match addr::split(address) {
+                Some(host_port)
+                    if host_port.port.is_none_or(|port| {
+                        !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+                    }) =>
+                {
+                    (
+                        host_port.host,
+                        host_port
+                            .port
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .unwrap_or(fallback),
+                    )
                 }
+                _ => (address, fallback),
             };
-            let host = host
-                .strip_prefix('[')
-                .and_then(|host| host.strip_suffix(']'))
-                .unwrap_or(host);
-            let endpoint = if host.contains(':') {
-                format!("[{host}]:{port}")
-            } else {
-                format!("{host}:{port}")
-            };
-            ("tcp+local", endpoint, host.to_string())
+            (
+                "tcp+local",
+                addr::format_host_port(host, port),
+                host.to_string(),
+            )
         }
         // localhost / fakedns / unknown schemes: no bootstrap possible.
         _ => return None,
@@ -666,7 +663,7 @@ mod tests {
         });
         cfg.bootstrap = "https://223.5.5.5/dns-query".into();
 
-        let wire = cfg.to_wire(false).unwrap();
+        let wire = cfg.to_wire().unwrap();
         assert_eq!(
             wire.get("bootstrap"),
             None,
@@ -779,11 +776,11 @@ mod tests {
         let restored: DnsCfg = serde_json::from_value(persisted).unwrap();
         assert_eq!(restored.servers[0].id, "resolver-a");
 
-        let wire = cfg.to_wire(false).expect("dns wire");
+        let wire = cfg.to_wire().expect("dns wire");
         assert_eq!(wire["servers"][0]["id"], json!("resolver-a"));
 
         cfg.servers[0].id.clear();
-        let wire = cfg.to_wire(false).expect("dns wire");
+        let wire = cfg.to_wire().expect("dns wire");
         assert!(
             wire["servers"][0].get("id").is_none(),
             "a cleared id must not be emitted"

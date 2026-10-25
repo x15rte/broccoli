@@ -107,20 +107,16 @@ impl DnsScreen {
                             // stays live (it is the row's own String).
                             ui.monospace(&self.row_captions[i].ordinal)
                                 .on_hover_text(t(lang, Key::DnsPriorityHint));
-                            if ui
-                                .add_enabled(i > 0, egui::Button::new("▲").small())
-                                .on_hover_text(t(lang, Key::DnsMoveUp))
-                                .clicked()
-                            {
-                                swap = Some((i, i - 1));
-                            }
-                            if ui
-                                .add_enabled(i + 1 < server_count, egui::Button::new("▼").small())
-                                .on_hover_text(t(lang, Key::DnsMoveDown))
-                                .clicked()
-                            {
-                                swap = Some((i, i + 1));
-                            }
+                            widgets::move_buttons(
+                                ui,
+                                i,
+                                server_count,
+                                widgets::MoveLabels::glyphs(
+                                    t(lang, Key::DnsMoveUp),
+                                    t(lang, Key::DnsMoveDown),
+                                ),
+                                &mut swap,
+                            );
                             ui.label(
                                 RichText::new(if srv.address.is_empty() {
                                     t(lang, Key::DnsNoAddress)
@@ -207,13 +203,14 @@ impl DnsScreen {
         widgets::section(ui, t(lang, Key::DnsSectionHosts), |ui| {
             let buf = self
                 .hosts_buf
-                .begin(|| hosts_to_rows(&ctx.settings.dns.hosts));
+                .begin(|| widgets::kv_rows_from_json(&ctx.settings.dns.hosts));
             if widgets::kv_table(
                 ui,
                 lang,
                 buf,
                 t(lang, Key::DnsHostsKeyHint),
                 t(lang, Key::DnsHostsValueHint),
+                t(lang, Key::AddKvRow),
             ) {
                 ctx.settings.dns.hosts = rows_to_hosts(buf);
                 *changed = true;
@@ -457,7 +454,18 @@ fn server_editor(ui: &mut Ui, lang: Language, srv: &mut DnsServer, idx: usize) -
                         .then(|| t(lang, Key::DnsAddressRequired).into())
                 },
             );
-            changed |= opt_u16(ui, lang, t(lang, Key::DnsPort), &mut srv.port);
+            // A port the core derives from the scheme when unset: checking
+            // the box seeds the standard 53 and the unchecked state names
+            // that fallback instead of showing a disabled box.
+            changed |= widgets::opt_num_with(
+                ui,
+                t(lang, Key::DnsPort),
+                &mut srv.port,
+                1..=65_535,
+                53,
+                Some(t(lang, Key::DnsSchemeDefault)),
+                1.0,
+            );
             ui.end_row();
 
             // `string_list` emits its label, item rows, and "+ Add" button as
@@ -619,41 +627,26 @@ fn timeout_editor(ui: &mut Ui, lang: Language, timeout_ms: &mut u64) -> bool {
     changed
 }
 
-/// dns.hosts values: a single IP/domain string, or a JSON array when the
-/// edited value contains commas.
-fn hosts_to_rows(hosts: &Map<String, Value>) -> Vec<(String, String)> {
-    hosts
-        .iter()
-        .map(|(k, v)| {
-            let s = match v {
-                Value::String(s) => s.clone(),
-                Value::Array(a) => a
-                    .iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                other => other.to_string(),
-            };
-            (k.clone(), s)
-        })
-        .collect()
-}
-
+/// The hosts table's rows back into the model: a value with commas is the
+/// JSON array form the core reads as several addresses, a single address
+/// stays a string. The trim/blank-key rule is the table's own
+/// ([`widgets::kv_rows_trimmed`]); only the list splitting is hosts-specific,
+/// because a hosts value is a list while the other tables' values are opaque
+/// text.
 fn rows_to_hosts(rows: &[(String, String)]) -> Map<String, Value> {
-    rows.iter()
-        .filter(|(k, _)| !k.trim().is_empty())
+    widgets::kv_rows_trimmed(rows)
         .map(|(k, v)| {
             let parts: Vec<String> = v
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let val = if parts.len() > 1 {
+            let value = if parts.len() > 1 {
                 Value::Array(parts.into_iter().map(Value::String).collect())
             } else {
                 Value::String(parts.into_iter().next().unwrap_or_default())
             };
-            (k.trim().to_string(), val)
+            (k, value)
         })
         .collect()
 }
@@ -680,27 +673,6 @@ fn remap_swapped_index(selected: Option<usize>, a: usize, b: usize) -> Option<us
         Some(index) if index == b => Some(a),
         other => other,
     }
-}
-
-/// Checkbox-gated DragValue for `Option<u16>` ports.
-fn opt_u16(ui: &mut Ui, lang: Language, label: &str, v: &mut Option<u16>) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let mut on = v.is_some();
-        if ui.checkbox(&mut on, "").changed() {
-            *v = on.then_some(53);
-            changed = true;
-        }
-        if let Some(x) = v.as_mut() {
-            if ui.add(DragValue::new(x).range(1..=65535)).changed() {
-                changed = true;
-            }
-        } else {
-            ui.label(RichText::new(t(lang, Key::DnsSchemeDefault)).weak());
-        }
-    });
-    changed
 }
 
 #[cfg(test)]

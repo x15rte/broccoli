@@ -28,9 +28,9 @@ pub struct TunScreen {
     /// a result clears it so the refresh cadence resumes.
     iface_request: Request<Vec<NetIf>>,
     /// Privacy-warning references, rebuilt when the model generation moves
-    /// (the inbounds `ValidationCache` precedent) — never on idle repaint
-    /// frames. `None` until the first frame.
-    validation: Option<ValidationCache>,
+    /// (the inbounds validation cache precedent) — never on idle repaint
+    /// frames.
+    validation: widgets::Memo<(u64, u64), ValidationTexts>,
 }
 
 /// One generation of the TUN screen's per-generation presentation: the
@@ -39,13 +39,12 @@ pub struct TunScreen {
 /// takeover state. The validation rules the settings walk publishes (the
 /// gateway requirement, the unrouted-family advisory) are *not* cached here:
 /// the screen asks `ctx.verdict.for_target(FindingTarget::Tun)` for them.
-struct ValidationCache {
-    generation: u64,
-    /// The generation the shell's published verdict judged. A separate key:
-    /// the persist publishes after the edit frame and stamps the edit
-    /// generation, so an edit-generation key would keep the previous
-    /// verdict's finding when the publish arrives.
-    verdict_generation: u64,
+///
+/// The memo key is `(model generation, published verdict generation)`: the
+/// second is separate because the persist publishes after the edit frame and
+/// stamps the edit generation, so an edit-only key would keep the previous
+/// verdict's finding when the publish arrives.
+struct ValidationTexts {
     tun_warning: Option<String>,
     /// The model's TUN findings, rendered at the cache's generation cadence:
     /// the gateway requirement and the leak block's unrouted-family advisory.
@@ -134,17 +133,11 @@ impl TunScreen {
         let verdict = ctx.verdict;
         let verdict_generation = ctx.verdict_generation;
         let generation = ctx.hooks.model_generation();
-        if !matches!(
-            &self.validation,
-            Some(cache) if cache.generation == generation
-                && cache.verdict_generation == verdict_generation
-        ) {
-            // The shell's verdict for this generation: the privacy finding
-            // is the one slice of it this screen renders.
+        let texts = self.validation.get(&(generation, verdict_generation), || {
+            // The shell's verdict for this generation: the privacy finding is
+            // the one slice of it this screen renders.
             let findings = ctx.safety;
-            self.validation = Some(ValidationCache {
-                generation,
-                verdict_generation,
+            ValidationTexts {
                 tun_warning: findings
                     .tun_privacy()
                     .map(|finding| safety_message(&finding.code, lang)),
@@ -158,26 +151,14 @@ impl TunScreen {
                     .map(|issue| validation_message(&issue.code, lang)),
                 dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
                     && ctx.settings.tun.leak_blocks_dns(),
-            });
-        }
-        let tun_warning = match &self.validation {
-            Some(cache) => cache.tun_warning.as_deref(),
-            None => unreachable!("validation is built when absent, above"),
-        };
+            }
+        });
+        let tun_warning = texts.tun_warning.as_deref();
         // The model's own TUN findings, rendered at the cache's generation
         // cadence (the switch and the gateway editor are the locations).
-        let gateway_error = match &self.validation {
-            Some(cache) => cache.gateway_error.as_deref(),
-            None => unreachable!("validation is built when absent, above"),
-        };
-        let leak_warning = match &self.validation {
-            Some(cache) => cache.leak_warning.as_deref(),
-            None => unreachable!("validation is built when absent, above"),
-        };
-        let dns_leak_block_on = match &self.validation {
-            Some(cache) => cache.dns_leak_block_on,
-            None => unreachable!("validation is built when absent, above"),
-        };
+        let gateway_error = texts.gateway_error.as_deref();
+        let leak_warning = texts.leak_warning.as_deref();
+        let dns_leak_block_on = texts.dns_leak_block_on;
 
         ui.add_space(4.0);
         let colors = status_colors_of(ui);

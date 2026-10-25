@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use super::addr;
 use super::dial::DialGraph;
 use super::dns::scoped_bootstrap_endpoint;
 use super::inbound::{
@@ -34,6 +35,12 @@ pub const BUILTIN_OUTBOUNDS: [(&str, &str); 2] = [
     ("freedom", DIRECT_OUTBOUND_TAG),
     ("blackhole", BLOCK_OUTBOUND_TAG),
 ];
+
+/// True when the fakeDNS pool is enabled: the top-level `fakeDns` object and
+/// every inbound carrying a `sniffing.destOverride` read this one gate.
+pub fn fakedns_enabled(settings: &Settings) -> bool {
+    settings.dns.fakedns.enabled
+}
 
 /// True when the document carries the top-level `dns` object: `DnsCfg::to_wire`
 /// collapses an effectively empty configuration to nothing, and every DNS arm
@@ -201,18 +208,15 @@ pub fn inbound_tags(settings: &Settings, scope: InboundScope) -> Vec<String> {
 /// sockopt, XTLS/Xray-core#5363).
 pub(crate) fn profile_server_domain(profile: &ServerProfile) -> Option<String> {
     let address = profile.server_address()?;
-    let host = if let Some((host, _)) = address
-        .strip_prefix('[')
-        .and_then(|address| address.split_once(']'))
-    {
-        host
-    } else if let Some((host, port)) = address.rsplit_once(':')
-        && !port.is_empty()
-        && port.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        host
-    } else {
-        address.as_str()
+    let host = match addr::split(&address) {
+        Some(host_port)
+            if host_port.port.is_none_or(|port| {
+                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            host_port.host
+        }
+        _ => address.as_str(),
     };
     if host.parse::<std::net::IpAddr>().is_ok() {
         return None;
@@ -319,7 +323,7 @@ impl Emission {
     /// in the query it calls), so the stages cannot disagree about which
     /// families reach the wire.
     pub(crate) fn new(servers: &ServersFile, settings: &Settings) -> Emission {
-        let fakedns = settings.dns.fakedns.enabled;
+        let fakedns = fakedns_enabled(settings);
         let dns_on = dns_module_emitted(settings);
         let dialed = DialGraph::for_profiles(&servers.profiles).dialed_outbound_tags(settings);
         let mut server_domains: Vec<String> = servers

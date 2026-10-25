@@ -10,13 +10,12 @@
 //!   stamp that names another build.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use crate::diag::{Diag, DiagError, DiagResult};
+use crate::digest::sha256_hex;
 use crate::r#gen::keys;
 use crate::i18n::Key;
 use crate::model::{ServersFile, Settings};
@@ -93,21 +92,6 @@ fn current_stamp(config_sha256: String) -> ConfigStamp {
         core_pin: crate::sys::core_dl::pinned_release_version().to_string(),
         config_sha256,
     }
-}
-
-/// Lowercase hex SHA-256 of `bytes`.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    // digest 0.11 no longer formats its output through `LowerHex`, so the
-    // bytes are written out explicitly (same rendering as the core payload
-    // verification).
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// True when `meta` is a stamp that names this build *and* describes `config`'s
@@ -576,12 +560,12 @@ fn write_candidate_bytes(v: &serde_json::Value) -> Result<Vec<u8>, DiagError> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).diag(Key::ApplyConfigDirCreateFailed)?;
     let json = serde_json::to_vec_pretty(v).diag(Key::ApplyCandidateSerializeFailed)?;
-    write_synced(&candidate_path(), &json)?;
+    write_durably(&candidate_path(), &json)?;
     // The stamp describes these exact bytes: its digest is the file identity
     // no later build-identity match can fake.
     let stamp = serde_json::to_vec_pretty(&current_stamp(sha256_hex(&json)))
         .diag(Key::ApplyCandidateSerializeFailed)?;
-    write_synced(&meta_candidate_path(), &stamp)?;
+    write_durably(&meta_candidate_path(), &stamp)?;
     Ok(json)
 }
 
@@ -590,16 +574,12 @@ pub async fn write_candidate_offloaded(v: serde_json::Value) -> Result<PathBuf, 
     on_blocking_pool(move || write_candidate(&v)).await
 }
 
-/// Create/write/flush one artefact. `sync_all` before the rename makes the
-/// bytes durable before anything promotes or executes the file.
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), DiagError> {
-    let mut file =
-        File::create(path).diag_with(Diag::new(Key::ApplyFileCreateFailed).arg(path.display()))?;
-    file.write_all(bytes)
-        .diag_with(Diag::new(Key::ApplyFileWriteFailed).arg(path.display()))?;
-    file.sync_all()
-        .diag_with(Diag::new(Key::ApplyFileFlushFailed).arg(path.display()))?;
-    Ok(())
+/// Create or replace one artefact, flushed to disk before anything promotes
+/// or executes it. The bytes land through the shared
+/// [`crate::sys::durable::write_synced`], the one flush-then-return writer.
+fn write_durably(path: &Path, bytes: &[u8]) -> Result<(), DiagError> {
+    crate::sys::durable::write_synced(path, bytes)
+        .diag_with(Diag::new(Key::ApplyFileWriteFailed).arg(path.display()))
 }
 
 /// Promote the validated candidate without an interval where `config.json`
@@ -622,14 +602,15 @@ pub fn commit() -> Result<(), DiagError> {
     let meta_lastgood = meta_lastgood_path();
     if active.exists() {
         let pending = dir.join("config.lastgood.pending.json");
-        durable_copy(&active, &pending).diag(Key::ApplyLastgoodStageFailed)?;
+        crate::sys::durable::copy_atomic(&active, &pending).diag(Key::ApplyLastgoodStageFailed)?;
         std::fs::rename(&pending, &lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
         // The retired artefact keeps its own stamp — and only while that stamp
         // really describes it. A mismatched or absent stamp is dropped, so the
         // last-good pair on disk is never a lie a replay could read as one.
         if meta.is_file() && stamp_describes(&meta, &active) {
             let pending_meta = dir.join("config.lastgood.meta.pending.json");
-            durable_copy(&meta, &pending_meta).diag(Key::ApplyLastgoodStageFailed)?;
+            crate::sys::durable::copy_atomic(&meta, &pending_meta)
+                .diag(Key::ApplyLastgoodStageFailed)?;
             std::fs::rename(&pending_meta, meta_lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
         } else if meta_lastgood.exists() {
             std::fs::remove_file(&meta_lastgood).diag(Key::ApplyLastgoodReplaceFailed)?;
@@ -664,13 +645,14 @@ pub fn rollback() -> Result<(), DiagError> {
         return Err(DiagError::new(Diag::new(Key::ApplyRollbackMissing)));
     }
     let pending = dir.join("config.rollback.json");
-    durable_copy(&lastgood, &pending).diag(Key::ApplyRollbackStageFailed)?;
+    crate::sys::durable::copy_atomic(&lastgood, &pending).diag(Key::ApplyRollbackStageFailed)?;
     std::fs::rename(&pending, &active).diag(Key::ApplyRollbackRestoreFailed)?;
     let lastgood_meta = meta_lastgood_path();
     let meta = meta_path();
     if lastgood_meta.is_file() && stamp_describes(&lastgood_meta, &active) {
         let pending_meta = dir.join("config.rollback.meta.pending.json");
-        durable_copy(&lastgood_meta, &pending_meta).diag(Key::ApplyRollbackStageFailed)?;
+        crate::sys::durable::copy_atomic(&lastgood_meta, &pending_meta)
+            .diag(Key::ApplyRollbackStageFailed)?;
         std::fs::rename(&pending_meta, &meta).diag(Key::ApplyRollbackRestoreFailed)?;
     } else if meta.is_file() {
         // The restored configuration has no stamp of its own (or one that does
@@ -697,18 +679,6 @@ fn read_candidate() -> Result<Vec<u8>, DiagError> {
 /// [`read_candidate`], off the executor (see [`on_blocking_pool`]).
 pub async fn read_candidate_offloaded() -> Result<Vec<u8>, DiagError> {
     on_blocking_pool(read_candidate).await
-}
-
-fn durable_copy(source: &Path, destination: &Path) -> Result<(), DiagError> {
-    let bytes = std::fs::read(source)
-        .diag_with(Diag::new(Key::ApplyFileReadFailed).arg(source.display()))?;
-    let mut file = File::create(destination)
-        .diag_with(Diag::new(Key::ApplyFileCreateFailed).arg(destination.display()))?;
-    file.write_all(&bytes)
-        .diag_with(Diag::new(Key::ApplyFileWriteFailed).arg(destination.display()))?;
-    file.sync_all()
-        .diag_with(Diag::new(Key::ApplyFileFlushFailed).arg(destination.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -762,7 +732,7 @@ mod tests {
                     r#"{{"appVersion":"{}","corePin":"{}","configSha256":"{}"}}"#,
                     env!("CARGO_PKG_VERSION"),
                     crate::sys::core_dl::pinned_release_version(),
-                    super::sha256_hex(previous)
+                    crate::digest::sha256_hex(previous)
                 ),
             )
             .expect("write the previous stamp");
@@ -791,7 +761,7 @@ mod tests {
             let retired_stamp = std::fs::read_to_string(config_dir().join(META_LASTGOOD_NAME))
                 .expect("the retired stamp travels with the configuration it describes");
             assert!(
-                retired_stamp.contains(&super::sha256_hex(previous)),
+                retired_stamp.contains(&crate::digest::sha256_hex(previous)),
                 "the retired stamp must describe the retired bytes: {retired_stamp}"
             );
         });
@@ -927,7 +897,7 @@ mod tests {
                 "a stamp whose digest is not its file's must fail closed"
             );
 
-            let digest = super::sha256_hex(br#"{"here":true}"#);
+            let digest = crate::digest::sha256_hex(br#"{"here":true}"#);
             std::fs::write(meta_path(), stamp_for(&digest)).expect("write the matching stamp");
             assert!(stamp_is_current(), "the digest of these bytes must match");
 

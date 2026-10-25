@@ -112,6 +112,57 @@ impl Draft<String> {
     }
 }
 
+/// One rebuild-on-key-change memo: the value an expensive derivation
+/// produced for a key, kept whole while that key holds.
+///
+/// Every screen that formats or derives per-generation data — a plot series,
+/// a latency grid, a caption set — held its own key field beside its payload
+/// and its own staleness comparison. The comparison is the same everywhere:
+/// equal key, reuse the value untouched; changed key, rebuild once. This is
+/// that comparison and its slot.
+///
+/// The key is compared by reference, so an idle frame neither clones the key
+/// nor re-derives the value; only a rebuild clones the live key into the
+/// slot. A caller that needs the key back reads [`Self::key`]. The value must
+/// not contain the key — screens that need that shape keep a plain struct
+/// (the dashboard's header cache keys on a payload-carrying phase, the
+/// settings screen's on a name list, and both compare those in place).
+pub struct Memo<K, V> {
+    slot: Option<(K, V)>,
+}
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Self { slot: None }
+    }
+}
+
+impl<K: Clone + PartialEq, V> Memo<K, V> {
+    /// The value for `key`: the stored one when the key still matches, and
+    /// otherwise the result of `build` — run exactly once per key change, so
+    /// a rebuild is one frame's work and idle frames do none.
+    pub fn get(&mut self, key: &K, build: impl FnOnce() -> V) -> &V {
+        if self.slot.as_ref().is_none_or(|(held, _)| held != key) {
+            self.slot = Some((key.clone(), build()));
+        }
+        match &self.slot {
+            Some((_, value)) => value,
+            // `get` fills the slot on a miss, so a miss cannot reach here.
+            None => unreachable!("a Memo fills its slot before it is read"),
+        }
+    }
+
+    /// The key the held value was built for, `None` before the first build.
+    pub fn key(&self) -> Option<&K> {
+        self.slot.as_ref().map(|(key, _)| key)
+    }
+
+    /// The held value, if one was built.
+    pub fn value(&self) -> Option<&V> {
+        self.slot.as_ref().map(|(_, value)| value)
+    }
+}
+
 /// A shared scratch buffer for a widget's row editors: [`Self::edit`] seeds
 /// it from the row's own text — a key, or a non-string value's formatted
 /// text — without dropping the buffer's capacity, and the row reads the
@@ -752,21 +803,51 @@ pub fn opt_num<Num: egui::emath::Numeric>(
     v: &mut Option<Num>,
     range: std::ops::RangeInclusive<Num>,
 ) -> bool {
+    let set_to = *range.start();
+    opt_num_with(ui, label, v, range, set_to, None, 1.0)
+}
+
+/// The one optional-number editor: [`opt_num`] and every site whose "set"
+/// state seeds a value other than the range start (a port's 53) or whose
+/// unset state names its fallback instead of showing the disabled box.
+///
+/// `set_to` is what checking the box writes. `unset` renders in place of the
+/// disabled box when the value is `None` — a caller inside a grid row with a
+/// meaningful inherited default ("(default)") passes its text, and every
+/// other caller passes `None` to keep the row's width stable. `speed` is the
+/// drag step: integers and counts keep `1.0`, a fractional range passes the
+/// step its granularity needs.
+pub fn opt_num_with<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut Option<Num>,
+    range: std::ops::RangeInclusive<Num>,
+    set_to: Num,
+    unset: Option<&str>,
+    speed: f32,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let mut set = v.is_some();
         if ui.checkbox(&mut set, label).changed() {
-            *v = set.then_some(*range.start());
+            *v = set.then_some(set_to);
             changed = true;
         }
         match v.as_mut() {
             Some(x) => {
-                changed |= ui.add(egui::DragValue::new(x).range(range)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(x).range(range).speed(speed))
+                    .changed();
             }
-            None => {
-                let mut dummy = *range.start();
-                ui.add_enabled(false, egui::DragValue::new(&mut dummy).range(range));
-            }
+            None => match unset {
+                Some(text) => {
+                    ui.label(RichText::new(text).weak());
+                }
+                None => {
+                    let mut dummy = *range.start();
+                    ui.add_enabled(false, egui::DragValue::new(&mut dummy).range(range));
+                }
+            },
         }
     });
     changed
@@ -854,6 +935,20 @@ pub fn opt_bool(ui: &mut egui::Ui, label: &str, v: &mut Option<bool>, none_label
     )
 }
 
+/// Optional bool as a checkbox whose unchecked state is the absent one: for
+/// the core flags where absent and false mean the same thing, so the model
+/// stores `Some(true)` or nothing. Distinct from [`opt_bool`], which keeps
+/// all three states apart — the two are never interchangeable.
+pub fn opt_bool_flag(ui: &mut egui::Ui, label: &str, v: &mut Option<bool>) -> bool {
+    let mut on = v.unwrap_or(false);
+    if ui.checkbox(&mut on, label).changed() {
+        *v = if on { Some(true) } else { None };
+        true
+    } else {
+        false
+    }
+}
+
 /// Optional bool as an "(inherit)/false/true" combo with translated entries:
 /// `None` inherits the global default while explicit false and true stay
 /// representable. The DNS screen's per-server override policy.
@@ -868,6 +963,84 @@ pub fn opt_bool_tri(ui: &mut egui::Ui, lang: Language, label: &str, v: &mut Opti
             (Some(true), t(lang, Key::BoolTrue)),
         ],
     )
+}
+
+/// The captions of one row's reorder pair, and the tooltips they carry.
+///
+/// The pair is the same control on every ordered list — the DNS server
+/// priorities, the routing rules, the finalmask rows — and only its wording
+/// differs, so the wording is this value rather than a per-screen copy of the
+/// two buttons.
+#[derive(Clone, Copy)]
+pub struct MoveLabels<'a> {
+    /// Caption of the move-up button.
+    pub up: &'a str,
+    /// Caption of the move-down button.
+    pub down: &'a str,
+    /// Tooltip of the move-up button, when the screen explains the order.
+    pub up_hint: Option<&'a str>,
+    /// Tooltip of the move-down button, when the screen explains the order.
+    pub down_hint: Option<&'a str>,
+    /// Whether the pair renders at the compact (small) button size.
+    pub small: bool,
+}
+
+impl<'a> MoveLabels<'a> {
+    /// The compact ▲/▼ pair with a per-direction tooltip: the list rows whose
+    /// order carries a meaning the arrows do not spell out.
+    pub fn glyphs(up_hint: &'a str, down_hint: &'a str) -> Self {
+        Self {
+            up: "▲",
+            down: "▼",
+            up_hint: Some(up_hint),
+            down_hint: Some(down_hint),
+            small: true,
+        }
+    }
+
+    /// Worded captions at the default button size, with no tooltip.
+    pub fn words(up: &'a str, down: &'a str) -> Self {
+        Self {
+            up,
+            down,
+            up_hint: None,
+            down_hint: None,
+            small: false,
+        }
+    }
+}
+
+/// The reorder pair of one row in an ordered list: each button is enabled
+/// only when the row can move that way, and a click reports the `(from, to)`
+/// swap into `move_to` for the caller to apply after the loop — mutating the
+/// list under the loop's iterator would skip the shifted row.
+pub fn move_buttons(
+    ui: &mut egui::Ui,
+    index: usize,
+    len: usize,
+    labels: MoveLabels<'_>,
+    move_to: &mut Option<(usize, usize)>,
+) {
+    let button = |text: &str| {
+        let button = egui::Button::new(text);
+        if labels.small { button.small() } else { button }
+    };
+    let up = ui.add_enabled(index > 0, button(labels.up));
+    let up = match labels.up_hint {
+        Some(hint) => up.on_hover_text(hint),
+        None => up,
+    };
+    if up.clicked() {
+        *move_to = Some((index, index.saturating_sub(1)));
+    }
+    let down = ui.add_enabled(index + 1 < len, button(labels.down));
+    let down = match labels.down_hint {
+        Some(hint) => down.on_hover_text(hint),
+        None => down,
+    };
+    if down.clicked() {
+        *move_to = Some((index, index + 1));
+    }
 }
 
 /// Label + ComboBox writing a `String`, popup salted from the label: the
@@ -1134,21 +1307,22 @@ pub fn validated_string_list(
 }
 
 /// Editable key→value table: a key column, a value field filling the rest of
-/// the row, a 🗑 per row, and an add-row button.
+/// the row, a delete button per row, and an add-row button captioned
+/// `add_label` (each screen names the kind of row it adds).
 ///
 /// Two columns only: egui grids size non-last columns from the previous
 /// frame's width (first frame: `min_col_width`), and a `TextEdit` clamps its
 /// desired width to the cell's available width — so fields in non-last
 /// columns are frozen at the first frame's width forever. The key column gets
-/// `min_col_width` and the value field lives in the last column (which egui
-/// sizes to the remaining width); the 🗑 pins to the row's right edge via a
-/// right-to-left layout, the same trick `string_list` uses.
+/// `min_col_width` and the row itself is [`kv_row`], shared with the tables
+/// over JSON objects.
 pub fn kv_table(
     ui: &mut egui::Ui,
     lang: Language,
     entries: &mut Vec<(String, String)>,
     key_hint: &str,
     val_hint: &str,
+    add_label: &str,
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -1157,30 +1331,11 @@ pub fn kv_table(
         .min_col_width(150.0)
         .show(ui, |ui| {
             for (i, (k, v)) in entries.iter_mut().enumerate() {
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(k)
-                            .hint_text(key_hint)
-                            .desired_width(150.0),
-                    )
-                    .changed();
-                // Right-to-left: the remove button pins to the row's right
-                // edge and the value field fills exactly the remaining
-                // width. An unbounded field in a left-to-right row would
-                // claim the whole row and push the button past the clip
-                // rect (invisible, unclickable).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
-                        remove = Some(i);
-                    }
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::singleline(v)
-                                .hint_text(val_hint)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed();
-                });
+                let edit = kv_row(ui, k, key_hint, v, val_hint, t(lang, Key::DeleteRow));
+                changed |= edit.key || edit.value;
+                if edit.removed {
+                    remove = Some(i);
+                }
                 ui.end_row();
             }
         });
@@ -1188,11 +1343,104 @@ pub fn kv_table(
         entries.remove(i);
         changed = true;
     }
-    if ui.button(t(lang, Key::AddKvRow)).clicked() {
+    if ui.button(add_label).clicked() {
         entries.push((String::new(), String::new()));
         changed = true;
     }
     changed
+}
+
+/// What one [`kv_row`]'s widgets reported this frame.
+#[derive(Clone, Copy, Default)]
+pub struct KvRowEdit {
+    /// The key buffer was edited.
+    pub key: bool,
+    /// The value buffer was edited.
+    pub value: bool,
+    /// The row's delete button was clicked; the caller removes the row after
+    /// its loop, when the iteration no longer borrows the table.
+    pub removed: bool,
+}
+
+/// One row of a two-column key→value table: the key box at the fixed key
+/// width, the delete button pinned to the row's right edge, and the value box
+/// filling exactly what the button leaves.
+///
+/// Both buffers belong to the caller: a plain `Vec<(String, String)>` table
+/// lends its own fields, and a table over a JSON object seeds a scratch for
+/// the row it renders (its key is a map key and a non-string value has no
+/// `String` of its own). Splitting the layout from the buffers is what keeps
+/// the two tables one row.
+///
+/// The value box must be the last widget: egui grids size non-last columns
+/// from the previous frame's width, and a `TextEdit` clamps its desired width
+/// to its cell's available width — a box in the key column is frozen at the
+/// first frame's width forever. The delete button pins right through a
+/// right-to-left layout, so the value box takes the width it leaves, and a
+/// left-to-right row would let an unbounded box claim the whole row and push
+/// the button past the clip rect (invisible, unclickable).
+pub fn kv_row(
+    ui: &mut egui::Ui,
+    key: &mut String,
+    key_hint: &str,
+    value: &mut String,
+    val_hint: &str,
+    delete_label: &str,
+) -> KvRowEdit {
+    let mut edit = KvRowEdit {
+        key: ui
+            .add(
+                egui::TextEdit::singleline(key)
+                    .hint_text(key_hint)
+                    .desired_width(150.0),
+            )
+            .changed(),
+        ..KvRowEdit::default()
+    };
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.small_button(delete_label).clicked() {
+            edit.removed = true;
+        }
+        edit.value = ui
+            .add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(val_hint)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+    });
+    edit
+}
+
+/// A JSON object as the rows a [`kv_table`] edits: a string value renders
+/// verbatim, a string array as its comma-joined items (the form both table
+/// screens show a list in), and any other value as its JSON text.
+pub fn kv_rows_from_json(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    map.iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => other.to_string(),
+            };
+            (k.clone(), text)
+        })
+        .collect()
+}
+
+/// The committed `(key, value)` pairs of an edited table, in row order: blank
+/// keys drop and both sides trim. Every table-to-model write starts from this
+/// shape, so the rows the widget refuses to commit are refused once.
+pub fn kv_rows_trimmed(rows: &[(String, String)]) -> impl Iterator<Item = (String, String)> + '_ {
+    rows.iter()
+        .filter(|(k, _)| !k.trim().is_empty())
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
 }
 
 /// Width of a ledger row's label column, so the columns line up from row to
@@ -1468,7 +1716,7 @@ mod tests {
             .with_size(egui::vec2(400.0, 200.0))
             .build_ui_state(
                 |ui, entries: &mut Vec<(String, String)>| {
-                    let _ = kv_table(ui, Language::En, entries, "domain", "ip");
+                    let _ = kv_table(ui, Language::En, entries, "domain", "ip", "+ Add row");
                 },
                 entries,
             );

@@ -14,11 +14,7 @@
 //! that cannot be secured is an error and callers must not write
 //! credential-bearing files after a failure.
 
-use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use windows::Win32::Security::{DACL_SECURITY_INFORMATION, SetFileSecurityW};
-use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-use windows::core::PCWSTR;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,28 +106,7 @@ fn secure_dir_user_only(dir: &Path) -> std::io::Result<()> {
             "test seam: state/config dir DACL failure injected",
         ));
     }
-    let wide: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let applied = crate::sys::security::with_user_restricted_security_descriptor(
-        FILE_ALL_ACCESS.0,
-        |descriptor| {
-            // SAFETY: `wide` is a NUL-terminated wide path alive for the call;
-            // `descriptor` is the absolute, initialized security descriptor
-            // built by `crate::sys::security::with_user_restricted_security_descriptor`
-            // (all Set* calls returned Ok) and alive for the call — the
-            // kernel copies the DACL out of the live buffers before it
-            // returns. Only the DACL is replaced
-            // (`DACL_SECURITY_INFORMATION`). The BOOLEAN result is checked by
-            // the caller.
-            unsafe {
-                SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, descriptor)
-            }
-        },
-    )
-    .map_err(|_| {
+    let applied = crate::sys::security::apply_user_restricted_dacl(dir).map_err(|_| {
         std::io::Error::other(format!(
             "cannot build a user-restricted DACL for {}",
             dir.display()

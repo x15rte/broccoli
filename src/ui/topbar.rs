@@ -4,11 +4,10 @@
 //!
 //! [`show_row`] is the row's whole interface: the shell fills
 //! [`TopbarRowState`] with the frame's facts and dispatches the clicks it
-//! gets back. The row owns its own memos ([`TopbarMemos`] — the captions and
-//! the reserved cluster width, rebuilt only when their inputs move), the
-//! width budget, the clip, and the order the three zones paint in, so the
-//! "chips yield, never cover" invariant is enforced where the widths are
-//! known. Everything is a free function or a plain data struct because the
+//! gets back. The row owns its own caption memo ([`TopbarMemos`]) and lays
+//! the zones out with [`egui::containers::Sides`], which measures the caption
+//! first and hands the chips only what it leaves — the "chips yield, never
+//! cover" invariant is the layout's, not a reserved number's. Everything is a free function or a plain data struct because the
 //! app shell itself is not constructible in tests (it needs
 //! `eframe::CreationContext` + profile I/O).
 
@@ -18,62 +17,6 @@ use crate::model::settings::Language;
 use crate::rt::CorePhase;
 use crate::ui::PhaseAction;
 use crate::ui::status::{PhaseBadgeWording, phase_badge_color, phase_badge_text, status_colors_of};
-
-/// Width the right-edge cluster reserves on the row: the version caption
-/// (weak, body text). The row subtracts this from the row width before sizing
-/// the chip zone, so the chips yield instead of ever covering the caption.
-fn caption_width(ui: &egui::Ui, version: &str) -> f32 {
-    let font_id = egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body));
-    ui.painter()
-        .layout_no_wrap(version.to_owned(), font_id, egui::Color32::WHITE)
-        .size()
-        .x
-}
-
-/// The app-shell memo for the right cluster: the width the version caption
-/// reserves, keyed by everything that moves it — the core version and the
-/// language (the caption's two text inputs) and the viewport width.
-#[derive(Default)]
-pub(crate) struct TopbarRightCache {
-    key: (Option<String>, Language, f32),
-    /// The width the cluster (the version caption) reserves on the row.
-    pub(crate) width: f32,
-}
-
-/// Refresh the right-cluster memo and return the width it reserves. Never
-/// allocates on the repaint path: the staleness check compares by value, and
-/// only a key change re-measures the caption — the memo surviving an idle
-/// frame and the key it rebuilds on are the checks the tests pin.
-fn refresh_topbar_right(
-    ui: &egui::Ui,
-    lang: Language,
-    version_caption: &str,
-    core_version: Option<&str>,
-    cache: &mut Option<TopbarRightCache>,
-) -> f32 {
-    let view_w = (ui.max_rect().width() * 2.0).round() / 2.0;
-    let stale = cache
-        .as_ref()
-        .is_none_or(|c| c.key.0.as_deref() != core_version || c.key.1 != lang || c.key.2 != view_w);
-    if stale {
-        *cache = Some(TopbarRightCache {
-            key: (core_version.map(str::to_owned), lang, view_w),
-            width: caption_width(ui, version_caption),
-        });
-    }
-    cache
-        .as_ref()
-        .expect("topbar right cache populated above")
-        .width
-}
-
-/// Render the right-edge cluster: the version caption anchored at the row's
-/// far right (right-to-left flow — the first widget lands rightmost).
-fn show_right_cluster(ui: &mut egui::Ui, version: &str) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.weak(version);
-    });
-}
 
 /// The top bar's per-frame facts, supplied by the shell: the model and
 /// runtime reads the row paints, plus the chip texts the shell already
@@ -111,14 +54,12 @@ pub(crate) struct TopbarRowState<'a> {
     pub(crate) persistence_error: Option<&'a str>,
 }
 
-/// The row's memo state: the caption generation and the right-cluster
-/// measurement, both rebuilt only when their own inputs move. One value the
-/// shell owns and hands back each frame — the layout that reads it (and the
-/// keys it is stale on) lives with the row.
+/// The row's memo state: the caption generation, rebuilt only when its own
+/// inputs move. One value the shell owns and hands back each frame — the
+/// layout that reads it (and the keys it is stale on) lives with the row.
 #[derive(Default)]
 pub(crate) struct TopbarMemos {
     labels: Option<TopbarLabels>,
-    right: Option<TopbarRightCache>,
 }
 
 /// One generation of the row's captions: the phase badge, the mode caption,
@@ -189,91 +130,102 @@ pub(crate) fn show_row(
     state: &TopbarRowState<'_>,
     memos: &mut TopbarMemos,
 ) -> TopbarRowClicks {
-    let TopbarMemos { labels, right } = memos;
+    let TopbarMemos { labels } = memos;
     ui.horizontal(|ui| {
         let labels = refresh_labels(labels, state);
-        // Measure the right cluster first: its width is memoized on the core
-        // version / language / viewport width, never measured per frame, and
-        // the zone below is capped to the row minus this reservation so the
-        // chips can never cover the caption.
-        let right_width = refresh_topbar_right(
+        // `Sides::shrink_left` measures the caption first and hands this
+        // side only the width the row has left, so no clip or reserved
+        // number has to reproduce the measurement.
+        let (clicks, ()) = egui::containers::Sides::new().shrink_left().show(
             ui,
-            state.lang,
-            &labels.version_caption,
-            state.core_version,
-            right,
+            |ui| row_left(ui, labels, state),
+            |ui| {
+                // The right-edge cluster: the caption anchored at the row's
+                // far right (the side's layout flows right-to-left, so the
+                // first widget lands rightmost).
+                ui.weak(&labels.version_caption);
+            },
         );
-        let mut clicks = TopbarRowClicks::default();
-        ui.colored_label(phase_badge_color(state.phase, status_colors_of(ui)), "●");
-        ui.label(&labels.badge);
-        ui.separator();
-        match PhaseAction::for_phase(state.phase) {
-            PhaseAction::Connect => {
-                let response = match state.blocked_reason {
-                    Some(reason) => ui
-                        .add_enabled(
-                            false,
-                            egui::Button::new(PhaseAction::Connect.label(state.lang)),
-                        )
-                        .on_disabled_hover_text(reason),
-                    None => ui.button(PhaseAction::Connect.label(state.lang)),
-                };
-                clicks.connect = response.clicked();
-            }
-            PhaseAction::Disconnect | PhaseAction::CancelRetry => {
-                clicks.stop = ui
-                    .button(PhaseAction::for_phase(state.phase).label(state.lang))
-                    .clicked();
-            }
-        }
-
-        // The chip zone, capped to the row remainder and clipped, so every
-        // chip truncates to its budget instead of pushing under the cluster.
-        let can_apply = matches!(state.phase, CorePhase::Running) && state.apply_block.is_none();
-        let status = TopbarStatus {
-            lang: state.lang,
-            mode_caption: &labels.mode_caption,
-            active_caption: labels.active_caption.as_deref(),
-            unsaved_changes: state.unsaved_changes,
-            trial_rule_count: state.trial_rule_count,
-            core_available: state.core_available,
-            config_dirty: state.config_dirty,
-            can_apply,
-            apply_block: state.apply_block,
-            apply_result: state.apply_result,
-            terminal_error: state.terminal_error,
-            config_error: state.config_error,
-            state_error: state.state_error,
-            persistence_error: state.persistence_error,
-        };
-        let zone_start_x = ui.cursor().min.x;
-        let zone_w =
-            (ui.max_rect().max.x - right_width - ui.spacing().item_spacing.x - zone_start_x)
-                .max(0.0);
-        let zone_clicks = ui
-            .scope(|ui| {
-                ui.set_max_width(zone_w);
-                ui.set_clip_rect(egui::Rect::from_min_max(
-                    egui::pos2(zone_start_x, ui.max_rect().min.y),
-                    egui::pos2(
-                        zone_start_x + zone_w + ui.spacing().item_spacing.x,
-                        ui.max_rect().max.y,
-                    ),
-                ));
-                topbar_status_zone(ui, &status)
-            })
-            .inner;
-        clicks.apply = zone_clicks.apply;
-        clicks.retry = zone_clicks.retry;
-        clicks.open_folder = zone_clicks.open_folder;
-        clicks.jump_to_error = zone_clicks.jump_to_error;
-
-        // The cluster last: right-to-left, anchored at the row's far right,
-        // painting into whatever the zone above yielded.
-        show_right_cluster(ui, &labels.version_caption);
         clicks
     })
     .inner
+}
+
+/// The row's left block: the phase badge, the lifecycle action, and the chip
+/// zone, laid out in the width [`egui::containers::Sides`] leaves after the
+/// version caption. Every chip truncates to its budget instead of pushing
+/// under the cluster.
+fn row_left(
+    ui: &mut egui::Ui,
+    labels: &TopbarLabels,
+    state: &TopbarRowState<'_>,
+) -> TopbarRowClicks {
+    let mut clicks = TopbarRowClicks::default();
+    ui.colored_label(phase_badge_color(state.phase, status_colors_of(ui)), "●");
+    ui.label(&labels.badge);
+    ui.separator();
+    match PhaseAction::for_phase(state.phase) {
+        PhaseAction::Connect => {
+            let response = match state.blocked_reason {
+                Some(reason) => ui
+                    .add_enabled(
+                        false,
+                        egui::Button::new(PhaseAction::Connect.label(state.lang)),
+                    )
+                    .on_disabled_hover_text(reason),
+                None => ui.button(PhaseAction::Connect.label(state.lang)),
+            };
+            clicks.connect = response.clicked();
+        }
+        PhaseAction::Disconnect | PhaseAction::CancelRetry => {
+            clicks.stop = ui
+                .button(PhaseAction::for_phase(state.phase).label(state.lang))
+                .clicked();
+        }
+    }
+
+    // The chip zone, capped to the row remainder and clipped, so every
+    // chip truncates to its budget instead of pushing under the cluster.
+    let can_apply = matches!(state.phase, CorePhase::Running) && state.apply_block.is_none();
+    let status = TopbarStatus {
+        lang: state.lang,
+        mode_caption: &labels.mode_caption,
+        active_caption: labels.active_caption.as_deref(),
+        unsaved_changes: state.unsaved_changes,
+        trial_rule_count: state.trial_rule_count,
+        core_available: state.core_available,
+        config_dirty: state.config_dirty,
+        can_apply,
+        apply_block: state.apply_block,
+        apply_result: state.apply_result,
+        terminal_error: state.terminal_error,
+        config_error: state.config_error,
+        state_error: state.state_error,
+        persistence_error: state.persistence_error,
+    };
+    // The zone's budget is the width `Sides` left for this side: its
+    // child `Ui` stops where the caption's block starts, and the clip
+    // keeps a chip that ignores it from painting across.
+    let zone_start_x = ui.cursor().min.x;
+    let zone_w = ui.available_width().max(0.0);
+    let zone_clicks = ui
+        .scope(|ui| {
+            ui.set_max_width(zone_w);
+            ui.set_clip_rect(egui::Rect::from_min_max(
+                egui::pos2(zone_start_x, ui.max_rect().min.y),
+                egui::pos2(
+                    zone_start_x + zone_w + ui.spacing().item_spacing.x,
+                    ui.max_rect().max.y,
+                ),
+            ));
+            topbar_status_zone(ui, &status)
+        })
+        .inner;
+    clicks.apply = zone_clicks.apply;
+    clicks.retry = zone_clicks.retry;
+    clicks.open_folder = zone_clicks.open_folder;
+    clicks.jump_to_error = zone_clicks.jump_to_error;
+    clicks
 }
 
 /// Refresh the caption memo when any of its inputs moved, and hand back the
@@ -777,78 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn right_cluster_refresh_memoizes_on_key_changes() {
-        // The inputs the right cluster depends on — a state struct because
-        // kittest drives the closure per frame and the app-shell pattern is
-        // build_ui_state + state mutation.
-        struct RightState {
-            lang: Language,
-            version: String,
-            core_version: Option<String>,
-            cache: Option<TopbarRightCache>,
-        }
-        let state = RightState {
-            lang: Language::En,
-            version: "xray v1 · app 0.1".to_owned(),
-            core_version: Some("v1".to_owned()),
-            cache: None,
-        };
-        let mut h = Harness::builder().build_ui_state(
-            move |ui, state: &mut RightState| {
-                refresh_topbar_right(
-                    ui,
-                    state.lang,
-                    &state.version,
-                    state.core_version.as_deref(),
-                    &mut state.cache,
-                );
-            },
-            state,
-        );
-        h.run();
-        let seeded = h
-            .state()
-            .cache
-            .as_ref()
-            .expect("the first call seeds the cache");
-        assert!(
-            seeded.width > 0.0,
-            "the cluster must reserve row width for the version caption"
-        );
-        let viewport = seeded.key.2;
-
-        // A core version change (an install) re-measures exactly once: the
-        // memo carries the version it was built for.
-        h.state_mut().core_version = Some("v2".to_owned());
-        h.step();
-        assert_eq!(
-            h.state().cache.as_ref().expect("cache populated").key,
-            (Some("v2".to_owned()), Language::En, viewport),
-            "a core-version change rebuilds exactly once"
-        );
-
-        // Idle frames with unchanged inputs must not rebuild: the memo keeps
-        // the very allocation it built, not merely its value.
-        let core_version_ptr = |h: &Harness<'_, RightState>| {
-            h.state()
-                .cache
-                .as_ref()
-                .expect("cache populated")
-                .key
-                .0
-                .as_ref()
-                .map(|version| version.as_ptr())
-        };
-        let rebuilt = core_version_ptr(&h);
-        h.run_steps(5);
-        assert_eq!(
-            core_version_ptr(&h),
-            rebuilt,
-            "unchanged inputs must not rebuild the caption memo"
-        );
-    }
-
-    #[test]
     fn status_zone_renders_every_chip_state() {
         let mut h = Harness::new_ui(|ui| {
             topbar_status_zone(ui, &heavy_status());
@@ -897,24 +777,23 @@ mod tests {
         );
     }
 
-    /// The width the row reserves for the version cluster this frame. Read
-    /// straight off the row's memo: the budget assertion below is the
-    /// invariant, and this is the reservation it is measured against.
-    fn reserved_width(h: &Harness<'_, RowFixture>) -> f32 {
-        h.state()
-            .memos
-            .right
-            .as_ref()
-            .expect("the row measures the cluster every frame")
-            .width
+    /// The x the chip zone may paint up to: the version cluster's own left
+    /// edge, which the row's `Sides` layout hands the chips as their width
+    /// budget.
+    fn cluster_edge(h: &Harness<'_, RowFixture>) -> f32 {
+        h.get_all_by_label(version_caption().as_str())
+            .next()
+            .expect("the row paints the version caption")
+            .rect()
+            .min
+            .x
     }
 
     /// A chip past the row's budget is clipped to a degenerate ellipsis: it
     /// can never carry a word of text into the cluster's reservation, which
-    /// is the whole point of the cap. `reserved` is the width the row set
-    /// aside this frame for the version cluster.
-    fn assert_chips_yield_to_the_cluster(h: &Harness<'_, RowFixture>, width: f32, reserved: f32) {
-        let budget_edge = 8.0 + width - reserved;
+    /// is the whole point of the cap.
+    fn assert_chips_yield_to_the_cluster(h: &Harness<'_, RowFixture>) {
+        let budget_edge = cluster_edge(h);
         for label in [
             "mode: TUN",
             "Server edits not saved",
@@ -928,8 +807,8 @@ mod tests {
             if rect.max.x > budget_edge {
                 assert!(
                     rect.width() < 30.0,
-                    "chip {label:?} carries text past the cluster reservation \
-                     ({reserved}): {:?}, budget edge {budget_edge}",
+                    "chip {label:?} carries text past the cluster's left edge \
+                     ({budget_edge}): {:?}",
                     rect
                 );
             }
@@ -955,9 +834,11 @@ mod tests {
             "version must anchor at the row's right edge, rect {:?}",
             version.rect()
         );
-        let reserved = reserved_width(&h);
-        assert!(reserved > 0.0, "the row must reserve width for the caption");
-        assert_chips_yield_to_the_cluster(&h, width, reserved);
+        assert!(
+            cluster_edge(&h) < 8.0 + width,
+            "the caption must leave the row's left part to the chips"
+        );
+        assert_chips_yield_to_the_cluster(&h);
     }
 
     #[test]
@@ -975,8 +856,10 @@ mod tests {
                 .is_some(),
             "the cluster must render at a tight width"
         );
-        let reserved = reserved_width(&h);
-        assert!(reserved > 0.0, "the row must reserve width for the caption");
-        assert_chips_yield_to_the_cluster(&h, width, reserved);
+        assert!(
+            cluster_edge(&h) > 8.0,
+            "the caption must keep the row's right edge for itself"
+        );
+        assert_chips_yield_to_the_cluster(&h);
     }
 }

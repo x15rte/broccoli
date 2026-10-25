@@ -12,7 +12,6 @@
 
 use std::error::Error as _;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -30,8 +29,9 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HWND,
-    LPARAM, LRESULT, NO_ERROR, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, NO_ERROR,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     CancelMibChangeNotify2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
@@ -42,8 +42,7 @@ use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
-    SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, TOKEN_QUERY, WinBuiltinAdministratorsSid,
-    WinLocalSystemSid,
+    SECURITY_DESCRIPTOR_CONTROL, TOKEN_QUERY, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -76,10 +75,9 @@ use windows::core::{BOOL, HRESULT, PCWSTR, w};
 use super::events::{Forward, HandOff, LogGate, LogHop, hand_within};
 use crate::model::inbound::TUN_INBOUND_TAG;
 use crate::rt::supervisor::CoreInvocation;
+use crate::sys::aligned::AlignedBuffer;
 use crate::sys::elevation::is_hex_secret;
-use crate::sys::security::{
-    Sid, TokenHandle, is_invalid_owner_error, with_protected_attributes, with_protected_descriptor,
-};
+use crate::sys::security::{Sid, TokenHandle, is_invalid_owner_error, with_protected_attributes};
 
 const PIPE_PREFIX: &str = r"\\.\pipe\broccoli-core-helper-";
 /// Format marker of the fallback line the GUI shows when a log record
@@ -339,11 +337,15 @@ fn wait_for_connection(handle: HANDLE, parent: Option<HANDLE>) -> Result<(), Dia
         // codes while keeping the handle valid for retry.
         match unsafe { ConnectNamedPipe(handle, None) } {
             Ok(()) => return Ok(()),
-            Err(error) if error.code() == windows::core::HRESULT::from_win32(535) => {
+            Err(error)
+                if error.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) =>
+            {
                 // Client connected between CreateNamedPipe and this call.
                 return Ok(());
             }
-            Err(error) if error.code() == windows::core::HRESULT::from_win32(536) => {
+            Err(error)
+                if error.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_LISTENING.0) =>
+            {
                 if Instant::now() >= deadline {
                     return Err(DiagError::new(Diag::new(Key::HelperConnectTimeout)));
                 }
@@ -584,16 +586,15 @@ fn trusted_program_data() -> Result<PathBuf, DiagError> {
 /// `dacl_present`) and the owner SID used by [`load_protected_directory`]
 /// point into `words`, so the storage must stay alive while they are used.
 struct LoadedProtectedDirectory {
-    /// Word storage for the self-relative descriptor written by
+    /// Storage for the self-relative descriptor written by
     /// [`load_protected_directory`]. A descriptor embeds pointer fields, so
-    /// it must be read at an 8-byte-aligned address; `Vec<u8>` only
-    /// guarantees 1-byte alignment by contract. `Vec<u64>` supplies that
-    /// alignment, and the self-relative layout carries it inward: the
-    /// descriptor header and every embedded ACL header are DWORD-sized, and
-    /// each ACE's `AceSize` is DWORD-rounded, so the DACL and every ACE (and
-    /// with it `SidStart` at offset 8) sit on DWORD boundaries from this
-    /// base. Every ACE/SID read below cites this rule.
-    words: Vec<u64>,
+    /// it must be read at an 8-byte-aligned address; [`AlignedBuffer`] over
+    /// `u64` supplies that alignment, and the self-relative layout carries it
+    /// inward: the descriptor header and every embedded ACL header are
+    /// DWORD-sized, and each ACE's `AceSize` is DWORD-rounded, so the DACL and
+    /// every ACE (and with it `SidStart` at offset 8) sit on DWORD boundaries
+    /// from this base. Every ACE/SID read below cites this rule.
+    words: AlignedBuffer<u64>,
     /// Number of descriptor bytes initialized at the base of `words`.
     byte_len: usize,
     control: SECURITY_DESCRIPTOR_CONTROL,
@@ -605,12 +606,12 @@ struct LoadedProtectedDirectory {
 impl LoadedProtectedDirectory {
     /// The loaded descriptor bytes, for the `validated_ace` bounds check.
     fn bytes(&self) -> &[u8] {
-        // SAFETY: `words` is a live allocation of `byte_len.div_ceil(8)`
-        // `u64`s, so at least `byte_len` bytes from its base are addressable
-        // and were initialized (zeroed before the load, then written by the
-        // successful `GetFileSecurityW`). The returned view borrows `words`,
-        // so it cannot outlive the storage the `dacl`/SID pointers target.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.byte_len) }
+        // SAFETY: `words` is a live allocation of at least `byte_len` bytes,
+        // so that many bytes from its base are addressable and were
+        // initialized (zeroed before the load, then written by the successful
+        // `GetFileSecurityW`). The returned view borrows `words`, so it cannot
+        // outlive the storage the `dacl`/SID pointers target.
+        unsafe { std::slice::from_raw_parts(self.words.as_mut_ptr().cast::<u8>(), self.byte_len) }
     }
 }
 
@@ -640,19 +641,18 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
     }
     let byte_len = required as usize;
     // A self-relative security descriptor carries pointer fields, so it must
-    // be read at an 8-byte-aligned address. `Vec<u8>` is only 1-byte aligned
-    // by contract — the system allocator's over-alignment is not a language
-    // guarantee — so the storage is `u64` words covering the same byte span,
-    // the same rule `sys::security::Sid::token_user` and
-    // `sys::netif::AdapterBuffer` apply to their Win32 buffers.
-    let mut words = vec![0u64; byte_len.div_ceil(std::mem::size_of::<u64>())];
+    // be read at an 8-byte-aligned address. The shared aligned allocation
+    // supplies that address (and its byte span) for `u64`, the same rule
+    // `sys::security` and `sys::netif` apply to their Win32 buffers.
+    let words = AlignedBuffer::<u64>::zeroed(byte_len)
+        .ok_or_else(|| DiagError::new(Diag::new(Key::HelperDescriptorReadFailed)))?;
     let descriptor = PSECURITY_DESCRIPTOR(words.as_mut_ptr().cast());
     // SAFETY: `words` covers at least `required` zeroed bytes from its base
     // and stays alive through all the descriptor reads below; `descriptor`
     // points into it, so the kernel writes at most `required` bytes. The
-    // storage is 8-byte aligned (`Vec<u64>`), satisfying the descriptor's
-    // pointer-field alignment when read back. The result is checked via
-    // `loaded.as_bool()` plus the thread's last error.
+    // storage is 8-byte aligned (`AlignedBuffer<u64>`), satisfying the
+    // descriptor's pointer-field alignment when read back. The result is
+    // checked via `loaded.as_bool()` plus the thread's last error.
     let loaded = unsafe {
         GetFileSecurityW(
             PCWSTR(wide.as_ptr()),
@@ -993,16 +993,8 @@ fn repair_protected_directory_dacl(path: &Path) -> Result<(), DiagError> {
     if !dacl_deviation_is_benign(path) {
         return Err(DiagError::new(Diag::new(Key::HelperDeviationNotBenign)));
     }
-    let wide = path_to_wide(path);
-    let applied = with_protected_descriptor(None, &[], |descriptor| unsafe {
-        // SAFETY: `wide` is a NUL-terminated wide path valid for the call;
-        // `descriptor` is the fully initialized protected descriptor built by
-        // `sys::security::with_protected_descriptor` (its SID/ACL buffers
-        // stay alive for the call) and the kernel copies the DACL out before
-        // it returns. The BOOLEAN result is checked by the caller below.
-        SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, descriptor)
-    })
-    .diag(Key::HelperDescriptorBuildFailed)?;
+    let applied =
+        crate::sys::security::apply_protected_dacl(path).diag(Key::HelperDescriptorBuildFailed)?;
     if !applied.as_bool() {
         return Err(windows::core::Error::from_thread()).diag(Key::HelperDaclRepairFailed);
     }
@@ -1056,8 +1048,9 @@ fn create_protected_directory(path: &Path, allow_existing: bool) -> Result<(), D
     }
     match created {
         Ok(()) => {}
-        Err(error) if allow_existing && error.code() == windows::core::HRESULT::from_win32(183) => {
-        }
+        Err(error)
+            if allow_existing
+                && error.code() == windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
         Err(error) => {
             return Err(error)
                 .diag_with(Diag::new(Key::HelperDirectoryCreateFailed).arg(path.display()));
@@ -1223,22 +1216,13 @@ fn sha256_handle(file: &mut File) -> Result<String, DiagError> {
         hasher.update(&buffer[..read]);
     }
     let digest = hasher.finalize();
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    Ok(output)
+    Ok(crate::digest::hex(&digest))
 }
 
 /// SHA-256 hex of in-memory `bytes`, the expected digest a staged copy is
 /// proven against (see [`stage_config_bytes_at`]).
 fn sha256_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    output
+    crate::digest::sha256_hex(bytes)
 }
 
 /// Whether a message that failed to deserialize still announces a `start`:
@@ -1735,41 +1719,29 @@ fn send_event(writer: &Arc<Mutex<File>>, value: &serde_json::Value) {
 /// helper's stream threads (plain std I/O, no tokio reactor there). Bounds
 /// one captured xray line at [`supervisor::MAX_LINE_BYTES`] with the shared
 /// truncation marker, so an over-long line cannot grow an unbounded buffer in
-/// the elevated helper either (CWE-400/770).
+/// the elevated helper either (CWE-400/770). The truncation rule itself is
+/// [`super::line::Line`], shared with the supervisor's async reader; this
+/// function only supplies the blocking I/O.
 fn read_capped_line_sync<R>(reader: &mut R) -> std::io::Result<Option<String>>
 where
     R: BufRead,
 {
-    let keep = super::supervisor::MAX_LINE_BYTES - super::supervisor::TRUNCATED_MARKER.len();
-    let mut line: Vec<u8> = Vec::with_capacity(keep.min(256));
+    use super::line::{Line, Step};
+
+    let mut line = Line::new();
     loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            // EOF: a partial final line is still a line.
-            return Ok(if line.is_empty() {
-                None
-            } else {
-                Some(finish_line_sync(line))
-            });
-        }
-        if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
-            let take = pos.min(keep.saturating_sub(line.len()));
-            line.extend_from_slice(&available[..take]);
-            reader.consume(pos + 1);
-            if take < pos {
-                line.truncate(keep);
-                line.extend_from_slice(super::supervisor::TRUNCATED_MARKER.as_bytes());
+        match line.take(reader.fill_buf()?) {
+            Step::Eof => return Ok((!line.is_empty()).then(|| line.finish())),
+            Step::More { consume } => reader.consume(consume),
+            Step::Done { consume } => {
+                reader.consume(consume);
+                return Ok(Some(line.finish()));
             }
-            return Ok(Some(finish_line_sync(line)));
-        }
-        let take = available.len().min(keep.saturating_sub(line.len()));
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if line.len() >= keep {
-            skip_rest_of_line_sync(reader)?;
-            line.truncate(keep);
-            line.extend_from_slice(super::supervisor::TRUNCATED_MARKER.as_bytes());
-            return Ok(Some(finish_line_sync(line)));
+            Step::Cut { consume } => {
+                reader.consume(consume);
+                skip_rest_of_line_sync(reader)?;
+                return Ok(Some(line.finish()));
+            }
         }
     }
 }
@@ -1787,13 +1759,6 @@ fn skip_rest_of_line_sync<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
         let len = available.len();
         reader.consume(len);
     }
-}
-
-fn finish_line_sync(mut line: Vec<u8>) -> String {
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    String::from_utf8_lossy(&line).into_owned()
 }
 
 /// The staged core's command line: the staged `xray.exe` run against the
@@ -1830,6 +1795,9 @@ fn validate_staged_config(stage: &Path) -> Result<(), DiagError> {
         }
     };
     let deadline = Instant::now() + super::apply::VALIDATE_TIMEOUT;
+    // Poll rather than `wait`: the deadline branch must terminate the Job
+    // Object before reaping, and a blocking wait would hold the serve thread
+    // for the whole validation window with no way to reach that branch.
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
@@ -3609,7 +3577,7 @@ impl HelperPipe {
     pub(super) fn connect_cancellable(
         pipe_id: &str,
         token: &str,
-        cancel: &AtomicBool,
+        cancel: &super::cancel::Cancel,
     ) -> Result<Self, DiagError> {
         if !is_hex_secret(token) {
             return Err(DiagError::new(Diag::new(Key::HelperAuthTokenInvalid)));
@@ -3618,7 +3586,7 @@ impl HelperPipe {
         let wide_name = to_wide(&pipe_name);
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         let handle = loop {
-            if cancel.load(Ordering::Acquire) {
+            if cancel.is_cancelled() {
                 return Err(DiagError::new(Diag::new(Key::HelperConnectCancelled)));
             }
             // SAFETY: `wide_name` is a NUL-terminated wide pipe path valid for
@@ -3657,7 +3625,7 @@ impl HelperPipe {
                 }
             }
         };
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             // SAFETY: `handle` is the valid handle returned by `CreateFileW`
             // above, still open and never closed elsewhere, so this closes it
             // exactly once.
@@ -3871,7 +3839,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write as _;
     use std::os::windows::io::FromRawHandle as _;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -4863,7 +4831,7 @@ mod tests {
             .expect("spawn live helper");
 
         let start = Instant::now();
-        let cancel = AtomicBool::new(false);
+        let cancel = crate::rt::cancel::Cancel::new();
         let mut pipe = match HelperPipe::connect_cancellable(&pipe_id, &token, &cancel) {
             Ok(pipe) => pipe,
             Err(error) => {
@@ -4982,7 +4950,7 @@ mod tests {
             .spawn()
             .expect("spawn live helper");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = crate::rt::cancel::Cancel::new();
         let mut pipe = match HelperPipe::connect_cancellable(&pipe_id, &token, &cancel) {
             Ok(pipe) => pipe,
             Err(error) => {

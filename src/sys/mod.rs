@@ -1,9 +1,11 @@
 // Windows system integration.
+pub(crate) mod aligned;
 #[doc(hidden)]
 pub mod appdata;
 pub mod cleanup;
 pub mod core_dl;
 pub mod dns_takeover;
+pub mod durable;
 pub mod elevation;
 pub mod exit_bound;
 pub mod geodata;

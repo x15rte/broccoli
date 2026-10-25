@@ -233,7 +233,7 @@ fn generate_on_defaults() {
     // stale window, 8s per-server timeout default. UDP is seeded over DoH:
     // DoH-over-TCP through the tunnel chain stalls in bursts under DNS
     // floods (empirical, 2026-08-29), while plain UDP rides the same chain
-    // statelessly. Exact wire form of DnsCfg::default().to_wire(false).
+    // statelessly. Exact wire form of DnsCfg::default().to_wire().
     assert_eq!(
         cfg["dns"],
         json!({
@@ -4378,9 +4378,13 @@ fn dns_projection_strips_gui_group_and_appends_fakedns_server() {
             address: "1.1.1.1".into(),
             ..Default::default()
         }],
+        fakedns: FakeDnsCfg {
+            enabled: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let wire = cfg.to_wire(true).expect("configured dns is emitted");
+    let wire = cfg.to_wire().expect("configured dns is emitted");
     assert!(wire.get("fakedns").is_none(), "GUI group must be stripped");
     let servers = wire["servers"].as_array().unwrap();
     assert_eq!(servers.len(), 2);
@@ -4401,9 +4405,13 @@ fn dns_projection_dedups_an_existing_fakedns_server() {
                 ..Default::default()
             },
         ],
+        fakedns: FakeDnsCfg {
+            enabled: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let wire = cfg.to_wire(true).expect("configured dns is emitted");
+    let wire = cfg.to_wire().expect("configured dns is emitted");
     assert_eq!(wire["servers"].as_array().unwrap().len(), 2);
 }
 
@@ -4417,9 +4425,16 @@ fn dns_projection_is_none_when_effectively_empty() {
         enable_parallel_query: false,
         ..Default::default()
     };
-    assert!(cfg.to_wire(false).is_none());
+    assert!(cfg.to_wire().is_none());
     // the appended fakedns server alone makes the object non-empty
-    assert!(cfg.to_wire(true).is_some());
+    let with_fakedns = DnsCfg {
+        fakedns: FakeDnsCfg {
+            enabled: true,
+            ..Default::default()
+        },
+        ..cfg
+    };
+    assert!(with_fakedns.to_wire().is_some());
 }
 
 #[test]
@@ -4518,9 +4533,7 @@ fn dns_script_suppresses_the_parallel_query_default_on_the_wire() {
         ..Default::default()
     };
     assert!(cfg.enable_parallel_query, "the seeded default is on");
-    let wire = cfg
-        .to_wire(false)
-        .expect("a script alone makes a dns block");
+    let wire = cfg.to_wire().expect("a script alone makes a dns block");
     assert_eq!(wire["script"], json!("dns.lua"));
     assert!(
         wire.get("enableParallelQuery").is_none(),
@@ -4529,7 +4542,7 @@ fn dns_script_suppresses_the_parallel_query_default_on_the_wire() {
 
     // Without a script the seeded default still reaches the wire unchanged.
     assert_eq!(
-        DnsCfg::default().to_wire(false).expect("dns wire")["enableParallelQuery"],
+        DnsCfg::default().to_wire().expect("dns wire")["enableParallelQuery"],
         json!(true)
     );
 }

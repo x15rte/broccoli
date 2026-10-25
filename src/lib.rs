@@ -3,11 +3,10 @@
 
 pub mod app;
 pub mod diag;
+pub mod digest;
 /// The crate's diagnostic-text bound, published for tests that assert a
 /// bound they cannot compute from the rendered text alone.
-pub mod excerpt {
-    pub use crate::links::excerpt;
-}
+pub mod excerpt;
 pub mod r#gen;
 pub mod i18n;
 mod icon;

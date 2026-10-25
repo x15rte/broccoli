@@ -904,17 +904,20 @@ fn keygen_field(
 /// headers). Edited values become JSON strings; untouched non-string values
 /// round-trip unchanged.
 ///
-/// `scratch` is the screen's shared edit buffer for the key column and the
-/// non-string value rows: the widgets need a `&mut String` for the frame,
-/// and an owned buffer per row would allocate on every repaint. It is seeded
-/// before each widget and read back only when that widget reports an edit.
+/// `scratch` is the screen's pair of reuse buffers: the key column's (a map
+/// key is not a `&mut String` of its own) and a non-string value's formatted
+/// text. Both are seeded before a widget and read back only when that widget
+/// reports an edit, so an owned buffer per row never allocates on a repaint.
+///
+/// The row layout is [`widgets::kv_row`], shared with the plain
+/// `Vec<(String, String)>` tables, so the two-column rule lives in one place.
 fn json_map_kv(
     ui: &mut egui::Ui,
     lang: Language,
     map: &mut serde_json::Map<String, serde_json::Value>,
     key_hint: &str,
     val_hint: &str,
-    scratch: &mut widgets::Scratch,
+    scratch: &mut KvScratch,
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<String> = None;
@@ -929,58 +932,43 @@ fn json_map_kv(
         .min_col_width(150.0)
         .show(ui, |ui| {
             for (k, v) in map.iter_mut() {
-                // Seed the shared buffer with the row's key and read it back
-                // only on an edit: the rename pair is built on the edit path.
-                let kr = ui.add(
-                    egui::TextEdit::singleline(scratch.edit(k))
-                        .hint_text(key_hint)
-                        .desired_width(150.0),
+                let key_text = scratch.key.edit(k);
+                // A JSON string is edited in place — the widget writes the
+                // model's own text only on a real edit. Every other value
+                // round-trips through the scratch and becomes a string only
+                // when it is edited; `&*v` seeds without moving the row.
+                let mut formatted_value = false;
+                let value_text = match &mut *v {
+                    serde_json::Value::String(text) => text,
+                    other => {
+                        formatted_value = true;
+                        scratch.value.edit(&*other)
+                    }
+                };
+                let edit = widgets::kv_row(
+                    ui,
+                    key_text,
+                    key_hint,
+                    value_text,
+                    val_hint,
+                    t(lang, Key::DeleteRow),
                 );
-                if kr.changed() {
+                if edit.key {
                     // A key must be non-empty and different to be a rename.
-                    scratch.commit_if(
+                    scratch.key.commit_if(
                         |text| !text.is_empty() && text != k.as_str(),
                         |text| rename = Some((k.clone(), text.to_owned())),
                     );
                 }
-                // Right-to-left: the remove button pins to the row's right
-                // edge and the value field fills exactly the remaining
-                // width. The value field must live in the last column —
-                // egui grids size non-last columns from the previous frame's
-                // width, and a TextEdit clamps to that, freezing the field
-                // at the first frame's width forever (see the kv_table
-                // regression test).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("🗑").clicked() {
-                        remove = Some(k.clone());
+                if edit.value {
+                    if formatted_value {
+                        *v = serde_json::Value::String(scratch.value.text().to_owned());
                     }
-                    // A JSON string is edited in place — the widget writes
-                    // the model's own text only on a real edit.
-                    if let serde_json::Value::String(text) = v {
-                        changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(text)
-                                    .hint_text(val_hint)
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed();
-                    } else {
-                        // Every other value round-trips through the shared
-                        // buffer and becomes a string only when it is edited;
-                        // `&*v` seeds without moving the row's `&mut`.
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(scratch.edit(&*v))
-                                    .hint_text(val_hint)
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed()
-                        {
-                            *v = serde_json::Value::String(scratch.text().to_owned());
-                            changed = true;
-                        }
-                    }
-                });
+                    changed = true;
+                }
+                if edit.removed {
+                    remove = Some(k.clone());
+                }
                 ui.end_row();
             }
         });
@@ -1006,6 +994,15 @@ fn json_map_kv(
         changed = true;
     }
     changed
+}
+
+/// The two reuse buffers of one JSON key→value table (see [`json_map_kv`]):
+/// the key column's and a non-string value's. One per screen table group, so
+/// the buffers keep their capacity across frames.
+#[derive(Default)]
+struct KvScratch {
+    key: widgets::Scratch,
+    value: widgets::Scratch,
 }
 
 /// One xdrive numeric scalar: zero keeps the core's own default
@@ -1069,7 +1066,7 @@ fn transport_headers(
     ui: &mut egui::Ui,
     lang: Language,
     map: &mut serde_json::Map<String, serde_json::Value>,
-    scratch: &mut widgets::Scratch,
+    scratch: &mut KvScratch,
 ) -> bool {
     let had_host = map.keys().any(|key| key.eq_ignore_ascii_case("host"));
     let mut changed = json_map_kv(
@@ -1097,7 +1094,7 @@ fn websocket_transport_headers(
     ui: &mut egui::Ui,
     lang: Language,
     settings: &mut WsSettings,
-    scratch: &mut widgets::Scratch,
+    scratch: &mut KvScratch,
 ) -> bool {
     let mut changed = json_map_kv(
         ui,
@@ -1737,92 +1734,54 @@ struct MaskListSpec<'a> {
     revision: u64,
 }
 
-/// The envelope's `type` string, known or not: what a mask displays when its
-/// type is one this build does not know.
-trait MaskEnvelope {
-    fn discriminator(&self) -> Option<&str>;
-}
-
-/// The finalmask list's per-kind vocabulary and editor: the TCP and UDP
-/// lists render the same rows — type combo, reorder controls, then the
-/// kind's own settings — and differ only here.
-trait MaskKind: MaskEnvelope + Sized {
-    /// The `type` string this mask serializes as, when it is a known one.
-    fn known_type(&self) -> Option<&'static str>;
+/// One finalmask list's per-kind vocabulary and editor: the TCP and UDP
+/// lists render the same chrome — type combo, reorder controls, then the
+/// kind's settings — and differ only here.
+///
+/// Plain function pointers to the model's own methods, not a trait: the two
+/// lists are one layout and the mask type is what varies, so the variation is
+/// a value the list takes.
+struct MaskKind<M> {
+    /// The `type` string the mask serializes as, when it is a known one.
+    known_type: fn(&M) -> Option<&'static str>,
+    /// The envelope's `type` string, known or not: what a row displays when
+    /// its type is one this build does not know.
+    discriminator: fn(&M) -> Option<&str>,
     /// The mask of this kind `kind` names (the loader folds the spelling).
-    fn from_known_type(kind: &str) -> Option<Self>;
-    /// The types the outbound editor offers, in the model's table order.
-    fn outbound_types() -> impl Iterator<Item = &'static str>;
+    from_known_type: fn(&str) -> Option<M>,
+    /// The types the outbound editor offers, in the model's table order. The
+    /// model returns an opaque iterator, so the box allocates once per frame
+    /// the type menu is open and never on a closed-menu frame.
+    outbound_types: fn() -> Box<dyn Iterator<Item = &'static str>>,
     /// The kind's settings rows, below the type combo.
-    fn edit_settings(
-        ui: &mut egui::Ui,
-        lang: Language,
-        mask: &mut Self,
-        field: RawField<'_>,
-        masked: bool,
-        revision: u64,
-    ) -> bool;
+    edit_settings: fn(&mut egui::Ui, Language, &mut M, RawField<'_>, bool, u64) -> bool,
 }
 
-impl MaskEnvelope for FinalmaskTcpMask {
-    fn discriminator(&self) -> Option<&str> {
-        FinalmaskTcpMask::discriminator(self)
-    }
-}
-
-impl MaskEnvelope for FinalmaskUdpMask {
-    fn discriminator(&self) -> Option<&str> {
-        FinalmaskUdpMask::discriminator(self)
+/// The TCP mask list's vocabulary (no revision input: every TCP field's
+/// verdict reads the draft generation the row is rendered at).
+fn tcp_mask_kind() -> MaskKind<FinalmaskTcpMask> {
+    MaskKind {
+        known_type: FinalmaskTcpMask::known_type,
+        discriminator: FinalmaskTcpMask::discriminator,
+        from_known_type: FinalmaskTcpMask::from_known_type,
+        outbound_types: || Box::new(FinalmaskTcpMask::outbound_types()),
+        edit_settings: |ui, lang, mask, field, masked, _revision| {
+            finalmask_tcp_settings_editor(ui, lang, mask, field, masked)
+        },
     }
 }
 
-impl MaskKind for FinalmaskTcpMask {
-    fn known_type(&self) -> Option<&'static str> {
-        FinalmaskTcpMask::known_type(self)
-    }
-
-    fn from_known_type(kind: &str) -> Option<Self> {
-        FinalmaskTcpMask::from_known_type(kind)
-    }
-
-    fn outbound_types() -> impl Iterator<Item = &'static str> {
-        FinalmaskTcpMask::outbound_types()
-    }
-
-    fn edit_settings(
-        ui: &mut egui::Ui,
-        lang: Language,
-        mask: &mut Self,
-        field: RawField<'_>,
-        masked: bool,
-        _revision: u64,
-    ) -> bool {
-        finalmask_tcp_settings_editor(ui, lang, mask, field, masked)
-    }
-}
-
-impl MaskKind for FinalmaskUdpMask {
-    fn known_type(&self) -> Option<&'static str> {
-        FinalmaskUdpMask::known_type(self)
-    }
-
-    fn from_known_type(kind: &str) -> Option<Self> {
-        FinalmaskUdpMask::from_known_type(kind)
-    }
-
-    fn outbound_types() -> impl Iterator<Item = &'static str> {
-        FinalmaskUdpMask::outbound_types()
-    }
-
-    fn edit_settings(
-        ui: &mut egui::Ui,
-        lang: Language,
-        mask: &mut Self,
-        field: RawField<'_>,
-        masked: bool,
-        revision: u64,
-    ) -> bool {
-        finalmask_udp_settings_editor(ui, lang, mask, field, masked, revision)
+/// The UDP mask list's vocabulary; its editors' verdicts memoize on the
+/// draft generation, so the revision reaches them.
+fn udp_mask_kind() -> MaskKind<FinalmaskUdpMask> {
+    MaskKind {
+        known_type: FinalmaskUdpMask::known_type,
+        discriminator: FinalmaskUdpMask::discriminator,
+        from_known_type: FinalmaskUdpMask::from_known_type,
+        outbound_types: || Box::new(FinalmaskUdpMask::outbound_types()),
+        edit_settings: |ui, lang, mask, field, masked, revision| {
+            finalmask_udp_settings_editor(ui, lang, mask, field, masked, revision)
+        },
     }
 }
 
@@ -1964,10 +1923,11 @@ enum ListAction {
     Export(String),
     Delete(String),
     ProbeLatency(String),
-    /// Move the dragged profile to the gap its drop proposed (an index in
-    /// the list as drawn; see [`reorder_target`]).
+    /// Move the dragged profile (its index in the list as drawn) to the gap
+    /// its drop proposed (an index in the same list; see
+    /// [`reorder_target`]).
     Reorder {
-        id: String,
+        from: usize,
         gap: usize,
     },
 }
@@ -2041,9 +2001,6 @@ struct ImportPreview {
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
-    /// In-flight row drag-reorder (see [`ListDrag`]); `None` whenever no row
-    /// is being dragged.
-    list_drag: Option<ListDrag>,
     /// Memoized latency badges keyed by profile id: the list
     /// paints one badge per visible row per frame, but a badge's text is a
     /// function of the row's measured latency, the language, and the status
@@ -2105,12 +2062,12 @@ pub struct ServersScreen {
     /// across frames, no per-frame key allocation); evicted with their owning
     /// profile.
     seeded_buffers: SeededBuffers,
-    /// Reused edit buffer for the header key/value tables (`json_map_kv`):
-    /// the key column and the non-string value rows need a `&mut String`
+    /// Reused edit buffers for the header key/value tables (`json_map_kv`):
+    /// the key column and the non-string value rows each need a `&mut String`
     /// for the frame, and one owned buffer per row would allocate on every
     /// repaint. Seeded from the row's own text before each widget and read
     /// back only when that widget reports an edit.
-    json_key_scratch: widgets::Scratch,
+    json_scratch: KvScratch,
     profile_validation_origin: Option<ProfileValidationOrigin>,
     profile_validation_count: usize,
     /// In-flight profile validation: the request's own reply channel,
@@ -3041,16 +2998,18 @@ impl ServersScreen {
                     ui.set_max_width((ui.available_width() - scrollbar_inset).max(0.0));
                     let colors = status_colors_of(ui);
                     // One frame of drag-reorder state: the pointer (only
-                    // while it is inside the list viewport), the proposed
-                    // drop — its gap index and the y its insertion line
-                    // paints at — and the band geometry both are derived
-                    // from. Recomputing this from the laid-out band every
-                    // frame keeps a scrolled virtualized list dropping at
-                    // real row boundaries.
+                    // while a row is lifted and the pointer is inside the
+                    // list viewport), the proposed drop — its gap index and
+                    // the y its insertion line paints at. egui owns the
+                    // gesture ([`egui::DragAndDrop`]): a row's payload is what
+                    // says a lift is in flight, and recomputing the gap from
+                    // the laid-out band every frame keeps a scrolled
+                    // virtualized list dropping at real row boundaries.
                     let viewport = ui.clip_rect();
                     let spacing = ui.spacing().item_spacing.y;
-                    let drag_pos = self
-                        .list_drag
+                    let lifted =
+                        egui::DragAndDrop::payload::<DragRow>(ui.ctx()).map(|payload| payload.0);
+                    let drag_pos = lifted
                         .is_some()
                         .then(|| ui.input(|i| i.pointer.interact_pos()))
                         .flatten()
@@ -3080,13 +3039,12 @@ impl ServersScreen {
                             .latency_badges
                             .get(p.id.as_str())
                             .expect("badge inserted above");
-                        // The dragged row dims in place; the insertion line
+                        // The lifted row dims in place; the insertion line
                         // carries the drop position. The opacity round-trips
                         // through this ui's painter, so the rows around it
                         // paint untouched.
-                        let dimmed = self.list_drag.as_ref().is_some_and(|drag| drag.id == p.id);
                         let previous_opacity = ui.opacity();
-                        if dimmed {
+                        if lifted == Some(index) {
                             ui.multiply_opacity(DRAGGED_ROW_OPACITY);
                         }
                         let clicks = server_list_row(
@@ -3102,23 +3060,21 @@ impl ServersScreen {
                             },
                         );
                         ui.set_opacity(previous_opacity);
+                        // A primary press that grows past egui's click
+                        // threshold lifts this row: the row's own drag sense
+                        // hands egui the payload, whose index the drop half
+                        // reads. Egui clears the payload on release or
+                        // Escape, so the gesture ends even when the window
+                        // loses focus mid-drag.
+                        if clicks.row.drag_started_by(egui::PointerButton::Primary) {
+                            egui::DragAndDrop::set_payload(ui.ctx(), DragRow(index));
+                        }
                         if clicks.probe {
                             action = Some(ListAction::ProbeLatency(p.id.clone()));
                         } else if clicks.delete {
                             action = Some(ListAction::Delete(p.id.clone()));
                         } else if clicks.name.clicked() || clicks.row.clicked() {
                             action = Some(ListAction::Select(p.id.clone()));
-                        }
-                        // A primary press that grows past egui's click
-                        // threshold lifts this row; its id is cloned once per
-                        // drag, never per frame. Other buttons never lift a
-                        // row (egui reports drags for any button, but only a
-                        // primary release can complete the move).
-                        if clicks.row.drag_started_by(egui::PointerButton::Primary) {
-                            self.list_drag = Some(ListDrag {
-                                id: p.id.clone(),
-                                gap: None,
-                            });
                         }
                         // The row under the pointer proposes the gap: above
                         // its midline inserts before it, below inserts after
@@ -3168,8 +3124,19 @@ impl ServersScreen {
                     {
                         drop_mark = Some((rows.end, bottom + spacing * 0.5));
                     }
-                    if let Some(drag) = &mut self.list_drag {
-                        drag.gap = drop_mark.map(|(gap, _)| gap);
+                    // The release ends the gesture: egui hands back the
+                    // lifted row's index, and the drop lands it at the gap
+                    // the pointer proposed on this same frame — a release
+                    // off the rows proposed none, so it cancels; Escape
+                    // aborts the payload before any release is seen.
+                    if let Some((gap, _)) = drop_mark
+                        && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+                        && let Some(lifted) = egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
+                    {
+                        action = Some(ListAction::Reorder {
+                            from: lifted.0,
+                            gap,
+                        });
                     }
                     // The insertion line paints over the rows, clamped into
                     // the viewport so a band-edge drop stays visible.
@@ -3196,24 +3163,6 @@ impl ServersScreen {
                     // following the shrunken content onto the controls.
                     ui.expand_to_include_x(band_right);
                 });
-        }
-        // A finished row drag performs its move at the gap the pointer last
-        // proposed; a release that ended away from the rows, or a drag whose
-        // button state vanished (window focus loss), cancels.
-        if let Some(drag) = self.list_drag.take() {
-            let (primary_down, released) = ui.input(|i| {
-                (
-                    i.pointer.primary_down(),
-                    i.pointer.button_released(egui::PointerButton::Primary),
-                )
-            });
-            if released {
-                if let Some(gap) = drag.gap {
-                    action = Some(ListAction::Reorder { id: drag.id, gap });
-                }
-            } else if primary_down {
-                self.list_drag = Some(drag);
-            }
         }
         ui.separator();
         let mut add_proto: Option<Protocol> = None;
@@ -3326,8 +3275,11 @@ impl ServersScreen {
                 ctx.servers.activate(&id);
                 ctx.hooks.mark_dirty();
             }
-            Some(ListAction::Reorder { id, gap }) => {
-                if let Some(from) = ctx.servers.profiles.iter().position(|p| p.id == id) {
+            Some(ListAction::Reorder { from, gap }) => {
+                // The payload index was read off this frame's list; a list
+                // that shrank under the gesture (a probe that removed a
+                // profile) simply drops the move.
+                if from < ctx.servers.profiles.len() {
                     let to = reorder_target(from, gap);
                     if to != from {
                         let profile = ctx.servers.profiles.remove(from);
@@ -3776,15 +3728,21 @@ struct RowClicks {
     probe: bool,
 }
 
-/// An in-flight list drag-reorder: the profile being moved (its id is cloned
-/// once at drag start, never per frame) and the gap the drop would insert it
-/// at — an index in the list as drawn (`0..=len`), recomputed from the
-/// pointer every frame, `None` while the pointer is off the rows (a release
-/// then cancels the move).
-struct ListDrag {
-    id: String,
-    gap: Option<usize>,
-}
+/// The drag payload of one server-list row: the row's index in the list as
+/// drawn. An index and not the profile id, because a cloned id would allocate
+/// per row; the release reads the payload in the same frame that laid the
+/// list out, so the index still names that row.
+///
+/// The row's own response is the drag source — it hands egui the payload
+/// through [`egui::DragAndDrop::set_payload`] — instead of
+/// [`egui::Ui::dnd_drag_source`]: that helper's drag-sensing rect covers the
+/// row's buttons and name button, and a press on any of them would be taken
+/// as the row's drag, so the button would never see its click. The drop half
+/// is still egui's: the payload survives until the release (or Escape) that
+/// ends it, and the release frame takes it back through
+/// [`egui::DragAndDrop::take_payload`].
+#[derive(Clone, Copy)]
+struct DragRow(usize);
 
 /// Opacity of the row being dragged: the source stays in place and dims,
 /// while the insertion line carries the drop position.
@@ -3826,7 +3784,7 @@ fn drag_scroll_delta(viewport: egui::Rect, pos: egui::Pos2, dt: f32) -> f32 {
 
 /// One row in the servers list: the name on the left, and the latency badge,
 /// probe button, and delete button pinned to the right edge. Returns the row
-/// [`egui::Response`] (click/right-click/drag anywhere on the row), the name
+/// [`egui::Response`] (click/right-click anywhere on the row), the name
 /// button's response (it fills the row, so it must be treated as a select
 /// target too), and whether the probe or delete button was clicked.
 ///
@@ -4540,7 +4498,7 @@ impl ServersScreen {
                     &mut settings.headers,
                     t(lang, Key::HeaderHint),
                     t(lang, Key::ValueHint),
-                    &mut self.json_key_scratch,
+                    &mut self.json_scratch,
                 );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
@@ -5122,7 +5080,7 @@ impl ServersScreen {
                                 &mut r.headers,
                                 t(lang, Key::HeaderHint),
                                 t(lang, Key::ValueHint),
-                                &mut self.json_key_scratch,
+                                &mut self.json_scratch,
                             );
                         }
                         let mut resp = h.response.is_some();
@@ -5147,7 +5105,7 @@ impl ServersScreen {
                                 &mut r.headers,
                                 t(lang, Key::HeaderHint),
                                 t(lang, Key::ValueHint),
-                                &mut self.json_key_scratch,
+                                &mut self.json_scratch,
                             );
                         }
                     }
@@ -5171,7 +5129,7 @@ impl ServersScreen {
                         );
                         changed |= mode_changed;
                         changed |=
-                            transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                            transport_headers(ui, lang, &mut s.headers, &mut self.json_scratch);
                     });
                     widgets::section(ui, t(lang, Key::SrvPadding), |ui| {
                         changed |= widgets::opt_range(
@@ -5490,7 +5448,7 @@ impl ServersScreen {
                     let mut changed = false;
                     changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
                     changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
-                    changed |= websocket_transport_headers(ui, lang, s, &mut self.json_key_scratch);
+                    changed |= websocket_transport_headers(ui, lang, s, &mut self.json_scratch);
                     changed |= widgets::opt_num(
                         ui,
                         t(lang, Key::SrvHeartbeatPeriodS),
@@ -5505,8 +5463,7 @@ impl ServersScreen {
                     let mut changed = false;
                     changed |= widgets::text_field(ui, "host", &mut s.host, "example.com");
                     changed |= widgets::text_field(ui, "path", &mut s.path, "/?ed=2048");
-                    changed |=
-                        transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                    changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_scratch);
                     changed
                 });
             }
@@ -5585,7 +5542,7 @@ impl ServersScreen {
                                     &mut m.headers,
                                     t(lang, Key::HeaderHint),
                                     t(lang, Key::ValueHint),
-                                    &mut self.json_key_scratch,
+                                    &mut self.json_scratch,
                                 );
                                 let mut sc = m.status_code;
                                 if widgets::opt_num(
@@ -5628,8 +5585,7 @@ impl ServersScreen {
                     changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
                     changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
                     changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
-                    changed |=
-                        transport_headers(ui, lang, &mut s.headers, &mut self.json_key_scratch);
+                    changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_scratch);
                     changed |= xmux_section(ui, lang, &mut s.xmux);
                     let mut has_warp = s.warp.is_some();
                     if ui
@@ -5971,7 +5927,7 @@ impl ServersScreen {
                 &mut op.headers,
                 t(lang, Key::HeadersKeyHint),
                 t(lang, Key::HeadersValueHint),
-                &mut self.json_key_scratch,
+                &mut self.json_scratch,
             );
         });
         if list_operation {
@@ -6034,7 +5990,7 @@ impl ServersScreen {
                         &mut auth.header,
                         t(lang, Key::HeadersKeyHint),
                         t(lang, Key::HeadersValueHint),
-                        &mut self.json_key_scratch,
+                        &mut self.json_scratch,
                     );
                 });
                 if auth.r#type == "oauth2" {
@@ -6060,7 +6016,7 @@ impl ServersScreen {
                             &mut auth.form,
                             t(lang, Key::HeaderHint),
                             t(lang, Key::ValueHint),
-                            &mut self.json_key_scratch,
+                            &mut self.json_scratch,
                         );
                     });
                     changed |= widgets::text_field(
@@ -6560,10 +6516,11 @@ impl ServersScreen {
 
     /// One finalmask list: the kind's rows, the reorder/remove application,
     /// and the add button — the chrome both mask kinds share.
-    fn finalmask_mask_list<M: MaskKind>(
+    fn finalmask_mask_list<M>(
         ui: &mut egui::Ui,
         lang: Language,
         spec: &MaskListSpec<'_>,
+        kind: &MaskKind<M>,
         masks: &mut Vec<M>,
         buffers: &mut SeededBuffers,
     ) -> bool {
@@ -6576,7 +6533,7 @@ impl ServersScreen {
         for (index, mask) in masks.iter_mut().enumerate() {
             ui.push_id((spec.group, spec.profile, index), |ui| {
                 ui.group(|ui| {
-                    let known = mask.known_type();
+                    let known = (kind.known_type)(mask);
                     // Known masks display their &'static type name — no
                     // per-frame allocation; the translated placeholder is
                     // built only for unknown envelopes.
@@ -6585,7 +6542,7 @@ impl ServersScreen {
                         None => std::borrow::Cow::Owned(t_fmt(
                             lang,
                             Key::SrvUnknownType,
-                            &[&mask.discriminator().unwrap_or(t(lang, Key::SrvMissingType))],
+                            &[&(kind.discriminator)(mask).unwrap_or(t(lang, Key::SrvMissingType))],
                         )),
                     };
                     let mut picked: Option<&'static str> = None;
@@ -6594,9 +6551,12 @@ impl ServersScreen {
                         egui::ComboBox::from_id_salt("type")
                             .selected_text(selected.as_ref())
                             .show_ui(ui, |ui| {
-                                for kind in M::outbound_types() {
-                                    if ui.selectable_label(known == Some(kind), kind).clicked() {
-                                        picked = Some(kind);
+                                for candidate in (kind.outbound_types)() {
+                                    if ui
+                                        .selectable_label(known == Some(candidate), candidate)
+                                        .clicked()
+                                    {
+                                        picked = Some(candidate);
                                     }
                                 }
                                 if known.is_none() {
@@ -6609,12 +6569,12 @@ impl ServersScreen {
                         finalmask_move_buttons(ui, lang, index, len, &mut move_to, &mut remove);
                     });
                     if picked != known
-                        && let Some(replacement) = picked.and_then(M::from_known_type)
+                        && let Some(replacement) = picked.and_then(kind.from_known_type)
                     {
                         *mask = replacement;
                         changed = true;
                     }
-                    changed |= M::edit_settings(
+                    changed |= (kind.edit_settings)(
                         ui,
                         lang,
                         mask,
@@ -6640,8 +6600,9 @@ impl ServersScreen {
             changed = true;
         }
         if ui.button(t(lang, spec.add_label)).clicked() {
-            masks
-                .push(M::from_known_type("header-custom").expect("registered finalmask mask type"));
+            masks.push(
+                (kind.from_known_type)("header-custom").expect("registered finalmask mask type"),
+            );
             changed = true;
         }
         changed
@@ -6734,6 +6695,7 @@ impl ServersScreen {
                     masked,
                     revision: set_key.0,
                 },
+                &tcp_mask_kind(),
                 &mut fm.tcp,
                 buffers,
             );
@@ -6753,6 +6715,7 @@ impl ServersScreen {
                     masked,
                     revision: set_key.0,
                 },
+                &udp_mask_kind(),
                 &mut fm.udp,
                 buffers,
             );
@@ -8586,7 +8549,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a reorder must mark the model dirty"
         );
         assert!(
-            harness.state().0.list_drag.is_none(),
+            !egui::DragAndDrop::has_any_payload(&harness.ctx),
             "the release must end the drag"
         );
         assert_eq!(
@@ -8742,7 +8705,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a cancelled drag must not mark the model dirty"
         );
         assert!(
-            harness.state().0.list_drag.is_none(),
+            !egui::DragAndDrop::has_any_payload(&harness.ctx),
             "the release must end the drag even when it cancels"
         );
     }
@@ -8797,7 +8760,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.drop_at(drop_pos);
         harness.step();
         assert!(
-            harness.state().0.list_drag.is_none(),
+            !egui::DragAndDrop::has_any_payload(&harness.ctx),
             "the release must end the drag"
         );
         assert!(

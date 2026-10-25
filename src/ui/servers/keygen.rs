@@ -4,7 +4,6 @@
 //! stdout payload extraction. Private to the screen; the tool-apply path in
 //! the parent module is the only caller.
 
-use std::fmt::Write as _;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -225,10 +224,7 @@ pub(super) const PUB_PREFIXES: &[&str] = &["Password (PublicKey):", "PublicKey:"
 /// 8 random lowercase hex chars from uuid v4 bytes (REALITY shortId).
 pub(super) fn gen_short_id() -> String {
     let u = uuid::Uuid::new_v4();
-    u.as_bytes()[..4].iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    crate::digest::hex(&u.as_bytes()[..4])
 }
 
 #[cfg(test)]

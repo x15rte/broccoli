@@ -20,7 +20,7 @@ use super::ServersFile;
 use super::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use super::settings::Settings;
 use super::validation::{ValidationCode, ValidationIssue};
-use crate::links::excerpt;
+use crate::excerpt::excerpt;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 

@@ -42,35 +42,31 @@
 //! kernel copies the security information out of them before returning, so a
 //! descriptor never outlives its buffers.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, E_OUTOFMEMORY, ERROR_INVALID_OWNER, ERROR_INVALID_PARAMETER, HANDLE,
+};
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
-    GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
-    TOKEN_ACCESS_MASK, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl,
+    InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
+    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorGroup, SetSecurityDescriptorOwner, TOKEN_ACCESS_MASK, TOKEN_QUERY,
+    TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::{BOOL, Result};
+use windows::core::{BOOL, PCWSTR, Result};
 
-/// `ERROR_INVALID_OWNER` (1307): the process's token cannot be assigned as —
-/// or cannot assign — the requested owner SID. Raised by the object manager
-/// when a create names an owner that the creating token has no
-/// `SeRestorePrivilege` / `SE_GROUP_OWNER` right to set; the trigger for the
-/// owner fallback (prefer Administrators, retry with the caller's own user
-/// SID, which any token may always assign).
-pub const ERROR_INVALID_OWNER: u32 = 1307;
+use std::path::Path;
 
-/// `ERROR_INVALID_PARAMETER` (87): used when a token-information query
-/// returns data that violates the documented `TOKEN_USER` layout.
-const ERROR_INVALID_PARAMETER: u32 = 87;
+use super::aligned::AlignedBuffer;
 
 /// A `windows::core::Error` carrying `ERROR_INVALID_PARAMETER`.
 fn invalid_parameter_error() -> windows::core::Error {
-    windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER))
+    windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+        ERROR_INVALID_PARAMETER.0,
+    ))
 }
 
 /// Zeroed 512-byte ACL buffer, aligned to 8 for the `ACL` header. 512 bytes
@@ -214,18 +210,18 @@ impl Sid {
             return Err(invalid_parameter_error());
         }
         // `TOKEN_USER` carries a pointer field, so it must be read from an
-        // 8-byte-aligned address. `Vec<u8>` is only 1-byte aligned by
-        // contract — the system allocator's over-alignment is not a language
-        // guarantee — so the buffer is word storage covering the same byte
-        // span, the same rule `sys::netif::AdapterBuffer` applies to its
-        // `GetAdaptersAddresses` buffer.
+        // 8-byte-aligned address. `AlignedBuffer` allocates zeroed storage
+        // with `align_of::<TOKEN_USER>()`, the one alignment rule the Win32
+        // buffer owners share.
         let buffer_bytes = required as usize;
-        let mut buffer = vec![0u64; buffer_bytes.div_ceil(std::mem::size_of::<u64>())];
+        let Some(buffer) = AlignedBuffer::<TOKEN_USER>::zeroed(buffer_bytes) else {
+            return Err(windows::core::Error::from_hresult(E_OUTOFMEMORY));
+        };
         // SAFETY: `token` is the valid open token handle. `buffer` covers at
-        // least the `required` bytes the sizing query reported, is 8-byte
-        // aligned (`Vec<u64>` storage), and stays alive for the call. On
-        // success the API has fully initialized the structure at the buffer
-        // base and `required` holds the final size.
+        // least the `required` bytes the sizing query reported, is aligned for
+        // `TOKEN_USER`, and stays alive for the call. On success the API has
+        // fully initialized the structure at the buffer base and `required`
+        // holds the final size.
         unsafe {
             GetTokenInformation(
                 token,
@@ -241,17 +237,17 @@ impl Sid {
         // validate that it really lies inside the buffer, then copy the SID
         // bytes out so this `Sid` owns them.
         // SAFETY: `buffer` covers at least `size_of::<TOKEN_USER>()` bytes
-        // (the guard above) and is 8-byte aligned (`Vec<u64>` storage), so
-        // casting its base to `TOKEN_USER` and reading the fully initialized
-        // structure is valid. The structure was written by the successful
+        // (the guard above) and is aligned for `TOKEN_USER`, so casting its
+        // base to `TOKEN_USER` and reading the fully initialized structure is
+        // valid. The structure was written by the successful
         // `GetTokenInformation` call above.
-        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let user = unsafe { &*buffer.as_mut_ptr() };
         let sid = user.User.Sid;
         if sid.is_invalid() {
             return Err(invalid_parameter_error());
         }
-        let base = buffer.as_ptr() as usize;
-        let allocated = buffer.len() * std::mem::size_of::<u64>();
+        let base = buffer.as_mut_ptr() as usize;
+        let allocated = buffer.size();
         let sid_offset = sid.0 as usize;
         // SAFETY: `sid` is the non-null SID pointer the API reported; the
         // pointer arithmetic below only compares addresses (no dereference).
@@ -475,7 +471,51 @@ pub fn with_protected_attributes<T>(
 /// access control is unchanged because the protected DACL still names the
 /// same principals.
 pub fn is_invalid_owner_error(error: &windows::core::Error) -> bool {
-    error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_OWNER)
+    error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_OWNER.0)
+}
+
+/// A NUL-terminated wide copy of `path` for the `SetFileSecurityW` call.
+fn wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Replace an existing object's DACL with the user-restricted one (see
+/// [`with_user_restricted_security_descriptor`]).
+///
+/// The descriptor's buffers are alive for exactly this call, which is the
+/// whole lifetime invariant: callers hand back the kernel's boolean and turn
+/// a refusal into their own fail-closed error.
+pub fn apply_user_restricted_dacl(path: &Path) -> Result<BOOL> {
+    let wide = wide_path(path);
+    with_user_restricted_security_descriptor(FILE_ALL_ACCESS.0, |descriptor| {
+        // SAFETY: `wide` is a NUL-terminated wide path alive for the call;
+        // `descriptor` is the absolute, initialized descriptor built by
+        // `with_user_restricted_security_descriptor` (every Set* returned Ok)
+        // and alive for the call, and the kernel copies the DACL out of the
+        // live buffers before it returns. Only the DACL is replaced
+        // (`DACL_SECURITY_INFORMATION`); a `false` result is returned to the
+        // caller, which fails closed.
+        unsafe { SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, descriptor) }
+    })
+}
+
+/// Replace an existing object's DACL with the protected one naming SYSTEM
+/// and Administrators (see [`with_protected_descriptor`] with no extras).
+pub fn apply_protected_dacl(path: &Path) -> Result<BOOL> {
+    let wide = wide_path(path);
+    with_protected_descriptor(None, &[], |descriptor| {
+        // SAFETY: `wide` is a NUL-terminated wide path alive for the call;
+        // `descriptor` is the absolute, initialized protected descriptor
+        // built by `with_protected_descriptor` (every Set* returned Ok) and
+        // alive for the call, and the kernel copies the DACL out before it
+        // returns. Only the DACL is replaced; a `false` result is returned
+        // to the caller, which fails closed.
+        unsafe { SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, descriptor) }
+    })
 }
 
 #[cfg(test)]

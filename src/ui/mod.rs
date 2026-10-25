@@ -1341,12 +1341,61 @@ pub(crate) fn format_single_latency_probe_feedback(
     }
 }
 
+/// The UTC calendar text of a filesystem timestamp: `2023-11-14T22:13:20Z`.
+///
+/// The shape is the RFC 3339 one the Logs screen writes into `app.log`
+/// (date, `T`, time, `Z`), at the second resolution a file modification time
+/// carries. `None` for a reading before the Unix epoch: no filesystem records
+/// one, and the epoch-relative conversion below cannot express it — callers
+/// render their own "unavailable" text instead of a fabricated date.
+///
+/// The conversion is local because the one RFC 3339 formatter the crate
+/// already links formats only the current instant: `tracing_subscriber`'s
+/// `SystemTime` formatter reads the clock, it does not render a supplied
+/// `SystemTime`, so an mtime cannot go through it. A date crate for one
+/// tooltip is the heavier alternative, and the day arithmetic below carries
+/// its own published-vector tests.
+pub(crate) fn utc_timestamp(time: std::time::SystemTime) -> Option<String> {
+    let secs = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let (year, month, day) = civil_from_days(i64::try_from(secs / 86_400).ok()?);
+    let second_of_day = secs % 86_400;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3_600,
+        (second_of_day / 60) % 60,
+        second_of_day % 60,
+    ))
+}
+
+/// The proleptic Gregorian `(year, month, day)` of a day count since
+/// 1970-01-01, by the era/century/400-year shift every UTC renderer uses.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppMessage, CoreSetupMount, CoreSetupState, FeedbackLevel, TerminalErrorView,
         UiCtxSnapshot, format_latency_probe_feedback, format_single_latency_probe_feedback,
-        show_core_setup,
+        show_core_setup, utc_timestamp,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -1360,6 +1409,24 @@ mod tests {
     use crate::sys::selfupd::UpdateCheckState;
     use crate::ui::test_rig::{UiTestRig, screen_harness};
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
+
+    /// The file-timestamp rendering is the RFC 3339 UTC shape `app.log`
+    /// records, at the second resolution a modification time carries: the
+    /// publishers' test vectors are fixed epoch seconds, not recomputed the
+    /// way the helper converts them.
+    #[test]
+    fn utc_timestamp_renders_rfc3339_utc() {
+        let at = |secs: u64| {
+            utc_timestamp(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        };
+        assert_eq!(at(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(at(1_700_000_000).as_deref(), Some("2023-11-14T22:13:20Z"));
+        // A leap day: the era arithmetic's month shift must land on 29.
+        assert_eq!(at(1_709_164_800).as_deref(), Some("2024-02-29T00:00:00Z"));
+        // A time before the epoch has no date to print.
+        let before = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(utc_timestamp(before), None);
+    }
 
     /// Render the shared surface over one rig state and hand back the
     /// harness, so each test states only the state it is about.

@@ -3,10 +3,16 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use broccoli::rt::sweep::{Matcher, sweep};
 use broccoli::sys::single_instance::SingleInstance;
 
 /// Crash reports older than this are removed at the next launch.
 const REPORT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// Filename prefix of a persisted panic report, shared by the writer and the
+/// startup sweep so the two can never disagree on what may be deleted.
+const REPORT_PREFIX: &str = "report-";
+/// Filename suffix of a persisted panic report.
+const REPORT_SUFFIX: &str = ".toml";
 
 /// Per-user directory that holds persisted panic reports — the same state dir
 /// the app already uses (`%APPDATA%\broccoli\state`), never the system temp
@@ -17,7 +23,7 @@ fn panic_report_dir() -> PathBuf {
 
 /// File name for a crash report, mirroring human-panic's `report-<uuid>.toml`.
 fn report_file_name(uuid: &uuid::Uuid) -> String {
-    format!("report-{}.toml", uuid.hyphenated())
+    format!("{REPORT_PREFIX}{}{REPORT_SUFFIX}", uuid.hyphenated())
 }
 
 /// On-disk path for the next crash report — a pure function of the report
@@ -37,46 +43,21 @@ fn write_report(dir: &Path, toml: &str) -> std::io::Result<PathBuf> {
 /// Remove `report-*.toml` files in `dir` whose mtime is at least `max_age`
 /// old. Never touches other files or subdirectories, so the state-dir
 /// neighbors (settings.json, servers.json, `.broken-*` quarantines) survive.
-/// Returns the number of reports removed; a missing `dir` is a no-op.
+/// The removal rules are the shared [`broccoli::rt::sweep`] ones; this binds
+/// the crash report's own naming contract. Returns the number of reports
+/// removed; a missing `dir` is a no-op.
 fn cleanup_old_reports(
     dir: &Path,
     now: SystemTime,
     max_age: std::time::Duration,
 ) -> std::io::Result<usize> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        // Best-effort housekeeping: an entry that races away or cannot be
-        // inspected must not abort cleanup of the remaining reports.
-        let Ok(entry) = entry else { continue };
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("report-") || !name.ends_with(".toml") {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        // A file stamped in the future (clock skew) counts as recent and is
-        // kept — cleanup must never delete a report that may be new.
-        let age = now
-            .duration_since(modified)
-            .unwrap_or(std::time::Duration::ZERO);
-        if age >= max_age && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    sweep(
+        dir,
+        now,
+        max_age,
+        Matcher::files(REPORT_PREFIX, REPORT_SUFFIX),
+        None,
+    )
 }
 
 /// Install the custom panic hook that persists a human-panic report into the

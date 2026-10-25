@@ -13,9 +13,9 @@
 //! another harness reads it is undefined behavior.
 
 use broccoli::app::BroccoliApp;
-use broccoli::i18n::safety_finding_message;
+use broccoli::i18n::safety_message;
 use broccoli::i18n::{Key, t, t_fmt};
-use broccoli::model::safety::{HazardClass, SafetyCode, SafetyFinding};
+use broccoli::model::safety::SafetyCode;
 use broccoli::model::settings::{Language, Mode};
 use broccoli::model::{DnsCfg, DnsServer, FakeDnsCfg, ServersFile, Settings};
 use broccoli::ui::Screen;
@@ -32,12 +32,7 @@ mod common;
 /// The expected inline message for one privacy finding, rendered through
 /// the i18n renderer the UI itself consumes.
 fn privacy_message(code: SafetyCode) -> String {
-    let finding = SafetyFinding {
-        path: String::new(),
-        class: HazardClass::Privacy,
-        code,
-    };
-    safety_finding_message(&finding, Language::En)
+    safety_message(&code, Language::En)
 }
 
 #[test]

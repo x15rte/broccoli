@@ -20,7 +20,7 @@
 //! private keys — so the worker owns its lifetime through
 //! [`ScratchConfigGuard`]: the file is removed on drop, during panic
 //! unwinding, and on the worker's own cancellation. Cancellation is
-//! cooperative by construction: the worker observes its cancel flag between
+//! cooperative by construction: the worker observes its cancel signal between
 //! profiles, so an in-flight `xray -test` child is never hard-aborted while it
 //! holds the file open (Windows cannot delete a file a live child keeps open,
 //! so an abort would strand plaintext secrets and orphan the child). A crash
@@ -29,7 +29,6 @@
 //! stale ones by age under the exact same naming contract.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message};
@@ -39,6 +38,7 @@ use crate::model::validation::validate_outbound;
 use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 
 use super::apply;
+use super::cancel::Cancel;
 use super::events::AppLogSink;
 
 /// Where an accepted draft validation commits: which editor draft the request
@@ -104,7 +104,7 @@ pub struct ProfileValidationResult {
 pub type ProfileValidationReply = Result<ProfileValidationResult, DiagError>;
 
 /// Terminal a cancelled validation delivers when the worker itself observes
-/// the cancel flag between profiles. The runtime-owned cancel paths (a
+/// the cancel signal between profiles. The runtime-owned cancel paths (a
 /// record cancelled before its worker ran, a join failure) deliver their own
 /// per-kind wording.
 pub(crate) fn validation_cancelled() -> DiagError {
@@ -153,7 +153,7 @@ fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
 /// would show them amber.
 pub(crate) async fn validate(
     request: ProfileValidationRequest,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     log: &AppLogSink,
 ) -> ProfileValidationReply {
     let ProfileValidationRequest {
@@ -173,7 +173,7 @@ pub(crate) async fn validate(
         // either committed or already reverted, so nothing is left behind
         // and no partial verdict is reported — a cancelled run commits
         // nothing.
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(validation_cancelled());
         }
         let label = if profile.name.is_empty() {
@@ -422,53 +422,26 @@ const SCRATCH_CONFIG_MAX_AGE: std::time::Duration = std::time::Duration::from_se
 /// generated profiles with UUIDs, passwords, private keys) in `dir` whose
 /// mtime is at least `max_age` old. A crash or kill mid-validation strands
 /// such a file because the worker task — and its [`ScratchConfigGuard`] —
-/// dies with the process; this sweep is the next-launch backstop. Mirrors the
-/// crash-report cleanup discipline (`cleanup_old_reports` in main.rs):
-/// best-effort, mtime-bounded, a future-stamped file counts as recent and is
-/// kept, and only regular files whose names match the exact scratch naming
-/// contract ([`is_scratch_config_file_name`]) are ever considered — user
-/// configs, lookalikes, and subdirectories survive no matter how old. Young
-/// files from a concurrent second instance survive via `max_age`. Returns the
-/// number of files removed; a missing `dir` is a no-op.
+/// dies with the process; this sweep is the next-launch backstop, driven by
+/// the shared [`sweep`](super::sweep::sweep) rule. Only regular files whose
+/// names match the exact scratch naming contract
+/// ([`is_scratch_config_file_name`]) are ever considered — user configs,
+/// lookalikes, and subdirectories survive no matter how old. Young files from
+/// a concurrent second instance survive via `max_age`. Returns the number of
+/// files removed; a missing `dir` is a no-op.
 fn cleanup_old_scratch_configs(
     dir: &Path,
     now: std::time::SystemTime,
     max_age: std::time::Duration,
 ) -> std::io::Result<usize> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        // Best-effort housekeeping: an entry that races away or cannot be
-        // inspected must not abort the sweep of the remaining entries.
-        let Ok(entry) = entry else { continue };
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_scratch_config_file_name(name) {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        // A file stamped in the future (clock skew) counts as recent and is
-        // kept — the sweep must never delete a file that may be new.
-        let age = now
-            .duration_since(modified)
-            .unwrap_or(std::time::Duration::ZERO);
-        if age >= max_age && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    super::sweep::sweep(
+        dir,
+        now,
+        max_age,
+        super::sweep::Matcher::files(SCRATCH_CONFIG_PREFIX, SCRATCH_CONFIG_SUFFIX)
+            .requiring(is_scratch_config_file_name),
+        None,
+    )
 }
 
 /// Remove scratch validation configs stranded by a crash or kill — the
@@ -487,8 +460,6 @@ pub fn sweep_stale_scratch_configs() -> std::io::Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use super::{
         ProfileValidationOrigin, ProfileValidationRequest, SCRATCH_CONFIG_MAX_AGE,
         ScratchConfigGuard, cleanup_old_scratch_configs, is_scratch_config_file_name,
@@ -498,6 +469,7 @@ mod tests {
     use crate::model::settings::Language;
     use crate::model::validation::{Severity, validate_outbound, validate_profiles};
     use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
+    use crate::rt::cancel::Cancel;
     use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect};
 
     fn request(profiles: Vec<ServerProfile>) -> ProfileValidationRequest {
@@ -992,7 +964,7 @@ mod tests {
             active: Some("0123456789abcdef".to_string()),
             ..ServersFile::default()
         };
-        let verdict = validate(request, &AtomicBool::new(false), &log_sink().0)
+        let verdict = validate(request, &Cancel::new(), &log_sink().0)
             .await
             .expect("the worker walks the profile list");
         assert!(verdict.accepted.is_empty(), "{:?}", verdict.accepted);
@@ -1082,7 +1054,7 @@ mod tests {
             active: Some(sibling.id.clone()),
             ..ServersFile::default()
         };
-        let verdict = validate(request, &AtomicBool::new(false), &log_sink().0)
+        let verdict = validate(request, &Cancel::new(), &log_sink().0)
             .await
             .expect("the worker walks the profile list");
         assert!(
@@ -1113,7 +1085,7 @@ mod tests {
         let profile = ServerProfile::new("advisory", outbound);
 
         let (log, rx) = log_sink();
-        let _ = validate(request(vec![profile]), &AtomicBool::new(false), &log).await;
+        let _ = validate(request(vec![profile]), &Cancel::new(), &log).await;
 
         let lines: Vec<String> = rx
             .try_iter()
@@ -1145,13 +1117,9 @@ mod tests {
         // so a request cancelled that early writes no scratch config and
         // reports no partial verdict.
         let profile = ServerProfile::new("cancelled", OutboundModel::new(Protocol::Freedom));
-        match validate(
-            request(vec![profile]),
-            &AtomicBool::new(true),
-            &log_sink().0,
-        )
-        .await
-        {
+        let cancel = Cancel::new();
+        cancel.cancel();
+        match validate(request(vec![profile]), &cancel, &log_sink().0).await {
             Ok(_) => panic!("a cancelled request must not report a verdict"),
             Err(error) => assert_eq!(error.diag().key(), Key::SeatValidationCancelled),
         }

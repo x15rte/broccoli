@@ -8,6 +8,7 @@ use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, excerpt_debug, extra_has_key, extra_key_set,
     is_vision_flow, issue, warning,
 };
+use crate::model::addr;
 use crate::model::outbound::{OutboundModel, ProtocolSettings};
 use crate::model::stream::{
     FinalmaskFilter, FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskRawValue,
@@ -2202,13 +2203,13 @@ fn finalmask_validate_tcp_mask(
 }
 
 fn finalmask_valid_split_host_port(value: &str) -> bool {
-    if let Some(rest) = value.strip_prefix('[') {
-        return rest.find(']').is_some_and(|close| {
-            rest.get(close + 1..)
-                .is_some_and(|suffix| suffix.starts_with(':'))
-        });
-    }
-    value.matches(':').count() == 1
+    let Some(host_port) = addr::split(value) else {
+        return false;
+    };
+    // A port is required. An unbracketed colon inside the host would mean a
+    // bare `a:b:c` (or an unbracketed IPv6 literal), neither of which this
+    // grammar accepts; a bracketed host is a v6 literal by construction.
+    host_port.port.is_some() && (value.starts_with('[') || !host_port.host.contains(':'))
 }
 
 /// The scheme an `xdns` resolver address selects, mirroring the mask build
@@ -2242,8 +2243,7 @@ fn finalmask_xdns_addr_scheme_word(value: &str) -> Option<&str> {
 /// IPv6 host or a host without a colon may carry a numeric port; a missing
 /// port takes the core's 53.
 fn finalmask_xdns_host_authority(authority: &str) -> bool {
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit('@').next().unwrap_or("");
+    let authority = super::super::addr::host_authority(authority);
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, tail)) = rest.split_once(']') else {
             return false;
@@ -2269,8 +2269,7 @@ fn finalmask_xdns_host_authority(authority: &str) -> bool {
 /// True for a DoH URL the mask build accepts: a non-empty host after the
 /// scheme, with the path and query passed through to the HTTP client.
 fn finalmask_xdns_https_authority(authority: &str) -> bool {
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit('@').next().unwrap_or("");
+    let authority = super::super::addr::host_authority(authority);
     if authority.is_empty() || authority.chars().any(char::is_whitespace) {
         return false;
     }
@@ -4246,6 +4245,24 @@ mod tests {
         );
     }
 
+    /// Go's `SplitHostPort` treats brackets only as delimiters, so a
+    /// bracketed DNS name is a legal `stunServers` endpoint and must not
+    /// gate the profile — the core resolves it at dial time.
+    #[test]
+    fn realm_stun_accepts_a_bracketed_name() {
+        let fm: FinalmaskModel = serde_json::from_str(
+            r#"{"udp":[{"type":"realm","settings":{"url":"realm://token@203.0.113.10:443/id","stunServers":["[stun.example.com]:3478"]}}]}"#,
+        )
+        .expect("fixture is valid finalmask JSON");
+        let findings = validate_finalmask(&fm);
+        assert!(
+            !findings
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::FinalmaskRealmStunFormat)),
+            "a bracketed name is a legal STUN endpoint: {findings:?}"
+        );
+    }
+
     /// The UDP mask wrap pins only the masks that own the outbound's own
     /// socket to the last list entry. `NewFinalMask` reverses both mask slices
     /// at construction and wraps forward
@@ -5387,7 +5404,7 @@ mod tests {
         use crate::model::settings::Language;
 
         let hostile = "u".repeat(65_536);
-        let excerpted = format!("{}…", &hostile[..crate::links::MAX_ERROR_EXCERPT_CHARS]);
+        let excerpted = format!("{}…", &hostile[..crate::excerpt::MAX_ERROR_EXCERPT_CHARS]);
         let quoted = format!("\"{excerpted}\"");
         let fm: FinalmaskModel = serde_json::from_str(&format!(
             r#"{{"tcp":[{{"type":"{hostile}","settings":{{}}}}],
@@ -5446,7 +5463,7 @@ mod tests {
                 }
                 (ValidationCode::FinalmaskRealmUrlSyntax(payload), None) => assert!(
                     payload.len() < 256
-                        && payload.chars().count() <= crate::links::MAX_ERROR_EXCERPT_CHARS + 1,
+                        && payload.chars().count() <= crate::excerpt::MAX_ERROR_EXCERPT_CHARS + 1,
                     "realm parse-error payload must stay bounded: {payload:?}"
                 ),
                 (code, _) => panic!("unexpected issue {code:?}"),
