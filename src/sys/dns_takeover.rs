@@ -26,19 +26,28 @@
 //! record that the next helper repairs instead of a machine with a dead DNS
 //! server. An adapter that is absent at restore time is restored through its
 //! saved registry configuration; only a failed registry write keeps its entry.
+//!
+//! The write API (`SetInterfaceDnsSettings`) exists from Windows 10 2004
+//! (build 19041). It is resolved from `iphlpapi.dll` at first use rather than
+//! imported at load time, so a build without it starts normally and simply
+//! skips the takeover; the capture/restore record still works, and a record
+//! from a build that had the export is repaired through the registry.
 
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{ERROR_SUCCESS, FARPROC, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GAA_FLAG_SKIP_ANYCAST,
     GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, GetIfEntry2, IF_TYPE_SOFTWARE_LOOPBACK,
-    MIB_IF_ROW2, SetInterfaceDnsSettings,
+    MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::core::{GUID, PWSTR};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::core::{GUID, HSTRING, PCSTR, PWSTR};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
 
@@ -358,8 +367,73 @@ fn interface_guid(luid: &windows::Win32::NetworkManagement::Ndis::NET_LUID_LH) -
     (rc == ERROR_SUCCESS).then_some(guid)
 }
 
-/// Write one adapter's DNS servers for one family.
-fn set_servers(guid: GUID, ipv6: bool, servers: Servers<'_>, alias: &str) -> Result<(), DiagError> {
+/// The `iphlpapi!SetInterfaceDnsSettings` export's signature.
+type SetInterfaceDnsSettingsFn =
+    unsafe extern "system" fn(GUID, *const DNS_INTERFACE_SETTINGS) -> WIN32_ERROR;
+
+/// Resolve `SetInterfaceDnsSettings` from `iphlpapi.dll`, once per process.
+///
+/// Windows 10 2004 (build 19041) introduced the export, while the app's
+/// manifest claims Windows 10/11 without a build floor. A static import would
+/// make the loader fail before `main` on an older build — even when TUN and
+/// the DNS takeover are never used — so the export is resolved here instead:
+/// its absence leaves the takeover unavailable rather than the process
+/// unloadable.
+fn set_interface_dns_settings() -> Option<SetInterfaceDnsSettingsFn> {
+    static RESOLVED: LazyLock<Option<SetInterfaceDnsSettingsFn>> =
+        LazyLock::new(|| resolve_set_interface_dns_settings(load_iphlpapi_export));
+    *RESOLVED
+}
+
+/// Map a `GetProcAddress` result onto the export's signature. `load` reports
+/// `None` when the export is missing; taking it as a parameter lets a test
+/// drive the pre-19041 branch without the real DLL.
+fn resolve_set_interface_dns_settings(
+    load: impl FnOnce() -> FARPROC,
+) -> Option<SetInterfaceDnsSettingsFn> {
+    let address = load()?;
+    // SAFETY: `address` is the non-null payload of a `Some` from
+    // `GetProcAddress`, a code pointer into a module the process keeps loaded.
+    // The export's documented signature is
+    // `DWORD SetInterfaceDnsSettings(const GUID*, DNS_INTERFACE_SETTINGS*)`
+    // and the windows crate declares it as taking the `GUID` by value, which
+    // is the signature declared above; `FARPROC` is
+    // `unsafe extern "system" fn() -> isize`, so both are a single code
+    // pointer entered with the `system` calling convention.
+    Some(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, SetInterfaceDnsSettingsFn>(
+            address,
+        )
+    })
+}
+
+/// Load `iphlpapi.dll` and look the export up.
+fn load_iphlpapi_export() -> FARPROC {
+    // SAFETY: `HSTRING` is a NUL-terminated UTF-16 module name that outlives
+    // the call, and `LoadLibraryW` copies it before returning. The returned
+    // handle is deliberately never released (no `FreeLibrary`), so the module
+    // stays resident and the code pointer resolved from it stays valid for
+    // the process lifetime — the same process-lifetime ownership the tray's
+    // uxtheme load documents.
+    let Ok(module) = (unsafe { LoadLibraryW(&HSTRING::from("iphlpapi.dll")) }) else {
+        return None;
+    };
+    // SAFETY: `module` is a live handle to the loaded DLL, and the export name
+    // is a static NUL-terminated ANSI string. `GetProcAddress` maps a missing
+    // export (the pre-19041 case) to `None`; a found one is a code pointer
+    // into that still-loaded module.
+    unsafe { GetProcAddress(module, PCSTR(c"SetInterfaceDnsSettings".as_ptr().cast())) }
+}
+
+/// Write one adapter's DNS servers for one family through the resolved
+/// `iphlpapi` export.
+fn set_servers(
+    api: SetInterfaceDnsSettingsFn,
+    guid: GUID,
+    ipv6: bool,
+    servers: Servers<'_>,
+    alias: &str,
+) -> Result<(), DiagError> {
     let text: Vec<u16> = match servers {
         Servers::List(list) => list
             .join(" ")
@@ -378,11 +452,12 @@ fn set_servers(guid: GUID, ipv6: bool, servers: Servers<'_>, alias: &str) -> Res
         },
         ..Default::default()
     };
-    // SAFETY: `guid` came from `ConvertInterfaceLuidToGuid` for a live
-    // adapter, and `settings` is a live local whose `NameServer` points at
-    // the function-local `text` buffer, which outlives the call; the API
-    // copies the string before it returns.
-    let rc = unsafe { SetInterfaceDnsSettings(guid, &settings) };
+    // SAFETY: `api` is the resolved `iphlpapi!SetInterfaceDnsSettings`; `guid`
+    // came from `ConvertInterfaceLuidToGuid` for a live adapter, and
+    // `settings` is a live local whose `NameServer` points at the
+    // function-local `text` buffer, which outlives the call; the API copies
+    // the string before it returns.
+    let rc = unsafe { api(guid, &settings) };
     if rc != ERROR_SUCCESS {
         let code = DiagError::new(Diag::new(Key::DnsTakeoverWin32Code).arg(rc.0));
         return Err(
@@ -476,7 +551,11 @@ fn find_view<'a>(views: &'a [AdapterView], entry: &Entry) -> Option<&'a AdapterV
 
 /// Apply the takeover: point every captured adapter's DNS at the tunnel
 /// address of its family.
-fn apply(record: &Record, targets: Targets) -> Result<usize, DiagError> {
+fn apply(
+    record: &Record,
+    targets: Targets,
+    api: SetInterfaceDnsSettingsFn,
+) -> Result<usize, DiagError> {
     let views = enumerate()?;
     let mut applied = 0;
     for entry in &record.entries {
@@ -494,7 +573,7 @@ fn apply(record: &Record, targets: Targets) -> Result<usize, DiagError> {
                 Servers::List(&servers),
             ) || servers_match(&view.dns, false, &servers);
             if !already {
-                set_servers(guid, false, Servers::List(&servers), &entry.alias)?;
+                set_servers(api, guid, false, Servers::List(&servers), &entry.alias)?;
                 verify_static(&entry.adapter, &entry.alias, false, Servers::List(&servers))?;
                 changed = true;
             }
@@ -506,7 +585,7 @@ fn apply(record: &Record, targets: Targets) -> Result<usize, DiagError> {
                 Servers::List(&servers),
             ) || servers_match(&view.dns, true, &servers);
             if !already {
-                set_servers(guid, true, Servers::List(&servers), &entry.alias)?;
+                set_servers(api, guid, true, Servers::List(&servers), &entry.alias)?;
                 verify_static(&entry.adapter, &entry.alias, true, Servers::List(&servers))?;
                 changed = true;
             }
@@ -521,10 +600,20 @@ fn apply(record: &Record, targets: Targets) -> Result<usize, DiagError> {
 /// Restore one captured entry. An adapter that is absent from the current
 /// enumeration cannot take `SetInterfaceDnsSettings`, so its saved
 /// `NameServer` is restored through the registry instead; the record then
-/// holds no residual entry and a later reconnect uses the original list.
-fn restore_entry(views: &[AdapterView], entry: &Entry) -> Result<(), DiagError> {
+/// holds no residual entry and a later reconnect uses the original list. The
+/// same registry path covers a process where the export is missing: the
+/// takeover could not have written the tunnel address from this build, so the
+/// saved configuration is still the original.
+fn restore_entry(
+    views: &[AdapterView],
+    entry: &Entry,
+    api: Option<SetInterfaceDnsSettingsFn>,
+) -> Result<(), DiagError> {
     match find_view(views, entry) {
         Some(view) => {
+            let Some(api) = api else {
+                return restore_saved(entry);
+            };
             let Some(guid) = interface_guid(&view.luid) else {
                 return restore_saved(entry);
             };
@@ -532,8 +621,8 @@ fn restore_entry(views: &[AdapterView], entry: &Entry) -> Result<(), DiagError> 
                 // A live adapter must accept the API write; a failure keeps
                 // the entry for the next pass instead of trusting a saved
                 // value the adapter may not have picked up.
-                restore_interface(guid, entry)?;
-            } else if let Err(api_error) = restore_interface(guid, entry) {
+                restore_interface(api, guid, entry)?;
+            } else if let Err(api_error) = restore_interface(api, guid, entry) {
                 // A down adapter can reject the API; its saved value is what
                 // a later reconnect uses.
                 restore_saved(entry)
@@ -546,15 +635,19 @@ fn restore_entry(views: &[AdapterView], entry: &Entry) -> Result<(), DiagError> 
 }
 
 /// Restore one present adapter through the interface settings API.
-fn restore_interface(guid: GUID, entry: &Entry) -> Result<(), DiagError> {
+fn restore_interface(
+    api: SetInterfaceDnsSettingsFn,
+    guid: GUID,
+    entry: &Entry,
+) -> Result<(), DiagError> {
     if let Some(state) = &entry.v4 {
         let write = state.restore_write();
-        set_servers(guid, false, write, &entry.alias)?;
+        set_servers(api, guid, false, write, &entry.alias)?;
         verify_static(&entry.adapter, &entry.alias, false, write)?;
     }
     if let Some(state) = &entry.v6 {
         let write = state.restore_write();
-        set_servers(guid, true, write, &entry.alias)?;
+        set_servers(api, guid, true, write, &entry.alias)?;
         verify_static(&entry.adapter, &entry.alias, true, write)?;
     }
     Ok(())
@@ -628,10 +721,13 @@ fn registry_error(alias: &str, error: std::io::Error) -> DiagError {
 /// that entry in the residual record; the other adapters are still restored.
 /// Returns the restored count, the residual entries, and the first failure so
 /// the caller can report it and retry the remainder.
-fn restore(record: &Record) -> Result<(usize, Vec<Entry>, Option<DiagError>), DiagError> {
+fn restore(
+    record: &Record,
+    api: Option<SetInterfaceDnsSettingsFn>,
+) -> Result<(usize, Vec<Entry>, Option<DiagError>), DiagError> {
     let views = enumerate()?;
     Ok(restore_entries(&record.entries, |entry| {
-        restore_entry(&views, entry)
+        restore_entry(&views, entry, api)
     }))
 }
 
@@ -683,12 +779,19 @@ fn read_record(record_path: &Path) -> Result<Option<Record>, DiagError> {
         .map_err(|_| record_error())
 }
 
-/// Persist the capture. The write goes through a sibling temporary file and
-/// a rename, so a crash mid-write cannot leave a truncated record.
+/// Persist the capture. The bytes go through a `File` that is flushed with
+/// `sync_all` before the rename, and the write goes through a sibling
+/// temporary file, so a crash mid-write cannot leave a truncated record and
+/// a power loss cannot leave the rename pointing at unflushed data. The
+/// record is the only way back to the original servers once an adapter has
+/// been pointed at the tunnel.
 fn write_record(record_path: &Path, record: &Record) -> Result<(), DiagError> {
     let bytes = serde_json::to_vec(record).map_err(|_| record_error())?;
     let temporary = record_path.with_extension("json.tmp");
-    std::fs::write(&temporary, bytes).map_err(|_| record_error())?;
+    let mut file = std::fs::File::create(&temporary).map_err(|_| record_error())?;
+    file.write_all(&bytes).map_err(|_| record_error())?;
+    file.sync_all().map_err(|_| record_error())?;
+    drop(file);
     std::fs::rename(&temporary, record_path).map_err(|_| record_error())
 }
 
@@ -771,13 +874,14 @@ fn prepare_record(
     existing: Option<Record>,
     fresh: Record,
     views: &[AdapterView],
+    api: Option<SetInterfaceDnsSettingsFn>,
 ) -> Result<(Record, usize, Option<DiagError>), DiagError> {
     let Some(existing) = existing else {
         return Ok((fresh, 0, None));
     };
     let (mut carried, dropped) = split_record(existing, &fresh);
     let (restored, residual, restore_error) =
-        restore_entries(&dropped, |entry| restore_entry(views, entry));
+        restore_entries(&dropped, |entry| restore_entry(views, entry, api));
     carried.extend(residual);
     Ok((
         merge(Some(Record { entries: carried }), fresh),
@@ -793,6 +897,11 @@ fn prepare_record(
 /// The record is written before the first change, so a crash between the two
 /// leaves a repair behind rather than an unrecoverable machine.
 ///
+/// A build without the interface-settings export (before Windows 10 2004)
+/// skips the whole pass and reports zero counts: it cannot point an adapter
+/// at the tunnel, and a capture for adapters nothing changed would make every
+/// later restore rewrite servers the takeover never touched.
+///
 /// A restart of the running core calls this again while the adapters are still
 /// pointed at the tunnel, so the fresh capture is merged with the record
 /// [`merge`] keeps. An entry the fresh capture no longer covers (a disconnected
@@ -803,10 +912,31 @@ pub(crate) fn engage(
     tun_name: Option<&str>,
     targets: Targets,
 ) -> Result<TakeoverCounts, DiagError> {
+    engage_with(
+        record_path,
+        set_interface_dns_settings(),
+        tun_if_index,
+        tun_name,
+        targets,
+    )
+}
+
+/// [`engage`] with the resolved export, split out so a test can drive the
+/// missing-export branch without a live system.
+fn engage_with(
+    record_path: &Path,
+    api: Option<SetInterfaceDnsSettingsFn>,
+    tun_if_index: u32,
+    tun_name: Option<&str>,
+    targets: Targets,
+) -> Result<TakeoverCounts, DiagError> {
+    let Some(api) = api else {
+        return Ok(TakeoverCounts::default());
+    };
     let views = enumerate()?;
     let fresh = plan(&views, tun_if_index, tun_name, targets);
     let (record, restored, restore_error) =
-        prepare_record(read_record(record_path)?, fresh, &views)?;
+        prepare_record(read_record(record_path)?, fresh, &views, Some(api))?;
     if record.entries.is_empty() {
         remove_record(record_path)?;
         return Ok(TakeoverCounts {
@@ -816,7 +946,7 @@ pub(crate) fn engage(
         });
     }
     write_record(record_path, &record)?;
-    let applied = match apply(&record, targets) {
+    let applied = match apply(&record, targets, api) {
         Ok(applied) => applied,
         Err(error) => {
             return Err(match restore_error {
@@ -843,17 +973,40 @@ pub(crate) fn engage(
 /// The record is rewritten only when it changed, and a server list that already
 /// carries the target is not written again. A network monitor calls this both
 /// on change notifications and on a periodic backstop, so it must stay
-/// idempotent.
+/// idempotent. Like [`engage`], a process without the interface-settings
+/// export skips the pass and returns zero counts.
 pub(crate) fn reconcile(
     record_path: &Path,
     tun_if_index: u32,
     tun_name: Option<&str>,
     targets: Targets,
 ) -> Result<TakeoverCounts, DiagError> {
+    reconcile_with(
+        record_path,
+        set_interface_dns_settings(),
+        tun_if_index,
+        tun_name,
+        targets,
+    )
+}
+
+/// [`reconcile`] with the resolved export, split out so a test can drive the
+/// missing-export branch without a live system.
+fn reconcile_with(
+    record_path: &Path,
+    api: Option<SetInterfaceDnsSettingsFn>,
+    tun_if_index: u32,
+    tun_name: Option<&str>,
+    targets: Targets,
+) -> Result<TakeoverCounts, DiagError> {
+    let Some(api) = api else {
+        return Ok(TakeoverCounts::default());
+    };
     let views = enumerate()?;
     let fresh = plan(&views, tun_if_index, tun_name, targets);
     let existing = read_record(record_path)?;
-    let (record, restored, restore_error) = prepare_record(existing.clone(), fresh, &views)?;
+    let (record, restored, restore_error) =
+        prepare_record(existing.clone(), fresh, &views, Some(api))?;
     if record.entries.is_empty() {
         remove_record(record_path)?;
         return Ok(TakeoverCounts {
@@ -865,7 +1018,7 @@ pub(crate) fn reconcile(
     if existing.as_ref() != Some(&record) {
         write_record(record_path, &record)?;
     }
-    let applied = match apply(&record, targets) {
+    let applied = match apply(&record, targets, api) {
         Ok(applied) => applied,
         Err(error) => {
             return Err(match restore_error {
@@ -893,7 +1046,7 @@ pub(crate) fn release(record_path: &Path) -> Result<Option<usize>, DiagError> {
     let Some(record) = read_record(record_path)? else {
         return Ok(None);
     };
-    let (restored, residual, first_error) = restore(&record)?;
+    let (restored, residual, first_error) = restore(&record, set_interface_dns_settings())?;
     if residual.is_empty() {
         remove_record(record_path)?;
     } else {
@@ -939,6 +1092,48 @@ mod tests {
             v4: Some(Ipv4Addr::new(10, 255, 0, 1)),
             v6: Some("fd00::1".parse().expect("ip")),
         }
+    }
+
+    #[test]
+    fn a_missing_export_resolves_to_unavailable_instead_of_panicking() {
+        // Pre-19041 iphlpapi has no `SetInterfaceDnsSettings`. The resolver
+        // must report the takeover unavailable; a static import would have
+        // failed the process in the loader before `main` instead.
+        assert!(
+            resolve_set_interface_dns_settings(|| None).is_none(),
+            "a missing export means the takeover is unavailable"
+        );
+        unsafe extern "system" fn found() -> isize {
+            0
+        }
+        assert!(
+            resolve_set_interface_dns_settings(|| Some(found)).is_some(),
+            "a found export maps onto the declared signature"
+        );
+    }
+
+    #[test]
+    fn a_pass_without_the_export_skips_the_takeover_without_a_capture() {
+        // Nothing can be pointed at the tunnel without the export, so the
+        // pass must report zero work and leave no record behind: a capture of
+        // adapters the takeover never touched would make every later restore
+        // rewrite servers it never changed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("dns-takeover.json");
+        let engaged = engage_with(&path, None, 9, None, both_families())
+            .expect("unavailability is not an error");
+        assert_eq!(engaged.applied, 0);
+        assert_eq!(engaged.restored, 0);
+        assert!(engaged.restore_error.is_none());
+        assert!(
+            !path.exists(),
+            "an unavailable takeover must not leave a record"
+        );
+
+        let reconciled = reconcile_with(&path, None, 9, None, both_families())
+            .expect("unavailability is not an error");
+        assert_eq!(reconciled.applied, 0);
+        assert!(!path.exists(), "a reconcile pass must not create a record");
     }
 
     #[test]
@@ -1266,6 +1461,41 @@ mod tests {
             }],
         };
         write_record(&path, &record).expect("write");
+        assert_eq!(read_record(&path).expect("read"), Some(record));
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temporary file must not survive the rename"
+        );
+    }
+
+    #[test]
+    fn the_record_is_written_completely_over_a_stale_one() {
+        // The record is the only copy of the original servers, so the whole
+        // capture must be on disk under the final name (the write syncs the
+        // temp file before the rename). `write_record` is the sole writer
+        // `engage`, `reconcile`, and `release` use; driving a real `engage`
+        // here would rewrite this machine's DNS, so the file it leaves is
+        // inspected at that one level. The oversized stale file proves the
+        // write replaces a shorter record instead of leaving a tail behind.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("dns-takeover.json");
+        std::fs::write(&path, vec![b'x'; 4096]).expect("stale record");
+        let record = Record {
+            entries: vec![Entry {
+                adapter: "{wired}".to_string(),
+                alias: "wired".to_string(),
+                v4: Some(state(&["192.0.2.1"], true)),
+                v6: None,
+            }],
+        };
+
+        write_record(&path, &record).expect("write");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            serde_json::to_vec(&record).expect("serialize"),
+            "the record must reach disk as the complete capture"
+        );
         assert_eq!(read_record(&path).expect("read"), Some(record));
         assert!(
             !path.with_extension("json.tmp").exists(),

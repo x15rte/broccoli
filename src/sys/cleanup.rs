@@ -24,6 +24,21 @@ const DELETE_RETRY_WINDOW: Duration = Duration::from_millis(1500);
 /// Pause between deletion retries.
 const DELETE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+/// `ERROR_SHARING_VIOLATION`: a file still open by a handle that lacks
+/// `FILE_SHARE_DELETE`, the usual in-use failure on Windows. std maps it to
+/// `ErrorKind::Uncategorized`, so the raw code is the only way to recognize
+/// it (std's own `remove_dir_all` retries the same code).
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// Whether a deletion failure is the transient in-use failure
+/// [`DELETE_RETRY_WINDOW`] exists for: a busy file (`ERROR_SHARING_VIOLATION`,
+/// or its access-denied spelling `PermissionDenied`). Every other error (ACL,
+/// corrupt path) will not clear itself and must surface immediately.
+fn is_transient_delete_failure(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+}
+
 /// Which exit-time maintenance action to run after the GUI has shut down.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CleanupMode {
@@ -143,16 +158,15 @@ fn remove_with_retry(path: &Path) -> std::io::Result<()> {
 
 /// Shared deletion retry policy: run `attempt` immediately; if it reports a
 /// transient in-use failure, retry for [`DELETE_RETRY_WINDOW`] before the
-/// last error surfaces. Non-`PermissionDenied` errors (ACL, corrupt path)
-/// will not clear themselves and surface immediately. `attempt` treats an
-/// absent path as success.
+/// last error surfaces. [`is_transient_delete_failure`] decides what is
+/// transient — both a busy file (`ERROR_SHARING_VIOLATION`) and its
+/// access-denied spelling are retried, and any other error surfaces
+/// immediately. `attempt` treats an absent path as success.
 fn with_delete_retry(mut attempt: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
     match attempt() {
         Ok(()) => Ok(()),
         Err(first) => {
-            if first.kind() != ErrorKind::PermissionDenied {
-                // Only a transient in-use failure is worth retrying; any
-                // other error (ACL, corrupt path) will not clear itself.
+            if !is_transient_delete_failure(&first) {
                 return Err(first);
             }
             let deadline = Instant::now() + DELETE_RETRY_WINDOW;
@@ -161,7 +175,7 @@ fn with_delete_retry(mut attempt: impl FnMut() -> std::io::Result<()>) -> std::i
                 std::thread::sleep(DELETE_RETRY_INTERVAL);
                 match attempt() {
                     Ok(()) => return Ok(()),
-                    Err(error) if error.kind() == ErrorKind::PermissionDenied => last = error,
+                    Err(error) if is_transient_delete_failure(&error) => last = error,
                     Err(error) => return Err(error),
                 }
             }
@@ -183,7 +197,7 @@ pub fn delete_root(root: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CleanupMode, delete_root, request, run, take_requested};
+    use super::{CleanupMode, delete_root, request, run, take_requested, with_delete_retry};
     use std::path::Path;
 
     /// Lay out a fake app-data root (core/config/state/logs with files,
@@ -389,5 +403,54 @@ mod tests {
 
         run(CleanupMode::ResetFiles, &missing).expect("an absent root must not be an error");
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_sharing_violation_on_the_first_attempt_is_retried() {
+        // `ERROR_SHARING_VIOLATION` (raw 32) is what Windows reports for a
+        // file an open handle keeps busy; std maps it to `Uncategorized`, so
+        // a retry keyed only on `PermissionDenied` would leave the file
+        // behind. The injected attempt proves the retry absorbs it.
+        let attempts = std::cell::Cell::new(0);
+        let result = with_delete_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok(), "a busy file must be retried, not reported");
+        assert_eq!(attempts.get(), 2, "the failed attempt must be retried once");
+    }
+
+    #[test]
+    fn an_access_denied_spelling_of_a_busy_file_is_retried_too() {
+        let attempts = std::cell::Cell::new(0);
+        let result = with_delete_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn a_permanent_delete_failure_surfaces_without_retrying() {
+        let attempts = std::cell::Cell::new(0);
+        let result = with_delete_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        });
+        assert!(result.is_err(), "a corrupt path must not be hidden");
+        assert_eq!(
+            attempts.get(),
+            1,
+            "only a transient in-use failure earns the retry window"
+        );
     }
 }

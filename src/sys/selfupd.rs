@@ -19,6 +19,12 @@ const RELEASE_REPO: &str = "x15rte/broccoli";
 /// HTTP timeout for one update-check request.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on a fetched body. The repository's `Cargo.toml` is a few hundred
+/// bytes, so a larger response is not the file this check asks for; streaming
+/// under a cap keeps an intercepting proxy or a compromised endpoint from
+/// allocating its whole body in the GUI process.
+const MAX_UPDATE_BODY_BYTES: usize = 8 * 1024;
+
 /// Default-branch guesses, in order. GitHub's default branch is normally
 /// `main`; `master` is the historical default of older repositories.
 const DEFAULT_BRANCHES: [&str; 2] = ["main", "master"];
@@ -289,6 +295,8 @@ pub enum UpdateCheckError {
     HttpStatus(u16),
     /// Neither default-branch guess carries the file (both 404).
     NotFound,
+    /// The response body exceeded [`MAX_UPDATE_BODY_BYTES`].
+    BodyTooLarge,
     /// The body could not be parsed into a package version.
     Unparseable(VersionParseError),
 }
@@ -301,6 +309,12 @@ impl fmt::Display for UpdateCheckError {
                 write!(f, "update check request failed with HTTP {status}")
             }
             Self::NotFound => write!(f, "Cargo.toml not found on main or master"),
+            Self::BodyTooLarge => {
+                write!(
+                    f,
+                    "update check body exceeded {MAX_UPDATE_BODY_BYTES} bytes"
+                )
+            }
             Self::Unparseable(error) => write!(f, "remote Cargo.toml unparseable: {error}"),
         }
     }
@@ -328,6 +342,41 @@ impl From<VersionParseError> for UpdateCheckError {
     }
 }
 
+/// One update-check body kept under [`MAX_UPDATE_BODY_BYTES`]. The response
+/// is consumed chunk by chunk, so the cap is enforced before the buffer grows
+/// past it instead of after the whole body has been collected.
+#[derive(Default)]
+struct BodyCap {
+    bytes: Vec<u8>,
+}
+
+impl BodyCap {
+    /// Append one chunk, or refuse the body once it would pass the cap.
+    fn push(&mut self, chunk: &[u8]) -> Result<(), UpdateCheckError> {
+        if self.bytes.len().saturating_add(chunk.len()) > MAX_UPDATE_BODY_BYTES {
+            return Err(UpdateCheckError::BodyTooLarge);
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// The collected body as text. `Cargo.toml` is UTF-8; an invalid byte is
+    /// replaced here and fails the version parse rather than the read, which
+    /// is what `Response::text` did.
+    fn into_text(self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// Read a success response's body under the cap.
+async fn read_body(mut response: reqwest::Response) -> Result<String, UpdateCheckError> {
+    let mut body = BodyCap::default();
+    while let Some(chunk) = response.chunk().await? {
+        body.push(&chunk)?;
+    }
+    Ok(body.into_text())
+}
+
 /// Fetches the repository's default-branch Cargo.toml and returns the parsed
 /// version. A 404 on `main` retries once with `master`; every other failure
 /// (network error, non-2xx, unparseable body) degrades to the failed state.
@@ -349,7 +398,7 @@ pub async fn check_for_update(client: &reqwest::Client) -> Result<Version, Updat
         if !response.status().is_success() {
             return Err(UpdateCheckError::HttpStatus(response.status().as_u16()));
         }
-        let body = response.text().await?;
+        let body = read_body(response).await?;
         return Ok(parse_package_version(&body)?);
     }
     Err(UpdateCheckError::NotFound)
@@ -358,9 +407,47 @@ pub async fn check_for_update(client: &reqwest::Client) -> Result<Version, Updat
 #[cfg(test)]
 mod tests {
     use super::{
-        RELEASE_REPO, UpdateCheckState, Version, VersionParseError, check_outcome, github_url,
-        parse_package_version, release_url, repository_url, split_repo,
+        BodyCap, MAX_UPDATE_BODY_BYTES, RELEASE_REPO, UpdateCheckError, UpdateCheckState, Version,
+        VersionParseError, check_outcome, github_url, parse_package_version, release_url,
+        repository_url, split_repo,
     };
+
+    #[test]
+    fn a_body_larger_than_the_cap_is_a_typed_failure() {
+        // The fetch streams chunks into this buffer; a reader that hands over
+        // more than the cap must fail with the typed error instead of
+        // collecting the body.
+        let mut body = BodyCap::default();
+        let oversized = vec![b'a'; MAX_UPDATE_BODY_BYTES + 1];
+        assert!(matches!(
+            body.push(&oversized),
+            Err(UpdateCheckError::BodyTooLarge)
+        ));
+        assert!(
+            body.bytes.is_empty(),
+            "a refused chunk must not be collected"
+        );
+    }
+
+    #[test]
+    fn the_cap_is_inclusive_and_still_accepts_a_version_file() {
+        let mut body = BodyCap::default();
+        let version_file = b"[package]\nname = \"broccoli\"\nversion = \"9.9.9\"\n";
+        body.push(version_file).expect("a small Cargo.toml");
+        assert_eq!(
+            parse_package_version(&body.into_text()).expect("parse"),
+            Version::parse("9.9.9").expect("version")
+        );
+
+        let mut at_cap = BodyCap::default();
+        at_cap
+            .push(&vec![b'a'; MAX_UPDATE_BODY_BYTES])
+            .expect("a body at the cap is still accepted");
+        assert!(
+            at_cap.push(b"a").is_err(),
+            "the first byte over the cap must be refused"
+        );
+    }
 
     #[test]
     fn repository_metadata_requires_a_safe_github_slug() {
