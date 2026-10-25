@@ -415,14 +415,9 @@ const MAX_PROFILE_NAME_LEN: usize = 512;
 /// echoed generation errors. A hostile value can never inflate rendered
 /// error text; identity below the bound keeps short values byte-identical.
 pub fn excerpt(s: &str) -> String {
-    let mut end = MAX_ERROR_EXCERPT_CHARS.min(s.len());
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    if end < s.len() {
-        format!("{}…", &s[..end])
-    } else {
-        s.to_owned()
+    match s.char_indices().nth(MAX_ERROR_EXCERPT_CHARS) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_owned(),
     }
 }
 
@@ -3907,19 +3902,14 @@ pub fn parse_link(s: &str) -> Result<ParsedLink, LinkError> {
 /// Parse a paste/subscription blob: one link per line; blank lines and
 /// `#comment` lines are skipped. The whole blob is bounded by
 /// [`MAX_BULK_LEN`]; an oversized blob yields one `Malformed` error entry.
+///
+/// A synchronous wrapper over [`parse_bulk_cancellable`], so the bulk cap and
+/// the skip rule have one implementation: the flag below is private to this
+/// function and nothing ever stores into it, so the walk always completes.
 pub fn parse_bulk(text: &str) -> Vec<Result<ParsedLink, LinkError>> {
-    if text.len() > MAX_BULK_LEN {
-        return vec![Err(malformed(
-            Diag::new(Key::LinkSubscriptionTooLarge)
-                .arg(text.len())
-                .arg(MAX_BULK_LEN),
-        ))];
-    }
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(parse_link)
-        .collect()
+    static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+    parse_bulk_cancellable(text, &NEVER_CANCELLED)
+        .expect("a cancellation flag private to this function is never set")
 }
 
 /// Cancellable bulk parse for worker threads: `cancel` is polled between
@@ -6752,6 +6742,46 @@ mod tests {
     }
 
     // ----- input-size caps and error redaction -----
+
+    /// The bound is a character count, so 48 CJK characters (144 bytes) fit
+    /// whole and only the 49th is elided. Indexing by bytes would cut this
+    /// input at 16 characters.
+    #[test]
+    fn excerpt_keeps_forty_eight_cjk_characters() {
+        let exact: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS);
+        assert_eq!(excerpt(&exact), exact, "the bound itself is not a cut");
+
+        let over: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
+        let kept: String = "错".repeat(MAX_ERROR_EXCERPT_CHARS);
+        assert_eq!(excerpt(&over), format!("{kept}…"));
+    }
+
+    /// The cut never splits a 4-byte emoji: the ellipsis follows the 48th
+    /// whole character even when the string continues with another one.
+    #[test]
+    fn excerpt_cuts_after_a_whole_emoji_at_the_bound() {
+        let exact: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS);
+        assert_eq!(excerpt(&exact), exact);
+
+        let over: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
+        let kept: String = "🦀".repeat(MAX_ERROR_EXCERPT_CHARS);
+        assert_eq!(excerpt(&over), format!("{kept}…"));
+        assert_eq!(
+            excerpt(&over).chars().count(),
+            MAX_ERROR_EXCERPT_CHARS + 1,
+            "the bound counts characters, not bytes"
+        );
+
+        // Mixed widths: byte 48 would land inside an emoji, so a byte-indexed
+        // cut would walk back and lose four characters.
+        let mixed = format!("a{}", "🦀".repeat(MAX_ERROR_EXCERPT_CHARS));
+        let kept = format!("a{}", "🦀".repeat(MAX_ERROR_EXCERPT_CHARS - 1));
+        assert_eq!(excerpt(&mixed), format!("{kept}…"));
+
+        // ASCII stays byte-identical to the previous byte-index semantics.
+        let ascii = "a".repeat(MAX_ERROR_EXCERPT_CHARS + 1);
+        assert_eq!(excerpt(&ascii), format!("{}…", "a".repeat(48)));
+    }
 
     #[test]
     fn parse_link_rejects_overlong_line_before_parsing() {

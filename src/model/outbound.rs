@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 /// The remote endpoint an outbound dials, as its settings spell it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServerEndpoint<'a> {
+pub(crate) enum ServerEndpoint<'a> {
     /// An address and port the settings carry as their own fields.
     HostPort { address: &'a str, port: u16 },
     /// A peer endpoint string carried verbatim (WireGuard).
@@ -174,7 +174,7 @@ macro_rules! outbound_protocols {
             /// The remote endpoint this outbound dials, or `None` when the
             /// protocol carries none (freedom, blackhole, dns, loopback) or
             /// its host/port is unusable (empty host or zero port).
-            pub fn server_endpoint(&self) -> Option<ServerEndpoint<'_>> {
+            pub(crate) fn server_endpoint(&self) -> Option<ServerEndpoint<'_>> {
                 match self {
                     $( Self::$variant(settings) => outbound_server_endpoint!(settings, $endpoint), )*
                 }

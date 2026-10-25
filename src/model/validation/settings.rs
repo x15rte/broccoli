@@ -152,17 +152,17 @@ pub fn noise_script_issues(script: Option<&str>, noise_items: usize) -> Vec<Vali
 /// leaves the listener open. Derived from [`LocalInboundCfg::authenticates`]
 /// — the exposure rule and this gate share that one model truth, never
 /// re-implemented.
-pub fn inbound_auth_trap(entry: &LocalInboundCfg) -> bool {
+fn inbound_auth_trap(entry: &LocalInboundCfg) -> bool {
     entry.auth == "password" && !entry.authenticates()
 }
 
-/// The verdict one local endpoint's authentication editor renders, or `None`
-/// when the row is appliable: an emitted row that requires authentication but
-/// whose wire form authenticates nobody — HTTP's accounts are its only
-/// authentication, so an empty list serves everyone at any bind. The settings
-/// walk reports this same finding from here, so the row the user edits and the
-/// Apply gate cannot disagree about it.
-pub fn local_inbound_auth_verdict(entry: &LocalInboundCfg) -> Option<ValidationCode> {
+/// The finding one emitted local endpoint's authentication rule produces, or
+/// `None` when the row is appliable: an emitted row that requires
+/// authentication but whose wire form authenticates nobody — HTTP's accounts
+/// are its only authentication, so an empty list serves everyone at any bind.
+/// The settings walk reports the finding from here, so the Apply gate and the
+/// row list read one rule.
+fn local_inbound_auth_verdict(entry: &LocalInboundCfg) -> Option<ValidationCode> {
     (emit::local_inbound_emitted(entry) && inbound_auth_trap(entry))
         .then_some(ValidationCode::LocalInboundAuthRequiresAccounts)
 }
@@ -178,12 +178,12 @@ pub fn tun_ipv4_gateway(tun: &TunCfg) -> Option<&str> {
         .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains('.')))
 }
 
-/// The verdict the TUN gateway editor renders, or `None` when the tunnel can
-/// come up: a TUN-mode document without an IPv4 gateway has no adapter address
-/// and no in-subnet address for the in-tun DNS listeners. The settings walk
-/// reports this same finding from here, so the editor and the Apply gate
-/// cannot disagree about it.
-pub fn tun_gateway_verdict(settings: &Settings) -> Option<ValidationCode> {
+/// The finding one TUN document's gateway rule produces, or `None` when the
+/// tunnel can come up: a TUN-mode document without an IPv4 gateway has no
+/// adapter address and no in-subnet address for the in-tun DNS listeners. The
+/// settings walk reports the finding from here, so the Apply gate and the TUN
+/// row's verdict read one rule.
+fn tun_gateway_verdict(settings: &Settings) -> Option<ValidationCode> {
     (emit::tun_inbound_emitted(settings) && tun_ipv4_gateway(&settings.tun).is_none())
         .then_some(ValidationCode::TunIpv4GatewayRequired)
 }
@@ -203,9 +203,8 @@ pub fn tun_ipv6_gateway(tun: &TunCfg) -> Option<&str> {
 /// unrouted-family half — the state [`ValidationCode::TunLeakMisconfigTunOff`]
 /// reports. The generator writes the key only while the TUN inbound and the
 /// DNS module are both present (`emit::dns_inbound_emitted`), so this is the
-/// exact predicate the settings pass judges; the TUN screen calls it too and
-/// renders that code's own message where the switch lives.
-pub fn tun_leak_misconfig_tun_off(settings: &Settings) -> bool {
+/// exact predicate the settings pass judges.
+fn tun_leak_misconfig_tun_off(settings: &Settings) -> bool {
     emit::dns_inbound_emitted(settings) && !settings.tun.leak_blocks_misconfig_tun()
 }
 
@@ -414,13 +413,12 @@ fn profile_set_verdict(
 
     for profile in profiles {
         let location = profile_display_name(profile);
-        let target = FindingTarget::Profile(profile.id.clone());
         for finding in validate_outbound(&profile.outbound) {
             issues.push(ValidationIssue {
                 code: finding.code,
                 path: Some(location.clone()),
                 severity: finding.severity,
-                target: target.clone(),
+                target: FindingTarget::Document,
             });
         }
     }
@@ -519,11 +517,9 @@ impl<'a> SettingsWalk<'a> {
     /// universe.
     fn balancers(&mut self) {
         for (index, balancer) in self.settings.routing.balancers.iter().enumerate() {
-            let target = FindingTarget::Balancer(index);
             if balancer.tag.trim().is_empty() {
-                self.issues.push(
-                    issue(ValidationCode::BalancerTagMissing(index + 1), None).at(target.clone()),
-                );
+                self.issues
+                    .push(issue(ValidationCode::BalancerTagMissing(index + 1), None));
                 // The remaining checks would name a tag that does not exist.
                 continue;
             }
@@ -532,36 +528,27 @@ impl<'a> SettingsWalk<'a> {
                 .iter()
                 .all(|selector| selector.trim().is_empty())
             {
-                self.issues.push(
-                    issue(
-                        ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
-                        None,
-                    )
-                    .at(target.clone()),
-                );
+                self.issues.push(issue(
+                    ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
+                    None,
+                ));
             }
             if !self.balancer_tags.insert(balancer.tag.clone()) {
-                self.issues.push(
-                    issue(
-                        ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
-                        None,
-                    )
-                    .at(target.clone()),
-                );
+                self.issues.push(issue(
+                    ValidationCode::BalancerTagDuplicated(excerpt(&balancer.tag)),
+                    None,
+                ));
             }
             if !balancer.fallback_tag.is_empty()
                 && !self.outbound_tags.contains(&balancer.fallback_tag)
             {
-                self.issues.push(
-                    issue(
-                        ValidationCode::BalancerFallbackMissing(
-                            excerpt(&balancer.tag),
-                            excerpt(&balancer.fallback_tag),
-                        ),
-                        None,
-                    )
-                    .at(target),
-                );
+                self.issues.push(issue(
+                    ValidationCode::BalancerFallbackMissing(
+                        excerpt(&balancer.tag),
+                        excerpt(&balancer.fallback_tag),
+                    ),
+                    None,
+                ));
             }
         }
     }
@@ -903,54 +890,41 @@ impl<'a> SettingsWalk<'a> {
             self.issues.push(issue(code, Some("routing.script".into())));
         }
         for (index, rule) in self.settings.routing.rules.iter().enumerate() {
-            let target = FindingTarget::Rule(index);
             if let Some(error) = rule.target_error() {
-                self.issues.push(
-                    issue(
-                        ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
-                        None,
-                    )
-                    .at(target),
-                );
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
+                    None,
+                ));
                 // The reference checks below would name an unresolved target.
                 continue;
             }
             if !rule.outbound_tag.is_empty() && !self.outbound_tags.contains(&rule.outbound_tag) {
-                self.issues.push(
-                    issue(
-                        ValidationCode::RoutingRuleOutboundMissing(
-                            index + 1,
-                            excerpt(&rule.outbound_tag),
-                        ),
-                        None,
-                    )
-                    .at(target.clone()),
-                );
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleOutboundMissing(
+                        index + 1,
+                        excerpt(&rule.outbound_tag),
+                    ),
+                    None,
+                ));
             }
             if !rule.balancer_tag.is_empty() && !self.balancer_tags.contains(&rule.balancer_tag) {
-                self.issues.push(
-                    issue(
-                        ValidationCode::RoutingRuleBalancerMissing(
-                            index + 1,
-                            excerpt(&rule.balancer_tag),
-                        ),
-                        None,
-                    )
-                    .at(target.clone()),
-                );
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleBalancerMissing(
+                        index + 1,
+                        excerpt(&rule.balancer_tag),
+                    ),
+                    None,
+                ));
             }
             if let Some(tag) = rule
                 .inbound_tag
                 .iter()
                 .find(|tag| !self.inbound_tags.contains(*tag))
             {
-                self.issues.push(
-                    issue(
-                        ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
-                        None,
-                    )
-                    .at(target),
-                );
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleInboundMissing(index + 1, excerpt(tag)),
+                    None,
+                ));
             }
         }
     }
@@ -1510,15 +1484,6 @@ mod tests {
                 .collect()
         };
         assert!(
-            codes_at(FindingTarget::Profile("aaaaaaaa11111111".into()))
-                .contains(&ValidationCode::SendThroughInvalid)
-        );
-        assert_eq!(
-            codes_at(FindingTarget::Profile("bbbbbbbb22222222".into())),
-            Vec::new(),
-            "a profile id that judged nothing owns no finding"
-        );
-        assert!(
             codes_at(FindingTarget::LocalInbound(1))
                 .contains(&ValidationCode::ListenAddressInvalid)
         );
@@ -1530,19 +1495,20 @@ mod tests {
             codes_at(FindingTarget::Dokodemo(0)).contains(&ValidationCode::ListenAddressInvalid)
         );
         assert!(codes_at(FindingTarget::Tun).contains(&ValidationCode::TunIpv4GatewayRequired));
+        // Profiles, rules and balancers judge no screen-editable settings row:
+        // their findings stay document-scoped, with the location in `path`.
+        let document = codes_at(FindingTarget::Document);
         assert!(
-            codes_at(FindingTarget::Rule(1))
+            document
                 .iter()
-                .any(|code| matches!(code, ValidationCode::RoutingRuleOutboundMissing(2, _)))
+                .any(|code| matches!(code, ValidationCode::RoutingRuleOutboundMissing(2, _))),
+            "a rule finding names its reference in the code, not as a row target"
         );
         assert!(
-            codes_at(FindingTarget::Rule(0)).is_empty(),
-            "the rule whose references resolve owns nothing"
+            document.contains(&ValidationCode::SendThroughInvalid),
+            "a profile finding is judged in isolation and owns no settings row"
         );
-        assert!(
-            codes_at(FindingTarget::Balancer(0)).contains(&ValidationCode::BalancerTagMissing(1))
-        );
-        assert!(codes_at(FindingTarget::Balancer(1)).is_empty());
+        assert!(document.contains(&ValidationCode::BalancerTagMissing(1)));
     }
 
     #[test]

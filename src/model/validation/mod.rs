@@ -1221,27 +1221,21 @@ pub enum Severity {
 /// asks its own row's verdict with ([`Verdict::for_target`]).
 ///
 /// [`Self::Document`] is every finding about the configuration rather than
-/// one editable row — and every editor/import-scope finding, which judges a
-/// profile in isolation and has no settings document to point into. The
-/// payload is the row's own identity: the profile id for [`Self::Profile`],
-/// the list index for every other row. It is deliberately *not* the rendered
-/// location text, which stays in [`ValidationIssue::path`].
+/// one editable settings row — and every editor/import-scope finding, which
+/// judges a profile in isolation and has no settings document to point into.
+/// The payload is the row's own identity: the list index for every row
+/// variant. It is deliberately *not* the rendered location text, which stays
+/// in [`ValidationIssue::path`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindingTarget {
-    /// The configuration as a whole (or a scope that judges no row).
+    /// The configuration as a whole, or a scope that judges no settings row.
     Document,
-    /// The profile with this `ServerProfile::id`.
-    Profile(String),
     /// `settings.local_inbounds[index]`.
     LocalInbound(usize),
     /// `settings.dokodemo[index]`.
     Dokodemo(usize),
     /// The TUN block (`settings.tun`).
     Tun,
-    /// `settings.routing.rules[index]`.
-    Rule(usize),
-    /// `settings.routing.balancers[index]`.
-    Balancer(usize),
 }
 
 /// One validation finding: a rule, the rendered location the generator
@@ -1321,10 +1315,9 @@ impl Verdict {
     }
 
     /// The findings scoped to `target`, in pass order — the query a screen
-    /// asks its own row. Equality is the whole comparison
-    /// ([`FindingTarget::Profile`] matches by id, every index by position), so
-    /// the caller states which row it owns and never re-derives the rule, the
-    /// gate, or the path.
+    /// asks its own row. Equality is the whole comparison (every row variant
+    /// matches by position), so the caller states which row it owns and never
+    /// re-derives the rule, the gate, or the path.
     pub fn for_target(&self, target: FindingTarget) -> impl Iterator<Item = &ValidationIssue> {
         self.issues
             .iter()
@@ -1535,9 +1528,8 @@ pub use outbound::{
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
-    dns_script_issues, inbound_auth_trap, local_inbound_auth_verdict, lua_script_path_issue,
-    noise_script_issues, routing_script_issues, tun_gateway_verdict, tun_ipv4_gateway,
-    tun_ipv6_gateway, tun_leak_misconfig_tun_off, validate_listen_address, validate_profiles,
+    dns_script_issues, lua_script_path_issue, noise_script_issues, routing_script_issues,
+    tun_ipv4_gateway, tun_ipv6_gateway, validate_listen_address, validate_profiles,
     validate_settings,
 };
 pub use stream::{
