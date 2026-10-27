@@ -10,9 +10,10 @@
 //! can land under the inherited `%APPDATA%` ACLs. Files created inside the
 //! protected roots inherit the user-only ACE. Re-application is idempotent
 //! and cheap, and it also hardens pre-existing roots created by older
-//! releases with default ACLs on every startup run. Fails closed: a root
-//! that cannot be secured is an error and callers must not write
-//! credential-bearing files after a failure.
+//! releases with default ACLs — once per process run, for the resolved root
+//! tuple (see [`ensure_dirs`]). Fails closed: a root that cannot be secured
+//! is an error and callers must not write credential-bearing files after a
+//! failure.
 
 use std::path::{Path, PathBuf};
 
@@ -59,17 +60,57 @@ pub fn app_log() -> PathBuf {
 }
 
 /// Create every directory above — each carrying the user-only, inheritable,
-/// protected DACL before any file can be written into it — and
-/// re-harden pre-existing roots on every run. Idempotent: re-application
-/// replaces the DACL with the same protected user-only shape, so a second
-/// run is effect-free. Fails closed: a directory that cannot be secured
-/// returns an error, and callers must not proceed with writes after that.
+/// protected DACL before any file can be written into it — and harden
+/// pre-existing roots created by older releases with default ACLs. The DACL
+/// step runs once per process run for a given four-root tuple: this function
+/// runs before every state save (up to five times a second), and re-applying
+/// four DACLs through `SetFileSecurityW` each time is pure overhead once the
+/// roots are hardened. `create_dir_all` still runs on every call. The tuple
+/// is the *resolved* path set, so a redirected `%APPDATA%` (tests) hardens
+/// again. Fails closed: a directory that cannot be secured returns an error,
+/// the tuple is not recorded, and callers must not proceed with writes after
+/// that.
 pub fn ensure_dirs() -> std::io::Result<()> {
-    for d in [core_dir(), config_dir(), state_dir(), logs_dir()] {
-        std::fs::create_dir_all(&d)?;
-        secure_dir_user_only(&d)?;
+    let roots = [core_dir(), config_dir(), state_dir(), logs_dir()];
+    let needs_hardening = !roots_already_hardened(&roots);
+    for dir in &roots {
+        std::fs::create_dir_all(dir)?;
+        if needs_hardening {
+            // Harden each root immediately after it exists, so no newly
+            // created root sits under the inherited `%APPDATA%` ACLs while
+            // the remaining roots are created.
+            secure_dir_user_only(dir)?;
+        }
+    }
+    if needs_hardening {
+        remember_hardened_roots(&roots);
     }
     Ok(())
+}
+
+/// The four-root tuple whose DACLs were last applied successfully.
+///
+/// Keyed on the resolved paths rather than a bare "done" flag: tests redirect
+/// `APPDATA`, so a different root tuple must harden before its files are
+/// written. Only a fully successful hardening pass is recorded — a failed one
+/// leaves no entry, so the next call retries and still fails closed.
+static HARDENED_ROOTS: std::sync::Mutex<Option<[PathBuf; 4]>> = std::sync::Mutex::new(None);
+
+/// Lock the hardened-tuple cell, tolerating a poisoned mutex: the cell holds
+/// plain paths and a panic while it was held left them untouched, so a
+/// poisoned lock is no reason to fail a directory setup.
+fn hardened_roots_guard() -> std::sync::MutexGuard<'static, Option<[PathBuf; 4]>> {
+    HARDENED_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn roots_already_hardened(roots: &[PathBuf; 4]) -> bool {
+    hardened_roots_guard().as_ref() == Some(roots)
+}
+
+fn remember_hardened_roots(roots: &[PathBuf; 4]) {
+    *hardened_roots_guard() = Some(roots.clone());
 }
 
 /// Locate a usable xray.exe for tests/tools: `$XRAY_EXE` override, else the

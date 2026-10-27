@@ -6,13 +6,6 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, RichText, Stroke, StrokeKind};
-
-// The generated document's schema keys also name the profile source the
-// editor's draft readers walk: the stored profile serializes the core's flat
-// `streamSettings` outbound shape by design, so one vocabulary covers both
-// documents.
-use crate::r#gen::keys::{DIALER_PROXY, SOCKOPT, STREAM_SETTINGS};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
 use crate::links;
 use crate::model::go_std_base64_decodes;
@@ -34,11 +27,10 @@ use crate::model::stream::{
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
-    dns_out_action_supported, ech_sockopt_emitted, freedom_final_rule_supported,
-    masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
-    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
-    send_through_supported, server_name_implausible, validate_finalmask, validate_outbound,
-    validate_sockopt,
+    dns_out_action_supported, freedom_final_rule_supported, masque_warp_address_list_verdict,
+    mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid,
+    reality_public_key_valid, send_through_supported, server_name_implausible,
+    validate_outbound_with_blocks,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -60,6 +52,7 @@ use crate::ui::widgets;
 use crate::ui::{
     FeedbackLevel, ServersCtx, format_latency_probe_feedback, format_single_latency_probe_feedback,
 };
+use egui::{Color32, RichText, Stroke, StrokeKind};
 
 pub(crate) mod finalmask_editors;
 mod keygen;
@@ -196,11 +189,12 @@ const DNS_RULE_ACTION_OPTIONS: [&str; DNS_OUT_ACTIONS.len() + 1] = [
 ];
 
 /// One full editor validation sweep, as findings: the model's
-/// `validate_outbound` verdict — protocol settings, stream security and the
-/// transport's own blocks — plus the block verdicts that same model pass
-/// calls (finalmask, sockopt, ECH sockopt). The sweep mints no rule of its
-/// own: every finding the editor gates on has a model code and a wire path,
-/// so the Save gate, generation and the importer answer one verdict. Nothing
+/// `validate_outbound_with_blocks` verdict — protocol settings, stream
+/// security and the transport's own blocks — plus the stream blocks that same
+/// pass returns (finalmask, sockopt, ECH sockopt). The sweep mints no rule of
+/// its own: every finding the editor gates on has a model code and a wire
+/// path, so the Save gate, generation and the importer answer one verdict, and
+/// an inline block row is never a second validation of the block. Nothing
 /// here is rendered; [`EditorValidationFindings::render`] turns a sweep into
 /// the strings the lists and the inline verdicts show, once per (draft
 /// generation, language).
@@ -304,60 +298,22 @@ impl EditorValidationFindings {
     }
 }
 
-/// The Advanced tab's inline finalmask verdict, in model order (TCP masks,
-/// UDP masks, QUIC params) — the exact findings the tab renders under the
-/// mask list.
-fn finalmask_findings(profile: &ServerProfile) -> Verdict {
-    profile
-        .outbound
-        .stream
-        .finalmask
-        .as_ref()
-        .map_or_else(Verdict::default, validate_finalmask)
-}
-
-/// `validate_sockopt` verdict for one sockopt block, under the wire path
-/// prefix its usage mounts it at.
-fn sockopt_findings(sockopt: &SockoptModel, usage: SockoptUsage) -> Verdict {
-    validate_sockopt(sockopt, usage.path_prefix())
-}
-
-/// The sockopt blocks' inline verdicts for one draft: the stream's own
-/// `stream.sockopt` block and — when TLS carries ECH — the
-/// `stream.tlsSettings.echSockopt` block.
-fn sockopt_findings_for(profile: &ServerProfile) -> (Verdict, Verdict) {
-    let stream = &profile.outbound.stream;
-    let stream_findings = stream
-        .sockopt
-        .as_ref()
-        .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::Stream))
-        .unwrap_or_default();
-    // The model sweep's own gate decides which block is judged, so the inline
-    // verdict and the error list always cover the same one.
-    let ech_findings = ech_sockopt_emitted(stream)
-        .map(|sockopt| sockopt_findings(sockopt, SockoptUsage::EchDnsQuery))
-        .unwrap_or_default();
-    (stream_findings, ech_findings)
-}
-
+/// The editor's one model sweep for a draft: the aggregated verdict (the
+/// error and warning lists) plus the stream blocks the tabs render inline.
+/// Both come from the same `validate_outbound_with_blocks` pass, so a block's
+/// inline rows are the sweep's own findings — never a second validation of
+/// the same block, and never a verdict that can drift from the error list.
 fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindings {
-    let (stream_sockopt, ech_sockopt) = sockopt_findings_for(profile);
-    let finalmask = finalmask_findings(profile);
-    // The model pass owns every rule the editor gates on — protocol
-    // settings (missing address/port/id/encryption, the reverse tag, the
-    // protocol/settings mismatch), stream security, transport security and
-    // the transport's own blocks. Its advisory findings render amber in the
-    // warnings list instead of the error list; the verdict answers which is
-    // which. The three block verdicts above are the same pass's per-block
-    // calls, kept apart only so the tabs can render them inline.
-    let model = validate_outbound(&profile.outbound);
-
+    let (model, blocks) = validate_outbound_with_blocks(&profile.outbound);
+    // The two list halves are the aggregate verdict consumed, not cloned: the
+    // lists own exactly the findings the sweep produced, in pass order.
+    let (blocking, advisory) = model.into_tiers();
     EditorValidationFindings {
-        blocking: model.blocking().cloned().collect(),
-        advisory: model.advisory().cloned().collect(),
-        finalmask,
-        stream_sockopt,
-        ech_sockopt,
+        blocking,
+        advisory,
+        finalmask: blocks.finalmask,
+        stream_sockopt: blocks.sockopt,
+        ech_sockopt: blocks.ech_sockopt,
     }
 }
 
@@ -604,23 +560,14 @@ fn tcp_fast_open_editor(
     changed
 }
 
+/// Which socket-options block an editor is rendering: the stream's own block
+/// or the TLS settings' ECH DNS-query block. They share `SockoptModel` but
+/// not every field's semantics, so the editor asks which one it paints
+/// instead of guessing from the wire path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SockoptUsage {
     Stream,
     EchDnsQuery,
-}
-
-impl SockoptUsage {
-    /// The wire path prefix the block's findings are scoped with. The ECH
-    /// DNS-query block lives under the TLS settings, not `stream.sockopt`
-    /// (the model's `validate_outbound` sweep scopes it the same way), so
-    /// the inline verdict names the field the user can actually find.
-    fn path_prefix(self) -> &'static str {
-        match self {
-            Self::Stream => "stream.sockopt",
-            Self::EchDnsQuery => "stream.tlsSettings.echSockopt",
-        }
-    }
 }
 
 /// Outbound-role socket options (the stream block and the ECH DNS-query
@@ -641,8 +588,8 @@ fn sockopt_editor(
     // embeds the same struct but sits in an editor with no profile list, so
     // it keeps the free-text field (`None`).
     dialer_proxy_options: Option<&[String]>,
-    // The block's memoized `validate_sockopt` verdicts (its usage's wire
-    // path in the message), rendered under the fields.
+    // The block's memoized verdicts from the enclosing draft's validation
+    // sweep (their wire path in the message), rendered under the fields.
     errors: &[String],
 ) -> bool {
     let mut changed = false;
@@ -1282,6 +1229,44 @@ impl DraftTarget<'_> {
     }
 }
 
+/// The snapshot one draft is compared against, precomputed once at creation:
+/// the persisted profile the draft was loaded from (or the empty profile of
+/// an add draft), serialized with the same serializer the comparison uses,
+/// plus the two source facts the retired-key gates read out of it. Deriving
+/// both here keeps an edit's changed-from-source question to one
+/// serialization of the live profile — no JSON tree is built to diff, and no
+/// snapshot document is re-read.
+///
+/// The derived default — empty bytes and no source facts — is what a snapshot
+/// that cannot serialize leaves: no profile serializes to it, so the draft
+/// stays "changed", the answer a failed serialization always gives.
+#[derive(Default)]
+struct DraftBaseline {
+    /// `serde_json::to_vec` of the snapshot. The comparison side serializes
+    /// the live profile the same way, so equal profiles produce equal bytes
+    /// and a value the editor reverted by hand compares unchanged.
+    json: Vec<u8>,
+    /// The snapshot's chain target (`streamSettings.sockopt.dialerProxy`).
+    /// Empty and absent are both "no chain", exactly as
+    /// `ServerProfile::chain_target` reads the live draft.
+    chain_target: Option<String>,
+    /// The snapshot's `udphop` UDP masks, serialized as the settings file
+    /// writes them.
+    udphop_masks: Vec<serde_json::Value>,
+}
+
+impl DraftBaseline {
+    /// The baseline of `source`: its serialized bytes and the two source
+    /// facts the retired-key gates compare the draft against.
+    fn of(source: &ServerProfile) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            json: serde_json::to_vec(source)?,
+            chain_target: source.chain_target().map(str::to_owned),
+            udphop_masks: udphop_masks(source),
+        })
+    }
+}
+
 /// One open editor draft, in either slot. The existing-profile editor and the
 /// add-server dialog differ in where the draft commits to and what "changed"
 /// is measured against — which is what `kind` and the baseline spell — so one
@@ -1302,11 +1287,11 @@ struct ProfileDraft {
     /// keeps once the draft commits; only the editor paints it.
     tag: String,
     profile: ServerProfile,
-    /// The serialized profile this draft is compared against: the persisted
-    /// snapshot the draft was loaded from, or — for an add draft, which has
-    /// no committed source — the empty profile carrying the draft's id,
-    /// computed once at creation.
-    baseline: serde_json::Value,
+    /// The snapshot this draft is compared against: the persisted profile the
+    /// draft was loaded from, or — for an add draft, which has no committed
+    /// source — the empty profile carrying the draft's id, taken once at
+    /// creation.
+    baseline: DraftBaseline,
     /// The draft generation, bumped by every content edit. It keys the
     /// memoized validation and stamps the request target a tool or validation
     /// is staged with, so a verdict that arrives after an edit is dropped.
@@ -1326,7 +1311,7 @@ impl ProfileDraft {
             id: persisted.id.clone(),
             tag: persisted.tag(),
             profile: persisted.clone(),
-            baseline: serde_json::to_value(persisted)?,
+            baseline: DraftBaseline::of(persisted)?,
             generation: 0,
             validation: None,
         })
@@ -1336,7 +1321,7 @@ impl ProfileDraft {
     /// what it is compared against is the empty profile carrying its id — an
     /// add draft is unsaved by definition until it commits.
     fn add(profile: ServerProfile) -> Self {
-        let baseline = serde_json::to_value(ServerProfile {
+        let baseline = DraftBaseline::of(&ServerProfile {
             id: profile.id.clone(),
             ..ServerProfile::default()
         })
@@ -1785,19 +1770,6 @@ fn udp_mask_kind() -> MaskKind<FinalmaskUdpMask> {
     }
 }
 
-/// The chain target the draft was loaded with: the dial-through tag the
-/// committed profile carried (`streamSettings.sockopt.dialerProxy`), read
-/// from the draft's serialized source. `None` when the source had none.
-fn source_chain_target(source: &serde_json::Value) -> Option<&str> {
-    source
-        .get("outbound")?
-        .get(STREAM_SETTINGS)?
-        .get(SOCKOPT)?
-        .get(DIALER_PROXY)?
-        .as_str()
-        .filter(|tag| !tag.is_empty())
-}
-
 /// True when the profile's `quicParams` still carries the retired `udpHop`
 /// key (any JSON shape) — the state that gates and that the finding row's
 /// dismissal control clears.
@@ -1832,33 +1804,15 @@ fn udphop_masks(profile: &ServerProfile) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The same state read from the draft's serialized source. An entry that
-/// cannot serialize was never written by this app, so it never matches.
-fn source_udphop_masks(source: &serde_json::Value) -> Vec<serde_json::Value> {
-    source
-        .get("outbound")
-        .and_then(|outbound| outbound.get(STREAM_SETTINGS))
-        .and_then(|stream| stream.get("finalmask"))
-        .and_then(|finalmask| finalmask.get("udp"))
-        .and_then(serde_json::Value::as_array)
-        .map(|masks| {
-            masks
-                .iter()
-                .filter(|mask| {
-                    mask.get("type").and_then(serde_json::Value::as_str) == Some("udphop")
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// True when `profile` differs from the serialized `baseline` it is compared
-/// against. A profile that cannot serialize counts as changed, so a draft
-/// whose serialization fails can never commit silently.
-fn profile_differs_from_baseline(profile: &ServerProfile, baseline: &serde_json::Value) -> bool {
-    serde_json::to_value(profile)
-        .map(|current| current != *baseline)
+/// True when `profile` differs from the baseline snapshot it is compared
+/// against. Both sides are written by the same serializer, so the comparison
+/// is one `to_vec` of the live profile against the bytes taken at creation
+/// (serde_json's value order is deterministic, so a profile the user reverted
+/// by hand compares unchanged). A profile that cannot serialize counts as
+/// changed, so a draft whose serialization fails can never commit silently.
+fn profile_differs_from_baseline(profile: &ServerProfile, baseline: &DraftBaseline) -> bool {
+    serde_json::to_vec(profile)
+        .map(|current| current != baseline.json)
         .unwrap_or(true)
 }
 
@@ -4109,14 +4063,14 @@ impl ServersScreen {
             // on the finding row. An unrelated edit (a rename, a port) leaves
             // the gate in place, so a save can never drop a chain the user
             // never looked at.
-            if draft.profile.chain_target() != source_chain_target(&draft.baseline) {
+            if draft.profile.chain_target() != draft.baseline.chain_target.as_deref() {
                 draft.profile.outbound.retired_proxy_settings = None;
             }
             // The retired `quicParams.udpHop` key clears the same way: the
             // user rebuilds the hop as a `udphop` UDP mask (the mask list
             // moved away from the loaded baseline's), or dismisses the key on
             // the finding row. Editing an unrelated mask leaves the gate.
-            if udphop_masks(&draft.profile) != source_udphop_masks(&draft.baseline)
+            if udphop_masks(&draft.profile) != draft.baseline.udphop_masks
                 && let Some(quic) = draft
                     .profile
                     .outbound
@@ -7700,21 +7654,22 @@ mod tests {
     use super::keygen::{keygen_value, redacted_tool_args};
     use super::raw_editor::JsonBuf;
     use super::{
-        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftKind, DraftTarget, EditorTab,
-        EditorValidationCache, EditorValidationFindings, EditorValidationRender, FINGERPRINTS,
-        FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft, RawField,
-        Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
-        ServersScreen, SockoptUsage, StatusLine, TlsProbe, TransportTabCtx,
-        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
-        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
-        fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        sockopt_findings, status_colors_of, status_toast_expired, validate_outbound, xmux_section,
+        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
+        EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
+        FINGERPRINTS, FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft,
+        RawField, Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
+        ServersScreen, StatusLine, TlsProbe, TransportTabCtx, basic_tab_inline_verdict,
+        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
+        server_list_row, status_colors_of, status_toast_expired, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
     use crate::links;
     use crate::model::stream::MasqueradeCfg;
-    use crate::model::validation::{ValidationCode, ValidationIssue};
+    use crate::model::validation::{
+        ValidationCode, ValidationIssue, validate_outbound, validate_sockopt,
+    };
     use crate::model::{
         BlackholeResponse, CustomSockopt, FinalmaskHeaderCustomTcp, FinalmaskModel, FinalmaskNoise,
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
@@ -7761,18 +7716,14 @@ mod tests {
     /// Install `profile` as the selected editor's draft, compared against
     /// `source`, behind the editor's back: no memo covers the new generation,
     /// so the next frame sweeps it.
-    fn install_draft(
-        screen: &mut ServersScreen,
-        profile: &ServerProfile,
-        source: serde_json::Value,
-    ) {
+    fn install_draft(screen: &mut ServersScreen, profile: &ServerProfile, source: &ServerProfile) {
         let generation = screen
             .existing
             .draft
             .as_ref()
             .map_or(1, |draft| draft.generation.wrapping_add(1));
         let mut draft = draft_for(profile);
-        draft.baseline = source;
+        draft.baseline = DraftBaseline::of(source).expect("the fixture serializes");
         draft.generation = generation;
         screen.existing.draft = Some(draft);
     }
@@ -9130,7 +9081,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         };
         let before = serde_json::to_value(&modeled).unwrap();
-        let findings = sockopt_findings(&modeled, SockoptUsage::Stream);
+        let findings = validate_sockopt(&modeled, "stream.sockopt");
         assert_eq!(
             codes_of(&findings),
             vec![
@@ -9178,7 +9129,7 @@ Authentication: ML-KEM-768, Post-Quantum
             tcp_fast_open: Some(json!(12.75)),
             ..Default::default()
         };
-        assert!(sockopt_findings(&modeled, SockoptUsage::Stream).is_empty());
+        assert!(validate_sockopt(&modeled, "stream.sockopt").is_empty());
 
         let rendered = Rc::new(RefCell::new(Some(modeled)));
         let rendered_for_ui = Rc::clone(&rendered);
@@ -9197,12 +9148,12 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn sockopt_verdicts_are_scoped_to_the_usage_s_wire_path() {
+    fn sockopt_verdicts_are_scoped_to_the_block_s_wire_path() {
         let modeled = SockoptModel {
             domain_strategy: "future-strategy".into(),
             ..Default::default()
         };
-        let stream_findings = sockopt_findings(&modeled, SockoptUsage::Stream);
+        let stream_findings = validate_sockopt(&modeled, "stream.sockopt");
         assert_eq!(
             finding(
                 &stream_findings,
@@ -9213,7 +9164,7 @@ Authentication: ML-KEM-768, Post-Quantum
             Some("stream.sockopt.domainStrategy"),
             "{stream_findings:#?}"
         );
-        let ech_findings = sockopt_findings(&modeled, SockoptUsage::EchDnsQuery);
+        let ech_findings = validate_sockopt(&modeled, "stream.tlsSettings.echSockopt");
         assert_eq!(
             finding(&ech_findings, ValidationCode::SockoptDomainStrategyInvalid)
                 .path
@@ -9305,6 +9256,43 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(findings.advisory.is_empty());
     }
 
+    /// The inline finalmask verdict is the block's own: the outbound-filter
+    /// advisories the sweep folds into the warnings list stay out of it, so
+    /// the Advanced tab paints only the mask findings under the mask list
+    /// while the amber list keeps the sweep's advisories.
+    #[test]
+    fn editor_inline_finalmask_verdict_excludes_the_sweep_s_filter_advisories() {
+        let mut profile = ServerProfile::new("filter", OutboundModel::new(Protocol::Freedom));
+        profile.outbound.stream = serde_json::from_value(json!({
+            "network": "raw",
+            "finalmask": {
+                "tcp": [{"type": "filter", "settings": {"blockedSourceIPs": ["geoip:private"]}}],
+                "udp": [{"type": "filter", "settings": {"allowedSourceIPs": ["10.0.0.0/8"]}}]
+            }
+        }))
+        .expect("fixture is a valid stream");
+
+        let findings = editor_validation_findings(&profile);
+        assert!(
+            !findings
+                .finalmask
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskFilterOnOutbound),
+            "the inline verdict must not carry the sweep's filter advisories: {:#?}",
+            findings.finalmask
+        );
+        assert_eq!(
+            codes_of(&findings.advisory),
+            vec![
+                ValidationCode::FinalmaskFilterOnOutbound,
+                ValidationCode::FinalmaskFilterOnOutbound,
+            ],
+            "the warnings list keeps the aggregated advisories: {:#?}",
+            findings.advisory
+        );
+        assert!(findings.blocking.is_empty(), "{:#?}", findings.blocking);
+    }
+
     /// The model's required-value findings are the rendered Save gate: an
     /// edited VLESS draft with an empty address and id paints the model's
     /// messages in the error list and takes Validate-and-save dark while
@@ -9336,11 +9324,7 @@ Authentication: ML-KEM-768, Post-Quantum
             settings.address.clear();
             settings.id.clear();
         }
-        install_draft(
-            &mut harness.state_mut().0,
-            &empty,
-            serde_json::to_value(&clean).unwrap(),
-        );
+        install_draft(&mut harness.state_mut().0, &empty, &clean);
         harness.run();
 
         let blocking = editor_blocking(&harness);
@@ -11983,7 +11967,7 @@ Authentication: ML-KEM-768, Post-Quantum
             }))
             .expect("fixture is a valid finalmask"),
         );
-        let findings = super::finalmask_findings(&profile);
+        let findings = editor_validation_findings(&profile).finalmask;
         let issue = finding(&findings, ValidationCode::FinalmaskXdnsResolverAddrsEmpty);
         let message = validation_message(&issue.code, Language::En);
         let errors = super::render_findings(findings.iter(), Language::En);
@@ -12033,7 +12017,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ],
             ..Default::default()
         });
-        let findings = super::finalmask_findings(&profile);
+        let findings = editor_validation_findings(&profile).finalmask;
         let errors = super::render_findings(findings.iter(), Language::En);
         let mut rendered = Vec::new();
         for code in [
@@ -13063,11 +13047,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The same draft with an edit behind it: both controls are live.
         let mut edited = clean.clone();
         edited.name = "Tokyo edited".into();
-        install_draft(
-            &mut harness.state_mut().0,
-            &edited,
-            serde_json::to_value(&clean).unwrap(),
-        );
+        install_draft(&mut harness.state_mut().0, &edited, &clean);
         harness.run();
         assert_eq!(
             action_row_disabled(&harness),
@@ -13079,11 +13059,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // itself still matches its source, so Save must refuse (committing
         // it would leave the unsaved text behind) while Discard stays live,
         // or the user would be stuck with the error text.
-        install_draft(
-            &mut harness.state_mut().0,
-            &clean,
-            serde_json::to_value(&clean).unwrap(),
-        );
+        install_draft(&mut harness.state_mut().0, &clean, &clean);
         harness.state_mut().0.seeded_buffers.json_mut().insert(
             egui::Id::new("finalmask-raw-action-row"),
             JsonBuf {
@@ -13105,11 +13081,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The edit plus a blocking finding: Discard stays, Save goes dark.
         let mut blocked = edited;
         blocked.outbound.stream.finalmask = Some(bad_finalmask_model());
-        install_draft(
-            &mut harness.state_mut().0,
-            &blocked,
-            serde_json::to_value(&clean).unwrap(),
-        );
+        install_draft(&mut harness.state_mut().0, &blocked, &clean);
         harness.run();
         assert!(
             !editor_blocking(&harness).is_empty(),
@@ -13219,7 +13191,8 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         // A moved generation sweeps the profile as it is now and renders it.
-        draft.baseline = serde_json::to_value(&draft.profile).expect("the fixture serializes");
+        let current = draft.profile.clone();
+        draft.baseline = DraftBaseline::of(&current).expect("the fixture serializes");
         draft.generation = 2;
         draft.refresh(Language::En);
         let reswept = draft.validation.as_ref().expect("the memo stays populated");

@@ -24,7 +24,7 @@ use super::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
     DNS_OUTBOUND_TAG, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
-use super::servers::{ServerProfile, ServersFile};
+use super::servers::{ServerProfile, ServersFile, TAG_PREFIX};
 use super::settings::{Mode, Settings};
 use serde_json::{Value, json};
 
@@ -295,11 +295,14 @@ fn bootstrap_dns_server(settings: &Settings, domains: &[String]) -> Option<Value
 /// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
 /// the compiler noticing.
 pub(crate) struct Emission {
-    /// The outbound tags this document dials: the default route and the
-    /// profiles its rules, balancers and health engines reach, each mapped to
-    /// its chain terminal. These are the only profiles whose server address
-    /// this machine dials, so the only ones whose domain the bootstrap
-    /// resolver may answer.
+    /// The tags this document dials — the default route and the profiles its
+    /// rules, balancers and health engines reach, each mapped to its chain
+    /// terminal — reduced to the `srv-` id prefix every tag carries
+    /// ([`ServerProfile::tag_eq`] defines the equivalence). These are the only
+    /// profiles whose server address this machine dials, so the only ones
+    /// whose domain the bootstrap resolver may answer. Membership tests run
+    /// against the profile's own id prefix, so a non-dialed profile costs no
+    /// tag formatting.
     dialed: BTreeSet<String>,
     /// The scoped bootstrap resolver this document emits, if any: a DNS
     /// module exists, a dialed profile has a domain, and no DNS script owns
@@ -325,11 +328,22 @@ impl Emission {
     pub(crate) fn new(servers: &ServersFile, settings: &Settings) -> Emission {
         let fakedns = fakedns_enabled(settings);
         let dns_on = dns_module_emitted(settings);
-        let dialed = DialGraph::for_profiles(&servers.profiles).dialed_outbound_tags(settings);
+        // `dialed_outbound_tags` only ever inserts `ServerProfile::tag`, so
+        // every entry carries the prefix; the id behind it is what a profile
+        // can reproduce without formatting its own tag.
+        let dialed: BTreeSet<String> = DialGraph::for_profiles(&servers.profiles)
+            .dialed_outbound_tags(settings)
+            .into_iter()
+            .map(|tag| {
+                tag.strip_prefix(TAG_PREFIX)
+                    .expect("a dialed outbound tag carries the `srv-` prefix")
+                    .to_string()
+            })
+            .collect();
         let mut server_domains: Vec<String> = servers
             .profiles
             .iter()
-            .filter(|profile| dialed.contains(&profile.tag()))
+            .filter(|profile| dialed.contains(profile.tag_id()))
             .filter_map(profile_server_domain)
             .collect();
         server_domains.sort();
@@ -368,7 +382,7 @@ impl Emission {
     /// on the far side, and a standby the document never dials resolves
     /// nothing before the tunnel — see [`crate::model::dial`]).
     pub(crate) fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
-        self.bootstrap.is_some() && self.dialed.contains(&profile.tag())
+        self.bootstrap.is_some() && self.dialed.contains(profile.tag_id())
     }
 
     /// The scoped bootstrap server to append to the DNS document, if one is

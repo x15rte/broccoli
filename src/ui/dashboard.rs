@@ -11,6 +11,7 @@ use crate::ui::status::{
 };
 use crate::ui::widgets;
 use crate::ui::{DashboardCtx, PhaseAction, TerminalErrorView};
+use std::collections::HashMap;
 
 /// Throughput-plot series, rebuilt only when the stats generation advances
 /// (a 1 Hz stats tick — the only way the history ring changes).
@@ -41,13 +42,31 @@ struct LatencyRow {
     name: String,
     tag: String,
     cell: LatencyCell,
-    /// Row detail shortened to ≤ 60 chars, plus the full text for the hover
-    /// and whether the label was truncated. The detail is the observatory's
-    /// last error — with the probe child's diagnostics wall when one was
-    /// captured — or the burst engine's window statistics.
+    /// The detail's headline: the observatory's last error, the keyed
+    /// no-observation fallback, or the burst engine's window statistics.
+    detail_head: String,
+    /// The probe child's captured diagnostics tail, kept apart so the
+    /// generation-keyed rebuild never joins it to the headline: the composed
+    /// wall can be several KiB, and only the first 60 characters feed the
+    /// visible label. The hover text is composed from the pieces on demand.
+    detail_tail: Option<String>,
+    /// The visible label: the first 60 characters of the composed text, and
+    /// whether the composition was cut short.
     detail_short: String,
-    detail_full: String,
     detail_truncated: bool,
+}
+
+impl LatencyRow {
+    /// The full detail text the hover tooltip shows, composed only when the
+    /// tooltip opens (egui runs the hover closure then, not on the row's
+    /// rebuild or on idle frames).
+    fn detail_full(&self, lang: Language) -> String {
+        let head = self.detail_head.clone();
+        match self.detail_tail.as_deref() {
+            Some(tail) => crate::probe_verdict::with_diagnostics_wall(lang, head, tail),
+            None => head,
+        }
+    }
 }
 
 /// The latency display resolution for one profile row.
@@ -675,7 +694,19 @@ impl DashboardScreen {
                                         .show_tooltip_when_elided(true),
                                 );
                                 if row.detail_truncated {
-                                    response.on_hover_text(&row.detail_full);
+                                    // The pieces are joined only when the
+                                    // tooltip opens: egui runs this closure
+                                    // then, so an idle or merely rebuilt
+                                    // frame never composes a dead row's
+                                    // multi-KiB diagnostics wall. The width
+                                    // pin is what `on_hover_text` (which this
+                                    // replaces to defer the join) sets too, so
+                                    // the tip cannot shrink around dynamic
+                                    // content.
+                                    response.on_hover_ui(|ui| {
+                                        ui.set_max_width(ui.spacing().tooltip_width);
+                                        ui.add(egui::Label::new(row.detail_full(lang)));
+                                    });
                                 }
                                 ui.end_row();
                             }
@@ -770,12 +801,22 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
 /// generation key changes, never per frame.
 fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
     let lang = ctx.settings.language;
+    // One index for the whole pass instead of a linear scan per profile: the
+    // previous `find` made this O(profiles × observatory rows) on every
+    // generation-keyed rebuild.
+    let mut by_tag: HashMap<&str, &OutboundStatusView> =
+        HashMap::with_capacity(ctx.observatory.len());
+    for status in ctx.observatory {
+        // `find` returned the first row for a tag; a duplicate tag must not
+        // overwrite that choice.
+        by_tag.entry(status.tag.as_str()).or_insert(status);
+    }
     ctx.servers
         .profiles
         .iter()
         .map(|p| {
             let tag = p.tag();
-            let status = ctx.observatory.iter().find(|o| o.tag == tag);
+            let status = by_tag.get(tag.as_str()).copied();
             let cell = match status {
                 Some(o) if o.alive => LatencyCell::Alive {
                     delay_ms: o.delay_ms,
@@ -791,55 +832,84 @@ fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
                     None => LatencyCell::Unknown,
                 },
             };
-            let detail = row_detail(lang, status);
-            let (detail_short, detail_truncated) = truncate_chars(&detail, 60);
+            let (detail_head, detail_tail) = row_detail(lang, status);
+            let (detail_short, detail_truncated) =
+                short_detail(lang, &detail_head, detail_tail.as_deref(), 60);
             LatencyRow {
                 name: p.name.clone(),
                 tag,
                 cell,
+                detail_head,
+                detail_tail,
                 detail_short,
-                detail_full: detail,
                 detail_truncated,
             }
         })
         .collect()
 }
 
-/// The detail column of one row: the burst engine's window statistics when it
-/// reported them, else the Observatory's last error — a dead row whose status
-/// carries probe-child diagnostics surfaces that wall in the hover-full text,
-/// while the visible label stays a 60-char truncation of the combined text.
-/// A dead row the Observatory could not explain reads the keyed fallback; a
-/// live row needs no detail and keeps the column empty.
-fn row_detail(lang: Language, status: Option<&OutboundStatusView>) -> String {
+/// The detail column of one row, as the two pieces the hover text composes:
+/// the headline — the burst engine's window statistics when it reported
+/// them, else the Observatory's last error — and the probe child's captured
+/// diagnostics tail when there is one. A dead row the Observatory could not
+/// explain reads the keyed fallback; a live row needs no detail and keeps
+/// both pieces empty.
+fn row_detail(lang: Language, status: Option<&OutboundStatusView>) -> (String, Option<String>) {
     let Some(status) = status else {
-        return String::new();
+        return (String::new(), None);
     };
     if let Some(health) = status.health_ping {
         // The engine keeps no error text; the sample window is the whole
         // story of a dead row.
-        return t_fmt(
-            lang,
-            Key::HealthPingSummary,
-            &[
-                &health.average_ms,
-                &health.min_ms,
-                &health.max_ms,
-                &health.deviation_ms,
-                &health.fail,
-                &health.all,
-            ],
+        return (
+            t_fmt(
+                lang,
+                Key::HealthPingSummary,
+                &[
+                    &health.average_ms,
+                    &health.min_ms,
+                    &health.max_ms,
+                    &health.deviation_ms,
+                    &health.fail,
+                    &health.all,
+                ],
+            ),
+            None,
         );
     }
-    let mut detail = match status.last_error.as_deref() {
+    let head = match status.last_error.as_deref() {
         Some(text) => text.to_owned(),
         None if status.alive => String::new(),
         None => t(lang, Key::DashboardLatencyNoObservation).to_owned(),
     };
-    if let Some(tail) = status.diagnostics.as_deref() {
-        detail = crate::probe_verdict::with_diagnostics_wall(lang, detail, tail);
-    }
-    detail
+    // An empty tail is no wall (`with_diagnostics_wall` returns the message
+    // unchanged): keep it as absence, so the tooltip's composition and the
+    // visible truncation both read it the same way.
+    let tail = status
+        .diagnostics
+        .as_deref()
+        .filter(|tail| !tail.is_empty())
+        .map(str::to_owned);
+    (head, tail)
+}
+
+/// The visible detail label: the first `max_chars` characters of the text
+/// the hover tooltip will compose, plus whether it was cut. Composed through
+/// the same helper the tooltip uses, with the diagnostics tail pre-cut to
+/// the longest it can matter: a dead row's multi-KiB probe tail never gets
+/// joined into the memoized rows.
+fn short_detail(
+    lang: Language,
+    head: &str,
+    tail: Option<&str>,
+    max_chars: usize,
+) -> (String, bool) {
+    let cut_tail = tail.map(|tail| tail.chars().take(max_chars + 1).collect::<String>());
+    let text = match cut_tail.as_deref() {
+        Some(tail) => crate::probe_verdict::with_diagnostics_wall(lang, head.to_owned(), tail),
+        None => head.to_owned(),
+    };
+    truncate_chars(&text, max_chars)
 }
 
 fn latency_color(ms: i64, colors: StatusColors) -> egui::Color32 {
@@ -1139,6 +1209,7 @@ mod tests {
     };
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
     use crate::ui::TerminalErrorView;
+    use crate::ui::TrafficSample;
     use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable as _};
     use std::cell::RefCell;
@@ -1903,11 +1974,9 @@ mod tests {
             profile("beta", Some(-1)),
             profile("gamma", None),
         ];
-        rig.borrow_mut().stats_history.push_back(StatsTick {
-            up: 10,
-            down: 20,
-            ..Default::default()
-        });
+        rig.borrow_mut()
+            .stats_history
+            .push_back(TrafficSample { up: 10, down: 20 });
         let rig_handle = rig.clone();
         let mut harness = Harness::builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
@@ -1934,11 +2003,9 @@ mod tests {
             .expect("unmeasured profile latency renders as the em dash");
 
         // A stats tick grows the plot history and leaves the rows intact.
-        rig.borrow_mut().stats_history.push_back(StatsTick {
-            up: 100,
-            down: 200,
-            ..Default::default()
-        });
+        rig.borrow_mut()
+            .stats_history
+            .push_back(TrafficSample { up: 100, down: 200 });
         rig.borrow_mut().stats_generation += 1;
         harness.run();
         harness
@@ -1978,7 +2045,8 @@ mod tests {
     }
 
     /// Long observatory last-error text is truncated to 60 chars in the
-    /// memoized row, and the full text is kept for the hover.
+    /// memoized row, and the hover text is composed from the stored pieces
+    /// when the tooltip opens.
     #[test]
     fn grid_rows_truncate_long_errors_once_per_rebuild() {
         let long_error = "e".repeat(100);
@@ -2024,7 +2092,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].cell, LatencyCell::DeadObservatory));
         assert_eq!(rows[0].detail_short, long_error[..60]);
-        assert_eq!(rows[0].detail_full, long_error);
+        assert_eq!(rows[0].detail_full(Language::En), long_error);
         assert!(rows[0].detail_truncated);
     }
 
@@ -2057,7 +2125,7 @@ mod tests {
             t(Language::En, Key::ProbeDiagnosticsWall)
         );
         assert_eq!(rows[0].detail_short, &combined[..60]);
-        assert_eq!(rows[0].detail_full, combined);
+        assert_eq!(rows[0].detail_full(Language::En), combined);
         assert!(rows[0].detail_truncated);
     }
 
@@ -2083,7 +2151,7 @@ mod tests {
 
         let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows[0].detail_short, "connection refused");
-        assert_eq!(rows[0].detail_full, "connection refused");
+        assert_eq!(rows[0].detail_full(Language::En), "connection refused");
         assert!(!rows[0].detail_truncated);
     }
 
@@ -2122,10 +2190,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0].cell, LatencyCell::DeadObservatory));
         assert_eq!(
-            rows[0].detail_full,
+            rows[0].detail_full(Language::En),
             t(Language::En, Key::DashboardLatencyNoObservation)
         );
-        assert_eq!(rows[1].detail_full, "");
+        assert_eq!(rows[1].detail_full(Language::En), "");
     }
 
     /// A row reported by the burst engine carries its window statistics in
@@ -2159,7 +2227,7 @@ mod tests {
         let rows = build_latency_rows(&rig.borrow_mut().ctx().dashboard());
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].detail_full,
+            rows[0].detail_full(Language::En),
             t_fmt(
                 Language::En,
                 Key::HealthPingSummary,

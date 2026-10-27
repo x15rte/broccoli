@@ -106,7 +106,7 @@ const MAX_WIRE_MESSAGE_BYTES: usize = 16 * super::supervisor::MAX_LINE_BYTES;
 /// cycle, but this hop's consumer is the single current-thread runtime
 /// select loop, which suspends its events arm for the whole duration of
 /// any command handler — and healthy handlers stall far beyond 250 ms: the
-/// stats poll runs sequential bounded RPCs (~1.5 s), a TUN teardown is
+/// stats poll runs its bounded RPCs together (~0.55 s), a TUN teardown is
 /// bounded by [`super::TUN_CLOSE_DEADLINE`] (3.25 s), and payload hashing
 /// freezes the loop for up to ~0.6 s. A TUN-mode core's unsolicited `Exit`
 /// is the only signal its Pipe backend ever gets, so an event must survive
@@ -406,8 +406,14 @@ fn wait_for_message(
     }
 }
 
-/// Read one complete message from the message-mode pipe `handle`, sized to
-/// the message instead of a fixed 8 KiB buffer.
+/// Growth step of the reusable pipe read buffer when a message outgrows it:
+/// the old per-message chunk size, so a message the kernel hands over in
+/// pieces still arrives in a bounded number of reads. Steady-state readers
+/// never allocate; only a message larger than any before grows the buffer.
+const READ_STEP: usize = 8 * 1024;
+
+/// Read one complete message from the message-mode pipe `handle` into
+/// `buffer`, sized to the message instead of a fixed 8 KiB read.
 ///
 /// Message-mode reads fail with `ERROR_MORE_DATA` when the caller's buffer is
 /// smaller than the message (the bytes that fit are consumed from the pipe).
@@ -419,7 +425,17 @@ fn wait_for_message(
 /// drained so the pipe stays aligned; the caller's JSON parse of the
 /// truncated bytes fails and the message is skipped — never fatal. `Ok(None)`
 /// means no message is currently buffered; `Err` means the pipe is gone.
-fn read_pipe_message(handle: HANDLE, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+///
+/// `buffer` belongs to the caller's read loop: the peek sizes it, its
+/// high-water length stays initialized, and only a message larger than any
+/// before grows (and zeroes) it — so a steady pipe pays no per-message
+/// allocation. The returned slice borrows it and is overwritten by the next
+/// call.
+fn read_pipe_message(
+    handle: HANDLE,
+    cap: usize,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<Option<&[u8]>> {
     let mut available = 0u32;
     // SAFETY: `handle` is the valid open pipe handle owned by the caller's
     // `File`; a null buffer with size 0 peeks without reading, and
@@ -434,28 +450,45 @@ fn read_pipe_message(handle: HANDLE, cap: usize) -> std::io::Result<Option<Vec<u
     if available == 0 {
         return Ok(None);
     }
-    let mut message: Vec<u8> = Vec::with_capacity((available as usize).min(cap));
-    let mut chunk = vec![0u8; 8 * 1024];
+    // The peek sizes this message; the cap bounds what it may retain.
+    let mut want = (available as usize).min(cap);
+    if buffer.len() < want {
+        buffer.resize(want, 0);
+    }
+    let mut filled = 0usize;
     loop {
         let mut read = 0u32;
-        // SAFETY: `handle` is the valid open pipe handle; `chunk` is a
-        // writable buffer alive for the call; `read` is a valid
-        // out-parameter. The result is checked below.
-        let result = unsafe { ReadFile(handle, Some(&mut chunk[..]), Some(&mut read), None) };
+        // SAFETY: `handle` is the valid open pipe handle; the untouched tail
+        // of `buffer` is a writable buffer alive for the call; `read` is a
+        // valid out-parameter. The result is checked below. Each read starts
+        // at `filled`, so a message the pipe hands over in pieces
+        // accumulates contiguously.
+        let result = unsafe {
+            ReadFile(
+                handle,
+                Some(&mut buffer[filled..want]),
+                Some(&mut read),
+                None,
+            )
+        };
         match result {
             Ok(()) => {
-                message.extend_from_slice(&chunk[..read as usize]);
-                if message.len() > cap {
-                    message.truncate(cap);
-                }
-                return Ok(Some(message));
+                filled += read as usize;
+                // The read fits `want`, which the cap already bounded.
+                return Ok(Some(&buffer[..filled]));
             }
             Err(error) if error.code() == HRESULT::from_win32(ERROR_MORE_DATA.0) => {
-                message.extend_from_slice(&chunk[..read as usize]);
-                if message.len() >= cap {
+                filled += read as usize;
+                if filled >= cap {
                     drain_pipe_remainder(handle)?;
-                    message.truncate(cap);
-                    return Ok(Some(message));
+                    return Ok(Some(&buffer[..cap]));
+                }
+                // The message continues past what this read could take:
+                // grow the reused buffer by one old-sized step and keep
+                // reading, so the message still arrives intact.
+                want = want.saturating_add(READ_STEP).min(cap);
+                if buffer.len() < want {
+                    buffer.resize(want, 0);
                 }
             }
             Err(error) => return Err(std::io::Error::other(error)),
@@ -1641,13 +1674,16 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     // No privileged state or command dispatch exists before bounded
     // authentication. Parent loss also terminates this wait.
     wait_for_message(handle, Some(Instant::now() + AUTH_TIMEOUT), Some(parent.0))?;
-    let Some(auth_bytes) =
-        read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES).diag(Key::HelperAuthReadFailed)?
+    // One read buffer for the handshake message and every command after it:
+    // the reader reuses its high-water allocation across messages.
+    let mut wire_buffer = Vec::new();
+    let Some(auth_bytes) = read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES, &mut wire_buffer)
+        .diag(Key::HelperAuthReadFailed)?
     else {
         return Err(DiagError::new(Diag::new(Key::HelperAuthMessageMissing)));
     };
     let auth: serde_json::Value =
-        serde_json::from_slice(&auth_bytes).diag(Key::HelperAuthParseFailed)?;
+        serde_json::from_slice(auth_bytes).diag(Key::HelperAuthParseFailed)?;
     let presented = auth
         .get("token")
         .and_then(serde_json::Value::as_str)
@@ -1676,11 +1712,12 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
             Ok(true) => {}
             Ok(false) | Err(_) => break,
         }
-        let command_bytes = match read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) | Err(_) => break,
-        };
-        let command = match serde_json::from_slice::<HelperCommand>(&command_bytes) {
+        let command_bytes =
+            match read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES, &mut wire_buffer) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(_) => break,
+            };
+        let command = match serde_json::from_slice::<HelperCommand>(command_bytes) {
             Ok(command) => command,
             Err(error) => {
                 // An unreadable message is ignored: the pipe carries
@@ -1689,7 +1726,7 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
                 // different — the GUI asked this helper to launch a core and
                 // the helper cannot serve the request — so it is reported and
                 // ends the helper, exactly like an invalid field.
-                if is_start_tag(&command_bytes) {
+                if is_start_tag(command_bytes) {
                     send_log_record(
                         &writer,
                         &DiagError::new(Diag::new(Key::HelperMalformedStartCommand))
@@ -1790,13 +1827,43 @@ fn serve(pipe_id: &str, token: &str, expected_parent_pid: u32) -> Result<(), Dia
     Ok(())
 }
 
-fn send_event(writer: &Arc<Mutex<File>>, value: &serde_json::Value) {
-    let mut message = value.to_string();
-    message.push('\n');
-    if let Ok(mut writer) = writer.lock() {
-        let _ = writer.write_all(message.as_bytes());
-        let _ = writer.flush();
-    }
+thread_local! {
+    /// Reused serialization buffer for the records the current thread writes.
+    /// The helper pipe is message-mode — the kernel turns each write into one
+    /// message — so a record must reach it in a single write; serializing into
+    /// this buffer first keeps the borrowed record's cost to the Value tree it
+    /// no longer builds, not an allocation per line.
+    static WIRE_RECORD: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Write one wire record and its newline framing. The record is serialized
+/// straight into the thread's buffer (`to_writer`), so a borrowed record
+/// costs no intermediate `Value`; the buffer then lands in the pipe as one
+/// message, which is what the reader's per-message parse requires.
+fn send_event<T>(writer: &Arc<Mutex<File>>, value: &T)
+where
+    T: serde::Serialize + ?Sized,
+{
+    WIRE_RECORD.with(|record| {
+        let mut record = record.borrow_mut();
+        record.clear();
+        if serde_json::to_writer(&mut *record, value).is_err() {
+            return;
+        }
+        record.push(b'\n');
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.write_all(&record);
+            let _ = writer.flush();
+        }
+    });
+}
+
+/// The `{"event":"log","line":...}` record for one captured core line: a
+/// borrowed record, built per line without touching the heap.
+#[derive(serde::Serialize)]
+struct LogLine<'a> {
+    event: &'static str,
+    line: &'a str,
 }
 
 /// Sync counterpart of `supervisor::read_capped_line` for the elevated
@@ -2123,7 +2190,10 @@ fn helper_start(
             while let Ok(Some(line)) = read_capped_line_sync(&mut reader) {
                 send_event(
                     &writer,
-                    &serde_json::json!({"event":"log","line":line.trim_end()}),
+                    &LogLine {
+                        event: "log",
+                        line: line.trim_end(),
+                    },
                 );
             }
             let _ = reader_done.send(());
@@ -3602,6 +3672,58 @@ pub enum HelperEvent {
     },
 }
 
+/// One `{"event":...}` record as the pipe carries it, borrowed from the read
+/// buffer. The reader decodes the common shapes — a passthrough core line, a
+/// phase report, an exit — straight into [`HelperEvent`] without building a
+/// `Value` tree per message. Anything this shape does not model falls back to
+/// [`decode_helper_event`]: an authored log record (its `keys` chain is a
+/// presence marker here; the `Value` decoder resolves it), a field with an
+/// unexpected type, or an event name this build does not know — which
+/// degrades and skips exactly as before.
+#[derive(serde::Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum WireEvent<'a> {
+    /// The child phase report; a missing or unknown phase fails this decode
+    /// and falls back to the `Value` decoder, which skips the record.
+    State {
+        state: ChildPhase,
+        #[serde(default)]
+        pid: u32,
+    },
+    /// One log record. `keys` is a presence marker only: when an authored
+    /// record carries the keyed chain, the `Value` decoder rebuilds the
+    /// `DiagError`; a passthrough core line (the common case) carries just
+    /// `line` and becomes [`HelperLog::Raw`] with one string copy. A line
+    /// whose wire text needed unescaping cannot be borrowed (serde buffers
+    /// it as an owned string), so that record fails this decode and takes
+    /// the same `Value` path — with the same text.
+    Log {
+        #[serde(default)]
+        line: Option<&'a str>,
+        #[serde(default)]
+        keys: Option<serde::de::IgnoredAny>,
+    },
+    /// The child exited with `code` (absent means the helper never learnt
+    /// one).
+    Exit {
+        /// Absent means the helper never learnt one; the `Value` decoder's
+        /// `-1` is the same statement, so the fast path must not read the
+        /// absent field as a clean exit.
+        #[serde(default)]
+        code: Option<i32>,
+    },
+    /// Terminal of a cleanup command.
+    Cleaned {
+        #[serde(default)]
+        dns_adapters: u32,
+        #[serde(default)]
+        adapters_removed: u32,
+    },
+    /// An event name this build does not know: skipped.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Decode one `{"event":...}` record from the helper. `None` means the record
 /// names no event this build knows, which the reader skips — a helper from
 /// the same build only ever sends the events above, and never a state
@@ -3910,15 +4032,49 @@ impl HelperPipe {
                 // backend).
                 let pipe_handle = HANDLE(reader_file.as_raw_handle());
                 let mut log_gate = LogGate::new();
+                // One read buffer for this reader's whole life: its
+                // high-water allocation is reused by every message.
+                let mut wire_buffer = Vec::new();
                 while !thread_cancel.load(Ordering::Acquire) {
-                    match read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES) {
+                    match read_pipe_message(pipe_handle, MAX_WIRE_MESSAGE_BYTES, &mut wire_buffer) {
                         Ok(Some(bytes)) => {
-                            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                            else {
-                                continue;
-                            };
-                            let Some(event) = decode_helper_event(&value) else {
-                                continue;
+                            // The borrowed shape decodes the common records —
+                            // a passthrough core line, a phase, an exit —
+                            // without building a `Value`. Anything it does
+                            // not model (an authored log with its keyed
+                            // chain, an unknown event, a malformed field)
+                            // goes through the `Value` decoder, whose
+                            // raw-degradation and skip rules are unchanged.
+                            let event = match serde_json::from_slice::<WireEvent<'_>>(bytes) {
+                                Ok(WireEvent::Unknown) => continue,
+                                Ok(WireEvent::State { state, pid }) => {
+                                    HelperEvent::State { state, pid }
+                                }
+                                Ok(WireEvent::Exit { code }) => {
+                                    HelperEvent::Exit(code.unwrap_or(-1))
+                                }
+                                Ok(WireEvent::Cleaned {
+                                    dns_adapters,
+                                    adapters_removed,
+                                }) => HelperEvent::Cleaned {
+                                    dns_adapters,
+                                    adapters_removed,
+                                },
+                                Ok(WireEvent::Log {
+                                    line: Some(line),
+                                    keys: None,
+                                }) => HelperEvent::Log(HelperLog::Raw(line.to_owned())),
+                                Ok(WireEvent::Log { .. }) | Err(_) => {
+                                    let Ok(value) =
+                                        serde_json::from_slice::<serde_json::Value>(bytes)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(event) = decode_helper_event(&value) else {
+                                        continue;
+                                    };
+                                    event
+                                }
                             };
                             // The hop is bounded: log lines are
                             // drop-coalesced by `log_gate` when the runtime
@@ -5463,10 +5619,12 @@ mod tests {
         client.write_all(&big).expect("write 20 KiB message");
         client.write_all(b"tail\n").expect("write tail message");
 
-        let read = |cap: usize| {
-            read_pipe_message(HANDLE(server.0), cap)
+        let mut wire = Vec::new();
+        let mut read = |cap: usize| -> Vec<u8> {
+            read_pipe_message(HANDLE(server.0), cap, &mut wire)
                 .expect("read from test pipe")
                 .expect("message available")
+                .to_vec()
         };
 
         let first = read(MAX_WIRE_MESSAGE_BYTES);
@@ -5492,10 +5650,12 @@ mod tests {
         client.write_all(&over).expect("write over-cap message");
         client.write_all(b"tail\n").expect("write tail message");
 
-        let read = |cap: usize| {
-            read_pipe_message(HANDLE(server.0), cap)
+        let mut wire = Vec::new();
+        let mut read = |cap: usize| -> Vec<u8> {
+            read_pipe_message(HANDLE(server.0), cap, &mut wire)
                 .expect("read from test pipe")
                 .expect("message available")
+                .to_vec()
         };
         let first = read(cap);
         assert_eq!(first.as_slice(), &b"small\n"[..]);
@@ -5527,14 +5687,15 @@ mod tests {
         client.write_all(b"bye\n").expect("write last message");
         drop(client);
         let handle = HANDLE(server.0);
+        let mut wire = Vec::new();
         // The buffered message is still readable before the break surfaces.
-        let message = read_pipe_message(handle, MAX_WIRE_MESSAGE_BYTES)
+        let message = read_pipe_message(handle, MAX_WIRE_MESSAGE_BYTES, &mut wire)
             .expect("buffered message must read")
             .expect("message available");
-        assert_eq!(message.as_slice(), &b"bye\n"[..]);
+        assert_eq!(message, &b"bye\n"[..]);
         // After the buffered data is gone the closed peer must be an error.
         assert!(
-            read_pipe_message(handle, MAX_WIRE_MESSAGE_BYTES).is_err(),
+            read_pipe_message(handle, MAX_WIRE_MESSAGE_BYTES, &mut wire).is_err(),
             "closed peer must surface as Err, never as an empty poll"
         );
     }
@@ -5750,7 +5911,7 @@ mod tests {
     /// hop is full must survive a runtime stall longer than the GUI-frame
     /// window — the helper hop's consumer is the single current-thread
     /// runtime, which can stay inside one healthy handler for seconds
-    /// (stats poll ~1.5 s, TUN teardown up to 3.25 s, payload hashing).
+    /// (stats poll ~0.55 s, TUN teardown up to 3.25 s, payload hashing).
     /// The channel stays full for a stall beyond the old 250 ms bound but
     /// well inside the new [`LIFECYCLE_SEND_WINDOW`]; when the runtime
     /// drains, the exit event must be delivered — not dropped.

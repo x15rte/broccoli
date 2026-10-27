@@ -1,8 +1,10 @@
 //! Minimal readers for the managed Xray geosite and geoip protobuf files.
 //!
 //! The payloads can be large, so this module only decodes the outer entry
-//! envelopes and each entry's code. Domain and CIDR fields are skipped in
-//! place without allocating or decoding them.
+//! envelopes and each entry's code. Domain and CIDR fields are skipped in the
+//! byte stream — read past into a sink, never buffered, allocated, or decoded
+//! — so loading a DAT costs one buffered pass and one small allocation per
+//! entry code, never a whole-file buffer.
 
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::settings::Language;
@@ -10,8 +12,7 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
-use std::ops::Range;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -178,22 +179,20 @@ fn load_catalog(path: PathBuf) -> Result<GeodataCatalog, GeodataError> {
             max_byte_len: MAX_FILE_SIZE_BYTES,
         });
     }
-
-    let capacity = usize::try_from(announced_len).map_err(|_| GeodataError::TooLarge {
-        path: path.clone(),
-        byte_len: announced_len,
-        max_byte_len: MAX_FILE_SIZE_BYTES,
-    })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.by_ref()
-        .take(MAX_FILE_SIZE_BYTES + 1)
-        .read_to_end(&mut bytes)
+    // The scan never buffers the file, so the number of bytes it may consume
+    // is established once, up front: the file's real length, capped at the
+    // probe byte that proves a file grown past the limit after the metadata
+    // check (the same cap the old whole-file read applied). That bound is the
+    // scan's end of stream, so a length-delimited field claiming more still
+    // reports the truncation the in-memory scanner reported.
+    let stream_len = file
+        .seek(SeekFrom::End(0))
         .map_err(|source| GeodataError::Io {
             operation: GeodataOperation::Read,
             path: path.clone(),
             source,
         })?;
-    let byte_len = bytes.len() as u64;
+    let byte_len = stream_len.min(MAX_FILE_SIZE_BYTES + 1);
     if byte_len > MAX_FILE_SIZE_BYTES {
         return Err(GeodataError::TooLarge {
             path,
@@ -201,11 +200,28 @@ fn load_catalog(path: PathBuf) -> Result<GeodataCatalog, GeodataError> {
             max_byte_len: MAX_FILE_SIZE_BYTES,
         });
     }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| GeodataError::Io {
+            operation: GeodataOperation::Read,
+            path: path.clone(),
+            source,
+        })?;
 
-    let codes = scan_codes(&bytes).map_err(|error| GeodataError::Malformed {
-        path: path.clone(),
-        offset: error.offset,
-        reason: error.kind.to_string(),
+    // One buffered pass over the file: entry envelopes are walked in place,
+    // and the domain/CIDR payloads — the bulk of a DAT — are discarded
+    // through a sink instead of being materialised, so no whole-file (or
+    // whole-entry) buffer is ever allocated.
+    let codes = scan_codes_stream(BufReader::new(file), byte_len).map_err(|error| match error {
+        CatalogScanError::Malformed(error) => GeodataError::Malformed {
+            path: path.clone(),
+            offset: error.offset,
+            reason: error.kind.to_string(),
+        },
+        CatalogScanError::Io(source) => GeodataError::Io {
+            operation: GeodataOperation::Read,
+            path: path.clone(),
+            source,
+        },
     })?;
 
     Ok(GeodataCatalog {
@@ -218,15 +234,190 @@ fn load_catalog(path: PathBuf) -> Result<GeodataCatalog, GeodataError> {
     })
 }
 
-/// Scan a `GeoSiteList` or `GeoIPList`. Both use repeated field 1 for entries,
-/// and both embedded entry messages use string field 1 for their code.
-fn scan_codes(bytes: &[u8]) -> Result<Vec<String>, ScanError> {
-    let mut cursor = 0;
+/// A failed incremental scan: either a malformed byte stream — reported with
+/// the same offset and reason the whole-buffer scanner produced — or an I/O
+/// failure that reading the file piecewise can now surface.
+enum CatalogScanError {
+    Malformed(ScanError),
+    Io(io::Error),
+}
+
+impl From<ScanError> for CatalogScanError {
+    fn from(error: ScanError) -> Self {
+        Self::Malformed(error)
+    }
+}
+
+/// A bounded incremental reader over one geodata byte stream.
+///
+/// `position` is the absolute offset of the next byte, so every error names
+/// the same `offset` a scan over the whole file buffer would have named. The
+/// `Take` bound is what ends a (sub)stream: the file cap for the outer scan,
+/// the entry's declared length for an entry envelope. Payloads are
+/// bounds-checked against `remaining` and then discarded through a sink, so
+/// nothing but a single entry's code is ever buffered.
+struct ScanStream<R> {
+    reader: io::Take<R>,
+    position: u64,
+}
+
+impl<R: Read> ScanStream<R> {
+    fn new(reader: R, length: u64, start: u64) -> Self {
+        Self {
+            reader: reader.take(length),
+            position: start,
+        }
+    }
+
+    /// The offset every error at this point must report.
+    ///
+    /// The stream is length-capped at `MAX_FILE_SIZE_BYTES + 1`, which fits a
+    /// `usize` on every supported target, so the cast never truncates.
+    fn offset(&self) -> usize {
+        self.position as usize
+    }
+
+    fn remaining(&self) -> u64 {
+        self.reader.limit()
+    }
+
+    /// Read as much of `out` as the stream still allows, retrying interrupted
+    /// reads; a short result means the stream ended early.
+    fn read_up_to(&mut self, out: &mut [u8]) -> Result<usize, CatalogScanError> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match self.reader.read(&mut out[filled..]) {
+                Ok(0) => break,
+                Ok(read) => {
+                    filled += read;
+                    self.position += read as u64;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(CatalogScanError::Io(error)),
+            }
+        }
+        Ok(filled)
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>, CatalogScanError> {
+        let mut byte = [0_u8; 1];
+        Ok((self.read_up_to(&mut byte)? == 1).then_some(byte[0]))
+    }
+
+    /// Read one base-128 varint. A truncated stream and a value wider than 64
+    /// bits keep their historical error offsets.
+    fn read_varint(&mut self) -> Result<u64, CatalogScanError> {
+        let start = self.offset();
+        let mut value = 0_u64;
+
+        for index in 0..10 {
+            let Some(byte) = self.read_byte()? else {
+                return Err(ScanError::new(start, ScanErrorKind::TruncatedVarint).into());
+            };
+
+            if index == 9 && byte > 1 {
+                return Err(ScanError::new(start, ScanErrorKind::VarintOverflow).into());
+            }
+            value |= u64::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+
+        Err(ScanError::new(start, ScanErrorKind::VarintOverflow).into())
+    }
+
+    /// Read a length-delimited field's byte count and reject one that runs
+    /// past the end of this (sub)stream. The payload starts at the current
+    /// offset once this returns.
+    fn read_length(&mut self) -> Result<u64, CatalogScanError> {
+        let length_offset = self.offset();
+        let encoded_len = self.read_varint()?;
+        // Platform overflow keeps its historical error: a length this
+        // platform cannot even address (or an offset that would wrap) is not
+        // the same fact as a length that runs past the stream.
+        let overflow = || ScanError::new(length_offset, ScanErrorKind::LengthOverflow(encoded_len));
+        let len = usize::try_from(encoded_len).map_err(|_| overflow())?;
+        length_offset.checked_add(len).ok_or_else(overflow)?;
+        let remaining = self.remaining();
+        if encoded_len > remaining {
+            return Err(ScanError::new(
+                length_offset,
+                ScanErrorKind::TruncatedLengthDelimited {
+                    declared: encoded_len,
+                    remaining: remaining as usize,
+                },
+            )
+            .into());
+        }
+        Ok(encoded_len)
+    }
+
+    /// Read and discard `len` bytes, returning how many the stream actually
+    /// held. `io::copy` into `sink` keeps the source buffered and the memory
+    /// use flat.
+    fn discard(&mut self, len: u64) -> Result<u64, CatalogScanError> {
+        let mut limited = self.reader.by_ref().take(len);
+        let copied = io::copy(&mut limited, &mut io::sink()).map_err(CatalogScanError::Io)?;
+        self.position += copied;
+        Ok(copied)
+    }
+
+    /// Skip a length-delimited payload `read_length` already bounds-checked.
+    fn skip_payload(&mut self, len: u64, length_offset: usize) -> Result<(), CatalogScanError> {
+        let copied = self.discard(len)?;
+        if copied < len {
+            return Err(ScanError::new(
+                length_offset,
+                ScanErrorKind::TruncatedLengthDelimited {
+                    declared: len,
+                    remaining: copied as usize,
+                },
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Skip a fixed-width field of `width` bytes.
+    fn skip_fixed(&mut self, width: usize) -> Result<(), CatalogScanError> {
+        let start = self.offset();
+        let remaining = self.remaining();
+        if width as u64 > remaining {
+            return Err(ScanError::new(
+                start,
+                ScanErrorKind::TruncatedFixed {
+                    width,
+                    remaining: remaining as usize,
+                },
+            )
+            .into());
+        }
+        let copied = self.discard(width as u64)?;
+        if copied < width as u64 {
+            return Err(ScanError::new(
+                start,
+                ScanErrorKind::TruncatedFixed {
+                    width,
+                    remaining: copied as usize,
+                },
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Scan a `GeoSiteList` or `GeoIPList` stream. Both use repeated field 1 for
+/// entries, and both embedded entry messages use string field 1 for their
+/// code.
+fn scan_codes_stream<R: Read>(reader: R, length: u64) -> Result<Vec<String>, CatalogScanError> {
+    let mut stream = ScanStream::new(reader, length, 0);
     let mut codes = Vec::new();
 
-    while cursor < bytes.len() {
-        let key_offset = cursor;
-        let key = read_varint(bytes, &mut cursor, 0)?;
+    while stream.remaining() > 0 {
+        let key_offset = stream.offset();
+        let key = stream.read_varint()?;
         let (field_number, wire_type) = decode_key(key, key_offset)?;
         if field_number == 1 {
             if wire_type != 2 {
@@ -237,19 +428,31 @@ fn scan_codes(bytes: &[u8]) -> Result<Vec<String>, ScanError> {
                         expected: 2,
                         actual: wire_type,
                     },
-                ));
+                )
+                .into());
             }
             if codes.len() >= MAX_CODES {
                 return Err(ScanError::new(
                     key_offset,
                     ScanErrorKind::TooManyEntries { max: MAX_CODES },
-                ));
+                )
+                .into());
             }
-            let entry_range = read_length_delimited_range(bytes, &mut cursor, 0)?;
-            let code = scan_entry_code(&bytes[entry_range.clone()], entry_range.start)?;
-            codes.push(code.to_owned());
+            let entry_len = stream.read_length()?;
+            let entry_offset = stream.position;
+            // The entry envelope is its own bounded stream: nothing inside it
+            // can read past its declared length, and its code field is the
+            // only bytes this scan copies out.
+            let code = {
+                let mut entry = ScanStream::new(&mut stream.reader, entry_len, entry_offset);
+                scan_entry_code(&mut entry)?
+            };
+            // The envelope was consumed in full; keep the outer offset in
+            // step without re-reading anything.
+            stream.position = entry_offset + entry_len;
+            codes.push(code);
         } else {
-            skip_field(bytes, &mut cursor, wire_type, 0)?;
+            skip_field(&mut stream, wire_type)?;
         }
     }
 
@@ -260,13 +463,30 @@ fn scan_codes(bytes: &[u8]) -> Result<Vec<String>, ScanError> {
     Ok(codes)
 }
 
-fn scan_entry_code(entry: &[u8], base_offset: usize) -> Result<&str, ScanError> {
-    let mut cursor = 0;
+/// Whole-buffer entry point for the scanner's unit tests: a byte slice is a
+/// complete stream, and an in-memory read cannot fail with I/O.
+#[cfg(test)]
+fn scan_codes(bytes: &[u8]) -> Result<Vec<String>, ScanError> {
+    scan_codes_stream(bytes, bytes.len() as u64).map_err(|error| match error {
+        CatalogScanError::Malformed(error) => error,
+        CatalogScanError::Io(error) => {
+            panic!("in-memory geodata scan cannot fail with I/O: {error}")
+        }
+    })
+}
+
+/// Scan one entry envelope for its string field 1 code.
+///
+/// The envelope's other fields are the domain/CIDR lists that make a DAT
+/// large, so they are discarded through the stream and never buffered; only
+/// the bounded code string is copied out.
+fn scan_entry_code<R: Read>(entry: &mut ScanStream<R>) -> Result<String, CatalogScanError> {
+    let base_offset = entry.offset();
     let mut code = None;
 
-    while cursor < entry.len() {
-        let key_offset = base_offset + cursor;
-        let key = read_varint(entry, &mut cursor, base_offset)?;
+    while entry.remaining() > 0 {
+        let key_offset = entry.offset();
+        let key = entry.read_varint()?;
         let (field_number, wire_type) = decode_key(key, key_offset)?;
         if field_number == 1 {
             if wire_type != 2 {
@@ -277,44 +497,53 @@ fn scan_entry_code(entry: &[u8], base_offset: usize) -> Result<&str, ScanError> 
                         expected: 2,
                         actual: wire_type,
                     },
-                ));
+                )
+                .into());
             }
             if code.is_some() {
-                return Err(ScanError::new(
-                    key_offset,
-                    ScanErrorKind::DuplicateCodeField,
-                ));
+                return Err(ScanError::new(key_offset, ScanErrorKind::DuplicateCodeField).into());
             }
-            let code_range = read_length_delimited_range(entry, &mut cursor, base_offset)?;
-            if code_range.len() > MAX_CODE_BYTES {
+            let length_offset = entry.offset();
+            let code_len = entry.read_length()?;
+            let code_offset = entry.offset();
+            if code_len > MAX_CODE_BYTES as u64 {
                 return Err(ScanError::new(
-                    base_offset + code_range.start,
+                    code_offset,
                     ScanErrorKind::CodeTooLong {
-                        byte_len: code_range.len(),
+                        byte_len: code_len as usize,
                         max_byte_len: MAX_CODE_BYTES,
                     },
-                ));
+                )
+                .into());
             }
-            let code_bytes = &entry[code_range.clone()];
-            let parsed = std::str::from_utf8(code_bytes).map_err(|error| {
+            let mut code_bytes = vec![0_u8; code_len as usize];
+            let copied = entry.read_up_to(&mut code_bytes)?;
+            if copied < code_bytes.len() {
+                return Err(ScanError::new(
+                    length_offset,
+                    ScanErrorKind::TruncatedLengthDelimited {
+                        declared: code_len,
+                        remaining: copied,
+                    },
+                )
+                .into());
+            }
+            let parsed = String::from_utf8(code_bytes).map_err(|error| {
                 ScanError::new(
-                    base_offset + code_range.start + error.valid_up_to(),
+                    code_offset + error.utf8_error().valid_up_to(),
                     ScanErrorKind::InvalidCodeUtf8,
                 )
             })?;
             if parsed.is_empty() {
-                return Err(ScanError::new(
-                    base_offset + code_range.start,
-                    ScanErrorKind::EmptyCode,
-                ));
+                return Err(ScanError::new(code_offset, ScanErrorKind::EmptyCode).into());
             }
             code = Some(parsed);
         } else {
-            skip_field(entry, &mut cursor, wire_type, base_offset)?;
+            skip_field(entry, wire_type)?;
         }
     }
 
-    code.ok_or_else(|| ScanError::new(base_offset, ScanErrorKind::MissingCodeField))
+    code.ok_or_else(|| ScanError::new(base_offset, ScanErrorKind::MissingCodeField).into())
 }
 
 fn compare_ascii_case_insensitive(left: &str, right: &str) -> Ordering {
@@ -345,119 +574,27 @@ fn decode_key(key: u64, offset: usize) -> Result<(u64, u8), ScanError> {
     }
 }
 
-fn read_varint(bytes: &[u8], cursor: &mut usize, base_offset: usize) -> Result<u64, ScanError> {
-    let start = *cursor;
-    let mut value = 0_u64;
-
-    for index in 0..10 {
-        let byte = *bytes
-            .get(*cursor)
-            .ok_or_else(|| ScanError::new(base_offset + start, ScanErrorKind::TruncatedVarint))?;
-        *cursor += 1;
-
-        if index == 9 && byte > 1 {
-            return Err(ScanError::new(
-                base_offset + start,
-                ScanErrorKind::VarintOverflow,
-            ));
-        }
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-
-    Err(ScanError::new(
-        base_offset + start,
-        ScanErrorKind::VarintOverflow,
-    ))
-}
-
-fn read_length_delimited_range(
-    bytes: &[u8],
-    cursor: &mut usize,
-    base_offset: usize,
-) -> Result<Range<usize>, ScanError> {
-    let length_offset = *cursor;
-    let encoded_len = read_varint(bytes, cursor, base_offset)?;
-    let len = usize::try_from(encoded_len).map_err(|_| {
-        ScanError::new(
-            base_offset + length_offset,
-            ScanErrorKind::LengthOverflow(encoded_len),
-        )
-    })?;
-    let start = *cursor;
-    let end = start.checked_add(len).ok_or_else(|| {
-        ScanError::new(
-            base_offset + length_offset,
-            ScanErrorKind::LengthOverflow(encoded_len),
-        )
-    })?;
-    if end > bytes.len() {
-        return Err(ScanError::new(
-            base_offset + length_offset,
-            ScanErrorKind::TruncatedLengthDelimited {
-                declared: encoded_len,
-                remaining: bytes.len().saturating_sub(start),
-            },
-        ));
-    }
-    *cursor = end;
-    Ok(start..end)
-}
-
-fn skip_field(
-    bytes: &[u8],
-    cursor: &mut usize,
-    wire_type: u8,
-    base_offset: usize,
-) -> Result<(), ScanError> {
+/// Skip one field of the enclosing (sub)stream, whatever its wire type.
+fn skip_field<R: Read>(stream: &mut ScanStream<R>, wire_type: u8) -> Result<(), CatalogScanError> {
     match wire_type {
         0 => {
-            read_varint(bytes, cursor, base_offset)?;
+            stream.read_varint()?;
             Ok(())
         }
-        1 => advance_fixed(bytes, cursor, 8, base_offset),
+        1 => stream.skip_fixed(8),
         2 => {
-            read_length_delimited_range(bytes, cursor, base_offset)?;
-            Ok(())
+            let length_offset = stream.offset();
+            let len = stream.read_length()?;
+            stream.skip_payload(len, length_offset)
         }
-        5 => advance_fixed(bytes, cursor, 4, base_offset),
+        5 => stream.skip_fixed(4),
         3 | 4 => Err(ScanError::new(
-            base_offset + *cursor,
+            stream.offset(),
             ScanErrorKind::UnsupportedGroupWireType(wire_type),
-        )),
-        _ => Err(ScanError::new(
-            base_offset + *cursor,
-            ScanErrorKind::InvalidWireType(wire_type),
-        )),
-    }
-}
-
-fn advance_fixed(
-    bytes: &[u8],
-    cursor: &mut usize,
-    width: usize,
-    base_offset: usize,
-) -> Result<(), ScanError> {
-    let start = *cursor;
-    let end = start.checked_add(width).ok_or_else(|| {
-        ScanError::new(
-            base_offset + start,
-            ScanErrorKind::LengthOverflow(width as u64),
         )
-    })?;
-    if end > bytes.len() {
-        return Err(ScanError::new(
-            base_offset + start,
-            ScanErrorKind::TruncatedFixed {
-                width,
-                remaining: bytes.len().saturating_sub(start),
-            },
-        ));
+        .into()),
+        _ => Err(ScanError::new(stream.offset(), ScanErrorKind::InvalidWireType(wire_type)).into()),
     }
-    *cursor = end;
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -635,6 +772,34 @@ mod tests {
         encoded.extend_from_slice(&[0xdd; 4]);
 
         assert_eq!(scan_codes(&encoded).unwrap(), ["TEST"]);
+    }
+
+    #[test]
+    fn skips_an_entry_payload_larger_than_the_read_buffer() {
+        // A real entry's domain list is far larger than any read buffer; the
+        // scan must discard it in place and still find a code field after it.
+        // The code comes second so this also proves the scan continues inside
+        // the entry after a skipped payload.
+        let mut encoded_entry = Vec::new();
+        push_bytes_field(&mut encoded_entry, 2, &vec![b'x'; 300 * 1024]);
+        push_bytes_field(&mut encoded_entry, 1, b"LARGE");
+
+        let directory = tempfile::tempdir().expect("temporary fixture directory");
+        let geosite = list(&[encoded_entry]);
+        std::fs::write(directory.path().join("geosite.dat"), &geosite)
+            .expect("write geosite fixture");
+        std::fs::write(directory.path().join("geoip.dat"), list(&[entry("LAN")]))
+            .expect("write geoip fixture");
+
+        let catalog = GeodataSnapshot::load_managed_at(directory.path())
+            .geosite
+            .expect("a large entry payload must parse");
+        assert_eq!(catalog.codes, ["LARGE"]);
+        assert_eq!(
+            catalog.metadata.byte_len,
+            geosite.len() as u64,
+            "the streamed catalog must report the file's full length"
+        );
     }
 
     #[test]

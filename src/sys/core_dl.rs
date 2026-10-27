@@ -352,13 +352,6 @@ pub fn open_verified_core_user_managed_dats(core: &Path) -> Result<VerifiedCore,
     open_verified_core_checked(core, VerifyScope::Full, true)
 }
 
-/// Strict form of the shared verify used by the download/install path below
-/// to validate freshly staged release trees: the geo data compare is never
-/// suspended for a staged tree.
-fn open_verified_core_at(core: &Path, scope: VerifyScope) -> Result<VerifiedCore, DiagError> {
-    open_verified_core_checked(core, scope, false)
-}
-
 /// Shared verify implementation behind [`open_verified_core`],
 /// [`open_verified_core_user_managed_dats`], and the config-driven decision
 /// [`open_verified_for_config`].
@@ -385,9 +378,10 @@ fn open_verified_core_at(core: &Path, scope: VerifyScope) -> Result<VerifiedCore
 /// restored bytes still mismatch the pin. Because this is the single shared
 /// choke, every production verification — the direct core spawn, the
 /// apply/`-test` gate, the servers screen's helper verbs, the elevated stage
-/// copy, and the install-funnel validation below — heals identically (a
-/// staged tree carries its own freshly seeded pair, so its strict open heals
-/// from it; nothing here reorders or repeats the funnel's restore).
+/// copy, and the install funnel's post-commit validation — heals identically
+/// (an installed tree carries its own freshly seeded pair, seeded while it
+/// was staged, so its strict open heals from it; nothing here reorders or
+/// repeats the funnel's restore).
 fn open_verified_core_checked(
     core: &Path,
     scope: VerifyScope,
@@ -891,9 +885,17 @@ pub fn install_pinned_core_archive(zip: &Path) -> Result<String, DiagError> {
             version: version.clone(),
         };
         write_json_atomic(&staging.join(RELEASE_DIGEST_FILE), &metadata)?;
-        drop(open_verified_core_at(&staging, VerifyScope::Full)?);
+        // Verification happens exactly once, on the committed tree:
+        // `commit_staging` renames the staging tree into place and runs the
+        // same `VerifyScope::Full` check on `core` itself, undoing the rename
+        // (restoring `core.bak` and the marker) when it fails. Verifying the
+        // staging path first would prove nothing the committed path does not
+        // prove again, and the verification error is the caller's error
+        // either way. The commit window can add exactly one failure the
+        // earlier check could not produce — a failed rollback — and any
+        // post-rename validation failure already carries that risk.
         commit_staging(&root, &staging, |dir| {
-            drop(open_verified_core_at(dir, VerifyScope::Full)?);
+            drop(open_verified_core(dir)?);
             Ok(())
         })?;
         Ok(version)
@@ -1168,6 +1170,11 @@ fn seed_pristine_from_tree(tree: &Path) -> Result<(), DiagError> {
                 .sync_all()
                 .diag_with(Diag::new(Key::CoreDlFileFlushFailed).arg(target.display()))?;
             drop(output);
+            // Load-bearing, not a redundant re-hash: nothing else hashes
+            // `pristine/` afterwards (the `Full` verification covers the
+            // named root payloads, not this directory), so this is the only
+            // proof that the pair carries pin bytes instead of a drifted
+            // source copied byte for byte.
             let actual = sha256_hex(&target)?;
             if !actual.eq_ignore_ascii_case(expected) {
                 return Err(DiagError::new(

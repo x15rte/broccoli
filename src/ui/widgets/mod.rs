@@ -1583,6 +1583,152 @@ pub(crate) fn parse_positive_probe_interval(
     }
 }
 
+/// One editable text buffer's layout generation: the counter a
+/// [`TrackedBuffer`] bumps on every mutation, and the value the memoized
+/// [`TextLayoutMemo`] keys its cached galley on.
+///
+/// A generation is what tells an unchanged frame apart from one whose text
+/// was replaced in place: a same-length replacement keeps the buffer's
+/// allocation and length, so only a counter the mutation itself advances can
+/// invalidate the cached layout.
+#[derive(Default)]
+pub struct TextRevision(std::cell::Cell<u64>);
+
+impl TextRevision {
+    /// Mark the text as changed.
+    pub fn bump(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    /// The current generation.
+    pub fn get(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// A `TextEdit` buffer over a `String` that bumps its [`TextRevision`] on
+/// every mutation, so a memoized layouter sees an edit as a new generation
+/// even when the edit kept the string's length (and allocation) unchanged.
+/// Everything else is the `String` implementation.
+pub struct TrackedBuffer<'a> {
+    text: &'a mut String,
+    revision: &'a TextRevision,
+}
+
+impl<'a> TrackedBuffer<'a> {
+    pub fn new(text: &'a mut String, revision: &'a TextRevision) -> Self {
+        Self { text, revision }
+    }
+}
+
+impl egui::TextBuffer for TrackedBuffer<'_> {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn as_str(&self) -> &str {
+        self.text
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: egui::text::CharIndex) -> usize {
+        self.revision.bump();
+        egui::TextBuffer::insert_text(&mut *self.text, text, char_index)
+    }
+
+    fn delete_char_range(&mut self, char_range: std::ops::Range<egui::text::CharIndex>) {
+        self.revision.bump();
+        egui::TextBuffer::delete_char_range(&mut *self.text, char_range);
+    }
+
+    fn type_id(&self) -> std::any::TypeId {
+        // The buffer is lifetime-parameterized, so `Self` need not be
+        // `'static`; the marker instantiation names the same type for
+        // `TypeId` (lifetimes do not participate).
+        std::any::TypeId::of::<TrackedBuffer<'static>>()
+    }
+}
+
+/// The style-dependent half of a [`TextLayoutMemo`]'s key: the resolved font
+/// and paint color, the line height and the wrap width. Equal components mean
+/// the cached galley is still the layout this frame's `TextEdit` would
+/// produce.
+#[derive(Clone, PartialEq)]
+struct TextLayoutStyle {
+    font_id: egui::FontId,
+    color: egui::Color32,
+    line_height: f32,
+    wrap_width: f32,
+}
+
+/// The memoized layouter for a large `TextEdit` buffer: an unchanged text at
+/// an unchanged width and style reuses the cached galley instead of copying
+/// the whole buffer into a fresh `LayoutJob` and laying it out again.
+///
+/// The default layouter does that copy and layout on every call — a plain
+/// [`egui::Label`] builds the same job — so a preview of a large config or a
+/// multi-megabyte raw override paid for its full text on every idle frame.
+/// The key is the buffer's [`TextRevision`] (never the buffer's pointer and
+/// length: a same-length in-place edit keeps both) plus the wrap width and
+/// the style the `TextEdit` resolves, all cheap to compare. The layout runs
+/// only when the key changes.
+#[derive(Default)]
+pub struct TextLayoutMemo {
+    layout: Memo<(u64, TextLayoutStyle), std::sync::Arc<egui::text::Galley>>,
+}
+
+impl TextLayoutMemo {
+    /// The layouter for this frame over a multiline `TextEdit` using `font`.
+    /// `revision` must change whenever the buffer's text does, and the caller
+    /// must pass the same [`egui::TextStyle`] the widget renders with (both
+    /// the font and the resulting line height depend on it).
+    pub fn layouter<'a>(
+        &'a mut self,
+        revision: &'a TextRevision,
+        font: egui::TextStyle,
+    ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::text::Galley> + 'a
+    {
+        move |ui, text, wrap_width| {
+            let font_id = font.resolve(ui.style());
+            // The color the default layouter resolves for an unstyled
+            // `TextEdit`: an explicit override, else the inactive widget
+            // color.
+            let color = ui
+                .visuals()
+                .override_text_color
+                .unwrap_or_else(|| ui.visuals().widgets.inactive.text_color());
+            let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id))
+                + ui.spacing().extra_text_line_spacing;
+            let key = (
+                revision.get(),
+                TextLayoutStyle {
+                    font_id,
+                    color,
+                    line_height,
+                    wrap_width,
+                },
+            );
+            let layout = self.layout.get(&key, || {
+                let style = &key.1;
+                let mut job = egui::text::LayoutJob::simple(
+                    text.as_str().to_owned(),
+                    style.font_id.clone(),
+                    style.color,
+                    style.wrap_width,
+                );
+                // The default layouter's two adjustments: trailing
+                // whitespace stays visible, and every section uses the
+                // resolved line height.
+                job.keep_trailing_whitespace = true;
+                for section in &mut job.sections {
+                    section.format.line_height = Some(style.line_height);
+                }
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            });
+            std::sync::Arc::clone(layout)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

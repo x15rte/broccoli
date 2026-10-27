@@ -527,15 +527,17 @@ pub async fn validate(candidate_path: &Path) -> (bool, ApplyOutput) {
     result
 }
 
-/// Run one blocking filesystem leg of the candidate/commit pipeline on
-/// tokio's blocking pool. The control plane runs on a current-thread runtime
+/// Run one blocking filesystem leg — the candidate/commit pipeline's, or a
+/// profile-validation candidate's config generate/write — on tokio's blocking
+/// pool. The control plane runs on a current-thread runtime
 /// ([`super::spawn_runtime`]), which must keep polling the tasks it spawned —
 /// the validation child's output pumps and `wait` included — while a config
-/// is tested, committed, or rolled back; a create/write/`sync_all`/read/rename
-/// sequence run inline would stall every one of them for the disk's latency.
+/// is generated, tested, committed, or rolled back; a
+/// create/write/`sync_all`/read/rename sequence run inline would stall every
+/// one of them for the disk's latency.
 /// A worker that panics, or that runtime shutdown cancels before it runs,
 /// reports through the join error and lands on the caller's reject path.
-async fn on_blocking_pool<T, F>(work: F) -> Result<T, DiagError>
+pub(super) async fn on_blocking_pool<T, F>(work: F) -> Result<T, DiagError>
 where
     F: FnOnce() -> Result<T, DiagError> + Send + 'static,
     T: Send + 'static,

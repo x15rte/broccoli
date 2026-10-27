@@ -93,6 +93,12 @@ pub struct ServerProfile {
     pub extra: Map<String, Value>,
 }
 
+/// The prefix every profile outbound tag carries: `srv-` plus the id's first
+/// 8 characters. One spelling shared by the tag builder and the
+/// allocation-free comparisons, so a selector and a comparison cannot
+/// disagree about the namespace.
+pub(crate) const TAG_PREFIX: &str = "srv-";
+
 impl ServerProfile {
     pub fn new(name: impl Into<String>, outbound: OutboundModel) -> Self {
         Self {
@@ -105,12 +111,38 @@ impl ServerProfile {
     }
     /// `srv-<id8>` — outbound tag used in generated configs, routing and stats.
     pub fn tag(&self) -> String {
+        format!("{TAG_PREFIX}{}", self.tag_id())
+    }
+    /// The id prefix [`Self::tag`] carries: the id's first 8 characters, or the
+    /// whole id when a hand-edited state file stores a shorter one.
+    pub(crate) fn tag_id(&self) -> &str {
         let end = self
             .id
             .char_indices()
             .nth(8)
             .map_or(self.id.len(), |(index, _)| index);
-        format!("srv-{}", &self.id[..end])
+        &self.id[..end]
+    }
+    /// Whether [`Self::tag`] equals `other`, without formatting the tag — the
+    /// comparison sites in the dial graph and the emitter test tags against
+    /// every candidate profile. `other` outside the `srv-` namespace never
+    /// matches, exactly as the formatted tag would compare.
+    pub fn tag_eq(&self, other: &str) -> bool {
+        other
+            .strip_prefix(TAG_PREFIX)
+            .is_some_and(|id| id == self.tag_id())
+    }
+    /// Whether [`Self::tag`] starts with `pattern`, without formatting the tag
+    /// — the balancer and observatory selectors match outbound tags by prefix
+    /// (`app/proxyman/outbound.Manager.Select`). A pattern that ends inside the
+    /// `srv-` prefix matches against the prefix itself; a longer one must carry
+    /// the prefix and then match the id prefix. Both agree with
+    /// `tag().starts_with(pattern)` on every pattern, the empty one included.
+    pub fn tag_starts_with(&self, pattern: &str) -> bool {
+        match pattern.strip_prefix(TAG_PREFIX) {
+            Some(rest) => self.tag_id().starts_with(rest),
+            None => TAG_PREFIX.starts_with(pattern),
+        }
     }
     /// The outbound tag this profile dials through, if any —
     /// `streamSettings.sockopt.dialerProxy`, the one spelling the pinned core
@@ -181,6 +213,56 @@ mod tests {
             sockopt.dialer_proxy.clear();
         }
         assert_eq!(profile.chain_target(), None);
+    }
+
+    #[test]
+    fn tag_comparisons_agree_with_the_formatted_tag() {
+        let mut profile = ServerProfile::new("srv", OutboundModel::new(Protocol::Freedom));
+        profile.id = "0123456789abcdef".into();
+        let tag = profile.tag();
+        assert_eq!(tag, "srv-01234567");
+        // Every pattern shape: empty, inside the prefix, the prefix itself,
+        // the id prefix, beyond it, and outside the namespace.
+        for pattern in [
+            "",
+            "s",
+            "sr",
+            "srv",
+            "srv-",
+            "srv-0",
+            "srv-01234567",
+            "srv-012345678",
+            "srv-9",
+            "direct",
+        ] {
+            assert_eq!(
+                profile.tag_starts_with(pattern),
+                tag.starts_with(pattern),
+                "pattern {pattern:?}"
+            );
+        }
+        for candidate in [
+            tag.as_str(),
+            "srv-0123456",
+            "srv-012345678",
+            "",
+            "srv-",
+            "direct",
+        ] {
+            assert_eq!(
+                profile.tag_eq(candidate),
+                tag == candidate,
+                "candidate {candidate:?}"
+            );
+        }
+        // A short (hand-edited) id carries a short prefix instead of 8
+        // characters; both comparisons follow the tag it actually produces.
+        profile.id = "abc".into();
+        assert_eq!(profile.tag(), "srv-abc");
+        assert!(profile.tag_eq("srv-abc"));
+        assert!(!profile.tag_eq("srv-abcd"));
+        assert!(profile.tag_starts_with("srv-ab"));
+        assert!(!profile.tag_starts_with("srv-abcd"));
     }
 
     #[test]

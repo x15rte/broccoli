@@ -24,6 +24,32 @@ mod common;
 /// The release version a seeded stale tree names: a build other than this one.
 const STALE_VERSION: &str = "26.7.28";
 
+/// Run frames until `settled` holds or the deadline passes. The shell's
+/// on-demand core verification runs on a worker thread and pokes a repaint
+/// when its answer lands, so a test that clicks Verify (or that ends an
+/// install the shell started) must drive frames until the adoption renders
+/// instead of assuming a fixed step count already carries the verdict. The
+/// timeout names what never settled; the bounded loop can never pass
+/// vacuously.
+fn run_until(
+    h: &mut Harness<'static, BroccoliApp>,
+    what: &str,
+    settled: impl Fn(&Harness<'static, BroccoliApp>) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        h.run_steps(2);
+        if settled(h) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never settled after the verification worker's answer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The managed core's release metadata file name.
 const RELEASE_METADATA: &str = ".broccoli-official-release.json";
 
@@ -385,7 +411,14 @@ fn a_rollback_terminal_re_derives_the_installed_tree() {
         .inject_event(CoreEvt::Download(DownloadState::Failed(
             Diag::new(Key::RtFrameUpdatedCoreSpawnRestored).into(),
         )));
-    h.run_steps(30);
+    // The re-derive is a worker pass now: wait for its verdict (the tree the
+    // transaction left has no installable tree, so the versions row reads
+    // "Installed: none") before asserting on the rendered state.
+    run_until(&mut h, "the rollback's re-derived facts", |h| {
+        h.query_all_by_label(t(Language::En, Key::CoreSetupNoInstalledVersion))
+            .next()
+            .is_some()
+    });
     assert!(
         h.query_all_by_label(t(Language::En, Key::CoreSetupInstalled))
             .next()
@@ -423,7 +456,33 @@ fn a_rollback_leaves_the_gate_reading_the_restored_tree() {
         .inject_event(CoreEvt::Download(DownloadState::Failed(
             Diag::new(Key::RtFrameUpdatedCoreSpawnRestored).into(),
         )));
-    h.run_steps(30);
+    // The re-derive is a worker pass now. Read its verdict where it is
+    // visible: the Settings mount's versions row names the restored tree's
+    // own release once the answer lands (the install's synthetic success had
+    // replaced it with the candidate's).
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        Screen::Settings.label(Language::En),
+    )
+    .click();
+    h.run();
+    let restored_row = t_fmt(
+        Language::En,
+        Key::CoreSetupInstalledVersionRow,
+        &[&STALE_VERSION],
+    );
+    run_until(&mut h, "the restored tree's re-derived facts", |h| {
+        h.query_all_by_label(restored_row.as_str()).next().is_some()
+    });
+
+    // The gate's message renders in the Dashboard's content area; return
+    // there before the click (the wait above reads the Settings mount).
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        Screen::Dashboard.label(Language::En),
+    )
+    .click();
+    h.run();
 
     h.get_all_by_role_and_label(
         egui::accesskit::Role::Button,
@@ -492,7 +551,14 @@ fn verify_rechecks_the_installed_tree_on_demand() {
         t(Language::En, Key::CoreSetupVerify),
     )
     .click();
-    h.run_steps(4);
+    // The click starts a worker pass; the surface renders its in-flight state
+    // until the answer lands, so wait for the verdict rather than a fixed
+    // step count.
+    run_until(&mut h, "the fresh verification verdict", |h| {
+        h.query_all_by_label(t(Language::En, Key::CoreSetupNotInstalled))
+            .next()
+            .is_some()
+    });
 
     assert!(
         h.query_all_by_label(t(Language::En, Key::CoreSetupNotInstalled))

@@ -132,6 +132,8 @@
 //! "Apply to server": installing a pin is not the configuration action, and
 //! the phrase stays.
 
+use std::fmt::Write as _;
+
 use crate::model::safety::{HazardClass, SafetyCode};
 use crate::model::settings::Language;
 use crate::model::stream::Network;
@@ -2514,6 +2516,15 @@ pub fn t_fmt(language: Language, key: Key, args: &[&dyn std::fmt::Display]) -> S
 /// extra arguments are ignored. Callers must pre-format arguments (e.g. Debug
 /// via `format!("{:?}", x)`); the placeholder inner text is never used.
 fn fill_placeholders(template: &str, args: &[&dyn std::fmt::Display]) -> String {
+    fill_placeholders_with(template, args)
+}
+
+/// The substitution loop behind [`fill_placeholders`] and
+/// [`fill_message_template`], generic over the argument element so a caller
+/// holding borrowed values ([`ValidationArg`]) pays no trait-object vector and
+/// no per-placeholder temporary string: each value renders straight into `out`
+/// through `fmt::Write`, and the bytes match the former `to_string()` exactly.
+fn fill_placeholders_with<A: std::fmt::Display>(template: &str, args: &[A]) -> String {
     let mut out = String::with_capacity(template.len() + args.len() * 8);
     let mut rest = template;
     let mut args = args.iter();
@@ -2522,7 +2533,8 @@ fn fill_placeholders(template: &str, args: &[&dyn std::fmt::Display]) -> String 
         let Some(end) = after.find('}') else { break };
         let Some(arg) = args.next() else { break };
         out.push_str(&rest[..start]);
-        out.push_str(&arg.to_string());
+        // Writing a `String` cannot fail; the value formats in place.
+        let _ = write!(out, "{arg}");
         rest = &rest[start + 1 + end + 1..];
     }
     out.push_str(rest);
@@ -2534,13 +2546,48 @@ fn fill_placeholders(template: &str, args: &[&dyn std::fmt::Display]) -> String 
 /// their callers fill the code-carried values here. The placeholder contract is
 /// the one [`t_fmt`] asserts: the argument count MUST equal the `{` count of
 /// the template, and a mismatch panics in debug builds.
-fn fill_message_template(template: &str, args: &[&dyn std::fmt::Display]) -> String {
+fn fill_message_template<A: std::fmt::Display>(template: &str, args: &[A]) -> String {
     debug_assert_eq!(
         args.len(),
         template.matches('{').count(),
         "fill_message_template({template:?}): argument count must equal placeholder count"
     );
-    fill_placeholders(template, args)
+    fill_placeholders_with(template, args)
+}
+
+/// One interpolation value of a validation template, borrowed from the code's
+/// own payload (or from the locale table) so rendering a message allocates only
+/// its output. The variants cover every shape [`validation_text`] pre-rendered
+/// with `format!`/`to_string()`; each one reproduces that byte output exactly.
+enum ValidationArg<'a> {
+    /// Rendered verbatim: a stored text value, or another rule's sentence.
+    Text(&'a str),
+    /// Rendered with `{:?}` — the quoted, escaped shape the pre-seam messages
+    /// printed for a stored name. `str`'s Debug and `String`'s Debug agree on
+    /// every value this table quotes.
+    Quoted(&'a str),
+    /// The Debug shape of an optional stored value: `None`, or
+    /// `Some("value")` with the value quoted like [`ValidationArg::Quoted`].
+    OptionalQuoted(Option<&'a str>),
+    /// A 1-based rule index, rendered in decimal.
+    Count(usize),
+    /// A signed count, rendered in decimal: the fakeDNS pool capacity is an
+    /// `i64` on the wire. The rule only fires for a positive pool, but a
+    /// hand-built code with a negative value must still render its own sign.
+    SignedCount(i64),
+}
+
+impl std::fmt::Display for ValidationArg<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::Quoted(value) => write!(f, "{value:?}"),
+            Self::OptionalQuoted(Some(value)) => write!(f, "Some({value:?})"),
+            Self::OptionalQuoted(None) => f.write_str("None"),
+            Self::Count(value) => write!(f, "{value}"),
+            Self::SignedCount(value) => write!(f, "{value}"),
+        }
+    }
 }
 
 /// Resolve one model-validation rule to the locale key whose template renders
@@ -2550,14 +2597,16 @@ fn fill_message_template(template: &str, args: &[&dyn std::fmt::Display]) -> Str
 /// [`ValidationCode`], so a code forgotten here is a compile error; where the
 /// underlying text is unchanged the key reuses the existing table entry.
 ///
-/// The values are the code's own payload, Debug-quoted exactly where the
-/// pre-pass generator used `{:?}` and rendered where the message names another
-/// rule's text (the sniffing/listen codes carry inner messages, one text per
-/// rule, never re-derived). A rule that starts carrying a payload without
-/// stating it here fails loudly: [`validation_message`] fills every code
-/// through [`fill_message_template`], whose placeholder-count assertion covers
-/// the whole universe.
-fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) {
+/// The values borrow the code's own payload ([`ValidationArg::Text`],
+/// [`ValidationArg::Quoted`] exactly where the pre-pass generator used `{:?}`,
+/// [`ValidationArg::Count`] for indices) and the locale table where the message
+/// names another rule's text (the sniffing/listen codes carry inner messages,
+/// one text per rule, never re-derived). A rule that starts carrying a payload
+/// without stating it here fails loudly: [`validation_message`] fills every
+/// code through [`fill_message_template`], whose placeholder-count assertion
+/// covers the whole universe.
+fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<ValidationArg<'a>>) {
+    use ValidationArg::*;
     use ValidationCode::*;
     match code {
         XhttpDepthExceeded => (Key::SrvDownloadNestingExceeds, Vec::new()),
@@ -2602,8 +2651,8 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         MasqueRemoteDnsInvalid => (Key::SrvMasqueRemoteDns, Vec::new()),
         MasquePathInvalid => (Key::SrvMasquePathInvalid, Vec::new()),
         MasqueHostInvalid => (Key::SrvMasqueHostInvalid, Vec::new()),
-        MasqueHeaderInvalid(arg) => (Key::SrvMasqueHeaderInvalid, vec![arg.clone()]),
-        MasqueReservedHeader(arg) => (Key::SrvMasqueReservedHeader, vec![arg.clone()]),
+        MasqueHeaderInvalid(arg) => (Key::SrvMasqueHeaderInvalid, vec![Text(arg)]),
+        MasqueReservedHeader(arg) => (Key::SrvMasqueReservedHeader, vec![Text(arg)]),
         MasqueAuthorizationConflict => (Key::SrvMasqueAuthorizationConflict, Vec::new()),
         MasqueUserColon => (Key::SrvMasqueUserColon, Vec::new()),
         MasqueAlpnPrefersHttp3 => (Key::SrvMasqueAlpnHttp3, Vec::new()),
@@ -2612,17 +2661,15 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         MasqueWarpAddressInvalid => (Key::SrvMasqueWarpAddressInvalid, Vec::new()),
         MasqueWarpAddressShape => (Key::SrvMasqueWarpAddressShape, Vec::new()),
         MasqueWarpCredentialsConflict => (Key::SrvMasqueWarpCredentialsConflict, Vec::new()),
-        XdriveServiceUnsupported(arg) => {
-            (Key::SrvXdriveServiceUnsupported, vec![format!("{arg:?}")])
-        }
+        XdriveServiceUnsupported(arg) => (Key::SrvXdriveServiceUnsupported, vec![Quoted(arg)]),
         XdriveServiceMissing => (Key::SrvXdriveServiceMissing, Vec::new()),
         XdriveDriveSecretsInvalid => (Key::SrvXdriveDriveSecrets, Vec::new()),
         XdriveTemplateMissing => (Key::SrvXdriveTemplateObject, Vec::new()),
         XdriveRemoteFolderRequired => (Key::SrvXdriveRemoteFolderRequired, Vec::new()),
-        XdriveTemplateOperationUrlRequired(arg) => (Key::SrvXdriveOperationUrl, vec![arg.clone()]),
+        XdriveTemplateOperationUrlRequired(arg) => (Key::SrvXdriveOperationUrl, vec![Text(arg)]),
         XdriveTemplateNamesRegexInvalid => (Key::SrvXdriveNamesRegexInvalid, Vec::new()),
         XdriveTemplateAuthTypeUnsupported(arg) => {
-            (Key::SrvXdriveAuthTypeUnsupported, vec![format!("{arg:?}")])
+            (Key::SrvXdriveAuthTypeUnsupported, vec![Quoted(arg)])
         }
         XdriveTemplateTokenUrlRequired => (Key::SrvXdriveTokenUrlRequired, Vec::new()),
         XdriveTemplateHeaderValuesNotStrings => (Key::SrvXdriveHeaderValues, Vec::new()),
@@ -2635,7 +2682,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         XdriveMuxXudpProxyUdp443Skip => (Key::SrvXdriveMuxXudpSkip, Vec::new()),
         XdriveVlessTestpreUnsupported => (Key::SrvXdriveTestpre, Vec::new()),
         XdriveDriveServiceRenamed => (Key::SrvXdriveDriveRenamed, Vec::new()),
-        XdriveH3MaskNotNoise(arg) => (Key::SrvXdriveH3MaskNotNoise, vec![arg.clone()]),
+        XdriveH3MaskNotNoise(arg) => (Key::SrvXdriveH3MaskNotNoise, vec![Text(arg)]),
         XdriveH3CongestionBrutal => (Key::SrvXdriveH3BrutalCongestion, Vec::new()),
         RealityRequiresTransport => (Key::SrvRealityRequiresTransport, Vec::new()),
         RealitySettingsMissing => (Key::SrvRealitySettingsMissing, Vec::new()),
@@ -2668,7 +2715,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         TlsFingerprintUnsupported => (Key::OutboundTlsFingerprintUnsupported, Vec::new()),
         RealityFingerprintUnsupported => (Key::OutboundRealityFingerprintUnsupported, Vec::new()),
         RealityFingerprintUntested(arg) => {
-            (Key::OutboundRealityFingerprintUntested, vec![arg.clone()])
+            (Key::OutboundRealityFingerprintUntested, vec![Text(arg)])
         }
         PinnedPeerCertSha256Invalid => (Key::OutboundPinnedPeerCertSha256Invalid, Vec::new()),
         TlsVersionRangeInvalid => (Key::OutboundTlsVersionRangeInvalid, Vec::new()),
@@ -2687,7 +2734,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         XhttpSessionIdLengthRequired => (Key::SrvXhttpSessionLengthRequired, Vec::new()),
         XhttpSessionIdTableInvalid => (Key::SrvXhttpSessionTableInvalid, Vec::new()),
         XmuxLimitsExclusive => (Key::SrvXmuxLimitsExclusive, Vec::new()),
-        XhttpExtraShadowsSettings(arg) => (Key::XhttpExtraShadowsSettings, vec![arg.clone()]),
+        XhttpExtraShadowsSettings(arg) => (Key::XhttpExtraShadowsSettings, vec![Text(arg)]),
         SniffingDestOverrideInvalid => (Key::SniffingDestOverrideInvalid, Vec::new()),
         OutboundTargetStrategyInvalid => (Key::OutboundTargetStrategyInvalid, Vec::new()),
         SockoptTproxySilentOff => (Key::SockoptTproxySilentOff, Vec::new()),
@@ -2727,7 +2774,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskQuicBandwidthNonFinite => (Key::FinalmaskQuicBandwidthNonFinite, Vec::new()),
         FinalmaskQuicBandwidthTooLarge => (Key::FinalmaskQuicBandwidthTooLarge, Vec::new()),
         FinalmaskQuicBandwidthUnitInvalid(arg) => {
-            (Key::FinalmaskQuicBandwidthUnitInvalid, vec![arg.clone()])
+            (Key::FinalmaskQuicBandwidthUnitInvalid, vec![Text(arg)])
         }
         FinalmaskQuicForceBrutalNeedsUp => (Key::FinalmaskQuicForceBrutalNeedsUp, Vec::new()),
         FinalmaskQuicHopMoved => (Key::FinalmaskQuicHopMoved, Vec::new()),
@@ -2735,7 +2782,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskUdpHopIntervalTooSmall => (Key::FinalmaskUdpHopIntervalTooSmall, Vec::new()),
         FinalmaskUdpHopSockoptRetired => (Key::FinalmaskUdpHopSockoptRetired, Vec::new()),
         FinalmaskUdpHopIpInvalid => (Key::FinalmaskUdpHopIpInvalid, Vec::new()),
-        FinalmaskUdpMaskNotLast(arg) => (Key::FinalmaskUdpMaskNotLast, vec![arg.clone()]),
+        FinalmaskUdpMaskNotLast(arg) => (Key::FinalmaskUdpMaskNotLast, vec![Text(arg)]),
         FinalmaskUdpHopIntervalTransportConflict => {
             (Key::FinalmaskUdpHopIntervalTransportConflict, Vec::new())
         }
@@ -2749,13 +2796,13 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         }
         FinalmaskPortNumberRange => (Key::FinalmaskPortNumberRange, Vec::new()),
         FinalmaskPortEnvNameRequired => (Key::FinalmaskPortEnvNameRequired, Vec::new()),
-        FinalmaskPortListInvalid(arg) => (Key::FinalmaskPortListInvalid, vec![arg.clone()]),
-        FinalmaskBytesValueRequired(arg) => (Key::FinalmaskBytesValueRequired, vec![arg.clone()]),
+        FinalmaskPortListInvalid(arg) => (Key::FinalmaskPortListInvalid, vec![Text(arg)]),
+        FinalmaskBytesValueRequired(arg) => (Key::FinalmaskBytesValueRequired, vec![Text(arg)]),
         FinalmaskArrayByteSyntax => (Key::FinalmaskArrayByteSyntax, Vec::new()),
         FinalmaskStrByteSyntax => (Key::FinalmaskStrByteSyntax, Vec::new()),
         FinalmaskHexByteSyntax => (Key::FinalmaskHexByteSyntax, Vec::new()),
         FinalmaskBase64ByteSyntax => (Key::FinalmaskBase64ByteSyntax, Vec::new()),
-        FinalmaskUnknownByteSyntax(arg) => (Key::FinalmaskUnknownByteSyntax, vec![arg.clone()]),
+        FinalmaskUnknownByteSyntax(arg) => (Key::FinalmaskUnknownByteSyntax, vec![Text(arg)]),
         FinalmaskTransformOpRequired => (Key::FinalmaskTransformOpRequired, Vec::new()),
         FinalmaskTransformArgRequired => (Key::FinalmaskTransformArgRequired, Vec::new()),
         FinalmaskTransformArgExclusive => (Key::FinalmaskTransformArgExclusive, Vec::new()),
@@ -2772,11 +2819,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskLengthsStartAboveZero => (Key::FinalmaskLengthsStartAboveZero, Vec::new()),
         FinalmaskUnknownTcpMask(arg) => (
             Key::FinalmaskUnknownTcpMask,
-            vec![
-                arg.as_deref()
-                    .map(|value| format!("Some({value:?})"))
-                    .unwrap_or_else(|| "None".into()),
-            ],
+            vec![OptionalQuoted(arg.as_deref())],
         ),
         FinalmaskUdpHeaderModeInvalid => (Key::FinalmaskUdpHeaderModeInvalid, Vec::new()),
         FinalmaskMkcpHeaderInvalid => (Key::FinalmaskMkcpHeaderInvalid, Vec::new()),
@@ -2784,19 +2827,13 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskNoiseScriptConflict => (Key::FinalmaskNoiseScriptConflict, Vec::new()),
         FinalmaskNoiseExpPacketNotString => (Key::FinalmaskNoiseExpPacketNotString, Vec::new()),
         FinalmaskNoiseExpEmpty => (Key::FinalmaskNoiseExpEmpty, Vec::new()),
-        FinalmaskNoiseExpTrailingText(arg) => {
-            (Key::FinalmaskNoiseExpTrailingText, vec![arg.clone()])
-        }
-        FinalmaskNoiseExpUnknownToken(arg) => {
-            (Key::FinalmaskNoiseExpUnknownToken, vec![arg.clone()])
-        }
-        FinalmaskNoiseExpMissingSize(arg) => (Key::FinalmaskNoiseExpMissingSize, vec![arg.clone()]),
-        FinalmaskNoiseExpSizeInvalid(arg) => (Key::FinalmaskNoiseExpSizeInvalid, vec![arg.clone()]),
-        FinalmaskNoiseExpBytesInvalid(arg) => {
-            (Key::FinalmaskNoiseExpBytesInvalid, vec![arg.clone()])
-        }
+        FinalmaskNoiseExpTrailingText(arg) => (Key::FinalmaskNoiseExpTrailingText, vec![Text(arg)]),
+        FinalmaskNoiseExpUnknownToken(arg) => (Key::FinalmaskNoiseExpUnknownToken, vec![Text(arg)]),
+        FinalmaskNoiseExpMissingSize(arg) => (Key::FinalmaskNoiseExpMissingSize, vec![Text(arg)]),
+        FinalmaskNoiseExpSizeInvalid(arg) => (Key::FinalmaskNoiseExpSizeInvalid, vec![Text(arg)]),
+        FinalmaskNoiseExpBytesInvalid(arg) => (Key::FinalmaskNoiseExpBytesInvalid, vec![Text(arg)]),
         FinalmaskNoiseExpArgumentNotAllowed(arg) => {
-            (Key::FinalmaskNoiseExpArgumentNotAllowed, vec![arg.clone()])
+            (Key::FinalmaskNoiseExpArgumentNotAllowed, vec![Text(arg)])
         }
         FinalmaskSalamanderPacketSize => (Key::FinalmaskSalamanderPacketSize, Vec::new()),
         FinalmaskXdnsShapeRetired => (Key::FinalmaskXdnsShapeRetired, Vec::new()),
@@ -2809,19 +2846,19 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskXdnsResolverAddrInvalid => (Key::FinalmaskXdnsResolverAddrInvalid, Vec::new()),
         FinalmaskXdnsResolverAddrsEmpty => (Key::FinalmaskXdnsResolverAddrsEmpty, Vec::new()),
         FinalmaskXdnsAddrSchemeUnknown(arg) => {
-            (Key::FinalmaskXdnsAddrSchemeUnknown, vec![arg.clone()])
+            (Key::FinalmaskXdnsAddrSchemeUnknown, vec![Text(arg)])
         }
         FinalmaskXdnsHttpsRequiresTls => (Key::FinalmaskXdnsHttpsRequiresTls, Vec::new()),
         FinalmaskXdnsWorkerInvalid => (Key::FinalmaskXdnsWorkerInvalid, Vec::new()),
         FinalmaskXdnsExtraPollInvalid => (Key::FinalmaskXdnsExtraPollInvalid, Vec::new()),
         FinalmaskXicmpIpInvalid => (Key::FinalmaskXicmpIpInvalid, Vec::new()),
-        FinalmaskFilterIpRuleInvalid(arg) => (Key::FinalmaskFilterIpRuleInvalid, vec![arg.clone()]),
+        FinalmaskFilterIpRuleInvalid(arg) => (Key::FinalmaskFilterIpRuleInvalid, vec![Text(arg)]),
         FinalmaskFilterOnOutbound => (Key::FinalmaskFilterOnOutbound, Vec::new()),
         FinalmaskRealmScheme => (Key::FinalmaskRealmScheme, Vec::new()),
         FinalmaskRealmHostRequired => (Key::FinalmaskRealmHostRequired, Vec::new()),
         FinalmaskRealmTokenBeforeAt => (Key::FinalmaskRealmTokenBeforeAt, Vec::new()),
         FinalmaskRealmIdInPath => (Key::FinalmaskRealmIdInPath, Vec::new()),
-        FinalmaskRealmUrlSyntax(arg) => (Key::FinalmaskRealmUrlSyntax, vec![arg.clone()]),
+        FinalmaskRealmUrlSyntax(arg) => (Key::FinalmaskRealmUrlSyntax, vec![Text(arg)]),
         FinalmaskRealmStunRequired => (Key::FinalmaskRealmStunRequired, Vec::new()),
         FinalmaskRealmStunFormat => (Key::FinalmaskRealmStunFormat, Vec::new()),
         FinalmaskRealmAllowInsecureRemoved => (Key::FinalmaskRealmAllowInsecureRemoved, Vec::new()),
@@ -2831,13 +2868,9 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         FinalmaskRealmEchKeysBase64 => (Key::FinalmaskRealmEchKeysBase64, Vec::new()),
         FinalmaskUnknownUdpMask(arg) => (
             Key::FinalmaskUnknownUdpMask,
-            vec![
-                arg.as_deref()
-                    .map(|value| format!("Some({value:?})"))
-                    .unwrap_or_else(|| "None".into()),
-            ],
+            vec![OptionalQuoted(arg.as_deref())],
         ),
-        FinalmaskExtraShadow(arg) => (Key::FinalmaskExtraShadow, vec![format!("{arg:?}")]),
+        FinalmaskExtraShadow(arg) => (Key::FinalmaskExtraShadow, vec![Quoted(arg)]),
         FinalmaskPortListTooLarge => (Key::FinalmaskPortListTooLarge, Vec::new()),
         // Editor rules that moved into the model pass: the error-list text
         // keeps the existing key (its bytes are the editor's contract).
@@ -2849,142 +2882,130 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         // Settings-level verdict rules (validate_settings /
         // validate_profiles). Parameterized rules return the template that
         // validation_issue_message fills with the code-carried values.
-        ActiveProfileMissing(id) => (Key::SettingsActiveProfileMissing, vec![format!("{id:?}")]),
+        ActiveProfileMissing(id) => (Key::SettingsActiveProfileMissing, vec![Quoted(id)]),
         ActiveProfileAmbiguous(id, count) => (
             Key::SettingsActiveProfileAmbiguous,
-            vec![format!("{id:?}"), count.to_string()],
+            vec![Quoted(id), Count(*count)],
         ),
         ProfilesRequired => (Key::SettingsProfilesRequired, Vec::new()),
-        ProfileIdEmpty(index) => (Key::SettingsProfileIdEmpty, vec![index.to_string()]),
+        ProfileIdEmpty(index) => (Key::SettingsProfileIdEmpty, vec![Count(*index)]),
         ProfileIdDuplicated(first, second, id) => (
             Key::SettingsProfileIdDuplicated,
-            vec![first.to_string(), second.to_string(), format!("{id:?}")],
+            vec![Count(*first), Count(*second), Quoted(id)],
         ),
         ProfileTagEmpty(index, id) => (
             Key::SettingsProfileTagEmpty,
-            vec![index.to_string(), format!("{id:?}")],
+            vec![Count(*index), Quoted(id)],
         ),
         ProfileTagInvalid(index, id, tag) => (
             Key::SettingsProfileTagInvalid,
-            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")],
+            vec![Count(*index), Quoted(id), Quoted(tag)],
         ),
         ProfileTagReserved(index, id, tag) => (
             Key::SettingsProfileTagReserved,
-            vec![index.to_string(), format!("{id:?}"), format!("{tag:?}")],
+            vec![Count(*index), Quoted(id), Quoted(tag)],
         ),
         ProfileTagDuplicated(first, first_id, second, second_id, tag) => (
             Key::SettingsProfileTagDuplicated,
             vec![
-                first.to_string(),
-                format!("{first_id:?}"),
-                second.to_string(),
-                format!("{second_id:?}"),
-                format!("{tag:?}"),
+                Count(*first),
+                Quoted(first_id),
+                Count(*second),
+                Quoted(second_id),
+                Quoted(tag),
             ],
         ),
         OutboundChainMissing(source, target) => (
             Key::SettingsOutboundChainMissing,
-            vec![format!("{source:?}"), format!("{target:?}")],
+            vec![Quoted(source), Quoted(target)],
         ),
-        OutboundChainCycle(path) => (Key::SettingsOutboundChainCycle, vec![path.clone()]),
-        BalancerTagMissing(index) => (Key::SettingsBalancerNoTag, vec![index.to_string()]),
-        BalancerSelectorMissing(tag) => (Key::SettingsBalancerNoSelector, vec![format!("{tag:?}")]),
-        BalancerTagDuplicated(tag) => {
-            (Key::SettingsBalancerTagDuplicated, vec![format!("{tag:?}")])
-        }
+        OutboundChainCycle(path) => (Key::SettingsOutboundChainCycle, vec![Text(path)]),
+        BalancerTagMissing(index) => (Key::SettingsBalancerNoTag, vec![Count(*index)]),
+        BalancerSelectorMissing(tag) => (Key::SettingsBalancerNoSelector, vec![Quoted(tag)]),
+        BalancerTagDuplicated(tag) => (Key::SettingsBalancerTagDuplicated, vec![Quoted(tag)]),
         BalancerFallbackMissing(tag, fallback) => (
             Key::SettingsBalancerFallbackMissing,
-            vec![format!("{tag:?}"), format!("{fallback:?}")],
+            vec![Quoted(tag), Quoted(fallback)],
         ),
         LocalInboundAuthRequiresAccounts => (Key::InboundsAuthRequiresAccounts, Vec::new()),
-        LocalInboundPortZero(tag) => (Key::SettingsLocalInboundPortZero, vec![format!("{tag:?}")]),
-        InboundTagDuplicated(tag) => (Key::SettingsInboundTagDuplicated, vec![tag.clone()]),
-        DokodemoTagMissing(index) => (Key::SettingsDokodemoTagMissing, vec![index.to_string()]),
+        LocalInboundPortZero(tag) => (Key::SettingsLocalInboundPortZero, vec![Quoted(tag)]),
+        InboundTagDuplicated(tag) => (Key::SettingsInboundTagDuplicated, vec![Text(tag)]),
+        DokodemoTagMissing(index) => (Key::SettingsDokodemoTagMissing, vec![Count(*index)]),
         DokodemoNetworkInvalid(tag, error) => (
             Key::SettingsDokodemoNetworkInvalid,
-            vec![format!("{tag:?}"), error.clone()],
+            vec![Quoted(tag), Text(error)],
         ),
-        DokodemoUnixSocketRequired(tag) => (
-            Key::SettingsDokodemoUnixSocketRequired,
-            vec![format!("{tag:?}")],
-        ),
+        DokodemoUnixSocketRequired(tag) => {
+            (Key::SettingsDokodemoUnixSocketRequired, vec![Quoted(tag)])
+        }
         DokodemoUnixSocketConflict(tag, other, path) => (
             Key::SettingsDokodemoUnixSocketConflict,
-            vec![
-                format!("{tag:?}"),
-                format!("{other:?}"),
-                format!("{path:?}"),
-            ],
+            vec![Quoted(tag), Quoted(other), Quoted(path)],
         ),
-        DokodemoPortZero(tag) => (Key::SettingsDokodemoPortZero, vec![format!("{tag:?}")]),
+        DokodemoPortZero(tag) => (Key::SettingsDokodemoPortZero, vec![Quoted(tag)]),
         TunIpv4GatewayRequired => (Key::SettingsTunIpv4GatewayRequired, Vec::new()),
-        TunGatewayInvalid(arg) => (Key::SettingsTunGatewayInvalid, vec![arg.clone()]),
+        TunGatewayInvalid(arg) => (Key::SettingsTunGatewayInvalid, vec![Text(arg)]),
         TunLeakRoutingTableRequired => (Key::SettingsTunLeakRoutingTableRequired, Vec::new()),
-        TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![arg.clone()]),
+        TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![Text(arg)]),
         TunLeakMisconfigTunOff => (Key::SettingsTunLeakMisconfigTunOff, Vec::new()),
         ListenerConflict(current, other, address, port) => (
             Key::SettingsListenerConflict,
             vec![
-                current.clone(),
-                other.clone(),
-                address.clone(),
-                port.to_string(),
+                Text(current),
+                Text(other),
+                Text(address),
+                Count(usize::from(*port)),
             ],
         ),
         RoutingRuleTarget(index, error) => (
             Key::SettingsRoutingRuleTarget,
-            vec![index.to_string(), error.clone()],
+            vec![Count(*index), Text(error)],
         ),
         RoutingRuleOutboundMissing(index, tag) => (
             Key::SettingsRoutingRuleOutboundMissing,
-            vec![index.to_string(), format!("{tag:?}")],
+            vec![Count(*index), Quoted(tag)],
         ),
         RoutingRuleBalancerMissing(index, tag) => (
             Key::SettingsRoutingRuleBalancerMissing,
-            vec![index.to_string(), format!("{tag:?}")],
+            vec![Count(*index), Quoted(tag)],
         ),
         RoutingRuleInboundMissing(index, tag) => (
             Key::SettingsRoutingRuleInboundMissing,
-            vec![index.to_string(), format!("{tag:?}")],
+            vec![Count(*index), Quoted(tag)],
         ),
-        DnsServerAddressMissing(index) => (
-            Key::SettingsDnsServerAddressMissing,
-            vec![index.to_string()],
-        ),
+        DnsServerAddressMissing(index) => {
+            (Key::SettingsDnsServerAddressMissing, vec![Count(*index)])
+        }
         DnsBootstrapNotResolvable => (Key::SettingsDnsBootstrapNotResolvable, Vec::new()),
         LuaScriptPathRequired => (Key::SettingsLuaScriptPathRequired, Vec::new()),
         LuaScriptPathNotLua => (Key::SettingsLuaScriptPathNotLua, Vec::new()),
-        FilePathRemote(arg) => (Key::FilePathRemote, vec![arg.clone()]),
-        TlsExtraShadow(arg) => (Key::TlsExtraShadow, vec![arg.clone()]),
-        StreamExtraShadow(arg) => (Key::StreamExtraShadow, vec![arg.clone()]),
-        OutboundExtraShadow(arg) => (Key::OutboundExtraShadow, vec![arg.clone()]),
-        EnvCorePathOverride(arg) => (Key::EnvCorePathOverride, vec![arg.clone()]),
-        SettingsExtraShadow(arg) => (Key::SettingsExtraShadow, vec![arg.clone()]),
-        XmuxExtraShadow(arg) => (Key::XmuxExtraShadow, vec![arg.clone()]),
+        FilePathRemote(arg) => (Key::FilePathRemote, vec![Text(arg)]),
+        TlsExtraShadow(arg) => (Key::TlsExtraShadow, vec![Text(arg)]),
+        StreamExtraShadow(arg) => (Key::StreamExtraShadow, vec![Text(arg)]),
+        OutboundExtraShadow(arg) => (Key::OutboundExtraShadow, vec![Text(arg)]),
+        EnvCorePathOverride(arg) => (Key::EnvCorePathOverride, vec![Text(arg)]),
+        SettingsExtraShadow(arg) => (Key::SettingsExtraShadow, vec![Text(arg)]),
+        XmuxExtraShadow(arg) => (Key::XmuxExtraShadow, vec![Text(arg)]),
         DnsScriptFallbackConflict => (Key::SettingsDnsScriptFallbackConflict, Vec::new()),
         DnsScriptServerConflict(index, field) => (
             Key::SettingsDnsScriptServerConflict,
-            vec![index.to_string(), field.clone()],
+            vec![Count(*index), Text(field)],
         ),
         RoutingScriptRulesConflict => (Key::SettingsRoutingScriptRulesConflict, Vec::new()),
         RoutingScriptStrategyConflict => (Key::SettingsRoutingScriptStrategyConflict, Vec::new()),
-        FakeDnsPoolCidrInvalid(index) => {
-            (Key::SettingsFakeDnsPoolCidrInvalid, vec![index.to_string()])
-        }
-        FakeDnsPoolSizeInvalid(index) => {
-            (Key::SettingsFakeDnsPoolSizeInvalid, vec![index.to_string()])
-        }
+        FakeDnsPoolCidrInvalid(index) => (Key::SettingsFakeDnsPoolCidrInvalid, vec![Count(*index)]),
+        FakeDnsPoolSizeInvalid(index) => (Key::SettingsFakeDnsPoolSizeInvalid, vec![Count(*index)]),
         FakeDnsPoolCapacityExceeded(index, size, pool) => (
             Key::SettingsFakeDnsPoolCapacityExceeded,
-            vec![index.to_string(), size.to_string(), pool.clone()],
+            vec![Count(*index), SignedCount(*size), Text(pool)],
         ),
         GeodataUrlInvalid(file) => (
             Key::SettingsGeodataUrlInvalid,
-            vec![file.clone(), t(lang, Key::GeodataUrlNotHttps).to_string()],
+            vec![Text(file), Text(t(lang, Key::GeodataUrlNotHttps))],
         ),
         GeodataCronInvalid => (
             Key::SettingsGeodataCronInvalid,
-            vec![t(lang, Key::GeodataCronNotFiveFields).to_string()],
+            vec![Text(t(lang, Key::GeodataCronNotFiveFields))],
         ),
         // Draft requirements: the editor's own rules, each rendering the
         // message the editor has always shown for that field.
@@ -3016,10 +3037,6 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
 /// [`validation_text`], so a caller cannot pick half of the rule's text.
 pub fn validation_message(code: &ValidationCode, lang: Language) -> String {
     let (key, args) = validation_text(code, lang);
-    let args: Vec<&dyn std::fmt::Display> = args
-        .iter()
-        .map(|arg| arg as &dyn std::fmt::Display)
-        .collect();
     fill_message_template(t(lang, key), &args)
 }
 

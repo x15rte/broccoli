@@ -88,7 +88,13 @@ impl Line {
         if self.bytes.last() == Some(&b'\r') {
             self.bytes.pop();
         }
-        String::from_utf8_lossy(&self.bytes).into_owned()
+        // The buffer moves into the string: valid UTF-8 — the overwhelmingly
+        // common case for a text log — costs no copy at all. Only an invalid
+        // byte forces the lossy scan, which then builds the string fresh.
+        match String::from_utf8(self.bytes) {
+            Ok(line) => line,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        }
     }
 
     /// Bytes still allowed before the cap.

@@ -1288,50 +1288,43 @@ impl OutboundModel {
 
     /// Keep protocol/transport/security combinations executable by Xray.
     pub fn enforce_invariants(&mut self) {
-        if let ProtocolSettings::Vless(settings) = &mut self.settings
-            && settings.encryption.is_empty()
-        {
-            settings.encryption = "none".to_string();
-        }
-        if let ProtocolSettings::Vmess(settings) = &mut self.settings
-            && !super::validation::vmess_security_supported(&settings.security)
-        {
-            // The rewrite is generation's, not the profile's: the core takes
-            // its own default for a value outside the vocabulary, the model
-            // pass reports that fallback as an advisory, and the stored value
-            // stays as written while the emitted document carries what the
-            // core will actually do.
-            settings.security = "auto".to_string();
-        }
-        if self.protocol == Protocol::Hysteria {
-            if let ProtocolSettings::Hysteria(settings) = &mut self.settings {
-                settings.version = 2;
-            }
-            let _ = self.stream.select_network(super::stream::Network::Hysteria);
-            if let Some(settings) = self.stream.hysteria_settings.as_mut() {
-                settings.version = 2;
-            }
-        }
-        self.stream.enforce_invariants();
+        enforce_wire_invariants(self.protocol, &mut self.settings, &mut self.stream);
     }
 
     /// Serialize to the wire object with `tag` injected.
+    ///
+    /// The document differs from the stored model in two subtrees only —
+    /// `settings` and `streamSettings` — so those two are cloned and
+    /// normalized while every other field is borrowed for serialization: a
+    /// full-model clone per profile per document buys nothing but copies.
     pub fn to_wire(&self, tag: &str) -> Value {
-        let mut normalized = self.clone();
-        normalized.enforce_invariants();
+        let mut settings = self.settings.clone();
+        let mut stream = self.stream.clone();
+        enforce_wire_invariants(self.protocol, &mut settings, &mut stream);
         // The retired key is a settings-file fact only: it round-trips
         // through `servers.json` so the user still sees the profile's state,
         // and the generated document never carries it (the pinned core
-        // refuses an outbound that does — infra/conf/xray.go:262).
-        normalized.retired_proxy_settings = None;
+        // refuses an outbound that does — infra/conf/xray.go:262). The wire
+        // view below simply carries no value for it.
+        //
         // Same for the retired WireGuard `domainStrategy`: the core removed
         // the field and its loader ignores an unknown key, so the generated
         // document drops the retained value and the model pass warns.
-        if let ProtocolSettings::Wireguard(settings) = &mut normalized.settings {
+        if let ProtocolSettings::Wireguard(settings) = &mut settings {
             settings.domain_strategy.clear();
         }
-        normalized.stream.retain_selected_stream_blocks_for_wire();
-        let mut value = serde_json::to_value(&normalized).expect(
+        stream.retain_selected_stream_blocks_for_wire();
+        let mut value = serde_json::to_value(OutboundWire {
+            protocol: self.protocol,
+            settings: &settings,
+            stream: &stream,
+            retired_proxy_settings: None,
+            send_through: &self.send_through,
+            target_strategy: &self.target_strategy,
+            mux: &self.mux,
+            extra: &self.extra,
+        })
+        .expect(
             "model serialization is infallible: the OutboundModel subtree serializes with \
              string map keys only and carries no float fields",
         );
@@ -1342,31 +1335,102 @@ impl OutboundModel {
     }
 }
 
-impl Serialize for OutboundModel {
+/// The normalization [`OutboundModel::enforce_invariants`] applies, over the
+/// two subtrees it reads and rewrites. [`OutboundModel::to_wire`] normalizes
+/// its clones through the same function, so a stored model and its wire
+/// document can never take different normalization paths.
+fn enforce_wire_invariants(
+    protocol: Protocol,
+    settings: &mut ProtocolSettings,
+    stream: &mut StreamModel,
+) {
+    if let ProtocolSettings::Vless(settings) = settings
+        && settings.encryption.is_empty()
+    {
+        settings.encryption = "none".to_string();
+    }
+    if let ProtocolSettings::Vmess(settings) = settings
+        && !super::validation::vmess_security_supported(&settings.security)
+    {
+        // The rewrite is generation's, not the profile's: the core takes
+        // its own default for a value outside the vocabulary, the model
+        // pass reports that fallback as an advisory, and the stored value
+        // stays as written while the emitted document carries what the
+        // core will actually do.
+        settings.security = "auto".to_string();
+    }
+    if protocol == Protocol::Hysteria {
+        if let ProtocolSettings::Hysteria(settings) = settings {
+            settings.version = 2;
+        }
+        let _ = stream.select_network(super::stream::Network::Hysteria);
+        if let Some(settings) = stream.hysteria_settings.as_mut() {
+            settings.version = 2;
+        }
+    }
+    stream.enforce_invariants();
+}
+
+/// The wire shape of an outbound: the exact field order and inclusion rules
+/// the document carries, borrowed field by field. [`OutboundModel`]'s own
+/// `Serialize` is this view over its stored fields, and
+/// [`OutboundModel::to_wire`] builds it over its two normalized clones, so the
+/// field list exists once and the two paths cannot emit different documents.
+struct OutboundWire<'a> {
+    protocol: Protocol,
+    settings: &'a ProtocolSettings,
+    stream: &'a StreamModel,
+    /// The retained `proxySettings` value as the settings file writes it;
+    /// [`OutboundModel::to_wire`] passes `None` so the generated document
+    /// never carries the retired key.
+    retired_proxy_settings: Option<&'a Value>,
+    send_through: &'a Option<String>,
+    target_strategy: &'a Option<String>,
+    mux: &'a MuxModel,
+    extra: &'a Map<String, Value>,
+}
+
+impl Serialize for OutboundWire<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut m = s.serialize_map(None)?;
         m.serialize_entry("protocol", self.protocol.as_str())?;
-        m.serialize_entry("settings", &self.settings)?;
+        m.serialize_entry("settings", self.settings)?;
         if !self.stream.is_default() {
-            m.serialize_entry("streamSettings", &self.stream)?;
+            m.serialize_entry("streamSettings", self.stream)?;
         }
-        if let Some(raw) = &self.retired_proxy_settings {
+        if let Some(raw) = self.retired_proxy_settings {
             m.serialize_entry("proxySettings", raw)?;
         }
-        if let Some(v) = &self.send_through {
+        if let Some(v) = self.send_through {
             m.serialize_entry("sendThrough", v)?;
         }
-        if let Some(v) = &self.target_strategy {
+        if let Some(v) = self.target_strategy {
             m.serialize_entry("targetStrategy", v)?;
         }
         if !self.mux.is_empty() {
-            m.serialize_entry("mux", &self.mux)?;
+            m.serialize_entry("mux", self.mux)?;
         }
-        for (k, v) in &self.extra {
+        for (k, v) in self.extra {
             m.serialize_entry(k, v)?;
         }
         m.end()
+    }
+}
+
+impl Serialize for OutboundModel {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        OutboundWire {
+            protocol: self.protocol,
+            settings: &self.settings,
+            stream: &self.stream,
+            retired_proxy_settings: self.retired_proxy_settings.as_ref(),
+            send_through: &self.send_through,
+            target_strategy: &self.target_strategy,
+            mux: &self.mux,
+            extra: &self.extra,
+        }
+        .serialize(s)
     }
 }
 

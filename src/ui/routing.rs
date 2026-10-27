@@ -67,30 +67,53 @@ struct BalancerRuntimeUi {
     info: Option<BalancerInfoView>,
     feedback: Option<(bool, String)>,
     known_target: String,
+    /// The view-cache generation [`Self::known_target`] was last validated
+    /// against: the fallback scan runs once per balancer per generation, not
+    /// once per balancer per frame.
+    known_target_generation: Option<(u64, Language)>,
     use_custom_target: bool,
     custom_target: String,
-    /// Bumped whenever `info` is replaced or created: the principle-targets
-    /// line memo's key.
+    /// Bumped whenever `info` is replaced or created: the memo key for the
+    /// rendered lines derived from it.
     info_generation: u64,
-    /// The rendered principle-targets line and the (info generation,
-    /// language) pair it was rendered for.
+    /// The rendered principle-targets and current-override lines and the
+    /// (info generation, language) pair they were rendered for.
     principle_line: Option<PrincipleLine>,
 }
 
-/// The principle-targets line as rendered for one info reply. The reply's
-/// target list only changes when the reply is consumed, so the join +
-/// `t_fmt` are cached per (reply generation, language) instead of running
-/// on every frame the balancer editor is open.
+/// The principle-targets and current-override lines as rendered for one info
+/// reply. The reply's target list and override target only change when the
+/// reply is consumed (or a mutate verdict echoes into it), so both texts are
+/// cached per (reply generation, language) instead of re-running the join +
+/// `t_fmt`/`t` on every frame the balancer editor is open.
 struct PrincipleLine {
     generation: u64,
     lang: Language,
     text: String,
+    /// The `CurrentOverride` / `CurrentOverrideNone` label for the same
+    /// reply (`CurrentOverride` formatting was per frame before).
+    override_text: String,
 }
 
 impl BalancerRuntimeUi {
-    /// Rebuild the memoized principle-targets line when the info reply or
-    /// the language moved; runs before the info block's shared borrow, which
-    /// then only reads the cached text.
+    /// Keep the override combo's target pointing at an outbound this
+    /// generation's list still offers: the first offered tag when the
+    /// remembered one vanished (or was never set). The membership scan and
+    /// the fallback clone are memoized on the view-cache generation, which
+    /// rebuilds exactly when the tag list can change.
+    fn refresh_known_target(&mut self, out_tags: &[String], generation: (u64, Language)) {
+        if self.known_target_generation == Some(generation) {
+            return;
+        }
+        if self.known_target.is_empty() || !out_tags.iter().any(|tag| tag == &self.known_target) {
+            self.known_target = out_tags.first().cloned().unwrap_or_default();
+        }
+        self.known_target_generation = Some(generation);
+    }
+
+    /// Rebuild the memoized principle-targets and current-override lines when
+    /// the info reply or the language moved; runs before the info block's
+    /// shared borrow, which then only reads the cached text.
     fn refresh_principle_line(&mut self, lang: Language) {
         let stale = self
             .principle_line
@@ -110,10 +133,21 @@ impl BalancerRuntimeUi {
             Some(_) => t(lang, Key::PrincipleTargetsNone).into(),
             None => t(lang, Key::PrincipleTargetsHidden).into(),
         };
+        // The override label belongs to the same reply: `info_generation`
+        // covers every writer of `override_target` (a consumed reply, and the
+        // mutate echo below bumps it too), so one key serves both lines.
+        let override_text =
+            self.info
+                .as_ref()
+                .map_or_else(String::new, |info| match &info.override_target {
+                    Some(target) => t_fmt(lang, Key::CurrentOverride, &[target]),
+                    None => t(lang, Key::CurrentOverrideNone).into(),
+                });
         self.principle_line = Some(PrincipleLine {
             generation: self.info_generation,
             lang,
             text,
+            override_text,
         });
     }
 
@@ -123,6 +157,14 @@ impl BalancerRuntimeUi {
         self.principle_line
             .as_ref()
             .map_or("", |line| line.text.as_str())
+    }
+
+    /// The cached current-override label, refreshed this frame by
+    /// [`Self::refresh_principle_line`].
+    fn override_line_text(&self) -> &str {
+        self.principle_line
+            .as_ref()
+            .map_or("", |line| line.override_text.as_str())
     }
 }
 
@@ -2352,8 +2394,20 @@ impl RoutingScreen {
                                 state.info = Some(BalancerInfoView::default());
                                 state.info_generation = state.info_generation.wrapping_add(1);
                             }
-                            if let Some(info) = state.info.as_mut() {
+                            // The echo also replaces the reply's override
+                            // target, which the memoized current-override
+                            // label renders: bump the generation so the memo
+                            // follows (`info_generation` is the key for every
+                            // writer of `override_target`).
+                            let mut echoed = false;
+                            if let Some(info) = state.info.as_mut()
+                                && info.override_target != target
+                            {
                                 info.override_target = target.clone();
+                                echoed = true;
+                            }
+                            if echoed {
+                                state.info_generation = state.info_generation.wrapping_add(1);
                             }
                             let message = match target {
                                 Some(target) => {
@@ -2397,40 +2451,23 @@ impl RoutingScreen {
 
         let action = {
             let state = Self::balancer_runtime_state(&mut self.balancer_runtime, tag);
-            if state.known_target.is_empty()
-                || !self
-                    .view_cache
-                    .as_ref()
-                    .expect("view cache populated above")
-                    .out_tags
-                    .iter()
-                    .any(|candidate| candidate == &state.known_target)
-            {
-                state.known_target = self
-                    .view_cache
-                    .as_ref()
-                    .expect("view cache populated above")
-                    .out_tags
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
-            }
+            let view = self
+                .view_cache
+                .as_ref()
+                .expect("view cache populated above");
+            // The combo's fallback target is validated once per view-cache
+            // generation (see `refresh_known_target`), not per frame.
+            state.refresh_known_target(&view.out_tags, view.generation);
 
-            // The principle-targets line is memoized on the info reply's
-            // generation (see `PrincipleLine`), so the editor's steady
-            // repaints only read the cached text.
+            // Both info lines are memoized on the reply's generation (see
+            // `PrincipleLine`), so the editor's steady repaints only read the
+            // cached text.
             state.refresh_principle_line(lang);
-            match &state.info {
-                Some(info) => {
-                    ui.label(match &info.override_target {
-                        Some(target) => t_fmt(lang, Key::CurrentOverride, &[target]),
-                        None => t(lang, Key::CurrentOverrideNone).into(),
-                    });
-                    ui.label(state.principle_line_text());
-                }
-                None => {
-                    ui.label(RichText::new(t(lang, Key::RuntimeStateNotRefreshed)).weak());
-                }
+            if state.info.is_some() {
+                ui.label(state.override_line_text());
+                ui.label(state.principle_line_text());
+            } else {
+                ui.label(RichText::new(t(lang, Key::RuntimeStateNotRefreshed)).weak());
             }
 
             let pending = state.pending_request.is_some();

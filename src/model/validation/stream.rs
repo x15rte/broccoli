@@ -1161,10 +1161,68 @@ fn transport_extra_shadows(stream: &StreamModel, issues: &mut Vec<ValidationIssu
     }
 }
 
+/// The per-block verdicts of one [`validate_stream_with_blocks`] sweep: the
+/// findings the editor renders under a block's own controls instead of in the
+/// profile-wide list. Each one is the sweep's own call to the block validator,
+/// so the inline verdict and the aggregated list can never disagree — and the
+/// block is validated once, not a second time beside the sweep.
+///
+/// Only the top-level stream's blocks are captured. A nested XHTTP download
+/// stream carries the same wire path prefix as its parent (its blocks are not
+/// separately addressable in the editor), so capturing them would make an
+/// inline row show a finding that belongs to another stream.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StreamBlocks {
+    /// The top-level `stream.sockopt` block.
+    pub sockopt: Verdict,
+    /// The top-level ECH DNS-query sockopt block
+    /// (`stream.tlsSettings.echSockopt`), present only when TLS carries one
+    /// ([`ech_sockopt_emitted`] is the gate).
+    pub ech_sockopt: Verdict,
+    /// The top-level `finalmask` block, through [`validate_finalmask`] alone:
+    /// the outbound-filter advisories the aggregated list folds in
+    /// (`finalmask_outbound_filter_advisories`) are not part of the block's
+    /// own verdict.
+    pub finalmask: Verdict,
+}
+
 /// Validate a stream model, recursing over every modeled XHTTP download
 /// stream. Mirrors the old `StreamModel::validation_errors` visit logic.
 pub fn validate_stream(s: &StreamModel) -> Verdict {
-    fn visit(stream: &StreamModel, depth: usize, issues: &mut Vec<ValidationIssue>) {
+    Verdict::from_issues(validate_stream_with_blocks(s).0)
+}
+
+/// [`validate_stream`] plus the top-level per-block verdicts
+/// ([`StreamBlocks`]) from the same single pass: the aggregated findings stay
+/// exactly what [`validate_stream`] returns (same order, same findings), and
+/// the block verdicts are the sweep's own per-block calls rather than a
+/// second validation of the same blocks.
+pub fn validate_stream_with_blocks(s: &StreamModel) -> (Vec<ValidationIssue>, StreamBlocks) {
+    /// Append one block verdict to the sweep's list, keeping the top-level
+    /// copy for [`StreamBlocks`]. The copy is the same findings the aggregate
+    /// list carries, so the editor's inline rows and the error list agree;
+    /// only a top-level block is copied, and only when it has findings.
+    fn push_block(
+        findings: Verdict,
+        depth: usize,
+        slot: Option<&mut Verdict>,
+        issues: &mut Vec<ValidationIssue>,
+    ) {
+        match slot {
+            Some(slot) if depth == 0 => {
+                issues.extend(findings.iter().cloned());
+                *slot = findings;
+            }
+            _ => issues.extend(findings),
+        }
+    }
+
+    fn visit(
+        stream: &StreamModel,
+        depth: usize,
+        issues: &mut Vec<ValidationIssue>,
+        mut blocks: Option<&mut StreamBlocks>,
+    ) {
         if depth > MAX_XHTTP_DOWNLOAD_DEPTH {
             issues.push(issue(ValidationCode::XhttpDepthExceeded, None));
             return;
@@ -1399,16 +1457,28 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             }
         }
         if let Some(sockopt) = &stream.sockopt {
-            issues.extend(validate_sockopt(sockopt, "stream.sockopt"));
+            push_block(
+                validate_sockopt(sockopt, "stream.sockopt"),
+                depth,
+                blocks.as_mut().map(|blocks| &mut blocks.sockopt),
+                issues,
+            );
         }
         if let Some(ech_sockopt) = ech_sockopt_emitted(stream) {
-            issues.extend(validate_sockopt(
-                ech_sockopt,
-                "stream.tlsSettings.echSockopt",
-            ));
+            push_block(
+                validate_sockopt(ech_sockopt, "stream.tlsSettings.echSockopt"),
+                depth,
+                blocks.as_mut().map(|blocks| &mut blocks.ech_sockopt),
+                issues,
+            );
         }
         if let Some(finalmask) = &stream.finalmask {
-            issues.extend(validate_finalmask(finalmask));
+            push_block(
+                validate_finalmask(finalmask),
+                depth,
+                blocks.as_mut().map(|blocks| &mut blocks.finalmask),
+                issues,
+            );
             finalmask_outbound_filter_advisories(finalmask, issues);
         }
         // XHTTP enum vocabularies and cross-field rules: every value below is
@@ -1535,7 +1605,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 ));
             }
             if let Some(download) = xhttp.download_settings.as_deref() {
-                visit(download, depth + 1, issues);
+                visit(download, depth + 1, issues, blocks);
             }
         }
         // mKCP configuration ranges: Xray's
@@ -1601,8 +1671,9 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
     }
 
     let mut issues = Vec::new();
-    visit(s, 0, &mut issues);
-    Verdict::from_issues(issues)
+    let mut blocks = StreamBlocks::default();
+    visit(s, 0, &mut issues, Some(&mut blocks));
+    (issues, blocks)
 }
 
 /// The sockopt `domainStrategy` vocabulary: the empty wire default plus the

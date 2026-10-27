@@ -65,9 +65,9 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_S
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, percent_encode};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::hash::Hasher;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -420,14 +420,41 @@ fn b64_decode_any(s: &str) -> Option<Vec<u8>> {
 
 // ---------- small parsed-query wrapper ----------
 
-struct Query(Vec<(String, String)>);
+/// A parsed link query: the decoded `key=value` pairs in link order, plus a
+/// first-occurrence index. The order is the link's own (consumers walk it to
+/// reach the whole query), while the index answers the grammar's dozens of
+/// single-key lookups — bulk import parses thousands of links, each with
+/// tens of parameters — without rescanning the pair list.
+struct Query {
+    /// The decoded pairs, in link order.
+    pairs: Vec<(String, String)>,
+    /// Each key's first pair position, keyed by [`query_key_hash`] rather
+    /// than by another owned copy of the key: the parse refuses duplicate
+    /// keys, so a key occupies at most one slot, and a hash collision between
+    /// two spellings is resolved by comparing the stored key (see [`get`]).
+    /// The index can therefore only cost speed, never correctness.
+    ///
+    /// [`get`]: Query::get
+    index: std::collections::HashMap<u64, usize>,
+}
 
 impl Query {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| value.as_str())
+        match self.index.get(&query_key_hash(key)) {
+            Some(&position) if self.pairs[position].0.as_str() == key => {
+                Some(self.pairs[position].1.as_str())
+            }
+            // The slot holds a different spelling: a hash collision. Only now
+            // is the ordered scan worth its cost.
+            Some(_) => self
+                .pairs
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str()),
+            // Every parsed key inserted its hash, so an absent hash means an
+            // absent key — the common "the link does not carry it" lookup.
+            None => None,
+        }
     }
 
     fn get_ne(&self, key: &str) -> Option<&str> {
@@ -435,23 +462,47 @@ impl Query {
     }
 }
 
+/// The hash the [`Query`] index is keyed by: the key's bytes through the
+/// standard hasher, computed once at parse and once per lookup.
+fn query_key_hash(key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(key.as_bytes());
+    hasher.finish()
+}
+
 fn parse_query(query: &str) -> Result<Query, LinkError> {
-    let mut values = Vec::new();
-    let mut keys = HashSet::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = pct_decode(raw_key)?;
-        if !keys.insert(key.clone()) {
+        let hash = query_key_hash(&key);
+        // A key repeats only if a pair spells it again. The slot usually
+        // answers that with one comparison; a collision between different
+        // keys leaves the slot to the earlier spelling, and the pair list is
+        // then authoritative (a scan reached only on a genuine hash
+        // collision, never per parameter).
+        let duplicate = match index.get(&hash) {
+            Some(&position) => {
+                pairs[position].0 == key
+                    || pairs
+                        .iter()
+                        .any(|(candidate, _)| candidate.as_str() == key.as_str())
+            }
+            None => false,
+        };
+        if duplicate {
             return Err(malformed(
                 Diag::new(Key::LinkQueryDuplicate).arg(excerpt_debug(&key)),
             ));
         }
-        values.push((key, pct_decode(raw_value)?));
+        index.entry(hash).or_insert(pairs.len());
+        pairs.push((key, pct_decode(raw_value)?));
     }
-    Ok(Query(values))
+    Ok(Query { pairs, index })
 }
 
 // ---------- generic link structure ----------
@@ -767,7 +818,7 @@ fn validate_url_query(
         }
     }
 
-    for (key, value) in &q.0 {
+    for (key, value) in &q.pairs {
         let allowed = match key.as_str() {
             "type" | "security" | "fm" => true,
             "encryption" => matches!(proto, Protocol::Vless | Protocol::Vmess),
@@ -2443,12 +2494,12 @@ fn parse_ss(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, Link
     // diagnostic); a recognized compatibility parameter is dropped; any other
     // query field makes the link unsupported, the first key deciding the
     // message.
-    if query.0.iter().any(|(key, _)| key == "plugin") {
+    if query.pairs.iter().any(|(key, _)| key == "plugin") {
         return Err(LinkError::Unsupported(Diag::new(
             Key::LinkUnsupportedSsPlugin,
         )));
     }
-    for (key, value) in &query.0 {
+    for (key, value) in &query.pairs {
         if drop_ignored_param(ignored, key, value) {
             continue;
         }
@@ -2543,7 +2594,7 @@ fn validate_scheme_query(
     own: &[&str],
     ignored: &mut Vec<String>,
 ) -> Result<(), LinkError> {
-    for (key, value) in &q.0 {
+    for (key, value) in &q.pairs {
         if own.contains(&key.as_str()) {
             continue;
         }
@@ -3364,6 +3415,10 @@ fn validate_xhttp(settings: &XhttpSettings) -> Result<(), LinkError> {
     Ok(())
 }
 
+/// The share grammar's own stream rules: the transport-security and
+/// transport-settings refusals a link spells, recursing over the XHTTP
+/// download chain. Only [`validate_profile_inner`] reaches this; the note at
+/// the end records which block the model sweep already covered.
 fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
     match stream.security {
         Security::None => {}
@@ -3478,9 +3533,14 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             // `spelling()`.
         }
     }
-    if let Some(finalmask) = stream.finalmask.as_ref() {
-        validate_finalmask(finalmask)?;
-    }
+    // `finalmask` is deliberately not re-validated here. This function only
+    // runs inside `validate_profile_inner`, for the top-level stream and —
+    // through `validate_xhttp` — each nested `downloadSettings` stream, and
+    // that walk already ran `validate_outbound`, whose stream visit descends
+    // the same XHTTP chain with the same model `validate_finalmask` and
+    // refuses first (`InvalidModel` with no prefix). Running the model
+    // verdict a second time could only repeat an outcome the caller has
+    // already been handed.
     Ok(())
 }
 
@@ -3490,20 +3550,41 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
 /// cross-field invariants. Callers that persist an imported profile should
 /// additionally run the generated scratch config through `xray run -test`.
 pub fn validate_profile(profile: &ServerProfile) -> Result<(), LinkError> {
-    validate_profile_inner(profile).map(|_| ())
+    validate_profile_inner(profile, AdvisoryReport::Discarded).map(|_| ())
 }
 
 /// The advisory half of [`validate_profile`]'s model pass: the findings a
 /// profile carries that are xray-legal and never refuse it. The import path
 /// logs them, so a profile the editors flag amber is not accepted in silence.
 pub fn profile_advisories(profile: &ServerProfile) -> Result<Vec<ValidationIssue>, LinkError> {
-    validate_profile_inner(profile)
+    validate_profile_inner(profile, AdvisoryReport::Collected)
+}
+
+/// Whether a [`validate_profile_inner`] walk hands the model sweep's advisory
+/// findings back. The import path logs them; the gate path only asks whether
+/// the profile is refused, so it never materializes a list it would drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdvisoryReport {
+    Collected,
+    Discarded,
+}
+
+/// The refusal a model finding produces at the link seam: the variant every
+/// `validate_profile` refusal of a model finding reports.
+fn model_refusal(issue: ValidationIssue) -> LinkError {
+    LinkError::InvalidModel {
+        prefix: None,
+        issue: Box::new(issue),
+    }
 }
 
 /// One walk, two seams: the refusal [`validate_profile`] reports and the
 /// advisory findings [`profile_advisories`] returns come from the same pass,
 /// so the import grammar and the logged warnings cannot drift apart.
-fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue>, LinkError> {
+fn validate_profile_inner(
+    profile: &ServerProfile,
+    report: AdvisoryReport,
+) -> Result<Vec<ValidationIssue>, LinkError> {
     let settings_protocol = profile.outbound.settings.protocol();
     if profile.outbound.protocol != settings_protocol {
         return Err(malformed(
@@ -3604,16 +3685,29 @@ fn validate_profile_inner(profile: &ServerProfile) -> Result<Vec<ValidationIssue
     // Model validation pass: protocol, stream, and transport-security
     // invariants in one sweep (no short-circuit). The verdict's first
     // blocking finding blocks the import/export; its advisory findings are
-    // the profile that is xray-legal and imports fine, returned to the
-    // caller instead of dropped. Remaining #716 grammar checks run below.
+    // the profile that is xray-legal and imports fine, handed to the caller
+    // that keeps them. Remaining #716 grammar checks run below.
     let verdict = validate_outbound(&profile.outbound);
-    let advisories: Vec<ValidationIssue> = verdict.advisory().cloned().collect();
-    if let Some(issue) = verdict.into_first_blocking() {
-        return Err(LinkError::InvalidModel {
-            prefix: None,
-            issue: Box::new(issue),
-        });
-    }
+    let advisories = match report {
+        // One consume, no clone: the blocking tier still answers with the
+        // first finding in pass order, and the advisory tier is the caller's
+        // whole answer.
+        AdvisoryReport::Collected => {
+            let (blocking, advisories) = verdict.into_tiers();
+            if let Some(issue) = blocking.into_iter().next() {
+                return Err(model_refusal(issue));
+            }
+            advisories
+        }
+        // The gate only asks for the refusal, so the verdict is consumed as
+        // it is: no advisory list is built for a caller that drops it.
+        AdvisoryReport::Discarded => {
+            if let Some(issue) = verdict.into_first_blocking() {
+                return Err(model_refusal(issue));
+            }
+            Vec::new()
+        }
+    };
 
     validate_stream_core(&profile.outbound.stream)?;
     Ok(advisories)

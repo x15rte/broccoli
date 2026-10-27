@@ -55,14 +55,22 @@ enum RawParseState {
 
 /// Per-file `(mtime, len)` fingerprint of the managed geo data (Settings →
 /// Geodata): the memoization key that decides when a provenance
-/// hash job must run. Two cheap metadata reads per rendered frame, never a
-/// hash on the UI thread; a file that is missing or cannot be statted
-/// fingerprints as absent, so its (re)appearance re-triggers a hash.
+/// hash job must run. The section stats it at most once per
+/// [`GEO_DATA_STAT_INTERVAL`] — the files change on user-managed edits, not
+/// per frame — and never hashes on the UI thread; a file that is missing or
+/// cannot be statted fingerprints as absent, so its (re)appearance
+/// re-triggers a hash.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 struct GeoDataFingerprint {
     geoip: Option<(std::time::SystemTime, u64)>,
     geosite: Option<(std::time::SystemTime, u64)>,
 }
+
+/// How long a [`geo_data_fingerprint`] stat stays fresh. One second keeps
+/// the provenance status responsive to a file change without paying the
+/// syscalls — `core_dir().is_dir()` plus two `metadata` calls — on every
+/// rendered frame.
+const GEO_DATA_STAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Current `(mtime, len)` of each managed geo data file, or `None` overall
 /// when the managed core directory itself is absent (there is then no geo
@@ -112,6 +120,12 @@ struct GeoDataCaption {
 /// geo data with the pin-verified pristine pair.
 #[derive(Default)]
 struct GeoDataProvenanceState {
+    /// Last `geo_data_fingerprint()` stat and when it ran: the section's
+    /// per-frame driver re-stats at most once per
+    /// [`GEO_DATA_STAT_INTERVAL`], reusing the cached value in between (an
+    /// `is_dir` plus two `metadata` reads per rendered frame were the
+    /// section's idle cost). Events that rewrite the files invalidate it.
+    stat: Option<(std::time::Instant, Option<GeoDataFingerprint>)>,
     /// Fingerprint the last adopted result was computed from.
     fingerprint: Option<GeoDataFingerprint>,
     /// Last completed provenance (`None` until the first job lands; the
@@ -137,29 +151,34 @@ impl GeoDataProvenanceState {
     /// Per-frame driver of the provenance hash, called once per rendered
     /// frame of the section. Drains a landed hash job (adopting its answer
     /// only while the files still match the fingerprint it hashed — the
-    /// raw-parse generation discipline, applied to bytes), fingerprints
-    /// both geo data files (two metadata reads, cheap), and respawns the
+    /// raw-parse generation discipline, applied to bytes), stats both geo
+    /// data files (at most once per [`GEO_DATA_STAT_INTERVAL`], reusing the
+    /// cached fingerprint in between, plus one fresh stat when a hash lands
+    /// because the files may have changed while it ran), and respawns the
     /// hash job when the fingerprint changed since the last completed hash
     /// or nothing is cached yet. Never hashes on the UI thread and never
-    /// runs two hash jobs at once; while a restore runs, hash respawns
-    /// wait for it (the restore rewrites the files a pending hash would
-    /// read).
+    /// runs two hash jobs at once; while a restore runs, hash respawns wait
+    /// for it (the restore rewrites the files a pending hash would read).
     fn update(&mut self, repaint: &egui::Context) {
-        let fingerprint = geo_data_fingerprint();
         if self.job.is_pending() {
             match self.job.poll() {
-                Some(Terminal::Answered(provenance)) if self.job_fingerprint == fingerprint => {
-                    // The files are still exactly the ones the job hashed.
-                    self.fingerprint = fingerprint;
-                    self.result = Some(provenance);
-                    self.caption = None;
-                }
-                Some(Terminal::Answered(_)) => {
-                    // The files changed while the job hashed; its answer is
-                    // stale and the fresh query below replaces it.
-                    self.fingerprint = None;
-                    self.result = None;
-                    self.caption = None;
+                Some(Terminal::Answered(provenance)) => {
+                    // A landed hash is a provenance event: the files may have
+                    // changed while it ran, so judge its answer against a
+                    // fresh stat instead of the throttle's cached one.
+                    let fingerprint = self.fingerprint_stat(true);
+                    if self.job_fingerprint == fingerprint {
+                        // The files are still exactly the ones the job hashed.
+                        self.fingerprint = fingerprint;
+                        self.result = Some(provenance);
+                        self.caption = None;
+                    } else {
+                        // The files changed while the job hashed; its answer
+                        // is stale and the fresh query below replaces it.
+                        self.fingerprint = None;
+                        self.result = None;
+                        self.caption = None;
+                    }
                 }
                 Some(Terminal::Exited) => {
                     // The worker closure has no panic path, so it cannot
@@ -177,6 +196,7 @@ impl GeoDataProvenanceState {
             // files the hash would read — never pile on.
             return;
         }
+        let fingerprint = self.fingerprint_stat(false);
         let needs_query = match (&self.result, self.fingerprint) {
             (None, _) => true,
             (Some(_), None) => fingerprint.is_some(),
@@ -195,6 +215,23 @@ impl GeoDataProvenanceState {
                 self.caption = None;
             }
         }
+    }
+
+    /// The managed geo data's current fingerprint: the cached stat while it
+    /// is younger than [`GEO_DATA_STAT_INTERVAL`], otherwise — or when
+    /// `force` asks, because a landed hash's files may have changed — one
+    /// fresh `is_dir` plus two `metadata` batch.
+    fn fingerprint_stat(&mut self, force: bool) -> Option<GeoDataFingerprint> {
+        let now = std::time::Instant::now();
+        if !force
+            && let Some((stat_at, cached)) = self.stat
+            && now.duration_since(stat_at) < GEO_DATA_STAT_INTERVAL
+        {
+            return cached;
+        }
+        let fingerprint = geo_data_fingerprint();
+        self.stat = Some((now, fingerprint));
+        fingerprint
     }
 
     /// Spawn one provenance hash job for `fingerprint` (the files it must
@@ -245,6 +282,10 @@ impl GeoDataProvenanceState {
         };
         match outcome {
             Ok(()) => {
+                // The restore rewrote the files: drop the cached stat so
+                // the next frame fingerprints them immediately instead of
+                // reusing a stat taken before the rewrite.
+                self.stat = None;
                 self.fingerprint = None;
                 self.result = None;
                 self.caption = None;
@@ -341,6 +382,15 @@ pub struct SettingsScreen {
     /// Buffer generation counter: bumped on every edit, so a stale worker
     /// result (from an older buffer) is detected and respawned.
     raw_parse_generation: u64,
+    /// Layout generation of `raw_buf` for the memoized editor layouter:
+    /// advanced by the tracked buffer on every mutation (a same-length
+    /// in-place edit keeps the buffer's pointer and length, so the layout
+    /// must key on a revision, not on the buffer's shape).
+    raw_layout_revision: widgets::TextRevision,
+    /// Cached layout of `raw_buf` for the raw-override editor: an unchanged
+    /// buffer at an unchanged width reuses the galley instead of copying and
+    /// laying out up to [`RAW_OVERRIDE_MAX_BYTES`] every frame.
+    raw_layout: widgets::TextLayoutMemo,
     /// Edit drafts for the geodata URL/cron fields (Option<String> model),
     /// seeded from settings on first open and committed only when the field's
     /// own rule accepts the text.
@@ -1207,11 +1257,21 @@ impl SettingsScreen {
                         let raw = self
                             .raw_buf
                             .begin(|| ctx.settings.raw_override.clone().unwrap_or_default());
+                        // The tracked buffer advances the layout revision on
+                        // every mutation, so an in-place same-length edit
+                        // re-lays the text while an unchanged frame reuses
+                        // the cached galley.
+                        let mut layouter = self
+                            .raw_layout
+                            .layouter(&self.raw_layout_revision, egui::TextStyle::Monospace);
+                        let mut tracked =
+                            widgets::TrackedBuffer::new(raw, &self.raw_layout_revision);
                         ui.add(
-                            egui::TextEdit::multiline(raw)
+                            egui::TextEdit::multiline(&mut tracked)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_rows(14)
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
                         )
                     };
                     let raw_changed = raw_response.changed();
@@ -2533,7 +2593,7 @@ mod tests {
             "unchanged geo data must not respawn the hash job"
         );
         // A file change (a configured-URL refresh while the core ran)
-        // re-dates the status on the next rendered frame.
+        // re-dates the status once the fingerprint stat window turns over.
         let later = first + Duration::from_secs(120);
         set_mtime(&core.join("geosite.dat"), later);
         harness.run();

@@ -78,7 +78,7 @@ impl<'a> DialGraph<'a> {
     }
 
     fn profile(&self, tag: &str) -> Option<&'a ServerProfile> {
-        self.profiles.iter().find(|profile| profile.tag() == tag)
+        self.profiles.iter().find(|profile| profile.tag_eq(tag))
     }
 
     /// The far end of `profile`'s dial-through chain: the profile whose server
@@ -124,7 +124,7 @@ impl<'a> DialGraph<'a> {
             for profile in self
                 .profiles
                 .iter()
-                .filter(|profile| profile.tag() == rule.outbound_tag)
+                .filter(|profile| profile.tag_eq(&rule.outbound_tag))
             {
                 dialed.insert(self.terminal(profile).tag());
             }
@@ -134,8 +134,8 @@ impl<'a> DialGraph<'a> {
                 balancer
                     .selector
                     .iter()
-                    .any(|pattern| profile.tag().starts_with(pattern))
-                    || profile.tag() == balancer.fallback_tag
+                    .any(|pattern| profile.tag_starts_with(pattern))
+                    || profile.tag_eq(&balancer.fallback_tag)
             }) {
                 dialed.insert(self.terminal(profile).tag());
             }
@@ -163,10 +163,10 @@ impl<'a> DialGraph<'a> {
             forced_observatory
                 || observatory_patterns
                     .iter()
-                    .any(|pattern| profile.tag().starts_with(pattern))
+                    .any(|pattern| profile.tag_starts_with(pattern))
                 || burst_patterns
                     .iter()
-                    .any(|pattern| profile.tag().starts_with(pattern))
+                    .any(|pattern| profile.tag_starts_with(pattern))
         }) {
             dialed.insert(self.terminal(profile).tag());
         }

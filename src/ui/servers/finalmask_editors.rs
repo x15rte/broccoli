@@ -31,6 +31,57 @@ use super::{TLS_VERSIONS, ech_sockopt_editor, fingerprint_editor, path_field};
 
 // ---------- finalmask typed editor ----------
 
+/// One list's pre-rendered ordinal captions: the `t_fmt` outputs a row
+/// header used to rebuild per row per frame.
+///
+/// The caption text is stored with the list length and language it was
+/// rendered for — the DNS screen's `row_captions` cadence, which is all the
+/// ordinal and its localized template depend on. It lives in egui temp data
+/// (never persisted) under the list's own id, so an idle frame indexes the
+/// cached strings and only a length or language change rebuilds them. The
+/// returned `Arc` makes the per-frame handoff a refcount bump: a borrowed
+/// cache could not outlive the `data_mut` closure while the row loop still
+/// renders.
+#[derive(Clone)]
+struct ListCaptions {
+    key: Key,
+    lang: Language,
+    len: usize,
+    text: std::sync::Arc<[String]>,
+}
+
+fn list_captions(
+    ui: &egui::Ui,
+    id: egui::Id,
+    len: usize,
+    lang: Language,
+    key: Key,
+) -> std::sync::Arc<[String]> {
+    if let Some(cached) = ui.ctx().data(|data| data.get_temp::<ListCaptions>(id))
+        && cached.key == key
+        && cached.lang == lang
+        && cached.len == len
+    {
+        return cached.text;
+    }
+    let text: std::sync::Arc<[String]> = (0..len)
+        .map(|index| t_fmt(lang, key, &[&(index + 1)]))
+        .collect::<Vec<String>>()
+        .into();
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            id,
+            ListCaptions {
+                key,
+                lang,
+                len,
+                text: std::sync::Arc::clone(&text),
+            },
+        );
+    });
+    text
+}
+
 fn range_editor(
     ui: &mut egui::Ui,
     label: &str,
@@ -291,11 +342,18 @@ fn finalmask_transform_editor(
 ) -> bool {
     let mut changed = widgets::text_field(ui, "op", &mut transform.op, "operation");
     let mut remove = None;
+    let arg_captions = list_captions(
+        ui,
+        field.id.key.with("transform-arg-captions"),
+        transform.args.len(),
+        lang,
+        Key::SrvArgumentN,
+    );
     for (index, arg) in transform.args.iter_mut().enumerate() {
         ui.push_id(("transform-arg", field.id.key, index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvArgumentN, &[&(index + 1)]));
+                    ui.label(arg_captions[index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove = Some(index);
                     }
@@ -471,35 +529,48 @@ fn finalmask_tcp_sequences_editor(
     let mut changed = false;
     ui.label(label);
     let mut remove_sequence = None;
+    let sequence_captions = list_captions(
+        ui,
+        field.id.key.with("sequence-captions"),
+        sequences.len(),
+        lang,
+        Key::SrvSequenceN,
+    );
     for (sequence_index, sequence) in sequences.iter_mut().enumerate() {
         ui.push_id((field.id.key, "sequence", sequence_index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvSequenceN, &[&(sequence_index + 1)]));
+                    ui.label(sequence_captions[sequence_index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemoveSequence)).clicked() {
                         remove_sequence = Some(sequence_index);
                     }
                 });
                 let mut remove_item = None;
+                let item_captions = list_captions(
+                    ui,
+                    field
+                        .id
+                        .key
+                        .with(("sequence-item-captions", sequence_index)),
+                    sequence.len(),
+                    lang,
+                    Key::SrvItemN,
+                );
                 for (item_index, item) in sequence.iter_mut().enumerate() {
                     ui.push_id(("item", item_index), |ui| {
-                        egui::CollapsingHeader::new(t_fmt(
-                            lang,
-                            Key::SrvItemN,
-                            &[&(item_index + 1)],
-                        ))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            if ui.small_button(t(lang, Key::SrvRemoveItem)).clicked() {
-                                remove_item = Some(item_index);
-                            }
-                            changed |= finalmask_tcp_item_editor(
-                                ui,
-                                lang,
-                                item,
-                                field.with((sequence_index, item_index)),
-                            );
-                        });
+                        egui::CollapsingHeader::new(item_captions[item_index].as_str())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if ui.small_button(t(lang, Key::SrvRemoveItem)).clicked() {
+                                    remove_item = Some(item_index);
+                                }
+                                changed |= finalmask_tcp_item_editor(
+                                    ui,
+                                    lang,
+                                    item,
+                                    field.with((sequence_index, item_index)),
+                                );
+                            });
                     });
                 }
                 if let Some(index) = remove_item {
@@ -534,9 +605,16 @@ fn finalmask_udp_items_editor(
     let mut changed = false;
     ui.label(label);
     let mut remove = None;
+    let item_captions = list_captions(
+        ui,
+        field.id.key.with("udp-item-captions"),
+        items.len(),
+        lang,
+        Key::SrvItemN,
+    );
     for (index, item) in items.iter_mut().enumerate() {
         ui.push_id((field.id.key, index), |ui| {
-            egui::CollapsingHeader::new(t_fmt(lang, Key::SrvItemN, &[&(index + 1)]))
+            egui::CollapsingHeader::new(item_captions[index].as_str())
                 .default_open(true)
                 .show(ui, |ui| {
                     if ui.small_button(t(lang, Key::SrvRemoveItem)).clicked() {
@@ -718,6 +796,8 @@ fn finalmask_xmc_editor(
     // login username is masked with it: a leaked username and a leaked
     // password together are worse than either alone.
     masked: bool,
+    // The list's layout-caption identity (its `RawField` key).
+    captions_id: egui::Id,
 ) -> bool {
     let mut changed =
         widgets::text_field(ui, "hostname", &mut settings.hostname, "play.example.com");
@@ -729,11 +809,18 @@ fn finalmask_xmc_editor(
         masked,
     );
     let mut remove = None;
+    let profile_captions = list_captions(
+        ui,
+        captions_id,
+        settings.profiles.len(),
+        lang,
+        Key::SrvMinecraftProfileN,
+    );
     for (index, profile) in settings.profiles.iter_mut().enumerate() {
         ui.push_id(("xmc-profile", index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvMinecraftProfileN, &[&(index + 1)]));
+                    ui.label(profile_captions[index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove = Some(index);
                     }
@@ -832,11 +919,18 @@ fn finalmask_xdns_editor(
 
     ui.label(t(lang, Key::SrvDomainsServer));
     let mut remove_domain = None;
+    let domain_captions = list_captions(
+        ui,
+        field.id.key.with("xdns-domain-captions"),
+        settings.domains.len(),
+        lang,
+        Key::SrvXdnsDomainN,
+    );
     for (index, domain) in settings.domains.iter_mut().enumerate() {
         ui.push_id(("xdns-domain", index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvXdnsDomainN, &[&(index + 1)]));
+                    ui.label(domain_captions[index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove_domain = Some(index);
                     }
@@ -916,11 +1010,18 @@ fn finalmask_xdns_editor(
 
     ui.label(t(lang, Key::SrvResolversClient));
     let mut remove_resolver = None;
+    let resolver_captions = list_captions(
+        ui,
+        field.id.key.with("xdns-resolver-captions"),
+        settings.resolvers.len(),
+        lang,
+        Key::SrvXdnsResolverN,
+    );
     for (index, resolver) in settings.resolvers.iter_mut().enumerate() {
         ui.push_id(("xdns-resolver", index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvXdnsResolverN, &[&(index + 1)]));
+                    ui.label(resolver_captions[index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove_resolver = Some(index);
                     }
@@ -1072,7 +1173,13 @@ pub(super) fn finalmask_tcp_settings_editor(
         FinalmaskTcpMask::Sudoku { settings, .. } => {
             finalmask_sudoku_editor(ui, lang, settings, masked)
         }
-        FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(ui, lang, settings, masked),
+        FinalmaskTcpMask::Xmc { settings, .. } => finalmask_xmc_editor(
+            ui,
+            lang,
+            settings,
+            masked,
+            field.id.key.with("xmc-profile-captions"),
+        ),
         FinalmaskTcpMask::Filter { settings, .. } => filter_settings_editor(ui, lang, settings),
         FinalmaskTcpMask::Unknown(raw) => {
             finalmask_unknown_editor(ui, lang, raw, field.with("unknown"))
@@ -1114,6 +1221,8 @@ fn finalmask_realm_tls_editor(
     profile: &str,
     tls: &mut FinalmaskRealmTls,
     buffers: &mut SeededBuffers,
+    // The certificate list's layout-caption identity (its `RawField` key).
+    captions_id: egui::Id,
 ) -> bool {
     // The removed `allowInsecure` key has no authoring control: Xray's TLS
     // build refuses any non-zero value (infra/conf/transport_security.go), so
@@ -1209,11 +1318,18 @@ fn finalmask_realm_tls_editor(
     // list below the mask list is the one that renders it.
     changed |= ech_sockopt_editor(ui, lang, &mut tls.ech_sockopt, &[]);
     let mut remove = None;
+    let certificate_captions = list_captions(
+        ui,
+        captions_id,
+        tls.certificates.len(),
+        lang,
+        Key::SrvCertificateN,
+    );
     for (index, certificate) in tls.certificates.iter_mut().enumerate() {
         ui.push_id(("realm-cert", index), |ui| {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t_fmt(lang, Key::SrvCertificateN, &[&(index + 1)]));
+                    ui.label(certificate_captions[index].as_str());
                     if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                         remove = Some(index);
                     }
@@ -1365,11 +1481,18 @@ pub(super) fn finalmask_udp_settings_editor(
             );
             changed |= range_editor(ui, "reset", &mut settings.reset, i32::MIN..=i32::MAX);
             let mut remove = None;
+            let noise_captions = list_captions(
+                ui,
+                field.id.key.with("noise-captions"),
+                settings.noise.len(),
+                lang,
+                Key::SrvNoiseN,
+            );
             for (index, item) in settings.noise.iter_mut().enumerate() {
                 ui.push_id(("noise", index), |ui| {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(t_fmt(lang, Key::SrvNoiseN, &[&(index + 1)]));
+                            ui.label(noise_captions[index].as_str());
                             if ui.small_button(t(lang, Key::SrvRemove)).clicked() {
                                 remove = Some(index);
                             }
@@ -1480,6 +1603,7 @@ pub(super) fn finalmask_udp_settings_editor(
                     field.id.profile,
                     tls,
                     &mut *field.buffers,
+                    field.id.key.with("realm-certificate-captions"),
                 );
             }
             changed

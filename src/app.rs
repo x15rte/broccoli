@@ -20,7 +20,9 @@ use crate::sys::selfupd::UpdateCheckState;
 use crate::sys::{self, paths};
 use crate::ui::logs::LogLine;
 use crate::ui::servers::{LeaveAction, ServersScreen};
-use crate::ui::{self, PhaseAction, Screen, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
+use crate::ui::{
+    self, PhaseAction, Screen, TrafficSample, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
+};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 use std::sync::{
@@ -289,6 +291,28 @@ impl HeldOperation {
     }
 }
 
+/// What adopting a verification pass's answer does with the terminal message.
+#[derive(Default, PartialEq, Eq)]
+enum CoreVerifyIntent {
+    /// The post-install re-derive: the message describes the install
+    /// transaction, not the tree, so it stays.
+    #[default]
+    RederiveFacts,
+    /// The user's Verify action: a pass that verifies clears the message the
+    /// click answered. The identity is captured at click time, so a failure
+    /// recorded while the pass ran is not the message it answered and stays.
+    ClearAnsweredMessage(Option<TerminalMessageId>),
+}
+
+/// Identity of the terminal message a Verify click answered: the rendered
+/// text plus the captured output are exactly what a recording writes, so a
+/// different pair is a newer failure.
+#[derive(PartialEq, Eq)]
+struct TerminalMessageId {
+    text: String,
+    output: String,
+}
+
 pub struct BroccoliApp {
     servers: ServersFile,
     settings: Settings,
@@ -325,7 +349,10 @@ pub struct BroccoliApp {
     /// Transport owned by the backend represented by the current live phase.
     active_transport: Option<CoreTransport>,
     stats: Option<StatsTick>,
-    stats_history: VecDeque<StatsTick>,
+    /// Throughput history for the dashboard plot, one 16-byte sample per
+    /// stats tick (the two counters the plot draws), capped at
+    /// [`HISTORY_CAP`].
+    stats_history: VecDeque<TrafficSample>,
     observatory: Vec<OutboundStatusView>,
     /// Core-output log ring, newest last, byte- and count-capped
     /// (`LogBuffer`).
@@ -449,8 +476,9 @@ pub struct BroccoliApp {
     /// Cached fast availability state for UI render passes. Full release-pin
     /// verification remains at every launch/validation boundary.
     core_available: bool,
-    /// The installed tree's own version and its last verification failure,
-    /// for the core setup surface's mounts.
+    /// The installed tree's own version, its last verification failure, and
+    /// whether an on-demand verification pass is in flight, for the core
+    /// setup surface's mounts.
     core_setup: ui::CoreSetupState,
     /// The terminal message the content area renders: the failure's keyed
     /// message plus the captured core output behind it, recorded with the
@@ -460,10 +488,26 @@ pub struct BroccoliApp {
     /// An install this shell started has run and its transaction is still
     /// open: set by the progress event, cleared when the terminal consumes it
     /// or the runtime releases the exclusive record. Only such a terminal
-    /// re-derives the core facts — a command rejected up front (stop the core
-    /// first, another operation is running) never touched the tree, and a
-    /// pass taken while the core runs could even misread its open files.
+    /// re-derives the core facts (through the verification worker pass) — a
+    /// command rejected up front (stop the core first, another operation is
+    /// running) never touched the tree, and a pass taken while the core runs
+    /// could even misread its open files.
     install_in_flight: bool,
+    /// The one in-flight on-demand pinned-payload verification (the setup
+    /// surface's Verify action and the post-install re-derive). The pass
+    /// re-hashes tens of MB of payloads, so it runs on a worker thread
+    /// ([`ui::request::Request::worker`]) and [`Self::poll_core_verify`]
+    /// adopts its answer; the surface disables Verify while this request is
+    /// pending. Single-flight: a request while one runs asks for the pass
+    /// already in flight — and no pass can predate a transaction it must
+    /// observe, because the surface offers neither action while the other
+    /// runs.
+    core_verify: ui::request::Request<sys::core_dl::CorePresence>,
+    /// What that pass's answer does with the terminal message: the user's
+    /// Verify action clears the message it answered (only that one — a
+    /// failure recorded while the pass ran is newer and stays), the
+    /// post-install re-derive leaves the message alone.
+    core_verify_intent: CoreVerifyIntent,
     is_elevated: bool,
     screen: Screen,
     dashboard: ui::dashboard::DashboardScreen,
@@ -864,6 +908,14 @@ impl BroccoliApp {
         let (tray, tray_menu) = build_tray(&icon_assets, settings.language, !headless);
         let (tray_registration_id, tray_action_rx) =
             install_tray_event_handlers(&cc.egui_ctx, tray.as_ref(), &tray_menu);
+        // Boot verification stays synchronous on purpose: the first frame
+        // must choose its surface (the first-run wizard vs. the shell) from
+        // the verified fact, and no earlier frame exists to render an
+        // in-flight state on. `cached_core_presence` answers from the
+        // presence memo when one is warm, so only a launch whose tree the
+        // memo does not cover pays the hashes here; every later on-demand
+        // pass (the setup surface's Verify and the post-install re-derive)
+        // runs on the worker thread (`start_core_verify`).
         let (core_version, core_setup) = core_facts(sys::core_dl::cached_core_presence(
             dat_pins_suspended(&settings),
         ));
@@ -906,6 +958,8 @@ impl BroccoliApp {
             core_setup,
             terminal_error: None,
             install_in_flight: false,
+            core_verify: ui::request::Request::default(),
+            core_verify_intent: CoreVerifyIntent::default(),
             is_elevated: sys::elevation::is_elevated(),
             screen: Screen::Dashboard,
             dashboard: Default::default(),
@@ -1027,7 +1081,7 @@ impl BroccoliApp {
         Self::apply_observatory_statuses(servers, &statuses);
         *current = statuses;
     }
-    fn drain_events(&mut self) -> DrainOutcome {
+    fn drain_events(&mut self, ctx: &egui::Context) -> DrainOutcome {
         for processed in 1..=EVENT_DRAIN_LIMIT {
             let Ok(ev) = self.evt_rx.try_recv() else {
                 return if processed == 1 {
@@ -1115,7 +1169,13 @@ impl BroccoliApp {
                     if self.stats_history.len() >= HISTORY_CAP {
                         self.stats_history.pop_front();
                     }
-                    self.stats_history.push_back(tick.clone());
+                    // Only the plotted counters enter the ring: the tick's
+                    // per-inbound/per-outbound vectors serve this frame's
+                    // tables, not 120 samples of history.
+                    self.stats_history.push_back(TrafficSample {
+                        up: tick.up,
+                        down: tick.down,
+                    });
                     self.stats = Some(tick);
                 }
                 CoreEvt::Observatory(list) => {
@@ -1230,11 +1290,13 @@ impl BroccoliApp {
                             // for a tree that was replaced and the Connect
                             // gate lets an attempt through to a spawn failure.
                             // One verification pass pays for the truth; the
-                            // transaction already made the memo stale.
+                            // transaction already made the memo stale. The
+                            // pass re-hashes the pinned payloads, so it runs
+                            // on a worker thread instead of this event-drain
+                            // frame: `poll_core_verify` adopts the answer on
+                            // the frame it lands.
                             if std::mem::take(&mut self.install_in_flight) {
-                                self.adopt_core_presence(sys::core_dl::verify_core_presence(
-                                    dat_pins_suspended(&self.settings),
-                                ));
+                                self.start_core_verify(ctx, CoreVerifyIntent::RederiveFacts);
                             }
                         }
                         DownloadState::Working { .. } => self.install_in_flight = true,
@@ -1578,7 +1640,7 @@ impl BroccoliApp {
                 && cache.config_error == self.config_error
                 && cache.operation == self.operation
                 && cache.mode == self.settings.mode
-                && cache.raw_override == self.settings.raw_override
+                && cache.raw_override_present == self.settings.raw_override.is_some()
                 && cache.config_revision == self.config_revision
         });
         if current {
@@ -1603,7 +1665,11 @@ impl BroccoliApp {
             // against on the next refresh.
             operation: self.operation.clone(),
             mode: self.settings.mode,
-            raw_override: self.settings.raw_override.clone(),
+            // Presence is the only fact the verdict reads, so the memo keys on
+            // it: an override edit that keeps it configured cannot change the
+            // text (the verdict arrives as `config_error` /
+            // `raw_override_verdict`, which the key covers).
+            raw_override_present: self.settings.raw_override.is_some(),
             config_revision: self.config_revision,
             reason,
             operation_caption,
@@ -1698,6 +1764,8 @@ impl BroccoliApp {
     }
 
     /// Adopt one verification pass's answer as the shell's cached core facts.
+    /// The bundle replaces the whole setup state, so the surface's in-flight
+    /// marker is cleared by the same assignment that renders the verdict.
     fn adopt_core_presence(&mut self, presence: sys::core_dl::CorePresence) {
         let (version, setup) = core_facts(presence);
         self.core_available = version.is_some();
@@ -1706,18 +1774,110 @@ impl BroccoliApp {
         self.ui_ctx_dirty = true;
     }
 
+    /// The identity of the terminal message shown now: what a Verify click
+    /// answered, compared at adoption so the pass never clears a newer
+    /// failure.
+    fn terminal_message_id(&self) -> Option<TerminalMessageId> {
+        self.terminal_error.as_ref().map(|error| TerminalMessageId {
+            text: error.text.clone(),
+            output: error.output.clone(),
+        })
+    }
+
     /// Re-verify the installed core on demand (the core setup surface's
     /// Verify action): one full pinned-payload pass, bypassing the render
-    /// memo — the same work boot does once, here on an explicit click. A pass
-    /// that verifies is a successful action and clears the terminal message;
-    /// a pass that fails leaves its reason on the surface, where the user
-    /// asked for it.
-    fn verify_core(&mut self) {
-        self.adopt_core_presence(sys::core_dl::verify_core_presence(dat_pins_suspended(
-            &self.settings,
-        )));
-        if self.core_available {
-            self.terminal_error = None;
+    /// memo — the same work boot does once, here on an explicit click. The
+    /// pass re-hashes tens of MB, so it runs on a worker thread; the surface
+    /// renders the request as in flight, and [`Self::poll_core_verify`]
+    /// adopts the answer (a pass that verifies clears the terminal message
+    /// it answered; a pass that fails leaves its reason on the surface,
+    /// where the user asked for it).
+    fn verify_core(&mut self, ctx: &egui::Context) {
+        self.start_core_verify(
+            ctx,
+            CoreVerifyIntent::ClearAnsweredMessage(self.terminal_message_id()),
+        );
+    }
+
+    /// Start one pinned-payload verification pass on a worker thread.
+    /// `intent` is what the answer does with the terminal message. Nothing in
+    /// this path hashes a payload: the answer arrives through
+    /// [`Self::poll_core_verify`], and the setup surface disables Verify (and
+    /// the install actions) while the request is pending.
+    fn start_core_verify(&mut self, ctx: &egui::Context, intent: CoreVerifyIntent) {
+        // Single-flight: while a pass runs, its answer is the one the caller
+        // asked for; a second thread would hash the same tree twice.
+        if self.core_verify.is_pending() {
+            return;
+        }
+        // The predicate is a cheap settings read; the worker owns its copy
+        // because `verify_core_presence` is pure over it, and the settings
+        // borrow cannot cross into the thread.
+        let suspended = dat_pins_suspended(&self.settings);
+        match ui::request::Request::worker("broccoli-core-verify", ctx, move |stop| {
+            // The payload hashing is one uninterruptible call; a request
+            // cancelled before its answer (dropped at shutdown) abandons the
+            // delivery instead of sending to a receiver that is gone.
+            let presence = sys::core_dl::verify_core_presence(suspended);
+            (!stop.load(Ordering::Relaxed)).then_some(presence)
+        }) {
+            Ok(request) => {
+                self.core_verify = request;
+                self.core_verify_intent = intent;
+                // The surface's in-flight state: the next frame renders the
+                // disabled Verify action and the working line.
+                self.core_setup.verification_in_flight = true;
+                self.ui_ctx_dirty = true;
+            }
+            Err(error) => {
+                // No worker thread (resource exhaustion): the click cannot be
+                // honoured. Record why on the setup surface instead of a
+                // silent no-op; a synchronous fallback would put the payload
+                // hashing back on the render frame this worker exists to keep
+                // it off.
+                tracing::warn!("core verification worker spawn failed: {error}");
+                self.core_setup.verification_error = Some(AppMessage::Message(Diag::new(
+                    Key::SupervisorVerifyWorkerFailed,
+                )));
+                self.ui_ctx_dirty = true;
+            }
+        }
+    }
+
+    /// Adopt the on-demand verification pass's terminal, if one landed: the
+    /// answer replaces the cached core facts, and a lost worker is recorded
+    /// on the setup surface as the failed action it is. Runs once per
+    /// `logic` pass; idle frames (no pending request) cost one enum match.
+    fn poll_core_verify(&mut self) {
+        let Some(terminal) = self.core_verify.poll() else {
+            return;
+        };
+        let intent = std::mem::take(&mut self.core_verify_intent);
+        match terminal {
+            ui::request::Terminal::Answered(presence) => {
+                self.adopt_core_presence(presence);
+                // A pass that verifies is a successful action and clears the
+                // terminal message it answered; a pass that fails leaves its
+                // reason on the surface. Only the answered message goes: one
+                // recorded while the pass ran is newer and stays. The adopt
+                // already dirtied the snapshot, so the clear lands in the
+                // same rebuild.
+                if let CoreVerifyIntent::ClearAnsweredMessage(answered) = intent
+                    && self.core_available
+                    && self.terminal_message_id() == answered
+                {
+                    self.terminal_error = None;
+                }
+            }
+            ui::request::Terminal::Exited => {
+                // The worker vanished without an answer: the action failed,
+                // and the surface must lose its in-flight state.
+                self.core_setup.verification_in_flight = false;
+                self.core_setup.verification_error = Some(AppMessage::Message(Diag::new(
+                    Key::WorkerExitedWithoutResult,
+                )));
+                self.ui_ctx_dirty = true;
+            }
         }
     }
 
@@ -1794,12 +1954,7 @@ impl BroccoliApp {
         if let Some(error) = self.core_gate_error() {
             return Err(self.record_core_gate_failure(error));
         }
-        if let Some(reason) = tun_outbound_interface_block_reason(
-            lang,
-            self.settings.mode,
-            &self.settings.tun.auto_outbounds_interface,
-            &sys::netif::list(),
-        ) {
+        if let Some(reason) = self.tun_interface_block_reason(lang) {
             self.record_generation_failure(reason.clone());
             return Err(reason);
         }
@@ -2038,16 +2193,29 @@ impl BroccoliApp {
         self.commit_runtime_config(lang);
     }
 
+    /// The TUN-interface generation gate for this shell's settings: adapter
+    /// enumeration runs only when the verdict can read it (see
+    /// [`tun_interface_lookup_needed`]), so both commit paths share one
+    /// prelude and cannot drift.
+    fn tun_interface_block_reason(&self, lang: Language) -> Option<String> {
+        let ifaces = tun_interface_lookup_needed(
+            self.settings.mode,
+            &self.settings.tun.auto_outbounds_interface,
+        )
+        .then(sys::netif::list);
+        tun_outbound_interface_block_reason(
+            lang,
+            self.settings.mode,
+            &self.settings.tun.auto_outbounds_interface,
+            ifaces.as_deref().unwrap_or_default(),
+        )
+    }
+
     /// The Apply-now commit after the blocked checks and the hazard gate;
     /// the hazard-dialog confirm resumes here, so confirming applies
     /// exactly what the normal path would have started.
     fn commit_runtime_config(&mut self, lang: Language) {
-        if let Some(reason) = tun_outbound_interface_block_reason(
-            lang,
-            self.settings.mode,
-            &self.settings.tun.auto_outbounds_interface,
-            &sys::netif::list(),
-        ) {
+        if let Some(reason) = self.tun_interface_block_reason(lang) {
             self.record_generation_failure(reason);
             return;
         }
@@ -2097,23 +2265,63 @@ impl BroccoliApp {
     /// Rebuild the generation-gated UI-context snapshot.
     /// Runs only when a drained event changed its inputs — never on idle
     /// frames — so a no-op rebuild (e.g. the initial `State(Stopped)` drain)
-    /// is skipped: the snapshot's own derived equality is the gate.
+    /// is skipped: each field's own equality is the gate (the same rule the
+    /// snapshot's derived `PartialEq` applies, field by field), and a changed
+    /// field is `clone_from`ed in place. The snapshot is long-lived, so the
+    /// in-place assignment reuses its existing allocations for the big owned
+    /// inputs (observatory rows with their diagnostics, stats tick, captured
+    /// core output) instead of building a whole candidate snapshot — and
+    /// cloning every field — before comparing.
     fn rebuild_ui_ctx_snapshot(&mut self) {
-        let candidate = UiCtxSnapshot {
-            transport: self.active_transport,
-            phase: self.phase.clone(),
-            stats: self.stats.clone(),
-            observatory: self.observatory.clone(),
-            core_version: self.core_version.clone(),
-            core_setup: self.core_setup.clone(),
-            terminal_error: self.terminal_error.as_ref().map(TerminalError::view),
-            download: self.download.clone(),
-            update_check: self.update_check.clone(),
-            stats_generation: self.stats_generation,
-            latency_generation: self.latency_generation,
-        };
-        if self.ui_ctx_snapshot != candidate {
-            self.ui_ctx_snapshot = candidate;
+        let dst = &mut self.ui_ctx_snapshot;
+        if dst.transport != self.active_transport {
+            dst.transport = self.active_transport;
+        }
+        if dst.phase != self.phase {
+            dst.phase.clone_from(&self.phase);
+        }
+        if dst.stats != self.stats {
+            dst.stats.clone_from(&self.stats);
+        }
+        if dst.observatory != self.observatory {
+            dst.observatory.clone_from(&self.observatory);
+        }
+        if dst.core_version != self.core_version {
+            dst.core_version.clone_from(&self.core_version);
+        }
+        if dst.core_setup != self.core_setup {
+            dst.core_setup.clone_from(&self.core_setup);
+        }
+        // The view's fields are exactly the shell's recorded failure (rendered
+        // text, captured output, leak remedy), so compare them directly and
+        // build the view only for a real change — never per drained event.
+        match &self.terminal_error {
+            None => {
+                if dst.terminal_error.is_some() {
+                    dst.terminal_error = None;
+                }
+            }
+            Some(error) => {
+                let unchanged = dst
+                    .terminal_error
+                    .as_ref()
+                    .is_some_and(|view| error.matches_view(view));
+                if !unchanged {
+                    dst.terminal_error = Some(error.view());
+                }
+            }
+        }
+        if dst.download != self.download {
+            dst.download.clone_from(&self.download);
+        }
+        if dst.update_check != self.update_check {
+            dst.update_check.clone_from(&self.update_check);
+        }
+        if dst.stats_generation != self.stats_generation {
+            dst.stats_generation = self.stats_generation;
+        }
+        if dst.latency_generation != self.latency_generation {
+            dst.latency_generation = self.latency_generation;
         }
         self.ui_ctx_dirty = false;
     }
@@ -2155,7 +2363,10 @@ impl Drop for BroccoliApp {
 
 impl eframe::App for BroccoliApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.frame_drain = self.drain_events();
+        self.frame_drain = self.drain_events(ctx);
+        // A verification pass started on the worker adopts its answer here,
+        // before this pass's connect-block refresh reads the core facts.
+        self.poll_core_verify();
         if self.frame_drain == DrainOutcome::Full {
             // A full drain batch means more events are queued:
             // keep the backlog draining frame by frame.
@@ -2473,7 +2684,7 @@ impl eframe::App for BroccoliApp {
         // owns the verification pass, the Explorer launch and the screen
         // switch these flags ask for.
         if requests.verify_core {
-            self.verify_core();
+            self.verify_core(&ctx);
         }
         if requests.open_core_folder
             && let Err(open_error) = sys::open_in_explorer(&paths::core_dir())
@@ -2621,6 +2832,23 @@ fn tun_outbound_interface_block_reason(
             Some(t_fmt(lang, Key::TunAutoOutboundsMissing, &[&name]))
         }
     }
+}
+
+/// Whether [`tun_outbound_interface_block_reason`] can use an adapter
+/// enumeration at all: only TUN mode with a fixed (non-empty, non-`auto`)
+/// pinned name reads the list, and every other configuration returns `None`
+/// before touching it. The commit paths evaluate this before enumerating, so
+/// `GetAdaptersAddresses` no longer runs on Connect/Apply for the default
+/// (TUN off, unpinned) configuration.
+///
+/// The test reuses [`sys::netif::fixed_name_verdict`] against an empty view —
+/// the same predicate the verdict itself applies — so the two cannot drift.
+fn tun_interface_lookup_needed(mode: Mode, setting: &str) -> bool {
+    mode == Mode::Tun
+        && !matches!(
+            sys::netif::fixed_name_verdict(setting, &[]),
+            sys::netif::FixedNameVerdict::Unpinned
+        )
 }
 
 /// One runtime candidate plus the verdict of the generation that judged it:
@@ -3655,6 +3883,13 @@ impl TerminalError {
             leak_remedy: self.leak_remedy,
         }
     }
+
+    /// Whether `view` already renders exactly this message, field for field:
+    /// the UI-context snapshot's dirty gate. It sits beside [`Self::view`] so
+    /// a field added to the view later cannot silently bypass the comparison.
+    fn matches_view(&self, view: &ui::TerminalErrorView) -> bool {
+        view.text == self.text && view.output == self.output && view.leak_remedy == self.leak_remedy
+    }
 }
 
 /// Project one verification pass into the shell's cached core facts: the
@@ -3670,6 +3905,9 @@ fn core_facts(presence: sys::core_dl::CorePresence) -> (Option<String>, ui::Core
             ui::CoreSetupState {
                 installed_version: installed,
                 verification_error: Some(AppMessage::Error(failure)),
+                // This bundle is the answer a pass just produced: no pass is
+                // in flight once it is adopted.
+                verification_in_flight: false,
             },
         ),
         sys::core_dl::CorePresence::Missing => (None, ui::CoreSetupState::default()),
@@ -3694,14 +3932,18 @@ fn dat_pins_suspended(settings: &Settings) -> bool {
 /// the shell painted. The texts are pure functions of the keyed inputs, so
 /// they are rebuilt only when an input moves, never on repaint frames (the
 /// caption-memo staleness pattern; the compare below is
-/// allocation-free — the `Option<String>` fields compare by value).
+/// allocation-free — the `Option<String>` fields compare by value and the raw
+/// override contributes only its presence, never the multi-megabyte text).
 struct ConnectBlockCache {
     lang: Language,
     persistence_error: Option<String>,
     config_error: Option<String>,
     operation: Option<HeldOperation>,
     mode: Mode,
-    raw_override: Option<String>,
+    /// Whether a raw override is configured. Presence is all
+    /// [`BroccoliApp::compute_connect_blocked_reason`] reads, so the memo never
+    /// compares (or owns a copy of) the override text itself.
+    raw_override_present: bool,
     config_revision: u64,
     /// Connect-block reason for the current key (`None` = Connect enabled).
     reason: Option<String>,

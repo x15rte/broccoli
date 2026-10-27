@@ -164,12 +164,16 @@ impl InboundsScreen {
                     (*count != 0).then(|| t_fmt(lang, Key::InboundsDeleteBlocked, &[count]))
                 })
                 .collect();
+            // One pass over the snapshot's endpoint buckets yields every
+            // row's collision verdict, keyed by the row it judged; the cache
+            // keeps the per-list vectors its render paths index by position.
+            let collisions = listener_collisions(&snapshot, lang);
             self.validation = Some(ValidationCache {
                 generation,
                 verdict_generation,
                 non_loopback: any_non_loopback_listen(ctx.settings),
                 local_collisions: (0..ctx.settings.local_inbounds.len())
-                    .map(|index| listener_collision(&snapshot, lang, ListenerKey::Local(index)))
+                    .map(|index| collisions.get(&ListenerKey::Local(index)).cloned())
                     .collect(),
                 // A disabled listener reaches neither the wire nor the
                 // settings walk, so its mask verdict must stay off the row
@@ -193,7 +197,7 @@ impl InboundsScreen {
                     })
                     .collect(),
                 doko_collisions: (0..ctx.settings.dokodemo.len())
-                    .map(|index| listener_collision(&snapshot, lang, ListenerKey::Dokodemo(index)))
+                    .map(|index| collisions.get(&ListenerKey::Dokodemo(index)).cloned())
                     .collect(),
                 doko_used_by_rules,
                 doko_delete_blocked,
@@ -751,7 +755,7 @@ pub(crate) fn protocol_label(lang: Language, protocol: LocalInboundProtocol) -> 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ListenerKey {
     Local(usize),
     Dokodemo(usize),
@@ -864,91 +868,150 @@ fn listeners(settings: &Settings, lang: Language) -> Vec<ListenerView> {
     result
 }
 
-/// The row's collision verdict, or `None` when the row is appliable. The
-/// conjunction itself is one definition
+/// Every row's collision verdict for one listener snapshot, keyed by the row
+/// it judged. The conjunction itself is one definition
 /// (`crate::model::inbound::listen_endpoints_conflict`); this walk keeps the
 /// draft-level concerns — invalid endpoints, the zero port, the empty UNIX
 /// path, disabled listeners, path normalization, labels, and the
 /// `Collision*` keys the model pass cannot render.
+///
+/// The endpoints are bucketed once per snapshot — by port for IP listeners,
+/// by normalized socket path for UNIX ones — so a row walks only the
+/// listeners that could share its endpoint instead of rescanning the whole
+/// list. Bucket vectors keep listener order, so the rendered conflict labels
+/// keep the order the previous per-row scan produced.
+fn listener_collisions(
+    listeners: &[ListenerView],
+    lang: Language,
+) -> std::collections::HashMap<ListenerKey, String> {
+    use std::collections::HashMap;
+
+    let mut by_port: HashMap<u16, Vec<usize>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, listener) in listeners.iter().enumerate() {
+        match &listener.endpoint {
+            ListenerEndpoint::IpPort { port, .. } => by_port.entry(*port).or_default().push(index),
+            ListenerEndpoint::Unix { path } => by_path
+                .entry(normalize_windows_socket_path(path))
+                .or_default()
+                .push(index),
+            ListenerEndpoint::Invalid(_) => {}
+        }
+    }
+
+    let verdicts: Vec<Option<String>> = listeners
+        .iter()
+        .enumerate()
+        .map(|(index, current)| {
+            if let ListenerEndpoint::Invalid(error) = &current.endpoint {
+                return Some(t_fmt(
+                    lang,
+                    Key::CollisionInvalidNetwork,
+                    &[&current.label, error],
+                ));
+            }
+            if !current.enabled {
+                return None;
+            }
+            match &current.endpoint {
+                ListenerEndpoint::IpPort {
+                    listen,
+                    port,
+                    protocols,
+                } => {
+                    if *port == 0 {
+                        return Some(t_fmt(lang, Key::CollisionNeedsPort, &[&current.label]));
+                    }
+                    let endpoint = (*port, *protocols, listen.as_str());
+                    let mut conflicts: Vec<&str> = Vec::new();
+                    if let Some(bucket) = by_port.get(port) {
+                        for &other_index in bucket {
+                            if other_index == index {
+                                continue;
+                            }
+                            let other = &listeners[other_index];
+                            if !other.enabled {
+                                continue;
+                            }
+                            // The port bucket holds IP endpoints only.
+                            let ListenerEndpoint::IpPort {
+                                listen: other_listen,
+                                port: other_port,
+                                protocols: other_protocols,
+                            } = &other.endpoint
+                            else {
+                                continue;
+                            };
+                            if listen_endpoints_conflict(
+                                endpoint,
+                                (*other_port, *other_protocols, other_listen.as_str()),
+                            ) {
+                                conflicts.push(other.label.as_str());
+                            }
+                        }
+                    }
+                    (!conflicts.is_empty()).then(|| {
+                        t_fmt(
+                            lang,
+                            Key::CollisionConflict,
+                            &[
+                                &current.label,
+                                &conflicts.join(", "),
+                                &format!("{listen}:{port}"),
+                            ],
+                        )
+                    })
+                }
+                ListenerEndpoint::Unix { path } => {
+                    if path.trim().is_empty() {
+                        return Some(t_fmt(lang, Key::CollisionNeedsUnix, &[&current.label]));
+                    }
+                    let normalized = normalize_windows_socket_path(path);
+                    let mut conflicts: Vec<&str> = Vec::new();
+                    if let Some(bucket) = by_path.get(&normalized) {
+                        for &other_index in bucket {
+                            if other_index == index {
+                                continue;
+                            }
+                            let other = &listeners[other_index];
+                            if other.enabled {
+                                // The path bucket holds UNIX endpoints whose
+                                // normalized path is exactly this one.
+                                conflicts.push(other.label.as_str());
+                            }
+                        }
+                    }
+                    (!conflicts.is_empty()).then(|| {
+                        let endpoint = t_fmt(lang, Key::CollisionEndpoint, &[&format!("{path:?}")]);
+                        t_fmt(
+                            lang,
+                            Key::CollisionConflict,
+                            &[&current.label, &conflicts.join(", "), &endpoint],
+                        )
+                    })
+                }
+                ListenerEndpoint::Invalid(_) => unreachable!(),
+            }
+        })
+        .collect::<Vec<Option<String>>>();
+    // Keyed by the row it judged: the cache and the single-row tests both ask
+    // by identity, so no caller re-derives a position from the snapshot.
+    listeners
+        .iter()
+        .zip(verdicts)
+        .filter_map(|(listener, verdict)| verdict.map(|text| (listener.key, text)))
+        .collect()
+}
+
+/// One row's collision verdict, looked up in the batch above. Only the tests
+/// ask for a single row; the screen's cache stores the one-pass batch.
+#[cfg(test)]
 fn listener_collision(
     listeners: &[ListenerView],
     lang: Language,
     key: ListenerKey,
 ) -> Option<String> {
-    let current = listeners.iter().find(|listener| listener.key == key)?;
-    if let ListenerEndpoint::Invalid(error) = &current.endpoint {
-        return Some(t_fmt(
-            lang,
-            Key::CollisionInvalidNetwork,
-            &[&current.label, error],
-        ));
-    }
-    if !current.enabled {
-        return None;
-    }
-
-    let (conflicts, endpoint) = match &current.endpoint {
-        ListenerEndpoint::IpPort {
-            listen,
-            port,
-            protocols,
-        } => {
-            if *port == 0 {
-                return Some(t_fmt(lang, Key::CollisionNeedsPort, &[&current.label]));
-            }
-            let current_endpoint = (*port, *protocols, listen.as_str());
-            let conflicts = listeners
-                .iter()
-                .filter(|other| other.key != key && other.enabled)
-                .filter(|other| match &other.endpoint {
-                    ListenerEndpoint::IpPort {
-                        listen: other_listen,
-                        port: other_port,
-                        protocols: other_protocols,
-                    } => listen_endpoints_conflict(
-                        current_endpoint,
-                        (*other_port, *other_protocols, other_listen.as_str()),
-                    ),
-                    ListenerEndpoint::Unix { .. } | ListenerEndpoint::Invalid(_) => false,
-                })
-                .map(|other| other.label.as_str())
-                .collect::<Vec<_>>();
-            (conflicts, format!("{listen}:{port}"))
-        }
-        ListenerEndpoint::Unix { path } => {
-            if path.trim().is_empty() {
-                return Some(t_fmt(lang, Key::CollisionNeedsUnix, &[&current.label]));
-            }
-            let normalized = normalize_windows_socket_path(path);
-            let conflicts = listeners
-                .iter()
-                .filter(|other| other.key != key && other.enabled)
-                .filter(|other| {
-                    matches!(
-                        &other.endpoint,
-                        ListenerEndpoint::Unix { path: other_path }
-                            if normalize_windows_socket_path(other_path) == normalized
-                    )
-                })
-                .map(|other| other.label.as_str())
-                .collect::<Vec<_>>();
-            (
-                conflicts,
-                t_fmt(lang, Key::CollisionEndpoint, &[&format!("{path:?}")]),
-            )
-        }
-        ListenerEndpoint::Invalid(_) => unreachable!(),
-    };
-
-    if conflicts.is_empty() {
-        None
-    } else {
-        Some(t_fmt(
-            lang,
-            Key::CollisionConflict,
-            &[&current.label, &conflicts.join(", "), &endpoint],
-        ))
-    }
+    listener_collisions(listeners, lang).get(&key).cloned()
 }
 
 /// The row-label tag verdict for one dokodemo entry. This is the screen's own

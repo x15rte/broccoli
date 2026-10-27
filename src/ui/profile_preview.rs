@@ -6,6 +6,7 @@ use crate::rt::{AppMessage, CoreCmd, CorePhase, JobKind, RuntimeEntryView, Runti
 use crate::ui::ProfilePreviewCtx;
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::request::{Request, Terminal};
+use crate::ui::widgets;
 
 enum PreviewState {
     NoLaunch,
@@ -25,6 +26,15 @@ enum PreviewTab {
 pub struct ProfilePreviewScreen {
     state: PreviewState,
     tab: PreviewTab,
+    /// Generation of the launched config text: bumped whenever
+    /// [`Self::record_start`] replaces it, so the memoized editor layout
+    /// never serves the previous launch's galley. The text itself is
+    /// immutable within one launch.
+    config_generation: widgets::TextRevision,
+    /// Cached layout of the launched config text (tens–hundreds of KiB):
+    /// idle frames reuse the galley instead of copying and laying out the
+    /// whole config again.
+    config_layout: widgets::TextLayoutMemo,
     /// Runtime state shown on the Runtime tab; `None` = nothing loaded yet.
     runtime: Option<Result<RuntimeStateView, DiagError>>,
     /// In-flight `ListRuntimeState` reply channel; only one request at a
@@ -37,6 +47,8 @@ impl Default for ProfilePreviewScreen {
         Self {
             state: PreviewState::NoLaunch,
             tab: PreviewTab::Config,
+            config_generation: widgets::TextRevision::default(),
+            config_layout: widgets::TextLayoutMemo::default(),
             runtime: None,
             pending_request: Request::default(),
         }
@@ -51,6 +63,10 @@ impl ProfilePreviewScreen {
             Ok(contents) => PreviewState::Available(contents),
             Err(error) => PreviewState::Unavailable(error),
         };
+        // A new launch replaces the config text; a new generation makes the
+        // memoized editor layout re-lay it instead of reusing the previous
+        // galley.
+        self.config_generation.bump();
     }
 
     /// Drop the cached runtime view and any in-flight request — a phase
@@ -118,10 +134,18 @@ impl ProfilePreviewScreen {
                 let label = ui.label(t(lang, Key::PreviewActiveConfig));
                 ScrollArea::both().show(ui, |ui| {
                     let mut text = contents.as_str();
+                    // The launched config is immutable within one launch, so
+                    // the revision only moves when `record_start` replaces
+                    // it; an unchanged frame reuses the cached galley
+                    // instead of copying and laying out the whole config.
+                    let mut layouter = self
+                        .config_layout
+                        .layouter(&self.config_generation, TextStyle::Monospace);
                     ui.add(
                         TextEdit::multiline(&mut text)
                             .font(TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
+                            .desired_width(f32::INFINITY)
+                            .layouter(&mut layouter),
                     )
                     .labelled_by(label.id);
                 });

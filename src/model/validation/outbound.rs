@@ -4,10 +4,10 @@
 //! and the vocabulary more than one scope reads.
 
 use super::stream::{
-    finalmask_udp_hop_interval_mode, freedom_domain_strategy_supported,
+    StreamBlocks, finalmask_udp_hop_interval_mode, freedom_domain_strategy_supported,
     hop_transport_migrates_connections, is_canonical_uuid, shadowsocks_2022_key_usable,
     shadowsocks_method_supported, sockopt_address_port_strategy_supported,
-    target_strategy_supported, tls_alpn_is_h3, validate_stream, vless_flow_supported,
+    target_strategy_supported, tls_alpn_is_h3, validate_stream_with_blocks, vless_flow_supported,
     vmess_security_supported, xmux_limits_conflict,
 };
 use super::{
@@ -926,6 +926,16 @@ const OUTBOUND_MODEL_WIRE_KEYS: &[&str] = &[
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
 pub fn validate_outbound(o: &OutboundModel) -> Verdict {
+    validate_outbound_with_blocks(o).0
+}
+
+/// [`validate_outbound`] plus the stream sweep's top-level per-block verdicts
+/// ([`StreamBlocks`]) from the same single pass. The aggregated verdict is
+/// exactly what [`validate_outbound`] returns (same findings, same order); the
+/// blocks are the sweep's own per-block calls, so a renderer that shows one
+/// block inline never re-validates it. This is the editor's entry point: one
+/// sweep answers the profile-wide lists and the inline block rows together.
+pub fn validate_outbound_with_blocks(o: &OutboundModel) -> (Verdict, StreamBlocks) {
     let mut issues = Vec::new();
 
     // The envelope's flattened `extra` map holds every key serde did not bind
@@ -1542,8 +1552,9 @@ pub fn validate_outbound(o: &OutboundModel) -> Verdict {
 
     validate_masque(o, &mut issues);
     validate_xdrive_outbound(o, &mut issues);
-    issues.extend(validate_stream(&o.stream));
-    Verdict::from_issues(issues)
+    let (stream_issues, blocks) = validate_stream_with_blocks(&o.stream);
+    issues.extend(stream_issues);
+    (Verdict::from_issues(issues), blocks)
 }
 
 #[cfg(test)]
@@ -1557,6 +1568,7 @@ mod tests {
         XmuxConfig,
     };
     use crate::model::validation::Severity;
+    use crate::model::validation::stream::validate_stream;
     use crate::model::validation::tests::{codes, finding};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;

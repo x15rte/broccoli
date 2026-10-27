@@ -314,12 +314,22 @@ struct TopbarClicks {
 
 /// One truncated chip in the dynamic zone: a `Label` capped to its
 /// available width with the full text on hover when it was actually elided.
-fn chip(ui: &mut egui::Ui, color: egui::Color32, text: impl Into<String>) {
+///
+/// Takes `WidgetText` so a caption the caller already materialized (a
+/// `String` from `t_fmt`) moves in without a second copy, and a caption the
+/// caller built as a styled `WidgetText` keeps that styling. The chip's tint
+/// rides a scoped `override_text_color` rather than a wrapping `RichText`:
+/// that colours plain `WidgetText::Text` too, dropping the per-frame
+/// `RichText` wrapper (and its `Arc` allocation) the old signature forced.
+fn chip(ui: &mut egui::Ui, color: egui::Color32, text: impl Into<egui::WidgetText>) {
+    let restore = ui.visuals().override_text_color;
+    ui.visuals_mut().override_text_color = Some(color);
     ui.add(
-        egui::Label::new(egui::RichText::new(text.into()).color(color))
+        egui::Label::new(text.into())
             .truncate()
             .show_tooltip_when_elided(true),
     );
+    ui.visuals_mut().override_text_color = restore;
 }
 
 /// Render the dynamic status/error zone. The caller lays this out inside a

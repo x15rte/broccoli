@@ -188,6 +188,15 @@ fn fold_key(c: char) -> char {
     }
 }
 
+/// The folded form of a whole key: every rune through [`fold_key`], so two
+/// keys are equal under [`equal_fold`] exactly when their folded forms are
+/// equal. A set of folded keys therefore expresses `equal_fold`'s equivalence
+/// for a whole object, which is what the generator's duplicate-key gate needs;
+/// comparing every pair of raw keys would re-fold both sides of each pair.
+pub(crate) fn folded_key(value: &str) -> String {
+    value.chars().map(fold_key).collect()
+}
+
 // ---------- state file load/save (atomic, corrupt-proof) ----------
 
 pub(crate) fn state_file(name: &str) -> PathBuf {

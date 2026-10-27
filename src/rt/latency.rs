@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::ExitStatus;
@@ -43,13 +43,23 @@ enum PollOutcome {
 /// Return a completed snapshot only when every requested tag has an exact row.
 /// Observatory selectors are prefix-based, so exact matching is required to
 /// prevent a longer selected tag from satisfying a shorter requested tag.
-pub(crate) fn complete_statuses(
-    statuses: &[OutboundStatusView],
+///
+/// The response is indexed once per poll rather than rescanned per requested
+/// tag, and the rows are returned borrowed: the caller clones them once, at
+/// the success site, instead of every poll paying a clone. A repeated tag
+/// (which the runtime does not produce) resolves to its first row, exactly
+/// the row the previous per-tag `find` returned.
+pub(crate) fn complete_statuses<'a>(
+    statuses: &'a [OutboundStatusView],
     requested_tags: &[String],
-) -> Option<Vec<OutboundStatusView>> {
+) -> Option<Vec<&'a OutboundStatusView>> {
+    let mut by_tag: HashMap<&str, &OutboundStatusView> = HashMap::with_capacity(statuses.len());
+    for status in statuses {
+        by_tag.entry(status.tag.as_str()).or_insert(status);
+    }
     requested_tags
         .iter()
-        .map(|tag| statuses.iter().find(|status| status.tag == *tag).cloned())
+        .map(|tag| by_tag.get(tag.as_str()).copied())
         .collect()
 }
 
@@ -72,9 +82,19 @@ fn with_run_diagnostics(
 
 fn push_diagnostic(tail: &Arc<Mutex<VecDeque<String>>>, line: String, is_stderr: bool) {
     let mut line = line;
-    if line.chars().count() > DIAGNOSTIC_LINE_CHARS {
-        line = line.chars().take(DIAGNOSTIC_LINE_CHARS).collect();
-        line.push_str("...");
+    // The byte length bounds the char count from above, so this only walks
+    // the string when truncation is actually possible — the common short
+    // line never pays a full char scan.
+    if line.len() > DIAGNOSTIC_LINE_CHARS
+        && let Some((cut, _)) = line.char_indices().nth(DIAGNOSTIC_LINE_CHARS)
+    {
+        // `cut` is a char boundary after exactly `DIAGNOSTIC_LINE_CHARS`
+        // chars, so the prefix is the same text `chars().take(n)` produced,
+        // built once into its final allocation.
+        let mut truncated = String::with_capacity(cut + 3);
+        truncated.push_str(&line[..cut]);
+        truncated.push_str("...");
+        line = truncated;
     }
     let stream = if is_stderr { "stderr" } else { "stdout" };
     if let Ok(mut tail) = tail.lock() {
@@ -281,6 +301,8 @@ pub(crate) async fn run(
                     // log and UI with the child's captured diagnostics tail
                     // (run-level: one probe, one child).
                     let tail = diagnostic_tail(&diagnostics);
+                    let completed: Vec<OutboundStatusView> =
+                        completed.into_iter().cloned().collect();
                     return Ok(with_run_diagnostics(completed, &tail));
                 }
                 last_api_error = None;

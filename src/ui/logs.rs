@@ -340,9 +340,9 @@ struct FilteredView {
     /// same fonts and width the render pass uses, so painted rows always
     /// fit their slots exactly.
     heights: Vec<f32>,
-    /// The galleys measured into `heights`, kept for the custom row
-    /// selection's cursor math (`cursor_from_pos` / `pos_from_cursor`).
-    /// Rebuilt only on a re-fit, never per frame.
+    /// The galleys measured into `heights`: the paint path draws each one
+    /// directly (re-colored per frame) and the custom row selection does its
+    /// cursor math on it. Rebuilt only on a re-fit, never per frame.
     galleys: Vec<std::sync::Arc<egui::text::Galley>>,
     /// Content width the heights were measured at.
     measured_width: f32,
@@ -600,9 +600,9 @@ impl FilteredView {
 }
 
 /// The view's paint data: the admitted rows, their measured heights, the
-/// prefix sums that place them and the galleys the row selection's cursor
-/// math runs on. Borrowed from the view, so the paint path reads one
-/// accessor instead of the view's fields.
+/// prefix sums that place them and the galleys the rows are painted with and
+/// the row selection's cursor math runs on. Borrowed from the view, so the
+/// paint path reads one accessor instead of the view's fields.
 ///
 /// Heights, galleys and offsets cover the rows the last layout pass reached;
 /// a refresh that admitted a tail no pass has measured yet leaves `rows`
@@ -1113,12 +1113,12 @@ impl LogsScreen {
             }
         };
         // The measurer is the screen's half of the layout seam: one layout
-        // serves both the row height and the galley the custom row selection
-        // does its cursor math on. A pass measures every row when `refit`,
+        // serves the row height, the painted row text, and the custom row
+        // selection's cursor math. A pass measures every row when `refit`,
         // and otherwise only the rows a refresh admitted that no pass has
-        // reached; galleys are never painted (the label paints the text with
-        // the per-frame color), so they are laid out with the placeholder
-        // color.
+        // reached; the paint path re-colors the stored galley with the
+        // row's per-frame color, so it is laid out with the placeholder
+        // color here.
         let font_id = TextStyle::Monospace.resolve(ui.style());
         let mut measurer = |text: &str, wrap_width: f32| {
             let galley = ui.ctx().fonts_mut(|fonts| {
@@ -1171,7 +1171,9 @@ impl LogsScreen {
             })
             .collect();
         ui.scope_builder(egui::UiBuilder::new().max_rect(band_rect), |ui| {
-            ui.skip_ahead_auto_ids(2 * band.start);
+            // One auto id per row (the interaction), so a row keeps its id
+            // — and an in-flight drag its owner — while the band scrolls.
+            ui.skip_ahead_auto_ids(band.start);
             let dark = ui.visuals().dark_mode;
             // The closure owns the selection for this frame; persisting to
             // the field at the end keeps the updates visible to later
@@ -1234,21 +1236,28 @@ impl LogsScreen {
                 }
                 // Non-selectable label: egui's label-selection machinery —
                 // which collapses on any press and owns private state —
-                // must never run on rows. The label still paints the text
-                // with the per-frame color and keeps the row in the
-                // accesskit tree; the selection widget sits on top and
-                // claims all presses.
+                // must never run on rows. The row's measured galley is
+                // painted directly, so the paint path neither builds a
+                // fresh `LayoutJob` nor lays the line out again; the widget
+                // info keeps the row in the accesskit tree with the same
+                // label text the old `Label` supplied, and the selection
+                // widget sits on top and claims all presses.
                 let response = ui
                     .interact(row_rect, ui.next_auto_id(), egui::Sense::click_and_drag())
                     .on_hover_cursor(egui::CursorIcon::Text);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(row.line.as_str())
-                            .text_style(TextStyle::Monospace)
-                            .color(color),
+                // `next_auto_id` only reads the counter; with the label gone
+                // the row must advance it itself so every row keeps its own
+                // stable interaction id (`base + row index`).
+                ui.skip_ahead_auto_ids(1);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        ui.is_enabled(),
+                        row.line.as_str(),
                     )
-                    .selectable(false),
-                );
+                });
+                ui.painter()
+                    .galley(row_rect.min, std::sync::Arc::clone(galley), color);
                 // The row context menu: the mouse-only copy trigger, which
                 // right-clicks leave the selection intact for.
                 response.context_menu(|ui| {

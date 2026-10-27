@@ -143,7 +143,7 @@ pub struct UiCtx<'a> {
     verdict_generation: u64,
     config_error: &'a Option<String>,
     stats: &'a Option<StatsTick>,
-    stats_history: &'a VecDeque<StatsTick>,
+    stats_history: &'a VecDeque<TrafficSample>,
     observatory: &'a [OutboundStatusView],
     logs: &'a VecDeque<LogLine>,
     logs_generation: u64,
@@ -317,7 +317,7 @@ pub struct DashboardCtx<'a> {
     pub(crate) phase: &'a CorePhase,
     pub(crate) transport: Option<CoreTransport>,
     pub(crate) stats: &'a Option<StatsTick>,
-    pub(crate) stats_history: &'a VecDeque<StatsTick>,
+    pub(crate) stats_history: &'a VecDeque<TrafficSample>,
     pub(crate) observatory: &'a [OutboundStatusView],
     pub(crate) download: &'a DownloadState,
     pub(crate) terminal_error: &'a Option<TerminalErrorView>,
@@ -558,7 +558,7 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) servers: &'a mut ServersFile,
     pub(crate) settings: &'a mut Settings,
     pub(crate) cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
-    pub(crate) stats_history: &'a VecDeque<StatsTick>,
+    pub(crate) stats_history: &'a VecDeque<TrafficSample>,
     pub(crate) logs: &'a VecDeque<LogLine>,
     /// Monotonic push count of the app's log ring: the Logs
     /// screen keys its memoized filtered view on `(len, logs_generation)`,
@@ -865,7 +865,8 @@ pub(crate) struct UiCtxSnapshot {
     pub(crate) stats: Option<StatsTick>,
     pub(crate) observatory: Vec<OutboundStatusView>,
     pub(crate) core_version: Option<String>,
-    /// The installed tree's own version and its last verification failure.
+    /// The installed tree's own version, its last verification failure, and
+    /// whether a verification pass is in flight.
     pub(crate) core_setup: CoreSetupState,
     /// The terminal message the content area renders (the failure's keyed
     /// headline plus the captured core output behind it).
@@ -884,11 +885,11 @@ pub(crate) fn core_setup_busy(ctx: &CoreSetupCtx<'_>) -> bool {
 /// The managed core's setup state as the core setup surface renders it.
 ///
 /// The verified version stays on [`UiCtx::core_version`] (the top-bar caption
-/// and the About screen read it); this bundle carries the two facts only the
+/// and the About screen read it); this bundle carries the facts only the
 /// setup surface needs: the version the installed tree's own release metadata
 /// names — set even when the tree does not match the compiled pins, so a stale
-/// install can name both versions — and the verification failure for a tree
-/// that did not verify.
+/// install can name both versions — the verification failure for a tree that
+/// did not verify, and whether an on-demand pass is in flight.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct CoreSetupState {
     /// The version the installed tree's release metadata names, even when the
@@ -897,6 +898,13 @@ pub(crate) struct CoreSetupState {
     /// The verification failure for a present tree, keyed so it renders in
     /// the active language at the label site.
     pub(crate) verification_error: Option<AppMessage>,
+    /// A pinned-payload verification pass is running on the shell's worker
+    /// thread: the surface disables Verify and the install actions (its
+    /// reads must not race a payload replacement) until the answer is
+    /// adopted. Set only by the shell when it starts a pass; every adopted
+    /// pass replaces the whole bundle with the facts it verified, which
+    /// clears this flag.
+    pub(crate) verification_in_flight: bool,
 }
 
 /// The terminal message the content area renders: the already-rendered
@@ -915,6 +923,17 @@ pub(crate) struct TerminalErrorView {
     /// offers the remedy the core's own message names (turn the block off and
     /// retry the start) alongside the standing core-setup route.
     pub(crate) leak_remedy: bool,
+}
+
+/// One throughput sample of the shell's stats-history ring: the two counters
+/// the dashboard plot reads, dropped from a [`StatsTick`] at push time. The
+/// ring keeps 120 of these (16 bytes each) instead of 120 whole ticks — whose
+/// three per-inbound vectors were stored and cloned per tick just to plot
+/// `up`/`down`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrafficSample {
+    pub(crate) up: u64,
+    pub(crate) down: u64,
 }
 
 /// Which mount renders the shared core-setup surface. The component is one,
@@ -1063,20 +1082,24 @@ pub(crate) fn show_core_setup(
     // Actions: stock buttons, like every other screen.
     let phase_allows_install = matches!(&ctx.phase, CorePhase::Stopped | CorePhase::Error(_));
     let busy = core_setup_busy(ctx);
-    let can_install = phase_allows_install && !busy;
+    // A verification pass this shell started owns the tree's payloads until
+    // its answer lands: an install must not race the hashing reads, and
+    // Verify must not start a second pass.
+    let verifying = ctx.core_setup.verification_in_flight;
+    let can_install = phase_allows_install && !busy && !verifying;
     // Verify re-hashes the installed payloads; with no tree to open there is
     // nothing for it to answer.
     let can_verify = can_install && tree_present;
     let install_disabled_reason = if !phase_allows_install {
         t(lang, Key::CoreSetupStopFirst)
-    } else if busy {
+    } else if busy || verifying {
         t(lang, Key::CoreSetupBusy)
     } else {
         ""
     };
     let verify_disabled_reason = if !phase_allows_install {
         t(lang, Key::CoreSetupStopFirst)
-    } else if busy {
+    } else if busy || verifying {
         t(lang, Key::CoreSetupBusy)
     } else {
         t(lang, Key::CoreSetupVerifyNoCore)
@@ -1131,6 +1154,16 @@ pub(crate) fn show_core_setup(
             }
         });
     });
+
+    // A verification pass in flight is a working state: the surface's
+    // existing spinner + working line, below the actions it disabled.
+    if verifying {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.weak(t(lang, Key::CoreSetupHealthCheck));
+        });
+    }
 
     // A closed control channel means the runtime thread is gone: the
     // actions above — and the update check rendered just below this surface
@@ -1453,6 +1486,7 @@ mod tests {
                     verification_error: Some(AppMessage::Message(Diag::new(
                         Key::CoreDlMetadataMismatch,
                     ))),
+                    ..CoreSetupState::default()
                 },
                 ..Default::default()
             },
@@ -1514,6 +1548,7 @@ mod tests {
                 verification_error: Some(AppMessage::Error(std::sync::Arc::new(
                     DiagError::new(Diag::new(Key::CoreDlMetadataMismatch)).caused_by_text(reason),
                 ))),
+                ..CoreSetupState::default()
             },
             ..Default::default()
         });
@@ -1608,6 +1643,41 @@ mod tests {
             .accesskit_node()
             .is_disabled();
         assert!(!import, "archive import must be offered and enabled");
+    }
+
+    /// A verification pass in flight disables Verify and the install actions
+    /// (the worker is reading the tree's payloads) and states the wait with
+    /// the surface's working line.
+    #[test]
+    fn core_setup_in_flight_verification_disables_the_actions() {
+        let rig = UiTestRig {
+            core_version: Some("26.9.9".into()),
+            core_setup: CoreSetupState {
+                verification_in_flight: true,
+                ..CoreSetupState::default()
+            },
+            ..Default::default()
+        };
+        let harness = core_setup_harness(rig);
+        for label in [
+            Key::CoreSetupVerify,
+            Key::CoreSetupDownloadButton,
+            Key::CoreSetupImportArchive,
+        ] {
+            assert!(
+                harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, label),)
+                    .accesskit_node()
+                    .is_disabled(),
+                "{label:?} must wait for the pass's answer"
+            );
+        }
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::CoreSetupHealthCheck))
+                .is_some(),
+            "the surface must state the working wait"
+        );
     }
 
     /// With no tree there is nothing to verify, and the surface says so on

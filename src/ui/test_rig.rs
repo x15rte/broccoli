@@ -21,7 +21,9 @@ use crate::rt::{
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::ui::logs::LogLine;
-use crate::ui::{CoreSetupState, TerminalErrorView, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView};
+use crate::ui::{
+    CoreSetupState, TerminalErrorView, TrafficSample, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
+};
 use egui_kittest::Harness;
 use std::collections::VecDeque;
 
@@ -69,7 +71,7 @@ pub(crate) struct UiTestRig {
     /// adopts them through its `ShellParked` request.
     pub(crate) probe_feedback: crate::ui::request::ParkedSlot<LatencyProbeResult>,
     pub(crate) stats: Option<StatsTick>,
-    pub(crate) stats_history: VecDeque<StatsTick>,
+    pub(crate) stats_history: VecDeque<TrafficSample>,
     pub(crate) observatory: Vec<OutboundStatusView>,
     pub(crate) logs: VecDeque<LogLine>,
     /// Monotonic push count mirroring the app's `LogBuffer::generation`

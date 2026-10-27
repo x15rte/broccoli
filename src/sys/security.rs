@@ -60,6 +60,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{BOOL, PCWSTR, Result};
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use super::aligned::AlignedBuffer;
 
@@ -384,9 +385,23 @@ fn wrap_attributes<T>(
 
 /// The current process's user SID — the principal behind every
 /// user-restricted DACL.
-fn current_process_user_sid() -> Result<Sid> {
+///
+/// Read once per process and cached: the process token's user SID cannot
+/// change for the life of the process, and every user-restricted DACL built
+/// here names it. Only a successful read is cached — a failed one leaves the
+/// cell empty, so the next caller retries instead of failing forever, and no
+/// caller ever gets a weaker DACL as a fallback.
+fn current_process_user_sid() -> Result<&'static Sid> {
+    static CACHED_USER_SID: OnceLock<Sid> = OnceLock::new();
+    if let Some(sid) = CACHED_USER_SID.get() {
+        return Ok(sid);
+    }
     let token = TokenHandle::open_current_process(TOKEN_QUERY)?;
-    Sid::token_user(&token)
+    let sid = Sid::token_user(&token)?;
+    // A concurrent caller may have stored the same process token's SID
+    // first; either value is the identical SID, so the loser's copy is
+    // simply dropped.
+    Ok(CACHED_USER_SID.get_or_init(|| sid))
 }
 
 /// Build an absolute descriptor whose DACL grants `access` only to the
@@ -407,7 +422,7 @@ pub fn with_user_restricted_security_descriptor<T>(
         None,
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
         true,
-        [(&user, access)],
+        [(user, access)],
         operation,
     )
 }
@@ -423,7 +438,7 @@ pub fn with_user_restricted_attributes<T>(
     operation: impl FnOnce(*const SECURITY_ATTRIBUTES) -> T,
 ) -> Result<T> {
     let user = current_process_user_sid()?;
-    build_descriptor(None, ACE_FLAGS(0), false, [(&user, access)], |descriptor| {
+    build_descriptor(None, ACE_FLAGS(0), false, [(user, access)], |descriptor| {
         wrap_attributes(descriptor, operation)
     })
 }

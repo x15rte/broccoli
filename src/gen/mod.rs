@@ -22,6 +22,7 @@ use crate::model::{
     TunCfg,
 };
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -363,15 +364,14 @@ fn refuse_folded_duplicates(value: Value) -> Result<Value, GenerateError> {
     fn walk(value: &Value) -> Option<String> {
         match value {
             Value::Object(object) => {
-                let mut seen: Vec<&str> = Vec::with_capacity(object.len());
+                let mut seen = HashSet::with_capacity(object.len());
                 for key in object.keys() {
-                    if seen
-                        .iter()
-                        .any(|prior| crate::model::equal_fold(prior, key))
-                    {
+                    // One fold per key against a set of folded keys: the same
+                    // equivalence `equal_fold` tests, without re-folding both
+                    // sides of every pair.
+                    if !seen.insert(crate::model::folded_key(key)) {
                         return Some(key.clone());
                     }
-                    seen.push(key);
                 }
                 object.values().find_map(walk)
             }

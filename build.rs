@@ -99,16 +99,22 @@ fn require_token(template: &str, token: &str, source: &str) -> Result<(), io::Er
     }
 }
 
+/// Parses the whole manifest once, so a caller reading several release pins
+/// pays for one TOML parse.
+///
+/// Comments and surrounding whitespace need no handling afterwards, and a
+/// duplicate key is rejected here as the invalid document it is.
+fn release_manifest(manifest: &str) -> Result<toml::Table, io::Error> {
+    toml::from_str(manifest)
+        .map_err(|error| invalid_data(format!("Cargo.toml is not valid TOML: {error}")))
+}
+
 /// The value of one key under `[package.metadata.broccoli.release]`.
 ///
-/// The whole manifest goes through the TOML parser, so comments and
-/// surrounding whitespace need no handling here, and a duplicate key is
-/// rejected as the invalid document it is. The value's TOML type decides
-/// whether it is usable: `version = { workspace = true }` is an inline table
-/// and is refused exactly like any other non-string value.
-fn release_metadata_value(manifest: &str, key: &str) -> Result<String, io::Error> {
-    let document: toml::Table = toml::from_str(manifest)
-        .map_err(|error| invalid_data(format!("Cargo.toml is not valid TOML: {error}")))?;
+/// The value's TOML type decides whether it is usable:
+/// `version = { workspace = true }` is an inline table and is refused exactly
+/// like any other non-string value.
+fn release_metadata_value(document: &toml::Table, key: &str) -> Result<String, io::Error> {
     let value = document
         .get("package")
         .and_then(|package| package.get("metadata"))
@@ -154,7 +160,7 @@ fn release_metadata_is_valid(key: &str, value: &str) -> bool {
 
 #[cfg(not(test))]
 fn emit_xray_release_metadata() -> Result<(), io::Error> {
-    let manifest = fs::read_to_string("Cargo.toml")?;
+    let manifest = release_manifest(&fs::read_to_string("Cargo.toml")?)?;
     let values = [
         ("BROCCOLI_XRAY_VERSION", "xray_version"),
         ("BROCCOLI_XRAY_ARCHIVE", "xray_archive"),
@@ -592,9 +598,15 @@ mod tests {
 
     use super::{
         BuildError, BuildMode, ProtocResolution, ProtocVerification, missing_proto,
-        parse_protoc_version, rc_path, release_metadata_is_valid, release_metadata_value,
-        resolve_protoc, vendored_protoc_path, verify_protoc,
+        parse_protoc_version, rc_path, release_manifest, release_metadata_is_valid,
+        release_metadata_value, resolve_protoc, vendored_protoc_path, verify_protoc,
     };
+
+    /// Parse-then-look-up in one call: the shape the old per-key reader had,
+    /// used by tests that only care about one key.
+    fn release_value(manifest: &str, key: &str) -> Result<String, std::io::Error> {
+        release_metadata_value(&release_manifest(manifest)?, key)
+    }
 
     fn resolution(mode: BuildMode) -> ProtocResolution<'static> {
         ProtocResolution {
@@ -862,16 +874,18 @@ xray_version = "v26.10.21" # trailing comment
 xray_archive = "Xray-windows-64.zip"
 xray_sha256 = "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
 "#;
+        // One parse feeds every key, the way the build script reads its pins.
+        let document = release_manifest(manifest).expect("fixture manifest parses");
         assert_eq!(
-            release_metadata_value(manifest, "xray_version").unwrap(),
+            release_metadata_value(&document, "xray_version").unwrap(),
             "v26.10.21"
         );
         assert_eq!(
-            release_metadata_value(manifest, "xray_archive").unwrap(),
+            release_metadata_value(&document, "xray_archive").unwrap(),
             "Xray-windows-64.zip"
         );
         assert_eq!(
-            release_metadata_value(manifest, "xray_sha256").unwrap(),
+            release_metadata_value(&document, "xray_sha256").unwrap(),
             "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
         );
     }
@@ -882,7 +896,7 @@ xray_sha256 = "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827"
 [package.metadata.broccoli.release]
 xray_version = { workspace = true }
 "#;
-        let error = release_metadata_value(manifest, "xray_version").unwrap_err();
+        let error = release_value(manifest, "xray_version").unwrap_err();
         assert!(
             error.to_string().contains("must be a quoted string"),
             "error: {error}"
@@ -896,7 +910,7 @@ xray_version = { workspace = true }
 xray_archive = "Xray-windows-64.zip"
 xray_archive = "Xray-windows-64.zip"
 "#;
-        let error = release_metadata_value(manifest, "xray_archive").unwrap_err();
+        let error = release_value(manifest, "xray_archive").unwrap_err();
         assert!(
             error.to_string().contains("not valid TOML"),
             "error: {error}"
@@ -906,11 +920,11 @@ xray_archive = "Xray-windows-64.zip"
     #[test]
     fn release_metadata_reports_a_missing_key_or_section() {
         let without_key = "[package.metadata.broccoli.release]\ntarget = \"x\"\n";
-        let error = release_metadata_value(without_key, "xray_version").unwrap_err();
+        let error = release_value(without_key, "xray_version").unwrap_err();
         assert!(error.to_string().contains("is missing"), "error: {error}");
 
         let without_section = "[package]\nversion = \"0.4.0\"\n";
-        let error = release_metadata_value(without_section, "xray_version").unwrap_err();
+        let error = release_value(without_section, "xray_version").unwrap_err();
         assert!(error.to_string().contains("is missing"), "error: {error}");
     }
 
@@ -953,6 +967,7 @@ xray_archive = "Xray-windows-64.zip"
         // The build script reads this exact file at compile time; every pin
         // it exports must be present and valid in it.
         let manifest = fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
+        let document = release_manifest(&manifest).expect("Cargo.toml parses");
         for (key, expected_prefix) in [
             ("xray_version", "v"),
             ("xray_archive", "Xray-"),
@@ -962,7 +977,7 @@ xray_archive = "Xray-windows-64.zip"
             ("geoip_sha256", ""),
             ("geosite_sha256", ""),
         ] {
-            let value = release_metadata_value(&manifest, key).expect("shipped release pin");
+            let value = release_metadata_value(&document, key).expect("shipped release pin");
             assert!(
                 value.starts_with(expected_prefix),
                 "`{key}` must start with {expected_prefix:?}, got {value:?}"

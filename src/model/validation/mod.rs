@@ -15,6 +15,10 @@
 //!
 //! - [`validate_outbound`] — one profile's protocol, stream and transport
 //!   security. What the share-link paste gate and the editor sweep judge.
+//!   [`validate_outbound_with_blocks`] is the same single pass for a renderer
+//!   that shows a stream block inline: the aggregated verdict is identical
+//!   and the top-level [`StreamBlocks`] verdicts come along, so the block is
+//!   never validated a second time.
 //! - [`validate_profiles`] — that plus the profile-set rules (identity,
 //!   generated tags, the dial graph's chain findings), judged against the
 //!   emitted outbound universe. `active_id` and `require_nonempty` are the
@@ -1426,6 +1430,26 @@ impl Verdict {
             .find(|issue| issue.severity == Severity::Error)
     }
 
+    /// The verdict split into its two tiers, consuming it: `(blocking,
+    /// advisory)`, each in pass order. A caller that needs both halves — a
+    /// refusal and the warnings it reports beside it — consumes the verdict
+    /// instead of cloning the advisory list to keep it past
+    /// [`Self::into_first_blocking`]; order within each tier is the pass
+    /// order, so the first blocking finding is the same one
+    /// [`Self::into_first_blocking`] names.
+    pub fn into_tiers(self) -> (Vec<ValidationIssue>, Vec<ValidationIssue>) {
+        let mut blocking = Vec::new();
+        let mut advisory = Vec::new();
+        for issue in self.issues {
+            if issue.severity == Severity::Error {
+                blocking.push(issue);
+            } else {
+                advisory.push(issue);
+            }
+        }
+        (blocking, advisory)
+    }
+
     /// The findings as the plain list, for the callers that store or extend
     /// one.
     pub fn into_issues(self) -> Vec<ValidationIssue> {
@@ -1611,8 +1635,9 @@ pub use outbound::{
     freedom_final_rule_supported, masque_remote_dns_verdict, masque_warp_address_list_verdict,
     masque_warp_address_verdict, masque_warp_private_key_verdict, masque_warp_public_key_verdict,
     mux_conflicts_with_vision_flow, send_through_supported, sniffing_dest_override_supported,
-    validate_outbound, validate_sniffing, wireguard_peer_public_key_verdict,
-    wireguard_preshared_key_verdict, wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
+    validate_outbound, validate_outbound_with_blocks, validate_sniffing,
+    wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,
+    wireguard_remote_dns_verdict, wireguard_secret_key_verdict,
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
@@ -1622,7 +1647,7 @@ pub use settings::{
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
-    SOCKOPT_DOMAIN_STRATEGY_OPTIONS, SS_METHOD_OPTIONS, TARGET_STRATEGY_OPTIONS,
+    SOCKOPT_DOMAIN_STRATEGY_OPTIONS, SS_METHOD_OPTIONS, StreamBlocks, TARGET_STRATEGY_OPTIONS,
     TLS_VERSION_OPTIONS, TPROXY_MODES, UPLINK_DATA_PLACEMENT_OPTIONS,
     UPLINK_STREAM_PLACEMENT_OPTIONS, VMESS_SECURITY_OPTIONS, X_PADDING_PLACEMENT_OPTIONS,
     XHTTP_MODE_OPTIONS, XPADDING_METHOD_OPTIONS, ech_sockopt_emitted, kcp_mtu_hard_ok,
@@ -1634,8 +1659,9 @@ pub use stream::{
     sockopt_domain_strategy_supported, tls_version_rank, tls_version_supported,
     uplink_data_placement_supported, uplink_http_method_mode_supported,
     uplink_placement_mode_supported, validate_finalmask, validate_sockopt, validate_stream,
-    vmess_security_supported, xhttp_mode_supported, xmux_limits_conflict, xpadding_bytes_supported,
-    xpadding_method_supported, xpadding_placement_supported,
+    validate_stream_with_blocks, vmess_security_supported, xhttp_mode_supported,
+    xmux_limits_conflict, xpadding_bytes_supported, xpadding_method_supported,
+    xpadding_placement_supported,
 };
 pub(crate) use stream::{is_canonical_uuid, range_has_session_room};
 
@@ -1652,5 +1678,43 @@ mod tests {
         code: &ValidationCode,
     ) -> Option<&'a ValidationIssue> {
         issues.iter().find(|issue| &issue.code == code)
+    }
+
+    /// The tier split consumes the verdict without a clone and keeps pass
+    /// order inside each tier, so the first blocking finding a seam refuses
+    /// with is the one `into_first_blocking` names.
+    #[test]
+    fn into_tiers_preserves_pass_order_and_the_first_refusal() {
+        let verdict = Verdict::from_issues(vec![
+            warning(ValidationCode::ServerNameImplausible, Some("first".into())),
+            issue(ValidationCode::ServerAddressRequired, Some("a".into())),
+            warning(ValidationCode::ServerNameImplausible, Some("second".into())),
+            issue(ValidationCode::MuxWithVisionFlow, Some("b".into())),
+        ]);
+        let first_blocking = verdict.blocking().next().cloned();
+        assert_eq!(
+            first_blocking,
+            Some(issue(
+                ValidationCode::ServerAddressRequired,
+                Some("a".into())
+            ))
+        );
+
+        let (blocking, advisory) = verdict.into_tiers();
+        assert_eq!(
+            codes(&blocking),
+            vec![
+                ValidationCode::ServerAddressRequired,
+                ValidationCode::MuxWithVisionFlow,
+            ]
+        );
+        assert_eq!(
+            codes(&advisory),
+            vec![
+                ValidationCode::ServerNameImplausible,
+                ValidationCode::ServerNameImplausible,
+            ]
+        );
+        assert_eq!(blocking.first(), first_blocking.as_ref());
     }
 }

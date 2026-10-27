@@ -924,12 +924,12 @@ const STATS_TICK_PERIOD: Duration = Duration::from_secs(1);
 ///
 /// Tokio's default `Burst` fires the next tick instantly after an overrun.
 /// A wedged core (accepts TCP on the API port, never answers) makes each
-/// stats poll overrun its 1 s period — three sequential RPCs at 500 ms
-/// deadline plus slack ≈ 1.65 s worst case — so Burst chains zero-gap
-/// timeout cycles that monopolize the single runtime thread, starving job
-/// tasks, cmd dispatch, and the event pumps between cycles. `Delay` skips
-/// the missed periods and re-aligns to the period after the poll
-/// completes: an overrun costs one poll per period, not a busy cycle.
+/// stats poll overrun its 1 s period — three RPCs issued together at one
+/// 500 ms deadline plus transport slack ≈ 0.55 s worst case — so Burst chains
+/// zero-gap timeout cycles that monopolize the single runtime thread,
+/// starving job tasks, cmd dispatch, and the event pumps between cycles.
+/// `Delay` skips the missed periods and re-aligns to the period after the
+/// poll completes: an overrun costs one poll per period, not a busy cycle.
 /// Every run-loop ticker (ready/stats/obs/house) is built
 /// here so none can fall back to Burst.
 fn ticker(period: Duration) -> tokio::time::Interval {
@@ -3820,16 +3820,16 @@ impl Runtime {
 
         // Every sweep hits the same loopback channel; a failure means the core
         // is unreachable or restarting — drop the whole sample (the exit
-        // watch handles state). All three run before any fold so a dropped
-        // sample also leaves every baseline untouched: the next successful
-        // sample then covers the full span since the last published one.
-        let Ok(rows) = self.grpc.query_traffic().await else {
-            return;
-        };
-        let Ok(inbound_rows) = self.grpc.query_inbound_traffic().await else {
-            return;
-        };
-        let Ok(sys_stats) = self.grpc.get_sys_stats().await else {
+        // watch handles state). The three RPCs are issued together and the
+        // sample is dropped unless all three succeed; none is folded until
+        // all three have landed, so a dropped sample also leaves every
+        // baseline untouched: the next successful sample then covers the full
+        // span since the last published one.
+        let Ok((rows, inbound_rows, sys_stats)) = tokio::try_join!(
+            self.grpc.query_traffic(),
+            self.grpc.query_inbound_traffic(),
+            self.grpc.get_sys_stats(),
+        ) else {
             return;
         };
 

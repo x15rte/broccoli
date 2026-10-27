@@ -29,6 +29,7 @@
 //! stale ones by age under the exact same naming contract.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message};
@@ -167,7 +168,21 @@ pub(crate) async fn validate(
     } = request;
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
-    let mut staged_servers = prepared_snapshot(&servers);
+    // One owned snapshot for the whole request, shared with the blocking
+    // writer by pointer: staging mutates the sole owner in place
+    // (`Arc::make_mut`), so no candidate ever pays a whole-file copy. The
+    // settings travel the same way.
+    let mut staged_servers = Arc::new(prepared_snapshot(&servers));
+    let settings = Arc::new(settings);
+    // The scratch directory is created by the write leg, after generation:
+    // a candidate whose generation fails reports that error, never a
+    // directory failure it would not have reached. The cancel boundary is
+    // observed first: a request cancelled before it started does no
+    // filesystem work at all.
+    if cancel.is_cancelled() {
+        return Err(validation_cancelled());
+    }
+    let directory = crate::sys::paths::config_dir();
     for profile in profiles {
         // Cooperative cancel boundary: the previous iteration's staging was
         // either committed or already reverted, so nothing is left behind
@@ -216,9 +231,12 @@ pub(crate) async fn validate(
             continue;
         }
 
-        match stage_and_validate(&mut staged_servers, &profile, &settings, lang).await {
-            Ok(()) => accepted.push(profile),
-            Err(message) => rejected.push((label, message)),
+        match stage_and_validate(&mut staged_servers, &profile, &settings, &directory, lang).await {
+            Ok(Ok(())) => accepted.push(profile),
+            Ok(Err(message)) => rejected.push((label, message)),
+            // The filesystem worker itself failed: terminal for the request,
+            // not a verdict for this profile.
+            Err(error) => return Err(error),
         }
     }
     Ok(ProfileValidationResult {
@@ -231,24 +249,37 @@ pub(crate) async fn validate(
 }
 
 /// Stage `profile` into the working servers file in place, generate the
-/// config for the staged file and validate it with `xray run -test`. `Err`
-/// is the rejection text as the screen renders it, and the staging has
-/// already been reverted: a rejected profile leaves the file that later
-/// profiles are generated against holding only accepted candidates. (The
-/// per-profile whole-file copy this replaced deep-copied every other profile
-/// once per candidate, so an import batch of N profiles cost O(N²) copies.)
+/// config for the staged file and validate it with `xray run -test`.
+/// `Ok(Err(..))` is the rejection text as the screen renders it, and the
+/// staging has already been reverted: a rejected profile leaves the file that
+/// later profiles are generated against holding only accepted candidates.
+/// `Err` is the filesystem worker's own failure, which ends the request
+/// instead of producing a verdict. (The per-profile whole-file copy this
+/// replaced deep-copied every other profile once per candidate, so an import
+/// batch of N profiles cost O(N²) copies.)
 async fn stage_and_validate(
-    staged: &mut ServersFile,
+    staged: &mut Arc<ServersFile>,
     profile: &ServerProfile,
-    settings: &Settings,
+    settings: &Arc<Settings>,
+    directory: &Path,
     lang: Language,
-) -> Result<(), String> {
-    let staging = stage_profile(staged, profile);
-    match generate_and_validate(staged, settings, lang).await {
-        Ok(()) => Ok(()),
+) -> Result<Result<(), String>, DiagError> {
+    // `make_mut` mutates the sole owner in place: the blocking leg below
+    // holds a pointer clone only while it runs, and it has finished by the
+    // time the next candidate stages.
+    let staging = stage_profile(Arc::make_mut(staged), profile);
+    match generate_and_validate(
+        Arc::clone(staged),
+        Arc::clone(settings),
+        directory.to_path_buf(),
+        lang,
+    )
+    .await?
+    {
+        Ok(()) => Ok(Ok(())),
         Err(message) => {
-            staging.revert(staged);
-            Err(message)
+            staging.revert(Arc::make_mut(staged));
+            Ok(Err(message))
         }
     }
 }
@@ -306,38 +337,74 @@ fn stage_profile(staged: &mut ServersFile, profile: &ServerProfile) -> StagingUn
     }
 }
 
-/// Generate the staged file's config, write it to a scratch file in the
-/// config directory and run it through `xray run -test`
-/// ([`apply::validate`]). `Err` is the rejection text for the profile.
-async fn generate_and_validate(
-    staged: &ServersFile,
-    settings: &Settings,
+/// One candidate's blocking leg: generate the staged file's config,
+/// serialize it, and write it to a scratch file in `directory`, all off the
+/// executor ([`apply::on_blocking_pool`]) so the current-thread control
+/// plane keeps polling the validation child's pumps and `wait` while the
+/// disk works. The snapshot and settings are shared by pointer, so one
+/// candidate costs no copy of either. `Ok(Err(..))` is the candidate's
+/// rejection text; `Err` is the worker itself failing.
+///
+/// The scratch file's [`ScratchConfigGuard`] is created inside the blocking
+/// leg, the moment the file exists: a cancel while this leg is still in
+/// flight drops the guard together with the discardable result instead of
+/// stranding plaintext secrets on disk.
+async fn write_scratch_config(
+    staged: Arc<ServersFile>,
+    settings: Arc<Settings>,
+    directory: PathBuf,
     lang: Language,
-) -> Result<(), String> {
-    let config = crate::r#gen::generate(staged, settings).map_err(|error| error.text(lang))?;
-    let directory = crate::sys::paths::config_dir();
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| t_fmt(lang, Key::SrvScratchConfigDirFailed, &[&error]))?;
-    let path = directory.join(scratch_config_file_name(&uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(&config)
-        .map_err(|error| t_fmt(lang, Key::SrvScratchConfigSerializeFailed, &[&error]))?;
-    std::fs::write(&path, bytes)
-        .map_err(|error| t_fmt(lang, Key::SrvScratchConfigWriteFailed, &[&error]))?;
-    // The guard removes the scratch config on drop — normal completion
-    // and panic unwinding alike — so a mid-flight abort cannot leave
-    // plaintext profile secrets on disk.
-    let (ok, output) = {
-        let _scratch = ScratchConfigGuard::new(path.clone());
-        apply::validate(&path).await
+) -> Result<Result<(PathBuf, ScratchConfigGuard), String>, DiagError> {
+    apply::on_blocking_pool(move || {
+        let outcome: Result<(PathBuf, ScratchConfigGuard), String> = (|| {
+            let config =
+                crate::r#gen::generate(&staged, &settings).map_err(|error| error.text(lang))?;
+            // Generation is judged before the directory is touched: a
+            // candidate the generator refuses reports its own error, the
+            // same precedence the pre-pool leg had.
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| t_fmt(lang, Key::SrvScratchConfigDirFailed, &[&error]))?;
+            let path = directory.join(scratch_config_file_name(&uuid::Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(&config)
+                .map_err(|error| t_fmt(lang, Key::SrvScratchConfigSerializeFailed, &[&error]))?;
+            std::fs::write(&path, bytes)
+                .map_err(|error| t_fmt(lang, Key::SrvScratchConfigWriteFailed, &[&error]))?;
+            Ok((path.clone(), ScratchConfigGuard::new(path)))
+        })();
+        Ok::<_, DiagError>(outcome)
+    })
+    .await
+}
+
+/// Validate one staged candidate: write its generated config to a scratch
+/// file ([`write_scratch_config`]) and run that file through `xray run
+/// -test` ([`apply::validate`]). The run itself stays on the executor, so
+/// the child it spawns is polled by the runtime that owns it. The guard
+/// lives to the end of this function, so the scratch config is removed on
+/// every path — normal completion, rejection, cancellation, and panic
+/// unwinding alike.
+async fn generate_and_validate(
+    staged: Arc<ServersFile>,
+    settings: Arc<Settings>,
+    directory: PathBuf,
+    lang: Language,
+) -> Result<Result<(), String>, DiagError> {
+    let (path, _scratch) = match write_scratch_config(staged, settings, directory, lang).await? {
+        Ok(written) => written,
+        Err(message) => return Ok(Err(message)),
     };
+    // The guard is already armed (with the write, before this first
+    // cancellable await), so a mid-flight abort cannot leave plaintext
+    // profile secrets on disk.
+    let (ok, output) = apply::validate(&path).await;
     if ok {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let output = output.text(lang);
     if output.trim().is_empty() {
-        Err(t(lang, Key::SrvXrayTestSilent).to_string())
+        Ok(Err(t(lang, Key::SrvXrayTestSilent).to_string()))
     } else {
-        Err(output)
+        Ok(Err(output))
     }
 }
 
@@ -471,6 +538,7 @@ mod tests {
     use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
     use crate::rt::cancel::Cancel;
     use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect};
+    use std::sync::Arc;
 
     fn request(profiles: Vec<ServerProfile>) -> ProfileValidationRequest {
         ProfileValidationRequest {
@@ -821,19 +889,22 @@ mod tests {
         // as it was, so later candidates are staged against accepted state
         // only. An unparsable raw override fails generation up front.
         let existing = import_profile("existing", "0123456789abcdef");
-        let mut staged = ServersFile {
+        let mut staged = Arc::new(ServersFile {
             profiles: vec![existing.clone()],
             active: Some(existing.id.clone()),
             ..ServersFile::default()
-        };
-        let settings = Settings {
+        });
+        let settings = Arc::new(Settings {
             raw_override: Some("not json".to_string()),
             ..Settings::default()
-        };
+        });
+        let directory = crate::sys::paths::config_dir();
         let candidate = import_profile("candidate", "fedcba9876543210");
-        let error = stage_and_validate(&mut staged, &candidate, &settings, Language::En)
-            .await
-            .expect_err("an unparsable raw override must reject the candidate");
+        let error =
+            stage_and_validate(&mut staged, &candidate, &settings, &directory, Language::En)
+                .await
+                .expect("the filesystem worker itself must not fail")
+                .expect_err("an unparsable raw override must reject the candidate");
         let prefix = t(Language::En, Key::GenRawOverride)
             .split_once("{}")
             .expect("the raw-override sentence carries one placeholder")
