@@ -170,7 +170,7 @@ name = "build"
 path = "tests/build.rs"
 
 [dev-dependencies]
-egui_kittest = { version = "0.36", features = ["eframe"] }
+egui_kittest = { version = "0.37", features = ["eframe"] }
 # Test certificates for the quic_probe transcript tests; aws_lc_rs keeps the
 # ring crate out of the dev graph too (deny.toml bans it).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
