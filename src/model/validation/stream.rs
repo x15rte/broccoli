@@ -792,6 +792,375 @@ fn stream_extra_shadow(stream: &StreamModel, issues: &mut Vec<ValidationIssue>) 
     }
 }
 
+// ---------- transport settings: flattened-key shadows ----------
+//
+// Every transport block carries `#[serde(flatten)] extra`, so a hand-edited
+// document can hold a case variant of one of the block's modeled keys: serde
+// keeps it in the flattened map, the emitted document carries it beside the
+// typed field, and Go's decoder binds it to the modeled field — the typed
+// value the rules above validated never reaches the core. The lists below are
+// the blocks' modeled wire spellings, serde renames and aliases included, so
+// an exact-case typed key stays out of `extra` and is never reported.
+
+/// `RawSettings` models `header`. The core's `RAWConfig` also reads
+/// `acceptProxyProtocol`, which this model does not type, so a carried
+/// spelling of that key is passthrough rather than a shadow.
+const RAW_MODEL_WIRE_KEYS: &[&str] = &["header"];
+
+// The core reads the header discriminator with an exact map lookup
+// (`tcpHeaderLoader`) and unmarshals only `request`/`response` into the
+// authenticator, so a carried `Type` is never bound. Exact `type` is the
+// typed discriminator; its absence is a separate rule.
+const RAW_HEADER_MODEL_WIRE_KEYS: &[&str] = &["request", "response"];
+
+const HTTP_CAMOUFLAGE_REQUEST_MODEL_WIRE_KEYS: &[&str] = &["version", "method", "path", "headers"];
+
+const HTTP_CAMOUFLAGE_RESPONSE_MODEL_WIRE_KEYS: &[&str] =
+    &["version", "status", "reason", "headers"];
+
+/// mKCP's modeled ranges. `seed`/`header`/`headerType` are absent on purpose:
+/// the removed-feature scans above already match those spellings under the
+/// core's own fold, so a case variant is refused once, by the finding that
+/// names the removed feature.
+const KCP_MODEL_WIRE_KEYS: &[&str] = &[
+    "mtu",
+    "tti",
+    "uplinkCapacity",
+    "downlinkCapacity",
+    "cwndMultiplier",
+    "maxSendingWindow",
+];
+
+/// gRPC: `GRPCConfig`'s JSON tags (infra/conf/transport_method.go:584-591),
+/// which spell the timeout/stream/window/agent keys with underscores.
+const GRPC_MODEL_WIRE_KEYS: &[&str] = &[
+    "authority",
+    "serviceName",
+    "multiMode",
+    "idle_timeout",
+    "health_check_timeout",
+    "permit_without_stream",
+    "initial_windows_size",
+    "user_agent",
+];
+
+const WS_MODEL_WIRE_KEYS: &[&str] = &["host", "path", "headers", "heartbeatPeriod"];
+
+const HTTPUPGRADE_MODEL_WIRE_KEYS: &[&str] = &["host", "path", "headers"];
+
+const HYSTERIA_MODEL_WIRE_KEYS: &[&str] = &["version", "auth", "udpIdleTimeout", "masquerade"];
+
+const MASQUERADE_MODEL_WIRE_KEYS: &[&str] = &[
+    "type",
+    "dir",
+    "url",
+    "rewriteHost",
+    "xForwarded",
+    "insecure",
+    "content",
+    "headers",
+    "statusCode",
+];
+
+const MASQUE_MODEL_WIRE_KEYS: &[&str] =
+    &["host", "path", "user", "pass", "headers", "warp", "xmux"];
+
+const MASQUE_WARP_MODEL_WIRE_KEYS: &[&str] = &["privateKey", "publicKey", "address"];
+
+const XDRIVE_MODEL_WIRE_KEYS: &[&str] = &[
+    "remoteFolder",
+    "service",
+    "secrets",
+    "segmentBytes",
+    "flushIntervalMs",
+    "pollIntervalMs",
+    "maxPollIntervalMs",
+    "sessionTtlSeconds",
+    "concurrency",
+    "eagerWindowMs",
+    "holeTimeoutMs",
+    "template",
+    "xmux",
+];
+
+const XDRIVE_TEMPLATE_MODEL_WIRE_KEYS: &[&str] = &[
+    "flatten",
+    "concurrency",
+    "auth",
+    "put",
+    "get",
+    "delete",
+    "list",
+    "retry",
+];
+
+const XDRIVE_TEMPLATE_AUTH_MODEL_WIRE_KEYS: &[&str] = &[
+    "type",
+    "header",
+    "username",
+    "password",
+    "tokenUrl",
+    "form",
+    "tokenPath",
+    "expiryPath",
+];
+
+const XDRIVE_TEMPLATE_OP_MODEL_WIRE_KEYS: &[&str] =
+    &["method", "url", "headers", "body", "namesRegex"];
+
+const XDRIVE_TEMPLATE_RETRY_MODEL_WIRE_KEYS: &[&str] = &["status", "rateReason"];
+
+const CUSTOM_SOCKOPT_MODEL_WIRE_KEYS: &[&str] =
+    &["system", "network", "level", "type", "opt", "value"];
+
+const HAPPY_EYEBALLS_MODEL_WIRE_KEYS: &[&str] = &[
+    "prioritizeIPv6",
+    "tryDelayMs",
+    "interleave",
+    "maxConcurrentTry",
+];
+
+/// REALITY client keys. `masterKeyLog` is absent on purpose: its own finding
+/// already reads the flattened map for that spelling.
+const REALITY_MODEL_WIRE_KEYS: &[&str] = &[
+    "serverName",
+    "fingerprint",
+    "password",
+    "publicKey",
+    "shortId",
+    "spiderX",
+    "show",
+    "mldsa65Verify",
+];
+
+/// Every key `SocketConfig` models (infra/conf/transport_sockopt.go:45-66),
+/// so the stream, ECH and realm ECH blocks all take the scan through
+/// [`validate_sockopt`].
+const SOCKOPT_MODEL_WIRE_KEYS: &[&str] = &[
+    "domainStrategy",
+    "dialerProxy",
+    "interface",
+    "tcpFastOpen",
+    "acceptProxyProtocol",
+    "tcpKeepAliveIdle",
+    "tcpKeepAliveInterval",
+    "tcpCongestion",
+    "tcpWindowClamp",
+    "tcpMaxSeg",
+    "tcpUserTimeout",
+    "tcpMptcp",
+    "mark",
+    "tproxy",
+    "penetrate",
+    "v6only",
+    "customSockopt",
+    "addressPortStrategy",
+    "happyEyeballs",
+    "trustedXForwardedFor",
+];
+
+/// Report every flattened key of one block that folds onto a key the same
+/// block models, under the wire path the key is emitted at.
+fn extra_shadow(
+    path: &str,
+    extra: &Map<String, Value>,
+    modeled: &[&str],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for key in shadowed_keys(extra, modeled) {
+        issues.push(issue(
+            ValidationCode::StreamExtraShadow(key.clone()),
+            Some(format!("{path}.{key}")),
+        ));
+    }
+}
+
+/// The `xmux` block's flattened-key scan, shared by the masque and xdrive
+/// carriers; XHTTP's copy is scanned with its own rules.
+fn xmux_extra_shadow(path: &str, xmux: &XmuxConfig, issues: &mut Vec<ValidationIssue>) {
+    for key in shadowed_keys(&xmux.extra, crate::model::stream::XMUX_MODELED_WIRE_KEYS) {
+        issues.push(issue(
+            ValidationCode::XmuxExtraShadow(key.clone()),
+            Some(format!("{path}.{key}")),
+        ));
+    }
+}
+
+/// Scan the transport block the wire pass keeps — nested objects only when
+/// present — for flattened keys that fold onto a key the same block models.
+/// The selection follows `retain_selected_stream_blocks_for_wire` (network,
+/// security, and the xdrive template service), so a stale draft block that
+/// the generated document drops cannot gate.
+fn transport_extra_shadows(stream: &StreamModel, issues: &mut Vec<ValidationIssue>) {
+    let network = stream.network;
+    if network == Network::Raw
+        && let Some(raw) = stream.raw_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.tcpSettings",
+            &raw.extra,
+            RAW_MODEL_WIRE_KEYS,
+            issues,
+        );
+        if let Some(header) = raw.header.as_ref() {
+            extra_shadow(
+                "stream.tcpSettings.header",
+                &header.extra,
+                RAW_HEADER_MODEL_WIRE_KEYS,
+                issues,
+            );
+            if let Some(request) = header.request.as_ref() {
+                extra_shadow(
+                    "stream.tcpSettings.header.request",
+                    &request.extra,
+                    HTTP_CAMOUFLAGE_REQUEST_MODEL_WIRE_KEYS,
+                    issues,
+                );
+            }
+            if let Some(response) = header.response.as_ref() {
+                extra_shadow(
+                    "stream.tcpSettings.header.response",
+                    &response.extra,
+                    HTTP_CAMOUFLAGE_RESPONSE_MODEL_WIRE_KEYS,
+                    issues,
+                );
+            }
+        }
+    }
+    if network == Network::Kcp
+        && let Some(kcp) = stream.kcp_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.kcpSettings",
+            &kcp.extra,
+            KCP_MODEL_WIRE_KEYS,
+            issues,
+        );
+    }
+    if network == Network::Grpc
+        && let Some(grpc) = stream.grpc_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.grpcSettings",
+            &grpc.extra,
+            GRPC_MODEL_WIRE_KEYS,
+            issues,
+        );
+    }
+    if network == Network::Ws
+        && let Some(ws) = stream.ws_settings.as_ref()
+    {
+        extra_shadow("stream.wsSettings", &ws.extra, WS_MODEL_WIRE_KEYS, issues);
+    }
+    if network == Network::Httpupgrade
+        && let Some(httpupgrade) = stream.httpupgrade_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.httpupgradeSettings",
+            &httpupgrade.extra,
+            HTTPUPGRADE_MODEL_WIRE_KEYS,
+            issues,
+        );
+    }
+    if network == Network::Hysteria
+        && let Some(hysteria) = stream.hysteria_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.hysteriaSettings",
+            &hysteria.extra,
+            HYSTERIA_MODEL_WIRE_KEYS,
+            issues,
+        );
+        if let Some(masquerade) = hysteria.masquerade.as_ref() {
+            extra_shadow(
+                "stream.hysteriaSettings.masquerade",
+                &masquerade.extra,
+                MASQUERADE_MODEL_WIRE_KEYS,
+                issues,
+            );
+        }
+    }
+    if network == Network::Masque
+        && let Some(masque) = stream.masque_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.masqueSettings",
+            &masque.extra,
+            MASQUE_MODEL_WIRE_KEYS,
+            issues,
+        );
+        if let Some(warp) = masque.warp.as_ref() {
+            extra_shadow(
+                "stream.masqueSettings.warp",
+                &warp.extra,
+                MASQUE_WARP_MODEL_WIRE_KEYS,
+                issues,
+            );
+        }
+        if let Some(xmux) = masque.xmux.as_ref() {
+            xmux_extra_shadow("stream.masqueSettings.xmux", xmux, issues);
+        }
+    }
+    if network == Network::Xdrive
+        && let Some(xdrive) = stream.xdrive_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.xdriveSettings",
+            &xdrive.extra,
+            XDRIVE_MODEL_WIRE_KEYS,
+            issues,
+        );
+        if xdrive.service == crate::model::stream::XDRIVE_SERVICE_TEMPLATE
+            && let Some(template) = xdrive.template.as_ref()
+        {
+            extra_shadow(
+                "stream.xdriveSettings.template",
+                &template.extra,
+                XDRIVE_TEMPLATE_MODEL_WIRE_KEYS,
+                issues,
+            );
+            extra_shadow(
+                "stream.xdriveSettings.template.auth",
+                &template.auth.extra,
+                XDRIVE_TEMPLATE_AUTH_MODEL_WIRE_KEYS,
+                issues,
+            );
+            for (name, operation) in [
+                ("put", &template.put),
+                ("get", &template.get),
+                ("delete", &template.delete),
+                ("list", &template.list),
+            ] {
+                extra_shadow(
+                    &format!("stream.xdriveSettings.template.{name}"),
+                    &operation.extra,
+                    XDRIVE_TEMPLATE_OP_MODEL_WIRE_KEYS,
+                    issues,
+                );
+            }
+            extra_shadow(
+                "stream.xdriveSettings.template.retry",
+                &template.retry.extra,
+                XDRIVE_TEMPLATE_RETRY_MODEL_WIRE_KEYS,
+                issues,
+            );
+        }
+        if let Some(xmux) = xdrive.xmux.as_ref() {
+            xmux_extra_shadow("stream.xdriveSettings.xmux", xmux, issues);
+        }
+    }
+    if stream.security == Security::Reality
+        && let Some(reality) = stream.reality_settings.as_ref()
+    {
+        extra_shadow(
+            "stream.realitySettings",
+            &reality.extra,
+            REALITY_MODEL_WIRE_KEYS,
+            issues,
+        );
+    }
+}
+
 /// Validate a stream model, recursing over every modeled XHTTP download
 /// stream. Mirrors the old `StreamModel::validation_errors` visit logic.
 pub fn validate_stream(s: &StreamModel) -> Verdict {
@@ -801,6 +1170,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             return;
         }
         stream_extra_shadow(stream, issues);
+        transport_extra_shadows(stream, issues);
         if !stream.carries_transport_block()
             && let Some(key) = crate::model::stream::transport_settings_key(stream.network)
         {
@@ -946,7 +1316,9 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 }
             }
         }
-        if let Some(reality) = stream.reality_settings.as_ref() {
+        if stream.security == Security::Reality
+            && let Some(reality) = stream.reality_settings.as_ref()
+        {
             // REALITY server-form keys (dest, target, privateKey,
             // serverNames, shortIds, mldsa65Seed) carried on a client
             // profile: a client REALITY build never reads them, and a set
@@ -981,7 +1353,9 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
         // an import refusal. Fingerprint vocabulary is the canonical table in
         // `crate::model::fingerprint`; REALITY excludes exactly
         // `unsafe`/`hellogolang`.
-        if let Some(reality) = stream.reality_settings.as_ref() {
+        if stream.security == Security::Reality
+            && let Some(reality) = stream.reality_settings.as_ref()
+        {
             if !crate::model::fingerprint::reality_wire_supported(&reality.fingerprint) {
                 issues.push(issue(
                     ValidationCode::RealityFingerprintUnsupported,
@@ -1152,13 +1526,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 ));
             }
             if let Some(xmux) = xhttp.xmux.as_ref() {
-                for key in shadowed_keys(&xmux.extra, crate::model::stream::XMUX_MODELED_WIRE_KEYS)
-                {
-                    issues.push(issue(
-                        ValidationCode::XmuxExtraShadow(key.clone()),
-                        Some(format!("stream.xhttpSettings.xmux.{key}")),
-                    ));
-                }
+                xmux_extra_shadow("stream.xhttpSettings.xmux", xmux, issues);
             }
             if xhttp.mode == "stream-one" && xhttp.download_settings.is_some() {
                 issues.push(issue(
@@ -1369,6 +1737,26 @@ pub fn validate_sockopt(s: &SockoptModel, prefix: &str) -> Verdict {
             ValidationCode::SockoptTproxySilentOff,
             Some(format!("{prefix}.tproxy")),
         ));
+    }
+    // The block's flattened map: a case variant of a modeled key binds the Go
+    // field without taking any rule above, so it gates. The scan lives here so
+    // the stream, ECH and realm ECH blocks all take it under their own prefix.
+    extra_shadow(prefix, &s.extra, SOCKOPT_MODEL_WIRE_KEYS, &mut issues);
+    for (index, entry) in s.custom_sockopt.iter().enumerate() {
+        extra_shadow(
+            &format!("{prefix}.customSockopt[{index}]"),
+            &entry.extra,
+            CUSTOM_SOCKOPT_MODEL_WIRE_KEYS,
+            &mut issues,
+        );
+    }
+    if let Some(happy) = &s.happy_eyeballs {
+        extra_shadow(
+            &format!("{prefix}.happyEyeballs"),
+            &happy.extra,
+            HAPPY_EYEBALLS_MODEL_WIRE_KEYS,
+            &mut issues,
+        );
     }
     Verdict::from_issues(issues)
 }
@@ -4224,6 +4612,243 @@ mod tests {
         assert!(
             validate_stream(&stream).is_empty(),
             "a key outside the modeled vocabulary stays legal"
+        );
+    }
+
+    /// The same fold inside one transport block: each block's flattened map
+    /// can carry a case variant of a key that block models, which serde emits
+    /// beside the typed field while Go's decoder binds it — the typed value the
+    /// block's rules validated never reaches the core. Every one gates as an
+    /// error under the wire path it sits at, nested objects included, and the
+    /// `xmux` carriers use their own code. The exact-case typed spellings stay
+    /// out of `extra` and report nothing.
+    #[test]
+    fn transport_extra_keys_that_fold_onto_modeled_fields_gate() {
+        for (document, key, path) in [
+            (
+                json!({"network": "tcp", "tcpSettings": {"Header": {}}}),
+                "Header",
+                "stream.tcpSettings.Header",
+            ),
+            (
+                json!({"network": "tcp", "tcpSettings": {"header": {"request": {
+                    "Version": "HTTP/1.1", "Method": "GET"
+                }}}}),
+                "Version",
+                "stream.tcpSettings.header.request.Version",
+            ),
+            (
+                json!({"network": "tcp", "tcpSettings": {"header": {"request": {
+                    "Version": "HTTP/1.1", "Method": "GET"
+                }}}}),
+                "Method",
+                "stream.tcpSettings.header.request.Method",
+            ),
+            (
+                json!({"network": "tcp", "tcpSettings": {"header": {"response": {
+                    "Reason": "OK"
+                }}}}),
+                "Reason",
+                "stream.tcpSettings.header.response.Reason",
+            ),
+            (
+                json!({"network": "kcp", "kcpSettings": {"Mtu": 1300}}),
+                "Mtu",
+                "stream.kcpSettings.Mtu",
+            ),
+            (
+                json!({"network": "grpc", "grpcSettings": {"ServiceName": "svc"}}),
+                "ServiceName",
+                "stream.grpcSettings.ServiceName",
+            ),
+            (
+                json!({"network": "grpc", "grpcSettings": {"IDLE_TIMEOUT": 30}}),
+                "IDLE_TIMEOUT",
+                "stream.grpcSettings.IDLE_TIMEOUT",
+            ),
+            (
+                json!({"network": "ws", "wsSettings": {"Host": "example.com"}}),
+                "Host",
+                "stream.wsSettings.Host",
+            ),
+            (
+                json!({"network": "httpupgrade", "httpupgradeSettings": {"Path": "/up"}}),
+                "Path",
+                "stream.httpupgradeSettings.Path",
+            ),
+            (
+                json!({"network": "hysteria", "hysteriaSettings": {"Auth": "secret"}}),
+                "Auth",
+                "stream.hysteriaSettings.Auth",
+            ),
+            (
+                json!({"network": "hysteria", "hysteriaSettings": {
+                    "masquerade": {"Dir": "/var/www"}
+                }}),
+                "Dir",
+                "stream.hysteriaSettings.masquerade.Dir",
+            ),
+            (
+                json!({"network": "masque", "masqueSettings": {"Pass": "secret"}}),
+                "Pass",
+                "stream.masqueSettings.Pass",
+            ),
+            (
+                json!({"network": "masque", "masqueSettings": {
+                    "warp": {"PrivateKey": "key"}
+                }}),
+                "PrivateKey",
+                "stream.masqueSettings.warp.PrivateKey",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {"Concurrency": 8}}),
+                "Concurrency",
+                "stream.xdriveSettings.Concurrency",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {
+                    "service": "template",
+                    "template": {"Flatten": true}
+                }}),
+                "Flatten",
+                "stream.xdriveSettings.template.Flatten",
+            ),
+            (
+                json!({"network": "raw", "security": "reality", "realitySettings": {
+                    "SpiderX": "/"
+                }}),
+                "SpiderX",
+                "stream.realitySettings.SpiderX",
+            ),
+            (
+                json!({"network": "raw", "sockopt": {"Mark": 1}}),
+                "Mark",
+                "stream.sockopt.Mark",
+            ),
+            (
+                json!({"network": "raw", "security": "tls", "tlsSettings": {
+                    "echSockopt": {"TcpFastOpen": true}
+                }}),
+                "TcpFastOpen",
+                "stream.tlsSettings.echSockopt.TcpFastOpen",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {
+                    "service": "template",
+                    "template": {"auth": {"Type": "oauth2"}}
+                }}),
+                "Type",
+                "stream.xdriveSettings.template.auth.Type",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {
+                    "service": "template",
+                    "template": {"put": {"Url": "https://example.com"}}
+                }}),
+                "Url",
+                "stream.xdriveSettings.template.put.Url",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {
+                    "service": "template",
+                    "template": {"retry": {"RateReason": "limit"}}
+                }}),
+                "RateReason",
+                "stream.xdriveSettings.template.retry.RateReason",
+            ),
+            (
+                json!({"network": "raw", "sockopt": {
+                    "customSockopt": [{"Level": "1"}]
+                }}),
+                "Level",
+                "stream.sockopt.customSockopt[0].Level",
+            ),
+            (
+                json!({"network": "raw", "sockopt": {"happyEyeballs": {"Interleave": 2}}}),
+                "Interleave",
+                "stream.sockopt.happyEyeballs.Interleave",
+            ),
+        ] {
+            let stream: StreamModel =
+                serde_json::from_value(document).expect("flatten extras load");
+            let issues = validate_stream(&stream);
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(&issue.code, ValidationCode::StreamExtraShadow(carried) if carried == key)
+                        && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing StreamExtraShadow for {key} at {path}: {issues:#?}")
+                });
+            assert_eq!(finding.severity, Severity::Error);
+        }
+
+        for (document, key, path) in [
+            (
+                json!({"network": "masque", "masqueSettings": {
+                    "xmux": {"MaxConnections": "1-1"}
+                }}),
+                "MaxConnections",
+                "stream.masqueSettings.xmux.MaxConnections",
+            ),
+            (
+                json!({"network": "xdrive", "xdriveSettings": {
+                    "xmux": {"MaxConcurrency": "2-4"}
+                }}),
+                "MaxConcurrency",
+                "stream.xdriveSettings.xmux.MaxConcurrency",
+            ),
+        ] {
+            let stream: StreamModel =
+                serde_json::from_value(document).expect("flatten extras load");
+            let issues = validate_stream(&stream);
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(&issue.code, ValidationCode::XmuxExtraShadow(carried) if carried == key)
+                        && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing XmuxExtraShadow for {key} at {path}: {issues:#?}")
+                });
+            assert_eq!(finding.severity, Severity::Error);
+        }
+
+        // A block the wire pass drops (network selects another transport) is
+        // not scanned: its stale extra never reaches the document.
+        let unselected: StreamModel =
+            serde_json::from_value(json!({"network": "ws", "kcpSettings": {"Mtu": 1300}}))
+                .expect("stale transport block loads");
+        assert!(
+            !validate_stream(&unselected)
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::StreamExtraShadow(_))),
+            "an unselected transport block must not gate"
+        );
+
+        let typed: StreamModel = serde_json::from_value(json!({
+            "network": "tcp",
+            "tcpSettings": {"header": {"type": "http", "request": {
+                "version": "HTTP/1.1", "method": "GET", "path": ["/"], "headers": {}
+            }}},
+            "kcpSettings": {"mtu": 1300, "tti": 30},
+            "grpcSettings": {"serviceName": "svc", "idle_timeout": 30, "user_agent": "ua"},
+            "wsSettings": {"host": "example.com", "path": "/ws", "heartbeatPeriod": 30},
+            "httpupgradeSettings": {"host": "h", "path": "/up"},
+            "masqueSettings": {"host": "h", "xmux": {"maxConcurrency": "2-4"}},
+            "xdriveSettings": {"concurrency": 8, "template": {"flatten": true}},
+            "realitySettings": {"spiderX": "/"},
+            "sockopt": {"mark": 1, "tcpFastOpen": true}
+        }))
+        .expect("typed spellings load");
+        let issues = validate_stream(&typed);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue.code,
+                ValidationCode::StreamExtraShadow(_) | ValidationCode::XmuxExtraShadow(_)
+            )),
+            "an exact-case typed key stays silent: {issues:#?}"
         );
     }
 
