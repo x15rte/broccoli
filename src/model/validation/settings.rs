@@ -35,12 +35,19 @@ pub fn validate_listen_address(s: &str) -> Result<(), ValidationCode> {
 /// own working directory.
 pub fn file_path_remote(path: &str) -> bool {
     let path = path.trim();
-    if path.starts_with(r"\\") || path.starts_with("//") || path.contains("://") {
+    let bytes = path.as_bytes();
+    // A leading pair of separators is a UNC path, in any mix Windows
+    // accepts: `\\server`, `//server`, `/\server` and `\/server` all name
+    // the same share after the Win32 path conversion, and Go's
+    // `filepath.IsAbs` treats the pair as a volume name too.
+    if bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\') {
+        return true;
+    }
+    if path.contains("://") {
         return true;
     }
     // Drive-relative: `C:x` names the current folder on that drive, while
     // `C:` alone and `C:\x` stay rooted.
-    let bytes = path.as_bytes();
     if bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
@@ -212,11 +219,6 @@ pub fn tun_ipv4_gateway(tun: &TunCfg) -> Option<&str> {
     })
 }
 
-/// The finding one TUN document's gateway rule produces, or `None` when the
-/// tunnel can come up: a TUN-mode document without an IPv4 gateway has no
-/// adapter address and no in-subnet address for the in-tun DNS listeners. The
-/// settings walk reports the finding from here, so the Apply gate and the TUN
-/// row's verdict read one rule.
 /// True when one gateway entry is a form Go's `netip.ParsePrefix` accepts.
 /// `ipnet::IpNet` is wider: it reads each octet and the prefix length as
 /// numbers, so it accepts a leading zero in either, while Go rejects the
@@ -1387,6 +1389,8 @@ mod tests {
         for remote in [
             r"\\attacker\share\dns.lua",
             "//attacker/share/dns.lua",
+            r"/\attacker\share\dns.lua",
+            r"\/attacker/share/dns.lua",
             r"\\.\C:\dns.lua",
             r"\\?\C:\dns.lua",
             "//./pipe/dns.lua",
@@ -1469,9 +1473,6 @@ mod tests {
         }
     }
 
-    /// Every `tun.gateway` entry becomes an adapter address, and the core
-    /// parses each with `netip.MustParsePrefix` — a malformed entry panics the
-    /// process at load. The model requires a CIDR prefix on every non-empty
     /// A flattened settings key that folds onto a modeled field is read by
     /// the core and not by the model: a DNS `Script` path would bypass the
     /// locality rule, and a TUN `Gateway`/`DestOverride` would change the
@@ -1526,6 +1527,9 @@ mod tests {
         }
     }
 
+    /// Every `tun.gateway` entry becomes an adapter address, and the core
+    /// parses each with `netip.MustParsePrefix` — a malformed entry panics the
+    /// process at load. The model requires a CIDR prefix on every non-empty
     /// entry the TUN document emits, and stays silent for the rest.
     #[test]
     fn tun_gateway_entries_must_parse_as_prefixes() {

@@ -46,13 +46,11 @@ jobs:
           ref: ${{ github.ref }}
 
       # Release gating model: the gates (test, deny, vet, CodeQL) run on every
-      # push to main, so every commit that is an ancestor of main has passed
-      # them. A tag is publishable only when the commit it names is such an
-      # ancestor — then the gates that ran on main cover exactly this tree —
-      # and the validation step below additionally pins the tag to the Cargo
-      # version and to the commit being built. A tag on a commit that reached
-      # main through no gated push cannot pass here. Manual dispatch builds
-      # the portable zip but never publishes.
+      # main push their path filters do not exclude. A tag is publishable only
+      # when the commit it names is an ancestor of main, and the validation
+      # step below pins the tag to the Cargo version and to the commit being
+      # built. A tag on a commit that reached main through no gated push cannot
+      # pass here. Manual dispatch builds the portable zip but never publishes.
       - name: Require the tagged commit to be an ancestor of main
         if: github.event_name == 'push'
         run: |

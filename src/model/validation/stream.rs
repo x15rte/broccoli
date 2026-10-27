@@ -3133,7 +3133,6 @@ fn finalmask_validate_realm_tls(
             "fingerprint",
             "rejectUnknownSni",
             "curvePreferences",
-            "masterKeyLog",
             "pinnedPeerCertSha256",
             "verifyPeerCertByName",
             "echServerKeys",

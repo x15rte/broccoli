@@ -77,14 +77,10 @@ pub(crate) fn windows_exe(name: &str) -> Option<PathBuf> {
 /// directories, so a bare `explorer` could run a planted program beside a
 /// portable install. A missing `explorer.exe` or a failed spawn comes back as
 /// a message for the caller's log line; there is no bare-name fallback.
-pub(crate) fn open_in_explorer(path: &Path) -> Result<(), String> {
+pub(crate) fn open_in_explorer(path: &Path) -> std::io::Result<()> {
     let explorer = windows_exe("explorer.exe")
-        .ok_or_else(|| String::from("explorer.exe is not available in the Windows directory"))?;
-    hidden_command(explorer)
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "explorer.exe"))?;
+    hidden_command(explorer).arg(path).spawn().map(|_| ())
 }
 
 /// Read one OS-owned directory (`GetSystemDirectoryW`, `GetWindowsDirectoryW`)
