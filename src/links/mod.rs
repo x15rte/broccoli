@@ -1666,11 +1666,12 @@ const XHTTP: TransportSpec = TransportSpec {
                 // would hand the core a value this model never validated.
                 // The shared list is the model pass's, so both gates refuse
                 // the same spellings.
-                if let Some(reserved) = settings.extra.keys().find(|key| {
-                    crate::model::stream::XHTTP_MODELED_WIRE_KEYS
-                        .iter()
-                        .any(|wire| crate::model::equal_fold(key, wire))
-                }) {
+                if let Some(reserved) = crate::model::validation::shadowed_keys(
+                    &settings.extra,
+                    crate::model::stream::XHTTP_MODELED_WIRE_KEYS,
+                )
+                .next()
+                {
                     return Err(malformed(
                         Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(reserved)),
                     ));
@@ -1679,11 +1680,11 @@ const XHTTP: TransportSpec = TransportSpec {
                 // a modeled field survives in its flatten map and binds in
                 // Go's decoder, so the exclusivity rule would never see it.
                 if let Some(reserved) = settings.xmux.as_ref().and_then(|xmux| {
-                    xmux.extra.keys().find(|key| {
-                        crate::model::stream::XMUX_MODELED_WIRE_KEYS
-                            .iter()
-                            .any(|wire| crate::model::equal_fold(key, wire))
-                    })
+                    crate::model::validation::shadowed_keys(
+                        &xmux.extra,
+                        crate::model::stream::XMUX_MODELED_WIRE_KEYS,
+                    )
+                    .next()
                 }) {
                     return Err(malformed(
                         Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(reserved)),
