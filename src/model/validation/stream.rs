@@ -2909,7 +2909,7 @@ fn finalmask_validate_udp_mask(
             );
             if let Some(mapping) = &settings.port_mapping {
                 finalmask_extra_shadow(
-                    &format!("{path}.portMapping"),
+                    &format!("{path}.settings.portMapping"),
                     &mapping.extra,
                     &["enabled", "timeout", "lifetime"],
                     issues,
@@ -3906,6 +3906,14 @@ mod tests {
                 json!({"tcp": [{"type": "fragment", "settings": {"Length": 100}}]}),
                 "Length",
                 "finalmask.tcp[0].settings.Length",
+            ),
+            (
+                json!({"udp": [{"type": "realm", "settings": {
+                    "url": "realm://x@attacker.example:443/id",
+                    "portMapping": {"Enabled": true}
+                }}]}),
+                "Enabled",
+                "finalmask.udp[0].settings.portMapping.Enabled",
             ),
         ] {
             let fm: FinalmaskModel = serde_json::from_value(fm).expect("flatten extras load");

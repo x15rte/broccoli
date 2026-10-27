@@ -2479,6 +2479,7 @@ impl Runtime {
         self.lifecycle.requested_tun_mode = tun_mode;
         self.api_port = api_port;
         self.grpc = GrpcClient::new(api_port);
+        self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
     }
 
     // -- backend lifecycle ---------------------------------------------------
@@ -2629,6 +2630,7 @@ impl Runtime {
             // `api.listen` is the endpoint the app polls through this client.
             self.api_port = api_port;
             self.grpc = GrpcClient::new(api_port);
+            self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
         }
         self.lifecycle.backoff.reset_since();
         self.lifecycle.core_update.clear_last_error();

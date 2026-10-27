@@ -17,10 +17,14 @@ pub mod selfupd;
 pub mod single_instance;
 pub mod wintun;
 
+use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
-use windows::core::BOOL;
+use windows::core::{BOOL, PCSTR, PCWSTR};
 
 /// `std::process::Command` preconfigured with CREATE_NO_WINDOW so helper
 /// processes never pop a console window.
@@ -122,34 +126,69 @@ fn existing_file(directory: &Path, name: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Flush the DNS client resolver cache (`DnsFlushResolverCache`). The
-/// helper runs this after it engages or restores the captured DNS servers,
-/// so answers the resolver cached through the tunnel do not outlive the
-/// session.
+/// The `DnsFlushResolverCache` entry point: no arguments, a `BOOL` result.
+type FlushResolverCache = unsafe extern "system" fn() -> BOOL;
+
+/// Resolve `DnsFlushResolverCache` from the system directory, once, and keep
+/// the module loaded for the process lifetime so the pointer stays valid.
 ///
-/// The windows crate's metadata does not carry this `dnsapi.dll` export, so
-/// the import is declared here with the same `raw-dylib` linkage its
-/// generated bindings use. A `false` result is the API's failure report; the
-/// thread's last error is the reason.
+/// The windows crate's metadata does not carry this export. A load-time
+/// import of `dnsapi.dll` would be resolved by the loader's search order,
+/// which starts in the application directory; inside the elevated helper
+/// that would load a planted DLL beside the portable executable. Resolving
+/// the absolute System32 path with `LOAD_LIBRARY_SEARCH_SYSTEM32` keeps the
+/// search out of the application directory.
+fn flush_resolver_cache_export() -> Option<FlushResolverCache> {
+    static EXPORT: std::sync::OnceLock<Option<FlushResolverCache>> = std::sync::OnceLock::new();
+    *EXPORT.get_or_init(|| {
+        let path = system32_exe("dnsapi.dll")?;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 absolute path that
+        // outlives the call, `hFile` is `None` (no file handle is used), and
+        // `LOAD_LIBRARY_SEARCH_SYSTEM32` restricts the dependency search to
+        // System32. `LoadLibraryExW` copies the path before returning. The
+        // returned handle is deliberately never released (no `FreeLibrary`),
+        // so the module stays resident and the code pointer resolved from it
+        // stays valid for the process lifetime.
+        let module =
+            unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
+                .ok()?;
+        // SAFETY: `module` is a live handle to the loaded DLL, and the export
+        // name is a static NUL-terminated ANSI string. `GetProcAddress` maps a
+        // missing export to `None`; a found one is a code pointer into that
+        // still-loaded module.
+        let export =
+            unsafe { GetProcAddress(module, PCSTR(c"DnsFlushResolverCache".as_ptr().cast())) }?;
+        // SAFETY: the export is `DnsFlushResolverCache`, declared by dnsapi as
+        // `BOOL WINAPI DnsFlushResolverCache(void)`; the transmute only
+        // attaches that documented signature to the resolved code pointer,
+        // which stays valid because the module is kept loaded.
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, FlushResolverCache>(export)
+        })
+    })
+}
+
+/// Flush the DNS client resolver cache. The helper runs this after it
+/// engages or restores the captured DNS servers, so answers the resolver
+/// cached through the tunnel do not outlive the session. A `false` result is
+/// the API's failure report; the thread's last error is the reason.
 pub(crate) fn flush_dns_cache() -> windows::core::Result<()> {
-    // SAFETY: `DnsFlushResolverCache` takes no arguments and only touches the
-    // local DNS client's cache; the declared signature (no arguments, a
-    // `BOOL` result) is the export's documented one, and the import is
-    // resolved against `dnsapi.dll` through the same raw-dylib mechanism the
-    // rest of the `windows` crate uses.
-    if unsafe { DnsFlushResolverCache() }.as_bool() {
+    let Some(flush) = flush_resolver_cache_export() else {
+        return Err(windows::core::Error::from_thread());
+    };
+    // SAFETY: the pointer comes from the loaded module and carries the
+    // export's declared signature; the call takes no arguments and only
+    // touches the local DNS client's cache.
+    if unsafe { flush() }.as_bool() {
         Ok(())
     } else {
         Err(windows::core::Error::from_thread())
     }
-}
-
-// SAFETY: `DnsFlushResolverCache` is the documented `dnsapi.dll` export with
-// no arguments and a `BOOL` result; this declaration matches that ABI and is
-// called only through [`flush_dns_cache`], which checks the result.
-#[link(name = "dnsapi.dll", kind = "raw-dylib", modifiers = "+verbatim")]
-unsafe extern "system" {
-    fn DnsFlushResolverCache() -> BOOL;
 }
 
 #[cfg(test)]

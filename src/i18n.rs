@@ -2120,6 +2120,7 @@ keys! {
     IntegrityRouteAttributeKey 1,
     RtLogOperationCancelled (Log, Warn, 2),
     RtLogUpdateFinishedAfterStop (Log, Warn, 0),
+    RtLogApiEndpointCommitted (Log, Info, 1),
     RtLogCoreStartedDirect (Log, Info, 1),
     RtLogTunGracefulCloseFailed (Log, Warn, 1),
     RtLogTunCoreStopWindow (Log, Warn, 0),
@@ -5940,6 +5941,7 @@ mod en {
             Key::RtLogUpdateFinishedAfterStop => {
                 "core update finished after the stop request; health-checked on the next start"
             }
+            Key::RtLogApiEndpointCommitted => "control plane endpoint committed: 127.0.0.1:{}",
             Key::RtLogCoreStartedDirect => "core started as a direct child (pid {})",
             Key::RtLogTunGracefulCloseFailed => {
                 "TUN graceful close failed; using the process fallback: {}"
