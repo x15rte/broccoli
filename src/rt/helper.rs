@@ -1422,11 +1422,6 @@ struct HelperChild {
     job: Job,
     state: ChildPhase,
     api_port: u16,
-    /// The WFP guard that limits the control plane to this application's
-    /// image. Dropping it closes the dynamic WFP session and removes the
-    /// filters with the child. `None` only in a unit test that never spawns a
-    /// core through this slot.
-    _api_guard: Option<crate::sys::wfp::ApiGuard>,
     _stage: SecureRuntimeStage,
 }
 
@@ -2056,24 +2051,6 @@ fn helper_start(
         }
     };
 
-    // The elevated core's control plane is a loopback listener with no
-    // credentials. Install the guard before the core can bind the port, and
-    // refuse the start if it cannot be installed: a TUN core whose control
-    // plane is reachable by every local process is the escalation this guard
-    // exists to close.
-    let api_guard = match crate::sys::wfp::ApiGuard::new(api_port) {
-        Ok(guard) => guard,
-        Err(error) => {
-            send_log_record(writer, &error);
-            send_event(writer, &serde_json::json!({"event":"exit","code":-1}));
-            return;
-        }
-    };
-    send_log(
-        writer,
-        Diag::new(Key::HelperApiGuardInstalled).arg(api_port),
-    );
-
     // Do not disturb a healthy old backend unless the complete replacement
     // has passed pins, ACL/copy proof, and staged `run -test`.
     if let Ok(mut slot) = current.lock()
@@ -2167,7 +2144,6 @@ fn helper_start(
             job,
             state: ChildPhase::Starting,
             api_port,
-            _api_guard: Some(api_guard),
             _stage: stage,
         });
     }
@@ -3285,9 +3261,6 @@ macro_rules! wire_keys {
 }
 
 wire_keys!(
-    HelperApiGuardInstalled,
-    HelperApiGuardInstallFailed,
-    WfpCallFailed,
     ApplyActiveReadFailed,
     ApplyActiveReplaceFailed,
     ApplyCandidateSerializeFailed,
@@ -5858,7 +5831,6 @@ mod tests {
             job,
             state: ChildPhase::Starting,
             api_port: 0,
-            _api_guard: None,
             _stage: stage,
         })));
         // The probe child stays alive while its piped stdin stays open.

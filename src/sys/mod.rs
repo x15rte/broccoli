@@ -15,7 +15,6 @@ pub mod paths;
 pub mod security;
 pub mod selfupd;
 pub mod single_instance;
-pub mod wfp;
 pub mod wintun;
 
 use std::os::windows::ffi::OsStrExt as _;

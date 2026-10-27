@@ -2329,7 +2329,6 @@ keys! {
     HelperCoreSpawnFailed (Log, Error, 0),
     HelperJobSetupFailed (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
-    HelperApiGuardInstalled (Log, Info, 1),
     HelperDnsTakeoverReapplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
     HelperDnsTakeoverReconcileFailed (Log, Warn, 0),
@@ -2349,8 +2348,6 @@ keys! {
     HelperConfigNoTunAdapter (Log, Error, 0),
     HelperTunCleanupConfigReadFailed (Log, Error, 0),
     HelperTunCleanupTimeout (Log, Warn, 1),
-    HelperApiGuardInstallFailed (Log, Error, 1),
-    WfpCallFailed 1,
     HelperStagedValidationSpawnFailed 0,
     HelperStagedValidationIsolateFailed 0,
     HelperStagedConfigRejected 1,
@@ -6371,13 +6368,6 @@ mod en {
             Key::HelperJobSetupFailed => {
                 "elevated helper could not isolate the staged core in a job object"
             }
-            Key::HelperApiGuardInstalled => {
-                "control plane protected: only broccoli may connect to 127.0.0.1:{}"
-            }
-            Key::HelperApiGuardInstallFailed => {
-                "control plane guard for 127.0.0.1:{} could not be installed; TUN did not start"
-            }
-            Key::WfpCallFailed => "filtering platform call failed: {}",
             Key::HelperDnsTakeoverApplied => {
                 "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
             }
