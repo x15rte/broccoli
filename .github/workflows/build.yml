@@ -6,50 +6,77 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+# Read-only at the workflow level. The only write in this workflow is the
+# publish job below, which asks for `contents: write` itself, so the job that
+# compiles and smoke-tests the tree never holds a write token.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   # Tag pushes and manual builds serialize per ref name; runs for different
-  # refs run concurrently. Manual runs never publish (see the publish step),
-  # so two publish-capable runs can never overlap.
+  # refs run concurrently. Manual runs never publish (the publish job is
+  # tag-push-only), so two publish-capable runs can never overlap.
   group: broccoli-build-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
-    name: Package and publish Windows release
+  build:
+    name: Build the Windows release
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
 
+    # The publish job needs these three values; they cross jobs through job
+    # outputs (written to $GITHUB_OUTPUT by the validation step) instead of
+    # the environment, so nothing in this job's environment is assumed by the
+    # job that holds the write token.
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+      version: ${{ steps.validate.outputs.version }}
+      zip_name: ${{ steps.validate.outputs.zip_name }}
+
     steps:
-      - name: Check out the repository at the triggering ref
+      - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.ref }}
 
-      - name: Configure stable Rust for the declared target
+      # Release gating model: the gates (test, deny, vet, CodeQL) run on every
+      # push to main, so every commit that is an ancestor of main has passed
+      # them. A tag is publishable only when the commit it names is such an
+      # ancestor — then the gates that ran on main cover exactly this tree —
+      # and the validation step below additionally pins the tag to the Cargo
+      # version and to the commit being built. A tag on a commit that reached
+      # main through no gated push cannot pass here. Manual dispatch builds
+      # the portable zip but never publishes.
+      - name: Require the tagged commit to be an ancestor of main
+        if: github.event_name == 'push'
         run: |
           $ErrorActionPreference = 'Stop'
-          rustup toolchain install stable --profile minimal
-          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
-          rustup default stable
-          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
-          rustup target add x86_64-pc-windows-msvc --toolchain stable
-          if ($LASTEXITCODE -ne 0) { throw "rustup target add failed with exit code $LASTEXITCODE" }
+          # The repository is public and checkout persists no credentials, so
+          # main is fetched anonymously rather than with the write token that
+          # this job deliberately does not have.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "git fetch origin main failed with exit code $LASTEXITCODE" }
+          git merge-base --is-ancestor HEAD origin/main
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -eq 1) {
+              throw "release commit $env:GITHUB_SHA is not an ancestor of main; only a main-gated commit can be released"
+          }
+          if ($exitCode -ne 0) { throw "git merge-base --is-ancestor failed with exit code $exitCode" }
 
       # Publishing is tag-push-only: on tag pushes the release tag must be
       # stable SemVer, exactly equal the Cargo package version, and point at
-      # the commit being built. Manual dispatch builds the portable zip but
-      # never publishes, so those assertions (and BROCCOLI_RELEASE_TAG) apply
-      # to tag pushes only. The Cargo version and the release contract are
-      # validated on every run.
+      # the commit being built (which the step above proved is on main).
+      # Manual dispatch builds the portable zip but never publishes, so those
+      # assertions (and BROCCOLI_RELEASE_TAG) apply to tag pushes only. The
+      # Cargo version and the release contract are validated on every run.
       - name: Validate Cargo version and artifact contract
+        id: validate
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -84,13 +111,13 @@ jobs:
               if ($tagCommit -cne $headCommit) {
                   throw "checked-out commit $headCommit is not release tag $tag ($tagCommit)"
               }
-              "BROCCOLI_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              "release_tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
 
           $zipName = "broccoli-v$version-win64.zip"
-          "BROCCOLI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "BROCCOLI_TARGET=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "BROCCOLI_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "BROCCOLI_ZIP_PATH=dist/$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # protobuf-src 2.1.1+27.1 cannot compile on Windows/MSVC (upstream
@@ -117,9 +144,11 @@ jobs:
           }
           "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # No test suite in this workflow: the test workflow already ran on this
-      # exact commit. The smoke test below still validates the release binary
-      # itself, which is the build-specific check that matters.
+      # No test suite in this workflow: the gates (test, deny, vet, CodeQL)
+      # already ran on this tree when it was pushed to main, which is what the
+      # ancestry check above establishes. The smoke test below still validates
+      # the release binary itself, which is the build-specific check that
+      # matters.
       - name: Build the release executable
         run: |
           $ErrorActionPreference = 'Stop'
@@ -153,6 +182,8 @@ jobs:
           }
 
       - name: Assemble the portable zip
+        env:
+          BROCCOLI_ZIP_NAME: ${{ steps.validate.outputs.zip_name }}
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
@@ -189,26 +220,62 @@ jobs:
               throw "dist must contain exactly $env:BROCCOLI_ZIP_NAME; found $($actualNames -join ', ')"
           }
 
-      - name: Upload workflow artifacts
+      - name: Upload the release zip as a workflow artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: broccoli-windows-${{ env.BROCCOLI_VERSION }}
+          name: broccoli-windows-${{ steps.validate.outputs.version }}
           path: ${{ env.BROCCOLI_ZIP_PATH }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
 
-      # Manual dispatch builds but never publishes: only tag pushes create the
-      # GitHub Release. Re-publishing requires deleting the existing release
-      # and the tag, then re-pushing the tag — which re-triggers this workflow
-      # on the same commit.
+  # Publication is a separate job because it is the only step that needs a
+  # write token: this job alone holds `contents: write`, and the build job
+  # that compiled the tree never does. Manual dispatch builds but never
+  # publishes; only tag pushes create the GitHub Release. Re-publishing
+  # requires deleting the existing release and the tag, then re-pushing the
+  # tag — which re-triggers this workflow on the same commit.
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # Full history, because the release notes below come from the commit
+      # log since the previous tag, and the tag itself must be present.
+      - name: Check out the tagged commit with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Download the release zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: broccoli-windows-${{ needs.build.outputs.version }}
+          path: dist
+
       - name: Publish the GitHub release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BROCCOLI_RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          BROCCOLI_VERSION: ${{ needs.build.outputs.version }}
+          BROCCOLI_ZIP_NAME: ${{ needs.build.outputs.zip_name }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:BROCCOLI_RELEASE_TAG
+          $zipPath = Join-Path 'dist' $env:BROCCOLI_ZIP_NAME
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+              throw "downloaded release zip is missing: $zipPath"
+          }
 
           # Release notes come from the commit history. GitHub's own generator
           # only lists merged pull requests, which on this repository means the
@@ -252,7 +319,7 @@ jobs:
               '--title', "Broccoli $env:BROCCOLI_VERSION"
           ) + $notesArguments + @(
               '--latest',
-              $env:BROCCOLI_ZIP_PATH
+              $zipPath
           )
           & gh @arguments
           if ($LASTEXITCODE -ne 0) { throw "GitHub release publication failed with exit code $LASTEXITCODE" }

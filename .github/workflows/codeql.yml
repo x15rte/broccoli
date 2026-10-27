@@ -1,9 +1,9 @@
 name: CodeQL
 
-# Advanced code scanning setup. Default setup ran the same two
-# analyses on every push with no filter and nothing to edit; this file exists
-# for the path filter below, so a push that cannot change what either analysis
-# reads does not spend twenty minutes proving it.
+# Advanced code scanning setup: the two analyses default setup ran, checked in
+# here so their action versions are pinned and their matrix is explicit. The
+# release workflow publishes only commits that are ancestors of main, so the
+# analyses that ran on a main push cover the released tree.
 on:
   push:
     branches: [main]
@@ -27,7 +27,8 @@ on:
   pull_request:
   schedule:
     # Weekly, the cadence default setup used: the queries and the database move
-    # without a commit here, so an unfiltered run has to happen on a timer.
+    # without a commit here, so a run has to happen on a timer even when the
+    # tree is quiet.
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
@@ -44,13 +45,8 @@ concurrency:
 jobs:
   analyze:
     # The same check names default setup produced, so nothing that reads them
-    # changes with this file.
+    # changes with this file. No commit subject can skip the analysis.
     name: Analyze (${{ matrix.language }})
-    # A version-only bump changes no code and no dependency, and it carries the
-    # subject "Bump version to <version>"; the test is a prefix, so any subject
-    # that starts with that string skips the job. See the test workflow for what
-    # has to hold for that skip to be sound.
-    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Bump version to ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:

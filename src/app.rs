@@ -2276,9 +2276,7 @@ impl eframe::App for BroccoliApp {
             self.screen = Screen::Dashboard;
         }
         if topbar_clicks.open_folder
-            && let Err(open_error) = sys::hidden_command("explorer")
-                .arg(paths::state_dir())
-                .spawn()
+            && let Err(open_error) = sys::open_in_explorer(&paths::state_dir())
         {
             self.push_keyed_log(
                 Key::LogOpenStateFolderFailed,
@@ -2478,9 +2476,7 @@ impl eframe::App for BroccoliApp {
             self.verify_core();
         }
         if requests.open_core_folder
-            && let Err(open_error) = sys::hidden_command("explorer")
-                .arg(paths::core_dir())
-                .spawn()
+            && let Err(open_error) = sys::open_in_explorer(&paths::core_dir())
         {
             let lang = self.settings.language;
             self.push_keyed_log(

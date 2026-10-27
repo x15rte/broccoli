@@ -225,7 +225,11 @@ fn generate_on_defaults() {
     assert_eq!(cfg["stats"], json!({}));
     assert_eq!(cfg["api"]["tag"], json!("api"));
     assert_eq!(cfg["api"]["listen"], json!("127.0.0.1:10853"));
-    assert_eq!(cfg["api"]["services"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        cfg["api"]["services"].as_array().unwrap().len(),
+        super::API_SERVICES.len(),
+        "the emitted services are the compiled list"
+    );
     assert_eq!(cfg["policy"]["system"]["statsOutboundUplink"], json!(true));
     assert_eq!(cfg["log"], json!({"loglevel": "warning", "access": "none"}));
     // Seeded DNS module: 1.1.1.1 and 8.8.8.8 plain
@@ -310,8 +314,9 @@ fn access_log_toggle_controls_the_xray_access_channel() {
 #[test]
 fn ephemeral_api_port_is_chosen_per_launch_and_emitted_loopback_only() {
     // The port is bound from 127.0.0.1:0 at generation time — never
-    // derived from persisted settings — so a same-user process cannot read the
-    // control-plane port ahead of the launch.
+    // derived from persisted settings — and bound to loopback. That is not a
+    // security boundary: the listener is host-global and Xray's API is
+    // unauthenticated, so a same-user process can reach it.
     let picked = super::pick_ephemeral_api_port().expect("the OS must assign an ephemeral port");
     assert_ne!(picked, 0, "the OS must assign a nonzero ephemeral port");
 
@@ -5117,4 +5122,55 @@ fn interval_hop_advisory_never_gates_generation() {
     );
     generate_deterministic(&servers, &base_settings())
         .expect("the HTTP/3 xhttp shape must generate");
+}
+
+#[test]
+fn a_document_with_folded_duplicate_keys_is_refused() {
+    // A flattened `extra` map can carry a spelling Go's decoder reads as the
+    // modeled field (`bytes.EqualFold`). The emitted document would then
+    // differ from the model the validator saw, so generation refuses the
+    // duplicate instead of handing the core an ambiguous object.
+    let mut settings = Settings::default();
+    settings
+        .dns
+        .extra
+        .insert("Script".into(), json!(r"\\attacker\share\d.lua"));
+    let error = generate(&ServersFile::default(), &settings)
+        .expect_err("the DNS script shadow must refuse generation");
+    let GenerateError::InvalidFinding(issue) = error else {
+        panic!("expected the settings shadow finding, got {error:?}");
+    };
+    assert!(
+        matches!(&issue.code, ValidationCode::SettingsExtraShadow(key) if key == "Script"),
+        "{issue:?}"
+    );
+
+    let settings = Settings {
+        mode: Mode::Tun,
+        tun: crate::model::TunCfg {
+            extra: std::iter::once(("Gateway".into(), json!(["10.0.0.1/24"]))).collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = generate(&ServersFile::default(), &settings)
+        .expect_err("the TUN gateway shadow must refuse generation");
+    let GenerateError::InvalidFinding(issue) = error else {
+        panic!("expected the settings shadow finding, got {error:?}");
+    };
+    assert!(
+        matches!(&issue.code, ValidationCode::SettingsExtraShadow(key) if key == "Gateway"),
+        "{issue:?}"
+    );
+
+    let settings = Settings {
+        raw_override: Some(r#"{"a":1,"A":2}"#.into()),
+        ..Default::default()
+    };
+    let error =
+        generate(&ServersFile::default(), &settings).expect_err("the raw override is checked too");
+    assert!(
+        matches!(error, GenerateError::FoldedKey(ref key) if crate::model::equal_fold(key, "a")),
+        "{error:?}"
+    );
 }

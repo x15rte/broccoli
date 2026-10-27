@@ -30,8 +30,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// is appended only when an observatory/burstObservatory config is emitted —
 /// it `RequireFeatures(extension.Observatory)` and the core fails with "not
 /// all dependencies are resolved" otherwise (app/observatory/command/command.go:40).
-const API_SERVICES: [&str; 5] = [
-    "ReflectionService",
+/// Reflection is not advertised: the app's tonic client never calls it.
+const API_SERVICES: [&str; 4] = [
     "HandlerService",
     "LoggerService",
     "StatsService",
@@ -54,6 +54,9 @@ pub enum GenerateError {
     InvalidFinding(Box<ValidationIssue>),
     /// No loopback API port is free; the payload is the OS error, verbatim.
     ApiPort(std::io::Error),
+    /// One object in the generated document carries two keys the core reads
+    /// as the same field. The payload is the later key.
+    FoldedKey(String),
 }
 
 impl GenerateError {
@@ -68,6 +71,7 @@ impl GenerateError {
             // that names the fault.
             Self::InvalidFinding(issue) => validation_issue_message(issue, language),
             Self::ApiPort(error) => t_fmt(language, Key::GenApiPort, &[error]),
+            Self::FoldedKey(key) => t_fmt(language, Key::GenFoldedKey, &[key]),
         }
     }
 }
@@ -83,7 +87,7 @@ impl Error for GenerateError {
         match self {
             Self::RawOverride(error) => Some(error),
             Self::ApiPort(error) => Some(error),
-            Self::InvalidModel(_) | Self::InvalidFinding(_) => None,
+            Self::InvalidModel(_) | Self::InvalidFinding(_) | Self::FoldedKey(_) => None,
         }
     }
 }
@@ -179,7 +183,9 @@ fn generate_reporting(
         )));
     }
     if let Some(raw) = &settings.raw_override {
-        return serde_json::from_str(raw).map_err(GenerateError::RawOverride);
+        return serde_json::from_str(raw)
+            .map_err(GenerateError::RawOverride)
+            .and_then(refuse_folded_duplicates);
     }
 
     *verdict = validate_settings(settings, servers, api_port);
@@ -344,7 +350,39 @@ fn generate_reporting(
         );
     }
 
-    Ok(Value::Object(root))
+    refuse_folded_duplicates(Value::Object(root))
+}
+
+/// Refuse a document that carries two keys in one object which the core reads
+/// as one field. Go's JSON decoder matches keys under `bytes.EqualFold`, so
+/// `Script`, `script` and `ſcript` name the same field and the later value
+/// wins; the emitted document would then differ from the model the validator
+/// saw. Unknown keys are preserved in flattened `extra` maps for forward
+/// compatibility, so this walk is the one gate that covers every such map.
+fn refuse_folded_duplicates(value: Value) -> Result<Value, GenerateError> {
+    fn walk(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                let mut seen: Vec<&str> = Vec::with_capacity(object.len());
+                for key in object.keys() {
+                    if seen
+                        .iter()
+                        .any(|prior| crate::model::equal_fold(prior, key))
+                    {
+                        return Some(key.clone());
+                    }
+                    seen.push(key);
+                }
+                object.values().find_map(walk)
+            }
+            Value::Array(items) => items.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    match walk(&value) {
+        Some(key) => Err(GenerateError::FoldedKey(key)),
+        None => Ok(value),
+    }
 }
 /// Classify a latency probe URL's literal host as a blocked address class, or
 /// `None` when the URL is acceptable under the static check. This is the SSRF

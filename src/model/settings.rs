@@ -173,6 +173,22 @@ fn default_version() -> u32 {
 /// Default geodata auto-update schedule (5-field cron, core's `geodata.cron`).
 pub const DEFAULT_GEODATA_CRON: &str = "0 4 * * *";
 
+/// Environment names that re-point the core's asset, configuration, and
+/// certificate directories. Xray applies `settings.env` with `os.Setenv`
+/// before it resolves assets, and checks the dotted `xray.location.*` keys
+/// before the uppercase spellings, so both forms are refused in the settings
+/// model and scrubbed from a launched core.
+pub const CORE_LOCATION_ENV_NAMES: [&str; 8] = [
+    "xray.location.asset",
+    "xray.location.confdir",
+    "xray.location.config",
+    "xray.location.cert",
+    "XRAY_LOCATION_ASSET",
+    "XRAY_LOCATION_CONFDIR",
+    "XRAY_LOCATION_CONFIG",
+    "XRAY_LOCATION_CERT",
+];
+
 /// Geodata auto-update configuration (core-native `geodata` key).
 /// All fields optional: empty = built-in dat files from the pinned core payload.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

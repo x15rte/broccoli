@@ -301,6 +301,11 @@ pub enum ValidationCode {
     FinalmaskPortNumberRange,
     FinalmaskPortEnvNameRequired,
     FinalmaskPortListInvalid(String),
+    /// A port list expands past 65536 ports. The core materializes every
+    /// range of the list (`common/net/port.go`, `PortList.Ports`), so a list
+    /// of repeated full ranges asks it to allocate multi-gigabyte slices
+    /// before the transport starts. Error tier.
+    FinalmaskPortListTooLarge,
     FinalmaskBytesValueRequired(String),
     FinalmaskArrayByteSyntax,
     FinalmaskStrByteSyntax,
@@ -463,6 +468,16 @@ pub enum ValidationCode {
     /// so the dial runs with the mask inert. Warning tier.
     FinalmaskFilterOnOutbound,
     FinalmaskUnknownUdpMask(Option<String>),
+    /// A finalmask container's flattened `extra` map carries a key that
+    /// folds onto a modeled wire key of the same container: serde bound the
+    /// stored spelling to nothing, keeps it verbatim, and emits it beside the
+    /// modeled value, while Go's case-insensitive unmarshal binds it to the
+    /// modeled field. The carried value bypasses every rule the typed field
+    /// takes — a mask `Script` path, a resolver `TlsConfig`, a whole mask
+    /// `Settings` object — so the configuration the core loads is not the one
+    /// the model validated. The code carries the offending key. Error tier:
+    /// the profile gates until the key is removed.
+    FinalmaskExtraShadow(String),
     // ---- editor rules that decide configuration validity
     //      (validate_outbound / validate_settings) ----
     //
@@ -622,6 +637,12 @@ pub enum ValidationCode {
     /// TUN mode without an IPv4 gateway: the adapter would carry no address
     /// while the in-tun DNS listener pins an address no adapter owns.
     TunIpv4GatewayRequired,
+    /// A `tun.gateway` entry that is not a CIDR prefix. Every entry becomes
+    /// an adapter address, and the core parses each with
+    /// `netip.MustParsePrefix`, which panics the process on a malformed entry
+    /// (proxy/tun/tun_windows.go). The app derives its DNS takeover address
+    /// from the same string. The code carries the entry. Error tier.
+    TunGatewayInvalid(String),
     /// A non-empty leak block beside an empty routing table. The core's
     /// filter install rides the routes of `autoSystemRoutingTable` and its
     /// build refuses the pair ("autoSystemWfpBlockLeak needs
@@ -672,6 +693,35 @@ pub enum ValidationCode {
     /// document never loads. Error tier; the app stores the path verbatim
     /// and never reads or runs the file.
     LuaScriptPathNotLua,
+    /// A file path the core opens at config load that is not a plain local
+    /// path: a UNC or device path, a URL, a drive-relative path, or a path
+    /// holding a `..` component. A UNC path makes the Windows client
+    /// authenticate to the named SMB server (a NetNTLMv2 leak), and the core
+    /// reads whatever the path resolves to before it starts. The code
+    /// carries the offending path. Error tier.
+    FilePathRemote(String),
+    /// A TLS block or certificate row carries a flattened `extra` key that
+    /// folds onto a modeled wire key of the same object. Serde bound the
+    /// stored spelling to nothing and emits it beside the modeled value,
+    /// while Go's case-insensitive unmarshal binds it — a `CertificateFile`
+    /// carrying a UNC path bypasses the locality rule, and a `Certificates`
+    /// list bypasses every certificate rule. The code carries the key. Error
+    /// tier.
+    TlsExtraShadow(String),
+    /// A `settings.env` key that overrides core path resolution: Xray applies
+    /// the map with `os.Setenv` before it resolves assets
+    /// (infra/conf/xray.go), and `xray.location.asset` outranks the
+    /// `XRAY_LOCATION_ASSET` the app pins (common/platform/platform.go), so a
+    /// configured value redirects the geodata files. Normalization folds the
+    /// key to its environment-variable spelling before the check. The code
+    /// carries the key. Error tier.
+    EnvCorePathOverride(String),
+    /// A settings block carries a flattened `extra` key that folds onto a
+    /// modeled wire key of the same block. Serde kept the spelling out of the
+    /// typed field, but Go's decoder binds it, so the core reads a value the
+    /// model never validated (a DNS `Script` path, a TUN `Gateway` list). The
+    /// code carries the key. Error tier.
+    SettingsExtraShadow(String),
     /// A DNS script beside `disableFallback` or `disableFallbackIfMatch`:
     /// Xray's DNS build refuses the combination (infra/conf/dns.go:276-278).
     /// Error tier.
@@ -940,8 +990,8 @@ pub enum ValidationCode {
     /// warns — advisory (Severity::Warning). JSON `null` is the Go zero shape
     /// and stays silent.
     HysteriaQuicKnobsMoved,
-    /// XHTTP `xhttpSettings.extra` holds a key that names a modeled xhttp
-    /// setting: the extra value overrides it.
+    /// XHTTP `xhttpSettings.extra` holds a key that folds onto a modeled
+    /// xhttp setting: the extra value overrides it.
     /// serde flatten emits the extra value over the typed field on export,
     /// and Xray's SplitHTTPConfig.Build additionally replaces the whole
     /// outer object with the nested `extra` object except host/path/mode
@@ -951,9 +1001,16 @@ pub enum ValidationCode {
     /// bogus" (the edited value never reaches Xray; the refusal cites the
     /// extra's), while an extra `mode` key is ignored (host/path/mode are
     /// protected on the nested path — but NOT through broccoli's flatten).
-    /// Configuration warning (class E, Severity::Warning): the
-    /// code carries the offending key.
+    /// Error tier: the document the core loads differs from the modeled one,
+    /// so the profile gates until the key is removed. The code carries the
+    /// key.
     XhttpExtraShadowsSettings(String),
+    /// An `xmux` block carries a flattened key that folds onto one of its
+    /// modeled fields. Go's decoder binds it, so a `MaxConcurrency` /
+    /// `MaxConnections` pair can reach the core while the typed fields look
+    /// empty and the exclusivity rule never ran. The code carries the key.
+    /// Error tier.
+    XmuxExtraShadow(String),
     /// The `masque` transport is carried by an outbound whose protocol is not
     /// `masque`: the pinned core refuses the document while it builds the
     /// outbound (`the masque transport can only be used by the masque
@@ -1415,7 +1472,7 @@ fn warning(code: ValidationCode, path: Option<String>) -> ValidationIssue {
 fn extra_has_key(extra: &Map<String, Value>, key: &str) -> bool {
     extra
         .keys()
-        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+        .any(|candidate| crate::model::equal_fold(candidate, key))
 }
 
 /// True when an `extra` map carries `key` with a value Go treats as "set":
@@ -1424,7 +1481,7 @@ fn extra_has_key(extra: &Map<String, Value>, key: &str) -> bool {
 fn extra_key_set(extra: &Map<String, Value>, key: &str) -> bool {
     extra
         .iter()
-        .any(|(candidate, value)| candidate.eq_ignore_ascii_case(key) && !value.is_null())
+        .any(|(candidate, value)| crate::model::equal_fold(candidate, key) && !value.is_null())
 }
 
 /// True for one routing IP rule, the grammar `geodata.ParseIPRules` accepts
@@ -1531,9 +1588,9 @@ pub use outbound::{
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
-    dns_script_issues, lua_script_path_issue, noise_script_issues, routing_script_issues,
-    tun_ipv4_gateway, tun_ipv6_gateway, validate_listen_address, validate_profiles,
-    validate_settings,
+    dns_script_issues, file_path_remote, lua_script_path_issue, noise_script_issues,
+    routing_script_issues, tun_ipv4_gateway, tun_ipv6_gateway, validate_listen_address,
+    validate_profiles, validate_settings,
 };
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,

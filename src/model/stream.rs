@@ -231,7 +231,63 @@ pub struct HttpCamouflageResponse {
     pub extra: Map<String, Value>,
 }
 
+/// The modeled wire keys of an `xmux` block. A flattened variant of one of
+/// these binds the Go field, so the link grammar and the model pass refuse it.
+pub const XMUX_MODELED_WIRE_KEYS: &[&str] = &[
+    "maxConcurrency",
+    "maxConnections",
+    "cMaxReuseTimes",
+    "hMaxRequestTimes",
+    "hMaxReusableSecs",
+    "hKeepAlivePeriod",
+];
+
 // ---------- XHTTP (transport_method.go:257-296) ----------
+
+/// Every wire key `XhttpSettings` models, in the serde/camelCase spelling —
+/// plus `extra` and `downloadSettings`, the two keys Xray's
+/// `SplitHTTPConfig.Build` (`infra/conf/transport_method.go`) reads inside a
+/// nested `extra` object: it replaces the whole outer settings object with
+/// that object, so a carried `extra` key lets any of these fields reach the
+/// core without passing the typed field this model validates.
+///
+/// serde binds only the exact spelling, so a case variant of any entry lands
+/// in the flattened `extra` map; Go's JSON unmarshal matches field names
+/// case-insensitively, so the variant still binds the modeled field on the
+/// wire. The model pass and the share-link `extra=` grammar both read this
+/// one list, so the two gates cannot drift.
+pub const XHTTP_MODELED_WIRE_KEYS: &[&str] = &[
+    "host",
+    "path",
+    "mode",
+    "headers",
+    "uplinkHTTPMethod",
+    "uplinkDataPlacement",
+    "uplinkDataKey",
+    "uplinkChunkSize",
+    "xPaddingBytes",
+    "xPaddingObfsMode",
+    "xPaddingKey",
+    "xPaddingHeader",
+    "xPaddingPlacement",
+    "xPaddingMethod",
+    "sessionIDPlacement",
+    "sessionIDKey",
+    "sessionIDTable",
+    "sessionIDLength",
+    "seqPlacement",
+    "seqKey",
+    "noGRPCHeader",
+    "noSSEHeader",
+    "scMaxEachPostBytes",
+    "scMinPostsIntervalMs",
+    "scMaxBufferedPosts",
+    "scStreamUpServerSecs",
+    "serverMaxHeaderBytes",
+    "xmux",
+    "downloadSettings",
+    "extra",
+];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -2051,6 +2107,14 @@ pub enum FinalmaskPortList {
     Text(String),
 }
 
+/// The most ports one `remotePorts` list may expand to. The core materializes
+/// every range of the list (`common/net/port.go`, `PortList.Ports`) before the
+/// transport starts, and `udphop.Build` keeps the result, so repeated full
+/// ranges multiply into multi-gigabyte slices. A list up to this size is a
+/// legitimate hop set; anything past it gates. The share-link grammar reads
+/// the same limit, so both import paths refuse the same text.
+pub const FINALMASK_PORT_LIST_LIMIT: u64 = 65_536;
+
 impl Default for FinalmaskPortList {
     fn default() -> Self {
         Self::Text(String::new())
@@ -2380,6 +2444,20 @@ macro_rules! finalmask_masks {
                         $( $kind => Self::$variant { settings: $default, extra }, )*
                         _ => return None,
                     })
+                }
+
+                /// The envelope keys this mask carried beside `type` and
+                /// `settings`. Go's JSON unmarshal binds such a key to the
+                /// mask struct's own field case-insensitively, so a carried
+                /// `Settings` or `Type` spelling reaches the core's typed
+                /// field while serde keeps it out of the modeled value. An
+                /// unknown mask carries its whole object instead — the type
+                /// itself is unreadable — so it has no envelope to compare.
+                pub fn envelope_extra(&self) -> Option<&Map<String, Value>> {
+                    match self {
+                        $( Self::$variant { extra, .. } => Some(extra), )*
+                        Self::Unknown(_) => None,
+                    }
                 }
             }
 

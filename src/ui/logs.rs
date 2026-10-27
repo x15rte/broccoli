@@ -926,11 +926,8 @@ impl LogsScreen {
                 self.clear_after_generation = Some(ctx.logs_generation);
             }
             if ui.button(t(lang, Key::LogsOpenFolder)).clicked() {
-                match sys::hidden_command("explorer")
-                    .arg(sys::paths::logs_dir())
-                    .spawn()
-                {
-                    Ok(_) => self.last_error = None,
+                match sys::open_in_explorer(&sys::paths::logs_dir()) {
+                    Ok(()) => self.last_error = None,
                     Err(e) => self.last_error = Some(t_fmt(lang, Key::LogsOpenFolderFailed, &[&e])),
                 }
             }

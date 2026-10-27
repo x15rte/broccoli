@@ -6,7 +6,7 @@
 use super::outbound::{validate_masque_stream, validate_xdrive_stream};
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, excerpt_debug, extra_has_key, extra_key_set,
-    is_vision_flow, issue, warning,
+    file_path_remote, is_vision_flow, issue, warning,
 };
 use crate::model::addr;
 use crate::model::outbound::{OutboundModel, ProtocolSettings};
@@ -22,7 +22,7 @@ use crate::model::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Predicate shared with the editor's targeted-inline hints: true when a
 /// TLS/REALITY `serverName` cannot plausibly be a hostname or IP
@@ -564,7 +564,7 @@ fn validate_tls_settings(tls: &TlsModel, path: &str, issues: &mut Vec<Validation
         || tls
             .extra
             .keys()
-            .any(|key| key.eq_ignore_ascii_case("masterKeyLog"))
+            .any(|key| crate::model::equal_fold(key, "masterKeyLog"))
     {
         issues.push(issue(
             ValidationCode::MasterKeyLogNotSupported,
@@ -577,9 +577,9 @@ fn validate_tls_settings(tls: &TlsModel, path: &str, issues: &mut Vec<Validation
     // other value (`true`, strings, numbers) either hard-fails
     // TLSConfig.Build (PrintRemovedFeatureError) or Xray's JSON
     // unmarshal into `AllowInsecure bool`. Go's unmarshal matches field
-    // names case-insensitively, so every key case must be scanned.
+    // names under `bytes.EqualFold`, so every key case must be scanned.
     if tls.extra.iter().any(|(key, value)| {
-        key.eq_ignore_ascii_case("allowInsecure")
+        crate::model::equal_fold(key, "allowInsecure")
             && !matches!(value, Value::Bool(false) | Value::Null)
     }) {
         issues.push(issue(
@@ -587,6 +587,7 @@ fn validate_tls_settings(tls: &TlsModel, path: &str, issues: &mut Vec<Validation
             Some(format!("{path}.allowInsecure")),
         ));
     }
+    tls_extra_shadow(path, tls, issues);
     // The fingerprint vocabulary is the canonical table in
     // `crate::model::fingerprint` — TLS accepts the full wire vocabulary
     // (`unsafe`/`hellogolang` included).
@@ -638,6 +639,107 @@ fn validate_tls_settings(tls: &TlsModel, path: &str, issues: &mut Vec<Validation
     }
 }
 
+/// The modeled wire keys of one `TlsCert` row (`infra/conf/transport_security.go`).
+/// A case variant of one of these stays in the flattened extra map, is emitted
+/// beside the typed field, and Go's decoder binds it — so it must gate like a
+/// modeled key.
+const TLS_CERT_WIRE_KEYS: [&str; 8] = [
+    "certificateFile",
+    "certificate",
+    "keyFile",
+    "key",
+    "usage",
+    "ocspStapling",
+    "oneTimeLoading",
+    "buildChain",
+];
+
+/// The modeled wire keys of a TLS block. `masterKeyLog` and `allowInsecure`
+/// are absent on purpose: each has its own finding above, so a variant is
+/// already reported there.
+const TLS_MODEL_WIRE_KEYS: [&str; 15] = [
+    "serverName",
+    "alpn",
+    "fingerprint",
+    "minVersion",
+    "maxVersion",
+    "cipherSuites",
+    "curvePreferences",
+    "certificates",
+    "disableSystemRoot",
+    "useSystemCA",
+    "enableSessionResumption",
+    "pinnedPeerCertSha256",
+    "verifyPeerCertByName",
+    "echConfigList",
+    "echSockopt",
+];
+
+/// Report flattened TLS keys that fold onto a modeled field. A variant such as
+/// `Certificates` binds the typed list in Go's decoder and bypasses every
+/// certificate rule, so the shadow gates instead.
+fn tls_extra_shadow(path: &str, tls: &TlsModel, issues: &mut Vec<ValidationIssue>) {
+    for key in tls.extra.keys() {
+        if TLS_MODEL_WIRE_KEYS
+            .iter()
+            .any(|wire| crate::model::equal_fold(key, wire))
+        {
+            issues.push(issue(
+                ValidationCode::TlsExtraShadow(key.clone()),
+                Some(format!("{path}.{key}")),
+            ));
+        }
+    }
+}
+
+/// One TLS block's certificate rows: the required-key rule, the flattened-key
+/// shadow rule, and the file-locality rule. `required` is the caller's finding
+/// for a row with no key material (the stream TLS block and the realm block
+/// name it differently).
+fn validate_tls_certificates(
+    path: &str,
+    certificates: &[crate::model::stream::TlsCert],
+    required: ValidationCode,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for (index, certificate) in certificates.iter().enumerate() {
+        let row = format!("{path}.certificates[{index}]");
+        if certificate.certificate_file.trim().is_empty()
+            && certificate
+                .certificate
+                .iter()
+                .all(|line| line.trim().is_empty())
+        {
+            issues.push(issue(required.clone(), Some(row.clone())));
+        }
+        for key in certificate.extra.keys() {
+            if TLS_CERT_WIRE_KEYS
+                .iter()
+                .any(|wire| crate::model::equal_fold(key, wire))
+            {
+                issues.push(issue(
+                    ValidationCode::TlsExtraShadow(key.clone()),
+                    Some(format!("{row}.{key}")),
+                ));
+            }
+        }
+        // The core opens both file paths at config load (`ReadCert`,
+        // infra/conf/transport_security.go), so a UNC path makes the Windows
+        // client authenticate to the named server before the transport runs.
+        for (field, value) in [
+            ("certificateFile", &certificate.certificate_file),
+            ("keyFile", &certificate.key_file),
+        ] {
+            if !value.trim().is_empty() && file_path_remote(value) {
+                issues.push(issue(
+                    ValidationCode::FilePathRemote(excerpt(value)),
+                    Some(format!("{row}.{field}")),
+                ));
+            }
+        }
+    }
+}
+
 /// The TLS settings rules Xray applies only when the block is actually
 /// selected: the `fromMitm` ALPN shape and the certificate rows. The stream
 /// takes them when `security` is TLS; a DoH resolver always does.
@@ -651,25 +753,12 @@ fn validate_tls_connection_settings(tls: &TlsModel, path: &str, issues: &mut Vec
             Some(format!("{path}.alpn")),
         ));
     }
-    // A certificate row with neither a file nor inline PEM lines has
-    // no key material to load (infra/conf: both file and bytes are
-    // empty). Both tests are trimmed: a whitespace-only path names no
-    // readable file and a blank-only line list parses no certificate,
-    // so the row has nothing to load. The path names the row so the
-    // finding points at the entry the user has to fill in.
-    for (index, certificate) in tls.certificates.iter().enumerate() {
-        if certificate.certificate_file.trim().is_empty()
-            && certificate
-                .certificate
-                .iter()
-                .all(|line| line.trim().is_empty())
-        {
-            issues.push(issue(
-                ValidationCode::TlsCertificateRequired,
-                Some(format!("{path}.certificates[{index}]")),
-            ));
-        }
-    }
+    validate_tls_certificates(
+        path,
+        &tls.certificates,
+        ValidationCode::TlsCertificateRequired,
+        issues,
+    );
 }
 
 /// Validate a stream model, recursing over every modeled XHTTP download
@@ -766,7 +855,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                 || reality
                     .extra
                     .keys()
-                    .any(|key| key.eq_ignore_ascii_case("masterKeyLog")))
+                    .any(|key| crate::model::equal_fold(key, "masterKeyLog")))
         {
             issues.push(issue(
                 ValidationCode::MasterKeyLogNotSupported,
@@ -1014,56 +1103,38 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
                     Some("stream.xhttpSettings.serverMaxHeaderBytes".into()),
                 ));
             }
-            // Extra-passthrough shadowing:
-            // an `xhttpSettings.extra` key naming a modeled xhttp setting
-            // overrides it — serde flatten emits the extra value over the
-            // typed field on export, and Xray's SplitHTTPConfig.Build
-            // (infra/conf/transport_method.go) replaces the whole outer
-            // object with the nested `extra` object except host/path/mode.
-            // Live repro 2026-09-06 on Xray 26.7.28: outer
-            // `xPaddingMethod: "tokenish"` + extra
-            // `xPaddingMethod: "bogus"` refuses at load ("unsupported
-            // padding method: bogus") while the same config without the
-            // extra key loads — the edited value never reaches Xray.
-            // Configuration warning (class E, Severity::Warning); the carried
-            // key names the offender. The list is
-            // the camelCase serde surface of `XhttpSettings`.
-            for wire_key in [
-                "host",
-                "path",
-                "mode",
-                "headers",
-                "uplinkHTTPMethod",
-                "uplinkDataPlacement",
-                "uplinkDataKey",
-                "uplinkChunkSize",
-                "xPaddingBytes",
-                "xPaddingObfsMode",
-                "xPaddingKey",
-                "xPaddingHeader",
-                "xPaddingPlacement",
-                "xPaddingMethod",
-                "sessionIDPlacement",
-                "sessionIDKey",
-                "sessionIDTable",
-                "sessionIDLength",
-                "seqPlacement",
-                "seqKey",
-                "noGRPCHeader",
-                "noSSEHeader",
-                "scMaxEachPostBytes",
-                "scMinPostsIntervalMs",
-                "scMaxBufferedPosts",
-                "scStreamUpServerSecs",
-                "serverMaxHeaderBytes",
-                "xmux",
-                "downloadSettings",
-            ] {
-                if extra_has_key(&xhttp.extra, wire_key) {
-                    issues.push(warning(
-                        ValidationCode::XhttpExtraShadowsSettings(wire_key.to_string()),
-                        Some(format!("stream.xhttpSettings.{wire_key}")),
+            // The extra map is serde's flatten: it holds every key serde did
+            // not bind, which means any spelling other than the exact modeled
+            // one. Go's JSON unmarshal matches field names case-insensitively,
+            // so a carried `DownloadSettings`, `Mode` or `extra` still binds
+            // the modeled field on the wire — and `extra` additionally makes
+            // `SplitHTTPConfig.Build` replace the whole settings object with
+            // the nested one. The typed value the model validated never
+            // reaches the core, so this gates. One shared list with the
+            // share-link grammar (`XHTTP_MODELED_WIRE_KEYS`), so the two
+            // surfaces cannot drift.
+            for key in xhttp.extra.keys() {
+                if crate::model::stream::XHTTP_MODELED_WIRE_KEYS
+                    .iter()
+                    .any(|wire| crate::model::equal_fold(key, wire))
+                {
+                    issues.push(issue(
+                        ValidationCode::XhttpExtraShadowsSettings(key.clone()),
+                        Some(format!("stream.xhttpSettings.{key}")),
                     ));
+                }
+            }
+            if let Some(xmux) = xhttp.xmux.as_ref() {
+                for key in xmux.extra.keys() {
+                    if crate::model::stream::XMUX_MODELED_WIRE_KEYS
+                        .iter()
+                        .any(|wire| crate::model::equal_fold(key, wire))
+                    {
+                        issues.push(issue(
+                            ValidationCode::XmuxExtraShadow(key.clone()),
+                            Some(format!("stream.xhttpSettings.xmux.{key}")),
+                        ));
+                    }
                 }
             }
             if xhttp.mode == "stream-one" && xhttp.download_settings.is_some() {
@@ -1289,11 +1360,43 @@ fn finalmask_range_bounds(value: Int32Range) -> (i32, i32) {
     }
 }
 
+/// Flag every flattened `extra` key of one finalmask container that folds
+/// onto a wire key the same container models. serde binds only the exact
+/// spelling; Go's JSON unmarshal matches field names case-insensitively and
+/// binds the carried key to the modeled field, so its value reaches the core
+/// without taking the rules the typed field takes — and serde emits the extra
+/// key beside the modeled one. The finding names the carried key and the JSON
+/// path it sits at.
+fn finalmask_extra_shadow(
+    path: &str,
+    extra: &Map<String, Value>,
+    modeled: &[&str],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for key in extra.keys() {
+        if modeled
+            .iter()
+            .any(|wire| crate::model::equal_fold(key, wire))
+        {
+            issues.push(issue(
+                ValidationCode::FinalmaskExtraShadow(key.clone()),
+                Some(format!("{path}.{key}")),
+            ));
+        }
+    }
+}
+
 /// Validate one finalmask block. Paths are wire paths suitable for inline UI
 /// and share-link diagnostics; they mirror the rejections of the current Xray
 /// finalmask loader and QUIC parameter builder.
 pub fn validate_finalmask(fm: &FinalmaskModel) -> Verdict {
     let mut issues = Vec::new();
+    finalmask_extra_shadow(
+        "finalmask",
+        &fm.extra,
+        &["tcp", "udp", "quicParams"],
+        &mut issues,
+    );
     for (index, mask) in fm.tcp.iter().enumerate() {
         finalmask_validate_tcp_mask(index, mask, &mut issues);
     }
@@ -1712,6 +1815,7 @@ fn finalmask_validate_transform(
     transform: &FinalmaskTransform,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    finalmask_extra_shadow(path, &transform.extra, &["op", "args"], issues);
     if transform.op.is_empty() {
         issues.push(issue(
             ValidationCode::FinalmaskTransformOpRequired,
@@ -1726,6 +1830,12 @@ fn finalmask_validate_transform(
     }
     for (index, arg) in transform.args.iter().enumerate() {
         let arg_path = format!("{path}.args[{index}]");
+        finalmask_extra_shadow(
+            &arg_path,
+            &arg.extra,
+            &["type", "bytes", "u64", "reuse", "metadata", "transform"],
+            issues,
+        );
         let count = usize::from(!arg.bytes.is_absent())
             + usize::from(arg.u64.is_some())
             + usize::from(!arg.reuse.is_empty())
@@ -1760,6 +1870,9 @@ fn finalmask_validate_transform(
 /// Read-only view of the finalmask header-custom item fields shared by the
 /// TCP and UDP item structs, so validation can accept either.
 trait FinalmaskCustomItem {
+    /// The flattened unknown-key map and the wire keys the item models.
+    fn extra(&self) -> &Map<String, Value>;
+    fn wire_keys(&self) -> &'static [&'static str];
     fn capture(&self) -> &str;
     fn packet(&self) -> &FinalmaskRawValue;
     fn rand(&self) -> i32;
@@ -1770,6 +1883,21 @@ trait FinalmaskCustomItem {
 }
 
 impl FinalmaskCustomItem for crate::model::stream::FinalmaskTcpItem {
+    fn extra(&self) -> &Map<String, Value> {
+        &self.extra
+    }
+    fn wire_keys(&self) -> &'static [&'static str] {
+        &[
+            "delay",
+            "rand",
+            "randRange",
+            "capture",
+            "type",
+            "reuse",
+            "transform",
+            "packet",
+        ]
+    }
     fn capture(&self) -> &str {
         &self.capture
     }
@@ -1794,6 +1922,20 @@ impl FinalmaskCustomItem for crate::model::stream::FinalmaskTcpItem {
 }
 
 impl FinalmaskCustomItem for crate::model::stream::FinalmaskUdpItem {
+    fn extra(&self) -> &Map<String, Value> {
+        &self.extra
+    }
+    fn wire_keys(&self) -> &'static [&'static str] {
+        &[
+            "rand",
+            "randRange",
+            "capture",
+            "type",
+            "reuse",
+            "transform",
+            "packet",
+        ]
+    }
     fn capture(&self) -> &str {
         &self.capture
     }
@@ -1822,6 +1964,7 @@ fn finalmask_validate_custom_item(
     item: &impl FinalmaskCustomItem,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    finalmask_extra_shadow(path, item.extra(), item.wire_keys(), issues);
     let capture = item.capture();
     let packet = item.packet();
     let rand = item.rand();
@@ -1886,6 +2029,12 @@ fn finalmask_validate_xmc(path: &str, settings: &FinalmaskXmc, issues: &mut Vec<
     }
     for (index, profile) in settings.profiles.iter().enumerate() {
         let profile_path = format!("{path}.profiles[{index}]");
+        finalmask_extra_shadow(
+            &profile_path,
+            &profile.extra,
+            &["username", "uuid", "texturesValue", "texturesSignature"],
+            issues,
+        );
         let username = profile.username.as_bytes();
         if !(3..=16).contains(&username.len())
             || !username
@@ -1979,6 +2128,8 @@ fn finalmask_validate_port_list(
             }
         }
         FinalmaskPortList::Text(text) => {
+            let mut expanded = 0_u64;
+            let mut too_large = false;
             for item in text
                 .split(',')
                 .map(str::trim)
@@ -1990,6 +2141,19 @@ fn finalmask_validate_port_list(
                             ValidationCode::FinalmaskPortEnvNameRequired,
                             Some(path.to_string()),
                         ));
+                    }
+                    // The core resolves the variable at load and materializes
+                    // every port it names, so the size is outside this
+                    // document. One entry may hold the whole budget; a second
+                    // one cannot be bounded here.
+                    expanded =
+                        expanded.saturating_add(crate::model::stream::FINALMASK_PORT_LIST_LIMIT);
+                    if expanded > crate::model::stream::FINALMASK_PORT_LIST_LIMIT && !too_large {
+                        issues.push(issue(
+                            ValidationCode::FinalmaskPortListTooLarge,
+                            Some(path.to_string()),
+                        ));
+                        too_large = true;
                     }
                     continue;
                 }
@@ -2006,6 +2170,25 @@ fn finalmask_validate_port_list(
                         ValidationCode::FinalmaskPortListInvalid(excerpt_debug(item)),
                         Some(path.to_string()),
                     ));
+                    continue;
+                }
+                // Count what the core will materialize: one port for a single
+                // entry, `to - from + 1` for a range.
+                let count = match item.split_once('-') {
+                    Some((from, to)) => {
+                        let from = from.parse::<u32>().unwrap_or(0);
+                        let to = to.parse::<u32>().unwrap_or(0);
+                        u64::from(to.saturating_sub(from)) + 1
+                    }
+                    None => 1,
+                };
+                expanded = expanded.saturating_add(count);
+                if expanded > crate::model::stream::FINALMASK_PORT_LIST_LIMIT && !too_large {
+                    issues.push(issue(
+                        ValidationCode::FinalmaskPortListTooLarge,
+                        Some(path.to_string()),
+                    ));
+                    too_large = true;
                 }
             }
         }
@@ -2017,6 +2200,30 @@ fn finalmask_validate_quic_params(
     quic: &FinalmaskQuicParams,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    finalmask_extra_shadow(
+        path,
+        &quic.extra,
+        &[
+            "congestion",
+            "debug",
+            "bbrProfile",
+            "brutalUp",
+            "brutalDown",
+            "brutalDisableLossCompensation",
+            "initStreamReceiveWindow",
+            "maxStreamReceiveWindow",
+            "initConnectionReceiveWindow",
+            "maxConnectionReceiveWindow",
+            "maxIdleTimeout",
+            "keepAlivePeriod",
+            "disablePathMTUDiscovery",
+            "disableChromeParrot",
+            "disableGSO",
+            "maxIncomingStreams",
+            "disableStatelessReset",
+        ],
+        issues,
+    );
     // `strings.ToLower` on the wire (`infra/conf/transport_internet.go:250`);
     // the vocabulary carries no `i` or `k`, so the primitive folds it exactly
     // rather than by an ASCII accident a future value would break.
@@ -2142,11 +2349,26 @@ fn finalmask_validate_tcp_mask(
     issues: &mut Vec<ValidationIssue>,
 ) {
     let path = format!("finalmask.tcp[{index}]");
+    if let Some(extra) = mask.envelope_extra() {
+        finalmask_extra_shadow(&path, extra, &["type", "settings"], issues);
+    }
     match mask {
         FinalmaskTcpMask::Filter { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["blockedSourceIPs", "allowedSourceIPs"],
+                issues,
+            );
             finalmask_validate_filter(&format!("{path}.settings"), settings, issues);
         }
         FinalmaskTcpMask::HeaderCustom { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["clients", "servers", "errors"],
+                issues,
+            );
             for (group_name, groups) in [
                 ("clients", &settings.clients),
                 ("servers", &settings.servers),
@@ -2166,6 +2388,14 @@ fn finalmask_validate_tcp_mask(
             }
         }
         FinalmaskTcpMask::Fragment { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &[
+                    "packets", "length", "delay", "lengths", "delays", "maxSplit",
+                ],
+                issues,
+            );
             if !settings.packets.is_empty() && !fold_eq(&settings.packets, "tlshello") {
                 match Int32Range::parse(&settings.packets) {
                     Some(range) if range.from != 0 => {}
@@ -2188,9 +2418,32 @@ fn finalmask_validate_tcp_mask(
             }
         }
         FinalmaskTcpMask::Sudoku { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &[
+                    "password",
+                    "ascii",
+                    "customTable",
+                    "custom_table",
+                    "customTables",
+                    "custom_tables",
+                    "paddingMin",
+                    "padding_min",
+                    "paddingMax",
+                    "padding_max",
+                ],
+                issues,
+            );
             finalmask_validate_sudoku(&format!("{path}.settings"), settings);
         }
         FinalmaskTcpMask::Xmc { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["hostname", "profiles", "password"],
+                issues,
+            );
             finalmask_validate_xmc(&format!("{path}.settings"), settings, issues);
         }
         FinalmaskTcpMask::Unknown(raw) => issues.push(issue(
@@ -2338,11 +2591,26 @@ fn finalmask_validate_udp_mask(
     issues: &mut Vec<ValidationIssue>,
 ) {
     let path = format!("finalmask.udp[{index}]");
+    if let Some(extra) = mask.envelope_extra() {
+        finalmask_extra_shadow(&path, extra, &["type", "settings"], issues);
+    }
     match mask {
         FinalmaskUdpMask::Filter { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["blockedSourceIPs", "allowedSourceIPs"],
+                issues,
+            );
             finalmask_validate_filter(&format!("{path}.settings"), settings, issues);
         }
         FinalmaskUdpMask::HeaderCustom { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["mode", "client", "server"],
+                issues,
+            );
             if !matches!(settings.mode.as_str(), "" | "prefix" | "standalone") {
                 issues.push(issue(
                     ValidationCode::FinalmaskUdpHeaderModeInvalid,
@@ -2361,6 +2629,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::MkcpLegacy { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["header", "value"],
+                issues,
+            );
             if !(settings.header.is_empty()
                 || vocabulary_holds(
                     &["dns", "dtls", "srtp", "utp", "wechat", "wireguard"],
@@ -2374,6 +2648,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Noise { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["reset", "noise", "script"],
+                issues,
+            );
             for code in super::settings::noise_script_issues(
                 settings.script.as_deref(),
                 settings.noise.len(),
@@ -2382,6 +2662,12 @@ fn finalmask_validate_udp_mask(
             }
             for (item_index, item) in settings.noise.iter().enumerate() {
                 let item_path = format!("{path}.settings.noise[{item_index}]");
+                finalmask_extra_shadow(
+                    &item_path,
+                    &item.extra,
+                    &["rand", "randRange", "type", "packet", "delay"],
+                    issues,
+                );
                 if !item.packet.is_absent() && finalmask_range_bounds(item.rand).1 > 0 {
                     issues.push(issue(
                         ValidationCode::FinalmaskNoisePacketExclusive,
@@ -2416,6 +2702,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Salamander { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["password", "packetSize"],
+                issues,
+            );
             let (from, to) = finalmask_range_bounds(settings.packet_size);
             if to > 0 && (from <= 0 || to > 2048) {
                 issues.push(issue(
@@ -2425,9 +2717,32 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Sudoku { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &[
+                    "password",
+                    "ascii",
+                    "customTable",
+                    "custom_table",
+                    "customTables",
+                    "custom_tables",
+                    "paddingMin",
+                    "padding_min",
+                    "paddingMax",
+                    "padding_max",
+                ],
+                issues,
+            );
             finalmask_validate_sudoku(&format!("{path}.settings"), settings);
         }
         FinalmaskUdpMask::Xdns { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["domains", "resolvers", "extraPoll"],
+                issues,
+            );
             if settings.retired_shape {
                 issues.push(warning(
                     ValidationCode::FinalmaskXdnsShapeRetired,
@@ -2453,6 +2768,12 @@ fn finalmask_validate_udp_mask(
             }
             for (domain_index, domain) in settings.domains.iter().enumerate() {
                 let entry_path = format!("{path}.settings.domains[{domain_index}]");
+                finalmask_extra_shadow(
+                    &entry_path,
+                    &domain.extra,
+                    &["names", "lenLimit", "labelLimit", "types", "edns0"],
+                    issues,
+                );
                 if domain.types.is_empty()
                     || domain
                         .types
@@ -2499,6 +2820,12 @@ fn finalmask_validate_udp_mask(
             }
             for (resolver_index, resolver) in settings.resolvers.iter().enumerate() {
                 let entry_path = format!("{path}.settings.resolvers[{resolver_index}]");
+                finalmask_extra_shadow(
+                    &entry_path,
+                    &resolver.extra,
+                    &["addrs", "worker", "tlsConfig", "quicConfig"],
+                    issues,
+                );
                 if resolver.addrs.is_empty() {
                     issues.push(issue(
                         ValidationCode::FinalmaskXdnsResolverAddrsEmpty,
@@ -2558,6 +2885,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Xicmp { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["dgram", "ips"],
+                issues,
+            );
             for (ip_index, ip) in settings.ips.iter().enumerate() {
                 if ip.parse::<std::net::IpAddr>().is_err() {
                     issues.push(issue(
@@ -2568,6 +2901,20 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Realm { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["url", "stunServers", "ipMode", "portMapping", "tlsConfig"],
+                issues,
+            );
+            if let Some(mapping) = &settings.port_mapping {
+                finalmask_extra_shadow(
+                    &format!("{path}.portMapping"),
+                    &mapping.extra,
+                    &["enabled", "timeout", "lifetime"],
+                    issues,
+                );
+            }
             match url::Url::parse(&settings.url) {
                 Ok(url) => {
                     if !matches!(url.scheme(), "realm" | "realm+http") {
@@ -2619,6 +2966,12 @@ fn finalmask_validate_udp_mask(
             }
         }
         FinalmaskUdpMask::Udphop { settings, .. } => {
+            finalmask_extra_shadow(
+                &format!("{path}.settings"),
+                &settings.extra,
+                &["sockopt", "mode", "interval", "remotePorts", "remoteIPs"],
+                issues,
+            );
             finalmask_validate_udphop(&format!("{path}.settings"), settings, issues);
         }
         FinalmaskUdpMask::Unknown(raw) => issues.push(issue(
@@ -2747,6 +3100,48 @@ fn finalmask_validate_realm_tls(
     tls: &crate::model::stream::FinalmaskRealmTls,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    // `masterKeyLog` makes the core open the named file and append TLS
+    // session keys to it (`transport/internet/tls/config.go`), and the Realm
+    // TLS mount builds through the same TLS config, so the typed field and a
+    // case variant in the flattened map both gate here. The path mirrors the
+    // stream TLS rule's.
+    if !tls.master_key_log.is_empty()
+        || tls
+            .extra
+            .keys()
+            .any(|key| crate::model::equal_fold(key, "masterKeyLog"))
+    {
+        issues.push(issue(
+            ValidationCode::MasterKeyLogNotSupported,
+            Some(format!("{path}.masterKeyLog")),
+        ));
+    }
+    finalmask_extra_shadow(
+        path,
+        &tls.extra,
+        &[
+            "allowInsecure",
+            "certificates",
+            "serverName",
+            "alpn",
+            "enableSessionResumption",
+            "disableSystemRoot",
+            "useSystemCA",
+            "minVersion",
+            "maxVersion",
+            "cipherSuites",
+            "fingerprint",
+            "rejectUnknownSni",
+            "curvePreferences",
+            "masterKeyLog",
+            "pinnedPeerCertSha256",
+            "verifyPeerCertByName",
+            "echServerKeys",
+            "echConfigList",
+            "echSockopt",
+        ],
+        issues,
+    );
     if tls.allow_insecure == Some(true) {
         issues.push(issue(
             ValidationCode::FinalmaskRealmAllowInsecureRemoved,
@@ -2768,16 +3163,12 @@ fn finalmask_validate_realm_tls(
             Some(format!("{path}.alpn")),
         ));
     }
-    for (certificate_index, certificate) in tls.certificates.iter().enumerate() {
-        if certificate.certificate_file.is_empty()
-            && certificate.certificate.iter().all(String::is_empty)
-        {
-            issues.push(issue(
-                ValidationCode::FinalmaskRealmCertRequired,
-                Some(format!("{path}.certificates[{certificate_index}]")),
-            ));
-        }
-    }
+    validate_tls_certificates(
+        path,
+        &tls.certificates,
+        ValidationCode::FinalmaskRealmCertRequired,
+        issues,
+    );
     if !tls.ech_server_keys.is_empty() && !go_std_base64_decodes(&tls.ech_server_keys) {
         issues.push(issue(
             ValidationCode::FinalmaskRealmEchKeysBase64,
@@ -3455,6 +3846,316 @@ mod tests {
                     .any(|issue| issue.code == code && issue.path.as_deref() == Some(path)),
                 "missing {code:?} at {path:?} in {issues:#?}"
             );
+        }
+    }
+
+    /// Every finalmask container's flattened `extra` map is scanned for keys
+    /// that fold onto a modeled wire key of the same container: serde kept
+    /// such a key out of the typed value, but Go's case-insensitive unmarshal
+    /// binds it, so the carried value is what the core reads. Each case here
+    /// is a bypass the typed walk cannot see: the model-level `UDP` list, a
+    /// mask envelope's `Settings`, a `noise` mask's `Script`, a resolver's
+    /// `TlsConfig`, and the Realm TLS `MasterKeyLog`.
+    #[test]
+    fn finalmask_extra_keys_that_shadow_modeled_fields_gate() {
+        let model: FinalmaskModel = serde_json::from_value(json!({
+            "UDP": [{"type": "noise", "settings": {"script": "noise.lua"}}]
+        }))
+        .expect("the model-level UDP key is a flatten-extra key");
+        let issues = validate_finalmask(&model);
+        let finding = issues
+            .iter()
+            .find(|issue| {
+                matches!(
+                    &issue.code,
+                    ValidationCode::FinalmaskExtraShadow(key) if key == "UDP"
+                )
+            })
+            .unwrap_or_else(|| panic!("model-level UDP must gate: {issues:#?}"));
+        assert_eq!(finding.path.as_deref(), Some("finalmask.UDP"));
+        assert_eq!(finding.severity, Severity::Error);
+
+        for (fm, key, path) in [
+            (
+                json!({"udp": [{"type": "noise", "Settings": {"script": "noise.lua"}}]}),
+                "Settings",
+                "finalmask.udp[0].Settings",
+            ),
+            (
+                json!({"udp": [{"type": "noise", "settings": {"Script": "noise.lua"}}]}),
+                "Script",
+                "finalmask.udp[0].settings.Script",
+            ),
+            (
+                json!({"udp": [{"type": "xicmp", "settings": {"IPs": ["127.0.0.1"]}}]}),
+                "IPs",
+                "finalmask.udp[0].settings.IPs",
+            ),
+            (
+                json!({"udp": [{"type": "xdns", "settings": {
+                    "domains": [{"names": ["a.example"], "types": [1]}],
+                    "resolvers": [{
+                        "addrs": ["udp://1.1.1.1:53"],
+                        "TlsConfig": {"masterKeyLog": "C:\\keys.log"}
+                    }]
+                }}]}),
+                "TlsConfig",
+                "finalmask.udp[0].settings.resolvers[0].TlsConfig",
+            ),
+            (
+                json!({"tcp": [{"type": "fragment", "settings": {"Length": 100}}]}),
+                "Length",
+                "finalmask.tcp[0].settings.Length",
+            ),
+        ] {
+            let fm: FinalmaskModel = serde_json::from_value(fm).expect("flatten extras load");
+            let issues = validate_finalmask(&fm);
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(
+                        &issue.code,
+                        ValidationCode::FinalmaskExtraShadow(carried) if carried == key
+                    ) && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| panic!("{key} must gate at {path}: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+        }
+    }
+
+    /// The Realm TLS mount takes the stream TLS rules: `masterKeyLog` makes
+    /// the core append session keys to the named file, so a typed value and a
+    /// case-variant extra spelling both gate under the same path.
+    #[test]
+    fn finalmask_realm_tls_refuses_master_key_log() {
+        for settings in [
+            json!({"tlsConfig": {"masterKeyLog": r"C:\keys.log"}}),
+            json!({"tlsConfig": {"MasterKeyLog": r"C:\keys.log"}}),
+        ] {
+            let fm: FinalmaskModel = serde_json::from_value(json!({
+                "udp": [{"type": "realm", "settings": {
+                    "url": "realm://token@example.com/id",
+                    "stunServers": ["stun.example.com:3478"],
+                    "tlsConfig": settings["tlsConfig"].clone()
+                }}]
+            }))
+            .expect("realm settings load");
+            let issues = validate_finalmask(&fm);
+            let finding = issues
+                .iter()
+                .find(|issue| issue.code == ValidationCode::MasterKeyLogNotSupported)
+                .unwrap_or_else(|| panic!("masterKeyLog must gate: {issues:#?}"));
+            assert_eq!(
+                finding.path.as_deref(),
+                Some("finalmask.udp[0].settings.tlsConfig.masterKeyLog")
+            );
+            assert_eq!(finding.severity, Severity::Error);
+        }
+    }
+
+    /// The core opens the files these paths name while it loads the config, so
+    /// a UNC, URL, and parent-relative form gates on the mask side as it does
+    /// for Lua script paths. A plain relative path stays legal.
+    #[test]
+    fn finalmask_script_and_certificate_paths_must_stay_local() {
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "noise", "settings": {"script": r"\\attacker\share\p.lua"}}]
+        }))
+        .expect("noise settings load");
+        let issues = validate_finalmask(&fm);
+        let finding = issues
+            .iter()
+            .find(|issue| matches!(&issue.code, ValidationCode::FilePathRemote(path) if path.contains("attacker")))
+            .unwrap_or_else(|| panic!("the UNC script path must gate: {issues:#?}"));
+        assert_eq!(
+            finding.path.as_deref(),
+            Some("finalmask.udp[0].settings.script")
+        );
+        assert_eq!(finding.severity, Severity::Error);
+
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "realm", "settings": {
+                "url": "realm://token@example.com/id",
+                "stunServers": ["stun.example.com:3478"],
+                "tlsConfig": {"certificates": [{
+                    "certificateFile": "//attacker/share/c.pem",
+                    "key": ["-----BEGIN PRIVATE KEY-----"]
+                }]}
+            }}]
+        }))
+        .expect("realm settings load");
+        let issues = validate_finalmask(&fm);
+        let finding = issues
+            .iter()
+            .find(|issue| matches!(&issue.code, ValidationCode::FilePathRemote(path) if path.contains("attacker")))
+            .unwrap_or_else(|| panic!("the UNC certificate path must gate: {issues:#?}"));
+        assert_eq!(
+            finding.path.as_deref(),
+            Some("finalmask.udp[0].settings.tlsConfig.certificates[0].certificateFile")
+        );
+
+        let fm: FinalmaskModel = serde_json::from_value(json!({
+            "udp": [{"type": "noise", "settings": {"script": "lua/noise.lua"}}]
+        }))
+        .expect("noise settings load");
+        assert!(
+            validate_finalmask(&fm).is_empty(),
+            "a local relative script path stays legal"
+        );
+    }
+
+    /// The core materializes every range of a `remotePorts` list before the
+    /// transport starts (`common/net/port.go`), so repeated full ranges are
+    /// refused above the shared cap. A single full range stays legal.
+    #[test]
+    fn finalmask_port_list_expansion_is_capped() {
+        let fm = |ports: &str| -> FinalmaskModel {
+            serde_json::from_value(json!({
+                "udp": [{"type": "udphop", "settings": {
+                    "mode": "perConnRemote", "remotePorts": ports
+                }}]
+            }))
+            .expect("udphop settings load")
+        };
+        let issues = validate_finalmask(&fm("1-65535,1-65535"));
+        let finding = issues
+            .iter()
+            .find(|issue| issue.code == ValidationCode::FinalmaskPortListTooLarge)
+            .unwrap_or_else(|| panic!("the expanded list must gate: {issues:#?}"));
+        assert_eq!(
+            finding.path.as_deref(),
+            Some("finalmask.udp[0].settings.remotePorts")
+        );
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            !validate_finalmask(&fm("1-65535"))
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskPortListTooLarge),
+            "one full range sits under the cap"
+        );
+        // An `env:` entry is resolved by the core, so one may hold the whole
+        // budget; a second cannot be bounded here and gates.
+        assert!(
+            !validate_finalmask(&fm("env:PORTS"))
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskPortListTooLarge),
+            "one environment entry sits at the cap"
+        );
+        assert!(
+            validate_finalmask(&fm("env:PORTS,env:MORE"))
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FinalmaskPortListTooLarge),
+            "two environment entries exceed the cap"
+        );
+    }
+
+    /// An outbound TLS certificate row's file paths are opened at config load
+    /// (`ReadCert`, infra/conf/transport_security.go), so a UNC path leaks the
+    /// Windows credentials to the named server. The rule names the row and the
+    /// field, and a plain local path stays legal.
+    #[test]
+    fn tls_certificate_files_must_stay_local() {
+        use crate::model::stream::{TlsCert, TlsModel};
+        let tls_stream = |tls: TlsModel| StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(tls),
+            ..Default::default()
+        };
+        let issues = validate_stream(&tls_stream(TlsModel {
+            certificates: vec![
+                TlsCert {
+                    certificate_file: r"\\attacker\share\c.pem".into(),
+                    key: vec!["-----BEGIN PRIVATE KEY-----".into()],
+                    ..Default::default()
+                },
+                TlsCert {
+                    certificate_file: "certs/c.pem".into(),
+                    key_file: "//attacker/share/k.pem".into(),
+                    ..Default::default()
+                },
+                TlsCert {
+                    certificate_file: r"..\secret\c.pem".into(),
+                    key: vec!["-----BEGIN PRIVATE KEY-----".into()],
+                    ..Default::default()
+                },
+                TlsCert {
+                    certificate_file: "certs/local.pem".into(),
+                    key_file: "certs/local.key".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        for path in [
+            "stream.tlsSettings.certificates[0].certificateFile",
+            "stream.tlsSettings.certificates[1].keyFile",
+            "stream.tlsSettings.certificates[2].certificateFile",
+        ] {
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(issue.code, ValidationCode::FilePathRemote(_))
+                        && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| panic!("missing FilePathRemote at {path}: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+        }
+        assert!(
+            !issues.iter().any(|issue| issue.path.as_deref()
+                == Some("stream.tlsSettings.certificates[3].certificateFile")),
+            "a local path stays legal"
+        );
+    }
+
+    /// Go's decoder matches field names under `bytes.EqualFold`, so a key with
+    /// the long s (`ſ`) binds the modeled field while serde keeps it in the
+    /// flattened map. A `Certificates` list would skip every certificate rule;
+    /// a `CertificateFile` row would skip the locality rule. Both gate, and the
+    /// folded row spelling names the key it carried.
+    #[test]
+    fn tls_extra_keys_that_fold_onto_modeled_fields_gate() {
+        use crate::model::stream::{TlsCert, TlsModel};
+        let stream = StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(TlsModel {
+                certificates: vec![TlsCert {
+                    certificate_file: "certs/local.pem".into(),
+                    key: vec!["-----BEGIN PRIVATE KEY-----".into()],
+                    extra: std::iter::once((
+                        "CertificateFile".to_string(),
+                        json!(r"\\attacker\share\c.pem"),
+                    ))
+                    .collect(),
+                    ..Default::default()
+                }],
+                extra: std::iter::once((
+                    "Certificate\u{17f}".to_string(),
+                    json!([{"certificateFile": r"\\attacker\share\c.pem"}]),
+                ))
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let issues = validate_stream(&stream);
+        for (key, path) in [
+            (
+                "CertificateFile",
+                "stream.tlsSettings.certificates[0].CertificateFile",
+            ),
+            (
+                "Certificate\u{17f}",
+                "stream.tlsSettings.Certificate\u{17f}",
+            ),
+        ] {
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(&issue.code, ValidationCode::TlsExtraShadow(carried) if carried == key)
+                        && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| panic!("missing TlsExtraShadow for {key}: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
         }
     }
 
@@ -6302,7 +7003,7 @@ mod tests {
     }
 
     #[test]
-    fn xhttp_extra_key_shadowing_warns_with_the_key() {
+    fn xhttp_extra_key_shadowing_gates_with_the_key() {
         let with_extra = XhttpSettings {
             x_padding_method: "tokenish".into(),
             ..Default::default()
@@ -6321,15 +7022,15 @@ mod tests {
                         if key == "xPaddingMethod"
                 )
             })
-            .expect("xPaddingMethod in extra must warn");
+            .expect("xPaddingMethod in extra must gate");
         assert_eq!(
             finding.path.as_deref(),
             Some("stream.xhttpSettings.xPaddingMethod")
         );
-        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.severity, Severity::Error);
         // The rendered message carries the offending key (fill arm).
         let rendered = crate::i18n::validation_issue_message(
-            &warning(
+            &issue(
                 ValidationCode::XhttpExtraShadowsSettings("xPaddingMethod".into()),
                 Some("stream.xhttpSettings.xPaddingMethod".into()),
             ),
@@ -6347,9 +7048,55 @@ mod tests {
             matches!(
                 &issue.code,
                 ValidationCode::XhttpExtraShadowsSettings(key)
-                    if key == "xPaddingMethod"
+                    if key == "XPADDINGMETHOD"
             )
         }));
+        // The two keys that carry the nested-settings bypass also gate: a
+        // `DownloadSettings` spelling binds the typed field in Go, and an
+        // `extra` object makes SplitHTTPConfig.Build replace the whole
+        // settings object with it.
+        for key in ["DownloadSettings", "extra"] {
+            let mut bypass = XhttpSettings::default();
+            bypass.extra.insert(key.into(), json!({"security": "tls"}));
+            let issues = validate_stream(&xhttp_stream(bypass));
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(
+                        &issue.code,
+                        ValidationCode::XhttpExtraShadowsSettings(carried) if carried == key
+                    )
+                })
+                .unwrap_or_else(|| panic!("{key} in extra must gate: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(
+                finding.path.as_deref(),
+                Some(format!("stream.xhttpSettings.{key}").as_str())
+            );
+        }
+        // The nested `xmux` object has the same shape: a variant of
+        // `maxConcurrency` binds in Go while the typed fields look empty, so
+        // the exclusivity rule never ran.
+        let mut xmux = XhttpSettings {
+            xmux: Some(crate::model::stream::XmuxConfig::default()),
+            ..Default::default()
+        };
+        xmux.xmux
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("MaxConcurrency".into(), json!("8"));
+        let issues = validate_stream(&xhttp_stream(xmux));
+        let finding = issues
+            .iter()
+            .find(|issue| {
+                matches!(
+                    &issue.code,
+                    ValidationCode::XmuxExtraShadow(key) if key == "MaxConcurrency"
+                ) && issue.path.as_deref() == Some("stream.xhttpSettings.xmux.MaxConcurrency")
+            })
+            .unwrap_or_else(|| panic!("MaxConcurrency in xmux must gate: {issues:#?}"));
+        assert_eq!(finding.severity, Severity::Error);
         // An unmodeled extra key stays silent, and so does canonical state.
         let mut other_extra = XhttpSettings::default();
         other_extra.extra.insert("xPaddingCaps".into(), json!(42));

@@ -151,6 +151,43 @@ fn simple_lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
+/// Equality under the fold Go's `encoding/json` applies when it matches an
+/// object key to a struct field: the same relation as `bytes.EqualFold`,
+/// Unicode simple case folding. `eq_ignore_ascii_case` is narrower: it does
+/// not fold the long s (`ſ` U+017F) onto `s` or the Kelvin sign onto `k`, so
+/// a key spelled with either would reach Go's decoder as a field assignment
+/// while this side saw an unknown key.
+pub(crate) fn equal_fold(left: &str, right: &str) -> bool {
+    let mut left = left.chars();
+    let mut right = right.chars();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(l), Some(r)) if fold_key(l) == fold_key(r) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// One rune's canonical form under simple case folding: apply the simple
+/// lowercase and uppercase mappings until the equivalence class settles.
+/// This maps `s`, `S` and `ſ` to `s`, and `k`, `K` and the Kelvin sign to
+/// `k`. A full casing that expands to several runes (`ß` → `SS`) contributes
+/// its first rune, which can only widen the fold: a key Go treats as unknown
+/// may be refused, never the reverse.
+fn fold_key(c: char) -> char {
+    let mut current = c;
+    loop {
+        let lower = current.to_lowercase().next().unwrap_or(current);
+        let upper = lower.to_uppercase().next().unwrap_or(lower);
+        let next = upper.to_lowercase().next().unwrap_or(upper);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
 // ---------- state file load/save (atomic, corrupt-proof) ----------
 
 pub(crate) fn state_file(name: &str) -> PathBuf {

@@ -18,10 +18,11 @@ use md5::Digest as _;
 use crate::r#gen::keys;
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DI_REMOVEDEVICE_GLOBAL, DIF_REMOVE, GUID_DEVCLASS_NET, HDEVINFO, SP_CLASSINSTALL_HEADER,
-    SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS, SetupDiCallClassInstaller,
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsExW,
-    SetupDiGetDeviceInstanceIdW, SetupDiSetClassInstallParamsW,
+    CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_LOCATE_DEVNODE_PHANTOM, CM_Locate_DevNodeW,
+    CM_PROB, CR_SUCCESS, DI_REMOVEDEVICE_GLOBAL, DIF_REMOVE, DN_STARTED, GUID_DEVCLASS_NET,
+    HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS,
+    SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiGetClassDevsExW, SetupDiGetDeviceInstanceIdW, SetupDiSetClassInstallParamsW,
 };
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::core::{GUID, HRESULT, PCWSTR, w};
@@ -234,19 +235,89 @@ pub fn remove_instance(instance_id: &str) -> Result<(), String> {
     }
 }
 
+/// Whether a devnode status reports a running device (`DN_STARTED`). A
+/// started devnode can belong to another Wintun VPN's live adapter — the
+/// configured name is not a reservation — so it is never removed.
+fn devnode_is_live(status: CM_DEVNODE_STATUS_FLAGS) -> bool {
+    status.contains(DN_STARTED)
+}
+
+/// The configuration-manager status of `instance_id`, or `None` when the
+/// devnode cannot be located or its status cannot be read. Both failures are
+/// treated as live by [`ensure_clean`]: a device whose state is unknown must
+/// never be destroyed.
+fn instance_status(instance_id: &str) -> Option<CM_DEVNODE_STATUS_FLAGS> {
+    let wide: Vec<u16> = instance_id
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut devinst = 0u32;
+    // SAFETY: `wide` is a NUL-terminated copy of the instance ID that outlives
+    // the call, `devinst` is a valid out-parameter, and
+    // `CM_LOCATE_DEVNODE_PHANTOM` finds non-present devnodes as well as
+    // present ones. The result is checked before `devinst` is used.
+    if unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR(wide.as_ptr()),
+            CM_LOCATE_DEVNODE_PHANTOM,
+        )
+    } != CR_SUCCESS
+    {
+        return None;
+    }
+    let mut status = CM_DEVNODE_STATUS_FLAGS(0);
+    let mut problem = CM_PROB(0);
+    // SAFETY: `devinst` is the handle the successful locate above returned,
+    // and both out-parameters are live locals; the status is only read when
+    // the call reports success.
+    if unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) } != CR_SUCCESS {
+        return None;
+    }
+    Some(status)
+}
+
 /// Remove leftover devnodes for the adapter name and wait (bounded) until none
 /// remain. The wait is what serializes the restart against the previous
 /// session's in-flight teardown. Returns `(clean, removed, log_lines)`, where
 /// `removed` counts the devnodes this call actually removed.
+///
+/// A started devnode is left alone: it belongs to a live adapter, possibly
+/// another Wintun VPN's, and removing it would break that application. Such a
+/// devnode is reported once and then keeps the wait running until the
+/// timeout, so a previous session that is still tearing down gets the same
+/// bounded window as before while a foreign live adapter is never destroyed.
 pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, usize, Vec<String>) {
     let deadline = Instant::now() + timeout;
     let mut removed = 0;
     let mut lines = Vec::new();
+    let mut reported: Vec<String> = Vec::new();
     loop {
         match matching_instance_ids(name) {
             Ok(ids) if ids.is_empty() => return (true, removed, lines),
             Ok(ids) => {
                 for id in ids {
+                    match instance_status(&id) {
+                        Some(status) if devnode_is_live(status) => {
+                            if !reported.contains(&id) {
+                                lines.push(format!(
+                                    "wintun devnode {id} is a started adapter; leaving it alone"
+                                ));
+                                reported.push(id);
+                            }
+                            continue;
+                        }
+                        None => {
+                            if !reported.contains(&id) {
+                                lines.push(format!(
+                                    "wintun devnode {id} status is unknown; leaving it alone"
+                                ));
+                                reported.push(id);
+                            }
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
                     match remove_instance(&id) {
                         Ok(()) => {
                             removed += 1;
@@ -317,6 +388,23 @@ mod tests {
             format_guid(&adapter_guid("tun0")),
             "{D89BE3B7-6DFA-9BED-1BA0-BAC340CA2C1C}"
         );
+    }
+
+    /// The removal gate reads only the `DN_STARTED` bit: a devnode with a
+    /// problem but no started flag is a leftover, while a started one is a
+    /// running adapter this app must not tear down.
+    #[test]
+    fn a_started_devnode_is_live() {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            CM_DEVNODE_STATUS_FLAGS, DN_HAS_PROBLEM,
+        };
+
+        assert!(devnode_is_live(DN_STARTED));
+        assert!(devnode_is_live(CM_DEVNODE_STATUS_FLAGS(
+            DN_STARTED.0 | DN_HAS_PROBLEM.0
+        )));
+        assert!(!devnode_is_live(CM_DEVNODE_STATUS_FLAGS(0)));
+        assert!(!devnode_is_live(DN_HAS_PROBLEM));
     }
 
     #[test]

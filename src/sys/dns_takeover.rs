@@ -34,6 +34,7 @@
 //! from a build that had the export is repaired through the registry.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -45,8 +46,10 @@ use windows::Win32::NetworkManagement::IpHelper::{
     IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::core::{GUID, HSTRING, PCSTR, PWSTR};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
+use windows::core::{GUID, PCSTR, PCWSTR, PWSTR};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
 
@@ -407,15 +410,33 @@ fn resolve_set_interface_dns_settings(
     })
 }
 
-/// Load `iphlpapi.dll` and look the export up.
+/// Load `iphlpapi.dll` from the Windows system directory and look the export
+/// up.
+///
+/// This runs inside the elevated helper, so the module is loaded by absolute
+/// path from `System32` and with `LOAD_LIBRARY_SEARCH_SYSTEM32`: a bare module
+/// name would be searched in the application directory first, where a
+/// medium-integrity process could plant a same-named DLL beside the portable
+/// helper binary and have it loaded with the helper's token. An unresolved
+/// system directory fails the load instead.
 fn load_iphlpapi_export() -> FARPROC {
-    // SAFETY: `HSTRING` is a NUL-terminated UTF-16 module name that outlives
-    // the call, and `LoadLibraryW` copies it before returning. The returned
-    // handle is deliberately never released (no `FreeLibrary`), so the module
-    // stays resident and the code pointer resolved from it stays valid for
-    // the process lifetime — the same process-lifetime ownership the tray's
-    // uxtheme load documents.
-    let Ok(module) = (unsafe { LoadLibraryW(&HSTRING::from("iphlpapi.dll")) }) else {
+    let path = super::system32_exe("iphlpapi.dll")?;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 absolute path that outlives
+    // the call, `hFile` is `None` (no file handle is used), and
+    // `LOAD_LIBRARY_SEARCH_SYSTEM32` restricts the dependency search to
+    // System32. `LoadLibraryExW` copies the path before returning. The
+    // returned handle is deliberately never released (no `FreeLibrary`), so
+    // the module stays resident and the code pointer resolved from it stays
+    // valid for the process lifetime — the same process-lifetime ownership
+    // the tray's uxtheme load documents.
+    let Ok(module) =
+        (unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32) })
+    else {
         return None;
     };
     // SAFETY: `module` is a live handle to the loaded DLL, and the export name

@@ -4,6 +4,10 @@
 //! stats / observatory / router / logger / handler services. This module wraps
 //! a lazily-connected tonic channel to that inbound.
 //!
+//! The API is unauthenticated, and loopback is host-global rather than
+//! per-process: any local process can reach the port, so it must not be
+//! treated as a secret.
+//!
 //! Prost path note: prost-build emits cross-package references as `super::`
 //! chains with one `super` per unmatched package segment, so the module tree
 //! in [`pb`] MUST mirror the protobuf package segments exactly

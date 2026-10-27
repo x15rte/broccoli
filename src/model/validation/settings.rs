@@ -24,15 +24,45 @@ pub fn validate_listen_address(s: &str) -> Result<(), ValidationCode> {
     }
 }
 
+/// True when a file path the core opens is not a plain local path: a UNC or
+/// device path, a URL, a drive-relative path, or a path holding a `..`
+/// component. The core opens these paths at config load — Lua scripts through
+/// its file resolver (`common/lua/program.go`), TLS certificates through
+/// `ReadCert` (`infra/conf/transport_security.go`) — so a UNC path makes the
+/// Windows client authenticate to the named SMB server before anything else
+/// runs, and a `..` component leaves the folder the path appears to name. A
+/// relative path without `..` stays legal: the core resolves it against its
+/// own working directory.
+pub fn file_path_remote(path: &str) -> bool {
+    let path = path.trim();
+    if path.starts_with(r"\\") || path.starts_with("//") || path.contains("://") {
+        return true;
+    }
+    // Drive-relative: `C:x` names the current folder on that drive, while
+    // `C:` alone and `C:\x` stay rooted.
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    path.split(['\\', '/']).any(|component| component == "..")
+}
+
 /// The structural verdict for one configured Lua script path, mirroring the
 /// two refusals the core's file resolver makes before it reads anything: the
 /// blank path (`ResolveLuaFile`) and every extension other than `.lua`
-/// (`resolveLuaTarget`, `common/platform/platform.go`). `None` — no script —
-/// never reaches this rule. The extension compare is case-sensitive, exactly
-/// as the core's is.
+/// (`resolveLuaTarget`, `common/platform/platform.go`). A path outside the
+/// local folder ([`file_path_remote`]) is refused before either, because the
+/// core opens it without asking. `None` — no script — never reaches this
+/// rule. The extension compare is case-sensitive, exactly as the core's is.
 pub fn lua_script_path_issue(script: &str) -> Option<ValidationCode> {
     if script.trim().is_empty() {
         Some(ValidationCode::LuaScriptPathRequired)
+    } else if file_path_remote(script) {
+        Some(ValidationCode::FilePathRemote(excerpt(script)))
     } else if !script.ends_with(".lua") {
         Some(ValidationCode::LuaScriptPathNotLua)
     } else {
@@ -173,9 +203,53 @@ fn local_inbound_auth_verdict(entry: &LocalInboundCfg) -> Option<ValidationCode>
 /// ([`ValidationCode::TunIpv4GatewayRequired`]); the generator derives the
 /// IPv4 listener address from the same value.
 pub fn tun_ipv4_gateway(tun: &TunCfg) -> Option<&str> {
-    tun.gateway
-        .iter()
-        .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains('.')))
+    tun.gateway.iter().find_map(|entry| {
+        entry
+            .split('/')
+            .next()
+            .map(str::trim)
+            .filter(|ip| ip.contains('.'))
+    })
+}
+
+/// The finding one TUN document's gateway rule produces, or `None` when the
+/// tunnel can come up: a TUN-mode document without an IPv4 gateway has no
+/// adapter address and no in-subnet address for the in-tun DNS listeners. The
+/// settings walk reports the finding from here, so the Apply gate and the TUN
+/// row's verdict read one rule.
+/// True when one gateway entry is a form Go's `netip.ParsePrefix` accepts.
+/// `ipnet::IpNet` is wider: it reads each octet and the prefix length as
+/// numbers, so it accepts a leading zero in either, while Go rejects the
+/// entry ("IPv4 field has octet with leading zero", "bad bits after slash").
+/// The core parses every entry with `netip.MustParsePrefix`, which panics on
+/// those spellings, so the model refuses them before emission.
+fn gateway_entry_go_compatible(entry: &str) -> bool {
+    let entry = entry.trim();
+    let Some((address, bits)) = entry.rsplit_once('/') else {
+        return false;
+    };
+    if bits.is_empty()
+        || !bits.chars().all(|ch| ch.is_ascii_digit())
+        || (bits.len() > 1 && bits.starts_with('0'))
+    {
+        return false;
+    }
+    // A dotted quad, bare or as the tail of an IPv6 address, may not carry a
+    // leading zero in any octet. The tail after the last colon is the only
+    // place an IPv4 part can sit, so the hex prefix (`::ffff:010`) does not
+    // hide the first octet.
+    let dotted = address.rsplit(':').next().unwrap_or(address);
+    if dotted.contains('.')
+        && dotted.split('.').any(|octet| {
+            !octet.is_empty()
+                && octet.chars().all(|ch| ch.is_ascii_digit())
+                && octet.len() > 1
+                && octet.starts_with('0')
+        })
+    {
+        return false;
+    }
+    entry.parse::<ipnet::IpNet>().is_ok()
 }
 
 /// The finding one TUN document's gateway rule produces, or `None` when the
@@ -194,9 +268,90 @@ fn tun_gateway_verdict(settings: &Settings) -> Option<ValidationCode> {
 /// port-53 reservation covers it as it does the IPv4 address; the runtime's
 /// IPv6 listener binds the same value.
 pub fn tun_ipv6_gateway(tun: &TunCfg) -> Option<&str> {
-    tun.gateway
+    tun.gateway.iter().find_map(|entry| {
+        entry
+            .split('/')
+            .next()
+            .map(str::trim)
+            .filter(|ip| ip.contains(':'))
+    })
+}
+
+/// True when one `settings.env` key names a core location variable after the
+/// normalization Windows and Xray's lookup apply: trim, uppercase, and a dot
+/// read as an underscore. Those four variables move the core's asset,
+/// configuration, and certificate lookup before the first connection.
+fn env_key_overrides_core_path(key: &str) -> bool {
+    let normalized = key.trim().to_uppercase().replace('.', "_");
+    crate::model::settings::CORE_LOCATION_ENV_NAMES
         .iter()
-        .find_map(|entry| entry.split('/').next().filter(|ip| ip.contains(':')))
+        .any(|name| crate::model::equal_fold(&normalized, &name.replace('.', "_")))
+}
+
+/// The modeled wire keys of the top-level `dns` object. `fakedns` and
+/// `bootstrap` are absent: the generator strips both before emission, so a
+/// variant of either never reaches the core.
+const DNS_WIRE_KEYS: [&str; 13] = [
+    "servers",
+    "hosts",
+    "clientIp",
+    "tag",
+    "queryStrategy",
+    "disableCache",
+    "serveStale",
+    "serveExpiredTTL",
+    "disableFallback",
+    "disableFallbackIfMatch",
+    "enableParallelQuery",
+    "useSystemHosts",
+    "script",
+];
+
+/// The modeled wire keys of the TUN inbound's settings object.
+const TUN_WIRE_KEYS: [&str; 10] = [
+    "name",
+    "desc",
+    "mtu",
+    "gateway",
+    "dns",
+    "userLevel",
+    "autoSystemRoutingTable",
+    "autoOutboundsInterface",
+    "autoSystemDnsToGateway",
+    "autoSystemWfpBlockLeak",
+];
+
+/// The modeled wire keys of a `sniffing` block.
+const SNIFFING_WIRE_KEYS: [&str; 6] = [
+    "enabled",
+    "destOverride",
+    "domainsExcluded",
+    "ipsExcluded",
+    "metadataOnly",
+    "routeOnly",
+];
+
+/// Report flattened keys that fold onto a modeled field of the same settings
+/// block. A variant (`Script`, `Gateway`) stays out of the typed field, is
+/// emitted beside it, and Go's decoder binds it, so the core would read a
+/// value the model never validated.
+fn settings_extra_shadow(
+    path: &str,
+    extra: &serde_json::Map<String, serde_json::Value>,
+    modeled: &[&str],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for key in extra.keys() {
+        if modeled
+            .iter()
+            .any(|wire| crate::model::equal_fold(key, wire))
+        {
+            issues.push(issue(
+                ValidationCode::SettingsExtraShadow(key.clone()),
+                Some(format!("{path}.{key}")),
+            ));
+        }
+    }
 }
 
 /// True when the emitted document carries the leak block without the
@@ -503,6 +658,7 @@ impl<'a> SettingsWalk<'a> {
         self.local_inbounds();
         self.dokodemo();
         self.tun();
+        self.env();
         self.emitter_reserved_inbounds();
         self.listener_conflicts();
         self.routing_rules();
@@ -774,6 +930,39 @@ impl<'a> SettingsWalk<'a> {
         if let Some(code) = tun_gateway_verdict(self.settings) {
             self.issues.push(issue(code, None).at(FindingTarget::Tun));
         }
+        // Every gateway entry becomes an adapter address, and the core parses
+        // each one with `netip.MustParsePrefix` while it builds the adapter
+        // (proxy/tun/tun_windows.go) — a malformed entry panics the whole
+        // process at config load. The app derives the DNS takeover address
+        // from the same string, so the model requires a CIDR prefix here.
+        if emit::tun_inbound_emitted(self.settings) {
+            settings_extra_shadow(
+                "tun",
+                &self.settings.tun.extra,
+                &TUN_WIRE_KEYS,
+                &mut self.issues,
+            );
+            settings_extra_shadow(
+                "tun.sniffing",
+                &self.settings.tun.sniffing.extra,
+                &SNIFFING_WIRE_KEYS,
+                &mut self.issues,
+            );
+            for (index, entry) in self.settings.tun.gateway.iter().enumerate() {
+                if entry.trim().is_empty() {
+                    continue;
+                }
+                if !gateway_entry_go_compatible(entry) {
+                    self.issues.push(
+                        issue(
+                            ValidationCode::TunGatewayInvalid(excerpt(entry)),
+                            Some(format!("tun.gateway[{index}]")),
+                        )
+                        .at(FindingTarget::Tun),
+                    );
+                }
+            }
+        }
         // The generator writes the leak key exactly while the TUN inbound and
         // the DNS module are both present (`emit::dns_inbound_emitted`, the model
         // side of the `config_runs_tun_dns` predicate the runtime reads back),
@@ -811,6 +1000,24 @@ impl<'a> SettingsWalk<'a> {
                     )
                     .at(FindingTarget::Tun),
                 );
+            }
+        }
+    }
+
+    /// Reject `settings.env` keys that would re-point core path resolution.
+    /// Xray applies the whole map with `os.Setenv` before it resolves assets
+    /// (infra/conf/xray.go), and `xray.location.asset` outranks the
+    /// `XRAY_LOCATION_ASSET` the app pins (common/platform/platform.go), so a
+    /// configured key can send the core to another asset folder. Windows
+    /// environment names ignore case, and Go's own variable lookup reads a
+    /// dot as an underscore, so the key is folded to that spelling first.
+    fn env(&mut self) {
+        for (index, (key, _)) in self.settings.env.iter().enumerate() {
+            if env_key_overrides_core_path(key) {
+                self.issues.push(issue(
+                    ValidationCode::EnvCorePathOverride(excerpt(key)),
+                    Some(format!("env[{index}]")),
+                ));
             }
         }
     }
@@ -945,6 +1152,12 @@ impl<'a> SettingsWalk<'a> {
     /// subnet fails the core at start (app/dns/fakedns/fake.go:82-90) — such a
     /// config must never be applied.
     fn dns(&mut self) {
+        settings_extra_shadow(
+            "dns",
+            &self.settings.dns.extra,
+            &DNS_WIRE_KEYS,
+            &mut self.issues,
+        );
         for code in dns_script_issues(
             self.settings.dns.script.as_deref(),
             &self.settings.dns.servers,
@@ -1163,6 +1376,213 @@ mod tests {
                 "{other:?}"
             );
         }
+    }
+
+    #[test]
+    fn lua_script_paths_must_stay_local() {
+        // The core opens the path while it loads the config, so a UNC or
+        // device path makes the Windows client authenticate to the named
+        // server before anything else runs. The same predicate guards the TLS
+        // certificate rows.
+        for remote in [
+            r"\\attacker\share\dns.lua",
+            "//attacker/share/dns.lua",
+            r"\\.\C:\dns.lua",
+            r"\\?\C:\dns.lua",
+            "//./pipe/dns.lua",
+            "//?/C:/dns.lua",
+            r"C:relative\dns.lua",
+            "file:///C:/dns.lua",
+            r"C:\scripts\..\dns.lua",
+            r"..\dns.lua",
+        ] {
+            match lua_script_path_issue(remote) {
+                Some(ValidationCode::FilePathRemote(path)) => {
+                    assert_eq!(path, remote, "the finding names the offending path")
+                }
+                other => panic!("{remote:?} must be refused as remote: {other:?}"),
+            }
+        }
+        for local in [
+            "dns.lua",
+            r"C:\scripts\dns.lua",
+            r"C:/scripts/dns.lua",
+            r"\scripts\dns.lua",
+            "./dns.lua",
+        ] {
+            assert_eq!(lua_script_path_issue(local), None, "{local:?}");
+        }
+    }
+
+    /// `settings.env` is emitted verbatim and Xray applies the whole map with
+    /// `os.Setenv` before it resolves assets, so a core location variable
+    /// redirects the geodata and certificate lookup past the paths the app
+    /// pins. Windows names ignore case and Go reads a dot as an underscore, so
+    /// every variant of the four names gates.
+    #[test]
+    fn env_keys_that_repoint_core_paths_are_refused() {
+        let settings = |env: &[(&str, &str)]| Settings {
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let verdict = validate_settings(
+            &settings(&[
+                ("PATH", r"C:\bin"),
+                ("xray.location.asset", r"C:\assets"),
+                (" Xray_Location_Cert ", r"C:\certs"),
+            ]),
+            &ServersFile::default(),
+            19999,
+        );
+        let overrides: Vec<&ValidationIssue> = verdict
+            .iter()
+            .filter(|issue| matches!(issue.code, ValidationCode::EnvCorePathOverride(_)))
+            .collect();
+        assert_eq!(overrides.len(), 2, "{verdict:#?}");
+        assert_eq!(overrides[0].path.as_deref(), Some("env[1]"));
+        assert_eq!(
+            overrides[0].code,
+            ValidationCode::EnvCorePathOverride("xray.location.asset".into())
+        );
+        assert_eq!(overrides[1].path.as_deref(), Some("env[2]"));
+        assert_eq!(overrides[1].severity, Severity::Error);
+        for key in [
+            "XRAY_LOCATION_ASSET",
+            "XRAY_LOCATION_CONFDIR",
+            "XRAY_LOCATION_CONFIG",
+            "XRAY_LOCATION_CERT",
+        ] {
+            let verdict = validate_settings(
+                &settings(&[(key, r"C:\elsewhere")]),
+                &ServersFile::default(),
+                19999,
+            );
+            assert!(
+                verdict
+                    .iter()
+                    .any(|issue| issue.code == ValidationCode::EnvCorePathOverride(key.into())),
+                "{key} must gate: {verdict:#?}"
+            );
+        }
+    }
+
+    /// Every `tun.gateway` entry becomes an adapter address, and the core
+    /// parses each with `netip.MustParsePrefix` — a malformed entry panics the
+    /// process at load. The model requires a CIDR prefix on every non-empty
+    /// A flattened settings key that folds onto a modeled field is read by
+    /// the core and not by the model: a DNS `Script` path would bypass the
+    /// locality rule, and a TUN `Gateway`/`DestOverride` would change the
+    /// emitted inbound. All three gate as Errors.
+    #[test]
+    fn settings_extra_keys_that_fold_onto_modeled_fields_gate() {
+        let mut settings = Settings::default();
+        settings
+            .dns
+            .extra
+            .insert("Script".into(), json!(r"\\attacker\share\d.lua"));
+        let verdict = validate_settings(&settings, &ServersFile::default(), 19999);
+        let finding = verdict
+            .iter()
+            .find(|issue| {
+                matches!(
+                    &issue.code,
+                    ValidationCode::SettingsExtraShadow(key) if key == "Script"
+                ) && issue.path.as_deref() == Some("dns.Script")
+            })
+            .unwrap_or_else(|| panic!("the DNS script shadow must gate: {verdict:#?}"));
+        assert_eq!(finding.severity, Severity::Error);
+
+        let mut settings = Settings {
+            mode: Mode::Tun,
+            ..Default::default()
+        };
+        settings
+            .tun
+            .extra
+            .insert("Gateway".into(), json!(["10.0.0.1/24"]));
+        settings
+            .tun
+            .sniffing
+            .extra
+            .insert("DestOverride".into(), json!(["http"]));
+        let verdict = validate_settings(&settings, &ServersFile::default(), 19999);
+        for (key, path) in [
+            ("Gateway", "tun.Gateway"),
+            ("DestOverride", "tun.sniffing.DestOverride"),
+        ] {
+            let finding = verdict
+                .iter()
+                .find(|issue| {
+                    matches!(
+                        &issue.code,
+                        ValidationCode::SettingsExtraShadow(carried) if carried == key
+                    ) && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| panic!("{key} must gate at {path}: {verdict:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+        }
+    }
+
+    /// entry the TUN document emits, and stays silent for the rest.
+    #[test]
+    fn tun_gateway_entries_must_parse_as_prefixes() {
+        let tun = |mode: Mode, gateway: &[&str]| Settings {
+            mode,
+            tun: TunCfg {
+                gateway: gateway.iter().map(|entry| (*entry).to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for entry in [
+            "10.255.0.1",
+            "not-a-prefix",
+            "10.0.0.0/33",
+            "fd00::1/129",
+            // `ipnet` reads numbers and accepts these; Go's
+            // `netip.ParsePrefix` rejects them and the core panics.
+            "010.255.0.1/30",
+            "10.255.0.1/030",
+            "fd00::1/064",
+            "::ffff:010.1.2.3/120",
+            "::010.1.2.3/120",
+        ] {
+            let settings = tun(Mode::Tun, &["10.255.0.1/30", entry]);
+            let verdict = validate_settings(&settings, &ServersFile::default(), 19999);
+            let path = "tun.gateway[1]";
+            let finding = verdict
+                .iter()
+                .find(|issue| {
+                    matches!(issue.code, ValidationCode::TunGatewayInvalid(_))
+                        && issue.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| panic!("{entry:?} must gate at {path}: {verdict:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(finding.target, FindingTarget::Tun);
+        }
+        assert!(
+            !validate_settings(
+                &tun(Mode::Tun, &["10.255.0.1/30", "fd00::1/126"]),
+                &ServersFile::default(),
+                19999,
+            )
+            .iter()
+            .any(|issue| matches!(issue.code, ValidationCode::TunGatewayInvalid(_))),
+            "CIDR prefixes stay legal"
+        );
+        assert!(
+            !validate_settings(
+                &tun(Mode::Off, &["10.255.0.1"]),
+                &ServersFile::default(),
+                19999,
+            )
+            .iter()
+            .any(|issue| matches!(issue.code, ValidationCode::TunGatewayInvalid(_))),
+            "a config that emits no TUN inbound carries no gateway list"
+        );
     }
 
     #[test]

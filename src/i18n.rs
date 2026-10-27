@@ -1656,6 +1656,10 @@ keys! {
     FinalmaskPortNumberRange 0,
     FinalmaskPortEnvNameRequired 0,
     FinalmaskPortListInvalid 1,
+    FinalmaskPortListTooLarge 0,
+    /// A finalmask extra key that folds onto a modeled wire key of the same
+    /// container (the carried key is the argument).
+    FinalmaskExtraShadow 1,
     FinalmaskBytesValueRequired 1,
     FinalmaskArrayByteSyntax 0,
     FinalmaskStrByteSyntax 0,
@@ -1817,6 +1821,9 @@ keys! {
     SettingsDokodemoUnixSocketConflict 3,
     SettingsDokodemoPortZero 1,
     SettingsTunIpv4GatewayRequired 0,
+    /// A `tun.gateway` entry that is not a CIDR prefix (the entry is the
+    /// argument).
+    SettingsTunGatewayInvalid 1,
     SettingsTunLeakRoutingTableRequired 0,
     SettingsTunLeakValueUnknown 1,
     SettingsTunLeakMisconfigTunOff 0,
@@ -1829,6 +1836,17 @@ keys! {
     SettingsDnsBootstrapNotResolvable 0,
     SettingsLuaScriptPathRequired 0,
     SettingsLuaScriptPathNotLua 0,
+    /// A file path the core opens at load that is remote or parent-relative
+    /// (the path is the argument).
+    FilePathRemote 1,
+    /// A TLS extra key that folds onto a modeled TLS field (the key is the
+    /// argument).
+    TlsExtraShadow 1,
+    /// A `settings.env` key that re-points core path resolution (the key is
+    /// the argument).
+    EnvCorePathOverride 1,
+    SettingsExtraShadow 1,
+    XmuxExtraShadow 1,
     SettingsDnsScriptFallbackConflict 0,
     SettingsDnsScriptServerConflict 2,
     SettingsRoutingScriptRulesConflict 0,
@@ -2087,6 +2105,7 @@ keys! {
     GenObservatoryProbeHostBlocked 1,
     GenProbeHostBlocked 1,
     GenApiPort 1,
+    GenFoldedKey 1,
     IntegrityBalancerMissing 1,
     IntegrityBalancerTagEmpty 0,
     IntegrityBalancerTagDuplicate 1,
@@ -2101,7 +2120,6 @@ keys! {
     IntegrityRouteAttributeKey 1,
     RtLogOperationCancelled (Log, Warn, 2),
     RtLogUpdateFinishedAfterStop (Log, Warn, 0),
-    RtLogApiEndpointCommitted (Log, Info, 1),
     RtLogCoreStartedDirect (Log, Info, 1),
     RtLogTunGracefulCloseFailed (Log, Warn, 1),
     RtLogTunCoreStopWindow (Log, Warn, 0),
@@ -2295,6 +2313,8 @@ keys! {
     HelperWireConfigMissing 0,
     HelperWireConfigEncodingInvalid 0,
     HelperWirePortInvalid 0,
+    HelperStageBaseOwnerUntrusted 1,
+    HelperDnsTargetNotAdapter 1,
     HelperConfigTooLarge 2,
     HelperMalformedStartCommand (Log, Error, 0),
     HelperStageValidated (Log, Info, 1),
@@ -2810,6 +2830,8 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
                     .unwrap_or_else(|| "None".into()),
             ],
         ),
+        FinalmaskExtraShadow(arg) => (Key::FinalmaskExtraShadow, vec![format!("{arg:?}")]),
+        FinalmaskPortListTooLarge => (Key::FinalmaskPortListTooLarge, Vec::new()),
         // Editor rules that moved into the model pass: the error-list text
         // keeps the existing key (its bytes are the editor's contract).
         SendThroughInvalid => (Key::SrvSendThroughInvalidShort, Vec::new()),
@@ -2889,6 +2911,7 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         ),
         DokodemoPortZero(tag) => (Key::SettingsDokodemoPortZero, vec![format!("{tag:?}")]),
         TunIpv4GatewayRequired => (Key::SettingsTunIpv4GatewayRequired, Vec::new()),
+        TunGatewayInvalid(arg) => (Key::SettingsTunGatewayInvalid, vec![arg.clone()]),
         TunLeakRoutingTableRequired => (Key::SettingsTunLeakRoutingTableRequired, Vec::new()),
         TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![arg.clone()]),
         TunLeakMisconfigTunOff => (Key::SettingsTunLeakMisconfigTunOff, Vec::new()),
@@ -2924,6 +2947,11 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         DnsBootstrapNotResolvable => (Key::SettingsDnsBootstrapNotResolvable, Vec::new()),
         LuaScriptPathRequired => (Key::SettingsLuaScriptPathRequired, Vec::new()),
         LuaScriptPathNotLua => (Key::SettingsLuaScriptPathNotLua, Vec::new()),
+        FilePathRemote(arg) => (Key::FilePathRemote, vec![arg.clone()]),
+        TlsExtraShadow(arg) => (Key::TlsExtraShadow, vec![arg.clone()]),
+        EnvCorePathOverride(arg) => (Key::EnvCorePathOverride, vec![arg.clone()]),
+        SettingsExtraShadow(arg) => (Key::SettingsExtraShadow, vec![arg.clone()]),
+        XmuxExtraShadow(arg) => (Key::XmuxExtraShadow, vec![arg.clone()]),
         DnsScriptFallbackConflict => (Key::SettingsDnsScriptFallbackConflict, Vec::new()),
         DnsScriptServerConflict(index, field) => (
             Key::SettingsDnsScriptServerConflict,
@@ -5189,6 +5217,13 @@ mod en {
             Key::FinalmaskUnknownUdpMask => {
                 "unsupported future UDP mask discriminator {:?}. The raw value is preserved"
             }
+            Key::FinalmaskExtraShadow => {
+                "{} reaches Xray as a modeled field. The stored value skips the rules that field \
+                 takes"
+            }
+            Key::FinalmaskPortListTooLarge => {
+                "the port list expands past 65536 ports. Xray builds the whole list at load"
+            }
             Key::DashboardMemory => "mem {} · sys {} · {} live objs · GC {}",
             Key::DashboardInboundTraffic => "Inbound traffic",
             Key::DashboardInboundNoListener => {
@@ -5356,6 +5391,10 @@ mod en {
                 "TUN mode needs at least one IPv4 gateway (the in-tun DNS address is derived \
                  from it)"
             }
+            Key::SettingsTunGatewayInvalid => {
+                "The gateway entry {} is not an address with a prefix length. Xray stops when it \
+                 reads the gateway list"
+            }
             Key::SettingsTunLeakRoutingTableRequired => {
                 "The leak block needs a non-empty routing table. The core refuses to load the \
                  configuration without it."
@@ -5383,6 +5422,26 @@ mod en {
                 "the script path is required once a script is enabled"
             }
             Key::SettingsLuaScriptPathNotLua => "the script path must name a .lua file",
+            Key::FilePathRemote => {
+                "The file path {} is a network, device, or URL form, or it holds a parent folder. \
+                 The core opens this path at load, so only a local path is safe"
+            }
+            Key::TlsExtraShadow => {
+                "The TLS block carries {} beside a modeled field of the same name. The core reads \
+                 the carried value, so remove it"
+            }
+            Key::EnvCorePathOverride => {
+                "The environment key {} overrides a core path. Xray reads this variable before it \
+                 resolves its assets"
+            }
+            Key::SettingsExtraShadow => {
+                "The settings block carries {} beside a modeled field of the same name. The core \
+                 reads the carried value, so remove it"
+            }
+            Key::XmuxExtraShadow => {
+                "The xmux block carries {} beside a modeled field of the same name. The core \
+                 reads the carried value, so remove it"
+            }
             Key::SettingsDnsScriptFallbackConflict => {
                 "A DNS script cannot be combined with disableFallback or \
                  disableFallbackIfMatch. Turn the script off or clear those flags."
@@ -5859,6 +5918,10 @@ mod en {
                  cloud-metadata hosts is not allowed."
             }
             Key::GenApiPort => "The app cannot allocate a loopback API port: {}",
+            Key::GenFoldedKey => {
+                "The configuration carries {} beside a spelling the core reads as the same \
+                 field. Remove one"
+            }
             Key::IntegrityBalancerMissing => "The balancer at index {} does not exist.",
             Key::IntegrityBalancerTagEmpty => "The balancer tag is required.",
             Key::IntegrityBalancerTagDuplicate => "The balancer tag {} is already in use.",
@@ -5877,7 +5940,6 @@ mod en {
             Key::RtLogUpdateFinishedAfterStop => {
                 "core update finished after the stop request; health-checked on the next start"
             }
-            Key::RtLogApiEndpointCommitted => "control plane endpoint committed: 127.0.0.1:{}",
             Key::RtLogCoreStartedDirect => "core started as a direct child (pid {})",
             Key::RtLogTunGracefulCloseFailed => {
                 "TUN graceful close failed; using the process fallback: {}"
@@ -6265,6 +6327,12 @@ mod en {
                 "The start command configuration content is not valid base64."
             }
             Key::HelperWirePortInvalid => "The start command carries an invalid API port.",
+            Key::HelperStageBaseOwnerUntrusted => {
+                "The secure runtime directory {} has an owner other than an administrator."
+            }
+            Key::HelperDnsTargetNotAdapter => {
+                "The TUN adapter does not own the DNS address {} that this configuration names."
+            }
             Key::HelperConfigTooLarge => {
                 "The configuration content of {} bytes cannot cross the helper pipe with its {} byte \
                  cap, so the app refuses to start."

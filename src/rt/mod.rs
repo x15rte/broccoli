@@ -2479,7 +2479,6 @@ impl Runtime {
         self.lifecycle.requested_tun_mode = tun_mode;
         self.api_port = api_port;
         self.grpc = GrpcClient::new(api_port);
-        self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
     }
 
     // -- backend lifecycle ---------------------------------------------------
@@ -2625,12 +2624,11 @@ impl Runtime {
             },
         };
         if api_port != self.api_port {
-            self.api_port = api_port;
-            self.grpc = GrpcClient::new(api_port);
             // The listen address comes from the artefact this start wrote or
             // committed, never from Settings: the fresh candidate's own
-            // `api.listen` is the endpoint the app must poll.
-            self.app_log(Diag::new(Key::RtLogApiEndpointCommitted).arg(api_port));
+            // `api.listen` is the endpoint the app polls through this client.
+            self.api_port = api_port;
+            self.grpc = GrpcClient::new(api_port);
         }
         self.lifecycle.backoff.reset_since();
         self.lifecycle.core_update.clear_last_error();
@@ -3158,27 +3156,19 @@ impl Runtime {
     // -- exit handling -------------------------------------------------------
 
     /// Best-effort OS resolver-cache flush on TUN up/down transitions
-    /// (`ipconfig /flushdns` — DnsFlushResolverCache). The Windows cache
+    /// (`DnsFlushResolverCache`, in-process). The Windows cache
     /// keeps pre-TUN ISP answers alive; after a route change they would be
     /// served stale (Xray does not flush the cache when its tunnel comes up
     /// or goes down).
     /// Failure is non-fatal: the cache ages out on its own, so errors are
     /// logged, not surfaced.
     fn flush_dns_cache(&mut self) {
-        // `ipconfig` is a console-subsystem child; created through
-        // [`crate::sys::hidden_command`] (`CREATE_NO_WINDOW`) so it cannot
-        // pop a console window from the GUI-subsystem app (user report: a
-        // console window appeared when TUN was enabled — the flush runs on
-        // every TUN up/down transition).
-        match crate::sys::hidden_command("ipconfig")
-            .arg("/flushdns")
-            .status()
-        {
-            // A non-zero exit is expected when the GUI is unelevated on a
-            // Windows build that requires elevation for `ipconfig /flushdns`.
-            // The elevated helper flushes at TUN start and on restore, so this
-            // fallback stays silent; only a spawn failure is actionable.
-            Ok(_) => {}
+        // The flush calls `DnsFlushResolverCache` in-process through
+        // [`crate::sys::flush_dns_cache`], so it spawns no console child.
+        match crate::sys::flush_dns_cache() {
+            // The helper also flushes at TUN start and on restore, so a
+            // failure here is logged best-effort and never surfaced.
+            Ok(()) => {}
             Err(error) => self.app_log(Diag::new(Key::RtLogDnsFlushFailed).arg(error)),
         }
     }

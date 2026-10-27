@@ -94,6 +94,9 @@ impl CoreInvocation {
     /// caller still chooses its pipes and the job object that pins the child.
     pub(crate) fn std_command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
+        for name in crate::model::settings::CORE_LOCATION_ENV_NAMES {
+            command.env_remove(name);
+        }
         command
             .args(&self.args)
             .current_dir(&self.dir)
@@ -106,6 +109,9 @@ impl CoreInvocation {
     /// The same for a tokio process object (see [`Self::std_command`]).
     pub(crate) fn tokio_command(&self) -> tokio::process::Command {
         let mut command = Command::new(&self.program);
+        for name in crate::model::settings::CORE_LOCATION_ENV_NAMES {
+            command.env_remove(name);
+        }
         command
             .args(&self.args)
             .current_dir(&self.dir)
@@ -552,17 +558,48 @@ mod tests {
                 config.as_os_str()
             ]
         );
-        let env: Vec<_> = test
+        let env: std::collections::BTreeMap<_, _> = test
             .get_envs()
             .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
             .collect();
         assert_eq!(
-            env,
-            vec![(
-                std::ffi::OsString::from(XRAY_LOCATION_ASSET),
-                Some(dir.into())
-            )]
+            env.get(std::ffi::OsStr::new(XRAY_LOCATION_ASSET)),
+            Some(&Some(dir.into()))
         );
+    }
+
+    /// Location overrides inherited from the GUI's environment never reach
+    /// the core: Xray checks the dotted `xray.location.*` spellings before the
+    /// uppercase ones, so any inherited value would beat the pinned asset
+    /// directory. The builder removes all eight names and sets only
+    /// `XRAY_LOCATION_ASSET`, to the core directory.
+    #[test]
+    fn the_launch_scrubs_inherited_core_location_variables() {
+        let dir = std::path::Path::new(r"C:\core");
+        let config = dir.join("config.json");
+
+        let env: std::collections::BTreeMap<_, _> = CoreInvocation::run(dir, &config)
+            .std_command()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect();
+
+        for name in crate::model::settings::CORE_LOCATION_ENV_NAMES {
+            let value = env.get(std::ffi::OsStr::new(name));
+            if name == XRAY_LOCATION_ASSET {
+                assert_eq!(
+                    value,
+                    Some(&Some(dir.into())),
+                    "{name} must point at the core directory"
+                );
+            } else {
+                assert_eq!(
+                    value,
+                    Some(&None),
+                    "{name} must be removed from the inherited environment"
+                );
+            }
+        }
     }
 
     /// The converted spawn failure renders its keyed frame with the keyed

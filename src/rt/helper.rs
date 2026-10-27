@@ -598,7 +598,14 @@ struct LoadedProtectedDirectory {
     /// Number of descriptor bytes initialized at the base of `words`.
     byte_len: usize,
     control: SECURITY_DESCRIPTOR_CONTROL,
+    /// The owner is one of the principals this app creates the directory
+    /// with: Administrators or the current user. Access is governed by the
+    /// DACL, so both are acceptable for a stage directory.
     owner_is_expected: bool,
+    /// The owner is Administrators or SYSTEM — a principal that a
+    /// medium-integrity process of an administrator account cannot assign,
+    /// which is what the stage base itself requires.
+    owner_is_privileged: bool,
     dacl_present: bool,
     dacl: *mut ACL,
 }
@@ -613,6 +620,25 @@ impl LoadedProtectedDirectory {
         // outlive the storage the `dacl`/SID pointers target.
         unsafe { std::slice::from_raw_parts(self.words.as_mut_ptr().cast::<u8>(), self.byte_len) }
     }
+}
+
+/// Whether `owner` is a principal the stage base itself may belong to:
+/// Administrators or SYSTEM. Both require an elevated token to assign, so a
+/// medium-integrity process of an administrator account — whose created
+/// objects default to its own user SID — cannot produce either. `owner`
+/// points at a SID in live storage; the well-known SIDs are built here.
+fn owner_is_privileged(owner: PSID) -> bool {
+    [WinLocalSystemSid, WinBuiltinAdministratorsSid]
+        .into_iter()
+        .filter_map(|kind| Sid::well_known(kind).ok())
+        .any(|sid| {
+            // SAFETY: `owner` is a SID pointer into storage the caller keeps
+            // alive — null when the descriptor carries no owner, which
+            // `EqualSid` rejects with ERROR_INVALID_PARAMETER — and
+            // `sid.psid()` is the owned well-known SID built just above.
+            // EqualSid only reads both.
+            unsafe { EqualSid(owner, sid.psid()) }.is_ok()
+        })
 }
 
 /// Load a protected runtime directory's descriptor, control bits, owner
@@ -697,6 +723,7 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
         || current_process_user_sid()
             .ok()
             .is_some_and(|own| unsafe { EqualSid(owner, own.psid()) }.is_ok());
+    let owner_is_privileged = owner_is_privileged(owner);
 
     let mut dacl_present = BOOL(0);
     let mut dacl_defaulted = BOOL(0);
@@ -720,6 +747,7 @@ fn load_protected_directory(path: &Path) -> Result<LoadedProtectedDirectory, Dia
         byte_len,
         control,
         owner_is_expected,
+        owner_is_privileged,
         dacl_present: dacl_present.as_bool(),
         dacl,
     })
@@ -810,10 +838,21 @@ fn validated_ace(ace: *const core::ffi::c_void, buffer: &[u8]) -> Option<Validat
 
 fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
     let loaded = load_protected_directory(path)?;
+    verify_loaded_protected(&loaded, loaded.owner_is_expected)
+}
+
+/// The strict-shape half of [`verify_protected_directory`], for a caller that
+/// already loaded the descriptor. `owner_ok` is the caller's owner rule: a
+/// stage directory takes the two principals this app creates it with, while
+/// the stage base takes only the elevated ones.
+fn verify_loaded_protected(
+    loaded: &LoadedProtectedDirectory,
+    owner_ok: bool,
+) -> Result<(), DiagError> {
     if !loaded.control.contains(SE_DACL_PRESENT) || !loaded.control.contains(SE_DACL_PROTECTED) {
         return Err(DiagError::new(Diag::new(Key::HelperDaclMissingOrInherited)));
     }
-    if !loaded.owner_is_expected {
+    if !owner_ok {
         return Err(DiagError::new(Diag::new(Key::HelperOwnerUnexpected)));
     }
     if !loaded.dacl_present || loaded.dacl.is_null() {
@@ -885,6 +924,27 @@ fn verify_protected_directory(path: &Path) -> Result<(), DiagError> {
         return Err(DiagError::new(Diag::new(Key::HelperAcePrincipalMissing)));
     }
     Ok(())
+}
+
+/// Verify a directory that is the stage base itself: the strict protected
+/// shape, and an owner that only an elevated token can assign.
+///
+/// `C:\ProgramData` lets `BUILTIN\Users` create entries, and a directory's
+/// creator owns it with implicit WRITE_DAC. A medium-integrity process of an
+/// administrator account could therefore pre-create this directory with the
+/// strict two-ACE protected DACL and a `dns-takeover.json` inside it; the next
+/// authenticated helper start would restore that record and point the
+/// machine's DNS at the attacker's servers. Current-user ownership is
+/// acceptable for the throwaway stage directories under the base — they are
+/// created with `CREATE_NEW` there — but never for the base.
+fn verify_stage_base(path: &Path) -> Result<(), DiagError> {
+    let loaded = load_protected_directory(path)?;
+    if !loaded.owner_is_privileged {
+        return Err(DiagError::new(
+            Diag::new(Key::HelperStageBaseOwnerUntrusted).arg(path.display()),
+        ));
+    }
+    verify_loaded_protected(&loaded, true)
 }
 
 /// True when `path`'s DACL is a shape the helper may repair into the strict
@@ -1083,6 +1143,11 @@ fn create_protected_directory(path: &Path, allow_existing: bool) -> Result<(), D
 fn secure_stage_base() -> Result<PathBuf, DiagError> {
     let base = trusted_program_data()?.join(STAGE_BASE);
     create_protected_directory(&base, true)?;
+    // The creation above accepts an existing directory, and the strict DACL
+    // alone does not prove the owner: a directory the user pre-created keeps
+    // their ownership and implicit WRITE_DAC. Fail closed on that instead of
+    // trusting a record such a directory can still replace.
+    verify_stage_base(&base)?;
     Ok(base)
 }
 
@@ -1859,6 +1924,32 @@ fn takeover_needed(dns_takeover: bool, config: Option<&serde_json::Value>) -> bo
     dns_takeover && config.is_some_and(crate::model::inbound::config_runs_tun_dns)
 }
 
+/// The first configured DNS target the named adapter does not own, or `None`
+/// when every target is one of its live unicast addresses.
+///
+/// The takeover points every other adapter's DNS at the tunnel, so the target
+/// has to be an address the tunnel adapter itself answers on. A hand-edited
+/// config or gateway that names some other host — a LAN router, a public
+/// resolver — would otherwise become the machine's DNS server as soon as the
+/// in-tun listener failed to come up. Addresses are compared as parsed values:
+/// `NetIf.ips` holds the textual form `GetAdaptersAddresses` reports.
+fn missing_tun_target(
+    interfaces: &[crate::sys::netif::NetIf],
+    name: &str,
+    targets: &[std::net::IpAddr],
+) -> Option<std::net::IpAddr> {
+    let owned: Vec<std::net::IpAddr> = interfaces
+        .iter()
+        .filter(|iface| iface.name == name)
+        .flat_map(|iface| iface.ips.iter())
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
+    targets
+        .iter()
+        .copied()
+        .find(|target| !owned.contains(target))
+}
+
 fn helper_start(
     current: &Arc<Mutex<Option<HelperChild>>>,
     writer: &Arc<Mutex<File>>,
@@ -1997,25 +2088,27 @@ fn helper_start(
             _stage: stage,
         });
     }
-    // System DNS takeover: while a TUN core with a DNS module runs, point every
-    // connected physical adapter's DNS at the tunnel so a name the tunnel
-    // answers with a negative result does not wait out the resolver's whole
-    // retry schedule
-    // (see `sys::dns_takeover`). It triggers on the same gate that makes the
-    // core emit its leak block — a TUN inbound and a top-level `dns` object —
-    // plus the app-owned switch. The TUN adapter (and its interface index) exists only
-    // after the child's tun inbound comes up, so the index is resolved by
-    // polling `GetAdaptersAddresses` for the staged tun name, and that index
-    // is what excludes the tunnel adapter itself from the capture. The
-    // capture is written before anything changes, so a failure still leaves
-    // a repair behind. Installed after the slot assignment so a concurrently
-    // exiting previous child's reaper never tears down a takeover this start
-    // has just applied. If this child dies during the poll nothing may be
-    // taken over for a corpse whose stage the reaper is about to delete, so
-    // the installer re-checks slot/child liveness after the index resolves
-    // (and while polling) and skips the takeover when the child is gone —
-    // see the poll and post-resolve checks below. Best-effort: failures are
-    // logged, never fatal.
+    // System DNS takeover: while a TUN core with a DNS module runs, point
+    // every connected physical adapter's DNS at the tunnel so a name the
+    // tunnel answers with a negative result does not wait out the resolver's
+    // whole retry schedule (see `sys::dns_takeover`). It triggers on the same
+    // gate that makes the core emit its leak block — a TUN inbound and a
+    // top-level `dns` object — plus the app-owned switch. The TUN adapter
+    // (and its interface index) exists only after the child's tun inbound
+    // comes up, so the index is resolved by polling `GetAdaptersAddresses`
+    // for the staged tun name, and that index is what excludes the tunnel
+    // adapter itself from the capture. The address the takeover points every
+    // other adapter at must be one the tunnel adapter itself owns, so a
+    // config that names any other host can never become the machine's DNS
+    // server. The capture is written before anything changes, so a failure
+    // still leaves a repair behind. Installed after the slot assignment so a
+    // concurrently exiting previous child's reaper never tears down a
+    // takeover this start has just applied. If this child dies during the
+    // poll nothing may be taken over for a corpse whose stage the reaper is
+    // about to delete, so the installer re-checks slot/child liveness after
+    // the index resolves (and while polling) and skips the takeover when the
+    // child is gone — see the poll and post-resolve checks below.
+    // Best-effort: failures are logged, never fatal.
     let config_text = fs::read_to_string(stage_path.join(STAGED_CONFIG)).ok();
     let config: Option<serde_json::Value> = config_text
         .as_deref()
@@ -2028,20 +2121,44 @@ fn helper_start(
         {
             None => Some(DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))),
             Some(name) => {
+                // The takeover targets the config's in-tun listener address.
+                // That address must be one the adapter itself owns: a
+                // hand-edited config or gateway could otherwise point the
+                // machine's DNS at a LAN host when the in-tun listener add
+                // fails, and no such target is ever engaged.
+                let in_tun = crate::rt::dns_in::listener_for_bytes(config_bytes);
+                let wanted: Vec<std::net::IpAddr> = in_tun
+                    .as_ref()
+                    .map(crate::rt::dns_in::Listener::addresses)
+                    .unwrap_or_default();
                 // The staged core can die while its TUN inbound is still
                 // coming up (wintun fault, bad config, a racing stop).
                 // Polling on would only resolve the index of an adapter whose
                 // owner is gone, so the poll stops as soon as the slot no
                 // longer holds this live child, and nothing is taken over for
-                // a corpse — this start's reaper reports the exit.
+                // a corpse — this start's reaper reports the exit. Both the
+                // index and the adapter's addresses appear once the inbound is
+                // up, so one poll waits for both.
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                let mut ifindex = crate::sys::netif::interface_index_by_name(&name);
-                while ifindex.is_none() && std::time::Instant::now() < deadline {
+                let interfaces = crate::sys::netif::list_all();
+                let mut ifindex = interfaces
+                    .iter()
+                    .find(|iface| iface.name == name)
+                    .map(|iface| iface.index);
+                let mut missing = missing_tun_target(&interfaces, &name, &wanted);
+                while (ifindex.is_none() || missing.is_some())
+                    && std::time::Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(500));
                     if !child_is_live_current(current, pid) {
                         break;
                     }
-                    ifindex = crate::sys::netif::interface_index_by_name(&name);
+                    let interfaces = crate::sys::netif::list_all();
+                    ifindex = interfaces
+                        .iter()
+                        .find(|iface| iface.name == name)
+                        .map(|iface| iface.index);
+                    missing = missing_tun_target(&interfaces, &name, &wanted);
                 }
                 // Resolving the index can take up to the poll deadline; the
                 // child may have died inside it, leaving no live tunnel to
@@ -2049,19 +2166,22 @@ fn helper_start(
                 if !child_is_live_current(current, pid) {
                     None
                 } else if let Some(ifindex) = ifindex {
-                    // The takeover targets the in-tun listener address,
-                    // derived from the same staged config; its capture is
-                    // written before the first change, so a failure here
-                    // still leaves a repair behind.
+                    // The target addresses just proved to belong to the
+                    // adapter; the capture is written before the first
+                    // change, so a failure here still leaves a repair behind.
                     let outcome = (|| -> Result<
                         Option<crate::sys::dns_takeover::TakeoverCounts>,
                         DiagError,
                     > {
                         let path = dns_takeover_record_path()?;
-                        let in_tun = crate::rt::dns_in::listener_for_bytes(config_bytes)
-                            .ok_or_else(|| {
-                                DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))
-                            })?;
+                        let in_tun = in_tun.ok_or_else(|| {
+                            DiagError::new(Diag::new(Key::HelperConfigNoTunAdapter))
+                        })?;
+                        if let Some(missing) = missing {
+                            return Err(DiagError::new(
+                                Diag::new(Key::HelperDnsTargetNotAdapter).arg(missing),
+                            ));
+                        }
                         // A committed session end may have started while the
                         // adapter index was resolving; the restore takes the
                         // same lock, so re-check inside it. A start that loses
@@ -2101,10 +2221,11 @@ fn helper_start(
                     })();
                     match outcome {
                         Ok(Some(counts)) => {
-                            // The GUI cannot flush an unelevated `ipconfig` on
-                            // builds that require elevation for it; the helper
-                            // owns this transition and can. `report_takeover`
-                            // already flushes when it restored an old adapter.
+                            // This transition happens inside the helper, so
+                            // the helper's own resolver-cache flush covers it;
+                            // the GUI's flush runs only on its own path.
+                            // `report_takeover` already flushes when it
+                            // restored an old adapter.
                             if counts.restored == 0 {
                                 flush_resolver_cache();
                             }
@@ -2347,12 +2468,12 @@ fn restore_dns_takeover_locked(record_path: &Path) -> Result<Option<usize>, Diag
 /// Drop the resolver cache after a restore. The cache can hold answers
 /// resolved through the tunnel, and the helper restores on paths where the
 /// GUI's transition flush does not run. Best-effort, like that flush.
+///
+/// The flush is the `dnsapi` call the helper's own token can make; it never
+/// resolves a command by bare name, which inside the elevated helper would
+/// run a same-named executable from beside the portable binary.
 fn flush_resolver_cache() {
-    let _ = crate::sys::hidden_command("ipconfig")
-        .arg("/flushdns")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = crate::sys::flush_dns_cache();
 }
 
 /// What a session-end message asks the helper to do. Kept separate from the
@@ -3166,6 +3287,8 @@ wire_keys!(
     HelperClientPipeModeFailed,
     HelperClientTimeReadFailed,
     HelperConfigNoTunAdapter,
+    HelperDnsTargetNotAdapter,
+    HelperStageBaseOwnerUntrusted,
     HelperConfigTooLarge,
     HelperConnectCancelled,
     HelperConnectFailed,
@@ -3856,11 +3979,12 @@ mod tests {
         ChildPhase, HelperCommand, HelperEvent, HelperLog, HelperPipe, MAX_WIRE_MESSAGE_BYTES,
         ParentIdentity, STAGED_CONFIG, SecureRuntimeStage, ShutdownAction, config_from_wire,
         current_process_user_sid, dacl_deviation_is_benign, decode_helper_event, decode_helper_log,
-        ensure_protected_directory, key_name, parent_identity_accepts, parse_helper_parent_arg,
-        path_from_units, path_to_wide, process_creation_time_of, read_pipe_message,
-        run_shutdown_window_with_class, shutdown_action, stage_config_bytes_at,
-        stage_entry_allowed, start_wire_message, takeover_needed, to_wide, token_matches,
-        validated_ace, validated_pipe_name, verify_protected_directory,
+        ensure_protected_directory, key_name, missing_tun_target, owner_is_privileged,
+        parent_identity_accepts, parse_helper_parent_arg, path_from_units, path_to_wide,
+        process_creation_time_of, read_pipe_message, run_shutdown_window_with_class,
+        shutdown_action, stage_config_bytes_at, stage_entry_allowed, start_wire_message,
+        takeover_needed, to_wide, token_matches, validated_ace, validated_pipe_name,
+        verify_protected_directory, verify_stage_base,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt};
@@ -4680,6 +4804,111 @@ mod tests {
             "foreign-SID deviation must stay fail-closed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only an elevated token can assign Administrators or SYSTEM as an
+    /// object's owner. A directory this test process creates itself is owned
+    /// by its user SID when the process is medium-integrity, so it carries
+    /// the strict DACL yet must still be refused as the stage base, whose
+    /// contents a helper start later trusts. Under an elevated token the
+    /// created directory's owner is Administrators and the base is accepted.
+    #[test]
+    fn a_user_owned_stage_base_is_refused() {
+        let dir = probe_dir("stage-base");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create probe dir");
+        let own = current_process_user_sid().expect("current user SID");
+        write_probe_dacl(&dir, &[], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("apply strict probe DACL");
+        assert!(
+            verify_protected_directory(&dir).is_ok(),
+            "the strict shape alone must verify"
+        );
+        if crate::sys::elevation::is_elevated() {
+            assert!(
+                verify_stage_base(&dir).is_ok(),
+                "an elevated token creates the directory as Administrators, which the stage base accepts"
+            );
+        } else {
+            let error =
+                verify_stage_base(&dir).expect_err("a user-owned stage base must not be trusted");
+            assert_eq!(error.diag().key(), Key::HelperStageBaseOwnerUntrusted);
+        }
+        // The strict DACL leaves an unelevated token no delete right; restore
+        // a user ACE first, as the other probe tests do.
+        write_probe_dacl(&dir, &[own.psid()], STRICT_FLAGS, false, STRICT_FLAGS)
+            .expect("restore probe user ACE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_administrators_and_system_own_a_trusted_stage_base() {
+        let administrators =
+            Sid::well_known(WinBuiltinAdministratorsSid).expect("Administrators SID");
+        let system = Sid::well_known(WinLocalSystemSid).expect("SYSTEM SID");
+        assert!(owner_is_privileged(administrators.psid()));
+        assert!(owner_is_privileged(system.psid()));
+        let own = current_process_user_sid().expect("current user SID");
+        assert!(
+            !owner_is_privileged(own.psid()),
+            "the interactive user SID is not an owner a medium-integrity process cannot take"
+        );
+    }
+
+    /// The takeover may only point the system's DNS at an address the tunnel
+    /// adapter owns. A v4-only adapter, a v6-only one, and a mismatch each
+    /// decide from the adapter's own unicast list, never from the config.
+    #[test]
+    fn a_dns_takeover_target_must_belong_to_the_tun_adapter() {
+        use crate::sys::netif::test_iface;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1));
+        let v6: IpAddr = "fdfe:dcba:9876::1".parse().expect("v6 literal");
+        let both = [
+            test_iface(
+                "broccoli0",
+                7,
+                false,
+                true,
+                &["10.7.0.1", "fdfe:dcba:9876::1"],
+            ),
+            test_iface("Ethernet", 3, false, true, &["192.168.1.10"]),
+        ];
+        assert_eq!(
+            missing_tun_target(&both, "broccoli0", &[v4]),
+            None,
+            "the adapter owns the v4 target"
+        );
+        assert_eq!(
+            missing_tun_target(&both, "broccoli0", &[v4, v6]),
+            None,
+            "the adapter owns both target families"
+        );
+
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(
+            missing_tun_target(&both, "broccoli0", &[lan]),
+            Some(lan),
+            "an address only another adapter owns is not the tunnel's"
+        );
+        assert_eq!(
+            missing_tun_target(&both, "absent0", &[v4]),
+            Some(v4),
+            "an adapter that does not exist owns no address"
+        );
+
+        let v4_only = [test_iface("broccoli0", 7, false, true, &["10.7.0.1"])];
+        assert_eq!(
+            missing_tun_target(&v4_only, "broccoli0", &[v4]),
+            None,
+            "the v4-only adapter owns its v4 target"
+        );
+        assert_eq!(
+            missing_tun_target(&v4_only, "broccoli0", &[v4, v6]),
+            Some(v6),
+            "a family the adapter has no address in is not owned"
+        );
     }
 
     #[test]

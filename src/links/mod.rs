@@ -1658,6 +1658,37 @@ const XHTTP: TransportSpec = TransportSpec {
                             Diag::new(Key::LinkXhttpExtraJson).arg(excerpt(&error.to_string())),
                         )
                     })?;
+                // Every key that did not bind a typed field stayed in the
+                // flattened map. A case variant of a modeled key still binds
+                // that field in Go's case-insensitive unmarshal, and a
+                // carried `extra` object makes `SplitHTTPConfig.Build`
+                // replace the whole settings object with it, so such a key
+                // would hand the core a value this model never validated.
+                // The shared list is the model pass's, so both gates refuse
+                // the same spellings.
+                if let Some(reserved) = settings.extra.keys().find(|key| {
+                    crate::model::stream::XHTTP_MODELED_WIRE_KEYS
+                        .iter()
+                        .any(|wire| crate::model::equal_fold(key, wire))
+                }) {
+                    return Err(malformed(
+                        Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(reserved)),
+                    ));
+                }
+                // The nested `xmux` object has the same shape: a variant of
+                // a modeled field survives in its flatten map and binds in
+                // Go's decoder, so the exclusivity rule would never see it.
+                if let Some(reserved) = settings.xmux.as_ref().and_then(|xmux| {
+                    xmux.extra.keys().find(|key| {
+                        crate::model::stream::XMUX_MODELED_WIRE_KEYS
+                            .iter()
+                            .any(|wire| crate::model::equal_fold(key, wire))
+                    })
+                }) {
+                    return Err(malformed(
+                        Diag::new(Key::LinkXhttpExtraReserved).arg(excerpt_debug(reserved)),
+                    ));
+                }
                 // The link's own host/path/mode parameters were applied before
                 // this field and #716 spells them outside `extra`, so their
                 // values stay in force.
@@ -2879,21 +2910,29 @@ fn parse_hop_port_list(text: &str, scheme: &str) -> Result<u16, LinkError> {
         )
     };
     let mut first = None;
+    let mut expanded = 0_u64;
     for item in text.split(',') {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
-        let (from, to) = match item.split_once('-') {
+        let (from_text, to_text) = match item.split_once('-') {
             Some((from, to)) => (from.trim(), to.trim()),
             None => (item, item),
         };
-        let from: u16 = from.parse().map_err(|_| invalid(item))?;
-        let to: u16 = to.parse().map_err(|_| invalid(item))?;
+        let from: u16 = from_text.parse().map_err(|_| invalid(item))?;
+        let to: u16 = to_text.parse().map_err(|_| invalid(item))?;
         if from == 0 || from > to {
             return Err(invalid(item));
         }
         first.get_or_insert(from);
+        // The core materializes every range of the list (`PortList.Ports`,
+        // common/net/port.go) before the transport starts, so a list past the
+        // shared cap is refused rather than handed over.
+        expanded = expanded.saturating_add(u64::from(to - from) + 1);
+        if expanded > crate::model::stream::FINALMASK_PORT_LIST_LIMIT {
+            return Err(invalid(item));
+        }
     }
     first.ok_or_else(|| invalid(text))
 }
@@ -4326,6 +4365,39 @@ mod tests {
     }
 
     #[test]
+    fn xhttp_extra_refuses_nested_and_shadowing_settings_keys() {
+        // A case variant of a modeled setting stays out of the typed field
+        // and reaches Xray through Go's case-insensitive unmarshal; a carried
+        // `extra` object replaces the whole settings object in
+        // SplitHTTPConfig.Build. Both spellings must be refused on import with
+        // the key named, before the model gate has to catch them.
+        for (payload, key) in [
+            (
+                r#"{"DownloadSettings":{"security":"tls"}}"#,
+                "DownloadSettings",
+            ),
+            (r#"{"extra":{"security":"tls"}}"#, "extra"),
+            (r#"{"Mode":"packet-up"}"#, "Mode"),
+            (r#"{"xmux":{"MaxConcurrency":"8"}}"#, "MaxConcurrency"),
+        ] {
+            let link = format!(
+                "vless://{UUID}@x.example.com:443?security=tls&sni=x.example.com&type=xhttp&extra={}#X",
+                pct_encode(payload)
+            );
+            match parse_link(&link) {
+                Err(LinkError::Malformed(message)) => {
+                    let text = message.text(Language::En);
+                    assert!(text.contains(key), "the refusal must name {key}: {text:?}");
+                }
+                other => panic!(
+                    "expected Malformed for the {key} key, got {}",
+                    outcome_shape(&other)
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn xhttp_extra_parse_error_never_echoes_the_full_value() {
         // A hostile `extra` value that fails XhttpSettings deserialization
         // must not inflate the error with the whole payload.
@@ -4599,6 +4671,76 @@ mod tests {
         let f = p.outbound.stream.finalmask.as_ref().unwrap();
         assert_eq!(f.udp.len(), 1);
         assert!(canonical.contains("fm="));
+    }
+
+    #[test]
+    fn finalmask_import_refuses_shadowed_modeled_keys() {
+        // A case variant of a modeled key lands in a flattened extra map:
+        // serde builds nothing for it, while Go's case-insensitive unmarshal
+        // builds the typed value from it. The typed walk never reaches the
+        // carried mask, so the import gates instead.
+        for (fm, key, path) in [
+            (
+                r#"{"UDP":[{"type":"noise","settings":{"script":"noise.lua"}}]}"#,
+                "UDP",
+                "finalmask.UDP",
+            ),
+            (
+                r#"{"udp":[{"type":"noise","Settings":{"script":"noise.lua"}}]}"#,
+                "Settings",
+                "finalmask.udp[0].Settings",
+            ),
+            (
+                r#"{"udp":[{"type":"noise","settings":{"Script":"noise.lua"}}]}"#,
+                "Script",
+                "finalmask.udp[0].settings.Script",
+            ),
+            (
+                r#"{"udp":[{"type":"xdns","settings":{
+                    "domains":[{"names":["a.example"],"types":[1]}],
+                    "resolvers":[{"addrs":["udp://1.1.1.1:53"],"TlsConfig":{"masterKeyLog":"keys.log"}}]
+                }}]}"#,
+                "TlsConfig",
+                "finalmask.udp[0].settings.resolvers[0].TlsConfig",
+            ),
+            (
+                r#"{"quicParams":{"Congestion":"brutal"}}"#,
+                "Congestion",
+                "finalmask.quicParams.Congestion",
+            ),
+        ] {
+            let link = format!("vless://{UUID}@fm.local:443?fm={}#Shadow", pct_encode(fm));
+            let error = parse_link(&link).expect_err("the shadowed key must refuse import");
+            let LinkError::InvalidModel { issue, .. } = &error else {
+                panic!("expected the model refusal for {key}, got {error:?}");
+            };
+            assert_eq!(issue.code, ValidationCode::FinalmaskExtraShadow(key.into()));
+            assert_eq!(issue.path.as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    fn finalmask_import_refuses_a_remote_script_path() {
+        // The core compiles the script while it loads the config, so a UNC
+        // path makes the client authenticate to the named SMB server before
+        // any proxy runs.
+        let fm = pct_encode(
+            r#"{"udp":[{"type":"noise","settings":{"script":"\\\\attacker\\share\\p.lua"}}]}"#,
+        );
+        let link = format!("vless://{UUID}@fm.local:443?fm={fm}#Script");
+        let error = parse_link(&link).expect_err("the UNC script path must refuse import");
+        let LinkError::InvalidModel { issue, .. } = &error else {
+            panic!("expected the model refusal, got {error:?}");
+        };
+        assert!(
+            matches!(&issue.code, ValidationCode::FilePathRemote(path) if path.contains("attacker")),
+            "{:?}",
+            issue.code
+        );
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("finalmask.udp[0].settings.script")
+        );
     }
 
     #[test]
@@ -5601,6 +5743,17 @@ mod tests {
         expect_malformed("hysteria2://pw@h.example.com:0");
         // A hop interval names nothing without a hop set.
         expect_unsupported("hysteria2://pw@h.example.com:443?hop_interval=30");
+    }
+
+    #[test]
+    fn hysteria2_refuses_an_unbounded_hop_expansion() {
+        // The core materializes every range of the hop set at config load, so
+        // repeated full ranges are refused rather than handed over. One full
+        // range still fits under the cap.
+        expect_malformed("hysteria2://pw@h.example.com:1-65535,1-65535");
+        expect_malformed("hysteria2://pw@h.example.com?mport=1-65535,1-65535");
+        parse_link("hysteria2://pw@h.example.com:1-65535")
+            .expect("one full range sits under the cap");
     }
 
     #[test]

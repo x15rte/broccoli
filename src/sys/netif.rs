@@ -62,17 +62,6 @@ pub fn list_all() -> Vec<NetIf> {
     enumerate(false).unwrap_or_default()
 }
 
-/// Resolve a network adapter's interface index by its friendly name. The
-/// elevated helper uses this to find the TUN adapter the staged core created,
-/// so the system-DNS takeover can exclude the tunnel adapter itself from the
-/// capture. Matches the name exactly; `None` when no adapter reports it.
-pub fn interface_index_by_name(name: &str) -> Option<u32> {
-    list_all()
-        .into_iter()
-        .find(|iface| iface.name == name)
-        .map(|iface| iface.index)
-}
-
 /// Shared `GetAdaptersAddresses` walk behind `list` and `list_all`.
 /// `exclude_tunnel` is true for `list` (physical outbound interfaces only)
 /// and false for `list_all` (the Xray heuristic's view). Loopback is always

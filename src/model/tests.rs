@@ -1871,6 +1871,21 @@ fn vocabulary_fold_matches_go_simple_lowercase() {
     assert!(!vocabulary_holds(&["forceip"], "forceip\u{307}"));
 }
 
+/// Go's JSON decoder matches object keys to struct fields with
+/// `bytes.EqualFold` semantics, which is wider than an ASCII-only fold: the
+/// long s and the Kelvin sign fold onto `s` and `k`. A shadow check that used
+/// `eq_ignore_ascii_case` would let `DownloadSettingſ` bind `downloadSettings`
+/// in the core while this side saw an unknown key.
+#[test]
+fn json_key_fold_matches_go_equal_fold() {
+    assert!(equal_fold("DownloadSettings", "DownloadSetting\u{17f}"));
+    assert!(equal_fold("masterKeyLog", "master\u{212a}eyLog"));
+    assert!(equal_fold("CERTIFICATE", "certificate"));
+    assert!(equal_fold("", ""));
+    assert!(!equal_fold("downloadSettings", "downloadSettingz"));
+    assert!(!equal_fold("abc", "ab"));
+}
+
 /// The dokodemo listener network and the balancer strategy fold like the core:
 /// `Network.Build` and the router both lowercase the value first
 /// (infra/conf/common.go:77, infra/conf/router.go:37), and the pinned v26.10.21

@@ -1,7 +1,6 @@
 {
   "api": {
     "services": [
-      "ReflectionService",
       "HandlerService",
       "LoggerService",
       "StatsService",

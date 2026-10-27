@@ -1140,8 +1140,25 @@ impl TunCfg {
             if self.mtu == 0 {
                 o.remove("mtu");
             }
-            if self.gateway.is_empty() {
+            // The gateway editor can hold a blank row, and a hand-edited
+            // entry can carry padding; Xray parses every entry with
+            // `netip.MustParsePrefix`, which trims neither and panics on a
+            // blank or padded string. Emit only trimmed, non-empty entries.
+            let gateways: Vec<&str> = self
+                .gateway
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty())
+                .collect();
+            if gateways.is_empty() {
                 o.remove("gateway");
+            } else if gateways.len() != self.gateway.len()
+                || gateways
+                    .iter()
+                    .zip(self.gateway.iter())
+                    .any(|(trimmed, raw)| *trimmed != raw.as_str())
+            {
+                o.insert("gateway".into(), json!(gateways));
             }
             if self.dns.is_empty() {
                 o.remove("dns");
@@ -1274,6 +1291,28 @@ mod tun_tests {
         assert_eq!(
             TunCfg::default().gateway,
             vec!["10.255.0.1/30".to_string(), "fd00::1/64".to_string()]
+        );
+    }
+
+    /// The gateway editor's Add button pushes a blank row, and a hand-edited
+    /// entry can carry padding. Xray parses every entry with
+    /// `netip.MustParsePrefix`, which trims neither and panics the core on a
+    /// blank or padded string, so the wire form holds trimmed, non-empty
+    /// entries only.
+    #[test]
+    fn blank_and_padded_gateway_rows_never_reach_the_wire() {
+        let tun = TunCfg {
+            gateway: vec![
+                " 10.255.0.1/30 ".into(),
+                String::new(),
+                " ".into(),
+                "fd00::1/64".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            tun.to_wire(false)["settings"]["gateway"],
+            serde_json::json!(["10.255.0.1/30", "fd00::1/64"])
         );
     }
 
