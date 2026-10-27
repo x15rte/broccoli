@@ -343,16 +343,11 @@ fn settings_extra_shadow(
     modeled: &[&str],
     issues: &mut Vec<ValidationIssue>,
 ) {
-    for key in extra.keys() {
-        if modeled
-            .iter()
-            .any(|wire| crate::model::equal_fold(key, wire))
-        {
-            issues.push(issue(
-                ValidationCode::SettingsExtraShadow(key.clone()),
-                Some(format!("{path}.{key}")),
-            ));
-        }
+    for key in super::shadowed_keys(extra, modeled) {
+        issues.push(issue(
+            ValidationCode::SettingsExtraShadow(key.clone()),
+            Some(format!("{path}.{key}")),
+        ));
     }
 }
 

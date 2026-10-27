@@ -6,7 +6,7 @@
 use super::outbound::{validate_masque_stream, validate_xdrive_stream};
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, excerpt_debug, extra_has_key, extra_key_set,
-    file_path_remote, is_vision_flow, issue, warning,
+    file_path_remote, is_vision_flow, issue, shadowed_keys, warning,
 };
 use crate::model::addr;
 use crate::model::outbound::{OutboundModel, ProtocolSettings};
@@ -679,16 +679,11 @@ const TLS_MODEL_WIRE_KEYS: [&str; 15] = [
 /// `Certificates` binds the typed list in Go's decoder and bypasses every
 /// certificate rule, so the shadow gates instead.
 fn tls_extra_shadow(path: &str, tls: &TlsModel, issues: &mut Vec<ValidationIssue>) {
-    for key in tls.extra.keys() {
-        if TLS_MODEL_WIRE_KEYS
-            .iter()
-            .any(|wire| crate::model::equal_fold(key, wire))
-        {
-            issues.push(issue(
-                ValidationCode::TlsExtraShadow(key.clone()),
-                Some(format!("{path}.{key}")),
-            ));
-        }
+    for key in shadowed_keys(&tls.extra, &TLS_MODEL_WIRE_KEYS) {
+        issues.push(issue(
+            ValidationCode::TlsExtraShadow(key.clone()),
+            Some(format!("{path}.{key}")),
+        ));
     }
 }
 
@@ -712,16 +707,11 @@ fn validate_tls_certificates(
         {
             issues.push(issue(required.clone(), Some(row.clone())));
         }
-        for key in certificate.extra.keys() {
-            if TLS_CERT_WIRE_KEYS
-                .iter()
-                .any(|wire| crate::model::equal_fold(key, wire))
-            {
-                issues.push(issue(
-                    ValidationCode::TlsExtraShadow(key.clone()),
-                    Some(format!("{row}.{key}")),
-                ));
-            }
+        for key in shadowed_keys(&certificate.extra, &TLS_CERT_WIRE_KEYS) {
+            issues.push(issue(
+                ValidationCode::TlsExtraShadow(key.clone()),
+                Some(format!("{row}.{key}")),
+            ));
         }
         // The core opens both file paths at config load (`ReadCert`,
         // infra/conf/transport_security.go), so a UNC path makes the Windows
@@ -761,6 +751,47 @@ fn validate_tls_connection_settings(tls: &TlsModel, path: &str, issues: &mut Vec
     );
 }
 
+/// Every wire key `StreamModel` models, in the serde spelling and every
+/// alias serde binds: `method` for `network`, `rawSettings` for
+/// `tcpSettings`, and the `splithttpSettings`/`splitHttpSettings` spellings
+/// for `xhttpSettings`. A case variant of any entry lands in the flattened
+/// `extra` map (serde binds only the exact spelling) while Go's JSON
+/// unmarshal still binds it to the modeled field on the wire, so the value
+/// reaches the core without the rules the typed field takes.
+const STREAM_MODEL_WIRE_KEYS: &[&str] = &[
+    "network",
+    "method",
+    "tcpSettings",
+    "rawSettings",
+    "xhttpSettings",
+    "splithttpSettings",
+    "splitHttpSettings",
+    "kcpSettings",
+    "grpcSettings",
+    "wsSettings",
+    "httpupgradeSettings",
+    "hysteriaSettings",
+    "masqueSettings",
+    "xdriveSettings",
+    "security",
+    "tlsSettings",
+    "realitySettings",
+    "sockopt",
+    "finalmask",
+];
+
+/// Report flattened stream keys that fold onto a modeled field. A carried
+/// `Security` or `TLSSettings` binds the typed field in Go's decoder and
+/// bypasses the rules that field takes, so the shadow gates instead.
+fn stream_extra_shadow(stream: &StreamModel, issues: &mut Vec<ValidationIssue>) {
+    for key in shadowed_keys(&stream.extra, STREAM_MODEL_WIRE_KEYS) {
+        issues.push(issue(
+            ValidationCode::StreamExtraShadow(key.clone()),
+            Some(format!("stream.{key}")),
+        ));
+    }
+}
+
 /// Validate a stream model, recursing over every modeled XHTTP download
 /// stream. Mirrors the old `StreamModel::validation_errors` visit logic.
 pub fn validate_stream(s: &StreamModel) -> Verdict {
@@ -769,6 +800,7 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             issues.push(issue(ValidationCode::XhttpDepthExceeded, None));
             return;
         }
+        stream_extra_shadow(stream, issues);
         if !stream.carries_transport_block()
             && let Some(key) = crate::model::stream::transport_settings_key(stream.network)
         {
@@ -1113,28 +1145,19 @@ pub fn validate_stream(s: &StreamModel) -> Verdict {
             // reaches the core, so this gates. One shared list with the
             // share-link grammar (`XHTTP_MODELED_WIRE_KEYS`), so the two
             // surfaces cannot drift.
-            for key in xhttp.extra.keys() {
-                if crate::model::stream::XHTTP_MODELED_WIRE_KEYS
-                    .iter()
-                    .any(|wire| crate::model::equal_fold(key, wire))
-                {
-                    issues.push(issue(
-                        ValidationCode::XhttpExtraShadowsSettings(key.clone()),
-                        Some(format!("stream.xhttpSettings.{key}")),
-                    ));
-                }
+            for key in shadowed_keys(&xhttp.extra, crate::model::stream::XHTTP_MODELED_WIRE_KEYS) {
+                issues.push(issue(
+                    ValidationCode::XhttpExtraShadowsSettings(key.clone()),
+                    Some(format!("stream.xhttpSettings.{key}")),
+                ));
             }
             if let Some(xmux) = xhttp.xmux.as_ref() {
-                for key in xmux.extra.keys() {
-                    if crate::model::stream::XMUX_MODELED_WIRE_KEYS
-                        .iter()
-                        .any(|wire| crate::model::equal_fold(key, wire))
-                    {
-                        issues.push(issue(
-                            ValidationCode::XmuxExtraShadow(key.clone()),
-                            Some(format!("stream.xhttpSettings.xmux.{key}")),
-                        ));
-                    }
+                for key in shadowed_keys(&xmux.extra, crate::model::stream::XMUX_MODELED_WIRE_KEYS)
+                {
+                    issues.push(issue(
+                        ValidationCode::XmuxExtraShadow(key.clone()),
+                        Some(format!("stream.xhttpSettings.xmux.{key}")),
+                    ));
                 }
             }
             if xhttp.mode == "stream-one" && xhttp.download_settings.is_some() {
@@ -1373,16 +1396,11 @@ fn finalmask_extra_shadow(
     modeled: &[&str],
     issues: &mut Vec<ValidationIssue>,
 ) {
-    for key in extra.keys() {
-        if modeled
-            .iter()
-            .any(|wire| crate::model::equal_fold(key, wire))
-        {
-            issues.push(issue(
-                ValidationCode::FinalmaskExtraShadow(key.clone()),
-                Some(format!("{path}.{key}")),
-            ));
-        }
+    for key in shadowed_keys(extra, modeled) {
+        issues.push(issue(
+            ValidationCode::FinalmaskExtraShadow(key.clone()),
+            Some(format!("{path}.{key}")),
+        ));
     }
 }
 
@@ -4164,6 +4182,49 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing TlsExtraShadow for {key}: {issues:#?}"));
             assert_eq!(finding.severity, Severity::Error);
         }
+    }
+
+    /// A hand-edited state file can carry a case variant of any modeled
+    /// stream key: serde leaves it in the flattened map while Go's decoder
+    /// binds the typed field, so the value the rules validated is not the
+    /// value the core reads. Every such key gates with the wire path it sits
+    /// at; a key outside the modeled vocabulary stays silent.
+    #[test]
+    fn stream_extra_keys_that_fold_onto_modeled_fields_gate() {
+        for key in [
+            "TLSSettings",
+            "Security",
+            "Network",
+            "Method",
+            "SplitHTTPSettings",
+            "FinalMask",
+        ] {
+            let stream = StreamModel {
+                extra: std::iter::once((key.to_string(), json!({}))).collect(),
+                ..Default::default()
+            };
+            let issues = validate_stream(&stream);
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(&issue.code, ValidationCode::StreamExtraShadow(carried) if carried == key)
+                })
+                .unwrap_or_else(|| panic!("missing StreamExtraShadow for {key}: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(
+                finding.path.as_deref(),
+                Some(format!("stream.{key}").as_str())
+            );
+        }
+
+        let stream = StreamModel {
+            extra: std::iter::once(("futureTransport".to_string(), json!({}))).collect(),
+            ..Default::default()
+        };
+        assert!(
+            validate_stream(&stream).is_empty(),
+            "a key outside the modeled vocabulary stays legal"
+        );
     }
 
     /// Every `xdns` rule the core refuses at build time reports the offending

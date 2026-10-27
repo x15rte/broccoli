@@ -117,6 +117,12 @@ const LIFECYCLE_SEND_WINDOW: Duration = Duration::from_millis(4000);
 /// Upper bound for settling a previous TUN session's wintun teardown before
 /// spawning the replacement core (see `clean_leftover_tun_adapter`).
 const TUN_CLEAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for waiting to see the started core's TUN adapter, so its name can be
+/// recorded as one this install created. Same window as the DNS-takeover poll:
+/// both watch for the inbound to come up.
+const TUN_ADAPTER_RECORD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll interval while waiting for that adapter.
+const TUN_ADAPTER_RECORD_POLL: Duration = Duration::from_millis(500);
 /// Bound for joining the core's per-stream output readers before the exit
 /// record is written. The readers end at pipe EOF once the child is gone —
 /// usually within milliseconds — but a pipe inherited by a surviving
@@ -179,6 +185,10 @@ static ENGAGED_SESSION: Mutex<Option<EngagedSession>> = Mutex::new(None);
 /// [`STAGE_BASE`] so it lives beside the stage directories and under the same
 /// protected DACL.
 const DNS_TAKEOVER_RECORD: &str = "dns-takeover.json";
+/// Marker of the wintun adapter names this install brought up, inside
+/// [`STAGE_BASE`] for the same protected DACL. Cleanup reads it to tell this
+/// install's devnodes from another Wintun VPN's started adapter.
+const TUN_ADAPTER_RECORD: &str = "tun-adapters.json";
 const STAGE_PREFIX: &str = "stage-";
 const STAGE_MARKER: &str = ".broccoli-secure-stage";
 const STAGE_MARKER_CONTENT: &[u8] = b"broccoli-secure-stage-v1";
@@ -1412,6 +1422,11 @@ struct HelperChild {
     job: Job,
     state: ChildPhase,
     api_port: u16,
+    /// The WFP guard that limits the control plane to this application's
+    /// image. Dropping it closes the dynamic WFP session and removes the
+    /// filters with the child. `None` only in a unit test that never spawns a
+    /// core through this slot.
+    _api_guard: Option<crate::sys::wfp::ApiGuard>,
     _stage: SecureRuntimeStage,
 }
 
@@ -1950,6 +1965,52 @@ fn missing_tun_target(
         .find(|target| !owned.contains(target))
 }
 
+/// Record `name` in the adapter marker once the started core (pid) brings a
+/// TUN adapter up. The pre-spawn cleanup settled the name, so no devnode with
+/// it existed at spawn; a same-named adapter another application creates in
+/// the meantime cannot be told apart, and the marker keeps the name the core
+/// is configured to use. A config that never reaches its TUN inbound records
+/// nothing. Runs on its own thread so the start path adds no wait beside the
+/// DNS-takeover poll, and stops at the deadline, on a committed session end,
+/// or as soon as the child is gone.
+fn record_created_adapter(
+    name: &str,
+    pid: u32,
+    current: &Arc<Mutex<Option<HelperChild>>>,
+    writer: &Arc<Mutex<File>>,
+) {
+    let deadline = Instant::now() + TUN_ADAPTER_RECORD_TIMEOUT;
+    loop {
+        if crate::sys::netif::list_all()
+            .iter()
+            .any(|iface| iface.name == name)
+        {
+            let Some(record) = adapter_record() else {
+                return;
+            };
+            if let Err(error) = record.record(name) {
+                send_event(
+                    writer,
+                    &serde_json::json!({
+                        "event":"log",
+                        "line":format!(
+                            "{HELPER_LINE_PREFIX}recording wintun adapter \"{name}\" failed: {error}"
+                        ),
+                    }),
+                );
+            }
+            return;
+        }
+        if Instant::now() >= deadline
+            || SHUTTING_DOWN.load(Ordering::SeqCst)
+            || !child_is_live_current(current, pid)
+        {
+            return;
+        }
+        std::thread::sleep(TUN_ADAPTER_RECORD_POLL);
+    }
+}
+
 fn helper_start(
     current: &Arc<Mutex<Option<HelperChild>>>,
     writer: &Arc<Mutex<File>>,
@@ -1995,6 +2056,24 @@ fn helper_start(
         }
     };
 
+    // The elevated core's control plane is a loopback listener with no
+    // credentials. Install the guard before the core can bind the port, and
+    // refuse the start if it cannot be installed: a TUN core whose control
+    // plane is reachable by every local process is the escalation this guard
+    // exists to close.
+    let api_guard = match crate::sys::wfp::ApiGuard::new(api_port) {
+        Ok(guard) => guard,
+        Err(error) => {
+            send_log_record(writer, &error);
+            send_event(writer, &serde_json::json!({"event":"exit","code":-1}));
+            return;
+        }
+    };
+    send_log(
+        writer,
+        Diag::new(Key::HelperApiGuardInstalled).arg(api_port),
+    );
+
     // Do not disturb a healthy old backend unless the complete replacement
     // has passed pins, ACL/copy proof, and staged `run -test`.
     if let Ok(mut slot) = current.lock()
@@ -2009,8 +2088,11 @@ fn helper_start(
     // `WintunCreateAdapter` indefinitely, and killing a core stuck there
     // wedges PnP device creation for every wintun user (2026-08-28).
     // Serialize the restart: remove leftovers for the staged config's tun
-    // adapter name and wait until none remain, bounded.
-    clean_leftover_tun_adapter(&stage.path, writer);
+    // adapter name and wait until none remain, bounded. The result also gates
+    // recording this start's adapter: a devnode the cleanup could not settle
+    // may belong to another Wintun VPN that happens to use the same name, so
+    // this start must not claim it.
+    let tun_name_free = clean_leftover_tun_adapter(&stage.path, writer);
 
     let mut command = staged_xray_command(&stage.path, false);
     command
@@ -2085,6 +2167,7 @@ fn helper_start(
             job,
             state: ChildPhase::Starting,
             api_port,
+            _api_guard: Some(api_guard),
             _stage: stage,
         });
     }
@@ -2114,6 +2197,20 @@ fn helper_start(
         .as_deref()
         .and_then(|text| serde_json::from_str(text).ok());
     let needs = takeover_needed(dns_takeover, config.as_ref());
+    // Record the adapter this start actually brings up, so a later cleanup can
+    // tell this install's devnodes from another Wintun VPN's started adapter.
+    // It watches the interface list on its own thread and independently of the
+    // DNS-takeover gate below: a TUN run with the takeover off (or without its
+    // DNS module) still creates an adapter the marker must know.
+    if tun_name_free
+        && let Some(name) = config_text
+            .as_deref()
+            .and_then(crate::sys::wintun::staged_tun_adapter_name)
+    {
+        let current = Arc::clone(current);
+        let writer = Arc::clone(writer);
+        std::thread::spawn(move || record_created_adapter(&name, pid, &current, &writer));
+    }
     let takeover_error = if needs && !SHUTTING_DOWN.load(Ordering::SeqCst) {
         match config_text
             .as_deref()
@@ -3075,7 +3172,9 @@ fn session_is_engaged(session: &EngagedSession) -> bool {
 /// removed. Every devnode line is forwarded to the GUI log, which is where a
 /// user reads what the cleanup removed.
 fn clean_leftover_adapters(name: &str, writer: &Arc<Mutex<File>>) -> (bool, usize) {
-    let (clean, removed, lines) = crate::sys::wintun::ensure_clean(name, TUN_CLEAN_TIMEOUT);
+    let record = adapter_record();
+    let (clean, removed, lines) =
+        crate::sys::wintun::ensure_clean(name, TUN_CLEAN_TIMEOUT, record.as_ref());
     for line in lines {
         send_event(
             writer,
@@ -3088,10 +3187,22 @@ fn clean_leftover_adapters(name: &str, writer: &Arc<Mutex<File>>) -> (bool, usiz
     (clean, removed)
 }
 
+/// The marker of wintun adapters this install brought up, under the
+/// admin-only stage base. `None` when the base cannot be resolved: cleanup
+/// then reads no recorded name (a legacy install), and a start records
+/// nothing — the removal decision still never destroys a started devnode it
+/// does not own.
+fn adapter_record() -> Option<crate::sys::wintun::AdapterRecord> {
+    secure_stage_base()
+        .ok()
+        .map(|base| crate::sys::wintun::AdapterRecord::new(base.join(TUN_ADAPTER_RECORD)))
+}
+
 /// Remove leftover devnodes for the staged config's TUN adapter name. Runs
 /// elevated before every core spawn; a no-op when the staged config has no
-/// TUN inbound.
-fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) {
+/// TUN inbound. Returns whether the adapter name is free of devnodes — only a
+/// start that found it free may record its adapter as this install's.
+fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) -> bool {
     let config = match fs::read_to_string(stage.join(STAGED_CONFIG)) {
         Ok(config) => config,
         Err(error) => {
@@ -3099,13 +3210,13 @@ fn clean_leftover_tun_adapter(stage: &Path, writer: &Arc<Mutex<File>>) {
                 writer,
                 &DiagError::new(Diag::new(Key::HelperTunCleanupConfigReadFailed)).caused_by(error),
             );
-            return;
+            return false;
         }
     };
     let Some(name) = crate::sys::wintun::staged_tun_adapter_name(&config) else {
-        return; // no TUN inbound — nothing to clean
+        return true; // no TUN inbound — nothing to clean
     };
-    clean_leftover_adapters(&name, writer);
+    clean_leftover_adapters(&name, writer).0
 }
 
 /// The manual cleanup (`HelperCommand::CleanUp`): stop a core this helper
@@ -3174,6 +3285,9 @@ macro_rules! wire_keys {
 }
 
 wire_keys!(
+    HelperApiGuardInstalled,
+    HelperApiGuardInstallFailed,
+    WfpCallFailed,
     ApplyActiveReadFailed,
     ApplyActiveReplaceFailed,
     ApplyCandidateSerializeFailed,
@@ -5744,6 +5858,7 @@ mod tests {
             job,
             state: ChildPhase::Starting,
             api_port: 0,
+            _api_guard: None,
             _stage: stage,
         })));
         // The probe child stays alive while its piped stdin stays open.

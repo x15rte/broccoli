@@ -1842,6 +1842,12 @@ keys! {
     /// A TLS extra key that folds onto a modeled TLS field (the key is the
     /// argument).
     TlsExtraShadow 1,
+    /// A stream extra key that folds onto a modeled stream field (the key is
+    /// the argument).
+    StreamExtraShadow 1,
+    /// An outbound extra key that folds onto a modeled outbound field (the key
+    /// is the argument).
+    OutboundExtraShadow 1,
     /// A `settings.env` key that re-points core path resolution (the key is
     /// the argument).
     EnvCorePathOverride 1,
@@ -2323,6 +2329,7 @@ keys! {
     HelperCoreSpawnFailed (Log, Error, 0),
     HelperJobSetupFailed (Log, Error, 0),
     HelperDnsTakeoverApplied (Log, Info, 1),
+    HelperApiGuardInstalled (Log, Info, 1),
     HelperDnsTakeoverReapplied (Log, Info, 1),
     HelperDnsTakeoverNotEngaged (Log, Error, 0),
     HelperDnsTakeoverReconcileFailed (Log, Warn, 0),
@@ -2342,6 +2349,8 @@ keys! {
     HelperConfigNoTunAdapter (Log, Error, 0),
     HelperTunCleanupConfigReadFailed (Log, Error, 0),
     HelperTunCleanupTimeout (Log, Warn, 1),
+    HelperApiGuardInstallFailed (Log, Error, 1),
+    WfpCallFailed 1,
     HelperStagedValidationSpawnFailed 0,
     HelperStagedValidationIsolateFailed 0,
     HelperStagedConfigRejected 1,
@@ -2950,6 +2959,8 @@ fn validation_text(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) 
         LuaScriptPathNotLua => (Key::SettingsLuaScriptPathNotLua, Vec::new()),
         FilePathRemote(arg) => (Key::FilePathRemote, vec![arg.clone()]),
         TlsExtraShadow(arg) => (Key::TlsExtraShadow, vec![arg.clone()]),
+        StreamExtraShadow(arg) => (Key::StreamExtraShadow, vec![arg.clone()]),
+        OutboundExtraShadow(arg) => (Key::OutboundExtraShadow, vec![arg.clone()]),
         EnvCorePathOverride(arg) => (Key::EnvCorePathOverride, vec![arg.clone()]),
         SettingsExtraShadow(arg) => (Key::SettingsExtraShadow, vec![arg.clone()]),
         XmuxExtraShadow(arg) => (Key::XmuxExtraShadow, vec![arg.clone()]),
@@ -5431,6 +5442,14 @@ mod en {
                 "The TLS block carries {} beside a modeled field of the same name. The core reads \
                  the carried value, so remove it"
             }
+            Key::StreamExtraShadow => {
+                "The stream block carries {} beside a modeled field of the same name. The core \
+                 reads the carried value, so remove it"
+            }
+            Key::OutboundExtraShadow => {
+                "The outbound carries {} beside a modeled field of the same name. The core reads \
+                 the carried value, so remove it"
+            }
             Key::EnvCorePathOverride => {
                 "The environment key {} overrides a core path. Xray reads this variable before it \
                  resolves its assets"
@@ -6352,6 +6371,13 @@ mod en {
             Key::HelperJobSetupFailed => {
                 "elevated helper could not isolate the staged core in a job object"
             }
+            Key::HelperApiGuardInstalled => {
+                "control plane protected: only broccoli may connect to 127.0.0.1:{}"
+            }
+            Key::HelperApiGuardInstallFailed => {
+                "control plane guard for 127.0.0.1:{} could not be installed; TUN did not start"
+            }
+            Key::WfpCallFailed => "filtering platform call failed: {}",
             Key::HelperDnsTakeoverApplied => {
                 "elevated helper pointed the DNS servers of {} adapters at the tunnel DNS"
             }

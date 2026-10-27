@@ -10,12 +10,23 @@
 //! cores also leave phantom devnodes behind that accumulate. This module
 //! enumerates and removes leftover devnodes for a configured adapter name so
 //! a restart never races the previous teardown.
+//!
+//! A devnode that still reports `DN_STARTED` may belong to another Wintun
+//! VPN's live adapter, so removal is gated by ownership: the helper records
+//! the adapter names it brought up in [`AdapterRecord`], and only those names'
+//! devnodes are removed while started. A name the marker does not know is
+//! removed only when its devnode is stopped — a legacy leftover — and recorded
+//! then, so the next cleanup treats that adapter as this install's.
 
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use md5::Digest as _;
 
 use crate::r#gen::keys;
+use crate::sys::durable::write_atomic;
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_LOCATE_DEVNODE_PHANTOM, CM_Locate_DevNodeW,
@@ -29,6 +40,18 @@ use windows::core::{GUID, HRESULT, PCWSTR, w};
 
 /// Poll interval while waiting for a devnode to disappear.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Most adapter names the marker keeps. One configuration names one adapter;
+/// the union survives a name change across sessions.
+const MAX_RECORDED_ADAPTERS: usize = 64;
+
+/// Upper bound on the marker's bytes. The file lives under an admin-only
+/// directory, and a larger one reads as empty rather than being parsed.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+/// Longest adapter name the marker accepts. Windows adapter names are far
+/// shorter; a longer value cannot name a devnode this module would find.
+const MAX_RECORDED_NAME_CHARS: usize = 256;
 
 /// PnP enumerator filter for wintun devnodes. `SetupDiGetClassDevsExW`'s
 /// second parameter is an enumerator (`EnumeratorName[\DeviceID]`), never a
@@ -235,11 +258,91 @@ pub fn remove_instance(instance_id: &str) -> Result<(), String> {
     }
 }
 
-/// Whether a devnode status reports a running device (`DN_STARTED`). A
-/// started devnode can belong to another Wintun VPN's live adapter — the
-/// configured name is not a reservation — so it is never removed.
-fn devnode_is_live(status: CM_DEVNODE_STATUS_FLAGS) -> bool {
+/// The protected marker of adapter names this install created, written by the
+/// elevated helper into its secure stage base. Cleanup reads it to tell this
+/// install's devnodes from another Wintun VPN's started adapter: a recorded
+/// name may be removed even while `DN_STARTED` is set, because the devnode is
+/// ours. A missing or unreadable marker means nothing is recorded — an old
+/// install still cleans up through the stopped-devnode migration in
+/// [`ensure_clean`].
+pub struct AdapterRecord {
+    path: PathBuf,
+}
+
+impl AdapterRecord {
+    /// The marker at `path`. Reading and writing stay bounded and atomic; the
+    /// file is never trusted for more than the names it lists.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The recorded adapter names. A missing, oversized, or unparseable marker
+    /// reads as empty and never panics — a corrupt marker can only cost the
+    /// started-devnode exemption, never a device removal.
+    pub fn names(&self) -> Vec<String> {
+        let Some(bytes) = read_bounded(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(names) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+            return Vec::new();
+        };
+        names
+            .into_iter()
+            .filter(|name| {
+                !name.trim().is_empty() && name.chars().count() <= MAX_RECORDED_NAME_CHARS
+            })
+            .take(MAX_RECORDED_ADAPTERS)
+            .collect()
+    }
+
+    /// Add `name` to the record, writing the whole marker atomically. An
+    /// already recorded name is a no-op. A name longer than any real adapter
+    /// name is refused instead of truncating the identity cleanup depends on.
+    pub fn record(&self, name: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        if name.chars().count() > MAX_RECORDED_NAME_CHARS {
+            return Err(format!(
+                "adapter name is longer than {MAX_RECORDED_NAME_CHARS} characters"
+            ));
+        }
+        let mut names = self.names();
+        if names.iter().any(|recorded| recorded == name) {
+            return Ok(());
+        }
+        if names.len() >= MAX_RECORDED_ADAPTERS {
+            names.remove(0);
+        }
+        names.push(name.to_string());
+        let bytes = serde_json::to_vec(&names).map_err(|error| error.to_string())?;
+        write_atomic(&self.path, &bytes).map_err(|error| error.to_string())
+    }
+}
+
+/// The marker's bytes, or `None` when it is absent, unreadable, or larger
+/// than [`MAX_RECORD_BYTES`]. The read is capped, so a corrupt file cannot
+/// grow an unbounded buffer in the elevated helper.
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_RECORD_BYTES).then_some(bytes)
+}
+
+/// Whether a devnode status reports a running device (`DN_STARTED`).
+fn devnode_is_started(status: CM_DEVNODE_STATUS_FLAGS) -> bool {
     status.contains(DN_STARTED)
+}
+
+/// Whether an enumerated devnode may be removed: one whose adapter name this
+/// install recorded is ours even while started, and one that is not started is
+/// a leftover from a hard-killed core. Only an unrecorded devnode that still
+/// reports started may belong to another Wintun VPN's live adapter.
+fn devnode_removal_allowed(recorded: bool, started: bool) -> bool {
+    recorded || !started
 }
 
 /// The configuration-manager status of `instance_id`, or `None` when the
@@ -282,31 +385,34 @@ fn instance_status(instance_id: &str) -> Option<CM_DEVNODE_STATUS_FLAGS> {
 /// session's in-flight teardown. Returns `(clean, removed, log_lines)`, where
 /// `removed` counts the devnodes this call actually removed.
 ///
-/// A started devnode is left alone: it belongs to a live adapter, possibly
-/// another Wintun VPN's, and removing it would break that application. Such a
-/// devnode is reported once and then keeps the wait running until the
-/// timeout, so a previous session that is still tearing down gets the same
-/// bounded window as before while a foreign live adapter is never destroyed.
-pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, usize, Vec<String>) {
+/// `record` is the helper's marker of adapter names this install brought up. A
+/// devnode whose name is recorded is ours, so a started one is removed too:
+/// that is the stale adapter a previous session's hard kill left reporting
+/// `DN_STARTED`. An unrecorded devnode that still reports started may belong
+/// to another Wintun VPN's live adapter — it is left alone, reported once, and
+/// keeps the wait running until the timeout. An unrecorded devnode that is not
+/// started is a legacy leftover from before the marker existed: it is removed
+/// and its name recorded, so the next cleanup treats that adapter as ours.
+pub fn ensure_clean(
+    name: &str,
+    timeout: Duration,
+    record: Option<&AdapterRecord>,
+) -> (bool, usize, Vec<String>) {
     let deadline = Instant::now() + timeout;
     let mut removed = 0;
     let mut lines = Vec::new();
     let mut reported: Vec<String> = Vec::new();
+    let mut recorded = record.is_some_and(|record| {
+        let names = record.names();
+        names.iter().any(|recorded| recorded == name)
+    });
     loop {
         match matching_instance_ids(name) {
             Ok(ids) if ids.is_empty() => return (true, removed, lines),
             Ok(ids) => {
                 for id in ids {
-                    match instance_status(&id) {
-                        Some(status) if devnode_is_live(status) => {
-                            if !reported.contains(&id) {
-                                lines.push(format!(
-                                    "wintun devnode {id} is a started adapter; leaving it alone"
-                                ));
-                                reported.push(id);
-                            }
-                            continue;
-                        }
+                    let started = match instance_status(&id) {
+                        Some(status) => devnode_is_started(status),
                         None => {
                             if !reported.contains(&id) {
                                 lines.push(format!(
@@ -316,12 +422,32 @@ pub fn ensure_clean(name: &str, timeout: Duration) -> (bool, usize, Vec<String>)
                             }
                             continue;
                         }
-                        Some(_) => {}
+                    };
+                    if !devnode_removal_allowed(recorded, started) {
+                        if !reported.contains(&id) {
+                            lines.push(format!(
+                                "wintun devnode {id} is a started adapter; leaving it alone"
+                            ));
+                            reported.push(id);
+                        }
+                        continue;
                     }
                     match remove_instance(&id) {
                         Ok(()) => {
                             removed += 1;
                             lines.push(format!("removed leftover wintun devnode {id}"));
+                            // An unrecorded leftover proves this install owned
+                            // the adapter; record the name so a later cleanup
+                            // may remove a started devnode for it. A failed
+                            // write only costs that exemption on the next run.
+                            if !recorded && let Some(record) = record {
+                                match record.record(name) {
+                                    Ok(()) => recorded = true,
+                                    Err(error) => lines.push(format!(
+                                        "recording wintun adapter \"{name}\" failed: {error}"
+                                    )),
+                                }
+                            }
                         }
                         Err(error) => {
                             lines.push(format!("removing {id} failed: {error}"));
@@ -375,6 +501,17 @@ pub fn staged_tun_adapter_name(config_json: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A uniquely named directory under the system temp dir, removed by the
+    /// test that made it.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "broccoli-wintun-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
     #[test]
     fn adapter_guid_matches_observed_instances() {
         // Both observed on this machine: "broccoli0" produced
@@ -390,21 +527,78 @@ mod tests {
         );
     }
 
-    /// The removal gate reads only the `DN_STARTED` bit: a devnode with a
-    /// problem but no started flag is a leftover, while a started one is a
-    /// running adapter this app must not tear down.
+    /// The removal gate reads the marker's ownership and the `DN_STARTED`
+    /// bit: an unrecorded devnode with a problem but no started flag is a
+    /// legacy leftover, while an unrecorded started one may be a running
+    /// adapter this app must not tear down. A recorded name is this install's,
+    /// so even a started devnode is removed.
     #[test]
-    fn a_started_devnode_is_live() {
+    fn devnode_removal_follows_the_record_and_the_started_bit() {
         use windows::Win32::Devices::DeviceAndDriverInstallation::{
             CM_DEVNODE_STATUS_FLAGS, DN_HAS_PROBLEM,
         };
 
-        assert!(devnode_is_live(DN_STARTED));
-        assert!(devnode_is_live(CM_DEVNODE_STATUS_FLAGS(
+        assert!(devnode_is_started(DN_STARTED));
+        assert!(devnode_is_started(CM_DEVNODE_STATUS_FLAGS(
             DN_STARTED.0 | DN_HAS_PROBLEM.0
         )));
-        assert!(!devnode_is_live(CM_DEVNODE_STATUS_FLAGS(0)));
-        assert!(!devnode_is_live(DN_HAS_PROBLEM));
+        assert!(!devnode_is_started(CM_DEVNODE_STATUS_FLAGS(0)));
+        assert!(!devnode_is_started(DN_HAS_PROBLEM));
+
+        assert!(
+            devnode_removal_allowed(true, true),
+            "a recorded devnode is ours"
+        );
+        assert!(devnode_removal_allowed(true, false));
+        assert!(
+            devnode_removal_allowed(false, false),
+            "a stopped leftover is removed"
+        );
+        assert!(
+            !devnode_removal_allowed(false, true),
+            "an unrecorded started devnode may belong to another Wintun VPN"
+        );
+    }
+
+    /// The marker round-trips the names it held, records each name once, and
+    /// reads every damage shape as "nothing recorded" — never a panic, and
+    /// never a stale exemption for a started devnode.
+    #[test]
+    fn adapter_record_round_trips_and_reads_damage_as_empty() {
+        let dir = scratch_dir("wintun-record");
+        let path = dir.join("tun-adapters.json");
+        let record = AdapterRecord::new(path.clone());
+
+        assert!(
+            record.names().is_empty(),
+            "a missing marker records nothing"
+        );
+        record.record("broccoli0").expect("record");
+        record.record("broccoli0").expect("record twice");
+        record.record("tun1").expect("record second name");
+        assert_eq!(record.names(), ["broccoli0", "tun1"]);
+
+        record.record("   ").expect("a blank name is a no-op");
+        assert!(
+            record
+                .record(&"n".repeat(MAX_RECORDED_NAME_CHARS + 1))
+                .is_err()
+        );
+        assert_eq!(record.names(), ["broccoli0", "tun1"]);
+
+        std::fs::write(&path, b"{not json").expect("corrupt marker");
+        assert!(
+            record.names().is_empty(),
+            "a corrupt marker records nothing"
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_RECORD_BYTES as usize + 1]).expect("oversized marker");
+        assert!(
+            record.names().is_empty(),
+            "an oversized marker records nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -708,6 +708,19 @@ pub enum ValidationCode {
     /// list bypasses every certificate rule. The code carries the key. Error
     /// tier.
     TlsExtraShadow(String),
+    /// A stream block carries a flattened `extra` key that folds onto a
+    /// modeled wire key of the stream (`Security`, `StreamSettings`-style
+    /// spellings included). Serde bound only the exact spelling, while Go's
+    /// JSON unmarshal binds every case variant — so a carried `Security` or
+    /// `TLSSettings` key reaches the typed field without any of the rules
+    /// that field takes. The code carries the key. Error tier.
+    StreamExtraShadow(String),
+    /// An outbound envelope carries a flattened `extra` key that folds onto
+    /// one of its modeled top-level wire keys (`Protocol`, `Settings`,
+    /// `StreamSettings`, `SendThrough`, `TargetStrategy`, `Mux`,
+    /// `ProxySettings`). Go's decoder binds the carried value, bypassing the
+    /// typed validation. The code carries the key. Error tier.
+    OutboundExtraShadow(String),
     /// A `settings.env` key that overrides core path resolution: Xray applies
     /// the map with `os.Setenv` before it resolves assets
     /// (infra/conf/xray.go), and `xray.location.asset` outranks the
@@ -1462,6 +1475,21 @@ fn warning(code: ValidationCode, path: Option<String>) -> ValidationIssue {
         severity: Severity::Warning,
         target: FindingTarget::Document,
     }
+}
+
+/// The `extra` keys that fold onto one of `modeled`'s wire keys — the
+/// flattened keys serde kept out of the typed field but Go's decoder binds to
+/// it anyway. Each caller pairs the yielded key with its own finding code and
+/// path, so the fold and the filter live in one place.
+pub(crate) fn shadowed_keys<'a>(
+    extra: &'a Map<String, Value>,
+    modeled: &'a [&'a str],
+) -> impl Iterator<Item = &'a String> + 'a {
+    extra.keys().filter(move |key| {
+        modeled
+            .iter()
+            .any(|wire| crate::model::equal_fold(key, wire))
+    })
 }
 
 /// True when an `extra` map carries `key` (ASCII-case-insensitively — Go's

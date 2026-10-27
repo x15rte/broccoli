@@ -12,7 +12,7 @@ use super::stream::{
 };
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, extra_has_key, extra_key_set,
-    is_vision_flow, issue, warning,
+    is_vision_flow, issue, shadowed_keys, warning,
 };
 use crate::model::inbound::Sniffing;
 use crate::model::outbound::{
@@ -907,11 +907,38 @@ fn require_remote(issues: &mut Vec<ValidationIssue>, address: &str, port: u16) {
     }
 }
 
+/// Every top-level wire key `OutboundModel` models — the envelope's own
+/// fields, in their wire spelling. A case variant of any entry lands in the
+/// flattened `extra` map (the deserializer takes only the exact spelling),
+/// while Go's JSON unmarshal still binds it to the modeled field, so the
+/// typed rules never judge the value the core reads.
+const OUTBOUND_MODEL_WIRE_KEYS: &[&str] = &[
+    "protocol",
+    "settings",
+    "streamSettings",
+    "sendThrough",
+    "targetStrategy",
+    "mux",
+    "proxySettings",
+];
+
 /// Validate one outbound: protocol-level rules, transport security, and the
 /// whole stream (recursively over XHTTP downloads) — one pass, no
 /// short-circuit; every violation is reported.
 pub fn validate_outbound(o: &OutboundModel) -> Verdict {
     let mut issues = Vec::new();
+
+    // The envelope's flattened `extra` map holds every key serde did not bind
+    // exactly — that is, every case variant of a modeled field. Go's JSON
+    // unmarshal matches field names case-insensitively, so a carried
+    // `StreamSettings` or `Protocol` binds the typed field on the wire, and
+    // the typed validation below never sees the value that reaches the core.
+    for key in shadowed_keys(&o.extra, OUTBOUND_MODEL_WIRE_KEYS) {
+        issues.push(issue(
+            ValidationCode::OutboundExtraShadow(key.clone()),
+            Some(key.clone()),
+        ));
+    }
 
     // The retired `proxySettings` key left this mark behind: the pinned core
     // refuses to build the outbound while the stored profile carries it
@@ -1694,6 +1721,50 @@ mod tests {
                 "{network:?} must accept string header values: {issues:#?}"
             );
         }
+    }
+
+    /// The outbound envelope's flattened map can carry a case variant of a
+    /// modeled top-level key. Go's decoder binds it to the typed field, so a
+    /// `StreamSettings` object would reach the core without ever passing the
+    /// stream rules; every variant gates, and a key outside the modeled
+    /// vocabulary stays silent.
+    #[test]
+    fn outbound_extra_keys_that_fold_onto_modeled_fields_gate() {
+        for key in [
+            "StreamSettings",
+            "Protocol",
+            "Settings",
+            "SendThrough",
+            "TargetStrategy",
+            "Mux",
+            "ProxySettings",
+        ] {
+            let mut outbound = vless_canonical();
+            outbound
+                .extra
+                .insert(key.to_string(), json!({"network": "ws"}));
+            let issues = validate_outbound(&outbound);
+            let finding = issues
+                .iter()
+                .find(|issue| {
+                    matches!(&issue.code, ValidationCode::OutboundExtraShadow(carried) if carried == key)
+                })
+                .unwrap_or_else(|| panic!("missing OutboundExtraShadow for {key}: {issues:#?}"));
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(finding.path.as_deref(), Some(key));
+        }
+
+        let mut outbound = vless_canonical();
+        outbound
+            .extra
+            .insert("futureEnvelope".into(), json!({"a": 1}));
+        let verdict = validate_outbound(&outbound);
+        assert!(
+            !verdict
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::OutboundExtraShadow(_))),
+            "a key outside the modeled vocabulary raises no shadow finding: {verdict:#?}"
+        );
     }
 
     #[test]
