@@ -201,7 +201,7 @@ mod tests {
     fn the_readout_renders_one_line_per_direction() {
         let mut h = nav_rail_harness(NavRailFixture::default());
         h.run();
-        for label in ["↑ 1.0 MiB/s", "↓ 2.0 MiB/s"] {
+        for label in ["⬆️ 1.0 MiB/s", "⬇️ 2.0 MiB/s"] {
             assert!(
                 h.get_all_by_label(label).next().is_some(),
                 "{label:?} must render in the nav rail"
@@ -212,9 +212,9 @@ mod tests {
     #[test]
     fn the_readout_follows_the_global_unit_ladder() {
         for (unit, up, down) in [
-            (TrafficUnit::Auto, "↑ 1.0 MiB/s", "↓ 2.0 MiB/s"),
-            (TrafficUnit::KiBps, "↑ 1024.0 KiB/s", "↓ 2048.0 KiB/s"),
-            (TrafficUnit::Bps, "↑ 1048576.0 B/s", "↓ 2097152.0 B/s"),
+            (TrafficUnit::Auto, "⬆️ 1.0 MiB/s", "⬇️ 2.0 MiB/s"),
+            (TrafficUnit::KiBps, "⬆️ 1024.0 KiB/s", "⬇️ 2048.0 KiB/s"),
+            (TrafficUnit::Bps, "⬆️ 1048576.0 B/s", "⬇️ 2097152.0 B/s"),
         ] {
             let mut h = nav_rail_harness(NavRailFixture {
                 unit,
@@ -238,7 +238,7 @@ mod tests {
         let mut h = nav_rail_harness(NavRailFixture::default());
         h.run();
         assert!(
-            h.query_by_label("↑ 1.0 MiB/s").is_some(),
+            h.query_by_label("⬆️ 1.0 MiB/s").is_some(),
             "the live session must show its rates"
         );
 
@@ -260,11 +260,11 @@ mod tests {
             .next()
             .expect("the last screen selector renders");
         let up = h
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("the up line renders");
         let down = h
-            .get_all_by_label("↓ 2.0 MiB/s")
+            .get_all_by_label("⬇️ 2.0 MiB/s")
             .next()
             .expect("the down line renders");
 

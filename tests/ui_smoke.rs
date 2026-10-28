@@ -137,15 +137,15 @@ fn dashboard_session_totals_drop_on_phase_change() {
     }));
     h.run();
 
-    for label in ["↑ 1.0 MiB/s", "↓ 2.0 MiB/s"] {
+    for label in ["⬆️ 1.0 MiB/s", "⬇️ 2.0 MiB/s"] {
         h.get_all_by_label(label)
             .next()
             .unwrap_or_else(|| panic!("the nav rail must show the live rate {label:?}"));
     }
-    h.get_all_by_label("↑ 239.5 MiB")
+    h.get_all_by_label("⬆️ 239.5 MiB")
         .next()
         .expect("the inbound table must carry the uplink session total");
-    h.get_all_by_label("↓ 1.0 GiB")
+    h.get_all_by_label("⬇️ 1.0 GiB")
         .next()
         .expect("the inbound table must carry the downlink session total");
 
@@ -155,14 +155,14 @@ fn dashboard_session_totals_drop_on_phase_change() {
     });
     h.run();
     assert!(
-        h.query_all_by_label("↑ 239.5 MiB").next().is_none(),
+        h.query_all_by_label("⬆️ 239.5 MiB").next().is_none(),
         "a phase change must drop the uplink session total"
     );
     assert!(
-        h.query_all_by_label("↓ 1.0 GiB").next().is_none(),
+        h.query_all_by_label("⬇️ 1.0 GiB").next().is_none(),
         "the downlink total must drop with the uplink total"
     );
-    for label in ["↑ 1.0 MiB/s", "↓ 2.0 MiB/s"] {
+    for label in ["⬆️ 1.0 MiB/s", "⬇️ 2.0 MiB/s"] {
         assert!(
             h.query_all_by_label(label).next().is_none(),
             "the rate readout {label:?} must drop with the dead session"

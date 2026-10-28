@@ -229,8 +229,8 @@ impl DashboardScreen {
                                 tag.clone(),
                                 t_fmt(lang, Key::DashboardRateUp, &[&format_bytes(*up, unit)]),
                                 t_fmt(lang, Key::DashboardRateDown, &[&format_bytes(*down, unit)]),
-                                format!("↑ {}", format_bytes(total_up, unit)),
-                                format!("↓ {}", format_bytes(total_down, unit)),
+                                format!("⬆️ {}", format_bytes(total_up, unit)),
+                                format!("⬇️ {}", format_bytes(total_down, unit)),
                             )
                         })
                         .collect();
@@ -1424,11 +1424,11 @@ mod tests {
             .expect("socks row tag must render");
         // 1 MiB/s up / 2 MiB/s down through the same IEC ladder under Auto.
         harness
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("tun up rate must render");
         harness
-            .get_all_by_label("↓ 2.0 MiB/s")
+            .get_all_by_label("⬇️ 2.0 MiB/s")
             .next()
             .expect("socks down rate must render");
     }
@@ -1827,11 +1827,11 @@ mod tests {
         // ladder. The down rate climbs the ladder: 2000/1024 = 1.953
         // -> "2.0 KiB".
         harness
-            .get_all_by_label("↑ 1000.0 B/s")
+            .get_all_by_label("⬆️ 1000.0 B/s")
             .next()
             .expect("the up rate renders in bytes below 1 KiB under auto");
         harness
-            .get_all_by_label("↓ 2.0 KiB/s")
+            .get_all_by_label("⬇️ 2.0 KiB/s")
             .next()
             .expect("the down rate climbs the ladder under auto");
 
@@ -1865,11 +1865,11 @@ mod tests {
         // Fixed unit: every figure divides by the MiB base unconditionally
         // (1000 B -> "0.0 MiB"), and the memory line follows the unit.
         harness
-            .get_all_by_label("↑ 0.0 MiB/s")
+            .get_all_by_label("⬆️ 0.0 MiB/s")
             .next()
             .expect("the up rate renders in the fixed unit");
         harness
-            .get_all_by_label("↓ 0.0 MiB/s")
+            .get_all_by_label("⬇️ 0.0 MiB/s")
             .next()
             .expect("the down rate renders in the fixed unit");
         harness
@@ -1905,12 +1905,12 @@ mod tests {
         // The seed frame renders the Auto labels; idle frames keep them.
         harness.run();
         harness
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("the seed frame renders the auto rate");
         harness.run_steps(10);
         harness
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("idle frames keep the memoized auto labels");
 
@@ -1920,20 +1920,20 @@ mod tests {
         rig.borrow_mut().settings.traffic_unit = TrafficUnit::KiBps;
         harness.run();
         harness
-            .get_all_by_label("↑ 1024.0 KiB/s")
+            .get_all_by_label("⬆️ 1024.0 KiB/s")
             .next()
             .expect("the flip frame re-renders the rate in the new unit");
         assert!(
-            harness.query_all_by_label("↑ 1.0 MiB/s").next().is_none(),
+            harness.query_all_by_label("⬆️ 1.0 MiB/s").next().is_none(),
             "the old-unit label disappears on the flip frame"
         );
         harness.run_steps(10);
         harness
-            .get_all_by_label("↑ 1024.0 KiB/s")
+            .get_all_by_label("⬆️ 1024.0 KiB/s")
             .next()
             .expect("idle frames keep the new-unit labels");
         assert!(
-            harness.query_all_by_label("↑ 1.0 MiB/s").next().is_none(),
+            harness.query_all_by_label("⬆️ 1.0 MiB/s").next().is_none(),
             "idle frames must not rebuild back to the old labels"
         );
 
@@ -1941,19 +1941,19 @@ mod tests {
         rig.borrow_mut().settings.traffic_unit = TrafficUnit::Auto;
         harness.run();
         harness
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("flipping back restores the auto labels");
         assert!(
             harness
-                .query_all_by_label("↑ 1024.0 KiB/s")
+                .query_all_by_label("⬆️ 1024.0 KiB/s")
                 .next()
                 .is_none(),
             "the new-unit label disappears on the flip-back frame"
         );
         harness.run_steps(10);
         harness
-            .get_all_by_label("↑ 1.0 MiB/s")
+            .get_all_by_label("⬆️ 1.0 MiB/s")
             .next()
             .expect("idle frames keep the restored labels");
     }

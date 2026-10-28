@@ -16,9 +16,9 @@
 //! it.
 //!
 //! Every harness buys two opt-outs from egui 0.37's defaults:
-//! `.allow_missing_glyphs()`, because the screens' status symbols (●, ▲, →,
-//! ✓, 🗑) are drawn by the system font provider eframe registers at runtime,
-//! which a bare harness context does not have; and
+//! `.allow_missing_glyphs()`, because the screens' icons and status symbols
+//! (●, ⬆️, ⬇️, ✔️, 🗑, ⚡) are drawn by the system font provider eframe
+//! registers at runtime, which a bare harness context does not have; and
 //! `.with_accessibility_check(false)`, because the screens' combo boxes and
 //! numeric fields do not carry accessible names yet.
 

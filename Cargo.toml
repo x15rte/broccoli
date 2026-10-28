@@ -172,6 +172,10 @@ path = "tests/build.rs"
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe"] }
+# The app's icons are emoji drawn by the system font provider eframe registers;
+# `tests/emoji_glyphs.rs` builds that provider directly to pin the color-glyph
+# path the icons depend on.
+egui_system_font_provider = "0.37"
 # Test certificates for the quic_probe transcript tests; aws_lc_rs keeps the
 # ring crate out of the dev graph too (deny.toml bans it).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }

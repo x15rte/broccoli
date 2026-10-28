@@ -735,6 +735,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "egui_plot",
+ "egui_system_font_provider",
  "embed-resource",
  "fastrand",
  "hex",

@@ -3408,8 +3408,8 @@ mod en {
             }
             Key::DashboardActiveServer => "Active server:",
             Key::NoneSelected => "(none)",
-            Key::DashboardRateUp => "↑ {}/s",
-            Key::DashboardRateDown => "↓ {}/s",
+            Key::DashboardRateUp => "⬆️ {}/s",
+            Key::DashboardRateDown => "⬇️ {}/s",
             Key::DashboardUptime => "uptime {}",
             Key::DashboardGoroutines => "goroutines {}",
             Key::DashboardNoStatsStarting => "core is starting. Waiting for the first sample.",
@@ -4295,8 +4295,8 @@ mod en {
             Key::SrvWaitCoreOperationImports => {
                 "Wait for the current core operation before validating imports."
             }
-            Key::SrvImportOkMark => "✓ {} — {}",
-            Key::SrvImportIgnoredMark => "✓ {} — {} (ignored: {})",
+            Key::SrvImportOkMark => "✔️ {} — {}",
+            Key::SrvImportIgnoredMark => "✔️ {} — {} (ignored: {})",
             Key::SrvImportErrMark => "✗ {}",
             Key::SrvInvalidJson => "invalid JSON: {}",
             // Servers screen: editor sub-forms + finalmask + transports.
@@ -5313,12 +5313,12 @@ mod en {
             Key::TrafficUnitKiBps => "KiB/s",
             Key::TrafficUnitMiBps => "MiB/s",
             Key::TrafficUnitGiBps => "GiB/s",
-            Key::GridUpTotal => "↑ total",
-            Key::GridDownTotal => "↓ total",
+            Key::GridUpTotal => "⬆️ total",
+            Key::GridDownTotal => "⬇️ total",
             // Nav-rail speed readout: each label carries its own `/s` suffix
-            // — "↑ 1.0 MiB/s" over "↓ 2.0 MiB/s".
-            Key::NavSpeedUp => "↑ {}/s",
-            Key::NavSpeedDown => "↓ {}/s",
+            // — "⬆️ 1.0 MiB/s" over "⬇️ 2.0 MiB/s".
+            Key::NavSpeedUp => "⬆️ {}/s",
+            Key::NavSpeedDown => "⬇️ {}/s",
             Key::OutboundTrojanFlowRemoved => {
                 "flow was removed from Xray's Trojan. The outbound is refused at load. Use VLESS and \
                  set the vision flow there"
