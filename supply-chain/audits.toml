@@ -4625,6 +4625,11 @@ version = "1.0.229"
 criteria = "safe-to-deploy"
 version = "1.0.151"
 
+[[audits.serde_json]]
+criteria = "safe-to-deploy"
+version = "1.0.154"
+notes = "Delta from 1.0.151 reviewed: invalid UTF-8 now reports the first bad byte for raw values and for strings, `Number::as_f32` drops a non-finite cast of a finite value, and `-0` keeps its sign in `arbitrary_precision`; no unsafe, FFI or dependency change in this feature set (`foldhash` comes only with `preserve_order` without `std`)."
+
 [[audits.serde_path_to_error]]
 criteria = "safe-to-deploy"
 version = "0.1.20"
