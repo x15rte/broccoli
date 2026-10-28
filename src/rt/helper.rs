@@ -663,6 +663,25 @@ impl LoadedProtectedDirectory {
         // outlive the storage the `dacl`/SID pointers target.
         unsafe { std::slice::from_raw_parts(self.words.as_mut_ptr().cast::<u8>(), self.byte_len) }
     }
+
+    /// `AceCount` from the DACL header, read through [`Self::bytes`].
+    ///
+    /// The loader hands the DACL back as a pointer into `words`; reading its
+    /// header through the buffer keeps the access a checked byte read, the
+    /// same rule [`validated_ace`] follows for every ACE field. `AceCount` sits
+    /// at offset 4 of the `ACL` header — revision, `Sbz1`, `AclSize`, then the
+    /// count — and the six bytes read here sit inside that eight-byte header.
+    /// `None` means the loader reported no DACL, or its pointer lies outside
+    /// the bytes it initialized.
+    fn dacl_ace_count(&self) -> Option<u16> {
+        if !self.dacl_present || self.dacl.is_null() {
+            return None;
+        }
+        let bytes = self.bytes();
+        let offset = self.dacl.addr().checked_sub(bytes.as_ptr().addr())?;
+        let header = bytes.get(offset..offset.checked_add(6)?)?;
+        Some(u16::from_le_bytes([header[4], header[5]]))
+    }
 }
 
 /// Whether `owner` is a principal the stage base itself may belong to:
@@ -898,16 +917,9 @@ fn verify_loaded_protected(
     if !owner_ok {
         return Err(DiagError::new(Diag::new(Key::HelperOwnerUnexpected)));
     }
-    if !loaded.dacl_present || loaded.dacl.is_null() {
+    let Some(ace_count) = loaded.dacl_ace_count() else {
         return Err(DiagError::new(Diag::new(Key::HelperDaclMissing)));
-    }
-    // SAFETY: `loaded.dacl` is only dereferenced after the `dacl_present` and
-    // `dacl.is_null()` checks above, so it points at the DACL inside the
-    // valid descriptor storage (fully initialized by `GetFileSecurityW`); the
-    // storage's alignment rule (see `LoadedProtectedDirectory::words`) puts
-    // the ACL on its DWORD boundary, so this typed header read is sound and
-    // `AceCount` (offset 2) is initialized too.
-    let ace_count = unsafe { (*loaded.dacl).AceCount };
+    };
     if ace_count != 2 {
         return Err(DiagError::new(
             Diag::new(Key::HelperDaclUnexpectedPrincipals).arg(ace_count),
@@ -1010,20 +1022,16 @@ fn dacl_deviation_is_benign(path: &Path) -> bool {
     let Ok(loaded) = load_protected_directory(path) else {
         return false;
     };
+    let Some(ace_count) = loaded.dacl_ace_count() else {
+        return false;
+    };
     if !loaded.control.contains(SE_DACL_PRESENT)
         || !loaded.control.contains(SE_DACL_PROTECTED)
         || !loaded.owner_is_expected
-        || !loaded.dacl_present
-        || loaded.dacl.is_null()
     {
         return false;
     }
-    // SAFETY: `loaded.dacl` is non-null and valid here (checked above); it
-    // points at the DACL inside the live storage written by
-    // `load_protected_directory`, and the storage's alignment rule (see
-    // `LoadedProtectedDirectory::words`) puts the ACL on its DWORD boundary
-    // for this typed header read.
-    let ace_count = u32::from(unsafe { (*loaded.dacl).AceCount });
+    let ace_count = u32::from(ace_count);
     if !(2..=3).contains(&ace_count) {
         return false;
     }
