@@ -26,6 +26,28 @@ updates:
     # this makes a version bump a matter of waiting, not of per-crate review.
     cooldown:
       default-days: 7
+    # The egui family moves as one: the two vendored forks in
+    # `[patch.crates-io]` must be re-released at the egui family's version, and
+    # a crate left behind makes cargo drop its patch (see the note there). A
+    # one-crate PR from this family cannot pass, so group them and pay the
+    # migration once.
+    groups:
+      egui-family:
+        patterns:
+          - "egui*"
+          - "eframe"
+          - "egui-winit"
+          - "emath"
+          - "epaint*"
+          - "ecolor"
+          - "accesskit*"
+          - "vello*"
+          - "glifo"
+          - "fontique"
+          - "parlance"
+          - "poll-promise"
+          - "unicode-properties"
+          - "unicode-script"
     # glib reaches the lockfile only through tray-icon's Linux gtk backend and
     # is absent from the Windows dependency graph the project ships. The
     # advisory on glib 0.18.5 is fixed in 0.20.0, which only moves together
