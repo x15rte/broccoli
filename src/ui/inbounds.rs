@@ -1193,6 +1193,7 @@ mod listener_validation_tests {
     use crate::model::validation::ValidationCode;
     use crate::model::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Rule, Settings};
     use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::harness_builder;
     use egui_kittest::kittest::NodeT as _;
     use egui_kittest::{Harness, kittest::Queryable as _};
     use std::cell::RefCell;
@@ -1470,7 +1471,7 @@ mod listener_validation_tests {
     /// AccessKit tree without scrolling (the screen has no ScrollArea of its
     /// own in this unit-harness context).
     fn harness_for(rig: Rc<RefCell<UiTestRig>>) -> Harness<'static, InboundsScreen> {
-        Harness::builder()
+        harness_builder()
             .with_size(egui::vec2(900.0, 2400.0))
             .build_ui_state(
                 move |ui, screen: &mut InboundsScreen| {

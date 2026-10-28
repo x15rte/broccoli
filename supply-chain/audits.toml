@@ -4,35 +4,35 @@
 [[wildcard-audits.accesskit]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 27789
+user-id = 27789 # Arnold Loubriat (DataTriny)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.accesskit_atspi_common]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 27789
+user-id = 27789 # Arnold Loubriat (DataTriny)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.accesskit_consumer]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 27789
+user-id = 27789 # Arnold Loubriat (DataTriny)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.accesskit_macos]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 27789
+user-id = 27789 # Arnold Loubriat (DataTriny)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.accesskit_unix]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 27789
+user-id = 27789 # Arnold Loubriat (DataTriny)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -158,7 +158,7 @@ end = "2027-09-16"
 [[wildcard-audits.async-broadcast]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -515,42 +515,42 @@ end = "2027-09-16"
 [[wildcard-audits.ecolor]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.egui]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.egui-wgpu]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.egui_glow]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.egui_kittest]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.egui_plot]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -564,14 +564,14 @@ end = "2027-09-16"
 [[wildcard-audits.emath]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.endi]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -585,14 +585,14 @@ end = "2027-09-16"
 [[wildcard-audits.epaint]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.epaint_default_fonts]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -627,7 +627,7 @@ end = "2027-09-16"
 [[wildcard-audits.event-listener]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -690,7 +690,7 @@ end = "2027-09-16"
 [[wildcard-audits.font-types]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 81909
+user-id = 81909 # Chad Brokaw (dfrg)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1180,7 +1180,7 @@ end = "2027-09-16"
 [[wildcard-audits.kittest]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 197939
+user-id = 197939 # Rerun (rerunio)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2881,28 +2881,28 @@ end = "2027-09-16"
 [[wildcard-audits.zbus]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zbus_macros]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zbus_names]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zbus_xml]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -2979,21 +2979,21 @@ end = "2027-09-16"
 [[wildcard-audits.zvariant]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zvariant_derive]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.zvariant_utils]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 6423
+user-id = 6423 # Zeeshan Ali Khan (zeenix)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -3723,6 +3723,11 @@ version = "0.18.1"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 
+[[audits.glifo]]
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Delta from 0.2.0 reviewed: no source change; the release only moves its vello_common dependency to 0.2.0."
+
 [[audits.glow]]
 criteria = "safe-to-deploy"
 version = "0.17.0"
@@ -4006,6 +4011,11 @@ version = "0.4.14"
 [[audits.log]]
 criteria = "safe-to-deploy"
 version = "0.4.33"
+
+[[audits.log]]
+criteria = "safe-to-deploy"
+version = "0.4.34"
+notes = "Delta from 0.4.33 reviewed: the boxed logger moves behind the new `alloc` feature and the documentation follows; no unsafe, FFI or capability change."
 
 [[audits.lru-slab]]
 criteria = "safe-to-deploy"
@@ -5031,9 +5041,19 @@ version = "0.1.1"
 criteria = "safe-to-deploy"
 version = "0.1.0"
 
+[[audits.vello_common]]
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Delta from 0.1.0 reviewed: atlas space diagnostics, the probe feature enum, and a move to the SIMD `bitcast` API; no new unsafe block or ambient capability."
+
 [[audits.vello_cpu]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
+
+[[audits.vello_cpu]]
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Delta from 0.1.0 reviewed: dispatcher init/flush ordering, an image sampler axis fix, the SIMD `bitcast` move and new tests; no new unsafe block or ambient capability."
 
 [[audits.version-compare]]
 criteria = "safe-to-deploy"
@@ -5424,6 +5444,11 @@ version = "0.5.2"
 [[audits.zbus_macros]]
 criteria = "safe-to-deploy"
 version = "5.18.0"
+
+[[audits.zbus_macros]]
+criteria = "safe-to-deploy"
+version = "5.19.0"
+notes = "Delta from 5.18.0 reviewed: the syn receiver-kind and impl-item modifier renames; a proc-macro crate with no unsafe code."
 
 [[audits.zbus_names]]
 criteria = "safe-to-deploy"

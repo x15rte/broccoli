@@ -14,6 +14,13 @@
 //! This module is `cfg(test)`-only and never ships. The full-app integration
 //! suite (`tests/ui_smoke.rs`) drives the real eframe app and does not use
 //! it.
+//!
+//! Every harness buys two opt-outs from egui 0.37's defaults:
+//! `.allow_missing_glyphs()`, because the screens' status symbols (●, ▲, →,
+//! ✓, 🗑) are drawn by the system font provider eframe registers at runtime,
+//! which a bare harness context does not have; and
+//! `.with_accessibility_check(false)`, because the screens' combo boxes and
+//! numeric fields do not carry accessible names yet.
 
 use crate::model::{ServersFile, Settings};
 use crate::rt::{
@@ -24,8 +31,21 @@ use crate::ui::logs::LogLine;
 use crate::ui::{
     CoreSetupState, TerminalErrorView, TrafficSample, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
 };
-use egui_kittest::Harness;
+use egui_kittest::{Harness, HarnessBuilder};
 use std::collections::VecDeque;
+
+/// The harness builder every screen test starts from.
+///
+/// egui 0.37's harness panics on a glyph no installed font can draw and checks
+/// that every widget carries an accessible name. This suite renders the status
+/// symbols the app takes from the system font provider at runtime, and the
+/// screens' combo boxes and numeric fields do not carry accessible names yet,
+/// so both checks are off here (see the module docs).
+pub(crate) fn harness_builder<State>() -> HarnessBuilder<State> {
+    Harness::<State>::builder()
+        .allow_missing_glyphs()
+        .with_accessibility_check(false)
+}
 
 /// Minimal UiCtx backing shared by screen-level and app-shell-wiring tests:
 /// real settings plus inert runtime fields, so a screen can be driven
@@ -222,7 +242,7 @@ pub(crate) fn screen_harness_at<S: ScreenShow + 'static>(
     rig: UiTestRig,
     screen: S,
 ) -> Harness<'static, (S, UiTestRig)> {
-    Harness::builder().with_size(size).build_ui_state(
+    harness_builder().with_size(size).build_ui_state(
         |ui, state: &mut (S, UiTestRig)| state.0.show_frame(ui, &mut state.1),
         (screen, rig),
     )
@@ -243,7 +263,7 @@ pub(crate) fn servers_frame_harness<F>(
 where
     F: Fn(&mut crate::ui::servers::ServersScreen, &mut UiTestRig, &egui::Ui) + 'static,
 {
-    Harness::builder().with_size(size).build_ui_state(
+    harness_builder().with_size(size).build_ui_state(
         move |ui, state: &mut (crate::ui::servers::ServersScreen, UiTestRig)| {
             state.0.show(ui, &mut state.1.ctx().servers());
             // The screen just rendered, so its dialogs own their questions.

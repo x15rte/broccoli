@@ -1440,6 +1440,7 @@ mod tests {
     };
     use crate::sys;
     use crate::sys::selfupd::UpdateCheckState;
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{UiTestRig, screen_harness};
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable as _};
 
@@ -1464,7 +1465,7 @@ mod tests {
     /// Render the shared surface over one rig state and hand back the
     /// harness, so each test states only the state it is about.
     fn core_setup_harness(rig: UiTestRig) -> Harness<'static, UiTestRig> {
-        Harness::new_ui_state(
+        harness_builder().build_ui_state(
             |ui, rig: &mut UiTestRig| {
                 let _ = show_core_setup(ui, &mut rig.ctx().wizard(), CoreSetupMount::Settings);
             },

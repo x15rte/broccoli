@@ -17,9 +17,10 @@ geosite_sha256 = "ef725a08ba804effd5b5b6e747c8c28eabc54ed068d786d7366d067d2e1a38
 
 [patch.crates-io]
 # Vendored with four local fixes:
-# - eframe: persist the last measurable window geometry while the window is
-#   minimized (a minimized window's client area cannot be read, and skipping
-#   the save loses a resize made just before minimizing)
+# - eframe: persist the last measurable window state while the window is
+#   minimized (a minimized window reports no client area and no longer reports
+#   itself maximized, and skipping the save loses the state it had just before
+#   minimizing)
 # - eframe: re-arm a repaint egui still owes when nothing is scheduled, so one
 #   wake lost while a native menu ran cannot silence every later request
 # - egui-winit: clamp restored window size to min/max inner size
@@ -68,9 +69,9 @@ mutex_atomic = "warn"
 vendored-protoc = ["dep:protobuf-src"]
 
 [dependencies]
-eframe = { version = "0.36", features = ["persistence"] } # default renderer (wgpu)
-egui = "0.36"
-egui_plot = "0.37"
+eframe = { version = "0.37", features = ["persistence"] } # default renderer (wgpu)
+egui = "0.37"
+egui_plot = "0.38"
 tray-icon = "0.26"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "sync", "macros", "net"] }
 tempfile = "3"
@@ -170,7 +171,7 @@ name = "build"
 path = "tests/build.rs"
 
 [dev-dependencies]
-egui_kittest = { version = "0.36", features = ["eframe"] }
+egui_kittest = { version = "0.37", features = ["eframe"] }
 # Test certificates for the quic_probe transcript tests; aws_lc_rs keeps the
 # ring crate out of the dev graph too (deny.toml bans it).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }

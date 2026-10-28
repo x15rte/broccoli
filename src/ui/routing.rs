@@ -6238,6 +6238,7 @@ mod routing_control_render_tests {
         GeodataCatalog, GeodataError, GeodataFileMetadata, GeodataOperation, GeodataSnapshot,
     };
     use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::harness_builder;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT as _, Queryable as _};
     use std::path::PathBuf;
@@ -6246,7 +6247,7 @@ mod routing_control_render_tests {
     fn harness_for(
         state: (RoutingScreen, UiTestRig),
     ) -> Harness<'static, (RoutingScreen, UiTestRig)> {
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(900.0, 1600.0))
             .build_ui_state(
                 |ui, state: &mut (RoutingScreen, UiTestRig)| {

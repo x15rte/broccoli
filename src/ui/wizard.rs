@@ -20,7 +20,7 @@ impl WizardScreen {
         // Default modal frame (the app's native window look) over a dimmed
         // backdrop; blocks the rest of the app until the core is installed
         // or setup is deferred.
-        egui::Modal::new(egui::Id::new("broccoli-first-run")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("broccoli-first-run")).show(ctx, |ui| {
             let lang = uictx.settings.language;
             ui.set_max_width(560.0);
             ui.heading(t(lang, Key::WizardWelcome));

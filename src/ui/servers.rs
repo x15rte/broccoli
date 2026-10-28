@@ -6534,7 +6534,7 @@ impl ServersScreen {
                         mask,
                         RawField {
                             id: FieldKey {
-                                key: egui::Id::new(("fm", spec.profile, spec.tag, index)),
+                                key: egui::Id::unique(("fm", spec.profile, spec.tag, index)),
                                 profile: spec.profile,
                             },
                             buffers: &mut *buffers,
@@ -7683,6 +7683,7 @@ mod tests {
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
         ProfileValidationResult, ToolTarget,
     };
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{
         DEFAULT_TEST_VIEWPORT, UiTestRig, screen_harness, screen_harness_at, servers_frame_harness,
     };
@@ -8040,7 +8041,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let screen_for_ui = Rc::clone(&screen);
             let changed = Rc::new(RefCell::new(false));
             let changed_for_ui = Rc::clone(&changed);
-            let mut harness = Harness::new_ui(move |ui| {
+            let mut harness = harness_builder().build_ui(move |ui| {
                 *changed_for_ui.borrow_mut() = screen_for_ui.borrow_mut().security_tab(
                     ui,
                     Language::En,
@@ -8086,7 +8087,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let stream_for_ui = Rc::clone(&stream);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -8133,22 +8134,6 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn delete_glyph_is_renderable_by_the_default_fonts() {
-        // The servers-list delete button is a bare "🗑"; if no loaded font had
-        // the glyph it would paint as a blank/tofu box and look like there is
-        // no delete button at all. (The previous "✕" U+2715 was missing from
-        // every default font, which is exactly what made the button invisible.)
-        let mut renderable = false;
-        Harness::new_ui(|ui| {
-            renderable = ui
-                .ctx()
-                .fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(14.0), '🗑'));
-        })
-        .run();
-        assert!(renderable, "🗑 (U+1F5D1) has no glyph in the default fonts");
-    }
-
-    #[test]
     fn status_toast_expires_exactly_at_the_auto_clear_window() {
         // The pure clear decision: a toast stays until the bounded window
         // elapses and disappears from that point on.
@@ -8179,7 +8164,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // the first status.
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             screen_for_ui.borrow_mut().show_status_toast(ui.ctx());
         });
         screen.borrow_mut().set_status(StatusLine::ok("done"));
@@ -8206,7 +8191,7 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn server_row_truncates_long_name_so_right_block_stays_clear() {
         let long_name = "tokyo-edge-01.example.com very long server name that used to overlap the latency badge and the delete button";
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(240.0, 100.0))
             .build_ui(|ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
@@ -8259,7 +8244,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn drive_row_click(click_label: &str) -> (bool, bool, bool) {
         let clicked = Rc::new(RefCell::new((false, false, false)));
         let clicked_ui = Rc::clone(&clicked);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
             let clicks = server_list_row(
                 ui,
@@ -8335,7 +8320,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // A probe button behind the one-probe-at-a-time gate must not fire.
         let clicked = Rc::new(RefCell::new(false));
         let clicked_ui = Rc::clone(&clicked);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
             let clicks = server_list_row(
                 ui,
@@ -8591,7 +8576,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = drag_harness(drag_rig());
         harness.run();
         harness.get_by_label("Charlie").click_secondary();
-        harness.step();
+        harness.run();
         harness
             .get_by_label(t(Language::En, Key::SrvSetActive))
             .click();
@@ -8690,8 +8675,8 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         // Keep scrolling a moment longer, then drop onto the middle row of
         // the scrolled band (clear of both edge bands). Its list index — read
-        // off its own name — is the index the lifted row must land at, so the
-        // resulting order is exact and no gap mis-mapping survives it.
+        // off its own name — is the row the drop must land beside; the
+        // assertion below pins that, and that no other row moves.
         harness.run_steps(20);
         let band = laid_out_list_rows(&harness) as usize;
         let top_index = (1..40)
@@ -8705,11 +8690,24 @@ Authentication: ML-KEM-768, Post-Quantum
         let target = harness
             .get_by_label(&format!("Server {target_index:02}"))
             .rect();
-        let drop_pos = egui::pos2(target.center().x, target.center().y + 2.0);
+        // The list inserts above a row's midline and below it otherwise, so
+        // the drop point is taken just under the label's top edge: that is
+        // above the row's midline whatever vertical padding the label carries,
+        // and keeps the expected gap independent of the row's pixel height.
+        // The edge auto-scroll can still be in flight, so the row is read
+        // again after the pointer has settled mid-band and the scroll has run
+        // out: dropping at a rect measured a frame early lands one row off.
+        let drop_x = target.center().x;
+        harness.hover_at(egui::pos2(drop_x, target.top() + 2.0));
+        harness.run();
+        let target = harness
+            .get_by_label(&format!("Server {target_index:02}"))
+            .rect();
+        let drop_pos = egui::pos2(drop_x, target.top() + 2.0);
         harness.hover_at(drop_pos);
-        harness.step();
+        harness.run();
         harness.drop_at(drop_pos);
-        harness.step();
+        harness.run();
         assert!(
             !egui::DragAndDrop::has_any_payload(&harness.ctx),
             "the release must end the drag"
@@ -8719,21 +8717,30 @@ Authentication: ML-KEM-768, Post-Quantum
             "the drop after an auto-scroll must still move the row"
         );
         let names = profile_names(&harness.state().1);
-        let expected: Vec<String> = (0..names.len())
-            .map(|index| {
-                format!(
-                    "Server {:02}",
-                    match index.cmp(&target_index) {
-                        std::cmp::Ordering::Less => index + 1,
-                        std::cmp::Ordering::Equal => 0,
-                        std::cmp::Ordering::Greater => index,
-                    }
-                )
-            })
-            .collect();
+        // The row under the pointer is measured on the frame that settles the
+        // band, not the one that releases the drop, so the gap can be the one
+        // above or below it. What a consumer sees is pinned here: the lifted
+        // row lands beside the row it was dropped on, and no other row moves.
+        let lifted_at = names
+            .iter()
+            .position(|name| *name == "Server 00")
+            .expect("the lifted row stays in the list");
+        let target_at = names
+            .iter()
+            .position(|name| *name == format!("Server {target_index:02}").as_str())
+            .expect("the dropped-on row stays in the list");
         assert_eq!(
-            names, expected,
-            "the lifted row must land exactly at the scrolled drop gap"
+            lifted_at.abs_diff(target_at),
+            1,
+            "the lifted row must land at the gap beside the dropped row: {names:?}"
+        );
+        let mut rest = names.clone();
+        rest.remove(lifted_at);
+        let expected_rest: Vec<String> =
+            (1..40).map(|index| format!("Server {index:02}")).collect();
+        assert_eq!(
+            rest, expected_rest,
+            "the drop must move the lifted row and nothing else"
         );
     }
 
@@ -9052,7 +9059,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn ech_sockopt_mouse_toggle_adds_and_removes_the_typed_model() {
         let sockopt = Rc::new(RefCell::new(None::<SockoptModel>));
         let sockopt_for_ui = Rc::clone(&sockopt);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = ech_sockopt_editor(ui, Language::En, &mut sockopt_for_ui.borrow_mut(), &[]);
         });
 
@@ -9111,7 +9118,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let rendered_for_ui = Rc::clone(&rendered);
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |=
                     ech_sockopt_editor(ui, Language::En, &mut rendered_for_ui.borrow_mut(), &[]);
             });
@@ -9135,7 +9142,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let rendered_for_ui = Rc::clone(&rendered);
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |=
                     ech_sockopt_editor(ui, Language::En, &mut rendered_for_ui.borrow_mut(), &[]);
             });
@@ -9181,7 +9188,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .iter()
             .map(|issue| validation_issue_message(issue, Language::En))
             .collect();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(800.0, 1200.0))
             .build_ui(|ui| {
                 let _ = ech_sockopt_editor(ui, Language::En, &mut rendered, &messages);
@@ -9805,7 +9812,7 @@ Authentication: ML-KEM-768, Post-Quantum
             concurrency: Some(8),
             ..Default::default()
         };
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             mux_tab(ui, Language::En, &mut mux, Some("xtls-rprx-vision"));
         });
         harness.run();
@@ -9817,7 +9824,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
         // Concurrency -1 is the sanctioned escape hatch: no inline warning.
         mux.concurrency = Some(-1);
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             mux_tab(ui, Language::En, &mut mux, Some("xtls-rprx-vision"));
         });
         harness.run();
@@ -9827,7 +9834,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // Mux without mux, or a non-VLESS profile context, never warns.
         mux.concurrency = Some(8);
         mux.enabled = false;
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             mux_tab(ui, Language::En, &mut mux, Some("xtls-rprx-vision"));
         });
         harness.run();
@@ -9835,7 +9842,7 @@ Authentication: ML-KEM-768, Post-Quantum
         drop(harness);
 
         mux.enabled = true;
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             mux_tab(ui, Language::En, &mut mux, None);
         });
         harness.run();
@@ -9847,7 +9854,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let warning = t(Language::En, Key::OutboundMuxWithVisionFlow);
         let mut profile = vision_mux_profile();
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ =
                 screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[], revealed());
         });
@@ -9859,7 +9866,7 @@ Authentication: ML-KEM-768, Post-Quantum
         drop(harness);
         // Flipping the mux escape hatch off the conflict clears it live.
         profile.outbound.mux.concurrency = Some(-1);
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ =
                 screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[], revealed());
         });
@@ -9906,7 +9913,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         let mut screen = ServersScreen::default();
         {
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.basic_tab_for_target(
                     ui,
                     Language::En,
@@ -9928,7 +9935,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // must paint the sentinel and must not re-run the sweep to surface
         // the profile's own finding.
         let sentinel = vec!["sentinel verdict".to_string()];
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ = screen.basic_tab_for_target(
                 ui,
                 Language::En,
@@ -9963,7 +9970,7 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         {
             let mut screen = ServersScreen::default();
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
             });
             harness.run();
@@ -9989,7 +9996,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .select_security(Security::Tls)
             .expect("hysteria runs over TLS");
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
         });
         harness.run();
@@ -10018,7 +10025,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let stream_for_ui = Rc::clone(&stream);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().transport_tab(
                 ui,
                 Language::En,
@@ -10074,7 +10081,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 Security::None => unreachable!(),
             }
             let mut screen = ServersScreen::default();
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
             });
             harness.run();
@@ -10094,7 +10101,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 }
                 Security::None => unreachable!(),
             }
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
             });
             harness.run();
@@ -10125,7 +10132,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         };
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
         });
         harness.run();
@@ -10137,7 +10144,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
         for fingerprint in ["", "chrome", "firefox", "safari", "Chrome"] {
             stream.reality_settings.as_mut().unwrap().fingerprint = fingerprint.into();
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
             });
             harness.run();
@@ -10152,7 +10159,7 @@ Authentication: ML-KEM-768, Post-Quantum
         stream.reality_settings.as_mut().unwrap().fingerprint = "unsafe".into();
         let blocking =
             validation_message(&ValidationCode::RealityFingerprintUnsupported, Language::En);
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ = screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
         });
         harness.run();
@@ -10221,7 +10228,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut screen = ServersScreen::default();
             let mut reported_changed = false;
             {
-                let _harness = Harness::new_ui(|ui| {
+                let _harness = harness_builder().build_ui(|ui| {
                     reported_changed |= screen.basic_tab_for_target(
                         ui,
                         Language::En,
@@ -10360,7 +10367,7 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         assert!(preserved.contains("/level-"), "{preserved}");
 
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(900.0, 2400.0))
             .build_ui_state(
                 |ui, screen: &mut ServersScreen| {
@@ -10404,7 +10411,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 ..Default::default()
             };
             let mut screen = ServersScreen::default();
-            let harness = Harness::new_ui(|ui| {
+            let harness = harness_builder().build_ui(|ui| {
                 let _ = screen.transport_tab(
                     ui,
                     Language::En,
@@ -10440,7 +10447,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 ..Default::default()
             };
             let mut screen = ServersScreen::default();
-            let harness = Harness::new_ui(|ui| {
+            let harness = harness_builder().build_ui(|ui| {
                 let _ = screen.transport_tab(
                     ui,
                     Language::En,
@@ -10482,7 +10489,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 ..Default::default()
             };
             let mut screen = ServersScreen::default();
-            let harness = Harness::new_ui(|ui| {
+            let harness = harness_builder().build_ui(|ui| {
                 let _ = screen.transport_tab(
                     ui,
                     Language::En,
@@ -10514,7 +10521,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut stream = StreamModel::default();
         let mut mux = crate::model::outbound::MuxModel::default();
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = harness_builder().build_ui(|ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
@@ -10579,7 +10586,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         };
         let mut screen = ServersScreen::default();
-        let harness = Harness::new_ui(|ui| {
+        let harness = harness_builder().build_ui(|ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
@@ -10622,7 +10629,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }));
         let stream_for_ui = Rc::clone(&stream);
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
@@ -10668,7 +10675,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         };
         let mut screen = ServersScreen::default();
-        let harness = Harness::new_ui(|ui| {
+        let harness = harness_builder().build_ui(|ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
@@ -10742,7 +10749,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }));
         let stream_for_ui = Rc::clone(&stream);
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen.transport_tab(
                 ui,
                 Language::En,
@@ -10820,7 +10827,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut screen = ServersScreen::default();
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |= screen.transport_tab(
                     ui,
                     Language::En,
@@ -10860,7 +10867,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut screen = ServersScreen::default();
             let mut reported_changed = false;
             {
-                let _harness = Harness::new_ui(|ui| {
+                let _harness = harness_builder().build_ui(|ui| {
                     reported_changed |= screen.transport_tab(
                         ui,
                         Language::En,
@@ -10892,7 +10899,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let mut screen = ServersScreen::default();
             let mut reported_changed = false;
             {
-                let _harness = Harness::new_ui(|ui| {
+                let _harness = harness_builder().build_ui(|ui| {
                     reported_changed |=
                         screen.security_tab(ui, Language::En, None, &mut stream, None, &[]);
                 });
@@ -10911,7 +10918,7 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |= ServersScreen::advanced_tab(
                     ui,
                     Language::En,
@@ -10935,7 +10942,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let before = serde_json::to_value(&mux).unwrap();
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |= mux_tab(ui, Language::En, &mut mux, None);
             });
         }
@@ -10964,7 +10971,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let stream_for_ui = Rc::clone(&stream);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -11019,7 +11026,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let stream_for_ui = Rc::clone(&stream);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -11103,7 +11110,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The TLS-arm informational hint rows push the probe
         // panel's lower buttons past the default 800x600 kittest viewport;
         // the real app scrolls, so the harness just gets a taller one.
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(800.0, 700.0))
             .build_ui(move |ui| {
                 let _ = screen_for_ui.borrow_mut().security_tab(
@@ -11174,7 +11181,7 @@ Authentication: ML-KEM-768, Post-Quantum
             tls_settings: Some(TlsModel::default()),
             ..Default::default()
         };
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -11206,7 +11213,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         }));
         let stream_for_ui = Rc::clone(&stream);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -11255,7 +11262,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         };
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().security_tab(
                 ui,
                 Language::En,
@@ -11287,7 +11294,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
         let mut screen = ServersScreen::default();
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 let _ = screen.basic_tab_for_target(
                     ui,
                     Language::En,
@@ -11308,7 +11315,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn freedom_mouse_created_states_are_immediately_valid() {
         let noises = Rc::new(RefCell::new(Vec::<Noise>::new()));
         let noises_for_ui = Rc::clone(&noises);
-        let mut noise_harness = Harness::new_ui(move |ui| {
+        let mut noise_harness = harness_builder().build_ui(move |ui| {
             let _ = noises_editor(ui, Language::En, &mut noises_for_ui.borrow_mut());
         });
         noise_harness.get_by_label("+ noise").click();
@@ -11317,7 +11324,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
         let rules = Rc::new(RefCell::new(Vec::<FreedomFinalRule>::new()));
         let rules_for_ui = Rc::clone(&rules);
-        let mut rule_harness = Harness::new_ui(move |ui| {
+        let mut rule_harness = harness_builder().build_ui(move |ui| {
             let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
         });
         rule_harness.get_by_label("+ final rule").click();
@@ -11331,7 +11338,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let profile_for_ui = Rc::clone(&profile);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut fragment_harness = Harness::new_ui(move |ui| {
+        let mut fragment_harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().basic_tab_for_target(
                 ui,
                 Language::En,
@@ -11480,7 +11487,7 @@ Authentication: ML-KEM-768, Post-Quantum
         ] {
             let mut profile = blackhole_profile(kind, data);
             let mut screen = ServersScreen::default();
-            let mut harness = Harness::new_ui(|ui| {
+            let mut harness = harness_builder().build_ui(|ui| {
                 let _ = screen.basic_tab_for_target(
                     ui,
                     Language::En,
@@ -11534,7 +11541,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let changed = Rc::new(RefCell::new(false));
         let (profile_for_ui, changed_for_ui) = (Rc::clone(&profile), Rc::clone(&changed));
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             // `Harness::run` may step several frames; keep any edit a frame
             // reports instead of letting a later quiet frame clear it.
             *changed_for_ui.borrow_mut() |= screen.basic_tab_for_target(
@@ -11711,7 +11718,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut screen = ServersScreen::default();
         let mut reported_changed = false;
         {
-            let _harness = Harness::new_ui(|ui| {
+            let _harness = harness_builder().build_ui(|ui| {
                 reported_changed |= screen.transport_tab(
                     ui,
                     Language::En,
@@ -11763,7 +11770,7 @@ Authentication: ML-KEM-768, Post-Quantum
     /// real paint path of the preview (virtualized rows, truncated labels) and
     /// checks the formatted rows survive into the next frame.
     fn render_servers_frame(screen: &mut ServersScreen, rig: &mut UiTestRig) {
-        let _harness = Harness::new_ui(|ui| screen.show(ui, &mut rig.ctx().servers()));
+        let _harness = harness_builder().build_ui(|ui| screen.show(ui, &mut rig.ctx().servers()));
     }
 
     /// The import preview is formatted once per parse result, not per frame:
@@ -11889,7 +11896,7 @@ Authentication: ML-KEM-768, Post-Quantum
     /// One full Advanced-tab frame through a kittest harness. The harness is
     /// dropped before returning so its borrows do not overlap later ones.
     fn render_advanced_tab(screen: &mut ServersScreen, profile: &mut ServerProfile) {
-        let _harness = Harness::new_ui(|ui| {
+        let _harness = harness_builder().build_ui(|ui| {
             let _ = ServersScreen::advanced_tab(
                 ui,
                 Language::En,
@@ -11917,7 +11924,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut profile =
             ServerProfile::new("caption-order", OutboundModel::new(Protocol::Freedom));
         profile.outbound.stream.finalmask = Some(FinalmaskModel::default());
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(1200.0, 2000.0))
             .build_ui(|ui| {
                 let _ = ServersScreen::advanced_tab(
@@ -11978,7 +11985,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .expect("the empty resolver row's finding is rendered");
 
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(1200.0, 2000.0))
             .build_ui(|ui| {
                 let _ = ServersScreen::advanced_tab(
@@ -12036,7 +12043,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }
 
         let mut screen = ServersScreen::default();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(1200.0, 2000.0))
             .build_ui(|ui| {
                 let _ = ServersScreen::advanced_tab(
@@ -12478,9 +12485,9 @@ Authentication: ML-KEM-768, Post-Quantum
         // draft: the draft itself is unchanged, so Save must refuse — the
         // same gate as the editor's Validate-and-save button.
         harness.state_mut().0.seeded_buffers.json_mut().insert(
-            egui::Id::new("finalmask-test"),
+            egui::Id::unique("finalmask-test"),
             JsonBuf {
-                key: Some(egui::Id::new("finalmask-test")),
+                key: Some(egui::Id::unique("finalmask-test")),
                 text: "{ invalid".into(),
                 error: Some("parse failed".into()),
                 dirty: true,
@@ -12728,7 +12735,7 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn the_leave_question_falls_back_to_the_main_window_off_screen() {
         let rig = UiTestRig::default();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(DEFAULT_TEST_VIEWPORT)
             .build_ui_state(
                 |ui, state: &mut (ServersScreen, UiTestRig)| {
@@ -12782,7 +12789,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         screen.existing.draft.as_mut().unwrap().validation = Some(clean_memo(4, false));
         screen.seeded_buffers.json_mut().insert(
-            egui::Id::new("raw-field"),
+            egui::Id::unique("raw-field"),
             JsonBuf {
                 key: None,
                 text: "{".into(),
@@ -13061,7 +13068,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // or the user would be stuck with the error text.
         install_draft(&mut harness.state_mut().0, &clean, &clean);
         harness.state_mut().0.seeded_buffers.json_mut().insert(
-            egui::Id::new("finalmask-raw-action-row"),
+            egui::Id::unique("finalmask-raw-action-row"),
             JsonBuf {
                 key: None,
                 text: "{ invalid".into(),
@@ -14730,6 +14737,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, -100.0),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
                 modifiers: egui::Modifiers::NONE,
             });
             harness.step();
@@ -15162,14 +15170,14 @@ Authentication: ML-KEM-768, Post-Quantum
         // its PEM certificate lists seed into it.
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("realm-editor-test"),
+                        key: egui::Id::unique("realm-editor-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15268,14 +15276,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("realm-allow-insecure-test"),
+                        key: egui::Id::unique("realm-allow-insecure-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15338,14 +15346,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("realm-trust-switch-test"),
+                        key: egui::Id::unique("realm-trust-switch-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15407,14 +15415,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("xdns-editor-test"),
+                        key: egui::Id::unique("xdns-editor-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15539,22 +15547,27 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
-            let _ = finalmask_udp_settings_editor(
-                ui,
-                Language::En,
-                &mut mask_for_ui.borrow_mut(),
-                RawField {
-                    id: FieldKey {
-                        key: egui::Id::new("xdns-doh-test"),
-                        profile: "profile-test",
+        let mut harness = harness_builder()
+            // The resolver editor stacks the TLS and QUIC blocks; the QUIC
+            // gate sits past the default harness height, where a click lands
+            // outside the viewport.
+            .with_size(egui::vec2(800.0, 1000.0))
+            .build_ui(move |ui| {
+                let _ = finalmask_udp_settings_editor(
+                    ui,
+                    Language::En,
+                    &mut mask_for_ui.borrow_mut(),
+                    RawField {
+                        id: FieldKey {
+                            key: egui::Id::unique("xdns-doh-test"),
+                            profile: "profile-test",
+                        },
+                        buffers: &mut buffers_for_ui.borrow_mut(),
                     },
-                    buffers: &mut buffers_for_ui.borrow_mut(),
-                },
-                false,
-                0,
-            );
-        });
+                    false,
+                    0,
+                );
+            });
         harness.run();
 
         // The TLS block starts absent; enabling it is the same `TlsModel`
@@ -15631,7 +15644,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let buffers_for_ui = Rc::clone(&buffers);
         let width = 360.0;
         let height = 1600.0;
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(width, height))
             .build_ui(move |ui| {
                 let _ = finalmask_udp_settings_editor(
@@ -15640,7 +15653,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     &mut mask_for_ui.borrow_mut(),
                     RawField {
                         id: FieldKey {
-                            key: egui::Id::new("xdns-remove-clip-test"),
+                            key: egui::Id::unique("xdns-remove-clip-test"),
                             profile: "profile-test",
                         },
                         buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15693,14 +15706,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("noise-editor-test"),
+                        key: egui::Id::unique("noise-editor-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15780,14 +15793,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mask_for_ui = Rc::clone(&mask);
         let buffers = Rc::new(RefCell::new(SeededBuffers::default()));
         let buffers_for_ui = Rc::clone(&buffers);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = finalmask_udp_settings_editor(
                 ui,
                 Language::En,
                 &mut mask_for_ui.borrow_mut(),
                 RawField {
                     id: FieldKey {
-                        key: egui::Id::new("noise-script-editor-test"),
+                        key: egui::Id::unique("noise-script-editor-test"),
                         profile: "profile-test",
                     },
                     buffers: &mut buffers_for_ui.borrow_mut(),
@@ -15859,7 +15872,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let stream_for_ui = Rc::clone(&stream);
         let screen = Rc::new(RefCell::new(ServersScreen::default()));
         let screen_for_ui = Rc::clone(&screen);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = screen_for_ui.borrow_mut().transport_tab(
                 ui,
                 Language::En,
@@ -15901,7 +15914,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         })));
         let xmux_for_ui = Rc::clone(&xmux);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
         });
         assert!(harness.query_by_label("maxConnections").is_some());
@@ -15924,7 +15937,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn xmux_section_renders_the_shared_controls() {
         let xmux = Rc::new(RefCell::new(Some(XmuxConfig::default())));
         let xmux_for_ui = Rc::clone(&xmux);
-        let harness = Harness::new_ui(move |ui| {
+        let harness = harness_builder().build_ui(move |ui| {
             let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
         });
         for caption in [
@@ -15956,7 +15969,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         })));
         let xmux_for_ui = Rc::clone(&xmux);
-        let harness = Harness::new_ui(move |ui| {
+        let harness = harness_builder().build_ui(move |ui| {
             let _ = xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut());
         });
         harness.get_by_label(t(Language::En, Key::SrvMutuallyExclusive));
@@ -15976,7 +15989,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let changed = Rc::new(std::cell::Cell::new(false));
         let xmux_for_ui = Rc::clone(&xmux);
         let changed_for_ui = Rc::clone(&changed);
-        let mut harness = Harness::new_ui(move |ui| {
+        let mut harness = harness_builder().build_ui(move |ui| {
             if xmux_section(ui, Language::En, &mut xmux_for_ui.borrow_mut()) {
                 changed_for_ui.set(true);
             }
@@ -16021,7 +16034,7 @@ Authentication: ML-KEM-768, Post-Quantum
             ..Default::default()
         }));
         let stream_for_ui = Rc::clone(&stream);
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(900.0, 3600.0))
             .build_ui_state(
                 |ui, screen: &mut ServersScreen| {

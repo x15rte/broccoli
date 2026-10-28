@@ -4577,6 +4577,7 @@ mod safety_ack_tests {
     use crate::model::inbound::{DokodemoCfg, LocalInboundCfg, LocalInboundProtocol};
     use crate::model::safety::{HazardClass, SafetyCode, SafetyFinding, SafetyVerdicts};
     use crate::model::servers::ServersFile;
+    use crate::ui::test_rig::harness_builder;
 
     /// One finding per exposure rule: unauthenticated SOCKS + HTTP endpoints
     /// and an enabled dokodemo inbound, all bound beyond loopback.
@@ -4689,7 +4690,7 @@ mod safety_ack_tests {
 
     #[test]
     fn safety_ack_modal_lists_every_finding_and_apply_anyway_confirms() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -4711,7 +4712,7 @@ mod safety_ack_tests {
             .collect();
         let decision = Rc::new(Cell::new(None));
         let decision_for_ui = Rc::clone(&decision);
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, findings: &mut Vec<SafetyFinding>| {
                 show_safety_ack_modal(ui.ctx(), Language::En, findings, |confirmed| {
                     decision_for_ui.set(Some(confirmed));
@@ -4759,7 +4760,7 @@ mod safety_ack_tests {
 
     #[test]
     fn safety_ack_modal_cancel_aborts_without_confirming() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -4770,7 +4771,7 @@ mod safety_ack_tests {
         }];
         let decision = Rc::new(Cell::new(None));
         let decision_for_ui = Rc::clone(&decision);
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, findings: &mut Vec<SafetyFinding>| {
                 show_safety_ack_modal(ui.ctx(), Language::En, findings, |confirmed| {
                     decision_for_ui.set(Some(confirmed));
@@ -4807,6 +4808,7 @@ mod unsaved_changes_tests {
     use crate::model::settings::Language;
     use crate::model::{OutboundModel, Protocol, ServerProfile};
     use crate::ui::servers::LeaveAction;
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{UiTestRig, servers_frame_harness};
     use crate::ui::topbar::{TopbarMemos, TopbarRowState, show_row};
 
@@ -4819,7 +4821,7 @@ mod unsaved_changes_tests {
         use egui_kittest::kittest::Queryable;
 
         let row = |unsaved: bool| {
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = harness_builder()
                 .with_size(egui::Vec2::new(1100.0, 60.0))
                 .build_ui_state(
                     move |ui, memos: &mut TopbarMemos| {

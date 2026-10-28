@@ -480,6 +480,7 @@ fn topbar_status_zone(ui: &mut egui::Ui, status: &TopbarStatus<'_>) -> TopbarCli
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::test_rig::harness_builder;
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     /// A status exercising every chip: all errors set, a long server name,
@@ -556,7 +557,7 @@ mod tests {
     /// Drive the real row through kittest. The state is built per frame from
     /// the fixture's owned fields, exactly as the shell builds it.
     fn row_harness(width: f32, case: RowCase) -> Harness<'static, RowFixture> {
-        Harness::builder()
+        harness_builder()
             .with_size(egui::Vec2::new(width, 60.0))
             .build_ui_state(
                 |ui, fixture: &mut RowFixture| {
@@ -740,7 +741,7 @@ mod tests {
 
     #[test]
     fn status_zone_renders_every_chip_state() {
-        let mut h = Harness::new_ui(|ui| {
+        let mut h = harness_builder().build_ui(|ui| {
             topbar_status_zone(ui, &heavy_status());
         });
         h.run();
@@ -768,7 +769,7 @@ mod tests {
 
     #[test]
     fn terminal_error_chip_reports_the_jump_to_the_message() {
-        let mut h = Harness::builder().build_ui_state(
+        let mut h = harness_builder().build_ui_state(
             move |ui, clicks: &mut TopbarClicks| {
                 // Latched: `run` may frame past the click's frame.
                 if topbar_status_zone(ui, &heavy_status()).jump_to_error {

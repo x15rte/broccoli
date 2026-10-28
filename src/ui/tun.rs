@@ -456,6 +456,7 @@ mod tests {
     use super::*;
     use crate::i18n::{Key, t_fmt};
     use crate::model::settings::Language;
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::Harness;
     use egui_kittest::kittest::NodeT as _;
@@ -478,7 +479,7 @@ mod tests {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
         rig.settings.tun.auto_outbounds_interface = setting.to_string();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .build_ui_state(|ui, screen| screen.show(ui, &mut rig.ctx().tun()), screen);
         harness.run();
 
@@ -513,7 +514,7 @@ mod tests {
             }
         });
         rig.phase = phase;
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.show(ui, &mut rig.ctx().tun()),
             TunScreen::default(),
         );
@@ -538,7 +539,7 @@ mod tests {
         // present once it is.
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.show(ui, &mut rig.ctx().tun()),
             TunScreen::default(),
         );
@@ -654,7 +655,7 @@ mod tests {
         // holds on a loaded machine too: the gate, not the clock, decides.
         screen.next_refresh_at = Some(std::time::Instant::now() + REFRESH_INTERVAL * 1_000);
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen: &mut TunScreen| screen.show(ui, &mut rig.ctx().tun()),
             screen,
         );

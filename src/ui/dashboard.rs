@@ -965,7 +965,7 @@ fn format_rate(v: u64, unit: TrafficUnit) -> String {
 /// the surrounding layout changes. One definition, so a rename cannot leave a
 /// test bound to a key nothing writes.
 pub fn throughput_plot_id() -> egui::Id {
-    egui::Id::new("throughput-chart")
+    egui::Id::unique("throughput-chart")
 }
 
 /// Axis-mark label for the throughput plot: [`format_bytes`] on an `f64`
@@ -1210,6 +1210,7 @@ mod tests {
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
     use crate::ui::TerminalErrorView;
     use crate::ui::TrafficSample;
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{UiTestRig, screen_harness_at};
     use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable as _};
     use std::cell::RefCell;
@@ -1247,7 +1248,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(420.0, 600.0))
             .build_ui_state(
                 |ui, rig: &mut UiTestRig| {
@@ -1400,7 +1401,7 @@ mod tests {
             ],
             ..Default::default()
         });
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -1438,7 +1439,7 @@ mod tests {
     const HARNESS_WIDTH: f32 = 900.0;
 
     fn harness_for(rig: Rc<RefCell<UiTestRig>>) -> Harness<'static, DashboardScreen> {
-        Harness::builder()
+        harness_builder()
             .with_size(egui::vec2(HARNESS_WIDTH, 1400.0))
             .build_ui_state(
                 move |ui, screen: &mut DashboardScreen| {
@@ -1616,7 +1617,7 @@ mod tests {
             num_gc: 7,
             ..Default::default()
         });
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -1652,7 +1653,7 @@ mod tests {
         });
         let width = 340.0;
         let height = 700.0;
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(width, height))
             .build_ui_state(
                 move |ui, screen: &mut DashboardScreen| {
@@ -1700,7 +1701,7 @@ mod tests {
         rig.borrow_mut().settings = broken;
 
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -1813,7 +1814,7 @@ mod tests {
             ..Default::default()
         });
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -1893,7 +1894,7 @@ mod tests {
             ..Default::default()
         });
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -1978,7 +1979,7 @@ mod tests {
             .stats_history
             .push_back(TrafficSample { up: 10, down: 20 });
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -2069,7 +2070,7 @@ mod tests {
             rig.latency_generation += 1;
         }
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -2389,7 +2390,7 @@ mod tests {
             });
             rig.settings.local_inbounds[1].enabled = false;
         }
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())
@@ -2425,7 +2426,7 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         rig.borrow_mut().phase = CorePhase::Running;
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             move |ui, screen: &mut DashboardScreen| {
                 let mut rig = rig_handle.borrow_mut();
                 screen.show(ui, &mut rig.ctx().dashboard())

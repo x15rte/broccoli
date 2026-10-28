@@ -1525,6 +1525,7 @@ mod tests {
     use crate::sys::core_dl::GeoDataProvenance;
     use crate::sys::selfupd::{UpdateCheckState, Version};
     use crate::ui::test_rig::UiTestRig;
+    use crate::ui::test_rig::harness_builder;
     use egui::Color32;
     use egui_kittest::{
         Harness,
@@ -1536,12 +1537,10 @@ mod tests {
     #[test]
     fn appearance_scale_changes_global_zoom() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder()
-            .with_pixels_per_point(1.5)
-            .build_ui_state(
-                |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
-                SettingsScreen::default(),
-            );
+        let mut harness = harness_builder().with_pixels_per_point(1.5).build_ui_state(
+            |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
+            SettingsScreen::default(),
+        );
 
         harness
             .get_by_role_and_label(egui::accesskit::Role::ComboBox, "UI scale")
@@ -1566,7 +1565,7 @@ mod tests {
         );
 
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1604,7 +1603,7 @@ mod tests {
     #[test]
     fn appearance_language_list_is_english_only_and_persists() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1627,7 +1626,7 @@ mod tests {
     #[test]
     fn appearance_accent_row_exposes_picker_and_reset() {
         let mut rig = UiTestRig::default();
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.appearance_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1710,7 +1709,7 @@ mod tests {
     #[test]
     fn geodata_section_binds_url_fields_and_persists() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1783,7 +1782,7 @@ mod tests {
     #[test]
     fn ping_test_section_binds_url_field_and_persists() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.advanced_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1829,7 +1828,7 @@ mod tests {
     #[test]
     fn updates_section_idle_shows_only_the_check_button() {
         let mut rig = UiTestRig::default();
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1853,7 +1852,7 @@ mod tests {
             update_check: UpdateCheckState::Checking,
             ..Default::default()
         };
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1883,7 +1882,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1906,7 +1905,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1923,7 +1922,7 @@ mod tests {
             update_check: UpdateCheckState::Failed,
             ..Default::default()
         };
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1943,7 +1942,7 @@ mod tests {
     #[test]
     fn updates_section_idle_click_sends_one_check_update_command() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.updates_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1966,7 +1965,7 @@ mod tests {
     #[test]
     fn cleanup_section_renders_the_clean_up_and_exit_button() {
         let mut rig = UiTestRig::default();
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -1996,7 +1995,7 @@ mod tests {
     #[test]
     fn cleanup_section_renders_the_network_cleanup_button() {
         let mut rig = UiTestRig::default();
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2017,7 +2016,7 @@ mod tests {
     fn network_cleanup_modal_confirm_sends_one_clean_up_command() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2057,7 +2056,7 @@ mod tests {
     fn network_cleanup_modal_cancel_sends_nothing() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2083,7 +2082,7 @@ mod tests {
     fn cleanup_modal_opens_with_the_two_actions() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2107,7 +2106,7 @@ mod tests {
     fn cleanup_modal_cancel_closes_without_a_cleanup_request() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2133,7 +2132,7 @@ mod tests {
     fn cleanup_modal_full_cleanup_records_the_request_and_closes() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2162,7 +2161,7 @@ mod tests {
     fn reset_modal_confirm_records_the_request_and_closes() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2200,7 +2199,7 @@ mod tests {
     fn reset_modal_cancel_closes_without_a_request() {
         let mut rig = UiTestRig::default();
         let mut screen = SettingsScreen::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, _state| screen.cleanup_section(ui, &mut rig.ctx().settings()),
             (),
         );
@@ -2225,7 +2224,7 @@ mod tests {
     #[test]
     fn geodata_section_url_only_edit_marks_dirty_and_commits() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2262,7 +2261,7 @@ mod tests {
     #[test]
     fn geodata_section_shows_validation_errors() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2327,7 +2326,7 @@ mod tests {
     #[test]
     fn geodata_section_empty_is_unconfigured() {
         let mut rig = UiTestRig::default();
-        let harness = Harness::builder().build_ui_state(
+        let harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2442,7 +2441,7 @@ mod tests {
             ..Default::default()
         };
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             screen,
         );
@@ -2497,7 +2496,7 @@ mod tests {
         // on-disk bytes, never the config.
         rig.settings.geodata.geoip_url = Some("https://example.com/geoip.dat".into());
         rig.settings.geodata.geosite_url = Some("https://example.com/geosite.dat".into());
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             screen,
         );
@@ -2566,7 +2565,7 @@ mod tests {
         set_mtime(&core.join("geoip.dat"), first);
         set_mtime(&core.join("geosite.dat"), first);
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2633,7 +2632,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary AppData root");
         let _appdata = AppDataRedirect::to(temporary.path());
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2762,7 +2761,7 @@ mod tests {
             .expect("seed pristine geosite");
 
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, screen| screen.geodata_section(ui, &mut rig.ctx().settings()),
             SettingsScreen::default(),
         );
@@ -2974,7 +2973,7 @@ mod tests {
     fn raw_override_validate_click_arms_reply_poll_and_renders_accepted_verdict() {
         let screen = seeded_raw_override_screen();
         let rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
                 state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
@@ -3047,7 +3046,7 @@ mod tests {
     fn raw_override_validate_err_verdict_renders_reject_text_and_output() {
         let screen = seeded_raw_override_screen();
         let rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
                 state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
@@ -3106,7 +3105,7 @@ mod tests {
     fn raw_override_validate_failed_run_verdict_renders_reject_text_and_output() {
         let screen = seeded_raw_override_screen();
         let rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
                 state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
@@ -3166,7 +3165,7 @@ mod tests {
     fn raw_override_validate_closed_reply_clears_pending_without_a_verdict() {
         let screen = seeded_raw_override_screen();
         let rig = UiTestRig::default();
-        let mut harness = Harness::builder().build_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, state: &mut (SettingsScreen, UiTestRig)| {
                 state.0.advanced_section(ui, &mut state.1.ctx().settings());
             },
@@ -3226,7 +3225,7 @@ mod tests {
     #[test]
     fn policy_level_headers_follow_add_and_remove() {
         let mut rig = UiTestRig::default();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(800.0, 1000.0))
             .build_ui_state(
                 |ui, screen| screen.core_section(ui, &mut rig.ctx().settings()),

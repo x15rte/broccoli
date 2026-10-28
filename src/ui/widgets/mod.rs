@@ -1532,7 +1532,7 @@ pub fn section_with_reveal(
     // The arrow carries the section's own node, exactly as the plain header
     // does, so assistive technology reads the section and toggles it here.
     collapser.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, ui.is_enabled(), title)
+        egui::WidgetInfo::labeled(egui::Role::DisclosureTriangle, ui.is_enabled(), title)
     });
     *revealed = shown;
 }
@@ -1732,7 +1732,8 @@ impl TextLayoutMemo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable as _};
+    use crate::ui::test_rig::harness_builder;
+    use egui_kittest::kittest::Queryable as _;
 
     /// The one comparison every memoized screen row relies on: an unchanged
     /// key rebuilds nothing (an idle frame does no work), and a changed key
@@ -1808,7 +1809,7 @@ mod tests {
         // text is absent from the tree until the pointer is over the row,
         // and present once it is.
         let note = "The core downloads on first use.";
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(400.0, 200.0))
             .build_ui_state(
                 |ui, value: &mut String| {
@@ -1837,7 +1838,7 @@ mod tests {
         // inside `ui.horizontal`, claiming the entire row width and pushing
         // the remove button past the clip rect (invisible, unclickable).
         let items = vec!["10.255.0.1/30".to_owned()];
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(400.0, 200.0))
             .build_ui_state(
                 |ui, items: &mut Vec<String>| {
@@ -1884,7 +1885,7 @@ mod tests {
         // must reach its requested width and the value field must fill the
         // remaining row width.
         let entries = vec![("example.com".to_owned(), "1.2.3.4".to_owned())];
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(400.0, 200.0))
             .build_ui_state(
                 |ui, entries: &mut Vec<(String, String)>| {
@@ -2022,7 +2023,7 @@ mod tests {
 
         let runs = Cell::new(0usize);
         let runs_ref = &runs;
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(320.0, 120.0))
             .build_ui_state(
                 |ui, value: &mut String| {
@@ -2089,7 +2090,7 @@ mod tests {
     /// both directions.
     #[test]
     fn validated_field_with_revision_follows_the_context_both_ways() {
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(360.0, 160.0))
             .build_ui_state(
                 |ui, state: &mut (String, Vec<String>)| {
@@ -2154,7 +2155,7 @@ mod tests {
             changed: bool,
         }
 
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(400.0, 160.0))
             .build_ui_state(
                 |ui, row: &mut Row| {
@@ -2251,7 +2252,7 @@ mod tests {
         let not_lua = validation_message(&ValidationCode::LuaScriptPathNotLua, Language::En);
         let conflict = validation_message(&ValidationCode::DnsScriptFallbackConflict, Language::En);
 
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(600.0, 220.0))
             .build_ui_state(
                 |ui, row: &mut Row| {

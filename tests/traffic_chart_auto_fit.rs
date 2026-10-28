@@ -82,6 +82,7 @@ fn wheel_scroll_over_chart(h: &mut Harness<'static, BroccoliApp>) {
             delta: egui::Vec2::new(0.0, 60.0),
             modifiers: egui::Modifiers::NONE,
             phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
         h.run();
     }

@@ -315,8 +315,11 @@ fn inbound_accounts_mask_and_the_reveal_rides_the_listeners_header() {
         h.query_by_label(t(Language::En, Key::Accounts)).is_none(),
         "a click on the section title must collapse the section"
     );
-    h.get_by_role_and_label(Role::Button, t(Language::En, Key::LocalListeners))
-        .click();
+    h.get_by_role_and_label(
+        Role::DisclosureTriangle,
+        t(Language::En, Key::LocalListeners),
+    )
+    .click();
     h.run();
     assert!(
         h.query_by_label(t(Language::En, Key::Accounts)).is_some(),

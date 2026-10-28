@@ -43,7 +43,7 @@ use egui::{Context, Id, Ui, ViewportBuilder, ViewportId};
 /// shorter than the window.
 pub(crate) fn show(
     ctx: &Context,
-    key: impl egui::AsId,
+    key: impl egui::AsIdSalt,
     title: &str,
     size: [f32; 2],
     resizable: bool,
@@ -116,14 +116,14 @@ pub(crate) fn show(
 /// `Ui::close` — which the caller answers the same way as its Cancel button.
 pub(crate) fn modal(
     ctx: &Context,
-    key: impl egui::AsId,
+    key: impl egui::AsIdSalt,
     title: &str,
     width: f32,
     mut body: impl FnMut(&mut Ui),
 ) -> bool {
     // The key names the confirmation: two of them in one frame need different
     // keys, and the same one keeps its key across frames.
-    let id = Id::new(("popup-modal", key));
+    let id = Id::unique(("popup-modal", key));
     egui::Modal::new(id)
         .show(ctx, |ui| {
             // The modal carries no chrome of its own, so the helper draws the
@@ -145,11 +145,11 @@ pub(crate) fn modal(
 ///
 /// Returns whether the backdrop was clicked, which the caller answers the same
 /// way as its Cancel button.
-pub(crate) fn backdrop(ctx: &Context, key: impl egui::AsId) -> bool {
+pub(crate) fn backdrop(ctx: &Context, key: impl egui::AsIdSalt) -> bool {
     // The backdrop is the dim and the modality and nothing else: `egui::Modal`'s
     // own popup frame around an empty body would leave a stray box in the middle
     // of the dimmed window, and a dead spot for the click that declines.
-    egui::Modal::new(Id::new(("popup-modal-backdrop", key)))
+    egui::Modal::new(Id::unique(("popup-modal-backdrop", key)))
         .frame(egui::Frame::NONE)
         .show(ctx, |_| {})
         .should_close()

@@ -17,7 +17,7 @@ pub fn viewport_builder(
     egui_zoom_factor: f32,
     event_loop: &ActiveEventLoop,
     native_options: &mut epi::NativeOptions,
-    window_settings: Option<WindowSettings>,
+    window_settings: &mut Option<WindowSettings>,
 ) -> ViewportBuilder {
     profiling::function_scope!();
 
@@ -30,7 +30,7 @@ pub fn viewport_builder(
     // Always use the default window size / position on iOS. Trying to restore the previous position
     // causes the window to be shown too small.
     #[cfg(not(target_os = "ios"))]
-    let inner_size_points = if let Some(mut window_settings) = window_settings {
+    let inner_size_points = if let Some(window_settings) = window_settings {
         // Restore pos/size from previous session
 
         if clamp_size_to_monitor_size {
@@ -41,12 +41,9 @@ pub fn viewport_builder(
         }
         window_settings.clamp_position_to_monitors(egui_zoom_factor, event_loop);
 
-        viewport_builder = window_settings.initialize_viewport_builder(
-            egui_zoom_factor,
-            event_loop,
-            viewport_builder,
-        );
-        window_settings.inner_size_points()
+        viewport_builder =
+            window_settings.initialize_viewport_builder(egui_zoom_factor, viewport_builder);
+        Some(window_settings.inner_size_points())
     } else {
         if let Some(pos) = viewport_builder.position {
             viewport_builder = viewport_builder.with_position(pos);
@@ -76,8 +73,8 @@ pub fn viewport_builder(
                 .to_logical::<f32>(egui_zoom_factor as f64 * monitor.scale_factor());
             let inner_size = inner_size_points.unwrap_or(egui::Vec2 { x: 800.0, y: 600.0 });
             if 0.0 < monitor_size.width && 0.0 < monitor_size.height {
-                let x = (monitor_size.width - inner_size.x) / 2.0;
-                let y = (monitor_size.height - inner_size.y) / 2.0;
+                let x = (monitor_size.width - inner_size.x) * 0.5;
+                let y = (monitor_size.height - inner_size.y) * 0.5;
                 viewport_builder = viewport_builder.with_position([x, y]);
             }
         }
@@ -147,6 +144,35 @@ pub fn create_storage_with_file(_file: impl Into<PathBuf>) -> Option<Box<dyn epi
 
 // ----------------------------------------------------------------------------
 
+/// Stands in for the system font provider when the `system_fonts` feature is off.
+///
+/// It never finds a font, but tells you once why nothing was even looked for,
+/// so missing CJK/Arabic/emoji glyphs don't look like an egui bug.
+#[cfg(not(feature = "system_fonts"))]
+#[derive(Default)]
+struct MissingSystemFontsWarning {
+    warned: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(not(feature = "system_fonts"))]
+impl egui::FontProvider for MissingSystemFontsWarning {
+    fn font_for(&self, request: &egui::FallbackRequest<'_>) -> Option<egui::FontInsert> {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !self.warned.swap(true, Relaxed) {
+            log::info!(
+                "No font has {:?}. \
+                 Enable the `system_fonts` feature in `eframe`, \
+                 add a font with `egui::Context::add_font`, \
+                 or set `NativeOptions::system_font_fallback` to `false` to silence this.",
+                request.cluster
+            );
+        }
+        None
+    }
+}
+
+// ----------------------------------------------------------------------------
+
 /// Everything needed to make a winit-based integration for [`epi`].
 ///
 /// Only one instance per app (not one per viewport).
@@ -169,14 +195,21 @@ pub struct EpiIntegration {
     can_drag_window: bool,
     #[cfg(feature = "persistence")]
     persist_window: bool,
-    /// The geometry the window had when it was last measurable (visible, not
-    /// minimized). A minimized window reports an empty (0x0) client area on
-    /// Windows, so [`Self::save`] persists this snapshot while the window is
-    /// minimized instead of skipping the window key: without it, a resize made
-    /// just before minimizing is never written, and the next launch restores
-    /// the older size.
+
+    /// Settings the root window was restored with, for the parts applied when it is first shown.
+    restored_window_settings: Option<WindowSettings>,
+
+    /// Normal (non-maximized) geometry of the root window, as last saved.
+    #[cfg(feature = "persistence")]
+    normal_geometry: Option<egui_winit::WindowGeometry>,
+
+    /// The last persistable window state, captured while the window could be
+    /// measured. A minimized window reports an empty client area and is no
+    /// longer maximized, so the save persists this snapshot instead of
+    /// measuring one that would restore a tiny, un-maximized window.
     #[cfg(feature = "persistence")]
     last_window_settings: Option<WindowSettings>,
+
     app_icon_setter: super::app_icon::AppTitleIconSetter,
 }
 
@@ -204,10 +237,16 @@ impl EpiIntegration {
             #[cfg(feature = "glow")]
             glow_register_native_texture,
             #[cfg(feature = "wgpu_no_default_features")]
+            // We only care about the surface config if we are using wgpu
+            wgpu_surface_config: wgpu_render_state
+                .is_some()
+                .then_some(native_options.wgpu_options.surface),
+            #[cfg(feature = "wgpu_no_default_features")]
             wgpu_render_state,
             window: Some(Arc::clone(window)),
             raw_display_handle: window.display_handle().map(|h| h.as_raw()),
             raw_window_handle: window.window_handle().map(|h| h.as_raw()),
+            activation_token: None,
         };
 
         let icon = native_options
@@ -225,6 +264,24 @@ impl EpiIntegration {
             Some(icon),
         );
 
+        if native_options.system_font_fallback {
+            egui_ctx.add_font_provider(cfg_select! {
+                feature = "system_fonts" => Arc::new(egui_system_font_provider::SystemFontProvider::new()),
+                _ => Arc::new(MissingSystemFontsWarning::default()),
+            });
+        }
+
+        let restored_window_settings = load_window_settings(frame.storage());
+        #[cfg(feature = "persistence")]
+        let normal_geometry = restored_window_settings
+            .map(|settings| settings.normal_geometry())
+            .or_else(|| {
+                // Nothing saved yet, so use the window's own geometry, unless it starts maximized:
+                (!window.is_maximized() && window.fullscreen().is_none()).then(|| {
+                    egui_winit::WindowGeometry::from_window(egui_ctx.zoom_factor(), window)
+                })
+            });
+
         Self {
             frame,
             last_auto_save: Instant::now(),
@@ -234,6 +291,9 @@ impl EpiIntegration {
             can_drag_window: false,
             #[cfg(feature = "persistence")]
             persist_window: native_options.persist_window,
+            restored_window_settings,
+            #[cfg(feature = "persistence")]
+            normal_geometry,
             #[cfg(feature = "persistence")]
             last_window_settings: None,
             app_icon_setter,
@@ -390,32 +450,40 @@ impl EpiIntegration {
     pub fn post_rendering(&mut self, window: &winit::window::Window) {
         profiling::function_scope!();
         if core::mem::take(&mut self.is_first_frame) {
+            if let Some(window_settings) = &self.restored_window_settings {
+                window_settings.before_first_show(window);
+            }
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
             window.set_visible(true);
+            if let Some(window_settings) = &self.restored_window_settings {
+                window_settings.after_first_show(window);
+            }
         }
-
         // Every geometry change paints: a resize repaints synchronously on
         // Windows and a move schedules a repaint, so a snapshot per painted
-        // frame is the newest geometry the window can be measured in.
+        // frame is the newest window state that can be measured.
         #[cfg(feature = "persistence")]
         self.capture_window_settings(window);
     }
 
-    /// Snapshot the window geometry for window persistence.
+    /// Snapshot the root window's persistable state.
     ///
-    /// Only measurable states are recorded: a minimized window reports an
-    /// empty (0x0) client area on Windows, and persisting that snapshot would
-    /// make the next launch restore a tiny window.
+    /// Only a measurable window is recorded: a minimized one reports an empty
+    /// (0x0) client area on Windows and no longer reports itself as maximized,
+    /// so measuring it would persist a tiny, un-maximized window. A maximized
+    /// or fullscreen window keeps the normal geometry captured before it.
     #[cfg(feature = "persistence")]
     fn capture_window_settings(&mut self, window: &winit::window::Window) {
         if window.is_minimized() == Some(true) {
             return;
         }
-        let settings = WindowSettings::from_window(self.egui_ctx.zoom_factor(), window);
-        if settings
-            .inner_size_points()
-            .is_some_and(|size| size.x > 0.0 && size.y > 0.0)
-        {
+        let settings = WindowSettings::from_window(
+            self.egui_ctx.zoom_factor(),
+            window,
+            self.normal_geometry,
+        );
+        if settings.inner_size_points().x > 0.0 && settings.inner_size_points().y > 0.0 {
+            self.normal_geometry = Some(settings.normal_geometry());
             self.last_window_settings = Some(settings);
         }
     }
@@ -447,18 +515,26 @@ impl EpiIntegration {
                 && self.persist_window
             {
                 profiling::scope!("native_window");
-                // A minimized window reports an empty (0x0) client area on
-                // Windows, so it cannot be measured: persist the geometry from
-                // before the minimize instead of skipping the key. Skipping
-                // loses a resize made since the last save, and the next launch
-                // silently restores the older size.
-                let settings = if window.is_minimized() == Some(true) {
+                // A minimized window cannot be measured — an empty client
+                // area on Windows, and no maximize flag — so the last
+                // measurable snapshot is what gets persisted. Skipping the
+                // key instead would lose a resize made just before
+                // minimizing.
+                let window_settings = if window.is_minimized() == Some(true) {
                     self.last_window_settings
                 } else {
-                    Some(WindowSettings::from_window(self.egui_ctx.zoom_factor(), window))
+                    Some(WindowSettings::from_window(
+                        self.egui_ctx.zoom_factor(),
+                        window,
+                        self.normal_geometry,
+                    ))
                 };
-                if let Some(settings) = settings {
-                    epi::set_value(storage, STORAGE_WINDOW_KEY, &settings);
+                if let Some(window_settings) = window_settings {
+                    self.normal_geometry = Some(window_settings.normal_geometry());
+                    let size = window_settings.inner_size_points();
+                    if size.x > 0.0 && size.y > 0.0 {
+                        epi::set_value(storage, STORAGE_WINDOW_KEY, &window_settings);
+                    }
                 }
             }
             if app.persist_egui_memory() {

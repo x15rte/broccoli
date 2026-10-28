@@ -1250,11 +1250,7 @@ impl LogsScreen {
                 // stable interaction id (`base + row index`).
                 ui.skip_ahead_auto_ids(1);
                 response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Label,
-                        ui.is_enabled(),
-                        row.line.as_str(),
-                    )
+                    egui::WidgetInfo::labeled(egui::Role::Label, ui.is_enabled(), row.line.as_str())
                 });
                 ui.painter()
                     .galley(row_rect.min, std::sync::Arc::clone(galley), color);
@@ -1519,8 +1515,9 @@ fn logger_restart_feedback(lang: Language, result: Result<(), DiagError>) -> (bo
 mod tests {
     use super::*;
     use crate::model::settings::Language;
+    use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{UiTestRig, screen_harness};
-    use egui_kittest::{Harness, kittest::Queryable as _};
+    use egui_kittest::kittest::Queryable as _;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1603,7 +1600,7 @@ mod tests {
             }
         }
         let rig_handle = rig.clone();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(700.0, 400.0))
             .build_ui_state(
                 move |ui, screen: &mut LogsScreen| {
@@ -1723,7 +1720,7 @@ mod tests {
                 r.push_log(false, format!("line {i:04}"));
             }
         }
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(700.0, 400.0))
             .build_ui_state(
                 move |ui, screen: &mut LogsScreen| {
@@ -1764,6 +1761,7 @@ mod tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, 100.0),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
                 modifiers: egui::Modifiers::NONE,
             });
             harness.step();

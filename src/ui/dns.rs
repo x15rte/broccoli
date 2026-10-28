@@ -683,7 +683,8 @@ mod tests {
     };
     use crate::model::FakeDnsCfg;
     use crate::ui::test_rig::UiTestRig;
-    use egui_kittest::{Harness, kittest::Queryable as _};
+    use crate::ui::test_rig::harness_builder;
+    use egui_kittest::kittest::Queryable as _;
 
     #[test]
     fn add_pool_suggestion_matches_seeded_second_pool() {
@@ -730,7 +731,7 @@ mod tests {
     #[test]
     fn server_editor_exposes_the_optional_id() {
         let srv = new_dns_server();
-        let mut harness = Harness::new_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, srv: &mut DnsServer| {
                 let _ = server_editor(ui, Language::En, srv, 0);
             },
@@ -760,7 +761,7 @@ mod tests {
 
     #[test]
     fn timeout_editor_accepts_u64_max_from_keyboard() {
-        let mut harness = Harness::new_ui_state(
+        let mut harness = harness_builder().build_ui_state(
             |ui, timeout| {
                 let _ = timeout_editor(ui, Language::En, timeout);
             },
@@ -789,7 +790,7 @@ mod tests {
             "seeded default pair 1.1.1.1 + 8.8.8.8"
         );
         let mut screen = DnsScreen::default();
-        let mut harness = Harness::builder()
+        let mut harness = harness_builder()
             .with_size(egui::vec2(980.0, 720.0))
             .build_ui_state(
                 move |ui, _state: &mut ()| {

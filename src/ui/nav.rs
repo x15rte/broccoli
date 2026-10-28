@@ -137,6 +137,7 @@ fn refresh_readout<'a>(
 mod tests {
     use super::*;
     use crate::ui::test_rig::DEFAULT_TEST_VIEWPORT;
+    use crate::ui::test_rig::harness_builder;
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     /// A 1 Hz sample with distinctive rates: 1 MiB/s up, 2 MiB/s down under
@@ -176,7 +177,7 @@ mod tests {
     /// app's minimum window size — the layout a user's window can actually
     /// have.
     fn nav_rail_harness(fixture: NavRailFixture) -> Harness<'static, NavRailFixture> {
-        Harness::builder()
+        harness_builder()
             .with_size(DEFAULT_TEST_VIEWPORT)
             .build_ui_state(
                 |ui, fixture: &mut NavRailFixture| {

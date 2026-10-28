@@ -710,8 +710,9 @@ fn run_at(h: &mut Harness<'static, BroccoliApp>, time: f64, steps: usize) {
 }
 
 /// Pick a display unit through the dashboard's combo, which shows the current
-/// unit as its value. Each click costs one batch of frames, so a caller that
-/// pins the clock around two calls holds both edits inside one persist window.
+/// unit as its value. Opening the popup costs a second frame before its items
+/// exist, and each click costs a batch of frames, so a caller that pins the
+/// clock around two calls holds both edits inside one persist window.
 fn choose_traffic_unit_at(
     h: &mut Harness<'static, BroccoliApp>,
     time: f64,
@@ -722,7 +723,8 @@ fn choose_traffic_unit_at(
         .find(|node| node.value().as_deref() == Some(current))
         .expect("the traffic-unit combo must show the current unit")
         .click();
-    run_at(h, time, 1);
+    // The popup renders its items one frame after the click that opens it.
+    run_at(h, time, 2);
     h.get_by_role_and_label(egui::accesskit::Role::Button, next)
         .click();
     run_at(h, time, 2);

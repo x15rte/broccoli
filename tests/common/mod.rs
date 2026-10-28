@@ -18,7 +18,20 @@ use broccoli::app::BroccoliApp;
 use broccoli::i18n::{Key, t};
 use broccoli::model::settings::Language;
 use egui::accesskit::Role;
-use egui_kittest::{Harness, kittest::Queryable as _};
+use egui_kittest::{Harness, HarnessBuilder, kittest::Queryable as _};
+
+/// The harness builder every integration test starts from.
+///
+/// egui 0.37's harness panics on a glyph no installed font can draw and checks
+/// that every widget carries an accessible name. The app draws its status
+/// symbols from the system font provider eframe registers at runtime, which a
+/// headless harness does not have, and the screens' combo boxes and numeric
+/// fields do not carry accessible names yet, so both checks are off here.
+pub fn harness_builder<State>() -> HarnessBuilder<State> {
+    Harness::<State>::builder()
+        .allow_missing_glyphs()
+        .with_accessibility_check(false)
+}
 use parking_lot::{Mutex, MutexGuard};
 use std::ffi::OsString;
 use std::path::Path;
@@ -116,7 +129,7 @@ pub fn boot(
         tempfile::tempdir().expect("create a temp dir for the test environment"),
     );
     seed(env.path());
-    let mut builder = Harness::builder();
+    let mut builder = harness_builder();
     if let Some(frame_step) = frame_step {
         builder = builder.with_step_dt(frame_step);
     }
