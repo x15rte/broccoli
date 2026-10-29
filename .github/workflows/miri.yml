@@ -7,10 +7,13 @@ name: Miri scan
 # Miri re-compiles the test crate on every `cargo miri test` invocation
 # (rust-lang/miri#5013), so each test pays ~30 s before its body runs, and
 # Miri halts the whole interpreted process on the first unsupported operation.
-# A sweep of the ~1300 lib unit tests therefore takes hours and runs one
-# process per test. That is why nothing here is triggered by a push or a pull
-# request: the sweep is dispatched by hand when someone wants it, and it
-# reports rather than gates.
+# A sweep of the ~1700 lib unit tests therefore runs one process per test, and
+# at 4-way parallelism it needs about six hours — past the 5h50m a
+# GitHub-hosted job tolerates. The sweep is split across `shards` jobs that
+# each take every Nth test of the same sorted listing, so the wall clock is
+# the shard's share of the work plus one setup. That is why nothing here is
+# triggered by a push or a pull request: the sweep is dispatched by hand when
+# someone wants it, and it reports rather than gates.
 on:
   workflow_dispatch:
     inputs:
@@ -20,10 +23,15 @@ on:
         type: string
         default: ""
       workers:
-        description: "parallel Miri processes (one test per process)"
+        description: "parallel Miri processes inside one shard (one test per process)"
         required: false
         type: number
         default: 4
+      shards:
+        description: "parallel jobs; each takes every Nth test of the sorted listing"
+        required: false
+        type: number
+        default: 8
       test-timeout-seconds:
         description: "wall-clock budget for one test before its process tree is killed"
         required: false
@@ -45,13 +53,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A matrix is a literal in the workflow file, so this job turns the `shards`
+  # input into the literal before the sweep starts.
+  plan:
+    name: Plan the sweep
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.shards.outputs.matrix }}
+      count: ${{ steps.shards.outputs.count }}
+    steps:
+      - name: Build the shard matrix
+        id: shards
+        run: |
+          count="${{ inputs.shards }}"
+          if [ -z "$count" ] || [ "$count" -lt 1 ]; then count=1; fi
+          indices=$(seq -s, 0 $((count - 1)))
+          echo "matrix={\"shard\":[$indices]}" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
   miri:
-    name: Miri scan (x86_64-pc-windows-msvc)
-    # 4 vCPU: dependency metadata builds plus a sweep of every lib unit test,
-    # each in its own interpreter process. 350 minutes is the ceiling a
-    # GitHub-hosted job tolerates; a filtered sweep finishes far below it.
+    name: Miri scan shard ${{ matrix.shard }} (x86_64-pc-windows-msvc)
+    needs: plan
+    # 4 vCPU: dependency metadata builds plus the shard's share of the lib
+    # unit tests, each in its own interpreter process. The budget is per shard:
+    # the whole sweep no longer fits one job, and a shard is a fraction of it.
+    strategy:
+      # A shard that finds Undefined Behavior turns red and stops; the others
+      # must finish, or the report would lose the tests that had not run yet.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 300
     # No cache, unlike the gates: Miri's sysroot and the `target/miri` tree are
     # coupled to one nightly, and a restored sysroot from a different nightly is
     # the documented "found crate std compiled by an incompatible version of
@@ -69,6 +101,12 @@ jobs:
       # ("cargo uses an argfile to invoke rustc", rust-lang/miri#5234). The
       # opt-out keeps the classic `deps/` layout and a short command line.
       __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
+      MIRI_SCAN_SHARD: ${{ matrix.shard }}
+      MIRI_SCAN_SHARDS: ${{ needs.plan.outputs.count }}
+      # The Miri environment forwards this into the interpreted process, so a
+      # panic verdict carries the frames that name its site. Without it two
+      # failures from different call sites read as the same one-line message.
+      RUST_BACKTRACE: "1"
 
     steps:
       - name: Check out the repository
@@ -165,6 +203,8 @@ jobs:
           $budgetSeconds = [int]$env:MIRI_SCAN_BUDGET_SECONDS
           $failOnUb = $env:MIRI_SCAN_FAIL_ON_UB -eq 'true'
           $filter = [string]$env:MIRI_SCAN_FILTER
+          $shard = [int]$env:MIRI_SCAN_SHARD
+          $shards = [int]$env:MIRI_SCAN_SHARDS
 
           # The test list comes from the same Miri build the sweep uses, so a
           # name that cannot run is a name that cannot be listed either.
@@ -174,12 +214,21 @@ jobs:
               $listing | Write-Host
               throw "listing lib unit tests failed with exit code $LASTEXITCODE"
           }
-          $tests = @($listing |
+          $matched = @($listing |
               Where-Object { $_ -match ': test$' } |
               ForEach-Object { ($_ -replace ': test$', '').Trim() } |
-              Where-Object { -not $filter -or $_ -like "*$filter*" })
-          if ($tests.Count -eq 0) { throw "no lib unit test matched filter '$filter'" }
-          Write-Host "$($tests.Count) tests, $workers in parallel, $budgetSeconds s per test"
+              Where-Object { -not $filter -or $_ -like "*$filter*" } |
+              Sort-Object)
+          if ($matched.Count -eq 0) { throw "no lib unit test matched filter '$filter'" }
+          # Every shard sorts the same listing, so an index modulo the shard
+          # count tiles the tests without a gap or an overlap, and a given test
+          # stays in the same shard between runs.
+          $tests = @(
+              for ($index = 0; $index -lt $matched.Count; $index++) {
+                  if ($shards -le 1 -or ($index % $shards) -eq $shard) { $matched[$index] }
+              })
+          Write-Host "$($matched.Count) tests matched, $($tests.Count) in shard $shard of $shards, " +
+              "$workers in parallel, $budgetSeconds s per test"
 
           $started = Get-Date
           $results = $tests | ForEach-Object -Parallel {
@@ -194,7 +243,14 @@ jobs:
               $startInfo.UseShellExecute = $false
               $startInfo.RedirectStandardOutput = $true
               $startInfo.RedirectStandardError = $true
-              foreach ($argument in @('+nightly', 'miri', 'test', '--lib', '--', '--exact', $name, '--test-threads', '1')) {
+              # `--no-capture` writes the test's own output straight through:
+              # libtest buffers it per test and prints it only for a failure it
+              # observes, so a process that dies before the harness reports a
+              # result would take everything it printed with it.
+              $arguments = @(
+                  '+nightly', 'miri', 'test', '--lib', '--',
+                  '--exact', $name, '--test-threads', '1', '--no-capture')
+              foreach ($argument in $arguments) {
                   $startInfo.ArgumentList.Add($argument)
               }
               $process = [System.Diagnostics.Process]::Start($startInfo)
@@ -241,14 +297,28 @@ jobs:
               [pscustomobject]@{ name = $name; verdict = $verdict; detail = $detail; log = $logPath }
           } -ThrottleLimit $workers
 
+          # A shard with no tests produces no pipeline output at all, and a
+          # `$null` collected by `@()` would land in the document as one null
+          # entry: the report then cannot read a verdict from it.
+          $results = @($results | Where-Object { $null -ne $_ })
+
           $elapsed = (Get-Date) - $started
-          $results | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $scanDir 'results.json') -Encoding utf8
+          # The report job merges these documents, so the shard's identity and
+          # its share of the listing travel with the verdicts.
+          [ordered]@{
+              shard = $shard
+              shards = $shards
+              matched = $matched.Count
+              swept = $results.Count
+              results = $results
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $scanDir 'results.json') -Encoding utf8
 
           $summary = [System.Collections.Generic.List[string]]::new()
-          $summary.Add('# Miri scan')
+          $summary.Add("# Miri scan — shard $shard of $shards")
           $summary.Add('')
           $scope = if ($filter) { " matching ``$filter``" } else { '' }
-          $summary.Add("Swept $($results.Count) lib unit tests$scope on ``$($env:RUNNER_OS)``: " +
+          $summary.Add("Swept $($results.Count) of the $($tests.Count) tests in this shard " +
+              "($($matched.Count) matched$scope) on ``$($env:RUNNER_OS)``: " +
               "$workers in parallel, $([int]$elapsed.TotalMinutes) min wall clock, " +
               "$budgetSeconds s per test. Toolchain " +
               "$((& rustc +nightly --version) -join ' '), $((& cargo +nightly miri --version) -join ' ').")
@@ -317,7 +387,8 @@ jobs:
           $summary.Add('')
           $summary.Add('Integration suites, the binary target and the live-core oracles are out of scope:')
           $summary.Add('they need the real core, sockets and the windowing system, none of which Miri models.')
-          $summary.Add('Per-test logs and the sweep''s `results.json` are attached to this run as the `miri-scan` artifact.')
+          $summary.Add("Per-test logs and this shard's ``results.json`` are attached as the ``miri-scan-$shard`` artifact;")
+          $summary.Add('the report job merges every shard into the `miri-scan` artifact.')
           $markdown = $summary -join "`n"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $markdown
           Write-Host $markdown
@@ -336,6 +407,98 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: miri-scan
+          name: miri-scan-${{ matrix.shard }}
           path: ${{ runner.temp }}/miri-scan
+          retention-days: 14
+
+  # The shards report separately and in parallel, so one job presents the
+  # verdicts together. It merges whatever shard documents exist: a shard that
+  # failed or was cancelled shrinks the aggregate and is named as missing,
+  # instead of hiding the shards that did run.
+  report:
+    name: Miri scan report
+    needs: [plan, miri]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Download the shard results
+        # A run whose shards all died before their upload step has nothing to
+        # download; the merge below then reports zero shards, which is the
+        # honest summary of that run.
+        continue-on-error: true
+        uses: actions/download-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          pattern: miri-scan-*
+          path: shards
+
+      - name: Merge the shards
+        env:
+          SHARDS: ${{ needs.plan.outputs.count }}
+          FAIL_ON_UB: ${{ inputs['fail-on-ub'] }}
+        run: |
+          python3 - <<'PY'
+          import collections
+          import glob
+          import json
+          import os
+
+          documents = []
+          for path in sorted(glob.glob('shards/*/results.json')):
+              with open(path, encoding='utf-8-sig') as handle:
+                  documents.append(json.load(handle))
+          results = [row for document in documents for row in document['results']]
+          expected = int(os.environ.get('SHARDS') or 0)
+          filed = {document['shard'] for document in documents}
+          missing = sorted(set(range(expected)) - filed)
+
+          verdicts = collections.Counter(row['verdict'] for row in results)
+          modules = collections.Counter(row['name'].split('::')[0] for row in results)
+
+          summary = ['# Miri scan', '']
+          summary.append(f'{len(filed)} of {expected} shards reported, {len(results)} tests swept.')
+          if missing:
+              summary += ['', '## Shards that filed nothing', '']
+              summary += [f'- `{shard}` (that job\'s log names the failure)' for shard in missing]
+          summary += ['', '| verdict | tests |', '| --- | --- |']
+          summary += [f'| {verdict} | {count} |' for verdict, count in verdicts.most_common()]
+          summary += ['', '| module | tests |', '| --- | --- |']
+          summary += [f'| {module} | {count} |' for module, count in modules.most_common()]
+          for title, verdict in (('Undefined Behavior', 'ub'), ('Memory leaks', 'leak')):
+              rows = [row for row in results if row['verdict'] == verdict]
+              if rows:
+                  summary += ['', f'## {title}', '']
+                  summary += [f"- `{row['name']}` — {row['detail']}" for row in rows]
+          heavy = [row for row in results if row['verdict'] == 'timeout']
+          if heavy:
+              summary += ['', f'## Not swept: over the budget ({len(heavy)})', '']
+              summary += [f"- `{row['name']}`" for row in heavy]
+          stops = collections.Counter(row['detail'] for row in results if row['verdict'] == 'unsupported')
+          if stops:
+              summary += ['', f'## Tests Miri cannot interpret ({sum(stops.values())})', '']
+              summary += [f'- {count} × {detail}' for detail, count in stops.most_common(15)]
+          summary += ['', 'Integration suites, the binary target and the live-core oracles are out of scope:',
+                      'they need the real core, sockets and the windowing system, none of which Miri models.',
+                      'Per-test logs stay in the `miri-scan-<shard>` artifacts.']
+          markdown = '\n'.join(summary)
+          with open('merged.md', 'w', encoding='utf-8') as handle:
+              handle.write(markdown + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as handle:
+              handle.write(markdown + '\n')
+          print(markdown)
+          with open('merged.json', 'w', encoding='utf-8') as handle:
+              json.dump({'results': results}, handle, indent=2)
+          if verdicts['ub'] and os.environ.get('FAIL_ON_UB') == 'true':
+              raise SystemExit(f"{verdicts['ub']} tests report Undefined Behavior")
+          PY
+
+      - name: Upload the merged results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: miri-scan
+          path: |
+            merged.json
+            merged.md
           retention-days: 14
