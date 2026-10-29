@@ -4871,6 +4871,11 @@ version = "0.8.2"
 criteria = "safe-to-deploy"
 version = "1.1.4+spec-1.1.0"
 
+[[audits.toml]]
+criteria = "safe-to-deploy"
+version = "1.1.6+spec-1.1.0"
+notes = "Delta from 1.1.4 reviewed: the parser borrows integer and float values until it must own them and moves table header keys instead of cloning them, and one doc link is fixed. No unsafe code, no public API change and no runtime dependency change (only the crate's own test harness dev-dependencies moved)."
+
 [[audits.toml_datetime]]
 criteria = "safe-to-deploy"
 version = "0.6.3"
