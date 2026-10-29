@@ -36,7 +36,12 @@ on:
         description: "wall-clock budget for one test before its process tree is killed"
         required: false
         type: number
-        default: 300
+        default: 900
+      tests:
+        description: "comma-separated exact test names; overrides `filter`"
+        required: false
+        type: string
+        default: ""
       fail-on-ub:
         description: "red run when Miri reports Undefined Behavior"
         required: false
@@ -185,6 +190,7 @@ jobs:
       - name: Sweep the lib unit tests under Miri
         env:
           MIRI_SCAN_FILTER: ${{ inputs.filter }}
+          MIRI_SCAN_TESTS: ${{ inputs.tests }}
           MIRI_SCAN_WORKERS: ${{ inputs.workers }}
           MIRI_SCAN_BUDGET_SECONDS: ${{ inputs['test-timeout-seconds'] }}
           MIRI_SCAN_FAIL_ON_UB: ${{ inputs['fail-on-ub'] }}
@@ -203,6 +209,7 @@ jobs:
           $budgetSeconds = [int]$env:MIRI_SCAN_BUDGET_SECONDS
           $failOnUb = $env:MIRI_SCAN_FAIL_ON_UB -eq 'true'
           $filter = [string]$env:MIRI_SCAN_FILTER
+          $names = [string]$env:MIRI_SCAN_TESTS
           $shard = [int]$env:MIRI_SCAN_SHARD
           $shards = [int]$env:MIRI_SCAN_SHARDS
 
@@ -219,7 +226,19 @@ jobs:
               ForEach-Object { ($_ -replace ': test$', '').Trim() } |
               Where-Object { -not $filter -or $_ -like "*$filter*" } |
               Sort-Object)
-          if ($matched.Count -eq 0) { throw "no lib unit test matched filter '$filter'" }
+          if ($names) {
+              # A named sweep exists to re-run what an earlier verdict
+              # singled out, so a name the listing does not carry is a typo:
+              # it fails the run instead of sweeping less than was asked.
+              $wanted = @($names.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              $unknown = @($wanted | Where-Object { $_ -notin $matched })
+              if ($unknown.Count -gt 0) {
+                  throw "no such lib unit test: $($unknown -join ', ')"
+              }
+              $matched = @($matched | Where-Object { $_ -in $wanted })
+          } elseif ($matched.Count -eq 0) {
+              throw "no lib unit test matched filter '$filter'"
+          }
           # Every shard sorts the same listing, so an index modulo the shard
           # count tiles the tests without a gap or an overlap, and a given test
           # stays in the same shard between runs.
@@ -227,7 +246,7 @@ jobs:
               for ($index = 0; $index -lt $matched.Count; $index++) {
                   if ($shards -le 1 -or ($index % $shards) -eq $shard) { $matched[$index] }
               })
-          Write-Host "$($matched.Count) tests matched, $($tests.Count) in shard $shard of $shards, " +
+          Write-Host "$($matched.Count) tests selected, $($tests.Count) in shard $shard of $shards, " +
               "$workers in parallel, $budgetSeconds s per test"
 
           $started = Get-Date
@@ -322,7 +341,9 @@ jobs:
           $summary = [System.Collections.Generic.List[string]]::new()
           $summary.Add("# Miri scan — shard $shard of $shards")
           $summary.Add('')
-          $scope = if ($filter) { " matching ``$filter``" } else { '' }
+          $scope = if ($names) { ' named individually' }
+              elseif ($filter) { " matching ``$filter``" }
+              else { '' }
           $summary.Add("Swept $($results.Count) of the $($tests.Count) tests in this shard " +
               "($($matched.Count) matched$scope) on ``$($env:RUNNER_OS)``: " +
               "$workers in parallel, $([int]$elapsed.TotalMinutes) min wall clock, " +
