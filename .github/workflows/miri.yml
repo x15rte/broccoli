@@ -283,6 +283,12 @@ jobs:
               } elseif ($text -match 'test result: ok\.\s+1 passed') {
                   $verdict = 'pass'
                   $detail = ''
+              } elseif ($text -match 'test result: ok\.\s+0 passed; 0 failed; 1 ignored') {
+                  # A test whose attributes skip it (network, an elevated
+                  # token, a pinned archive) still exits 0 through the harness;
+                  # without this branch its log reads as a silent death.
+                  $verdict = 'ignored'
+                  $detail = 'skipped by its own attributes'
               } elseif ($text -match 'can''t call foreign function `([^`]+)`') {
                   $verdict = 'unsupported'
                   $detail = "foreign function ``$($Matches[1])``"
@@ -330,8 +336,8 @@ jobs:
           }
 
           $summary.Add('')
-          $summary.Add('| module | tests | pass | unsupported | panic | timeout | ub |')
-          $summary.Add('| --- | --- | --- | --- | --- | --- | --- |')
+          $summary.Add('| module | tests | pass | unsupported | panic | timeout | ignored | ub |')
+          $summary.Add('| --- | --- | --- | --- | --- | --- | --- | --- |')
           foreach ($group in ($results | Group-Object { $_.name.Split('::')[0] } |
                   Sort-Object Count -Descending)) {
               $rows = $group.Group | Group-Object verdict -AsHashtable
@@ -340,7 +346,8 @@ jobs:
                   if ($rows.ContainsKey($verdict)) { $rows[$verdict].Count } else { 0 }
               }
               $summary.Add("| $($group.Name) | $($group.Count) | $(& $cell 'pass') | " +
-                  "$(& $cell 'unsupported') | $(& $cell 'panic') | $(& $cell 'timeout') | $(& $cell 'ub') |")
+                  "$(& $cell 'unsupported') | $(& $cell 'panic') | $(& $cell 'timeout') | " +
+                  "$(& $cell 'ignored') | $(& $cell 'ub') |")
           }
 
           $ub = @($results | Where-Object { $_.verdict -eq 'ub' })
@@ -380,6 +387,16 @@ jobs:
               $summary.Add("## Not swept: over the $budgetSeconds s budget ($($heavy.Count))")
               $summary.Add('')
               foreach ($finding in $heavy) {
+                  $summary.Add("- ``$($finding.name)``")
+              }
+          }
+
+          $skipped = @($results | Where-Object { $_.verdict -eq 'ignored' })
+          if ($skipped.Count -gt 0) {
+              $summary.Add('')
+              $summary.Add("## Ignored by their own attributes ($($skipped.Count))")
+              $summary.Add('')
+              foreach ($finding in $skipped) {
                   $summary.Add("- ``$($finding.name)``")
               }
           }
@@ -428,7 +445,7 @@ jobs:
         # download; the merge below then reports zero shards, which is the
         # honest summary of that run.
         continue-on-error: true
-        uses: actions/download-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: miri-scan-*
           path: shards
@@ -474,6 +491,10 @@ jobs:
           if heavy:
               summary += ['', f'## Not swept: over the budget ({len(heavy)})', '']
               summary += [f"- `{row['name']}`" for row in heavy]
+          skipped = [row for row in results if row['verdict'] == 'ignored']
+          if skipped:
+              summary += ['', f'## Ignored by their own attributes ({len(skipped)})', '']
+              summary += [f"- `{row['name']}`" for row in skipped]
           stops = collections.Counter(row['detail'] for row in results if row['verdict'] == 'unsupported')
           if stops:
               summary += ['', f'## Tests Miri cannot interpret ({sum(stops.values())})', '']
