@@ -3884,6 +3884,11 @@ version = "0.25.10"
 criteria = "safe-to-deploy"
 version = "2.12.1"
 
+[[audits.ipnet]]
+criteria = "safe-to-deploy"
+version = "2.12.2"
+notes = "Delta from 2.12.1 reviewed: `IpNet::aggregate` merges closed `[network, broadcast]` intervals instead of `[network, broadcast + 1)`, so a network ending at `u32::MAX`/`u128::MAX` no longer pulls the all-ones address into the result. No API, unsafe or dependency change, and this app does not call `aggregate`."
+
 [[audits.is_terminal_polyfill]]
 criteria = "safe-to-deploy"
 version = "1.70.2"
