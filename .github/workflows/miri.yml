@@ -31,7 +31,7 @@ on:
         description: "parallel jobs; each takes every Nth test of the sorted listing"
         required: false
         type: number
-        default: 8
+        default: 16
       test-timeout-seconds:
         description: "wall-clock budget for one test before its process tree is killed"
         required: false
