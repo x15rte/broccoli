@@ -138,9 +138,15 @@ impl ProfilePreviewScreen {
                     // the revision only moves when `record_start` replaces
                     // it; an unchanged frame reuses the cached galley
                     // instead of copying and laying out the whole config.
-                    let mut layouter = self
-                        .config_layout
-                        .layouter(&self.config_generation, TextStyle::Monospace);
+                    // The config is always JSON (a parsed raw override is
+                    // returned verbatim), so the text takes the JSON token
+                    // classes rather than a sniffed language.
+                    let colors = crate::ui::json::json_colors(ui.visuals());
+                    let mut layouter = self.config_layout.layouter_json(
+                        &self.config_generation,
+                        TextStyle::Monospace,
+                        colors,
+                    );
                     ui.add(
                         TextEdit::multiline(&mut text)
                             .font(TextStyle::Monospace)
@@ -309,6 +315,25 @@ mod tests {
             }
             _ => panic!("expected available preview"),
         }
+    }
+
+    /// The config tab renders the launched JSON through the editor path: the
+    /// read-only buffer keeps the whole document and the coloured layouter
+    /// drives the editor without breaking it. The token colours are pinned
+    /// where the layouter is built (`ui::json` and
+    /// `widgets::TextLayoutMemo::layouter_json`); this test covers the screen
+    /// wiring that hands it the text.
+    #[test]
+    fn config_tab_renders_the_launched_json() {
+        let config = "{\n  \"log\": {\"loglevel\": \"warning\"},\n  \"outbounds\": [{\"protocol\": \"freedom\"}]\n}";
+        let mut screen = ProfilePreviewScreen::default();
+        screen.record_start(Ok(config.to_owned()));
+        let mut harness = screen_harness(UiTestRig::default(), screen);
+        harness.run();
+        assert!(
+            harness.query_by_value(config).is_some(),
+            "the config tab shows the launched config text"
+        );
     }
 
     #[test]

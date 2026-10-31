@@ -47,6 +47,29 @@ pub(crate) fn harness_builder<State>() -> HarnessBuilder<State> {
         .with_accessibility_check(false)
 }
 
+/// WCAG relative-contrast ratio of two sRGB colors: one formula for every
+/// palette test that holds a colour to a legibility floor.
+pub(crate) fn wcag_contrast(a: egui::Color32, b: egui::Color32) -> f64 {
+    fn luminance(color: egui::Color32) -> f64 {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        let linear = |v: u8| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+    let (hi, lo) = if luminance(a) >= luminance(b) {
+        (luminance(a), luminance(b))
+    } else {
+        (luminance(b), luminance(a))
+    };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// Minimal UiCtx backing shared by screen-level and app-shell-wiring tests:
 /// real settings plus inert runtime fields, so a screen can be driven
 /// through egui's kittest harness without constructing the full eframe app.

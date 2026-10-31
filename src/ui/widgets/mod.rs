@@ -1654,8 +1654,9 @@ impl egui::TextBuffer for TrackedBuffer<'_> {
 }
 
 /// The style-dependent half of a [`TextLayoutMemo`]'s key: the resolved font
-/// and paint color, the line height and the wrap width. Equal components mean
-/// the cached galley is still the layout this frame's `TextEdit` would
+/// and paint color, the line height, the wrap width, and — for a
+/// JSON-coloured job — the palette its token classes take. Equal components
+/// mean the cached galley is still the layout this frame's `TextEdit` would
 /// produce.
 #[derive(Clone, PartialEq)]
 struct TextLayoutStyle {
@@ -1663,6 +1664,11 @@ struct TextLayoutStyle {
     color: egui::Color32,
     line_height: f32,
     wrap_width: f32,
+    /// `Some(colors)` for a job whose token classes are painted; `None` for
+    /// the default one-colour layout. The theme is part of the value, so a
+    /// flip to the other theme rebuilds a coloured layout and leaves a plain
+    /// one alone.
+    json: Option<crate::ui::json::JsonColors>,
 }
 
 /// The memoized layouter for a large `TextEdit` buffer: an unchanged text at
@@ -1692,11 +1698,35 @@ impl TextLayoutMemo {
         font: egui::TextStyle,
     ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::text::Galley> + 'a
     {
+        self.layouter_for(revision, font, None)
+    }
+
+    /// The layouter for a read-only `TextEdit` whose text is laid out as JSON:
+    /// the coloured job is built once per text revision, wrap width and
+    /// palette, so an idle frame neither re-tokenizes the buffer nor copies it
+    /// into a fresh job.
+    pub(crate) fn layouter_json<'a>(
+        &'a mut self,
+        revision: &'a TextRevision,
+        font: egui::TextStyle,
+        colors: crate::ui::json::JsonColors,
+    ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::text::Galley> + 'a
+    {
+        self.layouter_for(revision, font, Some(colors))
+    }
+
+    fn layouter_for<'a>(
+        &'a mut self,
+        revision: &'a TextRevision,
+        font: egui::TextStyle,
+        json: Option<crate::ui::json::JsonColors>,
+    ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::text::Galley> + 'a
+    {
         move |ui, text, wrap_width| {
             let font_id = font.resolve(ui.style());
             // The color the default layouter resolves for an unstyled
             // `TextEdit`: an explicit override, else the inactive widget
-            // color.
+            // color. A coloured job carries a color per token class instead.
             let color = ui
                 .visuals()
                 .override_text_color
@@ -1710,20 +1740,28 @@ impl TextLayoutMemo {
                     color,
                     line_height,
                     wrap_width,
+                    json,
                 },
             );
             let layout = self.layout.get(&key, || {
                 let style = &key.1;
-                let mut job = egui::text::LayoutJob::simple(
-                    text.as_str().to_owned(),
-                    style.font_id.clone(),
-                    style.color,
-                    style.wrap_width,
-                );
+                let mut job = match style.json {
+                    Some(colors) => {
+                        crate::ui::json::layout_job(text.as_str(), &style.font_id, colors)
+                    }
+                    None => egui::text::LayoutJob::simple(
+                        text.as_str().to_owned(),
+                        style.font_id.clone(),
+                        style.color,
+                        style.wrap_width,
+                    ),
+                };
                 // The default layouter's two adjustments: trailing
                 // whitespace stays visible, and every section uses the
-                // resolved line height.
+                // resolved line height. The tokenizer leaves both to the
+                // caller, so both job kinds take them here.
                 job.keep_trailing_whitespace = true;
+                job.wrap.max_width = style.wrap_width;
                 for section in &mut job.sections {
                     section.format.line_height = Some(style.line_height);
                 }
@@ -1739,6 +1777,69 @@ mod tests {
     use super::*;
     use crate::ui::test_rig::harness_builder;
     use egui_kittest::kittest::Queryable as _;
+
+    /// The launched config is laid out as JSON: the job keeps the text byte
+    /// for byte and paints several classes, and the palette follows the
+    /// theme — through one memo, so the palette is part of the cached key
+    /// instead of a fresh memo hiding a missing key component.
+    #[test]
+    fn json_layouter_colours_each_class_and_follows_the_palette() {
+        const CONFIG: &str =
+            "{\n  \"log\": {\"loglevel\": \"warning\"},\n  \"n\": -1.5,\n  \"on\": true\n}\n";
+
+        let ctx = egui::Context::default();
+        let mut memo = TextLayoutMemo::default();
+        let revision = TextRevision::default();
+        let captured = std::cell::RefCell::new(None);
+        let mut layout = |colors: crate::ui::json::JsonColors| -> (
+            String,
+            std::collections::HashSet<egui::Color32>,
+        ) {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let mut layouter =
+                    memo.layouter_json(&revision, egui::TextStyle::Monospace, colors);
+                let buffer: &str = CONFIG;
+                let galley = layouter(ui, &buffer, f32::INFINITY);
+                captured.borrow_mut().replace(galley.job.clone());
+            });
+            // Headless context: no renderer applies the glyph atlas deltas.
+            output.textures_delta.clear();
+            let job = captured
+                .borrow_mut()
+                .take()
+                .expect("the layouter returns this frame's job");
+            let colours = job
+                .sections
+                .iter()
+                .map(|section| section.format.color)
+                .collect();
+            (job.text.clone(), colours)
+        };
+
+        let dark = crate::ui::json::json_colors(&egui::Visuals::dark());
+        let (dark_text, dark_colours) = layout(dark);
+        assert_eq!(dark_text, CONFIG, "colouring must not alter the text");
+        let expected: std::collections::HashSet<egui::Color32> = [
+            dark.key,
+            dark.string,
+            dark.number,
+            dark.literal,
+            dark.punctuation,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            dark_colours, expected,
+            "the job must paint every palette role, and nothing else"
+        );
+        let light = crate::ui::json::json_colors(&egui::Visuals::light());
+        let (light_text, light_colours) = layout(light);
+        assert_eq!(light_text, CONFIG);
+        assert_ne!(
+            dark_colours, light_colours,
+            "the light palette must repaint the code, not reuse the dark one"
+        );
+    }
 
     /// The one comparison every memoized screen row relies on: an unchanged
     /// key rebuilds nothing (an idle frame does no work), and a changed key

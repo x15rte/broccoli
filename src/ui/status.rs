@@ -103,6 +103,7 @@ pub(crate) fn phase_badge_color(p: &CorePhase, colors: StatusColors) -> Color32 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::test_rig::wcag_contrast;
 
     /// Every phase maps to a badge caption in both wordings, and an error
     /// phase stays a phase word in each: the failure's message belongs to the
@@ -171,29 +172,6 @@ mod tests {
         );
     }
 
-    /// WCAG relative luminance of an sRGB color.
-    fn luminance(c: Color32) -> f64 {
-        let [r, g, b, _] = c.to_srgba_unmultiplied();
-        let linear = |v: u8| {
-            let s = f64::from(v) / 255.0;
-            if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
-    }
-
-    fn contrast(a: Color32, b: Color32) -> f64 {
-        let (hi, lo) = if luminance(a) >= luminance(b) {
-            (luminance(a), luminance(b))
-        } else {
-            (luminance(b), luminance(a))
-        };
-        (hi + 0.05) / (lo + 0.05)
-    }
-
     /// Regression lock for the Light-theme readability bug: every status
     /// role must be legible on BOTH themes' panel backgrounds.
     #[test]
@@ -210,7 +188,7 @@ mod tests {
                 ("warn", colors.warn),
                 ("err", colors.err),
             ] {
-                let ratio = contrast(color, bg);
+                let ratio = wcag_contrast(color, bg);
                 assert!(
                     ratio >= 4.5,
                     "{theme_name} {role} {color:?} has contrast {ratio:.2}:1, needs ≥ 4.5:1"

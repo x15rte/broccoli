@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod dns;
 pub(crate) mod gate;
 pub mod inbounds;
+pub(crate) mod json;
 pub mod logs;
 pub(crate) mod nav;
 pub(crate) mod popup;
