@@ -84,18 +84,17 @@ enum LatencyCell {
     Unknown,
 }
 
-/// One latency cell's presentation: the delay its bar fills to, that bar's
-/// color, and the text beside it.
+/// One latency cell's presentation: the colour its delay's threshold names
+/// and the text it paints.
 struct LatencyPresentation<'a> {
-    delay_ms: Option<i64>,
     color: egui::Color32,
     text: &'a str,
 }
 
 impl LatencyCell {
     /// What this cell shows: one row per variant, so a new variant cannot
-    /// render without stating all three channels. `neutral` colors a cell
-    /// that has no delay to judge.
+    /// render without stating both channels. `neutral` colors a cell that
+    /// has no delay to judge.
     fn presentation<'a>(
         &'a self,
         colors: StatusColors,
@@ -104,22 +103,18 @@ impl LatencyCell {
     ) -> LatencyPresentation<'a> {
         match self {
             Self::Alive { delay_ms, text } => LatencyPresentation {
-                delay_ms: Some(*delay_ms),
                 color: latency_color(*delay_ms, colors),
                 text,
             },
             Self::Stale { ms, text } => LatencyPresentation {
-                delay_ms: Some(*ms),
                 color: latency_color(*ms, colors),
                 text,
             },
             Self::DeadObservatory | Self::DeadStale => LatencyPresentation {
-                delay_ms: None,
                 color: colors.err,
                 text: t(lang, Key::Dead),
             },
             Self::Unknown => LatencyPresentation {
-                delay_ms: None,
                 color: neutral,
                 text: t(lang, Key::EmDash),
             },
@@ -754,41 +749,12 @@ impl DashboardScreen {
     }
 }
 
-/// Width of a latency cell's bar.
-const LATENCY_BAR_WIDTH: f32 = 56.0;
-/// Height of a latency cell's bar: a hairline against the row's text.
-const LATENCY_BAR_HEIGHT: f32 = 5.0;
-/// The delay at which a latency bar is full: the same point the latency
-/// color turns red.
-const LATENCY_BAR_FULL_MS: f32 = 1000.0;
-/// Shortest fill, so a fast server still shows a bar.
-const LATENCY_BAR_MIN_FRACTION: f32 = 0.06;
-
-/// A latency cell: a short bar scaled to the delay beside its text. A cell
-/// with no delay shows the empty track, and only a measured delay colors
-/// the fill, so a dead row's red text does not paint a bar.
+/// A latency cell: the delay's text in the colour its threshold names. A
+/// cell with no measurement keeps the neutral colour, so a dead row's red
+/// text and an absent delay never look like a measurement.
 fn latency_cell(ui: &mut egui::Ui, cell: &LatencyCell, colors: StatusColors, lang: Language) {
     let presentation = cell.presentation(colors, ui.visuals().text_color(), lang);
-    ui.horizontal(|ui| {
-        let fraction = presentation.delay_ms.map_or(0.0, |ms| {
-            (ms as f32 / LATENCY_BAR_FULL_MS).clamp(LATENCY_BAR_MIN_FRACTION, 1.0)
-        });
-        // A cell with no delay fills the track with the track's own color:
-        // `ProgressBar` paints its fill at least the corner radius wide, and
-        // that stub must not show as a mark on an unmeasured row.
-        let fill = if presentation.delay_ms.is_some() {
-            presentation.color
-        } else {
-            ui.visuals().extreme_bg_color
-        };
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .desired_width(LATENCY_BAR_WIDTH)
-                .desired_height(LATENCY_BAR_HEIGHT)
-                .fill(fill),
-        );
-        ui.colored_label(presentation.color, presentation.text);
-    });
+    ui.colored_label(presentation.color, presentation.text);
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -2241,21 +2207,23 @@ mod tests {
         );
     }
 
-    /// Every latency cell states the bar it draws: how far the bar fills and
-    /// in which colour. The colours are the dark palette's, so a threshold
-    /// moves only with `latency_color`; the text beside the bar is the row's
-    /// own measurement, which the cell passes through untouched.
+    /// Every latency cell states the text it paints and the colour its delay
+    /// threshold names. The colours are the dark palette's, so a threshold
+    /// moves only with `latency_color`; a dead cell is red whatever its
+    /// recorded delay, and an unmeasured one takes the neutral colour.
     #[test]
-    fn latency_cells_state_their_own_bar() {
+    fn latency_cells_state_their_own_text_and_colour() {
         let colors = crate::ui::status::status_colors(true);
         let neutral = egui::Color32::WHITE;
+        let dead = t(Language::En, Key::Dead);
+        let em_dash = t(Language::En, Key::EmDash);
         let cases = [
             (
                 LatencyCell::Alive {
                     delay_ms: 120,
                     text: "120 ms".to_string(),
                 },
-                Some(120),
+                "120 ms",
                 colors.ok,
             ),
             (
@@ -2263,7 +2231,7 @@ mod tests {
                     delay_ms: 1500,
                     text: "1500 ms".to_string(),
                 },
-                Some(1500),
+                "1500 ms",
                 colors.err,
             ),
             (
@@ -2271,18 +2239,49 @@ mod tests {
                     ms: 400,
                     text: "400 ms".to_string(),
                 },
-                Some(400),
+                "400 ms",
                 colors.warn,
             ),
-            (LatencyCell::DeadObservatory, None, colors.err),
-            (LatencyCell::DeadStale, None, colors.err),
-            (LatencyCell::Unknown, None, neutral),
+            (LatencyCell::DeadObservatory, dead, colors.err),
+            (LatencyCell::DeadStale, dead, colors.err),
+            (LatencyCell::Unknown, em_dash, neutral),
         ];
-        for (cell, delay_ms, color) in cases {
+        for (cell, text, color) in cases {
             let presentation = cell.presentation(colors, neutral, Language::En);
-            assert_eq!(presentation.delay_ms, delay_ms, "{cell:?}");
+            assert_eq!(presentation.text, text, "{cell:?}");
             assert_eq!(presentation.color, color, "{cell:?}");
         }
+    }
+
+    /// The latency column is text: a measured row renders its label and an
+    /// unmeasured row its placeholder, and neither paints a bar. The bar
+    /// carried no information the text lacks, and a progress indicator is
+    /// the one widget the column no longer owns.
+    #[test]
+    fn latency_grid_paints_text_without_a_bar() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut r = rig.borrow_mut();
+            r.servers.profiles = vec![profile("Tokyo edge", Some(42)), profile("Oslo", None)];
+            r.latency_generation += 1;
+        }
+        let mut harness = harness_for(rig);
+        harness.run();
+        harness
+            .get_all_by_label(&t_fmt(Language::En, Key::LatencyMs, &[&42]))
+            .next()
+            .expect("the measured latency renders as text");
+        harness
+            .get_all_by_label(t(Language::En, Key::EmDash))
+            .next()
+            .expect("an unmeasured row renders its placeholder");
+        assert_eq!(
+            harness
+                .query_all_by(|node| node.role() == egui::accesskit::Role::ProgressIndicator)
+                .count(),
+            0,
+            "the latency cell must paint no bar"
+        );
     }
 
     /// The local-endpoint derivation: a disabled inbound always wins
