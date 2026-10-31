@@ -5,6 +5,9 @@
 //! This pins that path for the glyphs the UI actually ships. A symbol swapped
 //! for a non-emoji, or the font provider dropped, shows up here as a glyph that
 //! would render monochrome and silently ignore the label's color.
+//!
+//! The direction arrows are not icons: they are plain text glyphs in the UI
+//! font, and they do take their label's color on purpose.
 
 // The glyphs come from the platform's own emoji font, which this app only
 // ships on Windows.
@@ -14,30 +17,18 @@ use std::sync::Arc;
 
 use broccoli::i18n::{Key, t};
 use broccoli::model::settings::Language;
-use broccoli::ui::widgets::{MOVE_DOWN_GLYPH, MOVE_UP_GLYPH};
 
-/// The first character of every UI string that opens with an icon, plus the
-/// compact move pair's own glyphs.
+/// The first character of every UI string that opens with an icon.
 fn icon_glyphs() -> Vec<char> {
     let keys = [
         Key::DeleteRow,
         Key::ProbeRow,
-        Key::DashboardRateUp,
-        Key::DashboardRateDown,
-        Key::GridUpTotal,
-        Key::GridDownTotal,
-        Key::NavSpeedUp,
-        Key::NavSpeedDown,
         Key::SrvImportOkMark,
         Key::SrvImportIgnoredMark,
     ];
-    let mut glyphs: Vec<char> = keys
-        .into_iter()
+    keys.into_iter()
         .filter_map(|key| t(Language::En, key).chars().next())
-        .collect();
-    glyphs.extend(MOVE_UP_GLYPH.chars().next());
-    glyphs.extend(MOVE_DOWN_GLYPH.chars().next());
-    glyphs
+        .collect()
 }
 
 #[test]

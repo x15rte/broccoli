@@ -975,13 +975,13 @@ pub struct MoveLabels<'a> {
     pub small: bool,
 }
 
-/// The compact move pair's glyphs: emoji, so the system emoji font draws them
-/// in color like every other icon the screens carry.
-pub const MOVE_UP_GLYPH: &str = "⬆️";
-pub const MOVE_DOWN_GLYPH: &str = "⬇️";
+/// The compact move pair's glyphs: plain text arrows, drawn by the UI font
+/// like the rest of the row's text.
+pub const MOVE_UP_GLYPH: &str = "↑";
+pub const MOVE_DOWN_GLYPH: &str = "↓";
 
 impl<'a> MoveLabels<'a> {
-    /// The compact ⬆️/⬇️ pair with a per-direction tooltip: the list rows whose
+    /// The compact ↑/↓ pair with a per-direction tooltip: the list rows whose
     /// order carries a meaning the arrows do not spell out.
     pub fn glyphs(up_hint: &'a str, down_hint: &'a str) -> Self {
         Self {
