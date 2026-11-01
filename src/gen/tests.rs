@@ -1624,6 +1624,35 @@ fn golden_xdrive_template() {
     );
 }
 
+/// An xdrive transport over the S3 backend: the endpoint, signing region,
+/// bucket and addressing style the runtime reads, plus the access key pair
+/// in the secrets list the other backends also use.
+#[test]
+fn golden_xdrive_s3() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_S3.into();
+        xdrive.remote_folder = "tunnel".into();
+        xdrive.secrets = vec!["access-key-id".into(), "secret-access-key".into()];
+        xdrive.s3 = Some(crate::model::stream::XdriveS3 {
+            endpoint: "https://s3.example.com".into(),
+            region: "us-east-1".into(),
+            bucket: "tunnel-bucket".into(),
+            path_style: Some(false),
+            ..Default::default()
+        });
+    }
+    golden!(
+        "goldens/xdrive_s3.json",
+        generate_deterministic(&single_server(ob), &base_settings())
+    );
+}
+
 /// An xdrive transport with its connection-reuse block: the chosen limit and
 /// the H2 reuse knobs, as the pinned core accepts them.
 #[test]
@@ -2382,24 +2411,51 @@ fn private_fallbacks_mirror_xrays_private_sets() {
         PRIVATE_IP_RANGES,
         [
             "0.0.0.0/8",
+            "0.0.0.0/32",
             "10.0.0.0/8",
             "100.64.0.0/10",
             "127.0.0.0/8",
             "169.254.0.0/16",
             "172.16.0.0/12",
-            "192.0.0.0/24",
+            "192.0.0.0/29",
+            "192.0.0.8/32",
+            "192.0.0.9/32",
+            "192.0.0.10/32",
+            "192.0.0.170/32",
+            "192.0.0.171/32",
             "192.0.2.0/24",
-            "192.88.99.0/24",
+            "192.52.193.0/24",
+            "192.88.99.2/32",
             "192.168.0.0/16",
             "198.18.0.0/15",
             "198.51.100.0/24",
             "203.0.113.0/24",
-            "224.0.0.0/3",
-            "::/127",
+            "240.0.0.0/4",
+            "255.255.255.255/32",
+            "224.0.0.0/4",
+            "::1/128",
+            "::/128",
+            "64:ff9b::/96",
+            "64:ff9b:1::/48",
+            "100::/64",
+            "100:0:0:1::/64",
+            "2001::/32",
+            "2001:1::1/128",
+            "2001:1::2/128",
+            "2001:1::3/128",
+            "2001:2::/48",
+            "2001:3::/32",
+            "2001:20::/28",
+            "2001:30::/28",
+            "2001:db8::/32",
+            "2002::/16",
+            "3fff::/20",
+            "5f00::/16",
             "fc00::/7",
             "fe80::/10",
             "ff00::/8",
         ]
+        .as_slice()
     );
     assert_eq!(
         PRIVATE_DOMAINS,
@@ -3218,7 +3274,14 @@ fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
     let settings_obj = tun_settings(&cfg);
     assert_eq!(
         settings_obj["autoSystemWfpBlockLeak"],
-        json!(["dns", "misconfigtun"])
+        json!([
+            "udp/53",
+            "tcp/53",
+            "windnsclient",
+            "tcp/853",
+            "udp/853",
+            "misconfigtun"
+        ])
     );
     assert!(
         settings_obj.get("autoSystemDnsToGateway").is_none(),
@@ -3242,9 +3305,9 @@ fn tun_without_dns_module_emits_no_leak_block() {
 }
 
 #[test]
-fn a_switched_off_leak_half_leaves_the_key_without_it() {
-    // Turning the DNS half off keeps the key (the module still answers), but
-    // the emitted value no longer blocks DNS egress. The case folding the
+fn a_switched_off_leak_entry_leaves_the_key_without_it() {
+    // Turning the DNS entries off keeps the key (the module still answers),
+    // but the emitted value no longer blocks DNS egress. The case folding the
     // core applies runs on the way out too.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
@@ -3255,6 +3318,22 @@ fn a_switched_off_leak_half_leaves_the_key_without_it() {
     assert_eq!(
         tun_settings(&cfg)["autoSystemWfpBlockLeak"],
         json!(["misconfigtun"])
+    );
+}
+
+#[test]
+fn a_stored_dns_alias_is_emitted_as_the_entries_it_stands_for() {
+    // A settings file written before the alias was expanded still names it.
+    // The load replaces it in place, so the emitted document carries the five
+    // entries the core would have expanded it into, in the core's order.
+    let mut settings = base_settings();
+    settings.mode = Mode::Tun;
+    settings.tun.auto_system_wfp_block_leak = vec!["DNS".into(), "Tcp/053".into()];
+    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+
+    assert_eq!(
+        tun_settings(&cfg)["autoSystemWfpBlockLeak"],
+        json!(["udp/53", "tcp/53", "windnsclient", "tcp/853", "udp/853"])
     );
 }
 

@@ -670,10 +670,12 @@ pub const XDRIVE_SERVICE_DRIVE: &str = "google-drive";
 /// The retired `Google Drive` spelling the core still accepts.
 pub const XDRIVE_SERVICE_DRIVE_RETIRED: &str = "Google Drive";
 pub const XDRIVE_SERVICE_TEMPLATE: &str = "template";
+pub const XDRIVE_SERVICE_S3: &str = "s3";
 pub const XDRIVE_SERVICES: &[&str] = &[
     XDRIVE_SERVICE_LOCAL,
     XDRIVE_SERVICE_DRIVE,
     XDRIVE_SERVICE_TEMPLATE,
+    XDRIVE_SERVICE_S3,
 ];
 
 /// `xdriveSettings` scalar defaults and caps (`transport/internet/xdrive/
@@ -699,6 +701,21 @@ pub const XDRIVE_TEMPLATE_MAX_CONCURRENCY: u32 = 256;
 /// (`infra/conf/transport_method.go:876-887`).
 pub fn xdrive_service_supported(service: &str) -> bool {
     XDRIVE_SERVICES.contains(&service)
+}
+
+/// Whether the service writes to a place the profile names, so `remoteFolder`
+/// must be non-empty (`empty "remoteFolder"` at start for `local` and Drive,
+/// `S3 remoteFolder must be a nonempty relative prefix` for `s3`). A template
+/// spells its place in the operation URLs, so its folder is only a
+/// substitution value.
+pub fn xdrive_folder_required(service: &str) -> bool {
+    matches!(
+        service,
+        XDRIVE_SERVICE_LOCAL
+            | XDRIVE_SERVICE_DRIVE
+            | XDRIVE_SERVICE_DRIVE_RETIRED
+            | XDRIVE_SERVICE_S3
+    )
 }
 
 /// The template authorization type the core's runtime accepts, plus the empty
@@ -971,22 +988,54 @@ impl XdriveTemplate {
     }
 }
 
+/// The `s3` backend's configuration (`XDriveS3Config`,
+/// infra/conf/transport_method.go:1009-1014). `endpoint`, `region` and
+/// `bucket` are strings the core reads verbatim; `pathStyle` is a pointer
+/// there, so an absent key keeps the loader's default of path-style
+/// addressing ([`XdriveS3::path_style`]) and the editor writes the key only
+/// when the user changes that choice.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct XdriveS3 {
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub region: String,
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub bucket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl XdriveS3 {
+    /// The addressing style the core builds: an absent `pathStyle` is the
+    /// loader's `true` (`c.PathStyle == nil || *c.PathStyle`,
+    /// infra/conf/transport_method.go:1081).
+    pub fn path_style(&self) -> bool {
+        self.path_style.unwrap_or(true)
+    }
+}
+
 /// `xdriveSettings` (infra/conf/transport_method.go:855-905). The service
 /// decides what `remoteFolder` means — a path on this machine for `local`, a
-/// Google Drive folder id, or a token for the template — and which of the
-/// backend rules apply. Every scalar the runtime reads is a field; zero keeps
-/// the core's own default (`transport/internet/xdrive/params.go`).
+/// Google Drive folder id, a token for the template, or a prefix inside the
+/// bucket for `s3` — and which of the backend rules apply. Every scalar the
+/// runtime reads is a field; zero keeps the core's own default
+/// (`transport/internet/xdrive/params.go`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct XdriveTransport {
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub remote_folder: String,
     /// Empty is unsupported: the core's conf build refuses it, naming the
-    /// empty spelling. The editor's combo offers the three real values.
+    /// empty spelling. The editor's combo offers the four real values.
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub service: String,
     /// Drive: exactly ClientID, ClientSecret, RefreshToken, in that order.
-    /// Template: substituted as `{secret0}` … `{secretN}`.
+    /// Template: substituted as `{secret0}` … `{secretN}`. S3: the access key
+    /// ID, the secret access key, and optionally one session token.
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub secrets: Vec<String>,
     #[serde(skip_serializing_if = "skip_zero_u32")]
@@ -1009,6 +1058,11 @@ pub struct XdriveTransport {
     /// the service without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<XdriveTemplate>,
+    /// The `s3` service's backend object; the core's conf build refuses the
+    /// service without it. The stored draft keeps it for every service, and
+    /// the wire pass drops it everywhere but `s3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<XdriveS3>,
     /// Connection reuse, the same block XHTTP and MASQUE carry. Absent keeps
     /// the core's defaults (one connection, or four for `google-drive` over
     /// h2); the reloaded editor shows the block only when it was stored.
@@ -2845,6 +2899,15 @@ impl StreamModel {
             if xdrive.service != XDRIVE_SERVICE_TEMPLATE {
                 xdrive.template = None;
             }
+            // The nested S3 backend belongs to the `s3` service alone, the
+            // same way: the conf build reads it only there and refuses that
+            // service without it (`infra/conf/transport_method.go:1032-1083`),
+            // so the other services' documents carry no `s3` key. The stored
+            // value stays in the settings file, so switching the service back
+            // restores it.
+            if xdrive.service != XDRIVE_SERVICE_S3 {
+                xdrive.s3 = None;
+            }
         }
         if let Some(websocket) = self.ws_settings.as_mut() {
             // `self` is the cloned wire model. Canonicalize Xray's accepted
@@ -3050,8 +3113,8 @@ mod tests {
         CustomSockopt, FinalmaskModel, FinalmaskRealmTls, FinalmaskTcpMask, FinalmaskUdpHop,
         FinalmaskUdpMask, HappyEyeballs, HysteriaTransport, Int32Range, MAX_XHTTP_DOWNLOAD_DEPTH,
         Network, RawSettings, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WsSettings,
-        XdriveOperation, XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, XdriveTemplateRetry,
-        XdriveTransport, XhttpSettings, XmuxConfig, transport_settings_key,
+        XdriveOperation, XdriveS3, XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp,
+        XdriveTemplateRetry, XdriveTransport, XhttpSettings, XmuxConfig, transport_settings_key,
         transport_settings_path,
     };
     use crate::model::validation::ValidationCode;
@@ -5042,6 +5105,185 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&round_tripped).unwrap(),
             serde_json::to_value(&settings).unwrap()
+        );
+    }
+
+    /// A VLESS outbound on the xdrive transport carrying `settings`.
+    fn xdrive_outbound(settings: XdriveTransport) -> OutboundModel {
+        let mut outbound = OutboundModel::new(Protocol::Vless);
+        outbound.stream.network = Network::Xdrive;
+        outbound.stream.xdrive_settings = Some(Box::new(settings));
+        outbound
+    }
+
+    /// An `s3` profile carries its four fields through the settings file, and
+    /// the wire carries them under the `s3` key the core's conf build reads.
+    #[test]
+    fn xdrive_s3_settings_round_trip_the_file_and_the_wire() {
+        let settings = XdriveTransport {
+            remote_folder: "streams/".into(),
+            service: super::XDRIVE_SERVICE_S3.into(),
+            secrets: vec!["access-key".into(), "secret-key".into(), "token".into()],
+            s3: Some(XdriveS3 {
+                endpoint: "https://s3.example.com".into(),
+                region: "eu-west-1".into(),
+                bucket: "logs".into(),
+                path_style: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The settings file: what the user saved is what loads back.
+        let saved = serde_json::to_value(&settings).expect("the block serializes");
+        let loaded: XdriveTransport =
+            serde_json::from_value(saved.clone()).expect("the block loads");
+        assert_eq!(
+            serde_json::to_value(&loaded).expect("the block serializes"),
+            saved
+        );
+        assert_eq!(loaded.service, super::XDRIVE_SERVICE_S3);
+
+        let outbound = xdrive_outbound(settings);
+        let wire = outbound.to_wire("s3");
+        let xdrive = &wire["streamSettings"]["xdriveSettings"];
+        assert_eq!(xdrive["service"], json!("s3"));
+        assert_eq!(xdrive["remoteFolder"], json!("streams/"));
+        assert_eq!(
+            xdrive["secrets"],
+            json!(["access-key", "secret-key", "token"])
+        );
+        assert_eq!(xdrive["s3"]["endpoint"], json!("https://s3.example.com"));
+        assert_eq!(xdrive["s3"]["region"], json!("eu-west-1"));
+        assert_eq!(xdrive["s3"]["bucket"], json!("logs"));
+        assert_eq!(xdrive["s3"]["pathStyle"], json!(false));
+        assert!(
+            xdrive.get("template").is_none(),
+            "an s3 profile carries no template object: {xdrive}"
+        );
+    }
+
+    /// An absent `pathStyle` is no wire key at all, and reads as the loader's
+    /// default — path-style addressing. An explicit choice survives as
+    /// written, false included.
+    #[test]
+    fn xdrive_s3_absent_path_style_is_absent_and_reads_as_path_style() {
+        let absent = XdriveS3 {
+            endpoint: "https://s3.example.com".into(),
+            ..Default::default()
+        };
+        assert!(absent.path_style(), "the loader's default is path-style");
+        let wire = serde_json::to_value(&absent).expect("the block serializes");
+        assert!(
+            wire.get("pathStyle").is_none(),
+            "an unset pathStyle is no key: {wire}"
+        );
+
+        let outbound = xdrive_outbound(XdriveTransport {
+            service: super::XDRIVE_SERVICE_S3.into(),
+            s3: Some(absent),
+            ..Default::default()
+        });
+        let wire = outbound.to_wire("s3");
+        assert!(
+            wire["streamSettings"]["xdriveSettings"]["s3"]
+                .get("pathStyle")
+                .is_none(),
+            "the generated document leaves the default implicit: {wire}"
+        );
+
+        let explicit = XdriveS3 {
+            path_style: Some(false),
+            ..Default::default()
+        };
+        assert!(!explicit.path_style());
+        assert_eq!(
+            serde_json::to_value(&explicit).expect("the block serializes")["pathStyle"],
+            json!(false)
+        );
+    }
+
+    /// The wire carries only the chosen backend's object while the settings
+    /// file keeps both, so switching the service back restores it.
+    #[test]
+    fn xdrive_wire_carries_only_the_selected_backend_object() {
+        let settings = |service: &str| XdriveTransport {
+            service: service.into(),
+            remote_folder: "folder".into(),
+            secrets: vec!["a".into(), "b".into(), "c".into()],
+            template: Some(XdriveTemplate::default()),
+            s3: Some(XdriveS3 {
+                endpoint: "https://s3.example.com".into(),
+                region: "eu-west-1".into(),
+                bucket: "logs".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for service in [
+            super::XDRIVE_SERVICE_LOCAL,
+            super::XDRIVE_SERVICE_DRIVE,
+            super::XDRIVE_SERVICE_TEMPLATE,
+        ] {
+            let outbound = xdrive_outbound(settings(service));
+            let wire = outbound.to_wire("p");
+            let xdrive = &wire["streamSettings"]["xdriveSettings"];
+            assert!(
+                xdrive.get("s3").is_none(),
+                "{service}: the wire carries no s3 object: {xdrive}"
+            );
+            assert!(
+                outbound
+                    .stream
+                    .xdrive_settings
+                    .as_ref()
+                    .and_then(|settings| settings.s3.as_ref())
+                    .is_some(),
+                "{service}: the draft keeps the s3 object"
+            );
+        }
+
+        for service in [
+            super::XDRIVE_SERVICE_LOCAL,
+            super::XDRIVE_SERVICE_DRIVE,
+            super::XDRIVE_SERVICE_S3,
+        ] {
+            let outbound = xdrive_outbound(settings(service));
+            let wire = outbound.to_wire("p");
+            let xdrive = &wire["streamSettings"]["xdriveSettings"];
+            assert!(
+                xdrive.get("template").is_none(),
+                "{service}: the wire carries no template object: {xdrive}"
+            );
+            assert!(
+                outbound
+                    .stream
+                    .xdrive_settings
+                    .as_ref()
+                    .and_then(|settings| settings.template.as_ref())
+                    .is_some(),
+                "{service}: the draft keeps the template object"
+            );
+        }
+
+        let outbound = xdrive_outbound(settings(super::XDRIVE_SERVICE_S3));
+        let wire = outbound.to_wire("p");
+        assert_eq!(
+            wire["streamSettings"]["xdriveSettings"]["s3"]["bucket"],
+            json!("logs")
+        );
+        assert!(
+            wire["streamSettings"]["xdriveSettings"]
+                .get("template")
+                .is_none()
+        );
+
+        let outbound = xdrive_outbound(settings(super::XDRIVE_SERVICE_TEMPLATE));
+        let wire = outbound.to_wire("p");
+        assert!(
+            wire["streamSettings"]["xdriveSettings"]
+                .get("template")
+                .is_some()
         );
     }
 

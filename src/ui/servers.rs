@@ -20,10 +20,10 @@ use crate::model::stream::{
     XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
     XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
-    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_TEMPLATE, XDRIVE_SERVICES,
-    XDRIVE_TEMPLATE_AUTH_TYPES, XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
+    XDRIVE_SERVICES, XDRIVE_TEMPLATE_AUTH_TYPES, XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
     XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTemplateAuth,
-    XdriveTemplateOp,
+    XdriveTemplateOp, xdrive_folder_required,
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
@@ -5619,10 +5619,10 @@ impl ServersScreen {
                         XDRIVE_SERVICE_LOCAL => t(lang, Key::SrvXdriveFolderLocalHint),
                         XDRIVE_SERVICE_DRIVE => t(lang, Key::SrvXdriveFolderDriveHint),
                         XDRIVE_SERVICE_TEMPLATE => t(lang, Key::SrvXdriveFolderTemplateHint),
+                        XDRIVE_SERVICE_S3 => t(lang, Key::SrvXdriveFolderS3Hint),
                         _ => "",
                     };
-                    let folder_required =
-                        s.service == XDRIVE_SERVICE_LOCAL || s.service == XDRIVE_SERVICE_DRIVE;
+                    let folder_required = xdrive_folder_required(&s.service);
                     let folder_validate = |folder: &str| {
                         (folder_required && folder.is_empty()).then(|| {
                             validation_message(&ValidationCode::XdriveRemoteFolderRequired, lang)
@@ -5659,19 +5659,36 @@ impl ServersScreen {
                         "",
                         masked,
                     );
-                    if s.service == XDRIVE_SERVICE_DRIVE {
-                        ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
-                        // The core's conf build refuses any count but three, so
-                        // the editor says so where the rows are.
-                        if s.secrets.len() != 3 {
-                            ui.colored_label(
-                                status_colors_of(ui).err,
-                                validation_message(
-                                    &ValidationCode::XdriveDriveSecretsInvalid,
-                                    lang,
-                                ),
-                            );
+                    match s.service.as_str() {
+                        XDRIVE_SERVICE_DRIVE => {
+                            ui.weak(t(lang, Key::SrvXdriveSecretsOrder));
+                            // The core's conf build refuses any count but
+                            // three, so the editor says so where the rows are.
+                            if s.secrets.len() != 3 {
+                                ui.colored_label(
+                                    status_colors_of(ui).err,
+                                    validation_message(
+                                        &ValidationCode::XdriveDriveSecretsInvalid,
+                                        lang,
+                                    ),
+                                );
+                            }
                         }
+                        XDRIVE_SERVICE_S3 => {
+                            ui.weak(t(lang, Key::SrvXdriveSecretsOrderS3));
+                            // The backend needs the access key and the secret
+                            // access key, and accepts one session token.
+                            if !(2..=3).contains(&s.secrets.len()) {
+                                ui.colored_label(
+                                    status_colors_of(ui).err,
+                                    validation_message(
+                                        &ValidationCode::XdriveS3SecretsInvalid,
+                                        lang,
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                     changed |= xdrive_scalar(
                         ui,
@@ -5774,6 +5791,52 @@ impl ServersScreen {
                         }
                         if had_template || changed {
                             s.template = Some(template);
+                        }
+                    }
+                    // The s3 backend is four fields, and its object is
+                    // created the first time one of them is edited: a fresh
+                    // draft has no block until the user states it.
+                    if s.service == XDRIVE_SERVICE_S3 {
+                        let had_s3 = s.s3.is_some();
+                        let mut s3 = s.s3.take().unwrap_or_default();
+                        let mut edited = false;
+                        widgets::section(ui, t(lang, Key::SrvXdriveS3Section), |ui| {
+                            edited |= widgets::text_field(
+                                ui,
+                                t(lang, Key::SrvXdriveS3Endpoint),
+                                &mut s3.endpoint,
+                                "https://s3.example.com",
+                            );
+                            edited |= widgets::text_field(
+                                ui,
+                                t(lang, Key::SrvXdriveS3Region),
+                                &mut s3.region,
+                                "us-east-1",
+                            );
+                            edited |= widgets::text_field(
+                                ui,
+                                t(lang, Key::SrvXdriveS3Bucket),
+                                &mut s3.bucket,
+                                "bucket",
+                            );
+                            // The wire key is a pointer and the loader reads
+                            // an absent one as path-style, so the box shows
+                            // that default until the user changes it.
+                            let mut path_style = s3.path_style();
+                            if ui
+                                .checkbox(&mut path_style, t(lang, Key::SrvXdriveS3PathStyle))
+                                .on_hover_text(t(lang, Key::SrvXdriveS3PathStyleNote))
+                                .changed()
+                            {
+                                s3.path_style = Some(path_style);
+                                edited = true;
+                            }
+                        });
+                        if edited {
+                            changed = true;
+                        }
+                        if had_s3 || edited {
+                            s.s3 = Some(s3);
                         }
                     }
                     changed |= xmux_section(ui, lang, &mut s.xmux);
@@ -10797,6 +10860,97 @@ Authentication: ML-KEM-768, Post-Quantum
                 .xmux
                 .is_none(),
             "the section must write the xdrive transport's block"
+        );
+    }
+
+    /// The s3 backend's section exists only while that service is chosen, and
+    /// its path-style box shows the loader's default — on — until the user
+    /// changes it, which writes the explicit choice.
+    #[test]
+    fn xdrive_s3_editor_appears_only_for_s3_and_defaults_to_path_style() {
+        // Render the xdrive editor for `service`; `None` when the s3 section
+        // is absent, the written `pathStyle` when the box was unchecked.
+        let render = |service: &'static str| -> Option<Option<bool>> {
+            let stream = Rc::new(RefCell::new(StreamModel {
+                network: Network::Xdrive,
+                xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                    service: service.into(),
+                    remote_folder: "streams/".into(),
+                    secrets: vec!["access-key".into(), "secret-key".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }));
+            let stream_for_ui = Rc::clone(&stream);
+            let mut screen = ServersScreen::default();
+            let mut harness = harness_builder().build_ui(move |ui| {
+                let _ = screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream_for_ui.borrow_mut(),
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                        protocol: Protocol::Vless,
+                        mux: None,
+                    },
+                );
+            });
+            harness.run();
+            let section = harness
+                .query_all_by_label_contains(t(Language::En, Key::SrvXdriveS3Section))
+                .next()
+                .is_some();
+            if service != crate::model::stream::XDRIVE_SERVICE_S3 {
+                assert!(!section, "{service} must not show the s3 section");
+                return None;
+            }
+            assert!(section, "the s3 service renders its section");
+            for label in [
+                Key::SrvXdriveS3Endpoint,
+                Key::SrvXdriveS3Region,
+                Key::SrvXdriveS3Bucket,
+                Key::SrvXdriveS3PathStyle,
+            ] {
+                assert!(
+                    harness
+                        .query_all_by_label_contains(t(Language::En, label))
+                        .next()
+                        .is_some(),
+                    "the s3 section must render {label:?}"
+                );
+            }
+            // The absent key reads as path-style, so the box starts checked;
+            // unchecking it writes the explicit choice.
+            harness
+                .get_by_label(t(Language::En, Key::SrvXdriveS3PathStyle))
+                .click();
+            harness.run();
+            let written = stream
+                .borrow()
+                .xdrive_settings
+                .as_ref()
+                .and_then(|settings| settings.s3.as_ref())
+                .and_then(|s3| s3.path_style);
+            Some(written)
+        };
+
+        for service in [
+            crate::model::stream::XDRIVE_SERVICE_LOCAL,
+            crate::model::stream::XDRIVE_SERVICE_DRIVE,
+            crate::model::stream::XDRIVE_SERVICE_TEMPLATE,
+        ] {
+            assert_eq!(
+                render(service),
+                None,
+                "{service} must not show the s3 section"
+            );
+        }
+        assert_eq!(
+            render(crate::model::stream::XDRIVE_SERVICE_S3),
+            Some(Some(false)),
+            "unchecking path-style writes the explicit choice"
         );
     }
 

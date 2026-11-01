@@ -971,39 +971,20 @@ pub struct OutboundModel {
     pub extra: Map<String, Value>,
 }
 /// Mirror Xray's `requiresTransportSecurity` private endpoint predicate
-/// (`infra/conf/xray.go` + `common/geodata/consts.go`).
+/// (`infra/conf/xray.go`): an IP endpoint is local when Go's `netip` calls it
+/// private, loopback or link-local unicast, and an empty address is not local,
+/// so it needs transport security. Domains keep the geodata private-domain
+/// matcher's spelling (`common/geodata/consts.go`).
 pub fn endpoint_requires_transport_security(address: &str) -> bool {
-    fn prefix_v4(address: std::net::Ipv4Addr, network: u32, prefix: u8) -> bool {
-        ipnet::Ipv4Net::new(std::net::Ipv4Addr::from(network), prefix)
-            .is_ok_and(|net| net.contains(&address))
+    fn local_v4(address: std::net::Ipv4Addr) -> bool {
+        address.is_private() || address.is_loopback() || address.is_link_local()
     }
-    fn prefix_v6(address: std::net::Ipv6Addr, network: u128, prefix: u8) -> bool {
-        ipnet::Ipv6Net::new(std::net::Ipv6Addr::from(network), prefix)
-            .is_ok_and(|net| net.contains(&address))
-    }
-    fn private_v4(address: std::net::Ipv4Addr) -> bool {
-        [
-            (0x0000_0000, 8),
-            (0x0a00_0000, 8),
-            (0x6440_0000, 10),
-            (0x7f00_0000, 8),
-            (0xa9fe_0000, 16),
-            (0xac10_0000, 12),
-            (0xc000_0000, 24),
-            (0xc000_0200, 24),
-            (0xc058_6300, 24),
-            (0xc0a8_0000, 16),
-            (0xc612_0000, 15),
-            (0xc633_6400, 24),
-            (0xcb00_7100, 24),
-            (0xe000_0000, 3),
-        ]
-        .into_iter()
-        .any(|(network, prefix)| prefix_v4(address, network, prefix))
+    fn local_v6(address: std::net::Ipv6Addr) -> bool {
+        address.is_unique_local() || address.is_loopback() || address.is_unicast_link_local()
     }
 
     if address.is_empty() {
-        return false;
+        return true;
     }
     let mut parsed = address;
     if parsed.starts_with('[') && parsed.ends_with(']') {
@@ -1022,24 +1003,11 @@ pub fn endpoint_requires_transport_security(address: &str) -> bool {
     }
 
     if let Ok(ip) = parsed.parse::<std::net::IpAddr>() {
-        let private = match ip {
-            std::net::IpAddr::V4(ip) => private_v4(ip),
-            std::net::IpAddr::V6(ip) => {
-                if let Some(ipv4) = ip.to_ipv4_mapped() {
-                    private_v4(ipv4)
-                } else {
-                    [
-                        (0_u128, 127),
-                        (0xfc00_u128 << 112, 7),
-                        (0xfe80_u128 << 112, 10),
-                        (0xff00_u128 << 112, 8),
-                    ]
-                    .into_iter()
-                    .any(|(network, prefix)| prefix_v6(ip, network, prefix))
-                }
-            }
+        let local = match ip {
+            std::net::IpAddr::V4(ip) => local_v4(ip),
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(|| local_v6(ip), local_v4),
         };
-        return !private;
+        return !local;
     }
 
     let domain = parsed.to_ascii_lowercase();
@@ -1661,23 +1629,43 @@ mod tests {
     }
 
     #[test]
-    fn private_endpoint_matcher_mirrors_xray_special_ranges_and_domains() {
+    fn private_endpoint_matcher_mirrors_netips_private_classes() {
         for private in [
             "10.0.0.1",
-            "100.64.0.1",
             "127.0.0.1",
-            "192.0.2.1",
-            "198.51.100.1",
-            "203.0.113.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.168.0.1",
             "[::1]",
             "fc00::1",
+            "fe80::1",
             "host.lan",
             "service.home.arpa.",
             "printer",
         ] {
             assert!(!endpoint_requires_transport_security(private), "{private}");
         }
-        for public in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888", "example.com"] {
+        // Go's `netip` classes stop at RFC 1918, loopback and link-local, so a
+        // shared (CGNAT), benchmarking, documentation, multicast or reserved
+        // address is public; so is an empty address, which the core refuses for
+        // a plaintext VLESS or Trojan outbound.
+        for public in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "0.0.0.0",
+            "::",
+            "2001:db8::1",
+            "2001:4860:4860::8888",
+            "example.com",
+            "",
+        ] {
             assert!(endpoint_requires_transport_security(public), "{public}");
         }
     }

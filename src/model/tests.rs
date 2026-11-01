@@ -466,7 +466,9 @@ fn roundtrip_inbounds() {
         "gateway": ["10.255.0.1/30"], "dns": ["1.1.1.1", "8.8.8.8"], "userLevel": 0,
         "autoSystemRoutingTable": ["0.0.0.0/1", "128.0.0.0/1"],
         "autoOutboundsInterface": "auto",
-        "autoSystemWfpBlockLeak": ["dns", "misconfigtun"],
+        "autoSystemWfpBlockLeak": [
+            "udp/53", "tcp/53", "windnsclient", "tcp/853", "udp/853", "misconfigtun"
+        ],
         "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
     }));
     // The Linux-only switch is wire-faithful: a set value round-trips, while

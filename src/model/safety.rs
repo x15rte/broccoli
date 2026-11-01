@@ -45,10 +45,11 @@ pub enum SafetyCode {
     DokodemoListenerExposed(String),
     /// TUN mode whose DNS leaves outside the tunnel: the core's leak block
     /// reaches the wire only while the TUN inbound and the DNS module are
-    /// both present, and only its `dns` half keeps port-53 egress inside the
-    /// tunnel. Either condition missing reopens that egress — the adapter
-    /// falls back to its stored resolvers, and queries can reach a server
-    /// outside the tunnel.
+    /// both present, and only a list carrying the entries that block the
+    /// system's DNS (`udp/53`, `tcp/53`, `windnsclient`) keeps port-53 egress
+    /// inside the tunnel. Either condition missing reopens that egress — the
+    /// adapter falls back to its stored resolvers, and queries can reach a
+    /// server outside the tunnel.
     TunDnsUnprotected,
     /// A balancer whose selectors match no emitted outbound tag — it cannot
     /// carry traffic. Payload is the balancer tag.
@@ -212,12 +213,13 @@ fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     // Privacy: TUN mode whose DNS leaves outside the tunnel. The core's leak
     // block is the only mechanism that keeps DNS inside it now — the deleted
     // app-side filter is gone — and the key reaches the wire only while the
-    // TUN inbound and the DNS module are both present, carrying its `dns`
-    // half. So the hazard is derived from that half, not from the absence of
-    // a filter the app used to install: a missing module or a switched-off
-    // half reopens DNS egress. The predicate mirrors the generator's
-    // emission decision exactly.
-    let dns_block_on = emit::dns_inbound_emitted(settings) && settings.tun.leak_blocks_dns();
+    // TUN inbound and the DNS module are both present, carrying the entries
+    // that block the system's DNS (`udp/53`, `tcp/53`, `windnsclient`). So the
+    // hazard is derived from those entries, not from the absence of a filter
+    // the app used to install: a missing module or a list without them
+    // reopens DNS egress. The predicate mirrors the generator's emission
+    // decision exactly, and this hazard is the app's only DNS-leak advisory.
+    let dns_block_on = emit::dns_inbound_emitted(settings) && settings.tun.leak_blocks_system_dns();
     if settings.mode == Mode::Tun && !dns_block_on {
         findings.push(finding(
             "tun".into(),
@@ -790,10 +792,11 @@ mod tests {
     }
 
     #[test]
-    fn tun_with_dns_module_but_dns_half_off_warns_privacy() {
-        // The leak key reaches the wire while the module exists, but without
-        // its `dns` half the core drops no DNS egress outside the tunnel —
-        // the hazard is derived from that half, not from the module alone.
+    fn tun_with_dns_module_but_no_system_dns_entry_warns_privacy() {
+        // The leak key reaches the wire while the module exists, but a list
+        // without `udp/53`, `tcp/53` or `windnsclient` leaves DNS free to
+        // leave the tunnel — the hazard is derived from those entries, not
+        // from the module alone.
         let settings = Settings {
             mode: Mode::Tun,
             tun: TunCfg {

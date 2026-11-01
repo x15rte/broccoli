@@ -1,7 +1,11 @@
 //! TUN screen: full-tunnel inbound settings + elevation state.
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
-use crate::model::inbound::{TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN};
+use crate::model::inbound::{
+    DNS_LEAK_ENTRY_LIST, LeakPort, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT, leak_port,
+    next_free_leak_port,
+};
+use crate::model::settings::Language;
 use crate::model::validation::{FindingTarget, ValidationCode};
 use crate::model::{Mode, emit, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
@@ -47,26 +51,142 @@ pub struct TunScreen {
 struct ValidationTexts {
     tun_warning: Option<String>,
     /// The model's TUN findings, rendered at the cache's generation cadence:
-    /// the gateway requirement and the leak block's unrouted-family advisory.
+    /// the gateway requirement and the leak list's advisories.
     gateway_error: Option<String>,
-    leak_warning: Option<String>,
-    /// The DNS leak block is emitted and its DNS half is on: the only state
-    /// in which turning the takeover off can stall name resolution.
+    /// The settings pass's advisories — an expanded `dns` alias and a missing
+    /// unrouted family — in the verdict's own order.
+    leak_warnings: Vec<String>,
+    /// The settings pass's blocking leak findings — a value outside the core's
+    /// vocabulary and a malformed port — rendered under the list they judge.
+    leak_errors: Vec<String>,
+    /// The leak block is emitted and its entries block the system's DNS: the
+    /// only state in which turning the takeover off can stall name
+    /// resolution.
     dns_leak_block_on: bool,
 }
 
-/// Write one leak-block half into the stored list: the core's canonical
-/// spelling when the switch turns it on, and every spelling of that half
-/// removed when it turns off. The other half — and any hand-edited value the
-/// core would refuse — keeps its place, so a toggle never rewrites entries it
-/// does not own, while the folded read ([`TunCfg::leak_blocks_dns`] and
-/// [`TunCfg::leak_blocks_misconfig_tun`]) stays truthful for a list edited
-/// into an odd shape.
-fn set_leak_half(list: &mut Vec<String>, half: &str, on: bool) {
-    list.retain(|entry| !fold_eq(entry, half));
-    if on {
-        list.push(half.to_string());
+/// The leak block: the two named entries as checkboxes over the stored list,
+/// the port filters as editable rows, and one button that appends a free
+/// port. Every edit writes the model directly, in the core's own form — the
+/// stored list and the generated document never carry an alias or a padded
+/// port.
+fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
+    let mut changed = false;
+    changed |= leak_switch(
+        ui,
+        lang,
+        entries,
+        TUN_LEAK_MISCONFIG_TUN,
+        Key::TunLeakMisconfigLabel,
+        Key::TunLeakMisconfigNote,
+    );
+    changed |= leak_switch(
+        ui,
+        lang,
+        entries,
+        TUN_LEAK_WINDNS_CLIENT,
+        Key::TunLeakWindnsClientLabel,
+        Key::TunLeakWindnsClientNote,
+    );
+
+    let mut remove = None;
+    for (index, entry) in entries.iter_mut().enumerate() {
+        // The two named entries are the checkboxes above; a row for them would
+        // edit the same value twice.
+        if fold_eq(entry, TUN_LEAK_MISCONFIG_TUN) || fold_eq(entry, TUN_LEAK_WINDNS_CLIENT) {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            if let Some(port) = leak_port(entry) {
+                changed |= leak_port_row(ui, index, port, entry);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                        remove = Some(index);
+                    }
+                });
+            } else {
+                // A value the core would refuse stays editable, so a
+                // hand-edited spelling can be fixed instead of lost.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                        remove = Some(index);
+                    }
+                    let field =
+                        ui.add(egui::TextEdit::singleline(entry).desired_width(f32::INFINITY));
+                    changed |= field.changed();
+                });
+            }
+        });
     }
+    if let Some(index) = remove {
+        entries.remove(index);
+        changed = true;
+    }
+    if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
+        let port = next_free_leak_port(entries);
+        entries.push(port.to_string());
+        changed = true;
+    }
+    changed
+}
+
+/// One named leak entry as a checkbox over the stored list: on appends the
+/// core's spelling, off removes every spelling of it. The note says what the
+/// entry closes, on hover, because it is one line of policy rather than a
+/// control the label can carry.
+fn leak_switch(
+    ui: &mut egui::Ui,
+    lang: Language,
+    entries: &mut Vec<String>,
+    entry: &str,
+    label: Key,
+    note: Key,
+) -> bool {
+    let mut on = entries.iter().any(|kept| fold_eq(kept, entry));
+    let toggled =
+        widgets::noted(ui, t(lang, note), |ui| ui.checkbox(&mut on, t(lang, label))).changed();
+    if !toggled {
+        return false;
+    }
+    entries.retain(|kept| !fold_eq(kept, entry));
+    if on {
+        entries.push(entry.to_string());
+    }
+    true
+}
+
+/// One port row: the protocol combo and the port, written back as the core's
+/// `tcp/<port>`/`udp/<port>` spelling. `port` always parses, so the field
+/// starts at a value the core accepts.
+fn leak_port_row(ui: &mut egui::Ui, index: usize, port: LeakPort, entry: &mut String) -> bool {
+    let mut protocol = port.protocol();
+    let protocol_changed = egui::ComboBox::from_id_salt(("leak-protocol", index))
+        .selected_text(protocol)
+        .show_ui(ui, |ui| {
+            let mut picked = false;
+            for candidate in ["tcp", "udp"] {
+                if ui
+                    .selectable_label(protocol == candidate, candidate)
+                    .clicked()
+                    && protocol != candidate
+                {
+                    protocol = candidate;
+                    picked = true;
+                }
+            }
+            picked
+        })
+        .inner
+        .unwrap_or(false);
+    let mut next_port = port.port();
+    let port_changed = ui
+        .add(egui::DragValue::new(&mut next_port).range(1..=65535))
+        .changed();
+    if !protocol_changed && !port_changed {
+        return false;
+    }
+    *entry = format!("{protocol}/{next_port}");
+    true
 }
 
 impl TunScreen {
@@ -145,19 +265,38 @@ impl TunScreen {
                     .for_target(FindingTarget::Tun)
                     .find(|issue| issue.code == ValidationCode::TunIpv4GatewayRequired)
                     .map(|issue| validation_message(&issue.code, lang)),
-                leak_warning: verdict
+                leak_warnings: verdict
                     .for_target(FindingTarget::Tun)
-                    .find(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff)
-                    .map(|issue| validation_message(&issue.code, lang)),
+                    .filter(|issue| {
+                        matches!(
+                            issue.code,
+                            ValidationCode::TunLeakMisconfigTunOff
+                                | ValidationCode::TunLeakDnsAliasExpanded
+                        )
+                    })
+                    .map(|issue| validation_message(&issue.code, lang))
+                    .collect(),
+                leak_errors: verdict
+                    .for_target(FindingTarget::Tun)
+                    .filter(|issue| {
+                        matches!(
+                            issue.code,
+                            ValidationCode::TunLeakValueUnknown(_)
+                                | ValidationCode::TunLeakPortInvalid(_)
+                        )
+                    })
+                    .map(|issue| validation_message(&issue.code, lang))
+                    .collect(),
                 dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
-                    && ctx.settings.tun.leak_blocks_dns(),
+                    && ctx.settings.tun.leak_blocks_system_dns(),
             }
         });
         let tun_warning = texts.tun_warning.as_deref();
         // The model's own TUN findings, rendered at the cache's generation
-        // cadence (the switch and the gateway editor are the locations).
+        // cadence (the list and the gateway editor are the locations).
         let gateway_error = texts.gateway_error.as_deref();
-        let leak_warning = texts.leak_warning.as_deref();
+        let leak_warnings = texts.leak_warnings.as_slice();
+        let leak_errors = texts.leak_errors.as_slice();
         let dns_leak_block_on = texts.dns_leak_block_on;
 
         ui.add_space(4.0);
@@ -220,43 +359,36 @@ impl TunScreen {
         ui.add_space(4.0);
         let tun = &mut ctx.settings.tun;
 
-        // The leak block sits right under the privacy banner it feeds: both
-        // halves are switchable, both default on, and each note names what the
-        // half closes and what it needs. A toggle writes the folded value
-        // straight into the model, so the state survives a restart and reaches
-        // the generator; the privacy banner reads the same model through the
-        // safety pass, so a switched-off DNS half shows in both places.
+        // The leak block sits right under the privacy banner it feeds. The two
+        // named entries are checkboxes, the core's `tcp/<port>`/`udp/<port>`
+        // values are one row each, and a value the core would refuse stays an
+        // editable row so the user can fix it. Each edit writes the model
+        // directly, so the state survives a restart and reaches the generator;
+        // the privacy banner reads the same model through the safety pass.
         widgets::section(ui, t(lang, Key::TunSectionLeakBlock), |ui| {
-            let mut dns_on = tun.leak_blocks_dns();
-            if widgets::noted(ui, t(lang, Key::TunLeakDnsNote), |ui| {
-                ui.checkbox(&mut dns_on, t(lang, Key::TunLeakDnsLabel))
-            })
-            .changed()
-            {
-                set_leak_half(&mut tun.auto_system_wfp_block_leak, TUN_LEAK_DNS, dns_on);
-                changed = true;
-            }
-            let mut misconfig_on = tun.leak_blocks_misconfig_tun();
-            if widgets::noted(ui, t(lang, Key::TunLeakMisconfigNote), |ui| {
-                ui.checkbox(&mut misconfig_on, t(lang, Key::TunLeakMisconfigLabel))
-            })
-            .changed()
-            {
-                set_leak_half(
-                    &mut tun.auto_system_wfp_block_leak,
-                    TUN_LEAK_MISCONFIG_TUN,
-                    misconfig_on,
-                );
-                changed = true;
-            }
-            // The unrouted-family advisory's own message, right under the
-            // switch that turns the half off: the same bytes the settings
-            // pass renders, never a second sentence. A plain label consumes
-            // no auto-id slot, so the section's widget ids do not shift when
-            // it appears or clears.
-            if let Some(message) = leak_warning {
+            let hint = t_fmt(lang, Key::TunLeakEntriesHint, &[&*DNS_LEAK_ENTRY_LIST]);
+            ui.label(egui::RichText::new(hint).small());
+            changed |= leak_entries(ui, lang, &mut tun.auto_system_wfp_block_leak);
+            // The settings pass's blocking findings — a value outside the
+            // core's vocabulary and a malformed port — render under the list
+            // they judge, in the same bytes the apply gate carries. An entry
+            // the load could not canonicalize stays editable above so the user
+            // can fix it, and this line names what is wrong with it.
+            for message in leak_errors {
                 ui.label(
-                    egui::RichText::new(message)
+                    egui::RichText::new(message.as_str())
+                        .small()
+                        .color(status_colors_of(ui).err),
+                );
+            }
+            // The settings pass's advisories — an expanded `dns` alias and a
+            // list without the unrouted family — render under the list they
+            // judge, in the same bytes the generator's verdict carries. A
+            // plain label consumes no auto-id slot, so the section's widget
+            // ids do not shift when one appears or clears.
+            for message in leak_warnings {
+                ui.label(
+                    egui::RichText::new(message.as_str())
                         .small()
                         .color(status_colors_of(ui).warn),
                 );
@@ -709,11 +841,8 @@ mod tests {
         );
     }
 
-    /// The toggled state of the leak checkbox the label names.
-    fn leak_switch(
-        harness: &Harness<'static, (TunScreen, UiTestRig)>,
-        label: &str,
-    ) -> Option<bool> {
+    /// The toggled state of the checkbox the label names.
+    fn checked(harness: &Harness<'static, (TunScreen, UiTestRig)>, label: &str) -> Option<bool> {
         harness
             .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
             .accesskit_node()
@@ -722,62 +851,85 @@ mod tests {
     }
 
     /// Render the screen over a rig at a viewport tall enough for every
-    /// section, so the leak switches sit in the AccessKit tree.
+    /// section, so the leak rows sit in the AccessKit tree.
     fn leak_harness(rig: UiTestRig) -> Harness<'static, (TunScreen, UiTestRig)> {
         screen_harness_at(egui::vec2(900.0, 3200.0), rig, TunScreen::default())
     }
 
-    /// The leak switches render each half's folded truth — including for a
-    /// hand-edited list — and a toggle writes only the half it owns, so the
-    /// other half and any entry the core would refuse keep their place.
+    /// The leak block is two checkboxes over the stored list plus one row per
+    /// port. A checkbox toggles its named entry, a row's 🗑 removes exactly
+    /// that port, and the one add button appends the lowest port the list does
+    /// not hold yet.
     #[test]
-    fn leak_switches_render_each_half_truthfully_and_write_through() {
-        // A list edited into an odd shape: the DNS half in a mixed-case
-        // spelling, a value the core would refuse, and no family half.
+    fn the_leak_block_renders_switches_rows_and_adds_a_free_port() {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
-        rig.settings.tun.auto_system_wfp_block_leak = vec!["DNS".into(), "bogus".into()];
         let mut harness = leak_harness(rig);
 
-        let dns_label = t(Language::En, Key::TunLeakDnsLabel);
-        let family_label = t(Language::En, Key::TunLeakMisconfigLabel);
-        assert_eq!(
-            leak_switch(&harness, dns_label),
-            Some(true),
-            "a mixed-case DNS entry is the DNS half, so its switch must read on"
+        let hint = t_fmt(
+            Language::En,
+            Key::TunLeakEntriesHint,
+            &[&*DNS_LEAK_ENTRY_LIST],
         );
-        assert_eq!(
-            leak_switch(&harness, family_label),
-            Some(false),
-            "an absent family half must read off"
+        assert!(
+            harness.query_by_label(hint.as_str()).is_some(),
+            "the section carries its one entry-list hint"
         );
+        for label in [Key::TunLeakWindnsClientLabel, Key::TunLeakMisconfigLabel] {
+            assert_eq!(
+                checked(&harness, t(Language::En, label)),
+                Some(true),
+                "the seeded list carries {label:?}, so its checkbox reads on"
+            );
+        }
 
+        // The leak section renders before every other list, so the first 🗑 on
+        // screen belongs to its first port row: the seeded `udp/53`.
         harness
-            .get_by_role_and_label(egui::accesskit::Role::CheckBox, family_label)
-            .click();
-        harness.run();
-        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
-        assert!(
-            leak.iter().any(|half| half == TUN_LEAK_MISCONFIG_TUN),
-            "the family switch must add the core's spelling"
-        );
-        assert!(
-            leak.iter().any(|half| half == "bogus"),
-            "a toggle must not drop an entry it does not own"
-        );
-        assert!(
-            leak.iter().any(|half| half == "DNS"),
-            "the other half keeps the spelling it had"
-        );
-
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::CheckBox, dns_label)
+            .query_all_by_label(t(Language::En, Key::DeleteRow))
+            .next()
+            .expect("the first leak row's delete button")
             .click();
         harness.run();
         assert_eq!(
             harness.state().1.settings.tun.auto_system_wfp_block_leak,
-            vec!["bogus".to_string(), TUN_LEAK_MISCONFIG_TUN.to_string()],
-            "turning the DNS half off must remove every spelling of it"
+            vec![
+                "tcp/53".to_string(),
+                TUN_LEAK_WINDNS_CLIENT.to_string(),
+                "tcp/853".to_string(),
+                "udp/853".to_string(),
+                TUN_LEAK_MISCONFIG_TUN.to_string(),
+            ],
+            "deleting a row must remove exactly that entry"
+        );
+
+        // The family checkbox writes its named entry and nothing else.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::CheckBox,
+                t(Language::En, Key::TunLeakMisconfigLabel),
+            )
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert!(
+            !leak.contains(&TUN_LEAK_MISCONFIG_TUN.to_string()),
+            "{leak:?}"
+        );
+
+        // The add button appends the lowest port the list does not hold.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::TunLeakAddPort),
+            )
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert_eq!(
+            leak.last().map(String::as_str),
+            Some("tcp/1"),
+            "the add button must append the lowest free port: {leak:?}"
         );
     }
 
@@ -791,7 +943,7 @@ mod tests {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
         rig.settings.tun.gateway.clear();
-        rig.settings.tun.auto_system_wfp_block_leak = vec![TUN_LEAK_DNS.into()];
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["udp/53".into()];
         let mut harness = leak_harness(rig);
 
         let gateway = validation_message(&ValidationCode::TunIpv4GatewayRequired, Language::En);
@@ -808,7 +960,7 @@ mod tests {
                 .query_all_by_label(advisory.as_str())
                 .next()
                 .is_some(),
-            "a switched-off family half must render the model's advisory: {advisory}"
+            "a list without the unrouted family must render the model's advisory: {advisory}"
         );
 
         {
@@ -833,8 +985,55 @@ mod tests {
                 .query_all_by_label(advisory.as_str())
                 .next()
                 .is_none(),
-            "re-enabling the half must clear the advisory"
+            "re-adding the family entry must clear the advisory"
         );
+    }
+
+    /// A blocking leak finding renders where the list is edited: a value the
+    /// core would refuse and a malformed port both name their entry under the
+    /// rows, in the same bytes the apply gate carries, and clearing the entry
+    /// clears the message.
+    #[test]
+    fn the_screen_renders_blocking_leak_findings_under_the_list() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak =
+            vec!["udp/53".into(), "bogus".into(), "tcp/0".into()];
+        let mut harness = leak_harness(rig);
+
+        let unknown = validation_message(
+            &ValidationCode::TunLeakValueUnknown("bogus".into()),
+            Language::En,
+        );
+        let port = validation_message(
+            &ValidationCode::TunLeakPortInvalid("tcp/0".into()),
+            Language::En,
+        );
+        for message in [&unknown, &port] {
+            assert!(
+                harness
+                    .query_all_by_label(message.as_str())
+                    .next()
+                    .is_some(),
+                "a blocking leak entry must render its message: {message}"
+            );
+        }
+
+        {
+            let rig = &mut harness.state_mut().1;
+            rig.settings.tun.auto_system_wfp_block_leak = vec!["udp/53".into()];
+            rig.edit();
+        }
+        harness.run();
+        for message in [&unknown, &port] {
+            assert!(
+                harness
+                    .query_all_by_label(message.as_str())
+                    .next()
+                    .is_none(),
+                "fixing the entry must clear its message: {message}"
+            );
+        }
     }
 
     /// The TUN cache keys on the published verdict's own generation beside the
@@ -884,7 +1083,7 @@ mod tests {
         let mut harness = leak_harness(rig);
         let label = t(Language::En, Key::TunDnsTakeoverLabel);
         assert_eq!(
-            leak_switch(&harness, label),
+            checked(&harness, label),
             Some(true),
             "the established behavior starts on"
         );
@@ -927,7 +1126,7 @@ mod tests {
             "the warning needs the DNS leak block"
         );
 
-        // The block is not emitted with TUN off, so the stored half alone
+        // The block is not emitted with TUN off, so the stored list alone
         // must not resurrect the warning.
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Off;
@@ -941,16 +1140,16 @@ mod tests {
         );
     }
 
-    /// Each switch carries its note on the row hover: the note names what the
-    /// half closes and what it needs, and costs no permanent line.
+    /// Each fixed-token row carries its note on the row hover: the note names
+    /// what the entry closes and what it needs, and costs no permanent line.
     #[test]
-    fn leak_switch_notes_ride_the_row_hover() {
+    fn leak_switch_notes_ride_the_checkbox_hover() {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
         let mut harness = leak_harness(rig);
 
         for (label, note) in [
-            (Key::TunLeakDnsLabel, Key::TunLeakDnsNote),
+            (Key::TunLeakWindnsClientLabel, Key::TunLeakWindnsClientNote),
             (Key::TunLeakMisconfigLabel, Key::TunLeakMisconfigNote),
         ] {
             let note = t(Language::En, note);
@@ -964,15 +1163,15 @@ mod tests {
             harness.run();
             assert!(
                 harness.query_all_by_label(note).next().is_some(),
-                "the switch hover must carry its note"
+                "the checkbox hover must carry its note"
             );
         }
     }
 
-    /// The privacy banner reads the safety hazard, so a switched-off DNS half
-    /// shows there as well as on the switch.
+    /// The privacy banner reads the safety hazard, so a list without the
+    /// entries that block the system's DNS shows there as well as in the list.
     #[test]
-    fn switched_off_dns_half_shows_in_the_privacy_banner() {
+    fn a_list_without_the_system_dns_entries_shows_in_the_privacy_banner() {
         let warning = t(Language::En, Key::SafetyTunDnsUnprotected);
 
         let mut on = UiTestRig::default();
@@ -980,7 +1179,7 @@ mod tests {
         let harness = leak_harness(on);
         assert!(
             harness.query_by_label(warning).is_none(),
-            "the seeded both-on block must not warn"
+            "the seeded list blocks the system's DNS, so it must not warn"
         );
 
         let mut off = UiTestRig::default();
@@ -989,7 +1188,7 @@ mod tests {
         let harness = leak_harness(off);
         assert!(
             harness.query_by_label(warning).is_some(),
-            "a switched-off DNS half must warn in the privacy banner"
+            "a list without port 53 or the DNS Client service must warn"
         );
     }
 }

@@ -804,12 +804,14 @@ fn inbounds(settings: &Settings, emission: &emit::Emission) -> Value {
                 // inbound and the DNS module are both present — the
                 // `config_runs_tun_dns` predicate the runtime reads back — so
                 // the document the core loads carries the same protection the
-                // elevated helper's DNS takeover assumes. The value folds like
-                // the core lowercases it (infra/conf/tun.go), and an empty
-                // list stays a no-op the core accepts.
+                // elevated helper's DNS takeover assumes. The value is the
+                // canonical list: lower case, the alias expanded, ports
+                // without leading zeros, no duplicates (proxy/tun/wfp_leak.go
+                // normalizes the same way), and an empty list stays a no-op
+                // the core accepts.
                 o.insert(
                     "autoSystemWfpBlockLeak".into(),
-                    json!(settings.tun.folded_leak_block()),
+                    json!(settings.tun.canonical_leak_block()),
                 );
             }
         } else if settings.tun.dns.is_empty()
@@ -867,23 +869,51 @@ fn routing(cfg: &RoutingCfg, emission: &emit::Emission) -> Value {
 
 /// Xray's definition of a private address (`common/geodata/consts.go`),
 /// emitted literally rather than as `geoip:private`: a refreshed `geoip.dat`
-/// without the `PRIVATE` code would otherwise fail the core at load.
-const PRIVATE_IP_RANGES: [&str; 18] = [
+/// without the `PRIVATE` code would otherwise fail the core at load. The
+/// entries are the IANA special-purpose registries the tag's matcher builds
+/// from, in the tag's order.
+const PRIVATE_IP_RANGES: &[&str] = &[
     "0.0.0.0/8",
+    "0.0.0.0/32",
     "10.0.0.0/8",
     "100.64.0.0/10",
     "127.0.0.0/8",
     "169.254.0.0/16",
     "172.16.0.0/12",
-    "192.0.0.0/24",
+    "192.0.0.0/29",
+    "192.0.0.8/32",
+    "192.0.0.9/32",
+    "192.0.0.10/32",
+    "192.0.0.170/32",
+    "192.0.0.171/32",
     "192.0.2.0/24",
-    "192.88.99.0/24",
+    "192.52.193.0/24",
+    "192.88.99.2/32",
     "192.168.0.0/16",
     "198.18.0.0/15",
     "198.51.100.0/24",
     "203.0.113.0/24",
-    "224.0.0.0/3",
-    "::/127",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "224.0.0.0/4",
+    "::1/128",
+    "::/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "100:0:0:1::/64",
+    "2001::/32",
+    "2001:1::1/128",
+    "2001:1::2/128",
+    "2001:1::3/128",
+    "2001:2::/48",
+    "2001:3::/32",
+    "2001:20::/28",
+    "2001:30::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+    "5f00::/16",
     "fc00::/7",
     "fe80::/10",
     "ff00::/8",

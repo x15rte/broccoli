@@ -1,0 +1,68 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "address": "1.1.1.1",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "8.8.8.8",
+        "timeoutMs": 8000
+      },
+      {
+        "address": "localhost",
+        "domains": [
+          "domain:xdrive.example.com"
+        ],
+        "skipFallback": true
+      }
+    ]
+  },
+  "outbounds": [
+    {
+      "mux": {
+        "enabled": true
+      },
+      "protocol": "vless",
+      "settings": {
+        "address": "xdrive.example.com",
+        "encryption": "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+        "id": "11111111-2222-3333-4444-555555555555",
+        "port": 443
+      },
+      "streamSettings": {
+        "network": "xdrive",
+        "sockopt": {
+          "domainStrategy": "useip"
+        },
+        "xdriveSettings": {
+          "remoteFolder": "tunnel",
+          "s3": {
+            "bucket": "tunnel-bucket",
+            "endpoint": "https://s3.example.com",
+            "pathStyle": false,
+            "region": "us-east-1"
+          },
+          "secrets": [
+            "access-key-id",
+            "secret-access-key"
+          ],
+          "service": "s3"
+        }
+      },
+      "tag": "srv-01234567"
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    }
+  ]
+}

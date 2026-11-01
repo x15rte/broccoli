@@ -657,14 +657,25 @@ pub enum ValidationCode {
     /// autoSystemRoutingTable to be set", live on the pinned binary), so the
     /// configuration never loads. Error tier.
     TunLeakRoutingTableRequired,
-    /// A leak-block value outside {`dns`, `misconfigtun`} (the offending
-    /// value, bounded). The core's build refuses any other spelling with
-    /// "unknown autoSystemWfpBlockLeak value: ..." (live on the pinned
+    /// A leak-block entry outside the core's vocabulary — `dns`,
+    /// `windnsclient`, `misconfigtun`, `tcp/<port>`, `udp/<port>` — with the
+    /// offending value, bounded. The core's build refuses any other spelling
+    /// with "unknown autoSystemWfpBlockLeak value: ..." (live on the pinned
     /// binary), so the configuration never loads. Values fold
-    /// case-insensitively, so a mixed-case `DNS` is the same half. Error
-    /// tier.
+    /// case-insensitively. Error tier.
     TunLeakValueUnknown(String),
-    /// The emitted leak block leaves the unrouted-family half out: an address
+    /// A `tcp/<port>` or `udp/<port>` entry whose port is not a nonzero
+    /// 16-bit number (the offending value, bounded), which the core's
+    /// `parseLeakPort` refuses with the same unknown-value error
+    /// (proxy/tun/wfp_leak.go). The structured editor cannot build one, so
+    /// this rule guards raw edits and imported files. Error tier.
+    TunLeakPortInvalid(String),
+    /// A profile that carried the `dns` alias after the load-time migration
+    /// expanded it — a raw edit or an import. The app accepts the alias in
+    /// memory and saves the five entries it stands for. Advisory
+    /// (Severity::Warning): the core loads the alias itself.
+    TunLeakDnsAliasExpanded,
+    /// The emitted leak block leaves the unrouted-family entry out: an address
     /// family the routing table does not route into the tunnel can then send
     /// traffic outside it. Advisory (Severity::Warning): the core loads and
     /// runs the document, only without that filter.
@@ -1149,13 +1160,48 @@ pub enum ValidationCode {
     /// build refuses the document (`service "template" needs a "template"
     /// object`, infra/conf/transport_method.go:882-884). Error tier.
     XdriveTemplateMissing,
-    /// A `local` or `Google Drive` `xdriveSettings` with an empty
-    /// `remoteFolder`: both storages refuse it while the transport is built
-    /// (`empty "remoteFolder"`, transport/internet/xdrive/local.go:20-22;
+    /// An `xdriveSettings` for a storage that writes to a named place — not
+    /// the template — with an empty `remoteFolder`: those storages refuse it
+    /// while the transport is built (`empty "remoteFolder"`, local.go:20-22;
     /// `empty "remoteFolder", it must be a Google Drive folder id`,
-    /// drive.go:62-64) — a start-time refusal the config-file check never
-    /// sees. One rule, path-disambiguated by the service. Error tier.
+    /// drive.go:62-64; `S3 remoteFolder must be a nonempty relative prefix`,
+    /// s3.go:75-77) — a start-time refusal the config-file check never sees.
+    /// One rule, path-disambiguated by the service. Error tier.
     XdriveRemoteFolderRequired,
+    /// The `s3` service without an `s3` object: the core's conf build refuses
+    /// the document (`service "s3" needs an "s3" object`, infra/conf/
+    /// transport_method.go). Error tier.
+    XdriveS3ObjectRequired,
+    /// An `s3.endpoint` that is not an http(s) URL with a host and no
+    /// credentials, query or fragment, which `ValidateS3Config` refuses
+    /// (transport/internet/xdrive/s3.go:49-90). Error tier.
+    XdriveS3EndpointInvalid,
+    /// An `s3.region` that is not one header-safe token — empty is allowed
+    /// here and warned about separately (transport/internet/xdrive/s3.go).
+    /// Error tier.
+    XdriveS3RegionInvalid,
+    /// An `s3.bucket` the addressing style cannot carry: path-style refuses a
+    /// path separator, host-style refuses a name that is not DNS-compatible
+    /// or an endpoint that is a bare address (transport/internet/xdrive/
+    /// s3.go:49-90). Error tier.
+    XdriveS3BucketInvalid,
+    /// An `s3.remoteFolder` that is not a nonempty relative prefix without
+    /// empty, single-dot or double-dot components
+    /// (transport/internet/xdrive/s3.go:75-77). Error tier.
+    XdriveS3RemoteFolderInvalid,
+    /// An `s3` service without two non-empty secrets (AccessKeyID,
+    /// SecretAccessKey) or with more than three, which `ValidateS3Config`
+    /// refuses, along with a header-unsafe value
+    /// (transport/internet/xdrive/s3.go:86-97). Error tier.
+    XdriveS3SecretsInvalid,
+    /// An `s3` profile with an empty signing region. The core loads it, so
+    /// this is not a rule; S3 then rejects the unsigned-region request.
+    /// Advisory (Severity::Warning).
+    XdriveS3RegionEmpty,
+    /// An `s3` profile whose endpoint is `http://`: the core loads it, and
+    /// the request then carries its signing secrets in cleartext. Advisory
+    /// (Severity::Warning).
+    XdriveS3EndpointNotHttps,
     /// A `template` operation without a `url`: the template storage is built
     /// when the transport is first used and refuses the document
     /// (`template needs put, get, list and delete operations`,

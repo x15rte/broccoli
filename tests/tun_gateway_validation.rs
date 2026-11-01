@@ -19,6 +19,7 @@
 use broccoli::app::BroccoliApp;
 use broccoli::r#gen::generate_with_api_port;
 use broccoli::i18n::{Key, t, t_fmt, validation_message};
+use broccoli::model::inbound::leak_port;
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::model::validation::{ValidationCode, Verdict, validate_settings};
 use broccoli::model::{ServersFile, TunCfg};
@@ -76,6 +77,16 @@ fn tun_settings(gateway: Vec<String>) -> Settings {
 fn generate(settings: &Settings) -> Result<serde_json::Value, String> {
     generate_with_api_port(&ServersFile::default(), settings, 19999)
         .map_err(|error| error.to_string())
+}
+
+/// The emitted TUN inbound's settings object.
+fn tun_wire(cfg: &serde_json::Value) -> &serde_json::Value {
+    &cfg["inbounds"]
+        .as_array()
+        .expect("inbounds is an array")
+        .iter()
+        .find(|inbound| inbound["protocol"] == "tun")
+        .expect("the TUN inbound must be emitted")["settings"]
 }
 
 // ---------- model-level validation ----------
@@ -236,9 +247,10 @@ fn leak_block_without_a_routing_table_is_a_validation_error() {
 
 #[test]
 fn unknown_leak_value_is_a_validation_error() {
-    // Any value outside {dns, misconfigtun} makes the core refuse the whole
-    // document at load ("unknown autoSystemWfpBlockLeak value: ...", confirmed
-    // against the pinned binary).
+    // Any value outside the core's vocabulary — the `dns` alias, `windnsclient`,
+    // `misconfigtun`, and a `tcp/<port>`/`udp/<port>` filter — makes the core
+    // refuse the whole document at load ("unknown autoSystemWfpBlockLeak
+    // value: ...", confirmed against the pinned binary).
     let settings = leak_settings(vec!["bogus".into()]);
     assert!(verdict_carries(
         &settings,
@@ -252,27 +264,99 @@ fn unknown_leak_value_is_a_validation_error() {
 }
 
 #[test]
-fn leak_halves_fold_case_insensitively_like_the_core() {
-    // The core lowercases each entry before it compares, so a mixed-case
-    // spelling is the same half and passes the vocabulary gate.
-    let settings = leak_settings(vec!["DNS".into(), "MisconfigTun".into()]);
+fn leak_entries_fold_case_insensitively_like_the_core() {
+    // The core lowercases each entry before it matches, so a mixed-case
+    // spelling is the same entry and passes the vocabulary gate. The generator
+    // reads the list through its canonical form, so the wire carries the
+    // core's own spelling even for a list built by hand.
+    let settings = leak_settings(vec![
+        "UDP/053".into(),
+        "WindnsClient".into(),
+        "MisconfigTun".into(),
+    ]);
     assert!(!verdict(&settings).has_blocking());
-    generate(&settings).expect("mixed-case halves are the core's own values");
+    let cfg = generate(&settings).expect("mixed-case entries are the core's own values");
+    assert_eq!(
+        tun_wire(&cfg)["autoSystemWfpBlockLeak"],
+        serde_json::json!(["udp/53", "windnsclient", "misconfigtun"])
+    );
 }
 
 #[test]
-fn a_switched_off_family_half_warns_with_what_reopens() {
+fn a_port_the_core_refuses_is_a_validation_error() {
+    // A `tcp/`/`udp/` value whose port is zero, over 65535, or not a number is
+    // the core's own refusal ("unknown autoSystemWfpBlockLeak value: ..."), so
+    // the entry is reported with the port rule rather than the unknown-value
+    // one.
+    for value in ["tcp/0", "udp/65536", "tcp/bogus", "udp/"] {
+        let settings = leak_settings(vec![value.into()]);
+        let code = ValidationCode::TunLeakPortInvalid(value.into());
+        assert!(verdict_carries(&settings, &code), "{value}");
+        let error = generate(&settings).expect_err("a port the core refuses must be rejected");
+        assert!(
+            error.contains(leak_message(&code).as_str()),
+            "{value}: the error must name the port rule: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_raw_dns_alias_profile_warns_once_about_the_expansion() {
+    // A raw JSON block — an import or a hand edit — still naming the alias
+    // loads expanded: the session is told once, and what the generator emits
+    // is the entries the alias stands for. The alias is the core's own value,
+    // so it never blocks.
+    let tun: TunCfg = serde_json::from_value(serde_json::json!({
+        "autoSystemWfpBlockLeak": ["dns"],
+        "autoSystemRoutingTable": ["0.0.0.0/1"],
+    }))
+    .expect("a raw block loads");
+    assert!(
+        tun.dns_alias_expanded,
+        "the load must remember that it expanded the alias"
+    );
+    let settings = Settings {
+        mode: Mode::Tun,
+        tun,
+        ..Default::default()
+    };
+    assert!(
+        verdict(&settings)
+            .advisory()
+            .any(|issue| issue.code == ValidationCode::TunLeakDnsAliasExpanded),
+        "a load that expanded the alias must warn"
+    );
+    assert!(!verdict(&settings).has_blocking());
+    generate(&settings).expect("the alias must not block generation");
+
+    // The save writes the expansion: a reload has nothing left to warn about.
+    let saved = serde_json::to_value(&settings.tun).expect("the TUN block serializes");
+    let reloaded: TunCfg = serde_json::from_value(saved).expect("the saved block reloads");
+    assert!(!reloaded.dns_alias_expanded);
+    assert!(
+        !verdict(&Settings {
+            tun: reloaded,
+            ..settings
+        })
+        .advisory()
+        .any(|issue| issue.code == ValidationCode::TunLeakDnsAliasExpanded),
+        "the saved block carries the entries, so the warning clears"
+    );
+}
+
+#[test]
+fn a_list_without_the_family_entry_warns_with_what_reopens() {
     // The key still reaches the wire (the DNS module is present), but without
-    // the unrouted-family half an address family the routing table does not
+    // the unrouted-family entry an address family the routing table does not
     // route into the tunnel can egress. Advisory, never a gate.
-    let settings = leak_settings(vec!["dns".into()]);
+    let settings = leak_settings(vec!["udp/53".into(), "tcp/53".into()]);
     assert!(
         verdict(&settings)
             .advisory()
             .any(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff),
-        "a missing family half must warn"
+        "a missing family entry must warn"
     );
-    generate(&settings).expect("a switched-off half must not block generation");
+    generate(&settings).expect("a list without the family entry must not block generation");
 }
 
 #[test]
@@ -344,12 +428,17 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
         "a dual-stack gateway must not show the inline error"
     );
 
-    // Delete both gateway rows. The gateways section renders before
-    // auto-routes, so the first 🗑 button is always a gateway row while
-    // both remain.
+    // Delete both gateway rows. The leak block renders one deletable row per
+    // seeded port above the gateways section — its two named entries are
+    // checkboxes — so the gateway rows' 🗑 buttons start after that many.
+    let above = TunCfg::default()
+        .auto_system_wfp_block_leak
+        .iter()
+        .filter(|entry| leak_port(entry).is_some())
+        .count();
     for _ in 0..2 {
         h.query_all_by_label("🗑")
-            .next()
+            .nth(above)
             .expect("gateway row delete button")
             .click();
         h.run_steps(4);
@@ -360,8 +449,8 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
         "deleting every gateway row must show the inline error"
     );
 
-    // Re-add an IPv4 gateway: "+ Add" in the gateways section is the first
-    // add button on the screen.
+    // Re-add an IPv4 gateway: the leak block adds ports with its own button,
+    // so the gateways section's "+ Add" is the first one on screen.
     h.query_all_by_label("+ Add")
         .next()
         .expect("gateways add button")

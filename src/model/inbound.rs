@@ -960,8 +960,8 @@ pub fn config_runs_tun_dns(config: &Value) -> bool {
 /// the adapter DNS to the TUN gateway's IPv4 (tun_dns_address,
 /// gen/mod.rs:346-352) regardless of this value), split default routes
 /// (v4 + v6), autoOutboundsInterface "auto".
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TunCfg {
     /// Always serialized (storage): a cleared name must survive the load
     /// round-trip — with the seeded "broccoli0" default, a missing key
@@ -998,16 +998,24 @@ pub struct TunCfg {
     pub auto_system_routing_table: Vec<String>,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub auto_outbounds_interface: String,
-    /// The core's leak block halves the tunnel runs: [`TUN_LEAK_DNS`] drops
-    /// DNS egress outside the tunnel, [`TUN_LEAK_MISCONFIG_TUN`] drops an
-    /// address family the routing table does not route into it
-    /// (infra/conf/tun.go). Values fold case-insensitively like every wire
-    /// vocabulary (the core lowercases each entry before it compares).
-    /// Always serialized (storage): the seeded both-on policy must survive a
-    /// round-trip after the user switches a half off, and the generator
-    /// emits it whenever the TUN inbound and the DNS module are both present
-    /// (the same predicate the runtime reads back).
+    /// The core's leak block: the entries whose traffic may only egress the
+    /// TUN. Most are `tcp/<port>`/`udp/<port>` filters; [`TUN_LEAK_WINDNS_CLIENT`]
+    /// blocks Windows' DNS Client service, [`TUN_LEAK_MISCONFIG_TUN`] drops an
+    /// address family the routing table does not route into the tunnel, and
+    /// [`DNS_LEAK_ALIAS`] is an alias the core expands into
+    /// [`DNS_LEAK_ENTRIES`] before it matches (`ExpandWfpBlockLeak`,
+    /// proxy/tun/wfp_leak.go). The load stores the canonical form
+    /// ([`Self::canonical_leak_block`]). Always serialized (storage): the
+    /// seeded policy must survive a round-trip after the user removes an
+    /// entry, and the generator emits it whenever the TUN inbound and the DNS
+    /// module are both present (the same predicate the runtime reads back).
     pub auto_system_wfp_block_leak: Vec<String>,
+    /// True when the load expanded a stored [`DNS_LEAK_ALIAS`] into
+    /// [`DNS_LEAK_ENTRIES`]. Never serialized: the save writes the entries the
+    /// alias stands for, and a raw JSON edit migrates through the same load
+    /// path. The settings pass warns from it once.
+    #[serde(skip)]
+    pub dns_alias_expanded: bool,
     /// Point the system resolver at the tunnel gateway. Linux-only upstream
     /// (only `LinuxTun` implements `ConfigureSystemDNS`), so the core
     /// accepts and no-ops it on Windows; the model carries it for wire
@@ -1024,19 +1032,162 @@ pub struct TunCfg {
 /// adapter, so a blank setting ([`TunCfg::effective_name`]) resolves here.
 pub const DEFAULT_TUN_NAME: &str = "broccoli0";
 
-/// The leak-block half that keeps DNS inside the tunnel: the core drops
-/// port-53 egress outside it (`proxy/tun/tun_windows.go`). Its prerequisite
-/// is a non-empty TUN resolver list (`TunCfg::dns`).
-pub const TUN_LEAK_DNS: &str = "dns";
-
-/// The leak-block half that drops traffic of an address family the routing
+/// The leak-block entry that drops traffic of an address family the routing
 /// table does not route into the tunnel (`proxy/tun/tun_windows.go`).
 pub const TUN_LEAK_MISCONFIG_TUN: &str = "misconfigtun";
 
-/// The leak-block halves a fresh install runs, in the core's own value
-/// order. A TUN session keeps DNS and the unrouted family inside the tunnel
-/// until the user switches a half off.
-pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 2] = [TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN];
+/// The leak-block entry covering Windows' DNS Client service, whose own
+/// queries can use protocols and ports a port filter does not see
+/// (`dnsLeaks`, proxy/tun/wfp_leak.go).
+pub const TUN_LEAK_WINDNS_CLIENT: &str = "windnsclient";
+
+/// The `dns` spelling of `autoSystemWfpBlockLeak`: an alias the core expands
+/// into [`DNS_LEAK_ENTRIES`] before it matches, so it names no entry of its
+/// own.
+pub const DNS_LEAK_ALIAS: &str = "dns";
+
+/// What `dns` in `autoSystemWfpBlockLeak` stands for, in the core's order
+/// (`dnsLeaks`, proxy/tun/wfp_leak.go): DNS over UDP and TCP, Windows' DNS
+/// Client service — which may also use other protocols and ports — and DNS
+/// over TLS and QUIC.
+pub const DNS_LEAK_ENTRIES: [&str; 5] = [
+    "udp/53",
+    "tcp/53",
+    TUN_LEAK_WINDNS_CLIENT,
+    "tcp/853",
+    "udp/853",
+];
+
+/// The entries `dns` stands for, spelled the way a message names them, so a
+/// tag that widens the alias cannot leave a sentence naming the old set.
+pub static DNS_LEAK_ENTRY_LIST: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| DNS_LEAK_ENTRIES.join(", "));
+
+/// The leak-block entries a fresh install runs: everything `dns` stands for,
+/// then the unrouted family. A TUN session keeps the system's DNS and the
+/// unrouted family inside the tunnel until the user removes an entry.
+pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 6] = [
+    DNS_LEAK_ENTRIES[0],
+    DNS_LEAK_ENTRIES[1],
+    DNS_LEAK_ENTRIES[2],
+    DNS_LEAK_ENTRIES[3],
+    DNS_LEAK_ENTRIES[4],
+    TUN_LEAK_MISCONFIG_TUN,
+];
+
+/// One `tcp/<port>` or `udp/<port>` leak entry the core parses: a connection
+/// to that port may only go through the TUN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeakPort {
+    tcp: bool,
+    port: u16,
+}
+
+impl LeakPort {
+    /// The protocol token the core matches, `tcp` or `udp`.
+    pub fn protocol(self) -> &'static str {
+        if self.tcp { "tcp" } else { "udp" }
+    }
+
+    /// The port the filter blocks.
+    pub fn port(self) -> u16 {
+        self.port
+    }
+}
+
+/// The core's spelling of the value, `tcp/<port>` or `udp/<port>`.
+impl std::fmt::Display for LeakPort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.protocol(), self.port())
+    }
+}
+
+/// Parse one canonical `tcp/<port>` or `udp/<port>` value the way the core
+/// does (`parseLeakPort`, proxy/tun/wfp_leak.go): the protocol token, then a
+/// decimal port in `1..=65535`. Go's `strconv.ParseUint` reads digits only, so
+/// a sign, padding, a second slash or a non-digit anywhere refuses the value.
+fn parse_leak_port(value: &str) -> Option<LeakPort> {
+    let (protocol, digits) = value.split_once('/')?;
+    let tcp = match protocol {
+        "tcp" => true,
+        "udp" => false,
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let port: u16 = digits.parse().ok()?;
+    (port != 0).then_some(LeakPort { tcp, port })
+}
+
+/// The protocol and port of one `tcp/<port>`/`udp/<port>` leak entry, folded
+/// the way the core lowercases it, or `None` for any other spelling. The leak
+/// editor asks this to decide whether an entry renders as a port row; an
+/// unparseable port stays an ordinary value the user can fix as text.
+pub fn leak_port(entry: &str) -> Option<LeakPort> {
+    parse_leak_port(&fold_lower(entry))
+}
+
+/// The lowest port no entry names yet, for the editor's "add a port" button: a
+/// new row that repeated an existing entry would edit the same value twice.
+pub fn next_free_leak_port(entries: &[String]) -> LeakPort {
+    let held: Vec<LeakPort> = entries
+        .iter()
+        .filter_map(|entry| leak_port(entry))
+        .collect();
+    let port = (1..=u16::MAX)
+        .find(|port| held.iter().all(|held| held.port != *port))
+        .unwrap_or(1);
+    LeakPort { tcp: true, port }
+}
+
+/// The canonical form of one leak list, plus whether the `dns` alias was among
+/// its stored spellings: every entry lowercased, the alias replaced by
+/// [`DNS_LEAK_ENTRIES`], a port written without leading zeros, and duplicates
+/// dropped with the first spelling kept and the order preserved — the core's
+/// own expansion (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go). An entry the
+/// core would refuse stays as written, so the validation pass reports it
+/// instead of the load rewriting it away.
+fn canonicalize_leak_block(entries: &[String]) -> (Vec<String>, bool) {
+    let mut canonical: Vec<String> = Vec::with_capacity(entries.len());
+    let mut dns_alias_expanded = false;
+    for entry in entries {
+        let folded = fold_lower(entry);
+        if folded.as_ref() == DNS_LEAK_ALIAS {
+            dns_alias_expanded = true;
+            for leak in DNS_LEAK_ENTRIES {
+                push_unique_leak(&mut canonical, leak);
+            }
+            continue;
+        }
+        match parse_leak_port(&folded) {
+            Some(port) => push_unique_leak(&mut canonical, &port.to_string()),
+            None => push_unique_leak(&mut canonical, &folded),
+        }
+    }
+    (canonical, dns_alias_expanded)
+}
+
+/// Append `entry` unless the list already holds it. Every entry reaching here
+/// is folded already, so an exact comparison is the core's own duplicate
+/// check.
+fn push_unique_leak(list: &mut Vec<String>, entry: &str) {
+    if !list.iter().any(|kept| kept == entry) {
+        list.push(entry.to_string());
+    }
+}
+
+/// Whether one stored leak entry keeps the system's DNS inside the tunnel,
+/// read the way the core reads an expanded list (`BlocksSystemDNS`,
+/// proxy/tun/wfp_leak.go): the alias and the DNS Client service block it, and
+/// so does a port filter on port 53.
+fn leak_entry_blocks_system_dns(entry: &str) -> bool {
+    let folded = fold_lower(entry);
+    let folded = folded.as_ref();
+    folded == DNS_LEAK_ALIAS
+        || folded == TUN_LEAK_WINDNS_CLIENT
+        || parse_leak_port(folded).is_some_and(|port| port.port == 53)
+}
 
 impl Default for TunCfg {
     fn default() -> Self {
@@ -1060,10 +1211,89 @@ impl Default for TunCfg {
             auto_outbounds_interface: "auto".into(),
             auto_system_wfp_block_leak: DEFAULT_TUN_LEAK_BLOCK
                 .iter()
-                .map(|half| (*half).into())
+                .map(|entry| (*entry).into())
                 .collect(),
+            dns_alias_expanded: false,
             auto_system_dns_to_gateway: false,
             extra: Map::new(),
+        }
+    }
+}
+
+/// The stored shape of a TUN block, before the leak-list migration: the raw
+/// list is what tells the load that a `dns` alias was stored, which
+/// [`TunCfg`] would have lost by keeping only the canonical entries.
+/// Field-for-field [`TunCfg`] minus the load-time flag.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct StoredTunCfg {
+    name: String,
+    desc: String,
+    mtu: u32,
+    gateway: Vec<String>,
+    dns: Vec<String>,
+    user_level: Option<u32>,
+    auto_system_routing_table: Vec<String>,
+    auto_outbounds_interface: String,
+    auto_system_wfp_block_leak: Vec<String>,
+    auto_system_dns_to_gateway: bool,
+    sniffing: Sniffing,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Default for StoredTunCfg {
+    /// The fresh-install seed, so a key the stored file omits loads the
+    /// seeded value exactly as [`TunCfg`] did before the split.
+    fn default() -> Self {
+        let seed = TunCfg::default();
+        Self {
+            name: seed.name,
+            desc: seed.desc,
+            mtu: seed.mtu,
+            gateway: seed.gateway,
+            dns: seed.dns,
+            user_level: seed.user_level,
+            auto_system_routing_table: seed.auto_system_routing_table,
+            auto_outbounds_interface: seed.auto_outbounds_interface,
+            auto_system_wfp_block_leak: seed.auto_system_wfp_block_leak,
+            auto_system_dns_to_gateway: seed.auto_system_dns_to_gateway,
+            sniffing: seed.sniffing,
+            extra: seed.extra,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TunCfg {
+    /// Load through the leak-list migration: both a stored profile and a raw
+    /// JSON edit reach the model with the canonical entries, and the alias
+    /// expansion is remembered for the settings pass.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(StoredTunCfg::deserialize(deserializer)?.into())
+    }
+}
+
+impl From<StoredTunCfg> for TunCfg {
+    fn from(stored: StoredTunCfg) -> Self {
+        let (auto_system_wfp_block_leak, dns_alias_expanded) =
+            canonicalize_leak_block(&stored.auto_system_wfp_block_leak);
+        Self {
+            name: stored.name,
+            desc: stored.desc,
+            mtu: stored.mtu,
+            gateway: stored.gateway,
+            dns: stored.dns,
+            user_level: stored.user_level,
+            auto_system_routing_table: stored.auto_system_routing_table,
+            auto_outbounds_interface: stored.auto_outbounds_interface,
+            auto_system_wfp_block_leak,
+            dns_alias_expanded,
+            auto_system_dns_to_gateway: stored.auto_system_dns_to_gateway,
+            sniffing: stored.sniffing,
+            extra: stored.extra,
         }
     }
 }
@@ -1085,28 +1315,49 @@ impl TunCfg {
         }
     }
 
-    /// Whether the leak list carries the DNS half (folded the way the core
-    /// lowercases each entry before it compares).
-    pub fn leak_blocks_dns(&self) -> bool {
+    /// Whether the leak list keeps the system's DNS inside the tunnel — port
+    /// 53 over UDP or TCP, or Windows' DNS Client service, which needs
+    /// resolvers of its own (`BlocksSystemDNS`, proxy/tun/wfp_leak.go). An
+    /// entry is read the way the core reads it: the `dns` alias blocks the
+    /// system's DNS, and a port spelling counts however it is cased or padded
+    /// with zeros.
+    pub fn leak_blocks_system_dns(&self) -> bool {
         self.auto_system_wfp_block_leak
             .iter()
-            .any(|half| fold_eq(half, TUN_LEAK_DNS))
+            .any(|entry| leak_entry_blocks_system_dns(entry))
     }
 
-    /// Whether the leak list carries the unrouted-family half.
+    /// Whether the leak list carries the unrouted-family entry.
     pub fn leak_blocks_misconfig_tun(&self) -> bool {
         self.auto_system_wfp_block_leak
             .iter()
-            .any(|half| fold_eq(half, TUN_LEAK_MISCONFIG_TUN))
+            .any(|entry| fold_eq(entry, TUN_LEAK_MISCONFIG_TUN))
     }
 
-    /// The leak halves folded to the canonical spelling the core stores
-    /// (`strings.ToLower`, infra/conf/tun.go), in the model's own order.
-    pub fn folded_leak_block(&self) -> Vec<String> {
+    /// Whether an in-memory list still carries the `dns` alias — a model
+    /// built by hand rather than loaded. The settings pass warns for it
+    /// exactly as it does for a load that expanded the alias.
+    pub fn leak_holds_dns_alias(&self) -> bool {
         self.auto_system_wfp_block_leak
             .iter()
-            .map(|half| fold_lower(half).into_owned())
-            .collect()
+            .any(|entry| fold_eq(entry, DNS_LEAK_ALIAS))
+    }
+
+    /// Whether this block reached the model with the `dns` alias still
+    /// spelled — a load that expanded it, or a list built in memory that still
+    /// carries it. The one state the settings pass warns about.
+    pub fn leak_alias_migrated(&self) -> bool {
+        self.dns_alias_expanded || self.leak_holds_dns_alias()
+    }
+
+    /// The leak list in the form the core stores and the generator emits
+    /// (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go): every entry lowercased,
+    /// the `dns` alias replaced by [`DNS_LEAK_ENTRIES`], a port written
+    /// without leading zeros, and duplicates dropped in the model's own
+    /// order. An entry the core would refuse stays as written, so validation
+    /// reports it.
+    pub fn canonical_leak_block(&self) -> Vec<String> {
+        canonicalize_leak_block(&self.auto_system_wfp_block_leak).0
     }
 
     /// Wire form of the TUN inbound; `sniffing` lives in the inbound
@@ -1169,7 +1420,8 @@ impl TunCfg {
             // The leak block is emitted by the generator, not here: the key
             // reaches the wire only while the TUN inbound and the DNS module
             // are both present (the predicate `config_runs_tun_dns` reads
-            // back), and the generator adds the folded value under that gate.
+            // back), and the generator adds the canonical value under that
+            // gate.
             o.remove("autoSystemWfpBlockLeak");
         }
         // Built as a map directly: the envelope is an object by construction,
@@ -1186,7 +1438,22 @@ impl TunCfg {
 }
 #[cfg(test)]
 mod tun_tests {
-    use super::{DEFAULT_TUN_NAME, TunCfg};
+    use super::{DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, TunCfg};
+    use serde_json::json;
+
+    /// The seeded list as the stored-file `Vec<String>`.
+    fn seeded_leak_block() -> Vec<String> {
+        DEFAULT_TUN_LEAK_BLOCK
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect()
+    }
+
+    /// Load a TUN block from its stored JSON through the model's own
+    /// deserializer — the path a settings file and a raw edit both take.
+    fn load(value: serde_json::Value) -> TunCfg {
+        serde_json::from_value(value).expect("the fixture must load")
+    }
 
     #[test]
     fn fresh_install_default_routing_table_covers_v4_and_v6() {
@@ -1202,35 +1469,141 @@ mod tun_tests {
     }
 
     #[test]
-    fn fresh_install_leak_block_covers_dns_and_the_unrouted_family() {
-        // Both halves seed on: the deleted app-side filter carried exactly
-        // this policy, and the core installs the same filters inside its own
-        // process.
+    fn fresh_install_leak_block_covers_the_system_dns_and_the_unrouted_family() {
+        // The seed carries every entry `dns` stands for, then the unrouted
+        // family: the core installs exactly these filters inside its own
+        // process, and nothing is left behind an alias a load would expand.
         let tun = TunCfg::default();
-        assert_eq!(
-            tun.auto_system_wfp_block_leak,
-            vec!["dns".to_string(), "misconfigtun".to_string()]
+        assert_eq!(tun.auto_system_wfp_block_leak, seeded_leak_block());
+        assert!(
+            !tun.dns_alias_expanded,
+            "the seed writes the expansion, so no load happened"
         );
-        assert!(tun.leak_blocks_dns());
+        assert!(tun.leak_blocks_system_dns());
         assert!(tun.leak_blocks_misconfig_tun());
         assert!(!tun.auto_system_dns_to_gateway);
     }
 
     #[test]
-    fn leak_halves_fold_like_the_core_lowercases_them() {
-        // The core lowercases each entry before it compares
-        // (infra/conf/tun.go), so a stored mixed-case spelling is the same
-        // half and reaches the wire folded.
-        let tun = TunCfg {
-            auto_system_wfp_block_leak: vec!["DNS".into(), "MisconfigTun".into()],
+    fn a_stored_dns_alias_loads_expanded_and_is_saved_expanded() {
+        // An old profile stores the alias. The load keeps the entries it
+        // stands for — in the core's order — and remembers that it expanded
+        // one, which is what the settings pass warns from.
+        let tun = load(json!({ "autoSystemWfpBlockLeak": ["DNS", "MisconfigTun"] }));
+        assert_eq!(tun.auto_system_wfp_block_leak, seeded_leak_block());
+        assert!(tun.dns_alias_expanded);
+        assert!(tun.leak_blocks_system_dns());
+        assert!(tun.leak_blocks_misconfig_tun());
+
+        let saved = serde_json::to_value(&tun).expect("the loaded block serializes");
+        assert_eq!(saved["autoSystemWfpBlockLeak"], json!(seeded_leak_block()));
+        assert!(
+            saved.get("dnsAliasExpanded").is_none(),
+            "the flag is a load-time fact, never a stored key: {saved}"
+        );
+
+        // The stored spelling an older profile wrote, exactly as it was saved.
+        let legacy = load(json!({ "autoSystemWfpBlockLeak": ["dns", "misconfigtun"] }));
+        assert_eq!(legacy.auto_system_wfp_block_leak, seeded_leak_block());
+        assert!(legacy.dns_alias_expanded);
+    }
+
+    #[test]
+    fn a_port_entry_is_canonicalised_by_the_load() {
+        // The core lowercases the protocol and re-renders the port it parsed,
+        // so a padded or cased spelling is the entry itself.
+        let tun = load(json!({ "autoSystemWfpBlockLeak": ["TCP/053", "udp/853"] }));
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            vec!["tcp/53".to_string(), "udp/853".to_string()]
+        );
+        assert!(
+            !tun.dns_alias_expanded,
+            "a port entry is not the alias, so nothing was expanded"
+        );
+    }
+
+    #[test]
+    fn duplicate_entries_collapse_keeping_the_first_spelling() {
+        // Port forms and an alias that reaches the same entries all fold to
+        // one list: the core drops a value it already holds.
+        let tun = load(json!({
+            "autoSystemWfpBlockLeak": ["udp/53", "UDP/53", "udp/053", "dns"],
+        }));
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            DNS_LEAK_ENTRIES.map(String::from).to_vec()
+        );
+        assert!(tun.dns_alias_expanded);
+    }
+
+    #[test]
+    fn a_port_the_core_refuses_is_kept_for_validation() {
+        // The load must not rewrite a value the core refuses: the settings
+        // pass reports the entry, and the user sees the spelling to fix.
+        let tun = load(json!({
+            "autoSystemWfpBlockLeak": ["tcp/0", "udp/65536", "tcp/x", "bogus"],
+        }));
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            vec![
+                "tcp/0".to_string(),
+                "udp/65536".to_string(),
+                "tcp/x".to_string(),
+                "bogus".to_string()
+            ]
+        );
+        assert!(!tun.dns_alias_expanded);
+    }
+
+    #[test]
+    fn the_system_dns_predicate_mirrors_the_core() {
+        // `BlocksSystemDNS` is true for exactly these three entries; the alias
+        // stands for them, so an in-memory list holding it reads true too.
+        for entry in [
+            DNS_LEAK_ENTRIES[0],
+            DNS_LEAK_ENTRIES[1],
+            DNS_LEAK_ENTRIES[2],
+        ] {
+            let tun = TunCfg {
+                auto_system_wfp_block_leak: vec![entry.to_string()],
+                ..Default::default()
+            };
+            assert!(tun.leak_blocks_system_dns(), "{entry}");
+        }
+        for entry in ["tcp/853", "udp/853", "misconfigtun", "TCP/53", "dns"] {
+            let tun = TunCfg {
+                auto_system_wfp_block_leak: vec![entry.to_string()],
+                ..Default::default()
+            };
+            let expected = matches!(entry, "TCP/53" | "dns");
+            assert_eq!(tun.leak_blocks_system_dns(), expected, "{entry}");
+        }
+        let clear = TunCfg {
+            auto_system_wfp_block_leak: Vec::new(),
             ..Default::default()
         };
-        assert!(tun.leak_blocks_dns());
-        assert!(tun.leak_blocks_misconfig_tun());
-        assert_eq!(
-            tun.folded_leak_block(),
-            vec!["dns".to_string(), "misconfigtun".to_string()]
-        );
+        assert!(!clear.leak_blocks_system_dns());
+    }
+
+    #[test]
+    fn the_canonical_form_is_what_the_generator_emits() {
+        // A model edited in memory reaches the generator through this form:
+        // folded, alias expanded in place, ports without leading zeros,
+        // duplicates gone, order kept, and a value the core refuses kept as
+        // written.
+        let tun = TunCfg {
+            auto_system_wfp_block_leak: vec![
+                "DNS".into(),
+                "TCP/053".into(),
+                "UDP/53".into(),
+                "Bogus".into(),
+            ],
+            ..Default::default()
+        };
+        let mut expected: Vec<String> = DNS_LEAK_ENTRIES.map(String::from).to_vec();
+        expected.push("bogus".into());
+        assert_eq!(tun.canonical_leak_block(), expected);
     }
 
     #[test]

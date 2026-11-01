@@ -10,10 +10,13 @@ use super::{
 };
 use crate::model::dns::parse_pool_cidr;
 use crate::model::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
-    LocalInboundProtocol, TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN, listen_endpoints_conflict,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_LEAK_ALIAS, DokodemoNetwork,
+    LocalInboundCfg, LocalInboundProtocol, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT,
+    leak_port, listen_endpoints_conflict,
 };
-use crate::model::{ServerProfile, ServersFile, Settings, TunCfg, emit, vocabulary_holds};
+use crate::model::{
+    ServerProfile, ServersFile, Settings, TunCfg, emit, fold_lower, vocabulary_holds,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Validate a listen address: always a concrete IP literal.
@@ -356,7 +359,7 @@ fn settings_extra_shadow(
 }
 
 /// True when the emitted document carries the leak block without the
-/// unrouted-family half — the state [`ValidationCode::TunLeakMisconfigTunOff`]
+/// unrouted-family entry — the state [`ValidationCode::TunLeakMisconfigTunOff`]
 /// reports. The generator writes the key only while the TUN inbound and the
 /// DNS module are both present (`emit::dns_inbound_emitted`), so this is the
 /// exact predicate the settings pass judges.
@@ -978,29 +981,65 @@ impl<'a> SettingsWalk<'a> {
         // side of the `config_runs_tun_dns` predicate the runtime reads back),
         // so these rules judge the same document the core will load. The
         // routing-table and value rules mirror refusals the app's wire can really
-        // hit; the dns half needs no check here — the generator overwrites the
-        // TUN inbound's resolver list with the in-tun gateway on the same gate
-        // (`gen::inbounds`), so the core's `len(v.DNS) == 0` refusal is satisfied
-        // structurally. The block is also the only mechanism that now keeps DNS
-        // and the unrouted family inside the tunnel, so a half switched off warns
-        // with what reopens.
+        // hit; the generator overwrites the TUN inbound's resolver list with the
+        // in-tun gateway on the same gate (`gen::inbounds`), so the core's
+        // `len(v.DNS) == 0` refusal is satisfied structurally. The block is also
+        // the only mechanism that now keeps the system's DNS and the unrouted
+        // family inside the tunnel, so a list without those entries warns with
+        // what reopens.
         if emit::dns_inbound_emitted(self.settings) {
-            let leak = &self.settings.tun.auto_system_wfp_block_leak;
-            if !leak.is_empty() && self.settings.tun.auto_system_routing_table.is_empty() {
+            let tun = &self.settings.tun;
+            let leak = &tun.auto_system_wfp_block_leak;
+            if !leak.is_empty() && tun.auto_system_routing_table.is_empty() {
                 self.issues.push(
                     issue(ValidationCode::TunLeakRoutingTableRequired, None).at(FindingTarget::Tun),
                 );
             }
             for (index, value) in leak.iter().enumerate() {
-                if !vocabulary_holds(&[TUN_LEAK_DNS, TUN_LEAK_MISCONFIG_TUN], value) {
+                // The core's whole vocabulary, folded the way it lowercases
+                // each entry before it matches (`ExpandWfpBlockLeak`,
+                // proxy/tun/wfp_leak.go): the `dns` alias it expands, the two
+                // named entries, and a port filter. A port filter is only
+                // accepted when the port is one `parseLeakPort` reads, so a
+                // `tcp/` entry the core would refuse is reported as such
+                // rather than as an unknown value.
+                let folded = fold_lower(value);
+                let code = if vocabulary_holds(
+                    &[
+                        DNS_LEAK_ALIAS,
+                        TUN_LEAK_WINDNS_CLIENT,
+                        TUN_LEAK_MISCONFIG_TUN,
+                    ],
+                    value,
+                ) {
+                    None
+                } else if folded.starts_with("tcp/") || folded.starts_with("udp/") {
+                    leak_port(value)
+                        .is_none()
+                        .then(|| ValidationCode::TunLeakPortInvalid(excerpt(value)))
+                } else {
+                    Some(ValidationCode::TunLeakValueUnknown(excerpt(value)))
+                };
+                if let Some(code) = code {
                     self.issues.push(
-                        issue(
-                            ValidationCode::TunLeakValueUnknown(excerpt(value)),
-                            Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
-                        )
-                        .at(FindingTarget::Tun),
+                        issue(code, Some(format!("tun.autoSystemWfpBlockLeak[{index}]")))
+                            .at(FindingTarget::Tun),
                     );
                 }
+            }
+            // The alias is the core's own value, so the load expands it and
+            // the save writes the entries it stands for. The advisory names
+            // the migration for the one session that still sees it, whether
+            // the load performed it or a hand-built model still holds the
+            // spelling.
+            if tun.leak_alias_migrated() {
+                self.issues.push(
+                    warning(
+                        ValidationCode::TunLeakDnsAliasExpanded,
+                        Some("tun.autoSystemWfpBlockLeak".into()),
+                    )
+                    .at(FindingTarget::Tun),
+                );
             }
             if tun_leak_misconfig_tun_off(self.settings) {
                 self.issues.push(

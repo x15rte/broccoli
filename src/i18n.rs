@@ -134,6 +134,7 @@
 
 use std::fmt::Write as _;
 
+use crate::model::inbound::DNS_LEAK_ENTRY_LIST;
 use crate::model::safety::{HazardClass, SafetyCode};
 use crate::model::settings::Language;
 use crate::model::stream::Network;
@@ -480,8 +481,10 @@ keys! {
     TunDnsTakeoverLabel 0,
     TunDnsTakeoverNote 0,
     TunDnsTakeoverOffWarning 0,
-    TunLeakDnsLabel 0,
-    TunLeakDnsNote 0,
+    TunLeakEntriesHint 1,
+    TunLeakAddPort 0,
+    TunLeakWindnsClientLabel 0,
+    TunLeakWindnsClientNote 0,
     TunLeakMisconfigLabel 0,
     TunLeakMisconfigNote 0,
     TunLeakInstallFailed 1,
@@ -1360,8 +1363,16 @@ keys! {
     SrvXdriveFolderLocalHint 0,
     SrvXdriveFolderDriveHint 0,
     SrvXdriveFolderTemplateHint 0,
+    SrvXdriveFolderS3Hint 0,
     SrvXdriveSecrets 0,
     SrvXdriveSecretsOrder 0,
+    SrvXdriveSecretsOrderS3 0,
+    SrvXdriveS3Section 0,
+    SrvXdriveS3Endpoint 0,
+    SrvXdriveS3Region 0,
+    SrvXdriveS3Bucket 0,
+    SrvXdriveS3PathStyle 0,
+    SrvXdriveS3PathStyleNote 0,
     SrvXdriveSegmentBytes 0,
     SrvXdriveFlushInterval 0,
     SrvXdrivePollInterval 0,
@@ -1395,6 +1406,14 @@ keys! {
     SrvXdriveDriveSecrets 0,
     SrvXdriveTemplateObject 0,
     SrvXdriveRemoteFolderRequired 0,
+    SrvXdriveS3ObjectRequired 0,
+    SrvXdriveS3EndpointInvalid 0,
+    SrvXdriveS3RegionInvalid 0,
+    SrvXdriveS3BucketInvalid 0,
+    SrvXdriveS3RemoteFolderInvalid 0,
+    SrvXdriveS3SecretsInvalid 0,
+    SrvXdriveS3RegionEmpty 0,
+    SrvXdriveS3EndpointNotHttps 0,
     SrvXdriveOperationUrl 1,
     SrvXdriveNamesRegexInvalid 0,
     SrvXdriveAuthTypeUnsupported 1,
@@ -1831,6 +1850,8 @@ keys! {
     SettingsTunGatewayInvalid 1,
     SettingsTunLeakRoutingTableRequired 0,
     SettingsTunLeakValueUnknown 1,
+    SettingsTunLeakPortInvalid 1,
+    SettingsTunLeakDnsAliasExpanded 1,
     SettingsTunLeakMisconfigTunOff 0,
     SettingsListenerConflict 4,
     SettingsRoutingRuleTarget 2,
@@ -2673,6 +2694,14 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         XdriveDriveSecretsInvalid => (Key::SrvXdriveDriveSecrets, Vec::new()),
         XdriveTemplateMissing => (Key::SrvXdriveTemplateObject, Vec::new()),
         XdriveRemoteFolderRequired => (Key::SrvXdriveRemoteFolderRequired, Vec::new()),
+        XdriveS3ObjectRequired => (Key::SrvXdriveS3ObjectRequired, Vec::new()),
+        XdriveS3EndpointInvalid => (Key::SrvXdriveS3EndpointInvalid, Vec::new()),
+        XdriveS3RegionInvalid => (Key::SrvXdriveS3RegionInvalid, Vec::new()),
+        XdriveS3BucketInvalid => (Key::SrvXdriveS3BucketInvalid, Vec::new()),
+        XdriveS3RemoteFolderInvalid => (Key::SrvXdriveS3RemoteFolderInvalid, Vec::new()),
+        XdriveS3SecretsInvalid => (Key::SrvXdriveS3SecretsInvalid, Vec::new()),
+        XdriveS3RegionEmpty => (Key::SrvXdriveS3RegionEmpty, Vec::new()),
+        XdriveS3EndpointNotHttps => (Key::SrvXdriveS3EndpointNotHttps, Vec::new()),
         XdriveTemplateOperationUrlRequired(arg) => (Key::SrvXdriveOperationUrl, vec![Text(arg)]),
         XdriveTemplateNamesRegexInvalid => (Key::SrvXdriveNamesRegexInvalid, Vec::new()),
         XdriveTemplateAuthTypeUnsupported(arg) => {
@@ -2954,6 +2983,11 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         TunGatewayInvalid(arg) => (Key::SettingsTunGatewayInvalid, vec![Text(arg)]),
         TunLeakRoutingTableRequired => (Key::SettingsTunLeakRoutingTableRequired, Vec::new()),
         TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![Text(arg)]),
+        TunLeakPortInvalid(arg) => (Key::SettingsTunLeakPortInvalid, vec![Text(arg)]),
+        TunLeakDnsAliasExpanded => (
+            Key::SettingsTunLeakDnsAliasExpanded,
+            vec![Text(&DNS_LEAK_ENTRY_LIST)],
+        ),
         TunLeakMisconfigTunOff => (Key::SettingsTunLeakMisconfigTunOff, Vec::new()),
         ListenerConflict(current, other, address, port) => (
             Key::SettingsListenerConflict,
@@ -3386,14 +3420,20 @@ mod en {
                 "With the DNS leak block on, turning this off can make DNS slow. Name lookups may \
                  wait about ten seconds on other adapters' blocked resolvers."
             }
-            Key::TunLeakDnsLabel => "keep DNS inside the tunnel",
-            Key::TunLeakDnsNote => {
-                "The core permits DNS only through the tunnel. Set the resolvers on the DNS tab."
+            Key::TunLeakEntriesHint => {
+                "The core drops traffic to these ports outside the tunnel. dns stands for {}, \
+                 and a profile saves those entries."
+            }
+            Key::TunLeakAddPort => "Add a port",
+            Key::TunLeakWindnsClientLabel => "keep the DNS Client service inside the tunnel",
+            Key::TunLeakWindnsClientNote => {
+                "Blocks the DNS Client service's own queries, which can bypass a port-53 filter on \
+                 a build that permits DoH or DoT."
             }
             Key::TunLeakMisconfigLabel => "keep the unrouted family inside the tunnel",
             Key::TunLeakMisconfigNote => {
                 "The core drops an address family the routing table does not route into the \
-                 tunnel. The family half needs a routing table."
+                 tunnel. The unrouted family needs a routing table."
             }
             Key::TunLeakInstallFailed => "The core could not install the leak block: {}",
             Key::TunLeakInstallRemedy => "Turn the leak block off and retry",
@@ -4599,8 +4639,21 @@ mod en {
             Key::SrvXdriveFolderLocalHint => "A path on this machine",
             Key::SrvXdriveFolderDriveHint => "A Google Drive folder id",
             Key::SrvXdriveFolderTemplateHint => "A folder token for the template",
+            Key::SrvXdriveFolderS3Hint => "A prefix inside the bucket",
             Key::SrvXdriveSecrets => "Secrets",
             Key::SrvXdriveSecretsOrder => "Order: client ID, client secret, refresh token",
+            Key::SrvXdriveSecretsOrderS3 => {
+                "Order: access key ID, secret access key, optionally session token"
+            }
+            Key::SrvXdriveS3Section => "Amazon S3",
+            Key::SrvXdriveS3Endpoint => "Endpoint",
+            Key::SrvXdriveS3Region => "Signing region",
+            Key::SrvXdriveS3Bucket => "Bucket",
+            Key::SrvXdriveS3PathStyle => "Address the bucket in the path",
+            Key::SrvXdriveS3PathStyleNote => {
+                "Path-style puts the bucket in the URL path. Turning it off puts the bucket in \
+                 the host name, which needs a DNS endpoint and a DNS-compatible bucket name."
+            }
             Key::SrvXdriveSegmentBytes => "Segment bytes",
             Key::SrvXdriveFlushInterval => "Flush interval (ms)",
             Key::SrvXdrivePollInterval => "Poll interval (ms)",
@@ -4636,6 +4689,34 @@ mod en {
             }
             Key::SrvXdriveTemplateObject => r#"The template service needs a "template" object"#,
             Key::SrvXdriveRemoteFolderRequired => "A remote folder is required",
+            Key::SrvXdriveS3ObjectRequired => r#"The s3 service needs an "s3" object"#,
+            Key::SrvXdriveS3EndpointInvalid => {
+                "The s3 endpoint must be an http or https URL with a host, and no credentials, \
+                 query or fragment"
+            }
+            Key::SrvXdriveS3RegionInvalid => {
+                "The s3 signing region must be one header-safe token, without a slash, comma, \
+                 space or tab"
+            }
+            Key::SrvXdriveS3BucketInvalid => {
+                "The s3 bucket name is not valid for the addressing style the profile uses"
+            }
+            Key::SrvXdriveS3RemoteFolderInvalid => {
+                "The s3 remote folder must be a relative prefix without empty, single-dot or \
+                 double-dot components"
+            }
+            Key::SrvXdriveS3SecretsInvalid => {
+                "The s3 backend needs an access key ID and a secret access key, and at most one \
+                 session token"
+            }
+            Key::SrvXdriveS3RegionEmpty => {
+                "The signing region is empty, so requests are signed for us-east-1. Set the \
+                 region the bucket lives in."
+            }
+            Key::SrvXdriveS3EndpointNotHttps => {
+                "The endpoint uses http, so the request and its signing secrets travel in \
+                 cleartext."
+            }
             Key::SrvXdriveOperationUrl => "The {} operation needs a URL",
             Key::SrvXdriveNamesRegexInvalid => "The list name pattern needs one capture group",
             Key::SrvXdriveAuthTypeUnsupported => "Unsupported template authorization type {}",
@@ -5449,6 +5530,13 @@ mod en {
             }
             Key::SettingsTunLeakValueUnknown => {
                 "Leak block value {} is unknown. The core refuses to load the configuration."
+            }
+            Key::SettingsTunLeakPortInvalid => {
+                "Leak block entry {} is not a port the core accepts. Use tcp with a port from 1 \
+                 to 65535, or udp with a port from 1 to 65535."
+            }
+            Key::SettingsTunLeakDnsAliasExpanded => {
+                "The dns value was expanded to {}. The profile saves the expanded entries."
             }
             Key::SettingsTunLeakMisconfigTunOff => {
                 "The unrouted address family is not blocked. A family without a route into the \

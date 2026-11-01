@@ -25,9 +25,10 @@ use crate::model::outbound::{
 use crate::model::stream::{
     Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
-    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3,
     XDRIVE_SERVICE_TEMPLATE, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate,
-    xdrive_names_regex_supported, xdrive_service_supported, xdrive_template_auth_type_supported,
+    XdriveTransport, xdrive_folder_required, xdrive_names_regex_supported,
+    xdrive_service_supported, xdrive_template_auth_type_supported,
 };
 use crate::model::{fold_eq, fold_lower, go_std_base64_decodes, parse_range_go, vocabulary_holds};
 use base64::Engine as _;
@@ -329,10 +330,11 @@ fn masque_header_name_supported(name: &str) -> bool {
         })
 }
 
-/// True when one `masqueSettings.headers` value is a valid HTTP field value
-/// (the core's `httpguts.ValidHeaderFieldValue`): no control byte other than
-/// the two line whitespace characters, and no DEL.
-fn masque_header_value_supported(value: &str) -> bool {
+/// True when one value is a valid HTTP field value (the core's
+/// `httpguts.ValidHeaderFieldValue`): no control byte other than the two line
+/// whitespace characters, and no DEL. MASQUE header values and the S3 signing
+/// values the core sends as headers are judged by it.
+fn header_value_supported(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| (byte >= b' ' || byte == b'\t') && byte != 0x7f)
@@ -568,7 +570,7 @@ pub(super) fn validate_masque_stream(stream: &StreamModel, issues: &mut Vec<Vali
             let Some(value) = value.as_str() else {
                 continue;
             };
-            if !masque_header_name_supported(name) || !masque_header_value_supported(value) {
+            if !masque_header_name_supported(name) || !header_value_supported(value) {
                 issues.push(issue(
                     ValidationCode::MasqueHeaderInvalid(excerpt(name)),
                     Some("stream.masqueSettings.headers".into()),
@@ -643,6 +645,15 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
             Some("stream.xdriveSettings.service".into()),
         ));
     }
+    // The folder is required by every service that writes to a place the
+    // profile names, so one rule covers them and the per-service arms below
+    // judge only what each storage adds (a folder id, a prefix, credentials).
+    if xdrive_folder_required(&xdrive.service) && xdrive.remote_folder.is_empty() {
+        issues.push(issue(
+            ValidationCode::XdriveRemoteFolderRequired,
+            Some("stream.xdriveSettings.remoteFolder".into()),
+        ));
+    }
     match xdrive.service.as_str() {
         XDRIVE_SERVICE_DRIVE | XDRIVE_SERVICE_DRIVE_RETIRED => {
             if xdrive.secrets.len() != 3 || xdrive.secrets.iter().any(String::is_empty) {
@@ -651,21 +662,8 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
                     Some("stream.xdriveSettings.secrets".into()),
                 ));
             }
-            if xdrive.remote_folder.is_empty() {
-                issues.push(issue(
-                    ValidationCode::XdriveRemoteFolderRequired,
-                    Some("stream.xdriveSettings.remoteFolder".into()),
-                ));
-            }
         }
-        XDRIVE_SERVICE_LOCAL => {
-            if xdrive.remote_folder.is_empty() {
-                issues.push(issue(
-                    ValidationCode::XdriveRemoteFolderRequired,
-                    Some("stream.xdriveSettings.remoteFolder".into()),
-                ));
-            }
-        }
+        XDRIVE_SERVICE_LOCAL => {}
         XDRIVE_SERVICE_TEMPLATE => match xdrive.template.as_ref() {
             None => issues.push(issue(
                 ValidationCode::XdriveTemplateMissing,
@@ -673,6 +671,7 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
             )),
             Some(template) => validate_xdrive_template(template, issues),
         },
+        XDRIVE_SERVICE_S3 => validate_xdrive_s3(xdrive, issues),
         _ => {}
     }
     // The XMUX block the transport carries is the same one XHTTP carries, and
@@ -806,6 +805,199 @@ fn validate_xdrive_template(template: &XdriveTemplate, issues: &mut Vec<Validati
             Some("stream.xdriveSettings.template.concurrency".into()),
         ));
     }
+}
+
+/// The `s3` backend's rules (`ValidateS3Config`,
+/// transport/internet/xdrive/s3.go:49-90), on the transport that carries the
+/// block. The rules run in the core's order and stop where the core stops: a
+/// missing block is the conf build's own refusal, so no later rule judges
+/// values the build never reaches. The two advisories cover values the core
+/// loads but the backend then cannot use well — a request signed with the
+/// backend's fallback region, and a cleartext endpoint carrying the signing
+/// secrets.
+fn validate_xdrive_s3(xdrive: &XdriveTransport, issues: &mut Vec<ValidationIssue>) {
+    let Some(s3) = xdrive.s3.as_ref() else {
+        issues.push(issue(
+            ValidationCode::XdriveS3ObjectRequired,
+            Some("stream.xdriveSettings.s3".into()),
+        ));
+        return;
+    };
+    let endpoint = xdrive_s3_endpoint(&s3.endpoint);
+    if endpoint.is_none() {
+        issues.push(issue(
+            ValidationCode::XdriveS3EndpointInvalid,
+            Some("stream.xdriveSettings.s3.endpoint".into()),
+        ));
+    }
+    if endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.scheme() == "http")
+    {
+        issues.push(warning(
+            ValidationCode::XdriveS3EndpointNotHttps,
+            Some("stream.xdriveSettings.s3.endpoint".into()),
+        ));
+    }
+    if !xdrive_s3_region_supported(&s3.region) {
+        issues.push(issue(
+            ValidationCode::XdriveS3RegionInvalid,
+            Some("stream.xdriveSettings.s3.region".into()),
+        ));
+    } else if s3.region.is_empty() {
+        // The core accepts an empty region and the backend signs with its own
+        // `us-east-1` default (`s3Region`, s3.go:42-47), which is rarely the
+        // bucket's region.
+        issues.push(warning(
+            ValidationCode::XdriveS3RegionEmpty,
+            Some("stream.xdriveSettings.s3.region".into()),
+        ));
+    }
+    if !xdrive_s3_bucket_supported(&s3.bucket, s3.path_style(), endpoint.as_ref()) {
+        issues.push(issue(
+            ValidationCode::XdriveS3BucketInvalid,
+            Some("stream.xdriveSettings.s3.bucket".into()),
+        ));
+    }
+    if !xdrive.remote_folder.is_empty() && !xdrive_s3_remote_folder_supported(&xdrive.remote_folder)
+    {
+        issues.push(issue(
+            ValidationCode::XdriveS3RemoteFolderInvalid,
+            Some("stream.xdriveSettings.remoteFolder".into()),
+        ));
+    }
+    if !xdrive_s3_secrets_supported(&xdrive.secrets) {
+        issues.push(issue(
+            ValidationCode::XdriveS3SecretsInvalid,
+            Some("stream.xdriveSettings.secrets".into()),
+        ));
+    }
+}
+
+/// The endpoint the core's `url.Parse` call accepts
+/// (transport/internet/xdrive/s3.go:53-56): an http or https URL with a
+/// host, no credentials, query or fragment, and no opaque form. Go's parser
+/// leaves the host empty for `https:host` and `https:/host`, which this
+/// parser fills in for a special scheme, so the `//` delimiter is checked on
+/// the text, and Go refuses a control byte or surrounding whitespace there
+/// while this parser strips both instead of failing.
+fn xdrive_s3_endpoint(endpoint: &str) -> Option<url::Url> {
+    if endpoint.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        || endpoint
+            .trim_matches(|ch: char| ch == ' ' || ch.is_ascii_control())
+            .len()
+            != endpoint.len()
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(endpoint).ok()?;
+    let scheme = parsed.scheme();
+    // Go's `u.User` is non-nil for an empty userinfo too (`https://@host`),
+    // which the parsed URL cannot tell apart from no userinfo at all, so the
+    // authority text is checked as well.
+    let authority_has_userinfo = endpoint.get(scheme.len() + 3..).is_some_and(|rest| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    });
+    if !matches!(scheme, "http" | "https")
+        || !endpoint
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        || !endpoint
+            .get(scheme.len()..)
+            .is_some_and(|rest| rest.starts_with("://"))
+        || authority_has_userinfo
+        || parsed.host_str().is_none_or(str::is_empty)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed
+            .fragment()
+            .is_some_and(|fragment| !fragment.is_empty())
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// The signing region: one header-safe value with no `/`, `,`, space or tab
+/// — the core's `strings.ContainsAny(region, "/, \t")`
+/// (transport/internet/xdrive/s3.go:58). Empty passes and is warned about
+/// separately.
+fn xdrive_s3_region_supported(region: &str) -> bool {
+    header_value_supported(region)
+        && !region
+            .chars()
+            .any(|ch| matches!(ch, '/' | ',' | ' ' | '\t'))
+}
+
+/// One name in the core's `validS3Name` sense
+/// (transport/internet/xdrive/s3.go:92-104): no control byte, no DEL, no
+/// backslash, and every `/`-separated component non-empty and neither `.`
+/// nor `..`.
+fn xdrive_s3_name_supported(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte >= 0x20 && byte != 0x7f && byte != b'\\')
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// The bucket name the chosen addressing style can carry
+/// (transport/internet/xdrive/s3.go:60-73): every style refuses a `/`;
+/// virtual-hosted addressing (no `pathStyle`) additionally refuses an
+/// endpoint whose host is an IP literal and a name outside `[a-z0-9.-]`,
+/// with `..` or a leading or trailing dot. The endpoint is read only there;
+/// when it does not parse, its own finding covers it and the IP-literal
+/// refusal cannot be decided.
+fn xdrive_s3_bucket_supported(bucket: &str, path_style: bool, endpoint: Option<&url::Url>) -> bool {
+    if !xdrive_s3_name_supported(bucket) || bucket.contains('/') {
+        return false;
+    }
+    if path_style {
+        return true;
+    }
+    let host_is_address = endpoint.is_some_and(|endpoint| {
+        matches!(
+            endpoint.host(),
+            Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))
+        )
+    });
+    !host_is_address
+        && bucket.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+        })
+        && !bucket.contains("..")
+        && !bucket.starts_with('.')
+        && !bucket.ends_with('.')
+}
+
+/// The remote folder as a relative prefix
+/// (transport/internet/xdrive/s3.go:75-77): one trailing `/` is allowed and
+/// the rest must be an S3 name, so `streams/` passes while an empty
+/// component, `.` and `..` are refused. An empty folder is the requiredness
+/// finding, not this one.
+fn xdrive_s3_remote_folder_supported(folder: &str) -> bool {
+    xdrive_s3_name_supported(folder.strip_suffix('/').unwrap_or(folder))
+}
+
+/// The `s3` secrets the backend builds
+/// (transport/internet/xdrive/s3.go:78-89): AccessKeyID and
+/// SecretAccessKey, plus at most one session token; the first two are
+/// non-empty, every value is header-safe, and the access key is one token —
+/// no `/`, space, comma or tab.
+fn xdrive_s3_secrets_supported(secrets: &[String]) -> bool {
+    let [access_key, secret_key, ..] = secrets else {
+        return false;
+    };
+    (2..=3).contains(&secrets.len())
+        && !access_key.is_empty()
+        && !secret_key.is_empty()
+        && secrets.iter().all(|secret| header_value_supported(secret))
+        && !access_key
+            .chars()
+            .any(|ch| matches!(ch, '/' | ' ' | ',' | '\t'))
 }
 
 /// The core's outbound gate for the `xdrive` transport
@@ -1564,8 +1756,8 @@ mod tests {
     use crate::model::stream::{
         FinalmaskModel, FinalmaskNoise, FinalmaskQuicParams, FinalmaskSalamander, FinalmaskUdpMask,
         HttpupgradeSettings, HysteriaTransport, MasqueTransport, MasqueWarp, Security,
-        SockoptModel, TlsModel, WsSettings, XdriveTemplateOp, XdriveTransport, XhttpSettings,
-        XmuxConfig,
+        SockoptModel, TlsModel, WsSettings, XdriveS3, XdriveTemplateOp, XdriveTransport,
+        XhttpSettings, XmuxConfig,
     };
     use crate::model::validation::Severity;
     use crate::model::validation::stream::validate_stream;
@@ -2462,6 +2654,349 @@ mod tests {
         assert_eq!(
             issue.path.as_deref(),
             Some("stream.xdriveSettings.template.get.headers")
+        );
+    }
+
+    /// A complete `s3` backend block the core builds: path-style addressing
+    /// (the loader's default), a signing region, a bucket, a folder prefix and
+    /// the access key pair the backend requires.
+    fn s3_settings() -> XdriveTransport {
+        XdriveTransport {
+            service: super::XDRIVE_SERVICE_S3.into(),
+            remote_folder: "streams/".into(),
+            secrets: vec!["access-key".into(), "secret-key".into()],
+            s3: Some(XdriveS3 {
+                endpoint: "https://s3.example.com".into(),
+                region: "eu-west-1".into(),
+                bucket: "logs".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The `s3` block's verdict after `mutate`.
+    fn s3_verdict(mutate: impl FnOnce(&mut XdriveTransport)) -> Verdict {
+        let mut settings = s3_settings();
+        mutate(&mut settings);
+        validate_outbound(&xdrive_outbound(settings))
+    }
+
+    /// A complete `s3` profile yields no `s3` finding at all: neither a
+    /// refusal nor either advisory.
+    #[test]
+    fn xdrive_s3_complete_profile_is_clean() {
+        let verdict = s3_verdict(|_| {});
+        assert!(!verdict.has_blocking(), "{verdict:#?}");
+        for code in [
+            ValidationCode::XdriveS3ObjectRequired,
+            ValidationCode::XdriveS3EndpointInvalid,
+            ValidationCode::XdriveS3RegionInvalid,
+            ValidationCode::XdriveS3BucketInvalid,
+            ValidationCode::XdriveS3RemoteFolderInvalid,
+            ValidationCode::XdriveS3SecretsInvalid,
+            ValidationCode::XdriveS3RegionEmpty,
+            ValidationCode::XdriveS3EndpointNotHttps,
+        ] {
+            assert!(
+                finding(&verdict, &code).is_none(),
+                "a complete s3 profile yields no {code:?} finding: {verdict:#?}"
+            );
+        }
+    }
+
+    /// The conf build refuses the service without its block, naming the key
+    /// (`service "s3" needs an "s3" object`).
+    #[test]
+    fn xdrive_s3_needs_its_object() {
+        let verdict = s3_verdict(|settings| settings.s3 = None);
+        let issue = finding(&verdict, &ValidationCode::XdriveS3ObjectRequired)
+            .expect("the missing s3 object is refused");
+        assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.s3"));
+        assert_eq!(issue.severity, Severity::Error);
+    }
+
+    /// `ValidateS3Config`'s endpoint rule: an http or https URL with a host
+    /// and no credentials, query or fragment.
+    #[test]
+    fn xdrive_s3_endpoint_must_be_an_http_url_with_a_host() {
+        let set_endpoint = |endpoint: &str| -> Verdict {
+            let endpoint = endpoint.to_string();
+            s3_verdict(move |settings| {
+                settings.s3.as_mut().expect("the block is there").endpoint = endpoint;
+            })
+        };
+        for endpoint in [
+            "",
+            "s3.example.com",
+            "ftp://s3.example.com",
+            "https:example.com",
+            "https:/s3.example.com",
+            "https://user:pass@s3.example.com",
+            "https://@s3.example.com",
+            "https://s3.example.com/?list-type=2",
+            "https://s3.example.com/#frag",
+            " https://s3.example.com",
+            "https://s3.example.com ",
+        ] {
+            let verdict = set_endpoint(endpoint);
+            let issue = finding(&verdict, &ValidationCode::XdriveS3EndpointInvalid)
+                .unwrap_or_else(|| panic!("{endpoint:?} must be refused: {verdict:#?}"));
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("stream.xdriveSettings.s3.endpoint")
+            );
+        }
+        for endpoint in [
+            "https://s3.example.com",
+            "http://127.0.0.1:9000",
+            "https://s3.example.com/base/",
+        ] {
+            let verdict = set_endpoint(endpoint);
+            assert!(
+                finding(&verdict, &ValidationCode::XdriveS3EndpointInvalid).is_none(),
+                "{endpoint:?} is a shape the core parses: {verdict:#?}"
+            );
+        }
+    }
+
+    /// The signing region is one header-safe token: the core refuses any of
+    /// `/`, `,`, space or tab, and a control byte.
+    #[test]
+    fn xdrive_s3_region_must_be_one_header_safe_token() {
+        for region in ["eu/west", "eu,west", "eu west", "eu\twest", "eu\rwest"] {
+            let value = region.to_string();
+            let verdict = s3_verdict(move |settings| {
+                settings.s3.as_mut().expect("the block is there").region = value;
+            });
+            let issue = finding(&verdict, &ValidationCode::XdriveS3RegionInvalid)
+                .unwrap_or_else(|| panic!("{region:?} must be refused: {verdict:#?}"));
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("stream.xdriveSettings.s3.region")
+            );
+        }
+        // A legal region draws neither the refusal nor the empty advisory.
+        let verdict = s3_verdict(|_| {});
+        assert!(finding(&verdict, &ValidationCode::XdriveS3RegionInvalid).is_none());
+        assert!(finding(&verdict, &ValidationCode::XdriveS3RegionEmpty).is_none());
+    }
+
+    /// An empty region loads — the backend signs with its own fallback — so it
+    /// is an advisory, not a refusal.
+    #[test]
+    fn xdrive_s3_empty_region_is_advisory() {
+        let verdict = s3_verdict(|settings| {
+            settings
+                .s3
+                .as_mut()
+                .expect("the block is there")
+                .region
+                .clear();
+        });
+        assert!(!verdict.has_blocking(), "{verdict:#?}");
+        assert!(finding(&verdict, &ValidationCode::XdriveS3RegionInvalid).is_none());
+        let issue = finding(&verdict, &ValidationCode::XdriveS3RegionEmpty)
+            .expect("an empty region is warned about");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.s3.region")
+        );
+    }
+
+    /// The bucket rule of each addressing style: every style refuses a path
+    /// separator and a name `validS3Name` rejects; virtual-hosted addressing
+    /// additionally refuses an address endpoint and a name that is not
+    /// DNS-compatible.
+    #[test]
+    fn xdrive_s3_bucket_follows_the_addressing_style() {
+        let with_bucket = |path_style: Option<bool>, endpoint: &str, bucket: &str| -> Verdict {
+            let endpoint = endpoint.to_string();
+            let bucket = bucket.to_string();
+            s3_verdict(move |settings| {
+                let s3 = settings.s3.as_mut().expect("the block is there");
+                s3.path_style = path_style;
+                s3.endpoint = endpoint;
+                s3.bucket = bucket;
+            })
+        };
+        for (path_style, endpoint, bucket) in [
+            // Every style: a path separator, an empty name and a dot name.
+            (None, "https://s3.example.com", "logs/dir"),
+            (None, "https://s3.example.com", ""),
+            (Some(true), "https://s3.example.com", ".."),
+            // Virtual-hosted addressing puts the bucket in the authority.
+            (Some(false), "https://127.0.0.1:9000", "logs"),
+            (Some(false), "https://[::1]", "logs"),
+            (Some(false), "https://s3.example.com", "Logs"),
+            (Some(false), "https://s3.example.com", "logs..x"),
+            (Some(false), "https://s3.example.com", ".logs"),
+            (Some(false), "https://s3.example.com", "logs."),
+        ] {
+            let verdict = with_bucket(path_style, endpoint, bucket);
+            let issue =
+                finding(&verdict, &ValidationCode::XdriveS3BucketInvalid).unwrap_or_else(|| {
+                    panic!("{bucket:?} at {endpoint:?} must be refused: {verdict:#?}")
+                });
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("stream.xdriveSettings.s3.bucket")
+            );
+        }
+        for (path_style, endpoint, bucket) in [
+            (None, "https://s3.example.com", "any name"),
+            (Some(false), "https://s3.example.com", "logs-2026.bucket"),
+            (Some(true), "https://127.0.0.1:9000", "Logs_1"),
+        ] {
+            let verdict = with_bucket(path_style, endpoint, bucket);
+            assert!(
+                finding(&verdict, &ValidationCode::XdriveS3BucketInvalid).is_none(),
+                "{bucket:?} at {endpoint:?}: {verdict:#?}"
+            );
+        }
+    }
+
+    /// The folder is a relative prefix: one trailing separator is allowed, and
+    /// a component that is empty, `.` or `..` is refused. An empty folder is
+    /// the shared requiredness finding instead.
+    #[test]
+    fn xdrive_s3_folder_must_be_a_relative_prefix() {
+        let with_folder = |folder: &str| -> Verdict {
+            let folder = folder.to_string();
+            s3_verdict(move |settings| settings.remote_folder = folder)
+        };
+        for folder in ["/", "a//b", "./a", "a/../b", "a\\b", "a\u{0}"] {
+            let verdict = with_folder(folder);
+            let issue = finding(&verdict, &ValidationCode::XdriveS3RemoteFolderInvalid)
+                .unwrap_or_else(|| panic!("{folder:?} must be refused: {verdict:#?}"));
+            assert_eq!(
+                issue.path.as_deref(),
+                Some("stream.xdriveSettings.remoteFolder")
+            );
+        }
+        let verdict = with_folder("");
+        assert!(
+            finding(&verdict, &ValidationCode::XdriveRemoteFolderRequired).is_some(),
+            "{verdict:#?}"
+        );
+        assert!(
+            finding(&verdict, &ValidationCode::XdriveS3RemoteFolderInvalid).is_none(),
+            "{verdict:#?}"
+        );
+        for folder in ["streams", "streams/", "a/b/c"] {
+            let verdict = with_folder(folder);
+            assert!(
+                finding(&verdict, &ValidationCode::XdriveS3RemoteFolderInvalid).is_none(),
+                "{folder:?}: {verdict:#?}"
+            );
+            assert!(!verdict.has_blocking(), "{folder:?}: {verdict:#?}");
+        }
+    }
+
+    /// The secrets rule: the access key and the secret access key, plus at
+    /// most one session token; every value header-safe, and the access key one
+    /// token.
+    #[test]
+    fn xdrive_s3_secrets_are_the_access_key_pair() {
+        let with_secrets = |secrets: Vec<String>| -> Verdict {
+            s3_verdict(move |settings| settings.secrets = secrets)
+        };
+        let pair = |first: &str, second: &str| vec![first.to_string(), second.to_string()];
+        for secrets in [
+            vec![],
+            vec!["access-key".to_string()],
+            vec![
+                "access-key".to_string(),
+                "secret-key".to_string(),
+                "token".to_string(),
+                "extra".to_string(),
+            ],
+            pair("", "secret-key"),
+            pair("access-key", ""),
+            pair("access key", "secret-key"),
+            pair("access/key", "secret-key"),
+            pair("access,key", "secret-key"),
+            pair("access\tkey", "secret-key"),
+            pair("access-key", "secret\rkey"),
+        ] {
+            let verdict = with_secrets(secrets.clone());
+            let issue = finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid)
+                .unwrap_or_else(|| panic!("{secrets:?} must be refused: {verdict:#?}"));
+            assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.secrets"));
+        }
+        for secrets in [
+            pair("access-key", "secret-key"),
+            vec![
+                "access-key".to_string(),
+                "secret-key".to_string(),
+                "token".to_string(),
+            ],
+        ] {
+            let verdict = with_secrets(secrets.clone());
+            assert!(
+                finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid).is_none(),
+                "{secrets:?}: {verdict:#?}"
+            );
+            assert!(!verdict.has_blocking(), "{secrets:?}: {verdict:#?}");
+        }
+    }
+
+    /// An `http://` endpoint loads, and the advisory says the signing secrets
+    /// travel in cleartext.
+    #[test]
+    fn xdrive_s3_cleartext_endpoint_is_advisory() {
+        let verdict = s3_verdict(|settings| {
+            settings.s3.as_mut().expect("the block is there").endpoint =
+                "http://s3.example.com".into();
+        });
+        assert!(!verdict.has_blocking(), "{verdict:#?}");
+        assert!(finding(&verdict, &ValidationCode::XdriveS3EndpointInvalid).is_none());
+        let issue = finding(&verdict, &ValidationCode::XdriveS3EndpointNotHttps)
+            .expect("a cleartext endpoint is warned about");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.s3.endpoint")
+        );
+    }
+
+    /// Of the h3 form's two extra refusals, only the UDP-mask rule is Google
+    /// Drive's — it is about the h3 connection that backend gets. The
+    /// congestion refusal covers every service, because the core builds the
+    /// same QUIC connection whichever storage sits behind it.
+    #[test]
+    fn the_h3_mask_rule_is_drive_only_and_the_congestion_rule_is_not() {
+        let mut outbound = xdrive_outbound(s3_settings());
+        outbound.stream.security = Security::Tls;
+        outbound.stream.tls_settings = Some(TlsModel {
+            server_name: "s3.example.com".into(),
+            alpn: vec!["h3".into()],
+            ..Default::default()
+        });
+        outbound.stream.finalmask = Some(FinalmaskModel {
+            udp: vec![FinalmaskUdpMask::Salamander {
+                settings: FinalmaskSalamander::default(),
+                extra: Default::default(),
+            }],
+            quic_params: Some(FinalmaskQuicParams {
+                congestion: "brutal".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let verdict = validate_outbound(&outbound);
+        assert!(
+            finding(
+                &verdict,
+                &ValidationCode::XdriveH3MaskNotNoise("salamander".into())
+            )
+            .is_none(),
+            "{verdict:#?}"
+        );
+        assert!(
+            finding(&verdict, &ValidationCode::XdriveH3CongestionBrutal).is_some(),
+            "{verdict:#?}"
         );
     }
 
