@@ -393,6 +393,7 @@ keys! {
     TrayTooltipStopped 0,
     TopbarMode 1,
     TopbarActiveServer 1,
+    TopbarActiveBalancer 1,
     TopbarCoreNotInstalled 0,
     TopbarChangesPending 0,
     TopbarServerEditsUnsaved 0,
@@ -503,6 +504,7 @@ keys! {
     DashboardTunHoverElevated 0,
     DashboardTunHoverNotElevated 0,
     DashboardActiveServer 0,
+    DashboardBalancerScriptGated 0,
     NoneSelected 0,
     DashboardRateUp 1,
     DashboardRateDown 1,
@@ -831,7 +833,6 @@ keys! {
     RenameUpdateRules 0,
     TagUniqueHint 0,
     Selectors 0,
-    SelectorsHint 0,
     SelectorRequired 0,
     SelectAllServers 0,
     StrategyLabel 0,
@@ -918,6 +919,7 @@ keys! {
     RuleSummaryIn 1,
     RuleSummaryProc 1,
     RuleSummaryMatchAll 0,
+    RuleSummaryNoConditions 0,
     RuleTargetBalancer 1,
     // Settings screen.
     SettingsAppearance 0,
@@ -1768,6 +1770,7 @@ keys! {
     TrialRuleAddedUnlisted 0,
     TrialRuleCodeUnknown 1,
     TrialRulesPending 0,
+    TrialRulesActiveBalancer 0,
     TrialRulesRefresh 0,
     TopbarTrialRules 1,
     // Dashboard: traffic units + session totals.
@@ -1831,6 +1834,8 @@ keys! {
     SettingsTunLeakMisconfigTunOff 0,
     SettingsListenerConflict 4,
     SettingsRoutingRuleTarget 2,
+    SettingsRoutingRuleNoMatchers 1,
+    SettingsRoutingActiveBalancerMissing 1,
     SettingsRoutingRuleOutboundMissing 2,
     SettingsRoutingRuleBalancerMissing 2,
     SettingsRoutingRuleInboundMissing 2,
@@ -1858,6 +1863,7 @@ keys! {
     SettingsDnsScriptFallbackConflict 0,
     SettingsDnsScriptServerConflict 2,
     SettingsRoutingScriptRulesConflict 0,
+    SettingsRoutingScriptBalancerConflict 0,
     SettingsRoutingScriptStrategyConflict 0,
     SettingsFakeDnsPoolCidrInvalid 1,
     SettingsFakeDnsPoolSizeInvalid 1,
@@ -2118,6 +2124,7 @@ keys! {
     IntegrityBalancerTagEmpty 0,
     IntegrityBalancerTagDuplicate 1,
     IntegrityBalancerReferenced 2,
+    IntegrityBalancerIsActive 0,
     IntegrityRuleTargetRequired 0,
     IntegrityRuleTargetExclusive 0,
     IntegrityRouteTargetRequired 0,
@@ -2961,6 +2968,10 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
             Key::SettingsRoutingRuleTarget,
             vec![Count(*index), Text(error)],
         ),
+        RoutingRuleNoMatchers(index) => (Key::SettingsRoutingRuleNoMatchers, vec![Count(*index)]),
+        RoutingActiveBalancerMissing(tag) => {
+            (Key::SettingsRoutingActiveBalancerMissing, vec![Quoted(tag)])
+        }
         RoutingRuleOutboundMissing(index, tag) => (
             Key::SettingsRoutingRuleOutboundMissing,
             vec![Count(*index), Quoted(tag)],
@@ -2992,6 +3003,7 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
             vec![Count(*index), Text(field)],
         ),
         RoutingScriptRulesConflict => (Key::SettingsRoutingScriptRulesConflict, Vec::new()),
+        RoutingScriptBalancerConflict => (Key::SettingsRoutingScriptBalancerConflict, Vec::new()),
         RoutingScriptStrategyConflict => (Key::SettingsRoutingScriptStrategyConflict, Vec::new()),
         FakeDnsPoolCidrInvalid(index) => (Key::SettingsFakeDnsPoolCidrInvalid, vec![Count(*index)]),
         FakeDnsPoolSizeInvalid(index) => (Key::SettingsFakeDnsPoolSizeInvalid, vec![Count(*index)]),
@@ -3240,6 +3252,7 @@ mod en {
             Key::TrayTooltipStopped => "broccoli — Stopped",
             Key::TopbarMode => "mode: {}",
             Key::TopbarActiveServer => "server: {}",
+            Key::TopbarActiveBalancer => "balancer: {}",
             Key::TopbarCoreNotInstalled => "Xray core not installed",
             Key::TopbarChangesPending => "changes pending",
             Key::TopbarServerEditsUnsaved => "Server edits not saved",
@@ -3407,6 +3420,9 @@ mod en {
                 "Routes all traffic. Starts the elevated helper (one UAC prompt)."
             }
             Key::DashboardActiveServer => "Active server:",
+            Key::DashboardBalancerScriptGated => {
+                "A routing script owns every route, so an active balancer has no effect."
+            }
             Key::NoneSelected => "(none)",
             Key::DashboardRateUp => "↑ {}/s",
             Key::DashboardRateDown => "↓ {}/s",
@@ -3840,7 +3856,6 @@ mod en {
             Key::RenameUpdateRules => "Rename and update rules",
             Key::TagUniqueHint => "Enter a unique tag different from the current balancer tag",
             Key::Selectors => "Selectors",
-            Key::SelectorsHint => "srv- matches outbound tags by prefix",
             Key::SelectorRequired => "at least one outbound selector is required",
             Key::SelectAllServers => "Select all servers",
             Key::StrategyLabel => "Strategy",
@@ -3894,7 +3909,9 @@ mod en {
                 "Xray's own probe cadence. The app reads the status every five seconds."
             }
             Key::SubjectSelectors => "Subject selectors",
-            Key::SubjectSelectorsHint => "srv- prefix or exact outbound tag",
+            Key::SubjectSelectorsHint => {
+                "Pick the outbounds to observe. An empty list observes nothing."
+            }
             Key::ProbeUrl => "Probe URL",
             Key::EnableConcurrency => "Enable concurrency",
             Key::BurstObservatory => "Burst observatory (health ping)",
@@ -3954,6 +3971,7 @@ mod en {
             Key::RuleSummaryIn => "in: {}",
             Key::RuleSummaryProc => "proc: {}",
             Key::RuleSummaryMatchAll => "match all",
+            Key::RuleSummaryNoConditions => "no match conditions (the core refuses this rule)",
             Key::RuleTargetBalancer => "⚖ {}",
             // Settings screen.
             Key::SettingsAppearance => "Appearance",
@@ -5304,6 +5322,10 @@ mod en {
             }
             Key::TrialRuleCodeUnknown => "The app found no code {} in the geo data.",
             Key::TrialRulesPending => "applying…",
+            Key::TrialRulesActiveBalancer => {
+                "An active balancer owns the default route, so a trial rule would never match. \
+                 Choose an active server first."
+            }
             Key::TrialRulesRefresh => "Refresh",
             Key::TopbarTrialRules => "trial rules: {} active",
             // Dashboard: traffic units + session totals.
@@ -5434,6 +5456,11 @@ mod en {
             }
             Key::SettingsListenerConflict => "{} conflicts with {} on {}:{}",
             Key::SettingsRoutingRuleTarget => "routing rule {}: {}",
+            Key::SettingsRoutingRuleNoMatchers => {
+                "routing rule {} has no match conditions. The core refuses such a rule when \
+                 the configuration loads."
+            }
+            Key::SettingsRoutingActiveBalancerMissing => "the active balancer {} is not configured",
             Key::SettingsRoutingRuleOutboundMissing => {
                 "routing rule {} references missing outbound {}"
             }
@@ -5487,6 +5514,10 @@ mod en {
             Key::SettingsRoutingScriptRulesConflict => {
                 "A routing script cannot be combined with routing rules. Remove the rules \
                  or turn the script off. The app never drops them for you."
+            }
+            Key::SettingsRoutingScriptBalancerConflict => {
+                "A routing script cannot be combined with an active balancer. Choose an active \
+                 server or turn the script off."
             }
             Key::SettingsRoutingScriptStrategyConflict => {
                 "A routing script cannot be combined with a domain strategy. Set the \
@@ -5960,6 +5991,9 @@ mod en {
             Key::IntegrityBalancerTagEmpty => "The balancer tag is required.",
             Key::IntegrityBalancerTagDuplicate => "The balancer tag {} is already in use.",
             Key::IntegrityBalancerReferenced => "The balancer {} is used by {} routing rule(s).",
+            Key::IntegrityBalancerIsActive => {
+                "This balancer is the active route. Choose another active server first."
+            }
             Key::IntegrityRuleTargetRequired => "Choose an outbound or balancer target.",
             Key::IntegrityRuleTargetExclusive => {
                 "A rule cannot target both an outbound and a balancer."

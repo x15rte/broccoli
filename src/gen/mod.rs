@@ -959,8 +959,8 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &emit::Emission) -> Vec<Value>
     }
     // Private destinations stay on the machine by default: LAN peers,
     // loopback, link-local, and multicast (SSDP, mDNS) never travel through
-    // the tunnel. Last, after the user's rules, so an explicit rule can still
-    // send a private range (a remote LAN behind the proxy) through it. The
+    // the tunnel. After the user's rules, so an explicit rule can still send
+    // a private range (a remote LAN behind the proxy) through it. The
     // DNS interception above owns port 53 while its switch is on. Two rules
     // because a rule's conditions are ANDed: an IP target matches the first,
     // a sniffed hostname matches the second. builtin.private_direct turns the
@@ -975,6 +975,18 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &emit::Emission) -> Vec<Value>
         rules.push(json!({
             "domain": PRIVATE_DOMAINS,
             "outboundTag": DIRECT_OUTBOUND_TAG,
+        }));
+    }
+    // The Dashboard's active balancer is the default route, expressed as a
+    // rule: Xray has no default-balancer setting, and an unmatched flow falls
+    // to the first outbound. It follows the private fallback so LAN traffic
+    // stays direct, and it carries the widest condition a rule can have —
+    // `network: tcp,udp` — because the core refuses a rule with no matcher
+    // ("this rule has no effective fields", app/router/config.go).
+    if !cfg.active_balancer.is_empty() {
+        rules.push(json!({
+            "network": "tcp,udp",
+            "balancerTag": cfg.active_balancer,
         }));
     }
     rules

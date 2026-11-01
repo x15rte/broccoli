@@ -91,6 +91,10 @@ pub(crate) struct UiTestRig {
     /// the phase (see `CoreEvt::State`).
     pub(crate) transport: Option<crate::rt::CoreTransport>,
     pub(crate) connect_blocked_reason: Option<String>,
+    /// Whether the applied (running) configuration routes unmatched traffic
+    /// to a balancer. Tests seed it directly; the app derives it from its
+    /// applied candidate.
+    pub(crate) running_balancer_route: bool,
     /// The shell's stored config-generation error — the text the dashboard
     /// renders inline under Connect, excerpt-bounded by the shell's
     /// generation boundary.
@@ -170,6 +174,7 @@ impl Default for UiTestRig {
             phase: CorePhase::Stopped,
             transport: None,
             connect_blocked_reason: None,
+            running_balancer_route: false,
             config_error: None,
             safety: Default::default(),
             verdict: Default::default(),
@@ -378,6 +383,7 @@ impl UiTestRig {
                 verdict: &self.verdict,
                 verdict_generation,
                 connect_blocked_reason: &self.connect_blocked_reason,
+                running_balancer_route: self.running_balancer_route,
                 config_error: &self.config_error,
                 operation: self.operation,
                 is_elevated: self.is_elevated,

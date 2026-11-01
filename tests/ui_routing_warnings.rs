@@ -252,11 +252,18 @@ fn editing_selector_to_matching_tag_live_clears_warning() {
         "the warning must render before the edit"
     );
 
-    // Open the balancer editor and point the selector at the built-in
-    // "direct" outbound; the warning must clear without a restart.
+    // Open the balancer editor: the selector row keeps the stored prefix it
+    // does not offer, and its picker points it at the built-in "direct"
+    // outbound. The warning must clear without a restart.
     h.get_by_role_and_label(Role::Button, "▸").click();
     h.run();
-    replace_text(&mut h, "srv-", "direct");
+    h.get_all_by_role(Role::ComboBox)
+        .find(|node| node.value().as_deref() == Some("srv-"))
+        .expect("the selector row shows its stored value")
+        .click();
+    h.run();
+    h.get_by_role_and_label(Role::Button, "direct").click();
+    h.run_steps(4);
 
     assert!(
         h.query_by_label(&message).is_none(),

@@ -109,6 +109,31 @@ impl Rule {
         }
     }
 
+    /// True when the rule carries at least one field the core turns into a
+    /// matcher. `RoutingRule.BuildCondition` refuses a rule with none of them
+    /// ("this rule has no effective fields", app/router/config.go), and the
+    /// target tag, the rule tag and the webhook are not conditions. An
+    /// unmodeled key counts: the app never blocks a condition it does not
+    /// store.
+    pub fn has_conditions(&self) -> bool {
+        !self.domain.is_empty()
+            || !self.ip.is_empty()
+            || !self.port.is_empty()
+            || !self.source_port.is_empty()
+            || !self.local_port.is_empty()
+            || !self.network.is_empty()
+            || !self.source.is_empty()
+            || !self.local_ip.is_empty()
+            || !self.user.is_empty()
+            || !self.inbound_tag.is_empty()
+            || !self.protocol.is_empty()
+            || !self.attrs.is_empty()
+            || !self.vless_route.is_empty()
+            || !self.process.is_empty()
+            || !self.local_os.is_empty()
+            || !self.extra.is_empty()
+    }
+
     /// The target verdict for the rule editor, or `None` when the rule is
     /// well formed. The message renders in the active language at the display
     /// boundary.
@@ -450,6 +475,9 @@ pub enum RoutingIntegrityError {
     DuplicateBalancerTag(String),
     /// Routing rules still reference the tag, so the balancer cannot go.
     BalancerReferenced { tag: String, rules: usize },
+    /// The Dashboard routes unmatched traffic to this balancer, so removing it
+    /// would silently hand the default route back to the active profile.
+    BalancerIsActive,
 }
 
 impl RoutingIntegrityError {
@@ -470,6 +498,7 @@ impl RoutingIntegrityError {
                 Key::IntegrityBalancerReferenced,
                 &[&format!("{tag:?}"), rules],
             ),
+            Self::BalancerIsActive => t(language, Key::IntegrityBalancerIsActive).to_string(),
         }
     }
 }
@@ -518,6 +547,12 @@ pub struct RoutingCfg {
     pub rules: Vec<Rule>,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub balancers: Vec<Balancer>,
+    /// Tag of the balancer the Dashboard routes unmatched traffic to; empty
+    /// leaves the default route with the active profile. Xray has no
+    /// default-balancer setting, so the generator emits it as a catch-all
+    /// rule (`network: tcp,udp`) after the built-in private fallback.
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub active_balancer: String,
     /// The app's own rule groups; see [`BuiltinRules`].
     #[serde(skip_serializing_if = "BuiltinRules::is_default")]
     pub builtin: BuiltinRules,
@@ -617,6 +652,15 @@ impl RoutingCfg {
             .count()
     }
 
+    /// The active balancer tag when it names a configured balancer. A stored
+    /// tag with no balancer is a validation finding, not an active route, so
+    /// every reader falls back to the profile default.
+    pub fn active_balancer_tag(&self) -> Option<&str> {
+        let tag = self.active_balancer.as_str();
+        (!tag.is_empty() && self.balancers.iter().any(|balancer| balancer.tag == tag))
+            .then_some(tag)
+    }
+
     /// Rename a balancer and every rule reference as one validated mutation.
     pub fn rename_balancer(
         &mut self,
@@ -655,6 +699,9 @@ impl RoutingCfg {
                 rewritten += 1;
             }
         }
+        if !self.active_balancer.is_empty() && self.active_balancer == old_tag {
+            self.active_balancer = new_tag.to_string();
+        }
         self.balancers[index].tag = new_tag.to_string();
         Ok(rewritten)
     }
@@ -668,6 +715,9 @@ impl RoutingCfg {
         else {
             return Err(RoutingIntegrityError::MissingBalancer(index));
         };
+        if !self.active_balancer.is_empty() && self.active_balancer == tag {
+            return Err(RoutingIntegrityError::BalancerIsActive);
+        }
         let rules = self.balancer_reference_count(&tag);
         if rules != 0 {
             return Err(RoutingIntegrityError::BalancerReferenced { tag, rules });
@@ -681,6 +731,7 @@ impl Default for RoutingCfg {
         Self {
             rules: Vec::new(),
             balancers: Vec::new(),
+            active_balancer: String::new(),
             builtin: BuiltinRules::default(),
             domain_strategy: DEFAULT_DOMAIN_STRATEGY.into(),
             script: None,
@@ -743,6 +794,52 @@ mod integrity_tests {
         assert_eq!(cfg.rename_balancer(0, "new"), Ok(1));
         assert_eq!(cfg.balancers[0].tag, "new");
         assert_eq!(cfg.rules[0].balancer_tag, "new");
+    }
+
+    #[test]
+    fn renaming_the_active_balancer_moves_the_pointer_with_it() {
+        let mut cfg = RoutingCfg {
+            active_balancer: "old".into(),
+            ..Default::default()
+        };
+        cfg.balancers.push(Balancer {
+            tag: "old".into(),
+            ..Default::default()
+        });
+
+        assert_eq!(cfg.rename_balancer(0, "new"), Ok(0));
+        assert_eq!(cfg.active_balancer, "new");
+        assert_eq!(cfg.balancers[0].tag, "new");
+
+        // An untagged balancer beside the empty "no active route" tag is not
+        // the active route: renaming it must not activate it.
+        let mut untagged = RoutingCfg::default();
+        untagged.balancers.push(Balancer::default());
+        assert_eq!(untagged.rename_balancer(0, "named"), Ok(0));
+        assert!(untagged.active_balancer.is_empty());
+    }
+
+    #[test]
+    fn the_active_balancer_cannot_be_removed() {
+        let mut cfg = RoutingCfg {
+            active_balancer: "route".into(),
+            ..Default::default()
+        };
+        cfg.balancers.push(Balancer {
+            tag: "route".into(),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            cfg.remove_balancer(0),
+            Err(RoutingIntegrityError::BalancerIsActive)
+        ));
+        assert_eq!(cfg.balancers.len(), 1);
+
+        // No active route: an untagged balancer is removable like any other.
+        let mut none = RoutingCfg::default();
+        none.balancers.push(Balancer::default());
+        assert!(none.remove_balancer(0).is_ok());
     }
 
     #[test]
@@ -918,6 +1015,112 @@ mod integrity_tests {
         assert_eq!(balancer.strategy.r#type, "random");
     }
 }
+
+#[cfg(test)]
+mod rule_condition_tests {
+    use super::{Rule, Webhook};
+
+    /// A rule the core accepts carries at least one field its
+    /// `BuildCondition` turns into a matcher (`app/router/config.go`: "this
+    /// rule has no effective fields"). The target tags and the webhook are
+    /// not conditions, so they do not count. An unmodeled key does count: the
+    /// app cannot judge a condition it does not store.
+    #[test]
+    fn only_a_matcher_field_makes_a_rule_match() {
+        assert!(!Rule::new().has_conditions(), "a fresh rule has no matcher");
+        assert!(
+            !Rule {
+                webhook: Some(Webhook::default()),
+                ..Default::default()
+            }
+            .has_conditions(),
+            "a webhook is not a condition"
+        );
+
+        let conditions = [
+            Rule {
+                domain: vec!["geosite:cn".into()],
+                ..Default::default()
+            },
+            Rule {
+                ip: vec!["geoip:cn".into()],
+                ..Default::default()
+            },
+            Rule {
+                port: "443".into(),
+                ..Default::default()
+            },
+            Rule {
+                source_port: "1000-2000".into(),
+                ..Default::default()
+            },
+            Rule {
+                local_port: "8080".into(),
+                ..Default::default()
+            },
+            Rule {
+                network: "tcp,udp".into(),
+                ..Default::default()
+            },
+            Rule {
+                source: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            Rule {
+                local_ip: vec!["192.168.0.0/16".into()],
+                ..Default::default()
+            },
+            Rule {
+                user: vec!["u@x".into()],
+                ..Default::default()
+            },
+            Rule {
+                inbound_tag: vec!["in-socks".into()],
+                ..Default::default()
+            },
+            Rule {
+                protocol: vec!["tls".into()],
+                ..Default::default()
+            },
+            Rule {
+                attrs: [("host".to_string(), serde_json::Value::from("x"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            Rule {
+                vless_route: "8080".into(),
+                ..Default::default()
+            },
+            Rule {
+                process: vec!["chrome.exe".into()],
+                ..Default::default()
+            },
+            Rule {
+                local_os: vec!["windows".into()],
+                ..Default::default()
+            },
+        ];
+        for rule in conditions {
+            assert!(
+                rule.has_conditions(),
+                "a set matcher field must count: {rule:?}"
+            );
+        }
+
+        let unmodeled = Rule {
+            extra: [("futureCondition".to_string(), serde_json::Value::Bool(true))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            unmodeled.has_conditions(),
+            "an unmodeled key is the core's to judge, so the app never blocks it"
+        );
+    }
+}
+
 #[cfg(test)]
 mod error_text_tests {
     use super::{Key, Language, RouteTestRequest, RoutingIntegrityError, Rule, t_fmt};

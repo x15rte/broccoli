@@ -599,6 +599,10 @@ pub enum ValidationCode {
     BalancerSelectorMissing(String),
     /// Two routing balancers share a tag.
     BalancerTagDuplicated(String),
+    /// The Dashboard's active balancer names no configured balancer. The
+    /// generator's catch-all rule would reference a tag the core cannot
+    /// resolve, so the document never loads (tag).
+    RoutingActiveBalancerMissing(String),
     /// A routing balancer's `fallbackTag` names no outbound (balancer tag,
     /// fallback tag).
     BalancerFallbackMissing(String, String),
@@ -671,6 +675,10 @@ pub enum ValidationCode {
     /// A routing rule names neither or both of an outbound and a balancer
     /// (1-based index, the target rule's error text).
     RoutingRuleTarget(usize, String),
+    /// A routing rule carries no field the core builds a matcher from
+    /// (1-based index). `RoutingRule.BuildCondition` refuses such a rule
+    /// ("this rule has no effective fields"), so the document never loads.
+    RoutingRuleNoMatchers(usize),
     /// A routing rule references a missing outbound (index, tag).
     RoutingRuleOutboundMissing(usize, String),
     /// A routing rule references a missing balancer (index, tag).
@@ -752,6 +760,10 @@ pub enum ValidationCode {
     /// pair (infra/conf/router.go:94-96), and the app never drops the user's
     /// rules to make the script fit. Error tier.
     RoutingScriptRulesConflict,
+    /// A routing script beside an active balancer: the script owns every
+    /// route, so the catch-all rule the balancer needs is never emitted.
+    /// Error tier.
+    RoutingScriptBalancerConflict,
     /// A routing script beside a non-default `domainStrategy`: the core
     /// refuses a script with any `domainStrategy` key
     /// (infra/conf/router.go:94-96), and the app emits none beside a script.

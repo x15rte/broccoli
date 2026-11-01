@@ -125,6 +125,7 @@ pub fn dns_script_issues(
 pub fn routing_script_issues(
     script: Option<&str>,
     rules: usize,
+    active_balancer: bool,
     domain_strategy: &str,
 ) -> Vec<ValidationCode> {
     let Some(script) = script else {
@@ -136,6 +137,9 @@ pub fn routing_script_issues(
     }
     if rules > 0 {
         issues.push(ValidationCode::RoutingScriptRulesConflict);
+    }
+    if active_balancer {
+        issues.push(ValidationCode::RoutingScriptBalancerConflict);
     }
     if domain_strategy != crate::model::DEFAULT_DOMAIN_STRATEGY {
         issues.push(ValidationCode::RoutingScriptStrategyConflict);
@@ -704,6 +708,15 @@ impl<'a> SettingsWalk<'a> {
                 ));
             }
         }
+        // The Dashboard's active balancer must name one of the tags above; its
+        // catch-all rule would otherwise reference a tag the core refuses.
+        let active = &self.settings.routing.active_balancer;
+        if !active.is_empty() && !self.balancer_tags.contains(active) {
+            self.issues.push(issue(
+                ValidationCode::RoutingActiveBalancerMissing(excerpt(active)),
+                None,
+            ));
+        }
     }
 
     /// Local endpoints: every emitted entry must bind a valid listen address on
@@ -1089,6 +1102,7 @@ impl<'a> SettingsWalk<'a> {
         for code in routing_script_issues(
             self.settings.routing.script.as_deref(),
             self.settings.routing.rules.len(),
+            !self.settings.routing.active_balancer.is_empty(),
             &self.settings.routing.domain_strategy,
         ) {
             self.issues.push(issue(code, Some("routing.script".into())));
@@ -1101,6 +1115,12 @@ impl<'a> SettingsWalk<'a> {
                 ));
                 // The reference checks below would name an unresolved target.
                 continue;
+            }
+            if !rule.has_conditions() {
+                self.issues.push(issue(
+                    ValidationCode::RoutingRuleNoMatchers(index + 1),
+                    None,
+                ));
             }
             if !rule.outbound_tag.is_empty() && !self.outbound_tags.contains(&rule.outbound_tag) {
                 self.issues.push(issue(
@@ -1854,6 +1874,100 @@ mod tests {
             balancer < rule && rule < server && server < pool_cidr && pool_cidr < pool_size,
             "rules must stay in the generator's order: {found:#?}"
         );
+    }
+
+    #[test]
+    fn a_rule_without_a_matcher_is_rejected_before_the_core_reads_it() {
+        use crate::model::routing::Rule;
+
+        // The core's `RoutingRule.BuildCondition` refuses such a rule ("this
+        // rule has no effective fields"), so the app reports it instead of
+        // handing the core a configuration that cannot load.
+        let mut settings = Settings::default();
+        settings.routing.rules.push(Rule {
+            outbound_tag: DIRECT_OUTBOUND_TAG.into(),
+            ..Default::default()
+        });
+        let found = codes(&validate_settings(
+            &settings,
+            &ServersFile::default(),
+            10853,
+        ));
+        assert!(
+            found.contains(&ValidationCode::RoutingRuleNoMatchers(1)),
+            "{found:#?}"
+        );
+
+        // Any matcher the core builds a condition from clears the finding;
+        // `network: tcp,udp` is the widest one.
+        settings.routing.rules[0].network = "tcp,udp".into();
+        let found = codes(&validate_settings(
+            &settings,
+            &ServersFile::default(),
+            10853,
+        ));
+        assert!(
+            !found
+                .iter()
+                .any(|code| matches!(code, ValidationCode::RoutingRuleNoMatchers(_))),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn the_active_balancer_must_name_a_configured_balancer() {
+        use crate::model::routing::Balancer;
+
+        let mut settings = Settings::default();
+        settings.routing.active_balancer = "gone".into();
+        let found = codes(&validate_settings(
+            &settings,
+            &ServersFile::default(),
+            10853,
+        ));
+        assert!(
+            found.contains(&ValidationCode::RoutingActiveBalancerMissing("gone".into())),
+            "{found:#?}"
+        );
+
+        settings.routing.balancers.push(Balancer {
+            tag: "gone".into(),
+            selector: vec!["direct".into()],
+            ..Default::default()
+        });
+        let found = codes(&validate_settings(
+            &settings,
+            &ServersFile::default(),
+            10853,
+        ));
+        assert!(
+            !found
+                .iter()
+                .any(|code| matches!(code, ValidationCode::RoutingActiveBalancerMissing(_))),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn a_routing_script_conflicts_with_the_active_balancer() {
+        use crate::model::routing::Balancer;
+
+        // A script owns every route, so the catch-all rule the active
+        // balancer needs is never emitted: the pair cannot take effect.
+        let mut settings = Settings::default();
+        settings.routing.script = Some("routing.lua".into());
+        settings.routing.balancers.push(Balancer {
+            tag: "route".into(),
+            selector: vec!["direct".into()],
+            ..Default::default()
+        });
+        settings.routing.active_balancer = "route".into();
+
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        let issue = finding(&issues, &ValidationCode::RoutingScriptBalancerConflict)
+            .expect("the pair must reach the apply gate");
+        assert_eq!(issue.path.as_deref(), Some("routing.script"));
+        assert_eq!(issue.severity, Severity::Error);
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub(crate) struct TopbarRowState<'a> {
     pub(crate) mode: Mode,
     /// The active server's name (`None` while the list is empty).
     pub(crate) active_name: Option<&'a str>,
+    /// The active balancer's tag when one owns the default route; the chip
+    /// names it instead of `active_name`.
+    pub(crate) active_balancer: Option<&'a str>,
     pub(crate) core_version: Option<&'a str>,
     /// The model's edit generation: a rename, an added profile, a mode
     /// change or a core install moves the captions, and the memo re-derives
@@ -71,6 +74,7 @@ struct TopbarLabels {
     model_generation: u64,
     mode: Mode,
     active_name: Option<String>,
+    active_balancer: Option<String>,
     core_version: Option<String>,
     lang: Language,
     badge: String,
@@ -84,6 +88,7 @@ impl TopbarLabels {
         self.model_generation == state.model_generation
             && self.mode == state.mode
             && self.active_name.as_deref() == state.active_name
+            && self.active_balancer.as_deref() == state.active_balancer
             && self.core_version.as_deref() == state.core_version
             && self.lang == state.lang
             && self.phase == *state.phase
@@ -241,9 +246,11 @@ fn refresh_labels<'a>(
         .is_some_and(|labels| labels.is_current(state));
     if !current {
         let lang = state.lang;
-        let active_caption = state
-            .active_name
-            .map(|name| t_fmt(lang, Key::TopbarActiveServer, &[&name]));
+        let active_caption = match (state.active_balancer, state.active_name) {
+            (Some(tag), _) => Some(t_fmt(lang, Key::TopbarActiveBalancer, &[&tag])),
+            (None, Some(name)) => Some(t_fmt(lang, Key::TopbarActiveServer, &[&name])),
+            (None, None) => None,
+        };
         let version_caption = match state.core_version {
             // `&v` is `&&str` — `&str` implements Display, so the element
             // coerces to `&dyn Display` (same double-reference shape as the
@@ -261,6 +268,7 @@ fn refresh_labels<'a>(
             model_generation: state.model_generation,
             mode: state.mode,
             active_name: state.active_name.map(str::to_owned),
+            active_balancer: state.active_balancer.map(str::to_owned),
             core_version: state.core_version.map(str::to_owned),
             lang,
             badge: phase_badge_text(state.phase, lang, PhaseBadgeWording::Topbar),
@@ -543,6 +551,57 @@ mod tests {
         }
     }
 
+    /// The active route may be a balancer, and the chip names it with its own
+    /// word rather than the profile that still heads the outbound list.
+    #[test]
+    fn a_balancer_active_route_renders_its_own_caption() {
+        let mut harness = harness_builder()
+            .with_size(egui::Vec2::new(900.0, 60.0))
+            .build_ui_state(
+                |ui, memos: &mut TopbarMemos| {
+                    let phase = CorePhase::Running;
+                    let _ = show_row(
+                        ui,
+                        &TopbarRowState {
+                            lang: Language::En,
+                            phase: &phase,
+                            mode: Mode::Off,
+                            active_name: Some("alpha"),
+                            active_balancer: Some("route"),
+                            core_version: None,
+                            model_generation: 0,
+                            blocked_reason: None,
+                            unsaved_changes: false,
+                            trial_rule_count: 0,
+                            core_available: true,
+                            config_dirty: false,
+                            apply_block: None,
+                            apply_result: None,
+                            terminal_error: None,
+                            config_error: None,
+                            state_error: None,
+                            persistence_error: None,
+                        },
+                        memos,
+                    );
+                },
+                TopbarMemos::default(),
+            );
+        harness.run();
+
+        let caption = t_fmt(Language::En, Key::TopbarActiveBalancer, &[&"route"]);
+        assert!(
+            harness.query_by_label(caption.as_str()).is_some(),
+            "the chip names the active balancer: {caption:?}"
+        );
+        assert!(
+            harness
+                .query_by_label(t_fmt(Language::En, Key::TopbarActiveServer, &[&"alpha"]).as_str())
+                .is_none(),
+            "the profile caption must not claim the route a balancer owns"
+        );
+    }
+
     /// The version caption the row formats for the fixture's core version:
     /// the locale template over the committed pins, never a literal, so a
     /// wording or version bump cannot red the row's tests.
@@ -578,6 +637,7 @@ mod tests {
                             } else {
                                 "alpha"
                             }),
+                            active_balancer: None,
                             core_version: Some("v26.7.28"),
                             model_generation: fixture.generation,
                             blocked_reason: None,

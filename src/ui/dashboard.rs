@@ -122,6 +122,14 @@ impl LatencyCell {
     }
 }
 
+/// What the active-server picker chose in one popup frame: a profile row (by
+/// list index) or a balancer tag. Applied after the popup so the model is
+/// never mutated while the lists are borrowed.
+enum ActivePick {
+    Profile(usize),
+    Balancer(String),
+}
+
 #[derive(Default)]
 pub struct DashboardScreen {
     /// Throughput-plot series, rebuilt only when the stats generation
@@ -437,52 +445,94 @@ impl DashboardScreen {
                     },
                 );
 
-                // Active server. The selected caption is the active
-                // profile's name — an O(n) borrow (no allocation) with the
-                // same fallback as the label always had.
+                // Active server. The caption is the active route's own name:
+                // the active balancer's tag, else the first profile's name.
+                // The popup offers both — a server moves to the list's front
+                // (the config's default route), while a balancer becomes the
+                // catch-all rule the generator emits for it.
                 widgets::ledger_row(
                     ui,
                     egui::RichText::new(t(lang, Key::DashboardActiveServer)).weak(),
                     |ui| {
-                        let cur = match ctx.servers.active.as_deref() {
-                            Some(id) => ctx
+                        let cur = match ctx.settings.routing.active_balancer_tag() {
+                            Some(tag) => tag,
+                            None => ctx
                                 .servers
-                                .profiles
-                                .iter()
-                                .find(|p| p.id == id)
-                                .map_or(t(lang, Key::NoneSelected), |p| p.name.as_str()),
-                            None => t(lang, Key::NoneSelected),
+                                .active_profile()
+                                .map_or(t(lang, Key::NoneSelected), |profile| {
+                                    profile.name.as_str()
+                                }),
                         };
+                        // A routing script owns every route, so the catch-all
+                        // rule an active balancer needs is never emitted: the
+                        // rows stay visible and explain why they are inert
+                        // (the settings verdict refuses the pair too).
+                        let script_owns_routing = ctx.settings.routing.script_path().is_some();
+                        // The popup reads the profile and balancer lists and
+                        // writes two disjoint model fields, so the click is
+                        // deferred to a row identity instead of mutating while
+                        // borrowed. Only the chosen value is cloned, on the
+                        // click, never per row per open-popup frame.
+                        let mut picked = None;
                         egui::ComboBox::from_id_salt("active-server")
                             .selected_text(cur)
                             .show_ui(ui, |ui| {
-                                // The popup reads the profile list and writes
-                                // the selection slot — two disjoint fields of
-                                // the same model borrow — by deferring the
-                                // click to a row index. Only the chosen id is
-                                // cloned, on the click, instead of an
-                                // (id, name) pair per profile per open-popup
-                                // frame.
-                                let mut picked = None;
                                 for (index, profile) in ctx.servers.profiles.iter().enumerate() {
-                                    let selected =
-                                        ctx.servers.active.as_deref() == Some(profile.id.as_str());
+                                    let selected = ctx.settings.routing.active_balancer.is_empty()
+                                        && ctx.servers.active.as_deref()
+                                            == Some(profile.id.as_str());
                                     if ui
                                         .selectable_label(selected, profile.name.as_str())
                                         .clicked()
                                     {
-                                        picked = Some(index);
+                                        picked = Some(ActivePick::Profile(index));
                                     }
                                 }
-                                if let Some(index) = picked {
-                                    // The active profile is the list's first row
-                                    // (the config's default route), so picking it
-                                    // moves it there.
-                                    let id = ctx.servers.profiles[index].id.clone();
-                                    ctx.servers.activate(&id);
-                                    ctx.hooks.mark_dirty();
+                                if !ctx.settings.routing.balancers.is_empty() {
+                                    ui.separator();
+                                    ui.weak(t(lang, Key::BalancersSection));
+                                    for balancer in &ctx.settings.routing.balancers {
+                                        let selected =
+                                            ctx.settings.routing.active_balancer == balancer.tag;
+                                        let row = ui.add_enabled(
+                                            !script_owns_routing,
+                                            egui::Button::selectable(
+                                                selected,
+                                                balancer.tag.as_str(),
+                                            ),
+                                        );
+                                        let row = if script_owns_routing {
+                                            row.on_disabled_hover_text(t(
+                                                lang,
+                                                Key::DashboardBalancerScriptGated,
+                                            ))
+                                        } else {
+                                            row
+                                        };
+                                        if row.clicked() {
+                                            picked =
+                                                Some(ActivePick::Balancer(balancer.tag.clone()));
+                                        }
+                                    }
                                 }
                             });
+                        match picked {
+                            Some(ActivePick::Profile(index)) => {
+                                // The active profile is the list's first row
+                                // (the config's default route), so picking it
+                                // moves it there — and it takes the default
+                                // route back from an active balancer.
+                                let id = ctx.servers.profiles[index].id.clone();
+                                ctx.settings.routing.active_balancer.clear();
+                                ctx.servers.activate(&id);
+                                ctx.hooks.mark_dirty();
+                            }
+                            Some(ActivePick::Balancer(tag)) => {
+                                ctx.settings.routing.active_balancer = tag;
+                                ctx.hooks.mark_dirty();
+                            }
+                            None => {}
+                        }
                     },
                 );
 
@@ -1343,6 +1393,108 @@ mod tests {
         assert!(truncated);
         assert_eq!(short.chars().count(), 60);
         assert!(input.starts_with(&short));
+    }
+
+    /// The active-server picker lists the balancers under their own heading:
+    /// choosing one writes the active-route field (the generator's catch-all
+    /// rule), and choosing a server again hands the default route back.
+    #[test]
+    fn the_active_server_picker_lists_balancers_and_writes_the_active_route() {
+        use crate::model::Balancer;
+
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![profile("alpha", None), profile("beta", None)];
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.settings
+            .routing
+            .balancers
+            .push(Balancer::new("route".into(), "srv-".into()));
+        let rig = Rc::new(RefCell::new(rig));
+        let mut harness = harness_for(Rc::clone(&rig));
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some("alpha"))
+            .expect("the active server is the caption")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::BalancersSection))
+                .is_some(),
+            "the popup groups the balancers under their own heading"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "route")
+            .click();
+        harness.run();
+        assert_eq!(rig.borrow().settings.routing.active_balancer, "route");
+        assert!(
+            rig.borrow().requests.dirty,
+            "the choice persists through the config pipeline"
+        );
+        assert!(
+            !rig.borrow().requests.connect,
+            "choosing a route never starts the core"
+        );
+
+        // The caption follows, and picking the server again clears the field.
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some("route"))
+            .expect("the caption names the active balancer")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "alpha")
+            .click();
+        harness.run();
+        assert!(
+            rig.borrow().settings.routing.active_balancer.is_empty(),
+            "a server choice hands the default route back"
+        );
+        assert_eq!(
+            rig.borrow().servers.active.as_deref(),
+            Some(rig.borrow().servers.profiles[0].id.as_str())
+        );
+    }
+
+    /// A routing script owns every route, so an active balancer cannot take
+    /// effect: the row stays visible, disabled, and writes nothing.
+    #[test]
+    fn a_routing_script_disables_the_balancer_rows() {
+        use crate::model::Balancer;
+
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![profile("alpha", None)];
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.settings.routing.script = Some("routing.lua".into());
+        rig.settings
+            .routing
+            .balancers
+            .push(Balancer::new("route".into(), "srv-".into()));
+        let rig = Rc::new(RefCell::new(rig));
+        let mut harness = harness_for(Rc::clone(&rig));
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some("alpha"))
+            .expect("the active server is the caption")
+            .click();
+        harness.run();
+        let row = harness.get_by_role_and_label(egui::accesskit::Role::Button, "route");
+        assert!(
+            row.accesskit_node().is_disabled(),
+            "the balancer row must be inert while a script owns the routes"
+        );
+        row.click();
+        harness.run();
+        assert!(
+            rig.borrow().settings.routing.active_balancer.is_empty(),
+            "a disabled row never writes the active-route field"
+        );
     }
 
     fn profile(name: &str, latency: Option<i64>) -> ServerProfile {

@@ -2190,6 +2190,56 @@ fn invalid_fakedns_pool_rejected_at_generation() {
     }
 }
 
+/// The Dashboard's active balancer is a routing rule, not the first
+/// outbound: Xray has no default-balancer setting. It is the last rule — after
+/// the user's rules and the private fallback, so it claims only traffic no
+/// other rule took — and it names the widest matcher the core accepts
+/// (`tcp,udp`), because `RoutingRule.BuildCondition` refuses a rule with no
+/// matcher at all.
+#[test]
+fn the_active_balancer_is_the_last_catch_all_rule() {
+    let mut settings = base_settings();
+    settings
+        .routing
+        .balancers
+        .push(Balancer::new("route".into(), "srv-".into()));
+    settings.routing.active_balancer = "route".into();
+    settings.routing.rules.push(Rule {
+        domain: vec!["domain:blocked.example".into()],
+        outbound_tag: "block".into(),
+        ..Default::default()
+    });
+    let servers = single_server(OutboundModel::new(Protocol::Freedom));
+
+    let generated = generate_deterministic(&servers, &settings).expect("generate config");
+    let rules = generated["routing"]["rules"].as_array().expect("rules");
+
+    let last = rules.last().expect("the catch-all rule is emitted last");
+    assert_eq!(last["balancerTag"], json!("route"));
+    assert_eq!(last["network"], json!("tcp,udp"));
+    assert!(
+        last.get("outboundTag").is_none(),
+        "a rule names exactly one target: {last}"
+    );
+    // The user's rule and the private fallback still precede it.
+    let user = rules
+        .iter()
+        .position(|rule| rule["domain"] == json!(["domain:blocked.example"]))
+        .expect("the user rule is emitted");
+    let private = rules
+        .iter()
+        .position(|rule| rule["ip"].is_array())
+        .expect("the private IP fallback is emitted");
+    assert!(
+        user < private && private < rules.len() - 1,
+        "the catch-all follows the user rule and the private fallback: {rules:#?}"
+    );
+    // The default outbound is untouched: the profile stays first, so the
+    // document keeps a dial target for the balancer and for a script-free
+    // default route.
+    assert_eq!(generated["outbounds"][0]["tag"], json!("srv-01234567"));
+}
+
 #[test]
 fn tun_user_rules_follow_the_dns_interception_rules() {
     let mut settings = base_settings();
@@ -3788,6 +3838,7 @@ fn rule_targets_and_balancer_members_keep_the_bootstrap_marking() {
     let mut settings = base_settings();
     settings.routing.rules.push(crate::model::Rule {
         outbound_tag: ruled.tag(),
+        network: "tcp,udp".into(),
         ..Default::default()
     });
     settings.routing.balancers.push(crate::model::Balancer {
@@ -3907,6 +3958,7 @@ fn rule_target_chain_terminal_is_the_marked_outbound() {
     let mut settings = base_settings();
     settings.routing.rules.push(crate::model::Rule {
         outbound_tag: hop.tag(),
+        network: "tcp,udp".into(),
         ..Default::default()
     });
 

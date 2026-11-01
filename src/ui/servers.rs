@@ -3225,7 +3225,10 @@ impl ServersScreen {
             }
             Some(ListAction::SetActive(id)) => {
                 // The active profile is the list's first row (the config's
-                // default route), so choosing it moves it there.
+                // default route), so choosing it moves it there — and an
+                // explicitly chosen server takes the default route back from
+                // an active balancer.
+                ctx.settings.routing.active_balancer.clear();
                 ctx.servers.activate(&id);
                 ctx.hooks.mark_dirty();
             }
@@ -8573,7 +8576,11 @@ Authentication: ML-KEM-768, Post-Quantum
 
     #[test]
     fn set_active_moves_the_chosen_row_to_the_front() {
-        let mut harness = drag_harness(drag_rig());
+        let mut rig = drag_rig();
+        // A balancer owns the default route; choosing a server explicitly must
+        // hand it back.
+        rig.settings.routing.active_balancer = "route".into();
+        let mut harness = drag_harness(rig);
         harness.run();
         harness.get_by_label("Charlie").click_secondary();
         harness.run();
@@ -8590,6 +8597,10 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(
             rig.servers.active.as_deref(),
             Some(rig.servers.profiles[0].id.as_str())
+        );
+        assert!(
+            rig.settings.routing.active_balancer.is_empty(),
+            "an explicitly chosen server takes the default route back"
         );
         assert!(rig.requests.dirty);
     }

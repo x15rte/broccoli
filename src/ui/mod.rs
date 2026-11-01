@@ -134,6 +134,9 @@ pub struct UiCtx<'a> {
     /// lifecycle/update transaction.
     busy: gate::BusyWindow,
     connect_blocked_reason: &'a Option<String>,
+    /// Whether the running configuration routes unmatched traffic to a
+    /// balancer (see [`UiCtxParts::running_balancer_route`]).
+    running_balancer_route: bool,
     safety: &'a SafetyVerdicts,
     verdict: &'a Verdict,
     /// The generation [`Self::verdict`] judged. It is the publish stamp, not
@@ -347,6 +350,10 @@ pub struct RoutingCtx<'a> {
     pub(crate) servers: &'a ServersFile,
     pub(crate) safety: &'a SafetyVerdicts,
     pub(crate) phase: &'a CorePhase,
+    /// Whether the running configuration routes unmatched traffic to a
+    /// balancer; the trial-rule gate reads the applied fact, not the pending
+    /// model, so an unapplied change cannot open a gate the core would shadow.
+    pub(crate) running_balancer_route: bool,
     pub(crate) busy: gate::BusyWindow,
     pub(crate) hooks: FrameHooks<'a>,
 }
@@ -440,12 +447,13 @@ pub struct CoreSetupCtx<'a> {
     pub(crate) hooks: FrameHooks<'a>,
 }
 
-/// Servers: the model it edits, the language/reference lookups it reads from
-/// settings, the window its probe gate reads, the parked probe outcome, and
-/// the send/edit/quit seams.
+/// Servers: the model it edits, the settings it reads (and the active-route
+/// handover it writes when the user chooses a server explicitly), the window
+/// its probe gate reads, the parked probe outcome, and the send/edit/quit
+/// seams.
 pub struct ServersCtx<'a> {
     pub(crate) servers: &'a mut ServersFile,
-    pub(crate) settings: &'a Settings,
+    pub(crate) settings: &'a mut Settings,
     pub(crate) busy: gate::BusyWindow,
     /// Outcome slot of the one single-flight latency probe: the shell parks
     /// the drained result here and the servers screen adopts it through its
@@ -569,6 +577,12 @@ pub(crate) struct UiCtxParts<'a> {
     pub(crate) requests: &'a mut FrameRequests,
     pub(crate) model_generation: &'a mut u64,
     pub(crate) connect_blocked_reason: &'a Option<String>,
+    /// Whether the configuration the running core holds routes unmatched
+    /// traffic to a balancer (the shell's applied baseline, not the pending
+    /// model). The trial-rule gate reads it: the core appends trial rules
+    /// after the configured rules, so the balancer's catch-all would shadow
+    /// every one of them.
+    pub(crate) running_balancer_route: bool,
     /// The shell's whole-model safety verdict for this frame's model
     /// generation: one instance every screen reads its own slice of, instead
     /// of each running the assessment itself.
@@ -659,6 +673,7 @@ impl<'a> UiCtx<'a> {
             verdict,
             verdict_generation,
             connect_blocked_reason,
+            running_balancer_route,
             config_error,
             operation,
             is_elevated,
@@ -690,6 +705,7 @@ impl<'a> UiCtx<'a> {
             verdict,
             verdict_generation,
             connect_blocked_reason,
+            running_balancer_route,
             config_error,
             is_elevated,
             stats,
@@ -758,6 +774,7 @@ impl<'a> UiCtx<'a> {
             servers: &*self.servers,
             safety: self.safety,
             phase: self.phase,
+            running_balancer_route: self.running_balancer_route,
             busy: self.busy,
             hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
         }
@@ -826,7 +843,7 @@ impl<'a> UiCtx<'a> {
     pub(crate) fn servers(&mut self) -> ServersCtx<'_> {
         ServersCtx {
             servers: &mut *self.servers,
-            settings: &*self.settings,
+            settings: &mut *self.settings,
             busy: self.busy,
             probe_feedback: &mut *self.probe_feedback,
             hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),

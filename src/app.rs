@@ -377,6 +377,11 @@ pub struct BroccoliApp {
     /// The generated config does not carry it, so the changes-pending gate
     /// compares this separately.
     applied_dns_takeover: bool,
+    /// Whether [`Self::applied_candidate`] routes unmatched traffic to a
+    /// balancer. The core appends trial rules after the configured rules, so
+    /// the balancer's catch-all shadows every one of them; the trial-rule gate
+    /// reads this applied fact, never the pending model.
+    applied_balancer_route: bool,
     /// Monotonic in-memory edit generation used to prevent an older runtime
     /// result from settling newer saved edits: an apply verdict names the
     /// revision it applied, so a verdict for an older one cannot settle the
@@ -870,6 +875,9 @@ impl BroccoliApp {
         let (generated_candidate, generation_verdict) =
             generate_runtime_candidate(&servers, &settings, lang);
         let config_error = generated_candidate.as_ref().err().cloned();
+        let applied_balancer_route = generated_candidate
+            .as_ref()
+            .is_ok_and(candidate_routes_balancer);
         let applied_candidate = generated_candidate
             .ok()
             .map(normalize_candidate_for_compare);
@@ -972,6 +980,7 @@ impl BroccoliApp {
             config_dirty: persistence_error.is_some() || config_error.is_some(),
             applied_candidate,
             applied_dns_takeover,
+            applied_balancer_route,
             config_revision: 0,
             model_generation: 0,
             last_persist: None,
@@ -1214,6 +1223,8 @@ impl BroccoliApp {
                             let (candidate, verdict) =
                                 generate_runtime_candidate(&self.servers, &self.settings, lang);
                             self.record_generation_verdict(verdict);
+                            self.applied_balancer_route =
+                                candidate.as_ref().is_ok_and(candidate_routes_balancer);
                             self.applied_candidate =
                                 candidate.ok().map(normalize_candidate_for_compare);
                             self.applied_dns_takeover = self.settings.dns_takeover;
@@ -2443,6 +2454,7 @@ impl eframe::App for BroccoliApp {
                         phase: &self.phase,
                         mode: self.settings.mode,
                         active_name: self.servers.active_profile().map(|p| p.name.as_str()),
+                        active_balancer: self.settings.routing.active_balancer_tag(),
                         core_version: self.core_version.as_deref(),
                         model_generation: self.model_generation,
                         blocked_reason: blocked.as_deref(),
@@ -2531,6 +2543,7 @@ impl eframe::App for BroccoliApp {
                     verdict: cached_verdict(&self.generation_verdict),
                     verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
+                    running_balancer_route: self.applied_balancer_route,
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
@@ -2594,6 +2607,7 @@ impl eframe::App for BroccoliApp {
                     verdict: cached_verdict(&self.generation_verdict),
                     verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
+                    running_balancer_route: self.applied_balancer_route,
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
@@ -2634,6 +2648,7 @@ impl eframe::App for BroccoliApp {
                     verdict: cached_verdict(&self.generation_verdict),
                     verdict_generation: cached_verdict_generation(&self.generation_verdict),
                     connect_blocked_reason: cached_block_reason(&self.connect_block_cache),
+                    running_balancer_route: self.applied_balancer_route,
                     config_error: &self.config_error,
                     operation,
                     is_elevated: self.is_elevated,
@@ -2849,6 +2864,33 @@ fn tun_interface_lookup_needed(mode: Mode, setting: &str) -> bool {
             sys::netif::fixed_name_verdict(setting, &[]),
             sys::netif::FixedNameVerdict::Unpinned
         )
+}
+
+/// True when the generated document routes unmatched traffic to a balancer:
+/// its catch-all rule (`network: tcp,udp` plus `balancerTag`) matches every
+/// proxied flow. The core appends trial rules after the configured rules, so
+/// this is the fact that makes an injected rule unreachable.
+fn candidate_routes_balancer(candidate: &serde_json::Value) -> bool {
+    candidate
+        .get("routing")
+        .and_then(|routing| routing.get("rules"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rules| {
+            // The generator's catch-all carries exactly the widest network and
+            // the balancer target. Any other condition key narrows the rule,
+            // leaving traffic for an appended trial rule.
+            rules.iter().any(|rule| {
+                let Some(object) = rule.as_object() else {
+                    return false;
+                };
+                object.get("balancerTag").is_some()
+                    && object.get("outboundTag").is_none()
+                    && object.get("network").and_then(serde_json::Value::as_str) == Some("tcp,udp")
+                    && object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "network" | "balancerTag" | "ruleTag"))
+            })
+        })
 }
 
 /// One runtime candidate plus the verdict of the generation that judged it:
@@ -4833,6 +4875,7 @@ mod unsaved_changes_tests {
                                 phase: &phase,
                                 mode: crate::model::Mode::Off,
                                 active_name: None,
+                                active_balancer: None,
                                 core_version: None,
                                 model_generation: 0,
                                 blocked_reason: None,
@@ -5222,12 +5265,49 @@ mod apply_verdict_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOG_BYTE_CAP, LOG_CAP, LogBuffer, LogLine, TerminalError};
+    use super::{
+        LOG_BYTE_CAP, LOG_CAP, LogBuffer, LogLine, TerminalError, candidate_routes_balancer,
+    };
     use super::{Language, native_dark_for, tun_outbound_interface_block_reason};
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
     use crate::model::settings::Mode;
     use crate::rt::supervisor::MAX_LINE_BYTES;
+
+    /// The trial-rule gate's running-config fact: only the catch-all rule the
+    /// generator appends (widest network, balancer target, no outbound) makes
+    /// an appended trial rule unreachable. A scoped balancer rule does not.
+    #[test]
+    fn the_balancer_catch_all_is_what_shadows_appended_rules() {
+        let catch_all = serde_json::json!({
+            "routing": { "rules": [{
+                "network": "tcp,udp",
+                "balancerTag": "route",
+            }]},
+        });
+        assert!(candidate_routes_balancer(&catch_all));
+
+        let scoped = serde_json::json!({
+            "routing": { "rules": [{
+                "network": "tcp,udp",
+                "balancerTag": "route",
+                "domain": ["domain:blocked.example"],
+            }]},
+        });
+        assert!(
+            !candidate_routes_balancer(&scoped),
+            "a scoped balancer rule leaves traffic for an appended trial rule"
+        );
+
+        let outbound = serde_json::json!({
+            "routing": { "rules": [{
+                "network": "tcp,udp",
+                "outboundTag": "direct",
+            }]},
+        });
+        assert!(!candidate_routes_balancer(&outbound));
+        assert!(!candidate_routes_balancer(&serde_json::json!({})));
+    }
 
     /// A fixture adapter for the commit-guard tests — the guard keys on the
     /// name and up flag only, so any nonzero index serves.

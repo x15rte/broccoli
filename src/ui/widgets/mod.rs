@@ -1188,6 +1188,69 @@ pub fn string_list(
     changed
 }
 
+/// [`string_list`] whose rows are pickers over `options` instead of text
+/// fields: one combo per row plus a 🗑 remove button, and a "+ Add" button
+/// appending an empty row. A stored value the options do not carry stays
+/// selected — the row shows it, and opening the popup never rewrites it — so
+/// an imported or hand-edited configuration round-trips. The empty value
+/// renders as `empty_label`.
+pub fn combo_list<S: AsRef<str>>(
+    ui: &mut egui::Ui,
+    lang: Language,
+    label: &str,
+    id: impl egui::AsIdSalt,
+    items: &mut Vec<String>,
+    options: &[S],
+    empty_label: &str,
+) -> bool {
+    let mut changed = false;
+    let label_id = (!label.is_empty()).then(|| ui.label(label).id);
+    let mut remove = None;
+    for (i, item) in items.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            // Right-to-left: the remove button pins to the row's right edge
+            // and the picker keeps its own width (a combo never claims the
+            // rest of the row, so it cannot push the button off the clip
+            // rect).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
+                    remove = Some(i);
+                }
+                let selected = if item.is_empty() {
+                    empty_label
+                } else {
+                    item.as_str()
+                };
+                let combo = egui::ComboBox::from_id_salt((&id, i))
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for opt in options {
+                            let opt = opt.as_ref();
+                            if ui.selectable_label(item.as_str() == opt, opt).clicked()
+                                && item.as_str() != opt
+                            {
+                                *item = opt.to_string();
+                                changed = true;
+                            }
+                        }
+                    });
+                if let Some(label_id) = label_id {
+                    let _ = combo.response.labelled_by(label_id);
+                }
+            });
+        });
+    }
+    if let Some(i) = remove {
+        items.remove(i);
+        changed = true;
+    }
+    if ui.button(t(lang, Key::AddRow)).clicked() {
+        items.push(String::new());
+        changed = true;
+    }
+    changed
+}
+
 /// [`string_list`] whose rows render masked while `masked` is set: each row
 /// shows the masked stand-in in place of its text box, so the values stay out
 /// of the frame, while the remove and Add buttons keep their meaning — a
@@ -1980,6 +2043,62 @@ mod tests {
             1,
             "the remove button deletes its row"
         );
+    }
+
+    /// The picker row list: a stored tag the options do not carry stays
+    /// displayed and untouched until the user picks another one, "+ Add"
+    /// appends an empty row that reads as the unset label, and the row's own
+    /// remove button deletes it.
+    #[test]
+    fn combo_list_rows_pick_from_the_offered_tags_and_keep_an_unknown_value() {
+        let items = vec!["srv-a".to_owned(), "hand-written".to_owned()];
+        let mut harness = harness_builder()
+            .with_size(egui::vec2(420.0, 240.0))
+            .build_ui_state(
+                |ui, items: &mut Vec<String>| {
+                    let _ = combo_list(
+                        ui,
+                        Language::En,
+                        "targets",
+                        "targets",
+                        items,
+                        &["srv-a", "srv-b"],
+                        t(Language::En, Key::SrvUnset),
+                    );
+                },
+                items,
+            );
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.value().as_deref() == Some("hand-written"))
+            .expect("the unknown stored tag is displayed, never dropped")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "srv-b")
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state()[1],
+            "srv-b",
+            "the row writes the picked tag into the model list"
+        );
+
+        harness.get_by_label("+ Add").click();
+        harness.run();
+        assert_eq!(harness.state().len(), 3, "+ Add appends a row");
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .any(|node| node.value().as_deref() == Some(t(Language::En, Key::SrvUnset))),
+            "the new row reads as the empty meaning"
+        );
+
+        harness.get_all_by_label("🗑").next().unwrap().click();
+        harness.run();
+        assert_eq!(harness.state().len(), 2, "the row button deletes its row");
     }
 
     #[test]
