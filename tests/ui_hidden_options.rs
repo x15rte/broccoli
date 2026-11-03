@@ -47,6 +47,12 @@ fn boot_servers(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
+    let mut profiles = profiles;
+    // The screen opens on `Emitted`: a switched-off row is not listed, and
+    // these tests address every seeded row by name.
+    for profile in &mut profiles {
+        profile.enabled = true;
+    }
     let first_name = profiles
         .first()
         .map(|profile| profile.name.clone())

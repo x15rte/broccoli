@@ -27,6 +27,11 @@ const LEGACY_TAG_PREFIX: &str = "srv-";
 pub struct Group {
     pub id: String,
     pub title: String,
+    /// The group's tab is pinned beside the three default tabs. Presentation
+    /// only: the stored group order, and with it the generated block order,
+    /// keeps its place either way.
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
     #[serde(flatten)]
@@ -38,6 +43,7 @@ impl Group {
         Self {
             id: uuid::Uuid::new_v4().simple().to_string(),
             title: title.into(),
+            pinned: false,
             subscription: None,
             extra: Map::new(),
         }
@@ -47,6 +53,7 @@ impl Group {
         Self {
             id: MANUAL_GROUP_ID.into(),
             title: MANUAL_GROUP_TITLE.into(),
+            pinned: false,
             subscription: None,
             extra: Map::new(),
         }
@@ -756,6 +763,44 @@ impl ServersFile {
                 }
             }
             None => self.groups.insert(0, Group::manual()),
+        }
+    }
+    /// Move group `id` to position `to` inside its pinned or unpinned tab
+    /// band. Only the dragged band's slots in the stored group order move;
+    /// each other band keeps its members and their places, so a drag never
+    /// changes the other band's blocks and pinning alone never moves a block.
+    /// The reserved `Manual` group does not move.
+    pub fn reorder_group_in_band(&mut self, id: &str, to: usize) {
+        if id == MANUAL_GROUP_ID {
+            return;
+        }
+        let Some(pinned) = self
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .map(|group| group.pinned)
+        else {
+            return;
+        };
+        let slots: Vec<usize> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| !group.is_manual() && group.pinned == pinned)
+            .map(|(index, _)| index)
+            .collect();
+        let mut band: Vec<Group> = slots
+            .iter()
+            .map(|&index| self.groups[index].clone())
+            .collect();
+        let Some(from) = band.iter().position(|group| group.id == id) else {
+            return;
+        };
+        let moved = band.remove(from);
+        let to = to.min(band.len());
+        band.insert(to, moved);
+        for (&slot, group) in slots.iter().zip(band) {
+            self.groups[slot] = group;
         }
     }
     /// Refresh each profile's cached group title from its group record and
@@ -1893,6 +1938,117 @@ mod tests {
         assert_eq!(tags(&servers), ["direct", "[First] A", "[Second] B"]);
         servers.groups.swap(1, 2);
         assert_eq!(tags(&servers), ["direct", "[Second] B", "[First] A"]);
+    }
+
+    #[test]
+    fn a_group_pin_round_trips_and_defaults_to_absent() {
+        let mut group = Group::new("Feed");
+        group.pinned = true;
+        let stored = serde_json::to_value(&group).expect("the group serializes");
+        assert_eq!(stored["pinned"], serde_json::json!(true));
+        let reloaded: Group = serde_json::from_value(stored).expect("a pinned group deserializes");
+        assert!(reloaded.pinned, "the pin survives a restart");
+
+        // A file written before the flag existed has no key: the group
+        // reloads unpinned, and a fresh group starts that way.
+        let legacy: Group = serde_json::from_value(serde_json::json!({"id": "g", "title": "Feed"}))
+            .expect("a legacy group deserializes");
+        assert!(!legacy.pinned);
+        assert!(!Group::new("Other").pinned);
+        let stored = serde_json::to_value(Group::new("Other")).expect("the group serializes");
+        assert!(
+            stored.get("pinned").is_none(),
+            "an unpinned flag stays out of the stored file"
+        );
+    }
+
+    #[test]
+    fn a_band_drag_reorders_only_its_own_band() {
+        let mut servers = ServersFile::default();
+        let mut groups = vec![Group::manual()];
+        for (title, pinned) in [
+            ("First", false),
+            ("Second", true),
+            ("Third", false),
+            ("Fourth", true),
+        ] {
+            let mut group = Group::new(title);
+            group.pinned = pinned;
+            groups.push(group);
+        }
+        servers.groups = groups;
+        let ids = |servers: &ServersFile| -> Vec<String> {
+            servers
+                .groups
+                .iter()
+                .map(|group| group.title.clone())
+                .collect()
+        };
+        assert_eq!(
+            ids(&servers),
+            ["Manual", "First", "Second", "Third", "Fourth"]
+        );
+
+        // The pinned band is [Second, Fourth]: moving Fourth to its start
+        // swaps only those two slots; the unpinned group keeps its place.
+        let fourth = servers.groups[4].id.clone();
+        servers.reorder_group_in_band(&fourth, 0);
+        assert_eq!(
+            ids(&servers),
+            ["Manual", "First", "Fourth", "Third", "Second"]
+        );
+
+        // A drag in the unpinned band leaves the pinned band's slots alone.
+        let third = servers.groups[3].id.clone();
+        servers.reorder_group_in_band(&third, 0);
+        assert_eq!(
+            ids(&servers),
+            ["Manual", "Third", "Fourth", "First", "Second"]
+        );
+
+        // The reserved group never moves.
+        servers.reorder_group_in_band(MANUAL_GROUP_ID, 4);
+        assert_eq!(
+            ids(&servers),
+            ["Manual", "Third", "Fourth", "First", "Second"]
+        );
+    }
+
+    #[test]
+    fn pinning_a_group_changes_presentation_not_the_block_order() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut a = ServerProfile::new("A", freedom());
+        a.enabled = true;
+        let mut b = ServerProfile::new("B", freedom());
+        b.enabled = true;
+        let first = Group::new("First");
+        let second = Group::new("Second");
+        a.group = first.id.clone();
+        b.group = second.id.clone();
+        let mut servers = ServersFile {
+            profiles: vec![a, b],
+            groups: vec![Group::manual(), first, second],
+            ..ServersFile::default()
+        };
+        servers.hydrate_group_titles();
+        let tags = |servers: &ServersFile| -> Vec<String> {
+            let config = crate::r#gen::generate_with_api_port(
+                servers,
+                &crate::model::Settings::default(),
+                10853,
+            )
+            .expect("generate config");
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .take(3)
+                .filter_map(|outbound| outbound["tag"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let before = tags(&servers);
+        servers.groups[2].pinned = true;
+        assert_eq!(tags(&servers), before, "a pin never rewrites the document");
     }
 
     #[test]

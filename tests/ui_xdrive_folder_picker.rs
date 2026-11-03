@@ -35,6 +35,9 @@ use parking_lot::MutexGuard;
 #[path = "common/screen.rs"]
 mod screen;
 
+#[path = "common/editor.rs"]
+mod editor;
+
 mod common;
 
 /// The folder field's own label: the row is addressed by it, never by its
@@ -90,6 +93,9 @@ fn boot_with_service(
     common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(Role::Button, "Servers").click();
     h.run();
+    // The editor lives in its pop-up window now: open it on the active row
+    // before addressing a tab of its body.
+    editor::open_server_editor(&mut h, "xdrive");
     h.get_by_role_and_label(Role::Button, t(Language::En, Key::SrvTabTransport))
         .click();
     h.run();

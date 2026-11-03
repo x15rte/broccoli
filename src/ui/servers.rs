@@ -1876,13 +1876,6 @@ enum ListAction {
     /// Flip the profile's switch. The active profile and a chain-only hop are
     /// locked; the handler re-checks both.
     ToggleEnabled(String),
-    /// Collapse or expand one group.
-    ToggleGroup(String),
-    /// Move one group by `delta` positions among the non-manual groups.
-    MoveGroup {
-        group: usize,
-        delta: i32,
-    },
     /// Open the editor window on one profile.
     Edit(String),
     Export(String),
@@ -1967,33 +1960,106 @@ struct ImportPreview {
     rows: Vec<ImportPreviewRow>,
 }
 
-/// One row of the grouped list: a group header or a profile.
-#[derive(Clone, Copy)]
-enum GroupListRow {
-    Header {
-        group: usize,
-        total: usize,
-        matched: usize,
-    },
-    Profile(usize),
+/// What the server table shows: one of the three default views or one group.
+/// Transient — opening the screen starts on `Emitted`, and nothing stores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ServerTab {
+    #[default]
+    Emitted,
+    /// The built-in `Manual` group; its tab is a default, its group is not.
+    Manual,
+    All,
+    Group(String),
 }
 
-/// The grouped row list, rebuilt only when the model, the search or the
-/// collapsed set moves.
-struct GroupRowsCache {
+impl ServerTab {
+    /// The label on the tab. A group tab shows its group title, falling back
+    /// to the reserved `Manual` title when the record is gone.
+    fn label(&self, servers: &crate::model::ServersFile, lang: Language) -> String {
+        match self {
+            Self::Emitted => t(lang, Key::SrvTabEmitted).to_owned(),
+            Self::Manual => t(lang, Key::SrvTabManual).to_owned(),
+            Self::All => t(lang, Key::SrvTabAll).to_owned(),
+            Self::Group(id) => servers
+                .group_title_of(id)
+                .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE)
+                .to_owned(),
+        }
+    }
+}
+
+/// The tabs the bar renders, in display order: the three default tabs, then
+/// the pinned groups in stored order, then the unpinned ones. The `Manual`
+/// group owns the default `Manual` tab, so it is not repeated here.
+fn tab_order(servers: &crate::model::ServersFile) -> Vec<ServerTab> {
+    let mut tabs = Vec::with_capacity(servers.groups.len() + 3);
+    tabs.push(ServerTab::Emitted);
+    tabs.push(ServerTab::Manual);
+    tabs.push(ServerTab::All);
+    for pinned in [true, false] {
+        for group in &servers.groups {
+            if !group.is_manual() && group.pinned == pinned {
+                tabs.push(ServerTab::Group(group.id.clone()));
+            }
+        }
+    }
+    tabs
+}
+
+/// A view-only sort column. It never reaches the stored order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortColumn {
+    Name,
+    Protocol,
+    Latency,
+}
+
+/// One tab's transient view sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewSort {
+    column: SortColumn,
+    ascending: bool,
+}
+
+/// The sort a header click asks for: a new column starts ascending, the same
+/// column toggles.
+fn next_view_sort(current: Option<ViewSort>, column: SortColumn) -> ViewSort {
+    match current {
+        Some(sort) if sort.column == column => ViewSort {
+            column,
+            ascending: !sort.ascending,
+        },
+        _ => ViewSort {
+            column,
+            ascending: true,
+        },
+    }
+}
+
+/// The row list of one tab, rebuilt only when the model, the tab, the search
+/// or the view sort moves.
+struct TabRowsCache {
     generation: u64,
+    tab: ServerTab,
     search: String,
-    rows: std::rc::Rc<[GroupListRow]>,
+    sort: Option<ViewSort>,
+    rows: std::rc::Rc<[usize]>,
 }
 
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
-    /// Groups the user collapsed, by id.
-    collapsed: std::collections::BTreeSet<String>,
-    /// The list's search text; group headers stay visible with match counts.
+    /// Whether the opening selection was filled in. The screen selects the
+    /// active server (or the first row) once; switching tabs clears the
+    /// selection and does not bring it back.
+    selection_initialized: bool,
+    /// The active tab. Opening the screen starts on `Emitted`.
+    view: ServerTab,
+    /// The active tab's view sort; dropped whenever the tab changes.
+    view_sort: Option<ViewSort>,
+    /// The list's search text; it filters the current tab only.
     search: String,
-    group_rows_cache: Option<GroupRowsCache>,
+    tab_rows_cache: Option<TabRowsCache>,
     /// Per-profile table cells (the protocol-and-security column and the
     /// `address:port` column), rebuilt only when the model generation moves.
     row_details: Option<(
@@ -3309,22 +3375,299 @@ impl ServersScreen {
             ctx.servers.active_route_repaired = false;
             self.set_status(StatusLine::err(t(lang, Key::SrvActiveRouteReset)));
         }
-        if self.selected.is_none() {
-            self.selected = ctx
-                .servers
-                .active
-                .clone()
-                .filter(|id| ctx.servers.profiles.iter().any(|profile| &profile.id == id))
-                .or_else(|| {
-                    ctx.servers
-                        .profiles
-                        .first()
-                        .map(|profile| profile.id.clone())
-                });
+        if !self.selection_initialized {
+            self.selection_initialized = true;
+            if self.selected.is_none() {
+                self.selected = ctx
+                    .servers
+                    .active
+                    .clone()
+                    .filter(|id| ctx.servers.profiles.iter().any(|profile| &profile.id == id))
+                    .or_else(|| {
+                        ctx.servers
+                            .profiles
+                            .first()
+                            .map(|profile| profile.id.clone())
+                    });
+            }
+        }
+        // A group deleted under its tab falls back to the default view; the
+        // selection and the view sort belong to the tab that just went away.
+        let stale_view = matches!(&self.view, ServerTab::Group(id)
+            if !ctx.servers.groups.iter().any(|group| &group.id == id));
+        if stale_view {
+            self.select_tab(ServerTab::Emitted);
         }
 
         egui::CentralPanel::default().show(ui, |ui| self.show_table(ui, ctx));
         self.show_dialogs(ui.ctx(), ctx);
+    }
+
+    // ---------- tab bar ----------
+
+    /// Switch tabs. The selection and the view sort belong to the tab that
+    /// was showing, so both are dropped here; the stored order never moves.
+    fn select_tab(&mut self, tab: ServerTab) {
+        if self.view == tab {
+            return;
+        }
+        self.view = tab;
+        self.selected = None;
+        self.view_sort = None;
+        self.tab_rows_cache = None;
+    }
+
+    /// The tab bar above the table. The three default tabs stay first and
+    /// undeletable; every group tab follows in its band, can be dragged inside
+    /// that band, and pins or unpins from its context menu.
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx, lang: Language) {
+        let tabs = tab_order(ctx.servers);
+        let mut select: Option<ServerTab> = None;
+        let mut pin: Option<(String, bool)> = None;
+        let mut tab_rects: Vec<(ServerTab, egui::Rect)> = Vec::with_capacity(tabs.len());
+        ui.horizontal_wrapped(|ui| {
+            for tab in &tabs {
+                let response = ui.add(egui::Button::selectable(
+                    self.view == *tab,
+                    tab.label(ctx.servers, lang),
+                ));
+                tab_rects.push((tab.clone(), response.rect));
+                if response.clicked() {
+                    select = Some(tab.clone());
+                }
+                let ServerTab::Group(id) = tab else {
+                    continue;
+                };
+                if response
+                    .interact(egui::Sense::click_and_drag())
+                    .drag_started_by(egui::PointerButton::Primary)
+                {
+                    egui::DragAndDrop::set_payload(ui.ctx(), DragTab(tab.clone()));
+                }
+                let pinned = ctx
+                    .servers
+                    .groups
+                    .iter()
+                    .find(|group| &group.id == id)
+                    .is_some_and(|group| group.pinned);
+                response.context_menu(|ui| {
+                    let (key, value) = if pinned {
+                        (Key::SrvUnpinTab, false)
+                    } else {
+                        (Key::SrvPinTab, true)
+                    };
+                    if ui.button(t(lang, key)).clicked() {
+                        pin = Some((id.clone(), value));
+                        ui.close();
+                    }
+                });
+            }
+        });
+        if let Some((id, pinned)) = pin
+            && let Some(group) = ctx.servers.groups.iter_mut().find(|group| group.id == id)
+        {
+            group.pinned = pinned;
+            ctx.hooks.mark_dirty();
+        }
+        if let Some(tab) = select {
+            self.select_tab(tab);
+        }
+        // A release over another group tab of the same band lands the drag at
+        // that tab's gap. The other band and the defaults never accept a drop.
+        if ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+            && egui::DragAndDrop::payload::<DragTab>(ui.ctx()).is_some()
+            && let Some(lifted) = egui::DragAndDrop::take_payload::<DragTab>(ui.ctx())
+            && let ServerTab::Group(id) = &lifted.0
+        {
+            let Some(position) = ui.input(|input| input.pointer.interact_pos()) else {
+                return;
+            };
+            let Some((target, rect)) = tab_rects.iter().find(|(_, rect)| rect.contains(position))
+            else {
+                return;
+            };
+            let ServerTab::Group(target_id) = target else {
+                return;
+            };
+            let band_member = |candidate: &str, pinned: bool| {
+                ctx.servers
+                    .groups
+                    .iter()
+                    .any(|group| group.id == candidate && group.pinned == pinned)
+            };
+            let dragged_pinned = ctx
+                .servers
+                .groups
+                .iter()
+                .find(|group| group.id == *id)
+                .map(|group| group.pinned);
+            let Some(dragged_pinned) = dragged_pinned else {
+                return;
+            };
+            if !band_member(target_id, dragged_pinned) {
+                return;
+            }
+            let band: Vec<&str> = tabs
+                .iter()
+                .filter_map(|tab| match tab {
+                    ServerTab::Group(candidate) => Some(candidate.as_str()),
+                    _ => None,
+                })
+                .filter(|candidate| band_member(candidate, dragged_pinned))
+                .collect();
+            let Some(from) = band.iter().position(|candidate| *candidate == id.as_str()) else {
+                return;
+            };
+            let Some(target_at) = band
+                .iter()
+                .position(|candidate| *candidate == target_id.as_str())
+            else {
+                return;
+            };
+            let gap = target_at + usize::from(position.x > rect.center().x);
+            let to = reorder_target(from, gap);
+            if to != from {
+                ctx.servers.reorder_group_in_band(id, to);
+                ctx.hooks.mark_dirty();
+            }
+        }
+    }
+
+    /// The subscription card between the tab bar and the table: the feed's
+    /// title, quota, expiry and update hint with its refresh, report and
+    /// delete actions. Only a subscription group's tab owns a feed, so the
+    /// three views and a manual group render nothing here.
+    fn show_subscription_card(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx, lang: Language) {
+        let ServerTab::Group(view) = &self.view else {
+            return;
+        };
+        let Some(group) = ctx.servers.groups.iter().find(|group| &group.id == view) else {
+            return;
+        };
+        let Some(subscription) = group.subscription.as_ref() else {
+            return;
+        };
+        let id = group.id.clone();
+        let title = group.title.clone();
+        let url = subscription.url.clone();
+        let custom_user_agent = subscription.user_agent_custom;
+        let user_agent = subscription.user_agent.clone();
+        let report = subscription.report.clone();
+        let metadata = subscription.metadata.as_ref();
+        let unit = ctx.settings.traffic_unit;
+        let mut refresh = false;
+        let mut show_report = false;
+        let mut delete = false;
+        let mut edit = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(RichText::new(&title).strong())
+                    .on_hover_text(t(lang, Key::SrvEditSubscription))
+                    .clicked()
+                {
+                    edit = true;
+                }
+                if let Some(metadata) = metadata {
+                    let used = metadata.upload.saturating_add(metadata.download);
+                    let has_quota =
+                        metadata.total > 0 || metadata.upload > 0 || metadata.download > 0;
+                    if !has_quota {
+                        // A title-only snapshot has no quota widget.
+                    } else if metadata.total > 0 {
+                        let percent = used
+                            .saturating_mul(100)
+                            .checked_div(metadata.total)
+                            .unwrap_or_default();
+                        ui.weak(t_fmt(
+                            lang,
+                            Key::SrvQuotaUsed,
+                            &[
+                                &crate::ui::dashboard::format_bytes(used, unit),
+                                &crate::ui::dashboard::format_bytes(metadata.total, unit),
+                                &percent,
+                            ],
+                        ));
+                    } else {
+                        ui.weak(t_fmt(
+                            lang,
+                            Key::SrvQuotaUnlimited,
+                            &[&crate::ui::dashboard::format_bytes(used, unit)],
+                        ));
+                    }
+                    if metadata.expire > 0 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .unwrap_or_default();
+                        if now >= metadata.expire {
+                            ui.colored_label(
+                                status_colors_of(ui).err,
+                                t(lang, Key::SrvSubscriptionExpired),
+                            );
+                        } else {
+                            let days = (metadata.expire - now).div_ceil(86_400);
+                            ui.weak(t_fmt(
+                                lang,
+                                Key::SrvSubscriptionExpiresIn,
+                                &[&days, &unix_date(metadata.expire)],
+                            ));
+                        }
+                    }
+                    if metadata.update_interval > 0 {
+                        ui.weak(t_fmt(
+                            lang,
+                            Key::SrvSubscriptionUpdateHint,
+                            &[&metadata.update_interval],
+                        ));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button(t(lang, Key::SrvDeleteSubscription))
+                        .clicked()
+                    {
+                        delete = true;
+                    }
+                    let report_button = if report.is_some() {
+                        ui.small_button(t(lang, Key::SrvShowReport))
+                    } else {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(t(lang, Key::SrvShowReport)).small(),
+                        )
+                    };
+                    if report_button.clicked() {
+                        show_report = true;
+                    }
+                    if ui
+                        .small_button(t(lang, Key::SrvRefreshSubscription))
+                        .clicked()
+                    {
+                        refresh = true;
+                    }
+                });
+            });
+        });
+        if refresh {
+            let repaint = ui.ctx().clone();
+            self.start_subscription_fetch(lang, repaint, ctx, id.clone());
+        }
+        if show_report && let Some(report) = report {
+            self.report_view = Some((title.clone(), report));
+        }
+        if delete {
+            self.subscription_delete_pending = Some(id.clone());
+        }
+        if edit {
+            self.subscription_dialog = Some(SubscriptionDraft {
+                editing: Some(id),
+                title,
+                url,
+                custom_user_agent,
+                user_agent,
+            });
+        }
     }
 
     // ---------- the table ----------
@@ -3349,6 +3692,8 @@ impl ServersScreen {
                 .map_or_else(|| t(lang, Key::NoneSelected).to_owned(), |p| p.name.clone())
         };
         ui.label(t_fmt(lang, Key::SrvActiveRoute, &[&route]));
+        self.show_tab_bar(ui, ctx, lang);
+        self.show_subscription_card(ui, ctx, lang);
 
         // One-probe-at-a-time gate for the toolbar command. The probe dials
         // through its own isolated core, so no phase rung refuses it; its own
@@ -3366,10 +3711,6 @@ impl ServersScreen {
             Rung::NotRunning | Rung::Busy => (false, t(lang, Key::SrvAnotherOperationWorking)),
         };
         let mut action: Option<ListAction> = None;
-        let mut refresh_group: Option<String> = None;
-        let mut delete_group: Option<String> = None;
-        let mut report_group: Option<String> = None;
-        let mut edit_group: Option<String> = None;
         // The toolbar's commands, with search at the end of the row so
         // filtering sits beside the actions it filters.
         let mut add_proto: Option<Protocol> = None;
@@ -3466,12 +3807,22 @@ impl ServersScreen {
             ui.colored_label(color, message);
         }
         ui.separator();
-        // The table's column header, on the same widths as every row.
+        // One flat table per tab, on the same widths as every row. The
+        // sortable header exists only where sorting is a view: every tab but
+        // `Emitted`, whose order is the outbound order.
+        let sortable = self.view != ServerTab::Emitted;
+        let shape = TableShape {
+            order: self.view == ServerTab::Emitted,
+            group: self.view == ServerTab::All,
+        };
         let header_columns = table_columns(
             (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
             ui.spacing().item_spacing.x,
+            shape,
         );
-        table_header(ui, lang, header_columns);
+        if let Some(column) = table_header(ui, lang, header_columns, sortable, self.view_sort) {
+            self.view_sort = Some(next_view_sort(self.view_sort, column));
+        }
         ui.separator();
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
@@ -3479,8 +3830,8 @@ impl ServersScreen {
         // widget per row is the non-small selectable name button, whose
         // height is clamped to `interact_size.y` (a 14 px single-line body
         // galley of 16 px plus the 2 px net button frame margin is below it;
-        // the small delete/probe buttons and the latency label never exceed
-        // it), so `row_height = spacing.interact_size.y` — the same
+        // the latency label never exceeds it), so
+        // `row_height = spacing.interact_size.y` — the same
         // derivation the geodata picker's virtualized lists use
         // (`routing.rs`). `show_rows` adds `item_spacing.y` between rows,
         // reproducing the old sequential layout row-for-row (only the
@@ -3490,24 +3841,29 @@ impl ServersScreen {
         // offset is preserved across the switch.
         let row_height = ui.spacing().interact_size.y;
         let generation = ctx.hooks.model_generation();
-        let stale_rows = self
-            .group_rows_cache
-            .as_ref()
-            .is_none_or(|cache| cache.generation != generation || cache.search != self.search);
+        let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
+            cache.generation != generation
+                || cache.tab != self.view
+                || cache.search != self.search
+                || cache.sort != self.view_sort
+        });
         if stale_rows {
-            self.group_rows_cache = Some(GroupRowsCache {
+            self.tab_rows_cache = Some(TabRowsCache {
                 generation,
+                tab: self.view.clone(),
                 search: self.search.clone(),
+                sort: self.view_sort,
                 rows: std::rc::Rc::from(
-                    group_list_rows(ctx.servers, &self.collapsed, &self.search).into_boxed_slice(),
+                    tab_rows(ctx.servers, &self.view, &self.search, self.view_sort)
+                        .into_boxed_slice(),
                 ),
             });
         }
         let display_rows = std::rc::Rc::clone(
             &self
-                .group_rows_cache
+                .tab_rows_cache
                 .as_ref()
-                .expect("the grouped rows were cached above")
+                .expect("the tab rows were cached above")
                 .rows,
         );
         if self.emitted_cache.as_ref().map(|(cached, _)| *cached) != Some(generation) {
@@ -3537,19 +3893,12 @@ impl ServersScreen {
                 .expect("the row details were cached above")
                 .1,
         );
-        if !self.search.trim().is_empty()
-            && display_rows
-                .iter()
-                .all(|row| matches!(row, GroupListRow::Header { .. }))
-        {
-            ui.label(RichText::new(t(lang, Key::SrvNoMatches)).weak());
-        }
-        if profiles.is_empty() || display_rows.is_empty() {
+        if display_rows.is_empty() {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
                 .max_height(ui.available_height().max(80.0))
                 .show(ui, |ui| {
-                    let message = if profiles.is_empty() {
+                    let message = if self.search.trim().is_empty() {
                         t(lang, Key::NoServersYet)
                     } else {
                         t(lang, Key::SrvNoMatches)
@@ -3596,165 +3945,7 @@ impl ServersScreen {
                     let mut drop_mark: Option<(usize, f32)> = None;
                     let mut last_row_bottom: Option<f32> = None;
                     for display in rows {
-                        let index = match display_rows[display] {
-                            GroupListRow::Profile(index) => index,
-                            GroupListRow::Header {
-                                group,
-                                total,
-                                matched,
-                            } => {
-                                let group = &ctx.servers.groups[group];
-                                let collapsed = self.collapsed.contains(&group.id);
-                                ui.horizontal(|ui| {
-                                    if ui.small_button(if collapsed { "▸" } else { "▾" }).clicked()
-                                    {
-                                        action = Some(ListAction::ToggleGroup(group.id.clone()));
-                                    }
-                                    if group.is_manual() {
-                                        ui.label(egui::RichText::new(&group.title).strong());
-                                    } else if ui
-                                        .button(egui::RichText::new(&group.title).strong())
-                                        .on_hover_text(t(lang, Key::SrvEditSubscription))
-                                        .clicked()
-                                    {
-                                        edit_group = Some(group.id.clone());
-                                    }
-                                    if self.search.trim().is_empty() {
-                                        ui.weak(format!("({total})"));
-                                    } else {
-                                        ui.weak(format!("{matched}/{total}"));
-                                    }
-                                    if let Some(metadata) = group
-                                        .subscription
-                                        .as_ref()
-                                        .and_then(|subscription| subscription.metadata.as_ref())
-                                    {
-                                        let unit = ctx.settings.traffic_unit;
-                                        let used =
-                                            metadata.upload.saturating_add(metadata.download);
-                                        let has_quota = metadata.total > 0
-                                            || metadata.upload > 0
-                                            || metadata.download > 0;
-                                        if !has_quota {
-                                            // A title-only snapshot has no
-                                            // quota widget.
-                                        } else if metadata.total > 0 {
-                                            let percent = used
-                                                .saturating_mul(100)
-                                                .checked_div(metadata.total)
-                                                .unwrap_or_default();
-                                            ui.weak(t_fmt(
-                                                lang,
-                                                Key::SrvQuotaUsed,
-                                                &[
-                                                    &crate::ui::dashboard::format_bytes(used, unit),
-                                                    &crate::ui::dashboard::format_bytes(
-                                                        metadata.total,
-                                                        unit,
-                                                    ),
-                                                    &percent,
-                                                ],
-                                            ));
-                                        } else {
-                                            ui.weak(t_fmt(
-                                                lang,
-                                                Key::SrvQuotaUnlimited,
-                                                &[&crate::ui::dashboard::format_bytes(used, unit)],
-                                            ));
-                                        }
-                                        if metadata.expire > 0 {
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|duration| duration.as_secs())
-                                                .unwrap_or_default();
-                                            if now >= metadata.expire {
-                                                ui.colored_label(
-                                                    status_colors_of(ui).err,
-                                                    t(lang, Key::SrvSubscriptionExpired),
-                                                );
-                                            } else {
-                                                let days = (metadata.expire - now).div_ceil(86_400);
-                                                ui.weak(t_fmt(
-                                                    lang,
-                                                    Key::SrvSubscriptionExpiresIn,
-                                                    &[&days, &unix_date(metadata.expire)],
-                                                ));
-                                            }
-                                        }
-                                        if metadata.update_interval > 0 {
-                                            ui.weak(t_fmt(
-                                                lang,
-                                                Key::SrvSubscriptionUpdateHint,
-                                                &[&metadata.update_interval],
-                                            ));
-                                        }
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if group.subscription.is_some() {
-                                                if ui
-                                                    .small_button(t(
-                                                        lang,
-                                                        Key::SrvRefreshSubscription,
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    refresh_group = Some(group.id.clone());
-                                                }
-                                                if group.subscription.as_ref().is_some_and(
-                                                    |subscription| subscription.report.is_some(),
-                                                ) && ui
-                                                    .small_button(t(lang, Key::SrvShowReport))
-                                                    .clicked()
-                                                {
-                                                    report_group = Some(group.id.clone());
-                                                }
-                                                if ui
-                                                    .small_button(t(
-                                                        lang,
-                                                        Key::SrvDeleteSubscription,
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    delete_group = Some(group.id.clone());
-                                                }
-                                            }
-                                            if !group.is_manual() {
-                                                let position = ctx
-                                                    .servers
-                                                    .groups
-                                                    .iter()
-                                                    .position(|candidate| candidate.id == group.id)
-                                                    .unwrap_or_default();
-                                                if ui
-                                                    .small_button("▼")
-                                                    .on_hover_text(t(lang, Key::RoutingMoveDown))
-                                                    .clicked()
-                                                {
-                                                    action = Some(ListAction::MoveGroup {
-                                                        group: position,
-                                                        delta: 1,
-                                                    });
-                                                }
-                                                if ui
-                                                    .small_button("▲")
-                                                    .on_hover_text(t(lang, Key::RoutingMoveUp))
-                                                    .clicked()
-                                                {
-                                                    action = Some(ListAction::MoveGroup {
-                                                        group: position,
-                                                        delta: -1,
-                                                    });
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                                last_row_bottom = Some(ui.min_rect().bottom());
-                                continue;
-                            }
-                        };
+                        let index = display_rows[display];
                         let p = &profiles[index];
                         let is_sel = self.selected.as_deref() == Some(p.id.as_str());
                         let is_active = ctx.servers.active.as_deref() == Some(p.id.as_str());
@@ -3782,7 +3973,7 @@ impl ServersScreen {
                         // through this ui's painter, so the rows around it
                         // paint untouched.
                         let previous_opacity = ui.opacity();
-                        if lifted == Some(index) {
+                        if lifted == Some(display) {
                             ui.multiply_opacity(DRAGGED_ROW_OPACITY);
                         }
                         let detail = row_details.get(&index);
@@ -3806,6 +3997,10 @@ impl ServersScreen {
                                 },
                             },
                             badge,
+                            RowExtras {
+                                order: shape.order.then_some(display + 1),
+                                group: shape.group.then_some(p.group_title.as_str()),
+                            },
                         );
                         ui.set_opacity(previous_opacity);
                         // A primary press that grows past egui's click
@@ -3814,8 +4009,10 @@ impl ServersScreen {
                         // reads. Egui clears the payload on release or
                         // Escape, so the gesture ends even when the window
                         // loses focus mid-drag.
-                        if clicks.row.drag_started_by(egui::PointerButton::Primary) {
-                            egui::DragAndDrop::set_payload(ui.ctx(), DragRow(index));
+                        if clicks.row.drag_started_by(egui::PointerButton::Primary)
+                            && self.view == ServerTab::Emitted
+                        {
+                            egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
                         }
                         if clicks.toggle {
                             action = Some(ListAction::ToggleEnabled(p.id.clone()));
@@ -3832,7 +4029,7 @@ impl ServersScreen {
                             && drop_mark.is_none()
                             && pos.y <= clicks.row.rect.center().y
                         {
-                            drop_mark = Some((index, clicks.row.rect.top() - spacing * 0.5));
+                            drop_mark = Some((display, clicks.row.rect.top() - spacing * 0.5));
                         }
                         last_row_bottom = Some(clicks.row.rect.bottom());
                         // The menu clones the id only when an action is actually
@@ -3873,21 +4070,42 @@ impl ServersScreen {
                         && drop_mark.is_none()
                         && let Some(bottom) = last_row_bottom
                     {
-                        drop_mark = Some((profiles.len(), bottom + spacing * 0.5));
+                        drop_mark = Some((display_rows.len(), bottom + spacing * 0.5));
                     }
                     // The release ends the gesture: egui hands back the
-                    // lifted row's index, and the drop lands it at the gap
-                    // the pointer proposed on this same frame — a release
-                    // off the rows proposed none, so it cancels; Escape
+                    // lifted row's display index, and the drop lands it beside
+                    // the row under the pointer. The rows are a view of the
+                    // stored list — emitted and filtered — so both ends map
+                    // back to profile indices before the list moves; a release
+                    // off the rows proposed none, so it cancels, and Escape
                     // aborts the payload before any release is seen.
                     if let Some((gap, _)) = drop_mark
                         && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
                         && let Some(lifted) = egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
                     {
-                        action = Some(ListAction::Reorder {
-                            from: lifted.0,
-                            gap,
-                        });
+                        let from = lifted.0;
+                        let to = reorder_target(from, gap);
+                        if let Some(&from_profile) = display_rows.get(from)
+                            && to != from
+                        {
+                            // `gap` names the pre-lift display slot the row
+                            // lands in; the stored list also holds rows this
+                            // view hides, so that slot becomes the profile to
+                            // land before (or the end of the view), never a
+                            // raw profile index.
+                            let dest = match display_rows.get(gap) {
+                                Some(&target) => target - if target > from_profile { 1 } else { 0 },
+                                None => display_rows.last().map_or(0, |&last| {
+                                    (if last > from_profile { last - 1 } else { last }) + 1
+                                }),
+                            };
+                            if dest != from_profile {
+                                action = Some(ListAction::Reorder {
+                                    from: from_profile,
+                                    gap: if dest > from_profile { dest + 1 } else { dest },
+                                });
+                            }
+                        }
                     }
                     // The insertion line paints over the rows, clamped into
                     // the viewport so a band-edge drop stays visible.
@@ -3914,34 +4132,6 @@ impl ServersScreen {
                     // following the shrunken content onto the controls.
                     ui.expand_to_include_x(band_right);
                 });
-        }
-        if let Some(id) = delete_group {
-            self.subscription_delete_pending = Some(id);
-        }
-        if let Some(id) = report_group
-            && let Some(group) = ctx.servers.groups.iter().find(|group| group.id == id)
-            && let Some(report) = group
-                .subscription
-                .as_ref()
-                .and_then(|subscription| subscription.report.clone())
-        {
-            self.report_view = Some((group.title.clone(), report));
-        }
-        if let Some(id) = refresh_group {
-            let repaint = ui.ctx().clone();
-            self.start_subscription_fetch(lang, repaint, ctx, id);
-        }
-        if let Some(id) = edit_group
-            && let Some(group) = ctx.servers.groups.iter().find(|group| group.id == id)
-        {
-            let subscription = group.subscription.as_ref();
-            self.subscription_dialog = Some(SubscriptionDraft {
-                editing: Some(id),
-                title: group.title.clone(),
-                url: subscription.map_or_else(String::new, |s| s.url.clone()),
-                custom_user_agent: subscription.is_some_and(|s| s.user_agent_custom),
-                user_agent: subscription.map_or_else(String::new, |s| s.user_agent.clone()),
-            });
         }
 
         // apply deferred list actions (needs &mut profiles)
@@ -3975,19 +4165,6 @@ impl ServersScreen {
                 ctx.settings.routing.active_balancer.clear();
                 ctx.servers.activate(&id);
                 ctx.hooks.mark_dirty();
-            }
-            Some(ListAction::ToggleGroup(id)) => {
-                if !self.collapsed.insert(id.clone()) {
-                    self.collapsed.remove(&id);
-                }
-                self.group_rows_cache = None;
-            }
-            Some(ListAction::MoveGroup { group, delta }) => {
-                let target = group as i32 + delta;
-                if group > 0 && target > 0 && (target as usize) < ctx.servers.groups.len() {
-                    ctx.servers.groups.swap(group, target as usize);
-                    ctx.hooks.mark_dirty();
-                }
             }
             Some(ListAction::Edit(id)) => self.open_editor(ctx.servers, lang, &id),
             Some(ListAction::ToggleEnabled(id)) => {
@@ -4594,34 +4771,65 @@ const TABLE_ACTIVE_WIDTH: f32 = 32.0;
 const TABLE_PROTOCOL_WIDTH: f32 = 150.0;
 const TABLE_ADDRESS_WIDTH: f32 = 210.0;
 const TABLE_LATENCY_WIDTH: f32 = 80.0;
+/// The order number and group name columns, present only on the tabs that
+/// carry them.
+const TABLE_ORDER_WIDTH: f32 = 44.0;
+const TABLE_GROUP_WIDTH: f32 = 140.0;
 /// The smallest width the name column keeps: a narrower band truncates the
 /// name rather than pushing the fixed columns past the viewport.
 const TABLE_MIN_NAME_WIDTH: f32 = 80.0;
 
-/// The six column widths of a table row laid out in `available` points.
+/// Which optional columns a tab carries: `Emitted` numbers its rows in
+/// outbound order, and `All` names each row's group.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TableShape {
+    order: bool,
+    group: bool,
+}
+
+/// The extra cells one row paints beyond the six shared columns.
+#[derive(Clone, Copy, Default)]
+struct RowExtras<'a> {
+    /// The outbound order number, shown only on `Emitted`.
+    order: Option<usize>,
+    /// The row's group title, shown only on `All`.
+    group: Option<&'a str>,
+}
+
+/// The six shared column widths plus the tab's optional columns, laid out in
+/// `available` points.
 #[derive(Clone, Copy)]
 struct TableColumns {
+    order: Option<f32>,
     switch: f32,
     active: f32,
     name: f32,
     protocol: f32,
     address: f32,
     latency: f32,
+    group: Option<f32>,
 }
 
-fn table_columns(available: f32, spacing: f32) -> TableColumns {
+fn table_columns(available: f32, spacing: f32, shape: TableShape) -> TableColumns {
+    let order = shape.order.then_some(TABLE_ORDER_WIDTH);
+    let group = shape.group.then_some(TABLE_GROUP_WIDTH);
+    let cells = 6 + usize::from(order.is_some()) + usize::from(group.is_some());
     let fixed = TABLE_SWITCH_WIDTH
         + TABLE_ACTIVE_WIDTH
         + TABLE_PROTOCOL_WIDTH
         + TABLE_ADDRESS_WIDTH
-        + TABLE_LATENCY_WIDTH;
+        + TABLE_LATENCY_WIDTH
+        + order.unwrap_or(0.0)
+        + group.unwrap_or(0.0);
     TableColumns {
+        order,
         switch: TABLE_SWITCH_WIDTH,
         active: TABLE_ACTIVE_WIDTH,
-        name: (available - fixed - spacing * 5.0).max(TABLE_MIN_NAME_WIDTH),
+        name: (available - fixed - spacing * (cells - 1) as f32).max(TABLE_MIN_NAME_WIDTH),
         protocol: TABLE_PROTOCOL_WIDTH,
         address: TABLE_ADDRESS_WIDTH,
         latency: TABLE_LATENCY_WIDTH,
+        group,
     }
 }
 
@@ -4650,27 +4858,68 @@ fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     );
 }
 
-/// The table's header row: the same six columns as every profile row.
-fn table_header(ui: &mut egui::Ui, lang: Language, columns: TableColumns) {
+/// The table's header row: the tab's columns, and — where the tab is a view —
+/// name, protocol and latency as sort controls. `Emitted`'s order is the
+/// outbound order, so its header never offers a sort.
+fn table_header(
+    ui: &mut egui::Ui,
+    lang: Language,
+    columns: TableColumns,
+    sortable: bool,
+    sort: Option<ViewSort>,
+) -> Option<SortColumn> {
     let weak = |ui: &mut egui::Ui, text: &str| {
         ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
     };
+    let mut clicked = None;
+    let mut column_header =
+        |ui: &mut egui::Ui, text: &str, column: Option<SortColumn>, width: f32| {
+            table_cell(ui, width, |ui| {
+                let Some(column) = column.filter(|_| sortable) else {
+                    weak(ui, text);
+                    return;
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new(text).weak()).frame(false))
+                    .clicked()
+                {
+                    clicked = Some(column);
+                }
+                if let Some(current) = sort.filter(|current| current.column == column) {
+                    ui.label(RichText::new(if current.ascending { "▲" } else { "▼" }).weak());
+                }
+            });
+        };
     ui.horizontal(|ui| {
-        table_cell(ui, columns.switch, |ui| weak(ui, t(lang, Key::Enabled)));
-        table_cell(ui, columns.active, |ui| {
-            weak(ui, t(lang, Key::SrvTableActive))
-        });
-        table_cell(ui, columns.name, |ui| weak(ui, t(lang, Key::SrvName)));
-        table_cell(ui, columns.protocol, |ui| {
-            weak(ui, t(lang, Key::SrvProtocol));
-        });
-        table_cell(ui, columns.address, |ui| {
-            weak(ui, t(lang, Key::SrvTableAddress));
-        });
-        table_cell(ui, columns.latency, |ui| {
-            weak(ui, t(lang, Key::SrvTableLatency));
-        });
+        if let Some(width) = columns.order {
+            column_header(ui, t(lang, Key::SrvTableOrder), None, width);
+        }
+        column_header(ui, t(lang, Key::Enabled), None, columns.switch);
+        column_header(ui, t(lang, Key::SrvTableActive), None, columns.active);
+        column_header(
+            ui,
+            t(lang, Key::SrvName),
+            Some(SortColumn::Name),
+            columns.name,
+        );
+        column_header(
+            ui,
+            t(lang, Key::SrvProtocol),
+            Some(SortColumn::Protocol),
+            columns.protocol,
+        );
+        column_header(ui, t(lang, Key::SrvTableAddress), None, columns.address);
+        column_header(
+            ui,
+            t(lang, Key::SrvTableLatency),
+            Some(SortColumn::Latency),
+            columns.latency,
+        );
+        if let Some(width) = columns.group {
+            column_header(ui, t(lang, Key::SrvTableGroup), None, width);
+        }
     });
+    clicked
 }
 
 /// The drag payload of one server-list row: the row's index in the list as
@@ -4688,6 +4937,11 @@ fn table_header(ui: &mut egui::Ui, lang: Language, columns: TableColumns) {
 /// [`egui::DragAndDrop::take_payload`].
 #[derive(Clone, Copy)]
 struct DragRow(usize);
+
+/// The drag payload of one group tab: the tab itself. Only group tabs are
+/// draggable, and only inside their pinned or unpinned band.
+#[derive(Clone)]
+struct DragTab(ServerTab);
 
 /// Opacity of the row being dragged: the source stays in place and dims,
 /// while the insertion line carries the drop position.
@@ -4747,55 +5001,67 @@ fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> 
     RowDetail { protocol, endpoint }
 }
 
-/// The grouped list: `Manual` first, then groups in stored order, one header
-/// per group and its matching rows. A collapsed group keeps its header but
-/// sheds its rows. `search` filters rows by name or address, case-insensitively;
-/// headers stay with their match counts.
-fn group_list_rows(
+/// One tab's rows as profile indices, in view order: the emitted set in
+/// generated order, one group's rows in stored order, or every row in grouped
+/// order for `All`. `search` filters by name or address, case-insensitively,
+/// and only inside this tab. `sort` is a view over the rows — except on
+/// `Emitted`, whose order is the outbound order and is never sorted here.
+fn tab_rows(
     servers: &crate::model::ServersFile,
-    collapsed: &std::collections::BTreeSet<String>,
+    tab: &ServerTab,
     search: &str,
-) -> Vec<GroupListRow> {
+    sort: Option<ViewSort>,
+) -> Vec<usize> {
     let needle = search.trim().to_lowercase();
-    let mut rows = Vec::new();
-    let manual = servers.groups.iter().position(|group| group.is_manual());
-    let order: Vec<usize> = manual
-        .into_iter()
-        .chain((0..servers.groups.len()).filter(|index| Some(*index) != manual))
-        .collect();
-    for group_index in order {
-        let group = &servers.groups[group_index];
-        let members: Vec<usize> = servers
+    let group_members = |group_id: &str| -> Vec<usize> {
+        servers
             .profiles
             .iter()
             .enumerate()
-            .filter(|(_, profile)| profile.group_id() == group.id)
+            .filter(|(_, profile)| profile.group_id() == group_id)
             .map(|(index, _)| index)
-            .collect();
-        let matched: Vec<usize> = members
-            .iter()
-            .copied()
-            .filter(|&index| {
-                if needle.is_empty() {
-                    return true;
-                }
-                let profile = &servers.profiles[index];
-                profile.name.to_lowercase().contains(&needle)
-                    || profile
-                        .server_address()
-                        .is_some_and(|address| address.to_lowercase().contains(&needle))
-            })
-            .collect();
-        rows.push(GroupListRow::Header {
-            group: group_index,
-            total: members.len(),
-            matched: matched.len(),
-        });
-        if !collapsed.contains(&group.id) {
-            rows.extend(matched.into_iter().map(GroupListRow::Profile));
+            .collect()
+    };
+    let mut rows: Vec<usize> = match tab {
+        ServerTab::Emitted => servers.emitted_set().order,
+        ServerTab::All => servers.grouped_order(),
+        ServerTab::Manual => group_members(crate::model::servers::MANUAL_GROUP_ID),
+        ServerTab::Group(id) => group_members(id),
+    };
+    rows.retain(|&index| {
+        if needle.is_empty() {
+            return true;
         }
+        let profile = &servers.profiles[index];
+        profile.name.to_lowercase().contains(&needle)
+            || profile
+                .server_address()
+                .is_some_and(|address| address.to_lowercase().contains(&needle))
+    });
+    if *tab != ServerTab::Emitted
+        && let Some(sort) = sort
+    {
+        sort_view_rows(&mut rows, &servers.profiles, sort);
     }
     rows
+}
+
+/// Sort a tab's row indices by one column, ascending or descending. The
+/// stored order is untouched; only the view's row list moves.
+fn sort_view_rows(rows: &mut [usize], profiles: &[crate::model::ServerProfile], sort: ViewSort) {
+    match sort.column {
+        SortColumn::Name => rows.sort_by_cached_key(|&index| profiles[index].name.to_lowercase()),
+        SortColumn::Protocol => {
+            rows.sort_by_cached_key(|&index| profiles[index].outbound.protocol.as_str().to_owned());
+        }
+        SortColumn::Latency => rows.sort_by_cached_key(|&index| match profiles[index].latency_ms {
+            Some(value) if value >= 0 => (0u8, value),
+            _ => (1u8, i64::MAX),
+        }),
+    }
+    if !sort.ascending {
+        rows.reverse();
+    }
 }
 
 /// A Unix time as `YYYY-MM-DD` (UTC), for an expiry caption. No calendar
@@ -4887,9 +5153,19 @@ fn server_list_row(
     detail: &RowDetail,
     row: RowState<'_>,
     latency: &LatencyBadge,
+    extras: RowExtras<'_>,
 ) -> RowClicks {
-    let columns = table_columns(ui.available_width(), ui.spacing().item_spacing.x);
+    let shape = TableShape {
+        order: extras.order.is_some(),
+        group: extras.group.is_some(),
+    };
+    let columns = table_columns(ui.available_width(), ui.spacing().item_spacing.x, shape);
     let inner = ui.horizontal(|ui| {
+        if let (Some(width), Some(order)) = (columns.order, extras.order) {
+            table_cell(ui, width, |ui| {
+                ui.add(egui::Label::new(RichText::new(order.to_string()).weak()).selectable(false));
+            });
+        }
         let mut checked = row.switch.checked;
         table_cell(ui, columns.switch, |ui| {
             let response = ui.add_enabled(
@@ -4935,6 +5211,11 @@ fn server_list_row(
                     .selectable(false),
             );
         });
+        if let (Some(width), Some(group)) = (columns.group, extras.group) {
+            table_cell(ui, width, |ui| {
+                ui.add(egui::Label::new(RichText::new(group).weak()).truncate());
+            });
+        }
         (toggled, name_resp)
     });
     let (toggled, name_resp) = inner.inner;
@@ -9172,12 +9453,12 @@ mod tests {
         AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
         EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
         FINGERPRINTS, FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft,
-        RawField, Request, RowDetail, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers,
-        ServerProfile, ServersScreen, StatusLine, TlsProbe, TransportTabCtx,
-        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
+        RawField, Request, RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
+        SeededBuffers, ServerProfile, ServerTab, ServersScreen, StatusLine, TlsProbe,
+        TransportTabCtx, basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
         editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
         fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        status_colors_of, status_toast_expired, xmux_section,
+        status_colors_of, status_toast_expired, tab_order, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -9749,46 +10030,460 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(harness.query_by_label("Feed report").is_some());
     }
 
-    #[test]
-    fn the_grouped_list_renders_headers_collapse_and_search() {
+    /// A rig with the reserved manual group holding `manual` and one `Feed`
+    /// group holding `feed`; every row is emitted.
+    fn tab_rig(manual: &[&str], feed: &[&str]) -> (UiTestRig, String) {
         use crate::model::servers::Group;
-        use crate::model::{OutboundModel as Model, Protocol, ServerProfile as Profile};
-
         let mut rig = UiTestRig::default();
-        let mut manual = Profile::new("ManualOne", Model::new(Protocol::Freedom));
-        manual.enabled = true;
-        let feed = Group::new("Feed");
-        let feed_id = feed.id.clone();
-        let mut feed_one = Profile::new("FeedOne", Model::new(Protocol::Freedom));
-        feed_one.group = feed_id;
-        feed_one.enabled = true;
-        rig.servers.profiles = vec![manual, feed_one];
-        rig.servers.groups.push(feed);
+        let group = Group::new("Feed");
+        let feed_id = group.id.clone();
+        let mut profiles = Vec::new();
+        for name in manual {
+            let mut profile = ServerProfile::new(*name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            profiles.push(profile);
+        }
+        for name in feed {
+            let mut profile = ServerProfile::new(*name, OutboundModel::new(Protocol::Freedom));
+            profile.group = feed_id.clone();
+            profile.enabled = true;
+            profiles.push(profile);
+        }
+        rig.servers.profiles = profiles;
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        (rig, feed_id)
+    }
+
+    #[test]
+    fn the_tab_bar_pins_the_defaults_first_and_bands_the_group_tabs() {
+        use crate::model::servers::Group;
+        let mut servers = crate::model::ServersFile::default();
+        let mut first = Group::new("First");
+        first.pinned = true;
+        let second = Group::new("Second");
+        let mut third = Group::new("Third");
+        third.pinned = true;
+        let (first_id, second_id, third_id) =
+            (first.id.clone(), second.id.clone(), third.id.clone());
+        servers.groups = vec![Group::manual(), first, second, third];
+
+        // Pinned groups follow the defaults in stored order, then the
+        // unpinned band in stored order.
+        assert_eq!(
+            tab_order(&servers),
+            vec![
+                ServerTab::Emitted,
+                ServerTab::Manual,
+                ServerTab::All,
+                ServerTab::Group(first_id),
+                ServerTab::Group(third_id),
+                ServerTab::Group(second_id),
+            ]
+        );
+
+        let rig = UiTestRig {
+            servers,
+            ..UiTestRig::default()
+        };
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let x = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().x
+        };
+        assert!(
+            x(&harness, t(Language::En, Key::SrvTabEmitted))
+                < x(&harness, t(Language::En, Key::SrvTabManual))
+        );
+        assert!(
+            x(&harness, t(Language::En, Key::SrvTabManual))
+                < x(&harness, t(Language::En, Key::SrvTabAll))
+        );
+        assert!(x(&harness, t(Language::En, Key::SrvTabAll)) < x(&harness, "First"));
+        assert!(x(&harness, "First") < x(&harness, "Third"));
+        assert!(x(&harness, "Third") < x(&harness, "Second"));
+    }
+
+    #[test]
+    fn the_screen_opens_on_emitted_and_all_lists_every_row_with_its_group() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let group = Group::new("Feed");
+        let feed_id = group.id.clone();
+        let mut active = ServerProfile::new("Active", OutboundModel::new(Protocol::Freedom));
+        active.enabled = true;
+        let disabled = ServerProfile::new("Disabled", OutboundModel::new(Protocol::Freedom));
+        let mut fed = ServerProfile::new("Fed", OutboundModel::new(Protocol::Freedom));
+        fed.group = feed_id;
+        fed.enabled = true;
+        rig.servers.profiles = vec![active, disabled, fed];
+        rig.servers.groups.push(group);
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
         rig.servers.hydrate_group_titles();
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
 
-        assert!(harness.get_all_by_label_contains("Manual").next().is_some());
-        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
-        assert!(harness.query_by_label("ManualOne").is_some());
-        assert!(harness.query_by_label("FeedOne").is_some());
+        // The opening tab is `Emitted`: the active server leads, switched-off
+        // servers are absent, and the row order is the generated order.
+        assert_eq!(harness.state().0.view, ServerTab::Emitted);
+        assert!(harness.query_by_label("Active").is_some());
+        assert!(harness.query_by_label("Fed").is_some());
+        assert!(
+            harness.query_by_label("Disabled").is_none(),
+            "a switched-off server is not emitted"
+        );
+        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().y
+        };
+        assert!(y(&harness, "Active") < y(&harness, "Fed"));
 
-        // Collapse the Feed header: its row goes, the header stays.
         harness
-            .get_all_by_label("▾")
-            .nth(1)
-            .expect("the Feed header")
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
-        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
-        assert!(harness.query_by_label("FeedOne").is_none());
+        assert_eq!(harness.state().0.view, ServerTab::All);
+        for name in ["Active", "Disabled", "Fed"] {
+            assert!(
+                harness.query_by_label(name).is_some(),
+                "All must list {name:?}"
+            );
+        }
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvTableGroup))
+                .next()
+                .is_some(),
+            "All must carry the group column"
+        );
+        assert!(harness.query_all_by_label("Feed").next().is_some());
+    }
 
-        // Search filters rows across groups and keeps both headers.
-        harness.state_mut().0.search = "FeedOne".into();
+    #[test]
+    fn a_group_tab_lists_only_its_group_and_search_stays_inside_the_tab() {
+        let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
-        assert!(harness.query_by_label("ManualOne").is_none());
-        assert!(harness.get_all_by_label_contains("Manual").next().is_some());
-        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
+        harness.get_by_label("Feed").click();
+        harness.run();
+        assert_eq!(harness.state().0.view, ServerTab::Group(feed_id));
+        assert!(harness.query_by_label("Bravo").is_some());
+        assert!(
+            harness.query_by_label("Alpha").is_none(),
+            "a group tab hides the other groups' rows"
+        );
+
+        harness.state_mut().0.search = "Alpha".into();
+        harness.run();
+        assert!(
+            harness.query_by_label("Bravo").is_none(),
+            "the search matches inside this tab only"
+        );
+        assert!(harness.query_by_label("Alpha").is_none());
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabManual))
+            .click();
+        harness.state_mut().0.search = "Bravo".into();
+        harness.run();
+        assert!(harness.query_by_label("Alpha").is_none());
+        assert!(
+            harness.query_by_label("Bravo").is_none(),
+            "a feed row never leaks into the Manual tab's search"
+        );
+    }
+
+    #[test]
+    fn switching_tabs_clears_the_selection_and_the_view_sort() {
+        let (rig, _) = tab_rig(&["Alpha", "Bravo"], &["Charlie"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Alpha").click();
+        harness.run();
+        assert!(harness.state().0.selected.is_some());
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.selected, None);
+        assert_eq!(harness.state().0.view_sort, None);
+
+        // A view sort exists while the tab shows and is dropped on the way
+        // out, so returning to the tab cannot resurrect it.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .click();
+        harness.run();
+        assert!(harness.state().0.view_sort.is_some());
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvTabManual),
+            )
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.view_sort, None);
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.view_sort, None);
+    }
+
+    #[test]
+    fn group_tabs_sort_the_view_only_and_emitted_has_no_header_sort() {
+        let mut rig = UiTestRig::default();
+        for (name, latency) in [("Bravo", 300), ("Alpha", 20), ("Charlie", 40)] {
+            let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            profile.latency_ms = Some(latency);
+            rig.servers.profiles.push(profile);
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        // `Emitted` orders the outbound document: its header offers no sort.
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::SrvName)
+                )
+                .is_none(),
+            "the Emitted tab must not sort"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        let stored: Vec<String> = harness
+            .state()
+            .1
+            .servers
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect();
+        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().y
+        };
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .click();
+        harness.run();
+        assert!(y(&harness, "Alpha") < y(&harness, "Bravo"));
+        assert!(y(&harness, "Bravo") < y(&harness, "Charlie"));
+        assert_eq!(
+            harness
+                .state()
+                .1
+                .servers
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect::<Vec<_>>(),
+            stored,
+            "a view sort never touches the stored order"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .click();
+        harness.run();
+        assert!(
+            y(&harness, "Charlie") < y(&harness, "Bravo"),
+            "a second click reverses the view"
+        );
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvTableLatency),
+            )
+            .click();
+        harness.run();
+        assert!(y(&harness, "Alpha") < y(&harness, "Charlie"));
+        assert!(y(&harness, "Charlie") < y(&harness, "Bravo"));
+        assert_eq!(
+            harness
+                .state()
+                .1
+                .servers
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect::<Vec<_>>(),
+            stored
+        );
+    }
+
+    #[test]
+    fn a_group_tab_pins_and_unpins_from_its_context_menu() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let first = Group::new("First");
+        let second = Group::new("Second");
+        let second_id = second.id.clone();
+        rig.servers.groups = vec![Group::manual(), first, second];
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let x = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().x
+        };
+        assert!(x(&harness, "First") < x(&harness, "Second"));
+
+        harness.get_by_label("Second").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvPinTab))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .1
+                .servers
+                .groups
+                .iter()
+                .find(|group| group.id == second_id)
+                .expect("the group exists")
+                .pinned,
+            "the pin is stored on the group record"
+        );
+        assert!(harness.state().1.requests.dirty);
+        assert!(
+            x(&harness, "Second") < x(&harness, "First"),
+            "a pinned tab moves directly after the defaults"
+        );
+
+        harness.get_by_label("Second").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvUnpinTab))
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .1
+                .servers
+                .groups
+                .iter()
+                .find(|group| group.id == second_id)
+                .expect("the group exists")
+                .pinned
+        );
+        assert!(x(&harness, "First") < x(&harness, "Second"));
+    }
+
+    #[test]
+    fn dragging_a_group_tab_persists_its_bands_drag_order() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let first = Group::new("First");
+        let second = Group::new("Second");
+        let (first_id, second_id) = (first.id.clone(), second.id.clone());
+        rig.servers.groups = vec![Group::manual(), first, second];
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let first_rect = harness.get_by_label("First").rect();
+        let second_rect = harness.get_by_label("Second").rect();
+        drag_list_row(
+            &mut harness,
+            first_rect.center(),
+            egui::pos2(second_rect.right() - 4.0, second_rect.center().y),
+        );
+        assert!(
+            !egui::DragAndDrop::has_any_payload(&harness.ctx),
+            "the release must end the drag"
+        );
+        let ids: Vec<&str> = harness
+            .state()
+            .1
+            .servers
+            .groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                crate::model::servers::MANUAL_GROUP_ID,
+                second_id.as_str(),
+                first_id.as_str()
+            ],
+            "the dropped position is the stored group order"
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "a tab drag persists the new group order"
+        );
+    }
+
+    #[test]
+    fn the_subscription_card_renders_only_on_a_subscription_tab() {
+        use crate::model::servers::{Group, RefreshReport, Subscription, SubscriptionMetadata};
+        let mut rig = UiTestRig::default();
+        let mut group = Group::new("Feed");
+        group.subscription = Some(Subscription {
+            url: "https://example.com/sub".into(),
+            metadata: Some(SubscriptionMetadata {
+                upload: 1_000,
+                download: 2_000,
+                total: 10_000,
+                update_interval: 12,
+                ..Default::default()
+            }),
+            report: Some(RefreshReport::default()),
+            ..Default::default()
+        });
+        let feed_id = group.id.clone();
+        let mut profile = ServerProfile::new("FeedOne", OutboundModel::new(Protocol::Freedom));
+        profile.group = feed_id;
+        profile.enabled = true;
+        rig.servers.profiles = vec![profile];
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvRefreshSubscription))
+                .is_none(),
+            "the Emitted view owns no feed"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabManual))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvRefreshSubscription))
+                .is_none(),
+            "a manual group owns no feed"
+        );
+
+        harness.get_by_label("Feed").click();
+        harness.run();
+        for label in [
+            Key::SrvRefreshSubscription,
+            Key::SrvShowReport,
+            Key::SrvDeleteSubscription,
+        ] {
+            assert!(
+                harness.query_by_label(t(Language::En, label)).is_some(),
+                "the subscription card must offer {label:?}"
+            );
+        }
+        assert!(
+            harness.query_by_label_contains("30%").is_some(),
+            "the card shows the quota use"
+        );
+        assert!(
+            harness.query_by_label_contains("12 h").is_some(),
+            "the card shows the provider's update hint"
+        );
     }
 
     #[test]
@@ -9857,10 +10552,9 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn double_clicking_a_row_opens_the_editor_window() {
         let mut rig = UiTestRig::default();
-        rig.servers.profiles.push(ServerProfile::new(
-            "Tokyo",
-            OutboundModel::new(Protocol::Freedom),
-        ));
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
         let mut harness = fast_servers_harness(rig);
         harness.run();
         harness.get_by_label("Tokyo").click();
@@ -9882,10 +10576,9 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn the_row_context_menu_offers_the_five_commands_and_no_inline_icons() {
         let mut rig = UiTestRig::default();
-        rig.servers.profiles.push(ServerProfile::new(
-            "Tokyo",
-            OutboundModel::new(Protocol::Freedom),
-        ));
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
         assert!(
@@ -9962,6 +10655,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         },
                     },
                     &badge,
+                    RowExtras::default(),
                 );
             });
         harness.run();
@@ -10019,6 +10713,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                 },
                 &badge,
+                RowExtras::default(),
             );
             *clicked_ui.borrow_mut() |= clicks.row.clicked() || clicks.name.clicked();
         });
@@ -10048,6 +10743,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         },
                     },
                     &badge,
+                    RowExtras::default(),
                 );
                 *toggled_ui.borrow_mut() |= clicks.toggle;
             });
@@ -10084,6 +10780,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                 },
                 &badge,
+                RowExtras::default(),
             );
             *doubled_ui.borrow_mut() |= clicks.double_clicked();
         });
@@ -10124,15 +10821,14 @@ Authentication: ML-KEM-768, Post-Quantum
             .collect()
     }
 
-    /// A three-profile rig, all rows visible, in list order
-    /// Alpha → Bravo → Charlie.
+    /// A three-profile rig, all rows visible on the opening `Emitted` tab, in
+    /// list order Alpha → Bravo → Charlie.
     fn drag_rig() -> UiTestRig {
         let mut rig = UiTestRig::default();
         for name in ["Alpha", "Bravo", "Charlie"] {
-            rig.servers.profiles.push(ServerProfile::new(
-                name,
-                OutboundModel::new(Protocol::Freedom),
-            ));
+            let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            rig.servers.profiles.push(profile);
         }
         rig
     }
@@ -10522,8 +11218,10 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn row_probe_button_requests_one_profile_and_shows_dedicated_feedback() {
         let mut rig = UiTestRig::default();
-        let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
-        let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        osaka.enabled = true;
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka);
         let mut harness = screen_harness(rig, ServersScreen::default());
@@ -10627,7 +11325,9 @@ Authentication: ML-KEM-768, Post-Quantum
         // whole chain or the core refuses to start.
         let mut rig = UiTestRig::default();
         let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
-        let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        osaka.enabled = true;
         tokyo.outbound.chain_via(osaka.tag());
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
@@ -16628,10 +17328,11 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut rig = UiTestRig::default();
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
-            let profile = ServerProfile::new(
+            let mut profile = ServerProfile::new(
                 format!("Server {i:02}"),
                 OutboundModel::new(Protocol::Freedom),
             );
+            profile.enabled = true;
             ids.push(profile.id.clone());
             rig.servers.profiles.push(profile);
         }

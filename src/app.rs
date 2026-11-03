@@ -4953,10 +4953,9 @@ mod unsaved_changes_tests {
         use std::rc::Rc;
 
         let mut rig = UiTestRig::default();
-        rig.servers.profiles.push(ServerProfile::new(
-            "Tokyo",
-            OutboundModel::new(Protocol::Freedom),
-        ));
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
         let deferred = Rc::new(Cell::new(None));
         let deferred_ui = Rc::clone(&deferred);
         let attempt_quit = Rc::new(Cell::new(false));
