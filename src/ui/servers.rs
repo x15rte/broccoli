@@ -2098,15 +2098,18 @@ pub struct ServersScreen {
     revealed_add: bool,
     import_open: bool,
     import_text: String,
-    subscription_dialog: Option<SubscriptionDraft>,
+    /// The group a paste or converted batch lands in: the group the tab that
+    /// opened the import dialog owns.
+    import_group: Option<String>,
+    group_dialog: Option<GroupDraft>,
     /// The one in-flight refresh; the group it targets travels with the
     /// result.
     subscription_fetch: Request<SubscriptionFetchResult>,
     /// The group the in-flight fetch targets, so deleting another group does
     /// not cancel it.
     subscription_fetch_group: Option<String>,
-    /// A subscription group awaiting delete confirmation.
-    subscription_delete_pending: Option<String>,
+    /// A group awaiting delete confirmation.
+    group_delete_pending: Option<String>,
     import_parsed: Vec<Result<links::ParsedLink, String>>,
     import_parsed_source: Option<String>,
     import_refusals: Vec<(String, String)>,
@@ -2187,15 +2190,75 @@ struct ImportParseResult {
     ignored_names: Vec<String>,
 }
 
-/// The add-subscription dialog's fields.
+/// The New group dialog's fields: a kind choice, then the fields that kind
+/// asks for. Editing an existing group keeps its kind — the dialog shows the
+/// kind but never offers the other one.
 #[derive(Default)]
-struct SubscriptionDraft {
-    /// The group being edited; `None` creates a new subscription.
+struct GroupDraft {
+    /// The group being edited; `None` creates a new group.
     editing: Option<String>,
+    kind: crate::model::servers::GroupKind,
     title: String,
     url: String,
     custom_user_agent: bool,
     user_agent: String,
+}
+
+impl GroupDraft {
+    /// The dialog for `group`: its kind is fixed and its fields are the
+    /// stored ones.
+    fn editing(group: &crate::model::servers::Group) -> Self {
+        let subscription = group.subscription.as_ref();
+        Self {
+            editing: Some(group.id.clone()),
+            kind: group.kind(),
+            title: group.title.clone(),
+            url: subscription
+                .map(|subscription| subscription.url.clone())
+                .unwrap_or_default(),
+            custom_user_agent: subscription
+                .is_some_and(|subscription| subscription.user_agent_custom),
+            user_agent: subscription
+                .map(|subscription| subscription.user_agent.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The kind names the New group dialog offers.
+fn group_kind_label(kind: crate::model::servers::GroupKind, lang: Language) -> &'static str {
+    match kind {
+        crate::model::servers::GroupKind::Manual => t(lang, Key::SrvGroupKindManual),
+        crate::model::servers::GroupKind::Subscription => t(lang, Key::SrvGroupKindSubscription),
+    }
+}
+
+/// The add draft's group picker: every group by title, writing the chosen
+/// group's id and cached title into the draft. A draft pointing at a vanished
+/// group shows `Manual`, which is where its row would land. Returns whether the
+/// user chose another group.
+fn group_picker(
+    ui: &mut egui::Ui,
+    servers: &crate::model::ServersFile,
+    profile: &mut crate::model::servers::ServerProfile,
+) -> bool {
+    let selected = servers
+        .group_title_of(profile.group_id())
+        .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE);
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("servers.add-draft.group")
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for group in &servers.groups {
+                let current = profile.group_id() == group.id.as_str();
+                if ui.selectable_label(current, &group.title).clicked() && !current {
+                    profile.group = group.id.clone();
+                    profile.group_title = group.title.clone();
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 /// One fetch worker's terminal result.
@@ -2885,6 +2948,13 @@ impl ServersScreen {
                 let mut added_names = Vec::new();
                 if accepted_count > 0 {
                     let first_id = result.accepted[0].id.clone();
+                    // The tab that opened the import owns the batch: the
+                    // dialog captured its group, so a tab switch while the
+                    // paste validated cannot retarget it.
+                    let target_group = self
+                        .import_group
+                        .clone()
+                        .unwrap_or_else(|| self.target_group(uictx.servers));
                     for profile in result.accepted {
                         if uictx
                             .servers
@@ -2895,7 +2965,7 @@ impl ServersScreen {
                             uictx.servers.replace_profile(uictx.settings, profile);
                         } else {
                             added_names.push(profile.name.clone());
-                            uictx.servers.adopt_profile(profile);
+                            uictx.servers.adopt_profile_in(profile, &target_group);
                         }
                     }
                     if uictx.servers.active.is_none() {
@@ -3417,6 +3487,31 @@ impl ServersScreen {
         self.tab_rows_cache = None;
     }
 
+    /// The group a new row lands in: the current tab's group, or `Manual` when
+    /// the tab is a view over the profile list. A group that disappeared falls
+    /// back to `Manual` with it.
+    fn target_group(&self, servers: &crate::model::ServersFile) -> String {
+        match &self.view {
+            ServerTab::Group(id) if servers.group_title_of(id).is_some() => id.clone(),
+            _ => crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+        }
+    }
+
+    /// Point an add draft at the group the current tab owns, so the picker
+    /// opens on that group and the row lands there.
+    fn target_profile_group(
+        &self,
+        servers: &crate::model::ServersFile,
+        profile: &mut crate::model::servers::ServerProfile,
+    ) {
+        let group = self.target_group(servers);
+        profile.group_title = servers
+            .group_title_of(&group)
+            .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE)
+            .to_owned();
+        profile.group = group;
+    }
+
     /// The tab bar above the table. The three default tabs stay first and
     /// undeletable; every group tab follows in its band, can be dragged inside
     /// that band, and pins or unpins from its context menu.
@@ -3424,6 +3519,8 @@ impl ServersScreen {
         let tabs = tab_order(ctx.servers);
         let mut select: Option<ServerTab> = None;
         let mut pin: Option<(String, bool)> = None;
+        let mut rename: Option<String> = None;
+        let mut delete: Option<String> = None;
         let mut tab_rects: Vec<(ServerTab, egui::Rect)> = Vec::with_capacity(tabs.len());
         ui.horizontal_wrapped(|ui| {
             for tab in &tabs {
@@ -3460,6 +3557,15 @@ impl ServersScreen {
                         pin = Some((id.clone(), value));
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button(t(lang, Key::SrvRenameGroup)).clicked() {
+                        rename = Some(id.clone());
+                        ui.close();
+                    }
+                    if ui.button(t(lang, Key::SrvDeleteGroup)).clicked() {
+                        delete = Some(id.clone());
+                        ui.close();
+                    }
                 });
             }
         });
@@ -3468,6 +3574,16 @@ impl ServersScreen {
         {
             group.pinned = pinned;
             ctx.hooks.mark_dirty();
+        }
+        // Only a group tab opens these: the three default tabs carry no group
+        // record, so they can be neither renamed nor deleted.
+        if let Some(id) = rename
+            && let Some(group) = ctx.servers.groups.iter().find(|group| group.id == id)
+        {
+            self.group_dialog = Some(GroupDraft::editing(group));
+        }
+        if let Some(id) = delete {
+            self.group_delete_pending = Some(id);
         }
         if let Some(tab) = select {
             self.select_tab(tab);
@@ -3549,9 +3665,7 @@ impl ServersScreen {
         };
         let id = group.id.clone();
         let title = group.title.clone();
-        let url = subscription.url.clone();
-        let custom_user_agent = subscription.user_agent_custom;
-        let user_agent = subscription.user_agent.clone();
+        let draft = GroupDraft::editing(group);
         let report = subscription.report.clone();
         let metadata = subscription.metadata.as_ref();
         let unit = ctx.settings.traffic_unit;
@@ -3623,10 +3737,7 @@ impl ServersScreen {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button(t(lang, Key::SrvDeleteSubscription))
-                        .clicked()
-                    {
+                    if ui.small_button(t(lang, Key::SrvDeleteGroup)).clicked() {
                         delete = true;
                     }
                     let report_button = if report.is_some() {
@@ -3657,16 +3768,10 @@ impl ServersScreen {
             self.report_view = Some((title.clone(), report));
         }
         if delete {
-            self.subscription_delete_pending = Some(id.clone());
+            self.group_delete_pending = Some(id);
         }
         if edit {
-            self.subscription_dialog = Some(SubscriptionDraft {
-                editing: Some(id),
-                title,
-                url,
-                custom_user_agent,
-                user_agent,
-            });
+            self.group_dialog = Some(draft);
         }
     }
 
@@ -3727,10 +3832,11 @@ impl ServersScreen {
             });
             if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
                 self.import_open = true;
+                self.import_group = Some(self.target_group(ctx.servers));
                 self.profile_validation_report = None;
             }
-            if ui.button(t(lang, Key::SrvAddSubscription)).clicked() {
-                self.subscription_dialog = Some(SubscriptionDraft::default());
+            if ui.button(t(lang, Key::SrvNewGroup)).clicked() {
+                self.group_dialog = Some(GroupDraft::default());
             }
             // The latency command is gated like the table's own probe
             // paths, plus the no-profiles case.
@@ -3781,10 +3887,12 @@ impl ServersScreen {
         });
         if let Some(protocol) = add_proto {
             self.draft_tab = EditorTab::Basic;
-            self.add.draft = Some(ProfileDraft::add(ServerProfile::new(
+            let mut profile = ServerProfile::new(
                 t_fmt(lang, Key::SrvNewDraftName, &[&protocol.as_str()]),
                 OutboundModel::new(protocol),
-            )));
+            );
+            self.target_profile_group(ctx.servers, &mut profile);
+            self.add.draft = Some(ProfileDraft::add(profile));
             // A fresh draft starts with no memoized verdicts, so this is a
             // fresh validation subject whatever the previous draft left.
             self.profile_validation_report = None;
@@ -8287,6 +8395,11 @@ impl ServersScreen {
                                 .desired_width(260.0),
                         );
                         ui.separator();
+                        ui.label(t(lang, Key::SrvTableGroup));
+                        if group_picker(ui, uictx.servers, &mut draft.profile) {
+                            draft.edited();
+                        }
+                        ui.separator();
                         ui.label(t(lang, Key::SrvProtocol));
                         ui.monospace(draft.profile.outbound.protocol.as_str());
                     });
@@ -8624,30 +8737,54 @@ impl ServersScreen {
         self.slot_mut(kind).probe.show_output = !close_requested && !close_clicked;
     }
 
-    /// Commit the add-subscription dialog: create the group and start its
-    /// first fetch.
-    fn finish_subscription_dialog(
+    /// Commit the group dialog: create a manual or subscription group, or
+    /// apply the edited one. A new subscription group is returned so the
+    /// caller starts its first fetch.
+    fn finish_group_dialog(
         &mut self,
         lang: Language,
         ctx: &egui::Context,
         uictx: &mut ServersCtx<'_>,
     ) {
-        let Some(draft) = self.subscription_dialog.take() else {
+        let Some(draft) = self.group_dialog.take() else {
             return;
         };
-        let url = draft.url.trim().to_owned();
-        if url.is_empty() {
-            return;
+        let fetch = ServersScreen::commit_group_dialog(draft, uictx.servers, uictx.settings);
+        uictx.hooks.mark_dirty();
+        if let Some(id) = fetch {
+            self.start_subscription_fetch(lang, ctx.clone(), uictx, id);
         }
-        if let Some(id) = draft.editing.clone() {
+    }
+
+    /// Apply a group dialog draft. A new group starts empty (manual) or with
+    /// its feed state (subscription), under a title unique among the groups.
+    /// An edited group keeps the kind it was created with: the dialog shows a
+    /// subscription's URL fields only for a subscription group, and a manual
+    /// group can never gain feed state here.
+    fn commit_group_dialog(
+        draft: GroupDraft,
+        servers: &mut crate::model::ServersFile,
+        settings: &mut crate::model::Settings,
+    ) -> Option<String> {
+        use crate::model::servers::{Group, GroupKind, Subscription};
+        if let Some(id) = draft.editing {
             let title = draft.title.trim();
             if !title.is_empty() {
-                crate::model::servers::rename_group(uictx.servers, uictx.settings, &id, title);
+                crate::model::servers::rename_group(servers, settings, &id, title);
             }
-            if let Some(group) = uictx.servers.groups.iter_mut().find(|group| group.id == id)
+            let kind = servers
+                .groups
+                .iter()
+                .find(|group| group.id == id)
+                .map(Group::kind)
+                .unwrap_or(GroupKind::Manual);
+            if kind == GroupKind::Subscription
+                && let Some(group) = servers.groups.iter_mut().find(|group| group.id == id)
                 && let Some(subscription) = group.subscription.as_mut()
             {
-                subscription.url = draft.url.clone();
+                if !draft.url.trim().is_empty() {
+                    subscription.url = draft.url.trim().to_owned();
+                }
                 subscription.user_agent_custom = draft.custom_user_agent;
                 subscription.user_agent = if draft.custom_user_agent {
                     draft.user_agent.trim().to_owned()
@@ -8656,31 +8793,41 @@ impl ServersScreen {
                 };
                 subscription.title_auto = false;
             }
-            uictx.hooks.mark_dirty();
-            return;
+            return None;
         }
-        let base = if draft.title.trim().is_empty() {
-            "Subscription"
-        } else {
-            draft.title.trim()
-        };
-        let title = uictx.servers.unique_group_title(base, None);
-        let mut group = crate::model::servers::Group::new(title);
-        group.subscription = Some(crate::model::servers::Subscription {
-            url,
-            user_agent_custom: draft.custom_user_agent,
-            user_agent: if draft.custom_user_agent {
-                draft.user_agent.trim().to_owned()
-            } else {
-                String::new()
-            },
-            title_auto: draft.title.trim().is_empty(),
-            ..Default::default()
-        });
-        let id = group.id.clone();
-        uictx.servers.groups.push(group);
-        uictx.hooks.mark_dirty();
-        self.start_subscription_fetch(lang, ctx.clone(), uictx, id);
+        match draft.kind {
+            GroupKind::Manual => {
+                let title = servers.unique_group_title(draft.title.trim(), None);
+                servers.groups.push(Group::new(title));
+                None
+            }
+            GroupKind::Subscription => {
+                let url = draft.url.trim().to_owned();
+                if url.is_empty() {
+                    return None;
+                }
+                let base = if draft.title.trim().is_empty() {
+                    "Subscription"
+                } else {
+                    draft.title.trim()
+                };
+                let mut group = Group::new(servers.unique_group_title(base, None));
+                group.subscription = Some(Subscription {
+                    url,
+                    user_agent_custom: draft.custom_user_agent,
+                    user_agent: if draft.custom_user_agent {
+                        draft.user_agent.trim().to_owned()
+                    } else {
+                        String::new()
+                    },
+                    title_auto: draft.title.trim().is_empty(),
+                    ..Default::default()
+                });
+                let id = group.id.clone();
+                servers.groups.push(group);
+                Some(id)
+            }
+        }
     }
 
     fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
@@ -8760,65 +8907,97 @@ impl ServersScreen {
                 self.report_view = Some(view);
             }
         }
-        // Add-subscription dialog.
-        if self.subscription_dialog.is_some() {
-            let mut add = false;
+        // New group / rename group dialog.
+        if self.group_dialog.is_some() {
+            let mut commit = false;
+            let dialog_title = match self.group_dialog.as_ref() {
+                Some(draft) => match (&draft.editing, draft.kind) {
+                    (Some(_), crate::model::servers::GroupKind::Manual) => {
+                        t(lang, Key::SrvRenameGroupTitle).to_owned()
+                    }
+                    (Some(_), crate::model::servers::GroupKind::Subscription) => {
+                        t(lang, Key::SrvEditSubscription).to_owned()
+                    }
+                    (None, _) => t(lang, Key::SrvNewGroup).to_owned(),
+                },
+                None => unreachable!("the dialog is open"),
+            };
+            let size = [480.0, 300.0];
             let close_requested = popup::show(
                 ctx,
-                "servers.add-subscription",
-                if self
-                    .subscription_dialog
-                    .as_ref()
-                    .is_some_and(|draft| draft.editing.is_some())
-                {
-                    t(lang, Key::SrvEditSubscription)
-                } else {
-                    t(lang, Key::SrvAddSubscription)
-                },
-                [480.0, 250.0],
+                "servers.group-dialog",
+                &dialog_title,
+                size,
                 false,
                 |ui| {
-                    let draft = self
-                        .subscription_dialog
-                        .as_mut()
-                        .expect("the dialog is open");
-                    crate::ui::widgets::text_field(
-                        ui,
-                        t(lang, Key::SrvSubscriptionUrl),
-                        &mut draft.url,
-                        "https://",
-                    );
+                    let draft = self.group_dialog.as_mut().expect("the dialog is open");
+                    ui.horizontal(|ui| {
+                        ui.label(t(lang, Key::SrvGroupKind));
+                        if draft.editing.is_some() {
+                            // The kind is fixed at creation: an existing group
+                            // never offers the other one.
+                            ui.weak(group_kind_label(draft.kind, lang));
+                        } else {
+                            for kind in [
+                                crate::model::servers::GroupKind::Manual,
+                                crate::model::servers::GroupKind::Subscription,
+                            ] {
+                                ui.selectable_value(
+                                    &mut draft.kind,
+                                    kind,
+                                    group_kind_label(kind, lang),
+                                );
+                            }
+                        }
+                    });
                     crate::ui::widgets::text_field(
                         ui,
                         t(lang, Key::SrvSubscriptionTitle),
                         &mut draft.title,
                         "",
                     );
-                    ui.checkbox(&mut draft.custom_user_agent, t(lang, Key::SrvUseCustomUa));
-                    if draft.custom_user_agent {
-                        crate::ui::widgets::text_field(ui, "User-Agent", &mut draft.user_agent, "");
+                    if draft.kind == crate::model::servers::GroupKind::Subscription {
+                        crate::ui::widgets::text_field(
+                            ui,
+                            t(lang, Key::SrvSubscriptionUrl),
+                            &mut draft.url,
+                            "https://",
+                        );
+                        ui.checkbox(&mut draft.custom_user_agent, t(lang, Key::SrvUseCustomUa));
+                        if draft.custom_user_agent {
+                            crate::ui::widgets::text_field(
+                                ui,
+                                "User-Agent",
+                                &mut draft.user_agent,
+                                "",
+                            );
+                        }
                     }
+                    let ready = match draft.kind {
+                        crate::model::servers::GroupKind::Manual => true,
+                        crate::model::servers::GroupKind::Subscription => {
+                            !draft.url.trim().is_empty()
+                        }
+                    };
                     let label = if draft.editing.is_some() {
                         t(lang, Key::SrvSaveSubscription)
                     } else {
-                        t(lang, Key::SrvAddSubscription)
+                        t(lang, Key::SrvCreateGroup)
                     };
-                    if ui
-                        .add_enabled(!draft.url.trim().is_empty(), egui::Button::new(label))
-                        .clicked()
-                    {
-                        add = true;
+                    if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
+                        commit = true;
                     }
                 },
             );
-            if add {
-                self.finish_subscription_dialog(lang, ctx, uictx);
+            if commit {
+                self.finish_group_dialog(lang, ctx, uictx);
             } else if close_requested {
-                self.subscription_dialog = None;
+                self.group_dialog = None;
             }
         }
-        // Delete-subscription confirmation.
-        if let Some(id) = self.subscription_delete_pending.clone() {
+        // Delete-group confirmation. Only a group tab opens it: the default
+        // tabs and the reserved group have no delete action at all.
+        if let Some(id) = self.group_delete_pending.clone() {
             let title = uictx
                 .servers
                 .groups
@@ -8830,12 +9009,12 @@ impl ServersScreen {
             let mut cancel = false;
             let close_requested = popup::show(
                 ctx,
-                "servers.delete-subscription",
-                t(lang, Key::SrvDeleteSubscription),
+                "servers.delete-group",
+                t(lang, Key::SrvDeleteGroupTitle),
                 [440.0, 150.0],
                 false,
                 |ui| {
-                    ui.label(t_fmt(lang, Key::SrvDeleteSubscriptionConfirm, &[&title]));
+                    ui.label(t_fmt(lang, Key::SrvDeleteGroupConfirm, &[&title]));
                     ui.horizontal(|ui| {
                         if ui.button(t(lang, Key::Delete)).clicked() {
                             confirm = true;
@@ -8847,32 +9026,18 @@ impl ServersScreen {
                 },
             );
             if confirm {
-                uictx.servers.groups.retain(|group| group.id != id);
-                uictx
-                    .servers
-                    .profiles
-                    .retain(|profile| profile.group_id() != id);
-                let active_lost = uictx.servers.active.as_deref().is_some_and(|active| {
-                    active != crate::model::inbound::DIRECT_OUTBOUND_TAG
-                        && active != crate::model::inbound::BLOCK_OUTBOUND_TAG
-                        && !uictx
-                            .servers
-                            .profiles
-                            .iter()
-                            .any(|profile| profile.id == active)
-                });
-                if active_lost || uictx.servers.profiles.is_empty() {
-                    uictx.servers.active =
-                        Some(crate::model::inbound::BLOCK_OUTBOUND_TAG.to_owned());
-                }
+                // The fetch belongs to the group it was started for: a group
+                // deleted mid-fetch cancels that fetch and no other.
                 if self.subscription_fetch_group.as_deref() == Some(id.as_str()) {
                     self.subscription_fetch.cancel();
                     self.subscription_fetch_group = None;
                 }
-                uictx.hooks.mark_dirty();
-                self.subscription_delete_pending = None;
+                if uictx.servers.delete_group(&id) {
+                    uictx.hooks.mark_dirty();
+                }
+                self.group_delete_pending = None;
             } else if cancel || close_requested {
-                self.subscription_delete_pending = None;
+                self.group_delete_pending = None;
             }
         }
         for kind in [DraftKind::Existing, DraftKind::Add] {
@@ -9452,13 +9617,13 @@ mod tests {
     use super::{
         AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
         EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
-        FINGERPRINTS, FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft,
-        RawField, Request, RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
-        SeededBuffers, ServerProfile, ServerTab, ServersScreen, StatusLine, TlsProbe,
-        TransportTabCtx, basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
-        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
-        fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
-        status_colors_of, status_toast_expired, tab_order, xmux_section,
+        FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language, LatencyBadge, LeaveAction,
+        ProfileDraft, RawField, Request, RowDetail, RowExtras, RowState, RowSwitch,
+        STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab, ServersScreen,
+        StatusLine, TlsProbe, TransportTabCtx, basic_tab_inline_verdict, drag_scroll_delta,
+        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
+        server_list_row, status_colors_of, status_toast_expired, tab_order, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -10318,6 +10483,415 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn creating_a_manual_group_starts_it_empty_and_opens_its_tab() {
+        use crate::model::servers::GroupKind;
+        let mut rig = UiTestRig::default();
+        let mut own = ServerProfile::new("Own", OutboundModel::new(Protocol::Freedom));
+        own.enabled = true;
+        rig.servers.profiles.push(own);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvNewGroup))
+            .click();
+        harness.run();
+        assert!(
+            harness.state().0.group_dialog.is_some(),
+            "New group opens one dialog"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionUrl))
+                .is_none(),
+            "a manual group asks only for a title"
+        );
+        replace_field_text(
+            &mut harness,
+            t(Language::En, Key::SrvSubscriptionTitle),
+            "Mine",
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvCreateGroup))
+            .click();
+        harness.run();
+
+        let servers = &harness.state().1.servers;
+        let group = servers
+            .groups
+            .iter()
+            .find(|group| group.title == "Mine")
+            .expect("the dialog creates the group");
+        assert_eq!(GroupKind::Manual, group.kind());
+        assert!(
+            !servers
+                .profiles
+                .iter()
+                .any(|profile| profile.group_id() == group.id),
+            "a manual group starts empty"
+        );
+        assert!(
+            harness.query_by_label("Mine").is_some(),
+            "the new group owns a tab"
+        );
+        assert!(
+            harness
+                .state()
+                .1
+                .servers
+                .groups
+                .iter()
+                .any(|group| group.title == "Mine"),
+            "the group record is stored"
+        );
+    }
+
+    #[test]
+    fn creating_a_group_twice_suffixes_the_second_title() {
+        let mut harness = screen_harness(UiTestRig::default(), ServersScreen::default());
+        harness.run();
+        for _ in 0..2 {
+            harness
+                .get_by_label(t(Language::En, Key::SrvNewGroup))
+                .click();
+            harness.run();
+            replace_field_text(
+                &mut harness,
+                t(Language::En, Key::SrvSubscriptionTitle),
+                "Mine",
+            );
+            harness
+                .get_by_label(t(Language::En, Key::SrvCreateGroup))
+                .click();
+            harness.run();
+        }
+        let titles: Vec<&str> = harness
+            .state()
+            .1
+            .servers
+            .groups
+            .iter()
+            .map(|group| group.title.as_str())
+            .filter(|title| *title != crate::model::servers::MANUAL_GROUP_TITLE)
+            .collect();
+        assert_eq!(
+            titles,
+            ["Mine", "Mine (1)"],
+            "a colliding title takes the existing numeric suffix"
+        );
+    }
+
+    #[test]
+    fn the_group_dialog_reveals_the_feed_fields_only_for_subscription() {
+        let mut harness = screen_harness(UiTestRig::default(), ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvNewGroup))
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label(t(Language::En, Key::SrvCreateGroup))
+                .accesskit_node()
+                .is_disabled(),
+            "a manual group needs no feed URL"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvGroupKindSubscription))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionUrl))
+                .is_some(),
+            "a subscription group asks for its URL"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvUseCustomUa))
+                .is_some(),
+            "a subscription group asks for its User-Agent mode"
+        );
+        assert!(
+            harness
+                .get_by_label(t(Language::En, Key::SrvCreateGroup))
+                .accesskit_node()
+                .is_disabled(),
+            "a subscription group cannot be created without a URL"
+        );
+    }
+
+    #[test]
+    fn the_group_dialog_creates_a_subscription_group_that_fetches_on_create() {
+        use crate::model::servers::{GroupKind, Subscription};
+        let mut servers = crate::model::ServersFile::default();
+        let draft = GroupDraft {
+            kind: GroupKind::Subscription,
+            title: "Feed".into(),
+            url: "https://example.com/sub".into(),
+            custom_user_agent: true,
+            user_agent: "broccoli/1".into(),
+            ..GroupDraft::default()
+        };
+        let id = ServersScreen::commit_group_dialog(
+            draft,
+            &mut servers,
+            &mut crate::model::Settings::default(),
+        )
+        .expect("a new subscription group starts its first fetch");
+
+        let group = servers
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .expect("the group is stored");
+        assert_eq!(GroupKind::Subscription, group.kind());
+        assert_eq!("Feed", group.title);
+        let subscription: &Subscription = group
+            .subscription
+            .as_ref()
+            .expect("a subscription group carries its feed");
+        assert_eq!("https://example.com/sub", subscription.url);
+        assert!(subscription.user_agent_custom);
+        assert_eq!("broccoli/1", subscription.user_agent);
+        assert!(!subscription.title_auto);
+    }
+
+    #[test]
+    fn an_edited_draft_cannot_convert_a_manual_group_into_a_subscription() {
+        use crate::model::servers::{Group, GroupKind};
+        let mine = Group::new("Mine");
+        let id = mine.id.clone();
+        let mut servers = crate::model::ServersFile::default();
+        servers.groups.push(mine);
+        let draft = GroupDraft {
+            editing: Some(id.clone()),
+            kind: GroupKind::Subscription,
+            title: "Mine".into(),
+            url: "https://example.com/sub".into(),
+            ..GroupDraft::default()
+        };
+        let fetch = ServersScreen::commit_group_dialog(
+            draft,
+            &mut servers,
+            &mut crate::model::Settings::default(),
+        );
+        assert!(fetch.is_none(), "an edited group never starts a fetch");
+        let group = servers
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .expect("the group stays");
+        assert_eq!(
+            GroupKind::Manual,
+            group.kind(),
+            "the kind is fixed at creation"
+        );
+        assert!(group.subscription.is_none());
+    }
+
+    #[test]
+    fn a_group_tab_renames_its_group_and_every_tag_it_prefixes() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let group = Group::new("Feed");
+        let feed_id = group.id.clone();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.group = feed_id;
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        harness.get_by_label("Feed").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvRenameGroup))
+            .click();
+        harness.run();
+        replace_field_text(
+            &mut harness,
+            t(Language::En, Key::SrvSubscriptionTitle),
+            "Mine",
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvSaveSubscription))
+            .click();
+        harness.run();
+
+        let servers = &harness.state().1.servers;
+        assert!(
+            servers.groups.iter().any(|group| group.title == "Mine"),
+            "the group takes the new title"
+        );
+        assert_eq!(
+            "[Mine] Tokyo",
+            servers.profiles[0].tag(),
+            "the rename rewrites every tag the group prefixes"
+        );
+        assert!(
+            harness.query_by_label("Mine").is_some(),
+            "the tab shows the new title"
+        );
+    }
+
+    #[test]
+    fn deleting_a_group_tab_asks_first_then_removes_its_servers_and_moves_the_route() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let group = Group::new("Feed");
+        let feed_id = group.id.clone();
+        let mut fed = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        fed.group = feed_id.clone();
+        fed.enabled = true;
+        let fed_id = fed.id.clone();
+        let own = ServerProfile::new("Own", OutboundModel::new(Protocol::Freedom));
+        rig.servers.profiles = vec![own, fed];
+        rig.servers.groups.push(group);
+        rig.servers.active = Some(fed_id.clone());
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        harness.get_by_label("Feed").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvDeleteGroup))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .1
+                .servers
+                .groups
+                .iter()
+                .any(|group| group.id == feed_id),
+            "the confirmation has not deleted the group yet"
+        );
+        harness.get_by_label(t(Language::En, Key::Delete)).click();
+        harness.run();
+
+        let servers = &harness.state().1.servers;
+        assert!(
+            !servers.groups.iter().any(|group| group.id == feed_id),
+            "the group record is gone"
+        );
+        assert!(
+            !servers.profiles.iter().any(|profile| profile.id == fed_id),
+            "the group's servers are gone"
+        );
+        assert_eq!(
+            Some(crate::model::inbound::BLOCK_OUTBOUND_TAG),
+            servers.active.as_deref(),
+            "deleting the active server moves the route to Block"
+        );
+        assert!(
+            harness.query_by_label("Feed").is_none(),
+            "the group's tab is gone"
+        );
+    }
+
+    #[test]
+    fn the_default_tabs_offer_no_group_rename_or_delete() {
+        let (rig, _) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        for tab in [Key::SrvTabEmitted, Key::SrvTabManual, Key::SrvTabAll] {
+            harness.get_by_label(t(Language::En, tab)).click_secondary();
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label(t(Language::En, Key::SrvRenameGroup))
+                    .is_none(),
+                "the {tab:?} tab cannot be renamed"
+            );
+            assert!(
+                harness
+                    .query_by_label(t(Language::En, Key::SrvDeleteGroup))
+                    .is_none(),
+                "the {tab:?} tab cannot be deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_add_editor_group_defaults_to_the_current_tab() {
+        // From the two views, a new server lands in `Manual`.
+        let (rig, _) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_add_editor(&mut harness);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvTableGroup))
+                .is_some(),
+            "the add editor offers a group picker"
+        );
+        let draft = harness
+            .state()
+            .0
+            .add
+            .draft
+            .as_ref()
+            .expect("the add editor opens");
+        assert_eq!(
+            crate::model::servers::MANUAL_GROUP_ID,
+            draft.profile.group_id()
+        );
+
+        // From a group tab, the same command targets that group.
+        let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Feed").click();
+        harness.run();
+        open_add_editor(&mut harness);
+        let draft = harness
+            .state()
+            .0
+            .add
+            .draft
+            .as_ref()
+            .expect("the add editor opens");
+        assert_eq!(feed_id, draft.profile.group_id());
+    }
+
+    #[test]
+    fn opening_the_import_from_a_group_tab_targets_that_group() {
+        let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Feed").click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvImportLinks))
+            .click();
+        harness.run();
+        assert_eq!(
+            Some(feed_id),
+            harness.state().0.import_group.clone(),
+            "a paste lands in the tab that opened it"
+        );
+
+        let (rig, _) = tab_rig(&["Alpha"], &["Bravo"]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvImportLinks))
+            .click();
+        harness.run();
+        assert_eq!(
+            Some(crate::model::servers::MANUAL_GROUP_ID.to_owned()),
+            harness.state().0.import_group.clone(),
+            "a view falls back to Manual"
+        );
+    }
+
+    #[test]
     fn a_group_tab_pins_and_unpins_from_its_context_menu() {
         use crate::model::servers::Group;
         let mut rig = UiTestRig::default();
@@ -10469,7 +11043,7 @@ Authentication: ML-KEM-768, Post-Quantum
         for label in [
             Key::SrvRefreshSubscription,
             Key::SrvShowReport,
-            Key::SrvDeleteSubscription,
+            Key::SrvDeleteGroup,
         ] {
             assert!(
                 harness.query_by_label(t(Language::En, label)).is_some(),
@@ -10500,6 +11074,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // toolbar row.
         for label in [
             t(Language::En, Key::SrvAddServer),
+            t(Language::En, Key::SrvNewGroup),
             t(Language::En, Key::SrvImportLinks),
             t(Language::En, Key::TestLatency),
             t(Language::En, Key::SrvSortByLatency),
@@ -17575,6 +18150,49 @@ Authentication: ML-KEM-768, Post-Quantum
             .expect("the field renders")
             .click();
         harness.run_steps(2);
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .unwrap_or_else(|| panic!("the clicked {label:?} field takes focus"))
+            .type_text(text);
+        harness.run_steps(2);
+    }
+
+    /// Open the add editor on the Freedom protocol through the toolbar menu.
+    fn open_add_editor(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        harness
+            .get_by_label(t(Language::En, Key::SrvAddServer))
+            .click();
+        harness.run();
+        harness
+            .query_all_by_role_and_label(egui::accesskit::Role::Button, Protocol::Freedom.as_str())
+            .next()
+            .expect("the protocol menu offers Freedom")
+            .click();
+        harness.run();
+    }
+
+    /// Replace the text of the text field `label`: click it like a user,
+    /// select all, then type over the selection.
+    fn replace_field_text(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        label: &str,
+        text: &str,
+    ) {
+        let field = harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, label)
+            .next()
+            .unwrap_or_else(|| panic!("the {label:?} field must render"));
+        field.scroll_to_me();
+        harness.run();
+        harness
+            .query_all_by_role_and_label(egui::accesskit::Role::TextInput, label)
+            .next()
+            .expect("the field renders")
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
         harness
             .get_all_by_role(egui::accesskit::Role::TextInput)
             .find(|node| node.is_focused())

@@ -61,6 +61,24 @@ impl Group {
     pub fn is_manual(&self) -> bool {
         self.id == MANUAL_GROUP_ID
     }
+    /// The group's kind, derived from whether it carries feed state. A kind is
+    /// fixed at creation: nothing converts a manual group into a subscription
+    /// group or the reverse.
+    pub fn kind(&self) -> GroupKind {
+        if self.subscription.is_some() {
+            GroupKind::Subscription
+        } else {
+            GroupKind::Manual
+        }
+    }
+}
+
+/// What a group is: hand-managed rows, or a provider's feed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupKind {
+    #[default]
+    Manual,
+    Subscription,
 }
 
 /// The provider-bound state of a subscription group. Body fetching fills the
@@ -626,20 +644,47 @@ impl ServersFile {
     }
     /// Append a profile from an import or a copy: an unknown group falls back
     /// to `Manual`, and the name is made unique inside its group.
-    pub fn adopt_profile(&mut self, mut profile: ServerProfile) {
+    pub fn adopt_profile(&mut self, profile: ServerProfile) {
         let group_id = profile.group_id().to_owned();
-        let group_id = if self.group_title_of(&group_id).is_some() {
+        self.adopt_profile_in(profile, &group_id);
+    }
+    /// Append a profile into `group_id` — the group the tab that launched the
+    /// add, paste or conversion owns. An unknown or missing group falls back
+    /// to `Manual`, and the name is made unique inside the target group.
+    pub fn adopt_profile_in(&mut self, mut profile: ServerProfile, group_id: &str) {
+        let group_id = if self.group_title_of(group_id).is_some() {
             group_id
         } else {
-            MANUAL_GROUP_ID.to_owned()
+            MANUAL_GROUP_ID
         };
-        profile.name = self.unique_profile_name(&group_id, &profile.name, None);
+        profile.name = self.unique_profile_name(group_id, &profile.name, None);
         profile.group_title = self
-            .group_title_of(&group_id)
+            .group_title_of(group_id)
             .unwrap_or(MANUAL_GROUP_TITLE)
             .to_owned();
-        profile.group = group_id;
+        profile.group = group_id.to_owned();
         self.profiles.push(profile);
+    }
+    /// Delete a group and its servers. The reserved `Manual` group cannot be
+    /// deleted, and neither can a group that does not exist, so this returns
+    /// `false` for both without touching the file. When one of the deleted
+    /// servers was the active route — or the group held the last servers — the
+    /// route moves to Block.
+    pub fn delete_group(&mut self, id: &str) -> bool {
+        if id == MANUAL_GROUP_ID || self.group_title_of(id).is_none() {
+            return false;
+        }
+        self.groups.retain(|group| group.id != id);
+        self.profiles.retain(|profile| profile.group_id() != id);
+        let active_lost = self.active.as_deref().is_some_and(|active| {
+            active != DIRECT_OUTBOUND_TAG
+                && active != BLOCK_OUTBOUND_TAG
+                && !self.profiles.iter().any(|profile| profile.id == active)
+        });
+        if active_lost || self.profiles.is_empty() {
+            self.active = Some(BLOCK_OUTBOUND_TAG.to_owned());
+        }
+        true
     }
     /// Atomic save (tmp + rename).
     pub fn save(&self) -> anyhow::Result<()> {
@@ -2132,5 +2177,140 @@ mod tests {
             servers.rename_group(MANUAL_GROUP_ID, "Renamed").is_empty(),
             "the reserved group cannot be renamed"
         );
+    }
+
+    #[test]
+    fn adopting_a_profile_into_a_group_targets_that_group() {
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut taken = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        taken.group = feed_id.clone();
+        let mut servers = ServersFile {
+            groups: vec![Group::manual(), feed],
+            profiles: vec![taken],
+            ..ServersFile::default()
+        };
+        servers.hydrate_group_titles();
+
+        let imported = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        servers.adopt_profile_in(imported, &feed_id);
+        let added = servers
+            .profiles
+            .iter()
+            .find(|profile| profile.group_id() == feed_id && profile.name == "Tokyo (1)")
+            .expect("the name is made unique inside the target group");
+        assert_eq!("[Feed] Tokyo (1)", added.tag());
+
+        let elsewhere = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        servers.adopt_profile_in(elsewhere, "missing-group");
+        assert!(
+            servers
+                .profiles
+                .iter()
+                .any(|profile| profile.name == "Osaka" && profile.group_id() == MANUAL_GROUP_ID),
+            "an unknown target group falls back to Manual"
+        );
+    }
+
+    #[test]
+    fn a_group_kind_comes_from_its_subscription_state() {
+        assert_eq!(GroupKind::Manual, Group::new("Mine").kind());
+        assert_eq!(GroupKind::Manual, Group::manual().kind());
+        let mut feed = Group::new("Feed");
+        feed.subscription = Some(Subscription::default());
+        assert_eq!(GroupKind::Subscription, feed.kind());
+        feed.subscription = None;
+        assert_eq!(
+            GroupKind::Manual,
+            feed.kind(),
+            "a group without feed state is a manual group"
+        );
+    }
+
+    #[test]
+    fn group_titles_stay_unique_with_the_existing_suffix() {
+        let mut servers = ServersFile::default();
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        servers.groups.push(feed);
+        assert_eq!(servers.unique_group_title("Feed", None), "Feed (1)");
+        assert_eq!(
+            servers.unique_group_title("Feed", Some(&feed_id)),
+            "Feed",
+            "the renamed group keeps its own title"
+        );
+        assert_eq!(
+            servers.unique_group_title("Manual", None),
+            "Manual (1)",
+            "the reserved group's title is taken too"
+        );
+        assert_eq!(servers.unique_group_title("", None), "Group");
+        assert_eq!(servers.unique_group_title("  Trimmed  ", None), "Trimmed");
+    }
+
+    #[test]
+    fn deleting_a_group_removes_its_servers_and_moves_a_lost_route_to_block() {
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut own = ServerProfile::new("Own", OutboundModel::new(Protocol::Freedom));
+        own.enabled = true;
+        let mut fed = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        fed.group = feed_id.clone();
+        fed.enabled = true;
+        let fed_id = fed.id.clone();
+        let mut servers = ServersFile {
+            profiles: vec![own, fed],
+            groups: vec![Group::manual(), feed],
+            active: Some(fed_id.clone()),
+            ..ServersFile::default()
+        };
+        servers.hydrate_group_titles();
+
+        assert!(servers.delete_group(&feed_id));
+        assert!(
+            !servers.groups.iter().any(|group| group.id == feed_id),
+            "the group record is gone"
+        );
+        assert!(
+            !servers.profiles.iter().any(|profile| profile.id == fed_id),
+            "the group's servers are gone"
+        );
+        assert!(servers.profiles.iter().any(|profile| profile.name == "Own"));
+        assert_eq!(
+            servers.active.as_deref(),
+            Some(crate::model::inbound::BLOCK_OUTBOUND_TAG),
+            "deleting the active server moves the route to Block"
+        );
+
+        assert!(
+            !servers.delete_group(MANUAL_GROUP_ID),
+            "the reserved group cannot be deleted"
+        );
+        assert!(servers.groups.iter().any(Group::is_manual));
+        assert!(
+            !servers.delete_group("missing"),
+            "an unknown group changes nothing"
+        );
+    }
+
+    #[test]
+    fn deleting_a_group_leaves_a_route_to_another_group_alone() {
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut own = ServerProfile::new("Own", OutboundModel::new(Protocol::Freedom));
+        own.enabled = true;
+        let own_id = own.id.clone();
+        let mut fed = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        fed.group = feed_id.clone();
+        let servers = ServersFile {
+            profiles: vec![own, fed],
+            groups: vec![Group::manual(), feed],
+            active: Some(own_id.clone()),
+            ..ServersFile::default()
+        };
+        let mut servers = servers;
+        servers.hydrate_group_titles();
+        assert!(servers.delete_group(&feed_id));
+        assert_eq!(servers.active.as_deref(), Some(own_id.as_str()));
     }
 }
