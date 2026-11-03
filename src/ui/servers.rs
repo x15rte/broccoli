@@ -1881,12 +1881,12 @@ enum ListAction {
     Export(String),
     Delete(String),
     ProbeLatency(String),
-    /// Move the dragged profile (its index in the list as drawn) to the gap
-    /// its drop proposed (an index in the same list; see
-    /// [`reorder_target`]).
-    Reorder {
+    /// Move the dragged profile (its index in the list as drawn) to a sibling
+    /// inside its own group: `before` names the row it lands ahead of, or its
+    /// block's tail. A cross-block drop never reaches this action.
+    MoveInGroup {
         from: usize,
-        gap: usize,
+        before: Option<usize>,
     },
 }
 
@@ -3865,13 +3865,12 @@ impl ServersScreen {
                 }
             }
             if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
-                // Ascending latency; timeouts and never-measured last. A sort
-                // reorders rows only: the active route names a server id and
-                // does not follow the row order.
-                ctx.servers.profiles.sort_by_key(|p| match p.latency_ms {
-                    Some(v) if v >= 0 => (0, v),
-                    _ => (1, i64::MAX),
-                });
+                // Ascending latency inside each group; timeouts and
+                // never-measured last. The sort rewrites the stored row order
+                // for real, but never moves a row into another group's block:
+                // the group tab order fixes the blocks. The active route
+                // names a server id and does not follow the row order.
+                ctx.servers.sort_rows_by_latency();
                 ctx.hooks.mark_dirty();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4050,7 +4049,26 @@ impl ServersScreen {
                         .then(|| ui.input(|i| i.pointer.interact_pos()))
                         .flatten()
                         .filter(|pos| viewport.contains(*pos));
+                    // The generated order pins the active server first, so its
+                    // row is a block of its own and accepts no drop.
+                    let active_index = ctx
+                        .servers
+                        .active
+                        .as_deref()
+                        .and_then(|id| profiles.iter().position(|profile| profile.id == id));
+                    // Only a gap inside the lifted row's own block proposes a
+                    // drop: another group's block would silently rewrite the
+                    // wrong group's row order.
+                    let droppable = |gap: usize| {
+                        lifted.is_some_and(|from| {
+                            block_drop(&display_rows, profiles, active_index, from, gap).is_some()
+                        })
+                    };
                     let mut drop_mark: Option<(usize, f32)> = None;
+                    // Whether the row under the pointer already named the
+                    // gap: a refused gap proposes nothing, and no later
+                    // block's gap may claim a drop the pointer never aimed at.
+                    let mut gap_decided = false;
                     let mut last_row_bottom: Option<f32> = None;
                     for display in rows {
                         let index = display_rows[display];
@@ -4114,11 +4132,13 @@ impl ServersScreen {
                         // A primary press that grows past egui's click
                         // threshold lifts this row: the row's own drag sense
                         // hands egui the payload, whose index the drop half
-                        // reads. Egui clears the payload on release or
-                        // Escape, so the gesture ends even when the window
-                        // loses focus mid-drag.
+                        // reads. The active server is pinned first by the
+                        // generated order, so its row never lifts. Egui clears
+                        // the payload on release or Escape, so the gesture
+                        // ends even when the window loses focus mid-drag.
                         if clicks.row.drag_started_by(egui::PointerButton::Primary)
                             && self.view == ServerTab::Emitted
+                            && !is_active
                         {
                             egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
                         }
@@ -4132,12 +4152,17 @@ impl ServersScreen {
                         // The row under the pointer proposes the gap: above
                         // its midline inserts before it, below inserts after
                         // it. Comparing midlines (not rects) leaves no dead
-                        // band in the rows' spacing.
+                        // band in the rows' spacing. Only the lifted row's own
+                        // block proposes one, so a cross-block drop paints no
+                        // insertion line and cannot move a row.
                         if let Some(pos) = drag_pos
-                            && drop_mark.is_none()
+                            && !gap_decided
                             && pos.y <= clicks.row.rect.center().y
                         {
-                            drop_mark = Some((display, clicks.row.rect.top() - spacing * 0.5));
+                            gap_decided = true;
+                            if droppable(display) {
+                                drop_mark = Some((display, clicks.row.rect.top() - spacing * 0.5));
+                            }
                         }
                         last_row_bottom = Some(clicks.row.rect.bottom());
                         // The menu clones the id only when an action is actually
@@ -4173,47 +4198,35 @@ impl ServersScreen {
                     }
                     // Below every laid-out row's midline the drop lands at
                     // the band's end: the visible tail of a scrolled list, or
-                    // the empty space under a short one.
+                    // the empty space under a short one — only while the
+                    // lifted row's block owns that tail, and only when no row
+                    // already named the gap.
                     if drag_pos.is_some()
-                        && drop_mark.is_none()
+                        && !gap_decided
                         && let Some(bottom) = last_row_bottom
+                        && droppable(display_rows.len())
                     {
                         drop_mark = Some((display_rows.len(), bottom + spacing * 0.5));
                     }
                     // The release ends the gesture: egui hands back the
-                    // lifted row's display index, and the drop lands it beside
-                    // the row under the pointer. The rows are a view of the
-                    // stored list — emitted and filtered — so both ends map
-                    // back to profile indices before the list moves; a release
-                    // off the rows proposed none, so it cancels, and Escape
-                    // aborts the payload before any release is seen.
+                    // lifted row's display index, and the drop lands it at the
+                    // proposed gap inside its own block. A release off the
+                    // rows proposed none, so it cancels — and so does a gap
+                    // another group's block owns, because the proposal half
+                    // already refused it. Escape aborts the payload before any
+                    // release is seen. The rows are a view of the stored list
+                    // — emitted and filtered — so the gap maps back through
+                    // the row it lands before, never a raw profile index.
                     if let Some((gap, _)) = drop_mark
                         && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
                         && let Some(lifted) = egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
+                        && let Some(drop) =
+                            block_drop(&display_rows, profiles, active_index, lifted.0, gap)
                     {
-                        let from = lifted.0;
-                        let to = reorder_target(from, gap);
-                        if let Some(&from_profile) = display_rows.get(from)
-                            && to != from
-                        {
-                            // `gap` names the pre-lift display slot the row
-                            // lands in; the stored list also holds rows this
-                            // view hides, so that slot becomes the profile to
-                            // land before (or the end of the view), never a
-                            // raw profile index.
-                            let dest = match display_rows.get(gap) {
-                                Some(&target) => target - if target > from_profile { 1 } else { 0 },
-                                None => display_rows.last().map_or(0, |&last| {
-                                    (if last > from_profile { last - 1 } else { last }) + 1
-                                }),
-                            };
-                            if dest != from_profile {
-                                action = Some(ListAction::Reorder {
-                                    from: from_profile,
-                                    gap: if dest > from_profile { dest + 1 } else { dest },
-                                });
-                            }
-                        }
+                        action = Some(ListAction::MoveInGroup {
+                            from: drop.from,
+                            before: drop.before,
+                        });
                     }
                     // The insertion line paints over the rows, clamped into
                     // the viewport so a band-edge drop stays visible.
@@ -4288,17 +4301,14 @@ impl ServersScreen {
                     }
                 }
             }
-            Some(ListAction::Reorder { from, gap }) => {
+            Some(ListAction::MoveInGroup { from, before }) => {
                 // The payload index was read off this frame's list; a list
                 // that shrank under the gesture (a probe that removed a
-                // profile) simply drops the move.
-                if from < ctx.servers.profiles.len() {
-                    let to = reorder_target(from, gap);
-                    if to != from {
-                        let profile = ctx.servers.profiles.remove(from);
-                        ctx.servers.profiles.insert(to, profile);
-                        ctx.hooks.mark_dirty();
-                    }
+                // profile) simply drops the move. The model refuses a
+                // destination another group owns and reports whether the
+                // stored order actually changed.
+                if ctx.servers.move_profile_in_group(from, before) {
+                    ctx.hooks.mark_dirty();
                 }
             }
             Some(ListAction::Export(id)) => {
@@ -5033,7 +5043,9 @@ fn table_header(
 /// The drag payload of one server-list row: the row's index in the list as
 /// drawn. An index and not the profile id, because a cloned id would allocate
 /// per row; the release reads the payload in the same frame that laid the
-/// list out, so the index still names that row.
+/// list out, so the index still names that row. Only the `Emitted` tab lifts
+/// rows, and only a row that is not the active server: the drag rewrites that
+/// row's own group order, which is the only order the list stores.
 ///
 /// The row's own response is the drag source — it hands egui the payload
 /// through [`egui::DragAndDrop::set_payload`] — instead of
@@ -5062,6 +5074,64 @@ const DRAGGED_ROW_OPACITY: f32 = 0.4;
 /// held at the last visible row's center sits inside it.
 const DRAG_SCROLL_EDGE: f32 = 32.0;
 const DRAG_SCROLL_MAX_SPEED: f32 = 600.0;
+
+/// The stored move one `Emitted` drop asks for: the dragged profile and the
+/// sibling inside the same group it lands ahead of. `before: None` lands it at
+/// its block's tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockDrop {
+    from: usize,
+    before: Option<usize>,
+}
+
+/// Map a drop on the `Emitted` list to a move inside the dragged row's own
+/// group block. `rows` is the list as drawn (profile indices), `from` and
+/// `gap` index that list the way [`reorder_target`] reads them, and `active`
+/// is the profile the generated order pins first — that row is a block of its
+/// own and accepts no drop.
+///
+/// A gap whose neighbours are both another group's rows yields `None`, so a
+/// drop outside the row's block neither paints an insertion line nor changes
+/// the stored order. At a block boundary the gap belongs to the block on the
+/// other side; when the lifted row's block owns that side, the row goes to the
+/// block's tail, because the next row belongs to the following block.
+/// [`move_profile_in_group`](crate::model::ServersFile::move_profile_in_group)
+/// is what then refuses a destination the view alone could not spot.
+fn block_drop(
+    rows: &[usize],
+    profiles: &[ServerProfile],
+    active: Option<usize>,
+    from: usize,
+    gap: usize,
+) -> Option<BlockDrop> {
+    let &from_profile = rows.get(from)?;
+    if Some(from_profile) == active || gap == from || gap == from + 1 {
+        return None;
+    }
+    let group = profiles.get(from_profile)?.group_id();
+    // The lifted row is not a place to land; the gaps beside it are no-ops.
+    let in_block = |display: usize| {
+        rows.get(display).is_some_and(|&index| {
+            index != from_profile
+                && Some(index) != active
+                && profiles
+                    .get(index)
+                    .is_some_and(|profile| profile.group_id() == group)
+        })
+    };
+    let previous = gap.checked_sub(1);
+    let next = (gap < rows.len()).then_some(gap);
+    if !previous.is_some_and(in_block) && !next.is_some_and(in_block) {
+        return None;
+    }
+    let before = next
+        .filter(|&display| in_block(display))
+        .map(|display| rows[display]);
+    Some(BlockDrop {
+        from: from_profile,
+        before,
+    })
+}
 
 /// Where a dragged row lands: `gap` indexes the list as drawn, so a gap past
 /// the row's own slot shifts down one once the row is lifted out; the two
@@ -10483,6 +10553,54 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn a_group_tab_sort_is_a_view_and_leaving_the_tab_drops_it() {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        for name in ["Zulu", "Alpha"] {
+            let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            profile.group = feed_id.clone();
+            rig.servers.profiles.push(profile);
+        }
+        rig.servers.groups.push(feed);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Feed").click();
+        harness.run();
+        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().y
+        };
+        assert!(y(&harness, "Zulu") < y(&harness, "Alpha"));
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .click();
+        harness.run();
+        assert!(
+            y(&harness, "Alpha") < y(&harness, "Zulu"),
+            "the group tab sorts its view"
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Zulu", "Alpha"],
+            "the view sort never rewrites the group's stored order"
+        );
+
+        // Leaving the tab drops the sort: returning shows the stored order.
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.view_sort, None);
+        harness.get_by_label("Feed").click();
+        harness.run();
+        assert!(y(&harness, "Zulu") < y(&harness, "Alpha"));
+    }
+
+    #[test]
     fn creating_a_manual_group_starts_it_empty_and_opens_its_tab() {
         use crate::model::servers::GroupKind;
         let mut rig = UiTestRig::default();
@@ -11412,6 +11530,33 @@ Authentication: ML-KEM-768, Post-Quantum
         screen_harness(rig, ServersScreen::default())
     }
 
+    /// Manual [Alpha, Bravo] then Feed [Charlie, Delta], every row emitted and
+    /// Alpha active, so `Emitted` shows the active row and then each block:
+    /// Alpha → Bravo → Charlie → Delta.
+    fn grouped_drag_rig() -> UiTestRig {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        for (name, group) in [
+            ("Alpha", None),
+            ("Bravo", None),
+            ("Charlie", Some(feed_id.clone())),
+            ("Delta", Some(feed_id)),
+        ] {
+            let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            if let Some(group) = group {
+                profile.group = group;
+            }
+            rig.servers.profiles.push(profile);
+        }
+        rig.servers.groups.push(feed);
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.servers.hydrate_group_titles();
+        rig
+    }
+
     /// Press `from` and move past egui's click threshold, leaving a row drag
     /// in flight at the pointer.
     fn begin_row_drag(
@@ -11440,6 +11585,17 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.step();
         harness.drop_at(to);
         harness.step();
+    }
+
+    /// Click the switch of the row labelled `name`. A row switch carries no
+    /// text of its own, so the row's name finds the checkbox on its line.
+    fn click_row_switch(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>, name: &str) {
+        let row_y = harness.get_by_label(name).rect().center().y;
+        harness
+            .get_all_by_role(egui::accesskit::Role::CheckBox)
+            .find(|node| (node.rect().center().y - row_y).abs() < 2.0)
+            .unwrap_or_else(|| panic!("the {name:?} row must render a switch"))
+            .click();
     }
 
     #[test]
@@ -11561,51 +11717,236 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn dragging_the_active_row_down_keeps_it_active_and_first_on_the_wire() {
-        let mut rig = drag_rig();
-        for profile in &mut rig.servers.profiles {
-            profile.enabled = true;
-        }
-        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
-        let active_tag = rig.servers.profiles[0].tag();
-        let active_id = rig.servers.profiles[0].id.clone();
-        let mut harness = drag_harness(rig);
+    fn dragging_a_row_inside_its_block_rewrites_that_groups_order() {
+        let mut harness = drag_harness(grouped_drag_rig());
         harness.run();
-        let alpha = harness.get_by_label("Alpha").rect();
         let charlie = harness.get_by_label("Charlie").rect();
-        // Below the last row: the leading row lands at the list's end.
+        let delta = harness.get_by_label("Delta").rect();
+        // Delta lands above Charlie: only the Feed block's rows move, and the
+        // generated outbounds follow in the same order.
         drag_list_row(
             &mut harness,
-            alpha.center(),
-            egui::pos2(charlie.center().x, charlie.bottom() + 8.0),
+            delta.center(),
+            egui::pos2(charlie.center().x, charlie.top() + 2.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Bravo", "Delta", "Charlie"]
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "an in-block drag persists the group's row order"
         );
         let rig = &harness.state().1;
-        assert_eq!(profile_names(rig), ["Bravo", "Charlie", "Alpha"]);
-        assert_eq!(
-            rig.servers.active.as_deref(),
-            Some(active_id.as_str()),
-            "the active server keeps its route across a reorder"
-        );
-        // The wire order is independent of the row order: the active server
-        // still leads, and the rest follow the grouped order.
         let config = crate::r#gen::generate_with_api_port(&rig.servers, &rig.settings, 10853)
             .expect("generate config");
         let emitted: Vec<&str> = config["outbounds"]
             .as_array()
             .expect("outbounds is an array")
             .iter()
-            .take(3)
+            .take(4)
             .filter_map(|outbound| outbound["tag"].as_str())
             .collect();
         assert_eq!(
             emitted,
             [
-                active_tag.as_str(),
-                rig.servers.profiles[0].tag().as_str(),
-                rig.servers.profiles[1].tag().as_str(),
+                "[Manual] Alpha",
+                "[Manual] Bravo",
+                "[Feed] Delta",
+                "[Feed] Charlie"
             ],
-            "the active server leads; the rest keep grouped order"
+            "the emitted order is the active server, then each block's row order"
         );
+    }
+
+    #[test]
+    fn a_drop_outside_the_rows_block_is_refused() {
+        let mut harness = drag_harness(grouped_drag_rig());
+        harness.run();
+        let bravo = harness.get_by_label("Bravo").rect();
+        let delta = harness.get_by_label("Delta").rect();
+        // Delta belongs to Feed; Bravo's gap is inside the Manual block.
+        drag_list_row(
+            &mut harness,
+            delta.center(),
+            egui::pos2(bravo.center().x, bravo.top() + 2.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Bravo", "Charlie", "Delta"],
+            "a cross-block drop must not move the row"
+        );
+        assert!(
+            !harness.state().1.requests.dirty,
+            "a refused drop is not a configuration change"
+        );
+    }
+
+    #[test]
+    fn switching_an_emitted_row_off_drops_it_from_the_tab_and_the_configuration() {
+        let mut rig = drag_rig();
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        let mut harness = drag_harness(rig);
+        harness.run();
+        click_row_switch(&mut harness, "Bravo");
+        harness.run();
+        assert!(
+            harness.query_by_label("Bravo").is_none(),
+            "a switched-off row leaves the Emitted tab"
+        );
+        assert!(harness.query_by_label("Alpha").is_some());
+        assert!(!harness.state().1.servers.profiles[1].enabled);
+        assert!(harness.state().1.requests.dirty);
+        let rig = &harness.state().1;
+        let config = crate::r#gen::generate_with_api_port(&rig.servers, &rig.settings, 10853)
+            .expect("generate config");
+        let tags: Vec<&str> = config["outbounds"]
+            .as_array()
+            .expect("outbounds is an array")
+            .iter()
+            .filter_map(|outbound| outbound["tag"].as_str())
+            .collect();
+        assert!(
+            !tags.contains(&"[Manual] Bravo"),
+            "the configuration drops the switched-off server"
+        );
+        assert!(tags.contains(&"[Manual] Charlie"));
+    }
+
+    #[test]
+    fn switching_a_group_rows_switch_off_drops_it_from_emitted_too() {
+        let mut harness = drag_harness(grouped_drag_rig());
+        harness.run();
+        harness.get_by_label("Feed").click();
+        harness.run();
+        click_row_switch(&mut harness, "Charlie");
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Charlie").is_none(),
+            "a row switched off on its group tab leaves Emitted"
+        );
+        assert!(harness.query_by_label("Delta").is_some());
+        // The row still exists, switched off, in `All`.
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        assert!(harness.query_by_label("Charlie").is_some());
+    }
+
+    #[test]
+    fn a_chain_only_hop_is_listed_and_its_switch_stays_locked_off() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut entry = ServerProfile::new("Entry", freedom());
+        entry.enabled = true;
+        let hop = ServerProfile::new("Hop", freedom());
+        let hop_tag = hop.tag();
+        entry.outbound.chain_via(hop_tag);
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![entry, hop];
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.servers.hydrate_group_titles();
+        let mut harness = drag_harness(rig);
+        harness.run();
+        // The hop is emitted through the chain even though its own switch is
+        // off, and that switch cannot be turned on: the row says why, and the
+        // model stays put.
+        assert!(harness.query_by_label("Hop").is_some());
+        click_row_switch(&mut harness, "Hop");
+        harness.run();
+        assert!(harness.query_by_label("Hop").is_some());
+        assert!(!harness.state().1.servers.profiles[1].enabled);
+        assert!(
+            !harness.state().1.requests.dirty,
+            "a locked switch is not a configuration change"
+        );
+    }
+
+    #[test]
+    fn sorting_by_latency_orders_rows_inside_each_group() {
+        let mut rig = grouped_drag_rig();
+        rig.servers.profiles[0].latency_ms = Some(300); // Alpha
+        rig.servers.profiles[1].latency_ms = Some(40); // Bravo
+        rig.servers.profiles[2].latency_ms = Some(500); // Charlie
+        rig.servers.profiles[3].latency_ms = Some(20); // Delta
+        let active_id = rig.servers.profiles[0].id.clone();
+        let mut harness = drag_harness(rig);
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvSortByLatency))
+            .click();
+        harness.run();
+        // The sort rewrites the stored row order, block by block.
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Bravo", "Alpha", "Delta", "Charlie"]
+        );
+        assert!(harness.state().1.requests.dirty);
+        assert_eq!(
+            harness.state().1.servers.active.as_deref(),
+            Some(active_id.as_str()),
+            "the route names a server id and does not follow the row order"
+        );
+        // The active server still leads the Emitted tab, then each block in
+        // its new row order.
+        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().y
+        };
+        for (upper, lower) in [("Alpha", "Bravo"), ("Bravo", "Delta"), ("Delta", "Charlie")] {
+            assert!(
+                y(&harness, upper) < y(&harness, lower),
+                "the Emitted tab must show {upper:?} above {lower:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_active_row_is_locked_first_and_never_lifts() {
+        let mut rig = drag_rig();
+        for profile in &mut rig.servers.profiles {
+            profile.enabled = true;
+        }
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        let active_id = rig.servers.profiles[0].id.clone();
+        let mut harness = drag_harness(rig);
+        harness.run();
+        let alpha = harness.get_by_label("Alpha").rect();
+        let charlie = harness.get_by_label("Charlie").rect();
+        // The active server is always first, so its row never lifts: a press
+        // dragged down leaves the stored order alone.
+        drag_list_row(
+            &mut harness,
+            alpha.center(),
+            egui::pos2(charlie.center().x, charlie.bottom() + 8.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+        assert_eq!(
+            harness.state().1.servers.active.as_deref(),
+            Some(active_id.as_str())
+        );
+        assert!(
+            !harness.state().1.requests.dirty,
+            "dragging the active row is refused, not a configuration change"
+        );
+        // The active row is a block of its own: no other row can land above
+        // it either.
+        drag_list_row(
+            &mut harness,
+            charlie.center(),
+            egui::pos2(alpha.center().x, alpha.top() + 2.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+        assert!(!harness.state().1.requests.dirty);
     }
 
     #[test]

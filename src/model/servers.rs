@@ -734,6 +734,68 @@ impl ServersFile {
         }
         order
     }
+    /// Move the profile at `from` inside its own group: ahead of the sibling
+    /// at `before`, or to the group's tail when that is `None`. Row order is
+    /// per group, so a destination naming another group's profile is refused
+    /// and the stored list stays untouched. Returns whether the order changed.
+    pub fn move_profile_in_group(&mut self, from: usize, before: Option<usize>) -> bool {
+        let Some(profile) = self.profiles.get(from) else {
+            return false;
+        };
+        let group = profile.group_id().to_owned();
+        if let Some(target) = before
+            && (target == from
+                || self
+                    .profiles
+                    .get(target)
+                    .is_none_or(|profile| profile.group_id() != group))
+        {
+            return false;
+        }
+        let moved = self.profiles.remove(from);
+        let insert = match before {
+            Some(target) if target > from => target - 1,
+            Some(target) => target,
+            // The group's tail in the stored list; other groups' rows move
+            // past in neither direction, since only relative order counts.
+            None => self
+                .profiles
+                .iter()
+                .rposition(|profile| profile.group_id() == group)
+                .map_or(self.profiles.len(), |last| last + 1),
+        };
+        let changed = insert != from;
+        self.profiles.insert(insert, moved);
+        changed
+    }
+    /// Reorder the stored rows by measured latency, inside each group. The
+    /// blocks and their order stay put: the group tab order fixes the blocks,
+    /// and this only rewrites each group's row order, with a probe that timed
+    /// out or never ran sorting last. The active route is independent of row
+    /// order and does not move.
+    pub fn sort_rows_by_latency(&mut self) {
+        let mut block: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(self.groups.len() + 1);
+        block.insert(MANUAL_GROUP_ID, 0);
+        for group in &self.groups {
+            if !group.is_manual() {
+                let rank = block.len();
+                block.entry(group.id.as_str()).or_insert(rank);
+            }
+        }
+        // A profile whose group record is missing lands in the tail block of
+        // `grouped_order`, so it sorts last as one block.
+        let fallback = block.len();
+        let ranks = &block;
+        self.profiles.sort_by_key(|profile| {
+            let rank = ranks.get(profile.group_id()).copied().unwrap_or(fallback);
+            let latency = match profile.latency_ms {
+                Some(value) if value >= 0 => (0u8, value),
+                _ => (1u8, i64::MAX),
+            };
+            (rank, latency)
+        });
+    }
     /// The profiles the generated document carries: the active profile,
     /// every enabled profile, and every profile reachable transitively
     /// through a chain hop from those. The active profile leads; the rest
@@ -2094,6 +2156,106 @@ mod tests {
         let before = tags(&servers);
         servers.groups[2].pinned = true;
         assert_eq!(tags(&servers), before, "a pin never rewrites the document");
+    }
+
+    #[test]
+    fn a_row_moves_only_inside_its_own_group() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut alpha = ServerProfile::new("Alpha", freedom());
+        alpha.enabled = true;
+        let mut bravo = ServerProfile::new("Bravo", freedom());
+        bravo.enabled = true;
+        let mut charlie = ServerProfile::new("Charlie", freedom());
+        charlie.enabled = true;
+        charlie.group = feed_id.clone();
+        let mut delta = ServerProfile::new("Delta", freedom());
+        delta.enabled = true;
+        delta.group = feed_id;
+        let mut servers = ServersFile {
+            profiles: vec![alpha, bravo, charlie, delta],
+            groups: vec![Group::manual(), feed],
+            ..ServersFile::default()
+        };
+        servers.hydrate_group_titles();
+        let names = |servers: &ServersFile| -> Vec<String> {
+            servers
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect()
+        };
+
+        // Delta lands ahead of Charlie inside Feed.
+        assert!(servers.move_profile_in_group(3, Some(2)));
+        assert_eq!(names(&servers), ["Alpha", "Bravo", "Delta", "Charlie"]);
+        // Already in place: the move reports no change.
+        assert!(!servers.move_profile_in_group(2, Some(3)));
+        assert_eq!(names(&servers), ["Alpha", "Bravo", "Delta", "Charlie"]);
+        // A destination in another group is refused and moves nothing.
+        assert!(!servers.move_profile_in_group(2, Some(1)));
+        assert_eq!(names(&servers), ["Alpha", "Bravo", "Delta", "Charlie"]);
+        // `None` is the row's own group's tail, not the list's.
+        assert!(servers.move_profile_in_group(0, None));
+        assert_eq!(names(&servers), ["Bravo", "Alpha", "Delta", "Charlie"]);
+        assert!(servers.move_profile_in_group(2, None));
+        assert_eq!(names(&servers), ["Bravo", "Alpha", "Charlie", "Delta"]);
+    }
+
+    #[test]
+    fn sorting_by_latency_orders_rows_inside_each_group() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut alpha = ServerProfile::new("Alpha", freedom());
+        alpha.enabled = true;
+        alpha.latency_ms = Some(300);
+        let mut bravo = ServerProfile::new("Bravo", freedom());
+        bravo.enabled = true;
+        bravo.latency_ms = Some(40);
+        let mut charlie = ServerProfile::new("Charlie", freedom());
+        charlie.enabled = true;
+        charlie.latency_ms = Some(500);
+        charlie.group = feed_id.clone();
+        let mut delta = ServerProfile::new("Delta", freedom());
+        delta.enabled = true;
+        delta.latency_ms = Some(20);
+        delta.group = feed_id;
+        let mut echo = ServerProfile::new("Echo", freedom());
+        echo.enabled = true;
+        let mut servers = ServersFile {
+            active: Some(alpha.id.clone()),
+            // Stored interleaved: the blocks are group order, not list order.
+            profiles: vec![charlie, alpha, delta, echo, bravo],
+            groups: vec![Group::manual(), feed],
+            ..ServersFile::default()
+        };
+        servers.hydrate_group_titles();
+        servers.sort_rows_by_latency();
+        let names = |servers: &ServersFile| -> Vec<String> {
+            servers
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect()
+        };
+        assert_eq!(
+            names(&servers),
+            ["Bravo", "Alpha", "Echo", "Delta", "Charlie"],
+            "each block sorts by latency, an unmeasured row last"
+        );
+        let emitted: Vec<&str> = servers
+            .emitted_set()
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            emitted,
+            ["Alpha", "Bravo", "Echo", "Delta", "Charlie"],
+            "the active server leads, then each block in its sorted row order"
+        );
     }
 
     #[test]

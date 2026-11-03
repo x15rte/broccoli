@@ -3071,6 +3071,58 @@ fn profile_outbounds_emit_in_list_order() {
 }
 
 #[test]
+fn profile_outbounds_follow_the_group_tab_order() {
+    // A group's block is its tab position, and the Manual tab's pinned place
+    // ahead of the group tabs keeps its block first among the groups.
+    let freedom = || OutboundModel::new(Protocol::Freedom);
+    let mut manual = ServerProfile::new("A", freedom());
+    manual.enabled = true;
+    let feed = Group::new("Feed");
+    let other = Group::new("Other");
+    let (feed_id, other_id) = (feed.id.clone(), other.id.clone());
+    let mut fed = ServerProfile::new("F", freedom());
+    fed.enabled = true;
+    fed.group = feed_id.clone();
+    let mut other_row = ServerProfile::new("O", freedom());
+    other_row.enabled = true;
+    other_row.group = other_id;
+    let mut servers = ServersFile {
+        active: Some(manual.id.clone()),
+        profiles: vec![fed, other_row, manual],
+        // The Manual record is not first in the file; its tab position still
+        // puts its block ahead of every group's.
+        groups: vec![other, Group::manual(), feed],
+        ..ServersFile::default()
+    };
+    servers.hydrate_group_titles();
+    let tags = |servers: &ServersFile| -> Vec<String> {
+        let config =
+            generate_with_api_port(servers, &base_settings(), 10853).expect("generate config");
+        config["outbounds"]
+            .as_array()
+            .expect("outbounds is an array")
+            .iter()
+            .take(3)
+            .filter_map(|outbound| outbound["tag"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        tags(&servers),
+        ["[Manual] A", "[Other] O", "[Feed] F"],
+        "blocks follow the group order, the Manual block leading"
+    );
+
+    // Dragging the Feed tab ahead of Other's rewrites the block order in the
+    // document without moving a single row.
+    servers.reorder_group_in_band(&feed_id, 0);
+    assert_eq!(
+        tags(&servers),
+        ["[Manual] A", "[Feed] F", "[Other] O"],
+        "the dragged tab order is the block order"
+    );
+}
+
+#[test]
 fn duplicate_local_inbound_tag_is_rejected() {
     // Two enabled entries sharing a tag, and an entry reusing the reserved
     // API tag, are both invalid models.
