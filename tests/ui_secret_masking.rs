@@ -26,6 +26,8 @@ use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 
+#[path = "common/editor.rs"]
+mod editor;
 #[path = "common/screen.rs"]
 mod screen;
 
@@ -51,7 +53,7 @@ fn boot_servers(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
-    let mut profile = ServerProfile::new("p", OutboundModel::new(Protocol::Vless));
+    let mut profile = ServerProfile::new("masked-profile", OutboundModel::new(Protocol::Vless));
     if let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings {
         settings.id = if empty_id {
             String::new()
@@ -74,6 +76,9 @@ fn boot_servers(
     h.get_by_role_and_label(Role::Button, Screen::Servers.label(Language::En))
         .click();
     h.run();
+    // The editor lives in its own window now; the profile's fields render
+    // there, so the masking checks need it open.
+    editor::open_server_editor(&mut h, "masked-profile");
     (lock, tmp, h)
 }
 
@@ -182,11 +187,14 @@ fn credentials_render_masked_and_the_reveal_is_transient() {
     );
 
     // A reveal never outlives the visit: another screen and back masks again.
+    // The editor window floats over the main window and can cover the nav
+    // rail, so navigation goes through the accessibility action, which
+    // reaches the button wherever the window sits.
     h.get_by_role_and_label(Role::Button, Screen::Settings.label(Language::En))
-        .click();
+        .click_accesskit();
     h.run();
     h.get_by_role_and_label(Role::Button, Screen::Servers.label(Language::En))
-        .click();
+        .click_accesskit();
     h.run();
     assert!(
         reveal_control(&h, false),

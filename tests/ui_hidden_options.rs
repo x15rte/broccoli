@@ -29,6 +29,8 @@ use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 
+#[path = "common/editor.rs"]
+mod editor;
 #[path = "common/screen.rs"]
 mod screen;
 
@@ -45,6 +47,10 @@ fn boot_servers(
     common::TempEnvironment,
     Harness<'static, BroccoliApp>,
 ) {
+    let first_name = profiles
+        .first()
+        .map(|profile| profile.name.clone())
+        .expect("each case boots at least one profile");
     let servers = ServersFile {
         active: profiles.first().map(|profile| profile.id.clone()),
         profiles,
@@ -60,7 +66,24 @@ fn boot_servers(
     common::dismiss_wizard(&mut h);
     h.get_by_role_and_label(Role::Button, "Servers").click();
     h.run();
+    // The editor body lives in its own window now: open it on the first
+    // profile so the absence checks below have an editor to inspect.
+    editor::open_server_editor(&mut h, &first_name);
     (lock, tmp, h)
+}
+
+/// Close the Servers screen's editor window through its own Close button. The
+/// embedded window floats over the table, so a test that wants to address
+/// another row must close it first.
+fn close_server_editor(h: &mut Harness<'static, BroccoliApp>) {
+    h.get_by_role_and_label(Role::Button, t(Language::En, Key::Close))
+        .click();
+    h.run();
+    assert!(
+        h.query_by_label(t(Language::En, Key::SrvValidateAndSave))
+            .is_none(),
+        "the editor window must close"
+    );
 }
 
 /// The structured editors must not render non-applicable fields: outbound
@@ -92,8 +115,10 @@ fn server_editors_hide_non_applicable_fields() {
     for (index, (protocol, hidden_label)) in cases.iter().enumerate() {
         let name = format!("p{index}");
         if index > 0 {
-            h.get_by_label(name.as_str()).click();
-            h.run();
+            // The editor window floats over the table, so close it before the
+            // next row's menu can be opened.
+            close_server_editor(&mut h);
+            editor::open_server_editor(&mut h, &name);
         }
         // Positive render evidence first: the editor's protocol selector
         // shows this profile's protocol (the combo is in the editor header),

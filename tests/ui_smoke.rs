@@ -993,7 +993,7 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
 }
 
 #[test]
-fn visible_delete_button_removes_selected_server() {
+fn row_context_menu_delete_removes_selected_server() {
     let mut profile = ServerProfile::new("visible-delete", OutboundModel::new(Protocol::Freedom));
     profile.id = "0123456789abcdef".into();
     let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
@@ -1022,11 +1022,10 @@ fn visible_delete_button_removes_selected_server() {
         .click();
     h.run();
 
-    assert!(
-        h.query_by_role_and_label(egui::accesskit::Role::Button, "🗑")
-            .is_some()
-    );
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "🗑")
+    // The row's Delete command lives in its context menu.
+    h.get_by_label("visible-delete").click_secondary();
+    h.run();
+    h.get_by_label(t(Language::En, Key::SrvDeleteEllipsis))
         .click();
     h.run();
     assert!(h.query_by_label("Delete server").is_some());
@@ -1049,7 +1048,9 @@ fn visible_delete_button_removes_selected_server() {
         servers_bytes
     );
 
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "🗑")
+    h.get_by_label("visible-delete").click_secondary();
+    h.run();
+    h.get_by_label(t(Language::En, Key::SrvDeleteEllipsis))
         .click();
     h.run();
     assert!(h.query_by_label("Delete server").is_some());
@@ -1058,7 +1059,7 @@ fn visible_delete_button_removes_selected_server() {
     h.run_steps(4);
     assert!(h.query_by_label("No servers yet.").is_some());
     assert!(
-        h.query_by_role_and_label(egui::accesskit::Role::Button, "🗑")
+        h.query_by_role_and_label(egui::accesskit::Role::Button, "visible-delete")
             .is_none()
     );
 

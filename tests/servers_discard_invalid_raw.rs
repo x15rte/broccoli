@@ -25,6 +25,8 @@ use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::json;
 
+#[path = "common/editor.rs"]
+mod editor;
 #[path = "common/screen.rs"]
 mod screen;
 
@@ -83,10 +85,10 @@ fn validate_button<'a>(h: &'a Harness<'a, BroccoliApp>) -> egui_kittest::Node<'a
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Validate and save")
 }
 
-/// Dismiss the first-run wizard, open the Servers screen (the seeded profile
-/// is active, so its editor is already open), and switch to the Advanced tab
-/// where the raw editor lives — at the app's DEFAULT window size 1100x720
-/// (the action row stays reachable there).
+/// Dismiss the first-run wizard, open the Servers screen, open the editor
+/// window on the seeded profile through its Edit command, and switch to the
+/// Advanced tab where the raw editor lives — at the app's DEFAULT window size
+/// 1100x720 (the action row stays reachable there).
 fn open_advanced_tab(h: &mut Harness<'static, BroccoliApp>) {
     h.set_size(egui::Vec2::new(1100.0, 720.0));
     h.run();
@@ -94,6 +96,7 @@ fn open_advanced_tab(h: &mut Harness<'static, BroccoliApp>) {
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Servers")
         .click();
     h.run();
+    editor::open_server_editor(h, "raw-editor");
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Advanced")
         .click();
     h.run();

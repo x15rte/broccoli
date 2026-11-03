@@ -31,6 +31,8 @@ use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
 use serde_json::{Value, json};
 
+#[path = "common/editor.rs"]
+mod editor;
 #[path = "common/screen.rs"]
 mod screen;
 
@@ -132,6 +134,8 @@ fn open_servers(h: &mut Harness<'static, BroccoliApp>) {
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Servers")
         .click();
     h.run();
+    // The editor lives in its own window; its Edit command opens it.
+    editor::open_server_editor(h, SEEDED_NAME);
 }
 
 /// The viewport rect at the default window size: `set_size` anchors the

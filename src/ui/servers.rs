@@ -1,7 +1,7 @@
-//! Servers screen: profile list with latency badges on the
-//! left, tabbed full-coverage outbound editor on the right. Covers all 12
-//! protocols, all 7 transports, TLS/REALITY, mux, and the advanced envelope
-//! (sendThrough / targetStrategy / finalmask / sockopt).
+//! Servers screen: one full-width, virtualized table of profiles under a
+//! toolbar, with the tabbed full-coverage outbound editor in a pop-up window.
+//! Covers all 12 protocols, all 7 transports, TLS/REALITY, mux, and the
+//! advanced envelope (sendThrough / targetStrategy / finalmask / sockopt).
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -1883,9 +1883,8 @@ enum ListAction {
         group: usize,
         delta: i32,
     },
-    /// Append a switched-off `[Manual]` snapshot of one subscription row.
-    CopyToManual(String),
-    Duplicate(String),
+    /// Open the editor window on one profile.
+    Edit(String),
     Export(String),
     Delete(String),
     ProbeLatency(String),
@@ -1907,6 +1906,10 @@ enum ListAction {
 pub enum LeaveAction {
     /// Switch the selected profile after resolution.
     Select(String),
+    /// Open the editor window on one profile after resolution.
+    OpenEditor(String),
+    /// Close the editor window after resolution.
+    CloseExisting,
     /// Close the Add-server dialog after resolution.
     CloseAdd,
     /// The app may proceed with quitting after resolution.
@@ -1991,9 +1994,12 @@ pub struct ServersScreen {
     /// The list's search text; group headers stay visible with match counts.
     search: String,
     group_rows_cache: Option<GroupRowsCache>,
-    /// Per-profile row detail (protocol, security, endpoint), rebuilt only
-    /// when the model generation moves.
-    row_details: Option<(u64, std::rc::Rc<std::collections::HashMap<usize, String>>)>,
+    /// Per-profile table cells (the protocol-and-security column and the
+    /// `address:port` column), rebuilt only when the model generation moves.
+    row_details: Option<(
+        u64,
+        std::rc::Rc<std::collections::HashMap<usize, RowDetail>>,
+    )>,
     /// The emitted set memoized for one model generation: the row switches
     /// and their lock hints read it, and it is rebuilt only when the model
     /// moves, never per repaint.
@@ -2737,6 +2743,10 @@ impl ServersScreen {
                             Some(LeaveAction::CloseAdd) => {
                                 self.leave_pending = None;
                             }
+                            Some(LeaveAction::OpenEditor(id)) => {
+                                self.leave_pending = None;
+                                self.load_existing_draft(uictx.servers, lang, &id);
+                            }
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
                                 if self
@@ -2769,7 +2779,9 @@ impl ServersScreen {
                         uictx.hooks.mark_dirty();
                         // The leave modal's Save committed the existing
                         // draft: resume the staged action. Select switches
-                        // now; Quit proceeds when no dirty draft remains
+                        // now; OpenEditor loads the profile the user asked
+                        // for; CloseExisting is already resolved by the
+                        // commit; Quit proceeds when no dirty draft remains
                         // (otherwise the modal stays staged for the next
                         // Save); CloseAdd keeps the modal staged so the next
                         // Save targets the add draft.
@@ -2777,7 +2789,14 @@ impl ServersScreen {
                         match staged {
                             Some(LeaveAction::Select(id)) => {
                                 self.leave_pending = None;
-                                self.selected = Some(id);
+                                self.load_existing_draft(uictx.servers, lang, &id);
+                            }
+                            Some(LeaveAction::OpenEditor(id)) => {
+                                self.leave_pending = None;
+                                self.load_existing_draft(uictx.servers, lang, &id);
+                            }
+                            Some(LeaveAction::CloseExisting) => {
+                                self.leave_pending = None;
                             }
                             Some(LeaveAction::Quit) => {
                                 self.leave_pending = None;
@@ -3270,12 +3289,21 @@ impl ServersScreen {
         self.poll_subscription_fetch(lang, ctx);
         self.poll_xray_tool(lang);
         self.consume_latency_probe_result(ctx);
-        // Keep the selection pointing at a real profile.
+        // Keep the selection and the open editor pointing at a real profile.
         if let Some(id) = &self.selected
             && !ctx.servers.profiles.iter().any(|profile| &profile.id == id)
         {
             self.selected = None;
-            self.existing.draft = None;
+        }
+        if self.existing.draft().is_some_and(|draft| {
+            !ctx.servers
+                .profiles
+                .iter()
+                .any(|profile| profile.id == draft.id)
+        }) {
+            // The edited profile was deleted under the window: drop the draft
+            // and the buffers seeded for it.
+            self.existing.close(&mut self.seeded_buffers);
         }
         if ctx.servers.active_route_repaired {
             ctx.servers.active_route_repaired = false;
@@ -3295,18 +3323,13 @@ impl ServersScreen {
                 });
         }
 
-        egui::Panel::left(ui.auto_id_with("servers.list"))
-            .resizable(true)
-            .default_size(200.0)
-            .size_range(160.0..=300.0)
-            .show(ui, |ui| self.show_list(ui, ctx));
-        egui::CentralPanel::default().show(ui, |ui| self.show_editor(ui, ctx));
+        egui::CentralPanel::default().show(ui, |ui| self.show_table(ui, ctx));
         self.show_dialogs(ui.ctx(), ctx);
     }
 
-    // ---------- left: profile list ----------
+    // ---------- the table ----------
 
-    fn show_list(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
+    fn show_table(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
         ui.add_space(4.0);
         ui.heading(t(lang, Key::ScreenServers));
@@ -3326,24 +3349,13 @@ impl ServersScreen {
                 .map_or_else(|| t(lang, Key::NoneSelected).to_owned(), |p| p.name.clone())
         };
         ui.label(t_fmt(lang, Key::SrvActiveRoute, &[&route]));
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text(t(lang, Key::SrvSearch))
-                    .desired_width(180.0),
-            );
-            if !self.search.is_empty() && ui.small_button("✕").clicked() {
-                self.search.clear();
-            }
-        });
-        ui.separator();
 
-        // One-probe-at-a-time gate shared by the toolbar button and every
-        // per-row probe button. The probe dials through its own isolated
-        // core, so no phase rung refuses it; its own request is the window's
-        // occupant while it runs, so the window is read for other jobs only —
-        // that is what keeps the "already running" rung ahead of the busy
-        // rung the probe's own job would otherwise state.
+        // One-probe-at-a-time gate for the toolbar command. The probe dials
+        // through its own isolated core, so no phase rung refuses it; its own
+        // request is the window's occupant while it runs, so the window is
+        // read for other jobs only — that is what keeps the "already
+        // running" rung ahead of the busy rung the probe's own job would
+        // otherwise state.
         let probe_pending = self.pending_latency_probe.is_some();
         let probe_verdict = verdict(true, ctx.busy.is_held() && !probe_pending, probe_pending);
         let probe_gate = match probe_verdict.rung {
@@ -3358,7 +3370,109 @@ impl ServersScreen {
         let mut delete_group: Option<String> = None;
         let mut report_group: Option<String> = None;
         let mut edit_group: Option<String> = None;
-        let list_height = (ui.available_height() - 120.0).max(80.0);
+        // The toolbar's commands, with search at the end of the row so
+        // filtering sits beside the actions it filters.
+        let mut add_proto: Option<Protocol> = None;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
+                ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
+                    for protocol in Protocol::ALL {
+                        if ui.button(protocol.as_str()).clicked() {
+                            add_proto = Some(protocol);
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
+                self.import_open = true;
+                self.profile_validation_report = None;
+            }
+            if ui.button(t(lang, Key::SrvAddSubscription)).clicked() {
+                self.subscription_dialog = Some(SubscriptionDraft::default());
+            }
+            // The latency command is gated like the table's own probe
+            // paths, plus the no-profiles case.
+            let can_test_latency = if !probe_gate.0 {
+                probe_gate
+            } else if ctx.servers.profiles.is_empty() {
+                (false, t(lang, Key::SrvAddServerBeforeLatency))
+            } else {
+                (true, "")
+            };
+            let test_latency = if can_test_latency.0 {
+                ui.button(t(lang, Key::TestLatency))
+                    .on_hover_text(t(lang, Key::SrvTestLatencyHint))
+            } else {
+                ui.add_enabled(false, egui::Button::new(t(lang, Key::TestLatency)))
+                    .on_disabled_hover_text(can_test_latency.1)
+            };
+            if test_latency.clicked() {
+                self.latency_probe_feedback = None;
+                match ctx.request_latency_probe() {
+                    Ok(()) => {
+                        self.pending_latency_probe = Some(false);
+                        self.latency_probe = Request::park_in_shell();
+                    }
+                    Err(error) => self.latency_probe_feedback = Some((FeedbackLevel::Err, error)),
+                }
+            }
+            if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
+                // Ascending latency; timeouts and never-measured last. A sort
+                // reorders rows only: the active route names a server id and
+                // does not follow the row order.
+                ctx.servers.profiles.sort_by_key(|p| match p.latency_ms {
+                    Some(v) if v >= 0 => (0, v),
+                    _ => (1, i64::MAX),
+                });
+                ctx.hooks.mark_dirty();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text(t(lang, Key::SrvSearch))
+                        .desired_width(180.0),
+                );
+                if !self.search.is_empty() && ui.small_button("✕").clicked() {
+                    self.search.clear();
+                }
+            });
+        });
+        if let Some(protocol) = add_proto {
+            self.draft_tab = EditorTab::Basic;
+            self.add.draft = Some(ProfileDraft::add(ServerProfile::new(
+                t_fmt(lang, Key::SrvNewDraftName, &[&protocol.as_str()]),
+                OutboundModel::new(protocol),
+            )));
+            // A fresh draft starts with no memoized verdicts, so this is a
+            // fresh validation subject whatever the previous draft left.
+            self.profile_validation_report = None;
+            // An empty form hides no credential, and the user opened it to
+            // type one.
+            self.revealed_add = true;
+        }
+        if self.pending_latency_probe.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(t(lang, Key::SrvTestingLatencyIsolated));
+            });
+        }
+        if let Some((level, message)) = &self.latency_probe_feedback {
+            let color = match level {
+                FeedbackLevel::Ok => status_colors_of(ui).ok,
+                FeedbackLevel::Warn => status_colors_of(ui).warn,
+                FeedbackLevel::Err => status_colors_of(ui).err,
+            };
+            ui.colored_label(color, message);
+        }
+        ui.separator();
+        // The table's column header, on the same widths as every row.
+        let header_columns = table_columns(
+            (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
+            ui.spacing().item_spacing.x,
+        );
+        table_header(ui, lang, header_columns);
+        ui.separator();
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
         // is not layout. Rows are uniform single-line rows: the tallest
@@ -3409,7 +3523,7 @@ impl ServersScreen {
         let profiles = &ctx.servers.profiles;
         if self.row_details.as_ref().map(|(cached, _)| *cached) != Some(generation) {
             let hide = ctx.settings.hide_server_info;
-            let details: std::collections::HashMap<usize, String> = profiles
+            let details: std::collections::HashMap<usize, RowDetail> = profiles
                 .iter()
                 .enumerate()
                 .map(|(index, profile)| (index, row_detail(profile, hide)))
@@ -3433,7 +3547,7 @@ impl ServersScreen {
         if profiles.is_empty() || display_rows.is_empty() {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
-                .max_height(list_height)
+                .max_height(ui.available_height().max(80.0))
                 .show(ui, |ui| {
                     let message = if profiles.is_empty() {
                         t(lang, Key::NoServersYet)
@@ -3445,7 +3559,7 @@ impl ServersScreen {
         } else {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
-                .max_height(list_height)
+                .max_height(ui.available_height().max(80.0))
                 .show_rows(ui, row_height, display_rows.len(), |ui, rows| {
                     // egui's floating (overlay) scroll bar paints and
                     // hit-tests over the band's right edge: a vertical
@@ -3459,10 +3573,8 @@ impl ServersScreen {
                     // frame from the style, since every row shares the band —
                     // and report the full band width again at the end so the
                     // bar stays pinned to the edge the rows stop short of.
-                    let scroll = ui.style().spacing.scroll;
-                    let scrollbar_inset = (scroll.bar_width - scroll.allocated_width()).max(0.0);
                     let band_right = ui.max_rect().right();
-                    ui.set_max_width((ui.available_width() - scrollbar_inset).max(0.0));
+                    ui.set_max_width((ui.available_width() - scrollbar_inset(ui.style())).max(0.0));
                     let colors = status_colors_of(ui);
                     // One frame of drag-reorder state: the pointer (only
                     // while a row is lifted and the pointer is inside the
@@ -3673,12 +3785,12 @@ impl ServersScreen {
                         if lifted == Some(index) {
                             ui.multiply_opacity(DRAGGED_ROW_OPACITY);
                         }
-                        let detail = row_details.get(&index).map_or("", String::as_str);
+                        let detail = row_details.get(&index);
                         let clicks = server_list_row(
                             ui,
                             lang,
                             &p.name,
-                            detail,
+                            detail.unwrap_or(&EMPTY_ROW_DETAIL),
                             RowState {
                                 selected: is_sel,
                                 active: is_active,
@@ -3691,10 +3803,6 @@ impl ServersScreen {
                                     } else {
                                         None
                                     },
-                                },
-                                probe: RowProbeState {
-                                    enabled: probe_gate.0,
-                                    disabled_hint: probe_gate.1,
                                 },
                             },
                             badge,
@@ -3711,10 +3819,8 @@ impl ServersScreen {
                         }
                         if clicks.toggle {
                             action = Some(ListAction::ToggleEnabled(p.id.clone()));
-                        } else if clicks.probe {
-                            action = Some(ListAction::ProbeLatency(p.id.clone()));
-                        } else if clicks.delete {
-                            action = Some(ListAction::Delete(p.id.clone()));
+                        } else if clicks.double_clicked() {
+                            action = Some(ListAction::Edit(p.id.clone()));
                         } else if clicks.name.clicked() || clicks.row.clicked() {
                             action = Some(ListAction::Select(p.id.clone()));
                         }
@@ -3734,21 +3840,19 @@ impl ServersScreen {
                         // 36-char String on every repaint.
                         let id = &p.id;
                         let mut menu = |ui: &mut egui::Ui| {
+                            if ui.button(t(lang, Key::SrvEdit)).clicked() {
+                                action = Some(ListAction::Edit(id.clone()));
+                                ui.close();
+                            }
                             if ui.button(t(lang, Key::SrvSetActive)).clicked() {
                                 action = Some(ListAction::SetActive(id.clone()));
                                 ui.close();
                             }
-                            if p.group_id() != crate::model::servers::MANUAL_GROUP_ID
-                                && ui.button(t(lang, Key::SrvCopyToManual)).clicked()
-                            {
-                                action = Some(ListAction::CopyToManual(id.clone()));
+                            if ui.button(t(lang, Key::TestLatency)).clicked() {
+                                action = Some(ListAction::ProbeLatency(id.clone()));
                                 ui.close();
                             }
-                            if ui.button(t(lang, Key::SrvDuplicate)).clicked() {
-                                action = Some(ListAction::Duplicate(id.clone()));
-                                ui.close();
-                            }
-                            if ui.button(t(lang, Key::SrvExportLinkQr)).clicked() {
+                            if ui.button(t(lang, Key::SrvShare)).clicked() {
                                 action = Some(ListAction::Export(id.clone()));
                                 ui.close();
                             }
@@ -3757,9 +3861,8 @@ impl ServersScreen {
                                 ui.close();
                             }
                         };
-                        // The name button fills the row (it truncates to the
-                        // remaining width), so both it and the row background
-                        // open the context menu.
+                        // The name button fills its cell, so both it and the
+                        // row background open the context menu.
                         clicks.row.context_menu(|ui| menu(ui));
                         clicks.name.context_menu(|ui| menu(ui));
                     }
@@ -3812,86 +3915,6 @@ impl ServersScreen {
                     ui.expand_to_include_x(band_right);
                 });
         }
-        ui.separator();
-        let mut add_proto: Option<Protocol> = None;
-        ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
-            ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
-                for protocol in Protocol::ALL {
-                    if ui.button(protocol.as_str()).clicked() {
-                        add_proto = Some(protocol);
-                        ui.close();
-                    }
-                }
-            });
-        });
-        if let Some(protocol) = add_proto {
-            self.draft_tab = EditorTab::Basic;
-            self.add.draft = Some(ProfileDraft::add(ServerProfile::new(
-                t_fmt(lang, Key::SrvNewDraftName, &[&protocol.as_str()]),
-                OutboundModel::new(protocol),
-            )));
-            // A fresh draft starts with no memoized verdicts, so this is a
-            // fresh validation subject whatever the previous draft left.
-            self.profile_validation_report = None;
-            // An empty form hides no credential, and the user opened it to
-            // type one.
-            self.revealed_add = true;
-        }
-        if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
-            self.import_open = true;
-            self.profile_validation_report = None;
-        }
-        if ui.button(t(lang, Key::SrvAddSubscription)).clicked() {
-            self.subscription_dialog = Some(SubscriptionDraft::default());
-        }
-        // The toolbar button is gated like the rows, plus the no-profiles case.
-        let can_test_latency = if !probe_gate.0 {
-            probe_gate
-        } else if ctx.servers.profiles.is_empty() {
-            (false, t(lang, Key::SrvAddServerBeforeLatency))
-        } else {
-            (true, "")
-        };
-        let test_latency = if can_test_latency.0 {
-            ui.button(t(lang, Key::TestLatency))
-                .on_hover_text(t(lang, Key::SrvTestLatencyHint))
-        } else {
-            ui.add_enabled(false, egui::Button::new(t(lang, Key::TestLatency)))
-                .on_disabled_hover_text(can_test_latency.1)
-        };
-        if test_latency.clicked() {
-            self.latency_probe_feedback = None;
-            match ctx.request_latency_probe() {
-                Ok(()) => {
-                    self.pending_latency_probe = Some(false);
-                    self.latency_probe = Request::park_in_shell();
-                }
-                Err(error) => self.latency_probe_feedback = Some((FeedbackLevel::Err, error)),
-            }
-        }
-        if self.pending_latency_probe.is_some() {
-            ui.spinner();
-            ui.label(t(lang, Key::SrvTestingLatencyIsolated));
-        }
-        if let Some((level, message)) = &self.latency_probe_feedback {
-            let color = match level {
-                FeedbackLevel::Ok => status_colors_of(ui).ok,
-                FeedbackLevel::Warn => status_colors_of(ui).warn,
-                FeedbackLevel::Err => status_colors_of(ui).err,
-            };
-            ui.colored_label(color, message);
-        }
-        if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
-            // Ascending latency; timeouts and never-measured last. A sort
-            // reorders rows only: the active route names a server id and does
-            // not follow the row order.
-            ctx.servers.profiles.sort_by_key(|p| match p.latency_ms {
-                Some(v) if v >= 0 => (0, v),
-                _ => (1, i64::MAX),
-            });
-            ctx.hooks.mark_dirty();
-        }
-
         if let Some(id) = delete_group {
             self.subscription_delete_pending = Some(id);
         }
@@ -3966,11 +3989,7 @@ impl ServersScreen {
                     ctx.hooks.mark_dirty();
                 }
             }
-            Some(ListAction::CopyToManual(id)) => {
-                if ctx.servers.copy_to_manual(&id).is_some() {
-                    ctx.hooks.mark_dirty();
-                }
-            }
+            Some(ListAction::Edit(id)) => self.open_editor(ctx.servers, lang, &id),
             Some(ListAction::ToggleEnabled(id)) => {
                 let active = ctx.servers.active.as_deref() == Some(id.as_str());
                 if !active && let Some(index) = ctx.servers.profiles.iter().position(|p| p.id == id)
@@ -3995,22 +4014,6 @@ impl ServersScreen {
                         ctx.servers.profiles.insert(to, profile);
                         ctx.hooks.mark_dirty();
                     }
-                }
-            }
-            Some(ListAction::Duplicate(id)) => {
-                if let Some(idx) = ctx.servers.profiles.iter().position(|p| p.id == id) {
-                    let mut copy = ctx.servers.profiles[idx].clone();
-                    copy.id = uuid::Uuid::new_v4().simple().to_string();
-                    copy.name = t_fmt(lang, Key::SrvCopySuffix, &[&copy.name]);
-                    copy.name = ctx
-                        .servers
-                        .unique_profile_name(copy.group_id(), &copy.name, None);
-                    ctx.servers.profiles.insert(idx + 1, copy.clone());
-                    // The switch to the copy is guarded like any other
-                    // selection change (the copy is already inserted; the
-                    // guard only defers the selection).
-                    self.guard_select(copy.id);
-                    ctx.hooks.mark_dirty();
                 }
             }
             Some(ListAction::Export(id)) => {
@@ -4132,6 +4135,78 @@ impl ServersScreen {
         }
     }
 
+    /// Open the editor window on `id`: a double click, the Edit command, or a
+    /// resolved leave action. A dirty draft guards the switch — its question
+    /// stages `OpenEditor` and the resolution performs the open — while a
+    /// clean state loads the profile's draft straight away.
+    fn open_editor(&mut self, servers: &ServersFile, lang: Language, id: &str) {
+        if self
+            .existing
+            .draft()
+            .is_some_and(|draft| draft.id.as_str() == id)
+        {
+            self.selected = Some(id.to_owned());
+            return;
+        }
+        if self.unsaved_changes() {
+            self.stage_leave(LeaveAction::OpenEditor(id.to_owned()));
+        } else {
+            self.load_existing_draft(servers, lang, id);
+        }
+    }
+
+    /// Load `id`'s persisted profile into the editor slot, replacing whatever
+    /// the window held: the previous draft's seeded buffers and probe result
+    /// go with it, because both describe the draft that is leaving.
+    fn load_existing_draft(&mut self, servers: &ServersFile, lang: Language, id: &str) {
+        let Some(persisted) = servers.profiles.iter().find(|profile| profile.id == id) else {
+            return;
+        };
+        match ProfileDraft::existing(persisted) {
+            Ok(draft) => {
+                self.existing.close(&mut self.seeded_buffers);
+                self.existing.probe.discard_result();
+                self.existing.hold(draft);
+                self.selected = Some(id.to_owned());
+                self.derive_dialog = None;
+                self.profile_validation_report = None;
+                self.revealed_existing = false;
+            }
+            Err(error) => self.set_status(StatusLine::err(t_fmt(
+                lang,
+                Key::SrvPrepareDraftFailed,
+                &[&error],
+            ))),
+        }
+    }
+
+    /// The editor window was closed or cancelled without commit. A derive
+    /// dialog targeting this draft cannot outlive it, so it is cleared first.
+    /// The draft then takes the shared close guard: stage the leave question
+    /// when it holds uncommitted changes, otherwise drop it and evict its
+    /// seeded buffers.
+    fn close_existing_editor(&mut self, draft: ProfileDraft, busy: bool) {
+        if self.derive_dialog.as_ref().is_some_and(|dialog| {
+            matches!(
+                &dialog.target,
+                ToolTarget::ExistingDraft { profile_id, .. } if profile_id == &draft.id
+            )
+        }) {
+            self.derive_dialog = None;
+        }
+        self.existing.hold(draft);
+        if self.delete_pending.is_none()
+            && self
+                .gate(DraftKind::Existing, busy)
+                .is_some_and(DraftGate::dirty)
+        {
+            self.stage_leave(LeaveAction::CloseExisting);
+        } else {
+            self.existing.close(&mut self.seeded_buffers);
+            self.existing.probe.discard_result();
+        }
+    }
+
     /// The Add-server dialog was closed or cancelled without commit. A derive
     /// dialog targeting this draft cannot outlive it (its apply would
     /// reference a draft that no longer exists), so it is cleared first. The
@@ -4177,8 +4252,30 @@ impl ServersScreen {
     fn discard_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
         match action {
             LeaveAction::Select(id) => {
+                // A selection switch staged by an open editor keeps the
+                // editor following the selection, as the split-pane screen
+                // did; a switch staged from elsewhere only moves the
+                // selection.
+                let follows_editor = self.existing.draft.is_some();
                 self.discard_existing_draft();
-                self.selected = Some(id);
+                if follows_editor {
+                    let lang = uictx.settings.language;
+                    self.load_existing_draft(uictx.servers, lang, &id);
+                } else {
+                    self.selected = Some(id);
+                }
+            }
+            LeaveAction::OpenEditor(id) => {
+                // The question's Discard drops the dirty draft and opens the
+                // profile the user asked to edit.
+                self.existing.close(&mut self.seeded_buffers);
+                self.existing.probe.discard_result();
+                let lang = uictx.settings.language;
+                self.load_existing_draft(uictx.servers, lang, &id);
+            }
+            LeaveAction::CloseExisting => {
+                self.existing.close(&mut self.seeded_buffers);
+                self.existing.probe.discard_result();
             }
             LeaveAction::CloseAdd => self.add.close(&mut self.seeded_buffers),
             LeaveAction::Quit => {
@@ -4213,7 +4310,20 @@ impl ServersScreen {
             // Every dirty draft was already committed while the modal was
             // staged; the deferred action is safe to perform now.
             match action {
-                LeaveAction::Select(id) => self.selected = Some(id),
+                LeaveAction::Select(id) => {
+                    if self.existing.draft.is_some() {
+                        self.load_existing_draft(uictx.servers, lang, &id);
+                    } else {
+                        self.selected = Some(id);
+                    }
+                }
+                LeaveAction::OpenEditor(id) => {
+                    self.load_existing_draft(uictx.servers, lang, &id);
+                }
+                LeaveAction::CloseExisting => {
+                    self.existing.close(&mut self.seeded_buffers);
+                    self.existing.probe.discard_result();
+                }
                 LeaveAction::CloseAdd => {}
                 LeaveAction::Quit => uictx.hooks.request_quit_resume(),
             }
@@ -4245,14 +4355,13 @@ impl ServersScreen {
     /// Dismissing it — a click on the dimmed window, Escape — is Cancel: the
     /// staged action is cleared without performing it.
     ///
-    /// The one staged action that came from a window — closing the add-server
-    /// editor — is that window's own: while `servers_screen_rendered` says the
-    /// servers screen drew its windows this frame, `show_add_draft` renders the
-    /// question inside the editor, and this call renders nothing, so the user
-    /// answers the window they just closed instead of a question floating over
-    /// the main window. Off the servers screen the editor is gone with its
-    /// window, and the question falls back to the main window so it stays
-    /// answerable.
+    /// A staged action that came from a window — closing either editor — is
+    /// that window's own: while `servers_screen_rendered` says the servers
+    /// screen drew its windows this frame, the editor renders the question
+    /// inside itself, and this call renders nothing, so the user answers the
+    /// window they just closed instead of a question floating over the main
+    /// window. Off the servers screen the editor is gone with its window, and
+    /// the question falls back to the main window so it stays answerable.
     pub fn show_leave_modal(
         &mut self,
         egui_ctx: &egui::Context,
@@ -4262,7 +4371,7 @@ impl ServersScreen {
         if self.leave_pending.is_none() {
             return;
         }
-        if servers_screen_rendered && self.add_close_is_staged() && self.add.draft.is_some() {
+        if servers_screen_rendered && self.close_is_staged_in_window() {
             return;
         }
         let lang = uictx.settings.language;
@@ -4287,10 +4396,20 @@ impl ServersScreen {
         }
     }
 
-    /// Whether closing the add-server editor is the staged leave action. That
-    /// editor's own question is the one about the draft it holds, so it renders
-    /// that question inside itself and the main window's home leaves it alone;
-    /// a staged action is exclusive, so at most one home asks it.
+    /// Whether closing one of the editor windows is the staged leave action
+    /// and that window is still on screen. The window's own question is the
+    /// one about the draft it holds, so it renders that question inside
+    /// itself and the main window's home leaves it alone; a staged action is
+    /// exclusive, so at most one home asks it.
+    fn close_is_staged_in_window(&self) -> bool {
+        match self.leave_pending {
+            Some(LeaveAction::CloseExisting) => self.existing.draft.is_some(),
+            Some(LeaveAction::CloseAdd) => self.add.draft.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether closing the add-server editor is the staged leave action.
     fn add_close_is_staged(&self) -> bool {
         matches!(self.leave_pending, Some(LeaveAction::CloseAdd))
     }
@@ -4417,20 +4536,12 @@ impl LatencyBadge {
     }
 }
 
-/// Per-frame inputs of one list row's probe button: whether it is enabled,
-/// and the hint shown while it is disabled.
-struct RowProbeState<'a> {
-    enabled: bool,
-    disabled_hint: &'a str,
-}
-
 /// The row's selection and emission state, grouped so the row builder keeps a
 /// readable argument list.
 struct RowState<'a> {
     selected: bool,
     active: bool,
     switch: RowSwitch<'a>,
-    probe: RowProbeState<'a>,
 }
 
 /// The row's enable switch: its current state, and — for the active server or
@@ -4440,15 +4551,126 @@ struct RowSwitch<'a> {
     locked_hint: Option<&'a str>,
 }
 
-/// What a rendered list row reported: the row's own response
-/// (click/right-click/drag anywhere on the row), the name button's response,
-/// and whether the probe, delete or enable switch was clicked.
+/// What a rendered table row reported: the row's own response (click,
+/// right-click and drag anywhere on the row), the name button's response, and
+/// whether the enable switch was clicked.
 struct RowClicks {
     row: egui::Response,
     name: egui::Response,
-    delete: bool,
-    probe: bool,
     toggle: bool,
+}
+
+impl RowClicks {
+    /// Whether this frame opened an editor on the row: a double click
+    /// anywhere on the row or on its name button. Checked before the plain
+    /// click so the second press of the gesture opens the editor instead of
+    /// only selecting the row again.
+    fn double_clicked(&self) -> bool {
+        self.row.double_clicked() || self.name.double_clicked()
+    }
+}
+
+/// One row's two formatted table cells: the protocol-and-security column and
+/// the `address:port` column. Formatted once per model generation, because
+/// both are functions of the profile alone.
+#[derive(Clone)]
+struct RowDetail {
+    protocol: String,
+    endpoint: String,
+}
+
+/// The cell text a row renders when the memo has no entry for it (the
+/// impossible index-after-rebuild case): both columns empty.
+const EMPTY_ROW_DETAIL: RowDetail = RowDetail {
+    protocol: String::new(),
+    endpoint: String::new(),
+};
+
+/// The table's fixed column widths in points. The name column takes the rest
+/// of the band, so the header and every row place the data columns at the
+/// same x every frame — a table reads by column, not by row.
+const TABLE_SWITCH_WIDTH: f32 = 40.0;
+const TABLE_ACTIVE_WIDTH: f32 = 32.0;
+const TABLE_PROTOCOL_WIDTH: f32 = 150.0;
+const TABLE_ADDRESS_WIDTH: f32 = 210.0;
+const TABLE_LATENCY_WIDTH: f32 = 80.0;
+/// The smallest width the name column keeps: a narrower band truncates the
+/// name rather than pushing the fixed columns past the viewport.
+const TABLE_MIN_NAME_WIDTH: f32 = 80.0;
+
+/// The six column widths of a table row laid out in `available` points.
+#[derive(Clone, Copy)]
+struct TableColumns {
+    switch: f32,
+    active: f32,
+    name: f32,
+    protocol: f32,
+    address: f32,
+    latency: f32,
+}
+
+fn table_columns(available: f32, spacing: f32) -> TableColumns {
+    let fixed = TABLE_SWITCH_WIDTH
+        + TABLE_ACTIVE_WIDTH
+        + TABLE_PROTOCOL_WIDTH
+        + TABLE_ADDRESS_WIDTH
+        + TABLE_LATENCY_WIDTH;
+    TableColumns {
+        switch: TABLE_SWITCH_WIDTH,
+        active: TABLE_ACTIVE_WIDTH,
+        name: (available - fixed - spacing * 5.0).max(TABLE_MIN_NAME_WIDTH),
+        protocol: TABLE_PROTOCOL_WIDTH,
+        address: TABLE_ADDRESS_WIDTH,
+        latency: TABLE_LATENCY_WIDTH,
+    }
+}
+
+/// The width a floating scroll bar overlaps in the table's band: a vertical
+/// `ScrollArea` shrinks horizontally to its content and the bar hugs that
+/// edge, reserving no space of its own (`ScrollStyle::allocated_width` is
+/// zero by default). The header and the rows reserve the same overlap, or the
+/// columns would shift between them once the list scrolls.
+fn scrollbar_inset(style: &egui::Style) -> f32 {
+    let scroll = style.spacing.scroll;
+    (scroll.bar_width - scroll.allocated_width()).max(0.0)
+}
+
+/// One table cell: exactly `width` points wide and one control row tall,
+/// clipped so a long value truncates inside its own column instead of
+/// painting over the next one.
+fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(width);
+            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+            add(ui);
+        },
+    );
+}
+
+/// The table's header row: the same six columns as every profile row.
+fn table_header(ui: &mut egui::Ui, lang: Language, columns: TableColumns) {
+    let weak = |ui: &mut egui::Ui, text: &str| {
+        ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
+    };
+    ui.horizontal(|ui| {
+        table_cell(ui, columns.switch, |ui| weak(ui, t(lang, Key::Enabled)));
+        table_cell(ui, columns.active, |ui| {
+            weak(ui, t(lang, Key::SrvTableActive))
+        });
+        table_cell(ui, columns.name, |ui| weak(ui, t(lang, Key::SrvName)));
+        table_cell(ui, columns.protocol, |ui| {
+            weak(ui, t(lang, Key::SrvProtocol));
+        });
+        table_cell(ui, columns.address, |ui| {
+            weak(ui, t(lang, Key::SrvTableAddress));
+        });
+        table_cell(ui, columns.latency, |ui| {
+            weak(ui, t(lang, Key::SrvTableLatency));
+        });
+    });
 }
 
 /// The drag payload of one server-list row: the row's index in the list as
@@ -4505,42 +4727,24 @@ fn drag_scroll_delta(viewport: egui::Rect, pos: egui::Pos2, dt: f32) -> f32 {
     (toward_top - toward_bottom) * DRAG_SCROLL_MAX_SPEED * dt
 }
 
-/// One row in the servers list: the name on the left, and the latency badge,
-/// probe button, and delete button pinned to the right edge. Returns the row
-/// [`egui::Response`] (click/right-click anywhere on the row), the name
-/// button's response (it fills the row, so it must be treated as a select
-/// target too), and whether the probe or delete button was clicked.
-///
-/// A plain `ui.horizontal` lets an over-long name overflow its allocated
-/// width and paint over the latency badge and the delete button, hiding both.
-/// So the name is laid out with `Sides::shrink_left().truncate()`: the right
-/// block is measured and placed first, and the name is clamped to the
-/// remaining width, truncating with "…" instead of colliding.
-///
-/// The row's interaction is registered by the surrounding `ui.horizontal`
-/// *before* the probe and delete buttons, so a click on them routes to the
-/// button and not the row — the caller must check those clicks first. The
-/// row's drag sense sits below them the same way, and the buttons sense
-/// clicks only, so a press-and-move that starts on any of them (or on the
-/// name button) routes to the row and reorders it. A touch swipe over a row
-/// claims the drag the same way (egui routes a drag to the topmost
-/// drag-sensing widget), so on a touch screen a swipe lifts the row instead
-/// of scrolling the list; the wheel and swipes over the empty tail below the
-/// rows still scroll.
-/// One row's detail line: protocol, security when it is not plain, and the
-/// endpoint (masked when the user hid server information).
-fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> String {
+/// One row's two formatted table cells. The protocol column pairs the
+/// protocol with its transport security when the security is not plain; the
+/// endpoint column is empty while the user hid server information, because
+/// the address is exactly what that setting hides.
+fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> RowDetail {
     let protocol = profile.outbound.protocol.as_str();
-    if hide_server_info {
-        return protocol.to_owned();
-    }
     let security = profile.outbound.stream.security.as_str();
-    let address = profile.server_address().unwrap_or_default();
-    if security == "none" {
-        format!("{protocol} · {address}")
+    let protocol = if security == "none" {
+        protocol.to_owned()
     } else {
-        format!("{protocol} · {security} · {address}")
-    }
+        format!("{protocol} · {security}")
+    };
+    let endpoint = if hide_server_info {
+        String::new()
+    } else {
+        profile.server_address().unwrap_or_default()
+    };
+    RowDetail { protocol, endpoint }
 }
 
 /// The grouped list: `Manual` first, then groups in stored order, one header
@@ -4663,137 +4867,232 @@ fn subscription_bind_address(
     }
 }
 
+/// One row of the servers table: the switch, the active marker, the name, the
+/// protocol-and-security column, the `address:port` column and the latency
+/// column, in that order. Returns the row [`egui::Response`] (click,
+/// right-click and drag anywhere on the row), the name button's response (it
+/// must be treated as a select target too), and whether the switch was
+/// clicked.
+///
+/// The name is a truncated selectable button inside its own cell, so an
+/// over-long name ends in "…" at the column boundary instead of painting over
+/// the protocol or address column. The row's interaction is registered by the
+/// surrounding `ui.horizontal` after the cells, so the switch's own click
+/// wins; every other click, double-click, right-click and drag lands on the
+/// row.
 fn server_list_row(
     ui: &mut egui::Ui,
     lang: Language,
     name: &str,
-    detail: &str,
+    detail: &RowDetail,
     row: RowState<'_>,
     latency: &LatencyBadge,
 ) -> RowClicks {
+    let columns = table_columns(ui.available_width(), ui.spacing().item_spacing.x);
     let inner = ui.horizontal(|ui| {
-        egui::containers::Sides::new()
-            .shrink_left()
-            .truncate()
-            .show(
-                ui,
-                |ui| {
-                    let mut checked = row.switch.checked;
-                    let response = ui.add_enabled(
-                        row.switch.locked_hint.is_none(),
-                        egui::Checkbox::without_text(&mut checked),
-                    );
-                    let response = match row.switch.locked_hint {
-                        Some(hint) => response.on_disabled_hover_text(hint),
-                        None => response.on_hover_text(t(lang, Key::Enabled)),
-                    };
-                    let toggled = response.clicked();
-                    // Text atoms instead of `format!("● {name}")` /
-                    // `name.to_string()`: no heap allocation per row per
-                    // repaint. The atoms render as one adjacent run.
-                    let button = if name.is_empty() {
-                        egui::Button::selectable(row.selected, t(lang, Key::SrvUnnamed))
-                    } else if row.active {
-                        egui::Button::selectable(row.selected, ("● ", name))
-                    } else {
-                        egui::Button::selectable(row.selected, name)
-                    };
-                    let name_resp = ui
-                        .add(button.truncate())
-                        .on_hover_text(t(lang, Key::SrvDragToReorder));
-                    if !detail.is_empty() {
-                        ui.weak(detail);
-                    }
-                    (toggled, name_resp)
-                },
-                |ui| {
-                    let delete = ui
-                        .small_button(t(lang, Key::DeleteRow))
-                        .on_hover_text(t(lang, Key::DeleteServer));
-                    let probe_button = if row.probe.enabled {
-                        ui.small_button(t(lang, Key::ProbeRow))
-                            .on_hover_text(t(lang, Key::SrvProbeServerLatencyHint))
-                    } else {
-                        // Same small sizing as the enabled variant: a gated
-                        // button must not grow the row while a probe runs.
-                        ui.add_enabled(false, egui::Button::new(t(lang, Key::ProbeRow)).small())
-                            .on_disabled_hover_text(row.probe.disabled_hint)
-                    };
-                    // The badge text/color come from the row's memoized
-                    // [`LatencyBadge`] — borrowed, never
-                    // re-formatted per painted row.
-                    // Not selectable: `interaction.selectable_labels` defaults to
-                    // true, and a click-sensing label would sit on top of the
-                    // row's click target, making the latency area unclickable.
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(latency.text.as_str()).color(latency.color),
-                        )
-                        .selectable(false),
-                    );
-                    (delete, probe_button)
-                },
-            )
+        let mut checked = row.switch.checked;
+        table_cell(ui, columns.switch, |ui| {
+            let response = ui.add_enabled(
+                row.switch.locked_hint.is_none(),
+                egui::Checkbox::without_text(&mut checked),
+            );
+            match row.switch.locked_hint {
+                Some(hint) => {
+                    response.on_disabled_hover_text(hint);
+                }
+                None => {
+                    response.on_hover_text(t(lang, Key::Enabled));
+                }
+            }
+        });
+        let toggled = checked != row.switch.checked;
+        table_cell(ui, columns.active, |ui| {
+            if row.active {
+                ui.label(RichText::new("▶").color(status_colors_of(ui).ok))
+                    .on_hover_text(t(lang, Key::SrvActiveAlwaysEmitted));
+            }
+        });
+        let name_resp = table_cell_button(ui, columns.name, lang, name, row.selected);
+        table_cell(ui, columns.protocol, |ui| {
+            ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
+        });
+        table_cell(ui, columns.address, |ui| {
+            let text = if detail.endpoint.is_empty() {
+                t(lang, Key::EmDash)
+            } else {
+                detail.endpoint.as_str()
+            };
+            ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
+        });
+        table_cell(ui, columns.latency, |ui| {
+            // The badge text/color come from the row's memoized
+            // [`LatencyBadge`] — borrowed, never re-formatted per painted row.
+            // Not selectable: `interaction.selectable_labels` defaults to
+            // true, and a click-sensing label would sit on top of the row's
+            // click target, making the latency area unclickable.
+            ui.add(
+                egui::Label::new(RichText::new(latency.text.as_str()).color(latency.color))
+                    .selectable(false),
+            );
+        });
+        (toggled, name_resp)
     });
-    let ((toggled, name_resp), (delete_resp, probe_resp)) = inner.inner;
-    let delete_clicked = delete_resp.clicked();
-    let probe_clicked = probe_resp.clicked();
+    let (toggled, name_resp) = inner.inner;
     let resp = inner.response.interact(egui::Sense::click_and_drag());
     RowClicks {
         row: resp,
         name: name_resp,
-        delete: delete_clicked,
-        probe: probe_clicked,
         toggle: toggled,
     }
 }
 
-impl ServersScreen {
-    // ---------- editor (right side) ----------
-
-    fn show_editor(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
-        let lang = ctx.settings.language;
-        // Borrow the selected id instead of cloning the 36-char String on
-        // every repaint (see show_list). The borrow is confined to the
-        // reseed check below: the tab closures re-borrow the id from the
-        // owned draft, whose profile id always mirrors the selection.
-        let Some(id) = self.selected.as_deref() else {
-            ui.centered_and_justified(|ui| {
-                ui.weak(t(lang, Key::SrvSelectServerOrAdd));
-            });
-            return;
+/// The name cell: a selectable button truncated at the column boundary.
+fn table_cell_button(
+    ui: &mut egui::Ui,
+    width: f32,
+    lang: Language,
+    name: &str,
+    selected: bool,
+) -> egui::Response {
+    let mut response = None;
+    table_cell(ui, width, |ui| {
+        let button = if name.is_empty() {
+            egui::Button::selectable(selected, t(lang, Key::SrvUnnamed))
+        } else {
+            egui::Button::selectable(selected, name)
         };
+        response = Some(
+            ui.add(button.truncate())
+                .on_hover_text(t(lang, Key::SrvDragToReorder)),
+        );
+    });
+    response.expect("the name cell always adds its button")
+}
 
-        if self
-            .existing
-            .draft()
-            .is_none_or(|draft| draft.profile.id != id)
-        {
-            let Some(persisted) = ctx.servers.profiles.iter().find(|profile| profile.id == id)
-            else {
-                return;
-            };
-            match ProfileDraft::existing(persisted) {
-                Ok(draft) => self.existing.hold(draft),
-                Err(error) => {
-                    self.set_status(StatusLine::err(t_fmt(
-                        lang,
-                        Key::SrvPrepareDraftFailed,
-                        &[&error],
-                    )));
-                    return;
-                }
-            }
-            // A fresh draft (or one for a different profile) carries no
-            // memoized verdicts of its own, so the sweep its editor runs
-            // below is the first one.
-            self.profile_validation_report = None;
-            self.revealed_existing = false;
-        }
+/// What the editor window's body asked for this frame. The work happens after
+/// the draft is put back (or closed), because the window's body only draws.
+#[derive(Default)]
+struct EditorWindowOutcome {
+    validate: bool,
+    discard: bool,
+    close: bool,
+}
 
+impl ServersScreen {
+    // ---------- editor window ----------
+
+    /// The profile editor's pop-up window. Opened by a double click on a row,
+    /// by the row's Edit command, or as the target of a resolved leave
+    /// question; it renders exactly while the slot holds a draft.
+    fn show_editor_window(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
         let Some(mut draft) = self.existing.take() else {
             return;
         };
+        let lang = uictx.settings.language;
+        let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Draft);
+        let busy = uictx.busy.is_held();
+        let mut outcome = EditorWindowOutcome::default();
+        let mut leave_decision: Option<LeaveDecision> = None;
+        // The question about this window's own draft is this window's: the
+        // user closed it, so it renders here, dimming the draft it asks
+        // about, instead of in a second window on top of it. A backend with
+        // no windows to give renders both in one context, where the modal
+        // already covers the window it dims.
+        let backdrop_dismissed = matches!(self.leave_pending, Some(LeaveAction::CloseExisting))
+            && !ctx.embed_viewports()
+            && popup::backdrop(ctx, "servers.leave.edit-draft");
+        let close_requested = popup::show(
+            ctx,
+            "servers.edit-draft",
+            t(lang, Key::SrvEditServerWindow),
+            [680.0, 600.0],
+            true,
+            |ui| {
+                self.show_editor_body(ui, uictx, &mut draft, &mut outcome);
+                if matches!(self.leave_pending, Some(LeaveAction::CloseExisting)) {
+                    let gate = draft.gate(&self.seeded_buffers, validating, busy);
+                    let dismissed = popup::modal(
+                        ui.ctx(),
+                        "servers.leave.edit-draft",
+                        t(lang, Key::SrvUnsavedChanges),
+                        520.0,
+                        |ui| {
+                            leave_decision = self.leave_confirmation(ui, uictx, Some(gate));
+                        },
+                    );
+                    if leave_decision.is_none() && (dismissed || backdrop_dismissed) {
+                        // A dismissal of the question — a click on the dimmed
+                        // draft, Escape, or a click on the dimmed main window —
+                        // is Cancel, as it is in the main window; a button's
+                        // answer wins the frame it lands in.
+                        leave_decision = Some(LeaveDecision::Cancel);
+                    }
+                }
+            },
+        );
+
+        // Only the leave question's Discard drops the draft with the window it
+        // closed; every other answer — Save holding it for the verdict it
+        // starts, Cancel leaving the editor as it was — is what the gate below
+        // does with an untouched window.
+        let discarded = matches!(leave_decision, Some(LeaveDecision::Discard));
+        if !discarded {
+            if outcome.discard {
+                // Discard reverts the editor in place: the window stays open
+                // on a fresh draft of the same profile.
+                let id = draft.id.clone();
+                self.existing.hold(draft);
+                self.discard_existing_draft();
+                self.load_existing_draft(uictx.servers, lang, &id);
+            } else if outcome.validate {
+                match self.start_profile_validation(
+                    lang,
+                    ProfileValidationOrigin::Draft,
+                    vec![draft.profile.clone()],
+                    Some(draft.target()),
+                    uictx,
+                ) {
+                    Ok(()) => self.existing.hold(draft),
+                    Err(error) => {
+                        self.profile_validation_report = Some(error.clone());
+                        self.set_status(StatusLine::err(error));
+                        self.existing.hold(draft);
+                    }
+                }
+            } else if validating || (!close_requested && !outcome.close) {
+                // A validation in flight holds the window: the platform's
+                // close on it is refused until the verdict lands, because the
+                // draft and the report it will render are what the window is
+                // open for.
+                self.existing.hold(draft);
+            } else {
+                // The window was closed without commit: the close guard stages
+                // the leave question when the draft is dirty, and otherwise
+                // drops the draft with its seeded raw buffers.
+                self.close_existing_editor(draft, busy);
+            }
+        }
+
+        // The answer resolves last, with the draft back in its slot: Save's
+        // validation reads the slot the same way the window's own commit does,
+        // and Discard closes the draft the gate above held back.
+        if let Some(decision) = leave_decision {
+            self.resolve_leave(decision, uictx);
+        }
+    }
+
+    /// One frame of the editor window's content. The caller owns the draft out
+    /// of its slot for the frame (the tabs mutate the screen around it) and
+    /// puts it back or closes it afterwards; `outcome` carries what the
+    /// action row asked for to that owner.
+    fn show_editor_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut ServersCtx,
+        draft: &mut ProfileDraft,
+        outcome: &mut EditorWindowOutcome,
+    ) {
+        let lang = ctx.settings.language;
         // The validation blocks below — the dot, the Advanced tab's inline
         // finalmask verdict, the error list, the Validate gate — render from
         // the draft's memoized verdicts, so a draft whose generation or
@@ -5001,7 +5300,7 @@ impl ServersScreen {
             {
                 quic.retired_udp_hop = None;
             }
-            self.draft_edited(&mut draft);
+            self.draft_edited(draft);
         }
         // Content edits ran the change protocol above; refresh the draft's
         // memoized verdicts (validation errors, finalmask issues,
@@ -5010,9 +5309,8 @@ impl ServersScreen {
         draft.refresh(lang);
         let Some(cached) = draft.validation.as_ref() else {
             // The refresh above leaves a memo for the generation it was
-            // handed; keep the draft so an impossible miss cannot lose the
-            // editor's state, and render nothing further.
-            self.existing.hold(draft);
+            // handed; an impossible miss renders nothing further, and the
+            // caller keeps the draft so the editor's state cannot be lost.
             return;
         };
         let validation_errors = &cached.rendered.blocking;
@@ -5083,17 +5381,15 @@ impl ServersScreen {
         // parsed into the draft, or the user would be stuck with the error
         // text.
         let gate = draft.gate(&self.seeded_buffers, validating, busy);
-        let mut validate_clicked = false;
-        let mut discard_clicked = false;
         ui.horizontal(|ui| {
-            validate_clicked = ui
+            outcome.validate = ui
                 .add_enabled(
                     gate.committable() && !gate.validating && !gate.busy,
                     egui::Button::new(t(lang, Key::SrvValidateAndSave)),
                 )
                 .on_hover_text(t(lang, Key::SrvValidateAndSaveHint))
                 .clicked();
-            discard_clicked = ui
+            outcome.discard = ui
                 .add_enabled(
                     gate.dirty() && !gate.validating,
                     egui::Button::new(t(lang, Key::SrvDiscardChanges)),
@@ -5103,13 +5399,16 @@ impl ServersScreen {
                 ui.spinner();
                 ui.weak(t(lang, Key::SrvValidatingXrayTest));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                outcome.close = ui.button(t(lang, Key::Close)).clicked();
+            });
         });
         // Dismissing the retired key changes the draft without touching any
         // field: the next frame's sweep drops the finding, and the next save
         // writes the profile without the key.
         if dismissed_retired_key {
             draft.profile.outbound.retired_proxy_settings = None;
-            self.draft_edited(&mut draft);
+            self.draft_edited(draft);
         }
         if dismissed_retired_hop
             && let Some(quic) = draft
@@ -5121,29 +5420,7 @@ impl ServersScreen {
                 .and_then(|finalmask| finalmask.quic_params.as_mut())
         {
             quic.retired_udp_hop = None;
-            self.draft_edited(&mut draft);
-        }
-        // The whole-profile snapshot is needed only when the user actually
-        // clicks "Validate and save", not on every repaint.
-        let validation_profile = validate_clicked.then(|| draft.profile.clone());
-        let validation_target = validate_clicked.then(|| draft.target());
-        self.existing.hold(draft);
-        if validate_clicked
-            && let (Some(validation_profile), Some(validation_target)) =
-                (validation_profile, validation_target)
-            && let Err(error) = self.start_profile_validation(
-                lang,
-                ProfileValidationOrigin::Draft,
-                vec![validation_profile],
-                Some(validation_target),
-                ctx,
-            )
-        {
-            self.profile_validation_report = Some(error.clone());
-            self.set_status(StatusLine::err(error));
-        }
-        if discard_clicked {
-            self.discard_existing_draft();
+            self.draft_edited(draft);
         }
         if let Some(report) = &self.profile_validation_report {
             ui.separator();
@@ -8320,6 +8597,7 @@ impl ServersScreen {
         for kind in [DraftKind::Existing, DraftKind::Add] {
             self.probe_output_window(ctx, lang, kind);
         }
+        self.show_editor_window(ctx, uictx);
         self.show_add_draft(ctx, uictx);
         // Import links.
         if self.import_open {
@@ -8894,8 +9172,8 @@ mod tests {
         AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
         EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
         FINGERPRINTS, FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft,
-        RawField, Request, RowProbeState, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
-        SeededBuffers, ServerProfile, ServersScreen, StatusLine, TlsProbe, TransportTabCtx,
+        RawField, Request, RowDetail, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers,
+        ServerProfile, ServersScreen, StatusLine, TlsProbe, TransportTabCtx,
         basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
         editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
         fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
@@ -9514,27 +9792,173 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn server_row_truncates_long_name_so_right_block_stays_clear() {
-        let long_name = "tokyo-edge-01.example.com very long server name that used to overlap the latency badge and the delete button";
+    fn the_servers_screen_is_a_toolbar_over_a_full_width_table() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        // The commands sit above the table, and the search field ends the
+        // toolbar row.
+        for label in [
+            t(Language::En, Key::SrvAddServer),
+            t(Language::En, Key::SrvImportLinks),
+            t(Language::En, Key::TestLatency),
+            t(Language::En, Key::SrvSortByLatency),
+        ] {
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::Button, label)
+                    .is_some(),
+                "the toolbar must render the {label:?} command"
+            );
+        }
+        let search = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("the toolbar must render the search field");
+        assert!(
+            search.rect().center().x > DEFAULT_TEST_VIEWPORT.x / 2.0,
+            "search must sit at the toolbar's end, on the right of its commands"
+        );
+
+        // The table names its columns: switch, active marker, name,
+        // protocol, address:port and latency.
+        for header in [
+            t(Language::En, Key::Enabled),
+            t(Language::En, Key::SrvTableActive),
+            t(Language::En, Key::SrvName),
+            t(Language::En, Key::SrvProtocol),
+            t(Language::En, Key::SrvTableAddress),
+            t(Language::En, Key::SrvTableLatency),
+        ] {
+            assert!(
+                harness.query_all_by_label(header).next().is_some(),
+                "the table must render the {header:?} column header"
+            );
+        }
+
+        // No editor occupies the screen until one is opened.
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvValidateAndSave))
+                .is_none(),
+            "no editor may occupy the screen when nothing is edited"
+        );
+        assert!(
+            harness.state().0.existing.draft.is_none(),
+            "opening the screen must not start an editor draft"
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_row_opens_the_editor_window() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let mut harness = fast_servers_harness(rig);
+        harness.run();
+        harness.get_by_label("Tokyo").click();
+        harness.get_by_label("Tokyo").click();
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvValidateAndSave))
+                .is_some(),
+            "a double click must open the editor window"
+        );
+        assert!(
+            harness.state().0.existing.draft.is_some(),
+            "the window must hold the profile's draft"
+        );
+    }
+
+    #[test]
+    fn the_row_context_menu_offers_the_five_commands_and_no_inline_icons() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::ProbeRow))
+                .is_none()
+                && harness
+                    .query_by_label(t(Language::En, Key::DeleteRow))
+                    .is_none(),
+            "a table row must render no inline probe or delete control"
+        );
+
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        for label in [
+            t(Language::En, Key::SrvEdit),
+            t(Language::En, Key::SrvSetActive),
+            t(Language::En, Key::TestLatency),
+            t(Language::En, Key::SrvShare),
+            t(Language::En, Key::SrvDeleteEllipsis),
+        ] {
+            assert!(
+                harness.query_all_by_label(label).next().is_some(),
+                "the row menu must offer {label:?}"
+            );
+        }
+
+        // Edit is the command that opens the same window a double click does.
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvEdit))
+            .last()
+            .expect("the row menu offers Edit")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvValidateAndSave))
+                .is_some(),
+            "the Edit command must open the editor window"
+        );
+    }
+
+    /// A row's detail cells for the standalone row tests: a protocol with a
+    /// security and a visible endpoint.
+    fn row_detail_fixture() -> RowDetail {
+        RowDetail {
+            protocol: "vless · tls".into(),
+            endpoint: "203.0.113.7:443".into(),
+        }
+    }
+
+    #[test]
+    fn server_row_keeps_each_column_inside_its_own_cell() {
+        // A long name must truncate at its column boundary, and the protocol,
+        // endpoint and latency columns must stay in order and inside the
+        // band — a table reads by column, so no cell may paint over the next.
+        let long_name = "tokyo-edge-01.example.com very long server name that used to overlap the latency badge and the following columns";
+        let width = 900.0;
         let mut harness = harness_builder()
-            .with_size(egui::vec2(240.0, 100.0))
+            .with_size(egui::vec2(width, 100.0))
             .build_ui(|ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
                 let _ = server_list_row(
                     ui,
                     Language::En,
                     long_name,
-                    "",
+                    &row_detail_fixture(),
                     RowState {
                         selected: false,
                         active: false,
                         switch: RowSwitch {
                             checked: false,
                             locked_hint: None,
-                        },
-                        probe: RowProbeState {
-                            enabled: true,
-                            disabled_hint: "",
                         },
                     },
                     &badge,
@@ -9543,38 +9967,41 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
 
         let name = harness.get_by_label(long_name);
+        let protocol = harness.get_by_label("vless · tls");
+        let endpoint = harness.get_by_label("203.0.113.7:443");
         let latency = harness.get_by_label("12 ms");
-        let probe = harness.get_by_label("⚡");
-        let delete = harness.get_by_label("🗑");
         assert!(
-            name.rect().max.x <= latency.rect().min.x,
-            "long name overlaps the latency badge: name ends at x={}, latency starts at x={}",
+            name.rect().max.x <= protocol.rect().min.x,
+            "the name must stop at its column: name ends at x={}, protocol starts at x={}",
             name.rect().max.x,
-            latency.rect().min.x,
+            protocol.rect().min.x,
         );
         assert!(
-            latency.rect().max.x <= probe.rect().min.x,
-            "latency badge overlaps the probe button"
+            protocol.rect().max.x <= endpoint.rect().min.x,
+            "the protocol column must stop before the endpoint column"
         );
         assert!(
-            probe.rect().max.x <= delete.rect().min.x,
-            "probe button overlaps the delete button"
+            endpoint.rect().max.x <= latency.rect().min.x,
+            "the endpoint column must stop before the latency column"
         );
         assert!(
-            delete.rect().max.x <= 240.0 + 0.5,
-            "delete button is pushed outside the panel"
+            latency.rect().max.x <= width + 0.5,
+            "the latency column must stay inside the band"
+        );
+        assert!(
+            harness.query_by_label("⚡").is_none() && harness.query_by_label("🗑").is_none(),
+            "a table row must not render inline probe or delete controls"
         );
     }
 
     /// Drive a `server_list_row` in a harness, click the node found by
-    /// `click_label`, and return (did_any_row_widget_click, did_delete_click,
-    /// did_probe_click).
+    /// `click_label`, and return whether the row reported a click.
     ///
-    /// The flags accumulate over frames: kittest runs one frame per pointer
+    /// The flag accumulates over frames: kittest runs one frame per pointer
     /// event and egui may repaint afterwards, so reading only the last frame
     /// would miss the click.
-    fn drive_row_click(click_label: &str) -> (bool, bool, bool) {
-        let clicked = Rc::new(RefCell::new((false, false, false)));
+    fn drive_row_click(click_label: &str) -> bool {
+        let clicked = Rc::new(RefCell::new(false));
         let clicked_ui = Rc::clone(&clicked);
         let mut harness = harness_builder().build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
@@ -9582,7 +10009,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 "A server",
-                "",
+                &row_detail_fixture(),
                 RowState {
                     selected: false,
                     active: false,
@@ -9590,22 +10017,14 @@ Authentication: ML-KEM-768, Post-Quantum
                         checked: false,
                         locked_hint: None,
                     },
-                    probe: RowProbeState {
-                        enabled: true,
-                        disabled_hint: "",
-                    },
                 },
                 &badge,
             );
-            let mut c = clicked_ui.borrow_mut();
-            c.0 |= clicks.row.clicked() || clicks.name.clicked();
-            c.1 |= clicks.delete;
-            c.2 |= clicks.probe;
+            *clicked_ui.borrow_mut() |= clicks.row.clicked() || clicks.name.clicked();
         });
         harness.get_by_label(click_label).click();
         harness.run();
-        let c = clicked.borrow();
-        (c.0, c.1, c.2)
+        *clicked.borrow()
     }
 
     #[test]
@@ -9619,17 +10038,13 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     "A server",
-                    "",
+                    &row_detail_fixture(),
                     RowState {
                         selected: false,
                         active: false,
                         switch: RowSwitch {
                             checked: false,
                             locked_hint: locked,
-                        },
-                        probe: RowProbeState {
-                            enabled: true,
-                            disabled_hint: "",
                         },
                     },
                     &badge,
@@ -9646,67 +10061,20 @@ Authentication: ML-KEM-768, Post-Quantum
         }
     }
 
-    /// The row's switch, probe/delete buttons and name all report through the
-    /// row: the caller reads the switch and buttons first, so a press on them
-    /// never selects the row or starts a drag.
     #[test]
-    fn server_row_clicking_delete_does_not_select_the_row() {
-        // Clicking "🗑" must delete, never select: the delete click wins because
-        // the row's click target is registered before the button.
-        let (row_clicked, delete_clicked, probe_clicked) = drive_row_click("🗑");
-        assert!(delete_clicked, "delete button click did not register");
-        assert!(
-            !row_clicked,
-            "clicking the delete button also selected the row"
-        );
-        assert!(!probe_clicked, "clicking the delete button also probed");
-    }
-
-    #[test]
-    fn server_row_clicking_the_row_selects_it() {
-        // Clicking the latency badge area (part of the row but not a widget
-        // that senses clicks) must select the row.
-        let (row_clicked, delete_clicked, probe_clicked) = drive_row_click("12 ms");
-        assert!(row_clicked, "clicking the row did not register as select");
-        assert!(!delete_clicked);
-        assert!(!probe_clicked);
-    }
-
-    #[test]
-    fn server_row_clicking_the_name_selects_it() {
-        // The name button fills the row (it truncates to the remaining width),
-        // so clicking it must count as selecting the row.
-        let (row_clicked, delete_clicked, probe_clicked) = drive_row_click("A server");
-        assert!(row_clicked, "clicking the name did not register as select");
-        assert!(!delete_clicked);
-        assert!(!probe_clicked);
-    }
-
-    #[test]
-    fn server_row_clicking_probe_does_not_select_the_row() {
-        // Clicking "⚡" must probe, never select or delete: the probe click
-        // wins because the row's click target is registered before the button.
-        let (row_clicked, delete_clicked, probe_clicked) = drive_row_click("⚡");
-        assert!(probe_clicked, "probe button click did not register");
-        assert!(
-            !row_clicked,
-            "clicking the probe button also selected the row"
-        );
-        assert!(!delete_clicked, "clicking the probe button also deleted");
-    }
-
-    #[test]
-    fn server_row_disabled_probe_button_does_not_fire() {
-        // A probe button behind the one-probe-at-a-time gate must not fire.
-        let clicked = Rc::new(RefCell::new(false));
-        let clicked_ui = Rc::clone(&clicked);
-        let mut harness = harness_builder().build_ui(move |ui| {
+    fn double_clicking_a_row_reports_the_edit_gesture() {
+        let doubled = Rc::new(RefCell::new(false));
+        let doubled_ui = Rc::clone(&doubled);
+        // A click is one frame per queued pointer event, so the harness's
+        // default quarter-second step puts two clicks outside egui's
+        // double-click delay. A fifth-second step keeps the gesture inside it.
+        let mut harness = harness_builder().with_step_dt(0.05).build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
             let clicks = server_list_row(
                 ui,
                 Language::En,
                 "A server",
-                "",
+                &row_detail_fixture(),
                 RowState {
                     selected: false,
                     active: false,
@@ -9714,20 +10082,34 @@ Authentication: ML-KEM-768, Post-Quantum
                         checked: false,
                         locked_hint: None,
                     },
-                    probe: RowProbeState {
-                        enabled: false,
-                        disabled_hint: "busy",
-                    },
                 },
                 &badge,
             );
-            *clicked_ui.borrow_mut() |= clicks.probe;
+            *doubled_ui.borrow_mut() |= clicks.double_clicked();
         });
-        harness.get_by_label("⚡").click();
+        harness.get_by_label("A server").click();
+        harness.get_by_label("A server").click();
         harness.run();
         assert!(
-            !*clicked.borrow(),
-            "a probe button behind the gate must not fire"
+            *doubled.borrow(),
+            "the second press of a double click must report the edit gesture"
+        );
+    }
+
+    #[test]
+    fn server_row_clicking_the_row_selects_it() {
+        // Clicking the latency area (part of the row but not a widget that
+        // senses clicks) must select the row.
+        assert!(drive_row_click("12 ms"), "clicking the row must select it");
+    }
+
+    #[test]
+    fn server_row_clicking_the_name_selects_it() {
+        // The name button truncates inside its cell, so clicking it must
+        // count as selecting the row.
+        assert!(
+            drive_row_click("A server"),
+            "clicking the name must select the row"
         );
     }
 
@@ -9918,7 +10300,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let active_id = rig.servers.profiles[0].id.clone();
         let mut harness = drag_harness(rig);
         harness.run();
-        let alpha = harness.get_by_label("●  Alpha").rect();
+        let alpha = harness.get_by_label("Alpha").rect();
         let charlie = harness.get_by_label("Charlie").rect();
         // Below the last row: the leading row lands at the list's end.
         drag_list_row(
@@ -10145,10 +10527,13 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka);
         let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
         harness
-            .get_all_by_label("⚡")
-            .next()
-            .expect("each row must render a probe button")
+            .get_all_by_label(t(Language::En, Key::TestLatency))
+            .last()
+            .expect("the row menu offers Test latency")
             .click();
         // `click` only queues events, and the pending flag is set at the end
         // of the frame that processes them, so the spinner needs one more
@@ -10156,7 +10541,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // settle — advance the frames by hand.
         harness.run_steps(2);
 
-        // The row click sends exactly the first profile, tagged as single.
+        // The row's command sends exactly the first profile, tagged as single.
         let tag = {
             let cmd = harness
                 .state_mut()
@@ -10247,10 +10632,13 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
         let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
         harness
-            .get_all_by_label("⚡")
-            .next()
-            .expect("each row must render a probe button")
+            .get_all_by_label(t(Language::En, Key::TestLatency))
+            .last()
+            .expect("the row menu offers Test latency")
             .click();
         harness.run_steps(2);
 
@@ -13740,10 +14128,37 @@ Authentication: ML-KEM-768, Post-Quantum
 
     // ---------- unsaved-changes indicator ----------
 
-    /// Full-servers-screen harness that also renders the leave modal every
-    /// frame, mirroring the app-shell wiring.
+    /// Open the editor window on the selected profile (or the active one, or
+    /// the first) the way a double click does, and render the frame that
+    /// shows it.
+    fn open_selected_editor(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        {
+            let state = harness.state_mut();
+            if state.0.existing.draft.is_some() {
+                return;
+            }
+            let id = state
+                .0
+                .selected
+                .clone()
+                .or_else(|| state.1.servers.active.clone())
+                .or_else(|| state.1.servers.profiles.first().map(|p| p.id.clone()));
+            let Some(id) = id else {
+                return;
+            };
+            let lang = state.1.settings.language;
+            state.0.open_editor(&state.1.servers, lang, &id);
+        }
+        harness.run();
+    }
+
+    /// Full-servers-screen harness with the editor window open on the
+    /// selected profile and the leave modal wired every frame, mirroring the
+    /// app-shell frame tail.
     fn unsaved_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
-        leave_modal_harness(DEFAULT_TEST_VIEWPORT, rig)
+        let mut harness = leave_modal_harness(DEFAULT_TEST_VIEWPORT, rig);
+        open_selected_editor(&mut harness);
+        harness
     }
 
     /// Like [`unsaved_harness`] in a window tall enough that the Advanced
@@ -13751,7 +14166,30 @@ Authentication: ML-KEM-768, Post-Quantum
     /// click-driven tests; the app-sized default would fold it under the
     /// editor's scroll viewport.
     fn wide_servers_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
+        let mut harness = leave_modal_harness(egui::vec2(1100.0, 700.0), rig);
+        open_selected_editor(&mut harness);
+        harness
+    }
+
+    /// The app-sized table with no editor window open: the harness for tests
+    /// that drive the table itself (virtualization, scrolling, search).
+    fn wide_table_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
         leave_modal_harness(egui::vec2(1100.0, 700.0), rig)
+    }
+
+    /// The screen at the app viewport with a fifth-second frame step: kittest
+    /// runs one frame per queued pointer event, so the default quarter-second
+    /// step puts two clicks outside egui's double-click delay.
+    fn fast_servers_harness(rig: UiTestRig) -> Harness<'static, (ServersScreen, UiTestRig)> {
+        harness_builder()
+            .with_step_dt(0.05)
+            .with_size(DEFAULT_TEST_VIEWPORT)
+            .build_ui_state(
+                |ui, state: &mut (ServersScreen, UiTestRig)| {
+                    state.0.show(ui, &mut state.1.ctx().servers());
+                },
+                (ServersScreen::default(), rig),
+            )
     }
 
     /// The servers screen plus the every-frame leave modal the app shell
@@ -13770,6 +14208,15 @@ Authentication: ML-KEM-768, Post-Quantum
         let draft = screen.existing.draft.as_mut().unwrap();
         draft.profile.name.push('-');
         draft.generation = draft.generation.wrapping_add(1);
+    }
+
+    /// Select a profile through the screen's own guarded selection path — the
+    /// action a row click performs. The editor window floats over the table in
+    /// the headless harness, so a pointer click on a row underneath would land
+    /// on the window instead.
+    fn select_row(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>, id: &str) {
+        harness.state_mut().0.guard_select(id.to_owned());
+        harness.run();
     }
 
     #[test]
@@ -13824,8 +14271,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         edit_existing_draft(&mut harness.state_mut().0);
         harness.run();
-        harness.get_by_label("Osaka").click();
-        harness.run();
+        select_row(&mut harness, &osaka.id);
         let state = harness.state();
         assert_eq!(
             state.0.leave_pending,
@@ -13871,6 +14317,43 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn closing_an_edited_editor_asks_the_unsaved_question_in_its_window() {
+        let mut rig = UiTestRig::default();
+        let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        rig.servers.profiles.push(tokyo.clone());
+        rig.servers.active = Some(tokyo.id);
+        let mut harness = unsaved_harness(rig);
+        harness.run();
+        edit_existing_draft(&mut harness.state_mut().0);
+        harness.run();
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::Close))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.leave_pending,
+            Some(LeaveAction::CloseExisting),
+            "closing an edited draft must stage the unsaved question"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvUnsavedChanges))
+                .is_some(),
+            "the question must render inside the editor window"
+        );
+
+        // Cancel keeps the draft and the window open.
+        harness.get_by_label(t(Language::En, Key::Cancel)).click();
+        harness.run();
+        assert!(harness.state().0.leave_pending.is_none());
+        assert!(
+            harness.state().0.existing.draft.is_some(),
+            "Cancel must keep the editor window with its draft"
+        );
+    }
+
+    #[test]
     fn select_guard_discard_drops_draft_and_switches_selection() {
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
@@ -13882,8 +14365,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         edit_existing_draft(&mut harness.state_mut().0);
         harness.run();
-        harness.get_by_label("Osaka").click();
-        harness.run();
+        select_row(&mut harness, &osaka.id);
         // The editor's own Discard button carries the same label, so take
         // the last match: the modal renders on top of the editor.
         harness
@@ -13982,8 +14464,7 @@ Authentication: ML-KEM-768, Post-Quantum
             },
         );
         harness.run();
-        harness.get_by_label("Osaka").click();
-        harness.run();
+        select_row(&mut harness, &osaka.id);
         assert_eq!(
             harness.state().0.leave_pending,
             Some(LeaveAction::Select(osaka.id.clone())),
@@ -15941,6 +16422,11 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         // intervalLocal joins the set; the stored unknown token rides along.
+        // The window's own scroll must bring the mode row into view first.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "intervalLocal")
+            .scroll_to_me();
+        harness.run();
         harness
             .get_by_role_and_label(egui::accesskit::Role::CheckBox, "intervalLocal")
             .click();
@@ -16160,7 +16646,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // rendered rows must be the band, never the profile total, and idle
         // frames (same band) must lay out the same rows again.
         let (rig, _) = seeded_rig(64);
-        let mut harness = wide_servers_harness(rig);
+        let mut harness = wide_table_harness(rig);
         harness.run();
 
         let band = laid_out_list_rows(&harness);
@@ -16202,7 +16688,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // the full list — the band renders the same widgets at the same
         // geometry as the un-virtualized rows did.
         let (rig, ids) = seeded_rig(64);
-        let mut harness = wide_servers_harness(rig);
+        let mut harness = wide_table_harness(rig);
         harness.run();
         assert!(
             harness
@@ -16248,7 +16734,6 @@ Authentication: ML-KEM-768, Post-Quantum
                 .is_none(),
             "the first row must not be laid out once the list is scrolled to the bottom"
         );
-        let row_y = row_center.y;
         assert!(
             (15..=37).contains(&laid_out_list_rows(&harness)),
             "the bottom band must still be the visible rows, not all 64"
@@ -16267,56 +16752,16 @@ Authentication: ML-KEM-768, Post-Quantum
             "clicking a scrolled-to row must select that profile"
         );
 
-        // The per-row probe button in the same band row sends exactly that
-        // profile (y-centered on the row the name click used).
+        // The row's context menu is its whole command surface. Delete… stages
+        // the confirmation dialog for that profile.
         harness
-            .get_all_by_label("⚡")
-            .find(|node| (node.rect().center().y - row_y).abs() < 8.0)
-            .expect("the scrolled-to row must render its probe button")
+            .query_by_role_and_label(egui::accesskit::Role::Button, "Server 63")
+            .expect("the last row is laid out")
+            .click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvDeleteEllipsis))
             .click();
-        harness.run_steps(2);
-        let cmd = harness
-            .state_mut()
-            .1
-            ._cmd_rx
-            .try_recv()
-            .expect("a row probe must send a command");
-        match cmd {
-            CoreCmd::ProbeLatency { profiles, .. } => {
-                assert_eq!(profiles.len(), 1, "a row probe must send one profile");
-                assert_eq!(
-                    profiles[0].id, ids[63],
-                    "the probe must carry the row whose button was clicked"
-                );
-            }
-            other => panic!("expected ProbeLatency, got {other:?}"),
-        }
-        assert_eq!(
-            harness.state().0.pending_latency_probe,
-            Some(true),
-            "the row probe must mark the pending slot"
-        );
-
-        // The per-row delete button in the same band row stages the
-        // confirmation dialog for that profile. The reserved strip must hold:
-        // the button stops clear of the overlay scroll bar, and a centre
-        // press must reach it.
-        let bar_rect = harness
-            .get_all_by_role(egui::accesskit::Role::ScrollBar)
-            .next()
-            .expect("the scrolled list must show its overlay scroll bar")
-            .rect();
-        let delete = harness
-            .get_all_by_label("🗑")
-            .find(|node| (node.rect().center().y - row_y).abs() < 8.0)
-            .expect("the scrolled-to row must render its delete button");
-        let delete_rect = delete.rect();
-        assert!(
-            delete_rect.max.x <= bar_rect.min.x,
-            "the delete button must stop clear of the overlay scroll bar: \
-             button {delete_rect:?}, bar {bar_rect:?}"
-        );
-        delete.click();
         harness.run_steps(2);
         assert_eq!(
             harness
@@ -16326,7 +16771,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 .as_ref()
                 .map(|dialog| dialog.name.as_str()),
             Some("Server 63"),
-            "the delete dialog must target the row whose button was clicked"
+            "the delete dialog must target the row whose menu was opened"
         );
         assert!(
             harness.query_by_label("Delete server").is_some(),
@@ -16346,6 +16791,41 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.state().0.selected.as_deref(),
             Some(ids[63].as_str()),
             "cancelling the delete must keep the selection"
+        );
+
+        // Test latency in the row's menu sends exactly that profile. It runs
+        // last: the pending probe's toolbar row shifts the table below.
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::Button, "Server 63")
+            .expect("the last row is laid out")
+            .click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::TestLatency))
+            .last()
+            .expect("the row menu offers Test latency")
+            .click();
+        harness.run_steps(2);
+        let cmd = harness
+            .state_mut()
+            .1
+            ._cmd_rx
+            .try_recv()
+            .expect("a row probe must send a command");
+        match cmd {
+            CoreCmd::ProbeLatency { profiles, .. } => {
+                assert_eq!(profiles.len(), 1, "a row probe must send one profile");
+                assert_eq!(
+                    profiles[0].id, ids[63],
+                    "the probe must carry the row whose menu was opened"
+                );
+            }
+            other => panic!("expected ProbeLatency, got {other:?}"),
+        }
+        assert_eq!(
+            harness.state().0.pending_latency_probe,
+            Some(true),
+            "the row probe must mark the pending slot"
         );
     }
 

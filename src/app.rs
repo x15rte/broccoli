@@ -4973,8 +4973,15 @@ mod unsaved_changes_tests {
             });
         harness.run();
 
-        // Select the profile through the real list; the editor draft opens.
-        harness.get_by_label("Tokyo").click();
+        // Open the profile's editor through the row's Edit command — the same
+        // window a double click opens.
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvEdit))
+            .last()
+            .expect("the row menu offers Edit")
+            .click();
         harness.run();
         assert!(
             !harness.state().0.unsaved_changes(),
