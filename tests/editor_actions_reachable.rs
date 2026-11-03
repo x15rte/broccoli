@@ -81,12 +81,7 @@ fn harness() -> (
         quic_params: None,
         extra: Default::default(),
     });
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Default::default(),
-    };
+    let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
@@ -121,12 +116,7 @@ fn harness_wg() -> (
             })
             .collect();
     }
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Default::default(),
-    };
+    let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;

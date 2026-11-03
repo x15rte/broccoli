@@ -568,17 +568,16 @@ pub enum ValidationCode {
     ProfileIdEmpty(usize),
     /// Two server profiles share an ID (1-based indices, then the ID).
     ProfileIdDuplicated(usize, usize, String),
-    /// A server profile's generated outbound tag is empty (index, profile ID).
-    ProfileTagEmpty(usize, String),
-    /// A server profile's generated outbound tag carries whitespace or
-    /// control characters (index, profile ID, tag).
-    ProfileTagInvalid(usize, String, String),
-    /// A server profile's generated outbound tag collides with the reserved
-    /// `direct`/`block` built-ins (index, profile ID, tag).
-    ProfileTagReserved(usize, String, String),
+    /// A server profile has an empty name (1-based index, profile ID). An
+    /// empty name would make the generated tag `[Group] `.
+    ProfileNameEmpty(usize, String),
     /// Two server profiles generate the same outbound tag (indices, IDs,
     /// tag).
     ProfileTagDuplicated(usize, String, usize, String, String),
+    /// A group title is empty (group ID).
+    GroupTitleEmpty(String),
+    /// Two groups share a title (1-based indices, titles).
+    GroupTitleDuplicated(usize, String, usize, String),
     /// A profile's stored outbound carries a non-null retired
     /// `proxySettings` value: Xray's outbound build refuses a configuration
     /// that carries it (infra/conf/xray.go:262, `outbound "proxySettings"` →
@@ -597,12 +596,21 @@ pub enum ValidationCode {
     BalancerTagMissing(usize),
     /// A routing balancer whose selector list is empty or all-blank (tag).
     BalancerSelectorMissing(String),
+    /// A routing balancer's selector matches no outbound tag the document
+    /// carries (balancer tag).
+    BalancerSelectorNoMatch(String),
+    /// An emitted health engine's subject selector matches no outbound tag
+    /// the document carries (engine name, e.g. `observatory`).
+    ObservatorySelectorNoMatch(String),
     /// Two routing balancers share a tag.
     BalancerTagDuplicated(String),
     /// The Dashboard's active balancer names no configured balancer. The
     /// generator's catch-all rule would reference a tag the core cannot
     /// resolve, so the document never loads (tag).
     RoutingActiveBalancerMissing(String),
+    /// The Dashboard's active balancer is switched off. Its catch-all rule
+    /// would reference an outbound that never reaches the document (tag).
+    ActiveBalancerDisabled(String),
     /// A routing balancer's `fallbackTag` names no outbound (balancer tag,
     /// fallback tag).
     BalancerFallbackMissing(String, String),

@@ -376,7 +376,7 @@ fn reality_fingerprint_outside_the_editor_options_survives_a_profile_round_trip(
             version: 1,
             active: Some(profile.id.clone()),
             profiles: vec![profile],
-            extra: Default::default(),
+            ..Default::default()
         };
         let stored = serde_json::to_value(&file).unwrap();
         assert_eq!(
@@ -881,20 +881,20 @@ fn next_local_tag_falls_back_to_uuid_at_suffix_overflow() {
 #[test]
 fn profile_tag_contract() {
     let p = ServerProfile {
-        id: "0123456789abcdef".into(),
+        name: "Tokyo".into(),
         ..ServerProfile::new("x", OutboundModel::default())
     };
-    assert_eq!(p.tag(), "srv-01234567");
-    let short = ServerProfile {
-        id: "abc".into(),
+    assert_eq!(p.tag(), "[Manual] Tokyo");
+    let mut grouped = ServerProfile {
+        name: "Osaka".into(),
+        group: "sub-1".into(),
+        group_title: "Feed".into(),
         ..ServerProfile::new("x", OutboundModel::default())
     };
-    assert_eq!(short.tag(), "srv-abc");
-    let unicode = ServerProfile {
-        id: "服务器αβ".into(),
-        ..ServerProfile::new("x", OutboundModel::default())
-    };
-    assert_eq!(unicode.tag(), "srv-服务器αβ");
+    assert_eq!(grouped.tag(), "[Feed] Osaka");
+    // A profile without a cached title falls back to the reserved group.
+    grouped.group_title.clear();
+    assert_eq!(grouped.tag(), "[Manual] Osaka");
 }
 
 #[test]
@@ -1742,7 +1742,7 @@ fn valid_state_files_load_unchanged() {
 }
 
 #[test]
-fn activating_a_profile_moves_it_to_the_front_of_the_list() {
+fn activating_a_profile_changes_only_the_route() {
     let mut servers = ServersFile {
         version: 1,
         active: Some("a".into()),
@@ -1765,26 +1765,32 @@ fn activating_a_profile_moves_it_to_the_front_of_the_list() {
     };
 
     servers.activate("c");
-    assert_eq!(ids(&servers), ["c", "a", "b"], "the choice leads the list");
+    assert_eq!(
+        ids(&servers),
+        ["a", "b", "c"],
+        "the route is independent of the row order"
+    );
     assert_eq!(servers.active.as_deref(), Some("c"));
+    assert_eq!(
+        servers.active_profile().map(|profile| profile.id.as_str()),
+        Some("c")
+    );
 
-    // Re-activating the profile already in the slot changes nothing.
-    servers.activate("c");
-    assert_eq!(ids(&servers), ["c", "a", "b"]);
-
-    // An id naming no profile is ignored — the old-choice tests rely on the
-    // profile-set validation reporting it — and never drops the slot.
-    servers.activate("missing");
-    assert_eq!(ids(&servers), ["c", "a", "b"]);
-    assert_eq!(servers.active.as_deref(), Some("c"));
+    // The reserved Direct/Block values are routes too, not profile ids.
+    servers.activate(crate::model::inbound::DIRECT_OUTBOUND_TAG);
+    assert_eq!(ids(&servers), ["a", "b", "c"]);
+    assert!(servers.active_profile().is_none());
+    assert_eq!(
+        servers.active_route_builtin(),
+        Some(crate::model::inbound::DIRECT_OUTBOUND_TAG)
+    );
 }
 
 #[test]
-fn loading_servers_keeps_the_default_server_in_the_first_slot() {
+fn loading_keeps_the_stored_route_and_repairs_unknown_ids() {
     with_appdata(|| {
         crate::sys::paths::ensure_dirs().expect("create dirs");
-        // A file written before the top-row rule: `active` names a middle
-        // profile while the list leads with another.
+        // A stored middle profile stays the route and stays in its row.
         let mut servers = ServersFile::default();
         for name in ["first", "default", "third"] {
             servers.profiles.push(ServerProfile::new(
@@ -1792,37 +1798,42 @@ fn loading_servers_keeps_the_default_server_in_the_first_slot() {
                 OutboundModel::new(Protocol::Freedom),
             ));
         }
-        servers.active = Some(servers.profiles[1].id.clone());
+        let choice = servers.profiles[1].id.clone();
+        servers.active = Some(choice.clone());
         servers.save().expect("save servers.json");
 
         let loaded = ServersFile::load().expect("servers.json must load");
         let names: Vec<&str> = loaded.profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["default", "first", "third"],
-            "the named default moves to the front instead of the default route changing"
-        );
-        assert_eq!(
-            loaded.active.as_deref(),
-            Some(loaded.profiles[0].id.as_str()),
-            "the active slot names the first profile"
-        );
+        assert_eq!(names, ["first", "default", "third"]);
+        assert_eq!(loaded.active.as_deref(), Some(choice.as_str()));
 
-        // A file with profiles but no choice gains the default its config
-        // already had: the first row.
-        let mut servers = ServersFile::default();
-        for name in ["first", "second"] {
-            servers.profiles.push(ServerProfile::new(
-                name,
-                OutboundModel::new(Protocol::Freedom),
-            ));
-        }
+        // No stored choice is Direct, not the first row.
+        servers.active = None;
         servers.save().expect("save servers.json without a choice");
+        let loaded = ServersFile::load().expect("servers.json must load");
+        assert_eq!(loaded.active, None, "an empty route is Direct");
+
+        // An id naming no profile becomes Block, so a stale file cannot
+        // silently route through another server.
+        servers.active = Some("missing".into());
+        servers
+            .save()
+            .expect("save servers.json with a stale choice");
         let loaded = ServersFile::load().expect("servers.json must load");
         assert_eq!(
             loaded.active.as_deref(),
-            Some(loaded.profiles[0].id.as_str()),
-            "an empty active slot defaults to the first row"
+            Some(crate::model::inbound::BLOCK_OUTBOUND_TAG)
+        );
+
+        // The reserved built-in routes survive a round-trip.
+        servers.active = Some(crate::model::inbound::DIRECT_OUTBOUND_TAG.into());
+        servers
+            .save()
+            .expect("save servers.json with a built-in route");
+        let loaded = ServersFile::load().expect("servers.json must load");
+        assert_eq!(
+            loaded.active_route_builtin(),
+            Some(crate::model::inbound::DIRECT_OUTBOUND_TAG)
         );
     });
 }

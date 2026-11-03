@@ -23,7 +23,7 @@ use crate::ui::servers::{LeaveAction, ServersScreen};
 use crate::ui::{
     self, PhaseAction, Screen, TrafficSample, UiCtx, UiCtxParts, UiCtxSnapshot, UiCtxView,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Deref;
 use std::sync::{
     Arc, LazyLock, Mutex, OnceLock,
@@ -807,20 +807,42 @@ impl BroccoliApp {
         // appear later as confusing secondary errors.
         let dirs_error = paths::ensure_dirs().err();
 
-        let (servers, servers_error) = match ServersFile::load() {
-            Ok(servers) => (servers, None),
+        let (servers, servers_error, legacy_renames) = match ServersFile::load_with_tag_renames() {
+            Ok((servers, renames)) => (servers, None, renames),
             Err(error) => {
                 tracing::error!("servers.json could not be loaded (left intact): {error}");
-                (ServersFile::default(), Some(error.to_string()))
+                (
+                    ServersFile::default(),
+                    Some(error.to_string()),
+                    BTreeMap::new(),
+                )
             }
         };
-        let (settings, settings_error) = match Settings::load() {
+        let (mut settings, settings_error) = match Settings::load() {
             Ok(settings) => (settings, None),
             Err(error) => {
                 tracing::error!("settings.json could not be loaded (left intact): {error}");
                 (Settings::default(), Some(error.to_string()))
             }
         };
+        // A file written before groups existed carried `srv-<id8>` tags; the
+        // server load rewrote the profile side and recorded the mapping. The
+        // routing document lives in settings.json, so rewrite it here, once,
+        // and persist both files so the upgrade does not repeat.
+        if !legacy_renames.is_empty() {
+            let renames: Vec<(String, String)> = legacy_renames
+                .iter()
+                .map(|(old, new)| (old.clone(), new.clone()))
+                .collect();
+            if settings.rewrite_outbound_tags(&renames)
+                && let Err(error) = settings.save()
+            {
+                tracing::error!("settings.json could not be saved after tag migration: {error:#}");
+            }
+            if let Err(error) = servers.save() {
+                tracing::error!("servers.json could not be saved after tag migration: {error:#}");
+            }
+        }
         // Custom Visuals are not persisted by eframe (`serde(skip)`), so the
         // accent lives in broccoli settings and must be re-applied on every boot.
         crate::ui::settings::apply_accent(&cc.egui_ctx, settings.accent_color);
@@ -2455,6 +2477,13 @@ impl eframe::App for BroccoliApp {
                         mode: self.settings.mode,
                         active_name: self.servers.active_profile().map(|p| p.name.as_str()),
                         active_balancer: self.settings.routing.active_balancer_tag(),
+                        active_route: self.servers.active_route_builtin().map(|tag| {
+                            if tag == crate::model::inbound::DIRECT_OUTBOUND_TAG {
+                                t(lang, Key::RouteDirect)
+                            } else {
+                                t(lang, Key::RouteBlock)
+                            }
+                        }),
                         core_version: self.core_version.as_deref(),
                         model_generation: self.model_generation,
                         blocked_reason: blocked.as_deref(),
@@ -4876,6 +4905,7 @@ mod unsaved_changes_tests {
                                 mode: crate::model::Mode::Off,
                                 active_name: None,
                                 active_balancer: None,
+                                active_route: None,
                                 core_version: None,
                                 model_generation: 0,
                                 blocked_reason: None,

@@ -395,6 +395,9 @@ keys! {
     TopbarMode 1,
     TopbarActiveServer 1,
     TopbarActiveBalancer 1,
+    TopbarActiveRoute 1,
+    RouteDirect 0,
+    RouteBlock 0,
     TopbarCoreNotInstalled 0,
     TopbarChangesPending 0,
     TopbarServerEditsUnsaved 0,
@@ -1093,6 +1096,45 @@ keys! {
     SrvSortByLatency 0,
     SrvDragToReorder 0,
     SrvSetActive 0,
+    SrvActiveAlwaysEmitted 0,
+    SrvChainOnlyHint 0,
+    SrvActiveRoute 1,
+    SrvSearch 0,
+    SrvNoMatches 0,
+    SrvCopyToManual 0,
+    SrvEditSubscription 0,
+    SrvSaveSubscription 0,
+    SrvReportRouteBlock 0,
+    SrvActiveRouteReset 0,
+    SrvAddSubscription 0,
+    SrvSubscriptionUrl 0,
+    SrvSubscriptionTitle 0,
+    SrvUseCustomUa 0,
+    SrvRefreshSubscription 0,
+    SrvDeleteSubscription 0,
+    SrvDeleteSubscriptionConfirm 1,
+    SrvSubscriptionFetching 0,
+    SrvShowReport 0,
+    SrvQuotaUsed 3,
+    SrvQuotaUnlimited 1,
+    SrvSubscriptionExpired 0,
+    SrvSubscriptionExpiresIn 2,
+    SrvSubscriptionUpdateHint 1,
+    SrvReportTitle 0,
+    SrvReportSummary 5,
+    SrvReportAdded 0,
+    SrvReportUpdated 0,
+    SrvReportRemoved 0,
+    SrvReportRefused 0,
+    SrvReportIgnored 0,
+    SrvSubscriptionFetchFailed 1,
+    SrvSubscriptionEmpty 0,
+    SrvSubscriptionNoUplinkAddress 1,
+    SettingsSubscriptions 0,
+    SettingsSubscriptionUserAgent 0,
+    SettingsSubscriptionUserAgentHint 0,
+    SettingsSubscriptionDirectFetch 0,
+    SettingsSubscriptionDirectFetchHint 0,
     SrvDuplicate 0,
     SrvExportLinkQr 0,
     SrvDeleteEllipsis 0,
@@ -1827,14 +1869,16 @@ keys! {
     SettingsProfilesRequired 0,
     SettingsProfileIdEmpty 1,
     SettingsProfileIdDuplicated 3,
-    SettingsProfileTagEmpty 2,
-    SettingsProfileTagInvalid 3,
-    SettingsProfileTagReserved 3,
+    SettingsProfileNameEmpty 2,
     SettingsProfileTagDuplicated 5,
+    SettingsGroupTitleEmpty 1,
+    SettingsGroupTitleDuplicated 4,
     SettingsOutboundChainMissing 2,
     SettingsOutboundChainCycle 1,
     SettingsBalancerNoTag 1,
     SettingsBalancerNoSelector 1,
+    SettingsBalancerNoMatch 1,
+    SettingsObservatoryNoMatch 1,
     SettingsBalancerTagDuplicated 1,
     SettingsBalancerFallbackMissing 2,
     SettingsLocalInboundPortZero 1,
@@ -1857,6 +1901,7 @@ keys! {
     SettingsRoutingRuleTarget 2,
     SettingsRoutingRuleNoMatchers 1,
     SettingsRoutingActiveBalancerMissing 1,
+    SettingsActiveBalancerDisabled 1,
     SettingsRoutingRuleOutboundMissing 2,
     SettingsRoutingRuleBalancerMissing 2,
     SettingsRoutingRuleInboundMissing 2,
@@ -2929,17 +2974,9 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
             Key::SettingsProfileIdDuplicated,
             vec![Count(*first), Count(*second), Quoted(id)],
         ),
-        ProfileTagEmpty(index, id) => (
-            Key::SettingsProfileTagEmpty,
+        ProfileNameEmpty(index, id) => (
+            Key::SettingsProfileNameEmpty,
             vec![Count(*index), Quoted(id)],
-        ),
-        ProfileTagInvalid(index, id, tag) => (
-            Key::SettingsProfileTagInvalid,
-            vec![Count(*index), Quoted(id), Quoted(tag)],
-        ),
-        ProfileTagReserved(index, id, tag) => (
-            Key::SettingsProfileTagReserved,
-            vec![Count(*index), Quoted(id), Quoted(tag)],
         ),
         ProfileTagDuplicated(first, first_id, second, second_id, tag) => (
             Key::SettingsProfileTagDuplicated,
@@ -2951,6 +2988,16 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
                 Quoted(tag),
             ],
         ),
+        GroupTitleEmpty(id) => (Key::SettingsGroupTitleEmpty, vec![Quoted(id)]),
+        GroupTitleDuplicated(first, first_title, second, second_title) => (
+            Key::SettingsGroupTitleDuplicated,
+            vec![
+                Count(*first),
+                Quoted(first_title),
+                Count(*second),
+                Quoted(second_title),
+            ],
+        ),
         OutboundChainMissing(source, target) => (
             Key::SettingsOutboundChainMissing,
             vec![Quoted(source), Quoted(target)],
@@ -2958,6 +3005,10 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         OutboundChainCycle(path) => (Key::SettingsOutboundChainCycle, vec![Text(path)]),
         BalancerTagMissing(index) => (Key::SettingsBalancerNoTag, vec![Count(*index)]),
         BalancerSelectorMissing(tag) => (Key::SettingsBalancerNoSelector, vec![Quoted(tag)]),
+        BalancerSelectorNoMatch(tag) => (Key::SettingsBalancerNoMatch, vec![Quoted(tag)]),
+        ObservatorySelectorNoMatch(engine) => {
+            (Key::SettingsObservatoryNoMatch, vec![Quoted(engine)])
+        }
         BalancerTagDuplicated(tag) => (Key::SettingsBalancerTagDuplicated, vec![Quoted(tag)]),
         BalancerFallbackMissing(tag, fallback) => (
             Key::SettingsBalancerFallbackMissing,
@@ -3006,6 +3057,7 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         RoutingActiveBalancerMissing(tag) => {
             (Key::SettingsRoutingActiveBalancerMissing, vec![Quoted(tag)])
         }
+        ActiveBalancerDisabled(tag) => (Key::SettingsActiveBalancerDisabled, vec![Quoted(tag)]),
         RoutingRuleOutboundMissing(index, tag) => (
             Key::SettingsRoutingRuleOutboundMissing,
             vec![Count(*index), Quoted(tag)],
@@ -3287,6 +3339,9 @@ mod en {
             Key::TopbarMode => "mode: {}",
             Key::TopbarActiveServer => "server: {}",
             Key::TopbarActiveBalancer => "balancer: {}",
+            Key::TopbarActiveRoute => "route: {}",
+            Key::RouteDirect => "Direct",
+            Key::RouteBlock => "Block",
             Key::TopbarCoreNotInstalled => "Xray core not installed",
             Key::TopbarChangesPending => "changes pending",
             Key::TopbarServerEditsUnsaved => "Server edits not saved",
@@ -4277,6 +4332,53 @@ mod en {
             Key::SrvSortByLatency => "Sort by latency",
             Key::SrvDragToReorder => "Drag to reorder",
             Key::SrvSetActive => "Set active",
+            Key::SrvActiveAlwaysEmitted => "The active server is always emitted",
+            Key::SrvChainOnlyHint => "Emitted because another server dials through it",
+            Key::SrvActiveRoute => "Active route: {}",
+            Key::SrvSearch => "Search servers",
+            Key::SrvNoMatches => "No server matches the search.",
+            Key::SrvCopyToManual => "Copy to manual",
+            Key::SrvEditSubscription => "Edit subscription",
+            Key::SrvSaveSubscription => "Save",
+            Key::SrvReportRouteBlock => "the active route moved to Block",
+            Key::SrvActiveRouteReset => {
+                "the saved active route named no server; the route is now Block"
+            }
+            Key::SrvAddSubscription => "Add subscription",
+            Key::SrvSubscriptionUrl => "Subscription URL",
+            Key::SrvSubscriptionTitle => "Title",
+            Key::SrvUseCustomUa => "Use a custom User-Agent",
+            Key::SrvRefreshSubscription => "Refresh",
+            Key::SrvDeleteSubscription => "Delete subscription",
+            Key::SrvDeleteSubscriptionConfirm => "Delete subscription {} and its servers?",
+            Key::SrvSubscriptionFetching => "Fetching subscription...",
+            Key::SrvShowReport => "Report",
+            Key::SrvQuotaUsed => "{} / {} ({}%)",
+            Key::SrvQuotaUnlimited => "{} / ∞",
+            Key::SrvSubscriptionExpired => "expired",
+            Key::SrvSubscriptionExpiresIn => "expires in {} days ({})",
+            Key::SrvSubscriptionUpdateHint => "provider suggests every {} h",
+            Key::SrvReportTitle => "Refresh report",
+            Key::SrvReportSummary => "Added {}, updated {}, removed {}, refused {}, ignored {}",
+            Key::SrvReportAdded => "added",
+            Key::SrvReportUpdated => "updated",
+            Key::SrvReportRemoved => "removed",
+            Key::SrvReportRefused => "refused",
+            Key::SrvReportIgnored => "ignored",
+            Key::SrvSubscriptionFetchFailed => "subscription fetch failed: {}",
+            Key::SrvSubscriptionEmpty => {
+                "the subscription returned no usable servers; the previous servers stay"
+            }
+            Key::SrvSubscriptionNoUplinkAddress => "the uplink adapter {} has no usable address",
+            Key::SettingsSubscriptions => "Subscriptions",
+            Key::SettingsSubscriptionUserAgent => "Subscription User-Agent",
+            Key::SettingsSubscriptionUserAgentHint => {
+                "Sent when a subscription uses the global agent; an empty value omits the header"
+            }
+            Key::SettingsSubscriptionDirectFetch => "Direct for subscription fetch",
+            Key::SettingsSubscriptionDirectFetchHint => {
+                "Bind the physical uplink instead of following the OS stack, which TUN intercepts"
+            }
             Key::SrvDuplicate => "Duplicate",
             Key::SrvExportLinkQr => "Export link / QR",
             Key::SrvDeleteEllipsis => "Delete…",
@@ -5482,18 +5584,19 @@ mod en {
             Key::SettingsProfilesRequired => "Latency test requires at least one server.",
             Key::SettingsProfileIdEmpty => "server profile {} has an empty or whitespace-only ID",
             Key::SettingsProfileIdDuplicated => "server profiles {} and {} have duplicate ID {}",
-            Key::SettingsProfileTagEmpty => {
-                "server profile {} ({}) generates an empty outbound tag"
-            }
-            Key::SettingsProfileTagInvalid => {
-                "server profile {} ({}) generates invalid outbound tag {}"
-            }
-            Key::SettingsProfileTagReserved => {
-                "server profile {} ({}) generates reserved outbound tag {}"
+            Key::SettingsProfileNameEmpty => {
+                "server profile {} ({}) has an empty name; a server tag needs one"
             }
             Key::SettingsProfileTagDuplicated => {
-                "server profiles {} ({}) and {} ({}) generate duplicate outbound tag {}. IDs must \
-                 differ within their first 8 characters"
+                "server profiles {} ({}) and {} ({}) generate duplicate outbound tag {}. Names must \
+                 be unique inside their group"
+            }
+            Key::SettingsGroupTitleEmpty => {
+                "server group {} has an empty title; every server tag starts with it"
+            }
+            Key::SettingsGroupTitleDuplicated => {
+                "server groups {} ({}) and {} ({}) share a title; every tag prefixed with it would \
+                 collide"
             }
             Key::SettingsOutboundChainMissing => {
                 "outbound {} references missing chained outbound {}"
@@ -5501,6 +5604,12 @@ mod en {
             Key::SettingsOutboundChainCycle => "outbound chain cycle: {}",
             Key::SettingsBalancerNoTag => "balancer {} has no tag",
             Key::SettingsBalancerNoSelector => "balancer {} has no outbound selector",
+            Key::SettingsBalancerNoMatch => {
+                "balancer {} has a selector that matches no outbound tag the document carries"
+            }
+            Key::SettingsObservatoryNoMatch => {
+                "{} observes no outbound: its subject selector matches no outbound tag the document carries"
+            }
             Key::SettingsBalancerTagDuplicated => "balancer tag {} is duplicated",
             Key::SettingsBalancerFallbackMissing => {
                 "balancer {} references missing fallback outbound {}"
@@ -5549,6 +5658,9 @@ mod en {
                  the configuration loads."
             }
             Key::SettingsRoutingActiveBalancerMissing => "the active balancer {} is not configured",
+            Key::SettingsActiveBalancerDisabled => {
+                "the active balancer {} is switched off; choose another route or switch it on"
+            }
             Key::SettingsRoutingRuleOutboundMissing => {
                 "routing rule {} references missing outbound {}"
             }
@@ -7588,7 +7700,7 @@ mod tests {
                 "srv-x".into()
             )),
             "server profiles 1 (\"aaaaaaaa\") and 2 (\"bbbbbbbb\") generate duplicate \
-             outbound tag \"srv-x\". IDs must differ within their first 8 characters"
+             outbound tag \"srv-x\". Names must be unique inside their group"
         );
         assert_eq!(
             rendered(ValidationCode::OutboundChainCycle(

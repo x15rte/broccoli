@@ -454,6 +454,9 @@ pub struct CoreSetupCtx<'a> {
 pub struct ServersCtx<'a> {
     pub(crate) servers: &'a mut ServersFile,
     pub(crate) settings: &'a mut Settings,
+    /// Whether the managed core is running now: the subscription fetch's
+    /// physical-uplink resolution reads it the way the latency probe does.
+    pub(crate) core_running: bool,
     pub(crate) busy: gate::BusyWindow,
     /// Outcome slot of the one single-flight latency probe: the shell parks
     /// the drained result here and the servers screen adopts it through its
@@ -844,6 +847,7 @@ impl<'a> UiCtx<'a> {
         ServersCtx {
             servers: &mut *self.servers,
             settings: &mut *self.settings,
+            core_running: matches!(self.phase, crate::rt::CorePhase::Running),
             busy: self.busy,
             probe_feedback: &mut *self.probe_feedback,
             hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),

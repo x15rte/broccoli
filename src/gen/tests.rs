@@ -16,7 +16,7 @@ use crate::model::validation::ValidationCode;
 use crate::model::*;
 use serde_json::{Map, Value, json};
 
-const ID: &str = "0123456789abcdef"; // tag: srv-01234567
+const ID: &str = "0123456789abcdef";
 
 fn base_settings() -> Settings {
     Settings::default()
@@ -24,11 +24,20 @@ fn base_settings() -> Settings {
 
 /// Deterministic goldens: the API port is ephemeral in production,
 /// so tests inject a fixed port through the generation seam.
+///
+/// Configuration-shape fixtures predate the per-server switch and describe
+/// documents, not lists: every profile is switched on here, so the emitted set
+/// is the whole fixture. Tests about the emitted set itself drive
+/// `generate_with_api_port` directly.
 fn generate_deterministic(
     servers: &ServersFile,
     settings: &Settings,
 ) -> Result<Value, GenerateError> {
-    generate_with_api_port(servers, settings, 10853)
+    let mut servers = servers.clone();
+    for profile in &mut servers.profiles {
+        profile.enabled = true;
+    }
+    generate_with_api_port(&servers, settings, 10853)
 }
 
 fn single_server(outbound: OutboundModel) -> ServersFile {
@@ -39,10 +48,9 @@ fn single_server(outbound: OutboundModel) -> ServersFile {
             id: ID.into(),
             name: "test".into(),
             outbound,
-            latency_ms: None,
-            extra: Map::new(),
+            ..Default::default()
         }],
-        extra: Map::new(),
+        ..Default::default()
     }
 }
 
@@ -370,8 +378,11 @@ fn observatory_probe_url_rejects_ssrf_targets_with_class_name() {
             probe_url: url.into(),
             ..Default::default()
         };
-        let error = generate_deterministic(&ServersFile::default(), &settings)
-            .expect_err("observatory probe URL must be rejected");
+        let error = generate_deterministic(
+            &single_server(OutboundModel::new(Protocol::Freedom)),
+            &settings,
+        )
+        .expect_err("observatory probe URL must be rejected");
         let message = match error {
             GenerateError::InvalidModel(message) => message.text(Language::En),
             other => panic!("expected InvalidModel, got {other:?}"),
@@ -397,15 +408,18 @@ fn observatory_probe_url_rejects_ssrf_targets_with_class_name() {
     forced.routing.observatory.probe_url = "http://127.0.0.1:1/".into();
     forced.routing.balancers.push(Balancer {
         tag: "health".into(),
-        selector: vec!["srv-".into()],
+        selector: vec!["[".into()],
         strategy: StrategyCfg {
             r#type: "leastping".into(),
             ..Default::default()
         },
         ..Default::default()
     });
-    let error = generate_deterministic(&ServersFile::default(), &forced)
-        .expect_err("a forced observatory must still reject blocked hosts");
+    let error = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &forced,
+    )
+    .expect_err("a forced observatory must still reject blocked hosts");
     assert!(
         error.to_string().contains("loopback"),
         "expected loopback class, got: {error}"
@@ -424,9 +438,11 @@ fn observatory_probe_url_rejects_ssrf_targets_with_class_name() {
             probe_url: url.into(),
             ..Default::default()
         };
-        generate_deterministic(&ServersFile::default(), &settings).unwrap_or_else(|error| {
-            panic!("public observatory probe URL {url:?} must pass: {error}")
-        });
+        generate_deterministic(
+            &single_server(OutboundModel::new(Protocol::Freedom)),
+            &settings,
+        )
+        .unwrap_or_else(|error| panic!("public observatory probe URL {url:?} must pass: {error}"));
     }
 }
 
@@ -536,19 +552,23 @@ fn explicit_observatory_emits_official_config_and_service() {
     let mut settings = base_settings();
     settings.routing.observatory = ObservatoryCfg {
         enabled: true,
-        subject_selector: vec!["edge-".into()],
+        subject_selector: vec!["[".into()],
         probe_url: "https://example.com/health".into(),
         probe_interval: DurationMs::secs(30),
         enable_concurrency: true,
-        extra: Map::new(),
+        ..Default::default()
     };
 
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert_eq!(
         cfg["observatory"],
         json!({
-            "subjectSelector": ["edge-"],
+            "subjectSelector": ["["],
             "probeURL": "https://example.com/health",
             "probeInterval": "30s",
             "enableConcurrency": true
@@ -560,8 +580,11 @@ fn explicit_observatory_emits_official_config_and_service() {
 
 #[test]
 fn disabled_observatory_omits_config_and_service_unless_burst_is_enabled() {
-    let cfg = generate_deterministic(&ServersFile::default(), &base_settings())
-        .expect("generate default config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &base_settings(),
+    )
+    .expect("generate default config");
 
     assert!(cfg.get("observatory").is_none());
     assert!(cfg.get("burstObservatory").is_none());
@@ -569,8 +592,11 @@ fn disabled_observatory_omits_config_and_service_unless_burst_is_enabled() {
 
     let mut burst_settings = base_settings();
     burst_settings.routing.burst_observatory.enabled = true;
-    let burst_cfg = generate_deterministic(&ServersFile::default(), &burst_settings)
-        .expect("generate burst config");
+    let burst_cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &burst_settings,
+    )
+    .expect("generate burst config");
 
     assert!(burst_cfg.get("observatory").is_none());
     assert!(burst_cfg.get("burstObservatory").is_some());
@@ -586,7 +612,11 @@ fn both_engines_configured_still_emit_both_blocks() {
     settings.routing.observatory.enabled = true;
     settings.routing.burst_observatory.enabled = true;
 
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert!(cfg.get("observatory").is_some());
     assert!(cfg.get("burstObservatory").is_some());
@@ -606,7 +636,7 @@ fn health_balancer_keeps_the_observatory_beside_burst() {
     settings.routing.burst_observatory.enabled = true;
     settings.routing.balancers.push(Balancer {
         tag: "health".into(),
-        selector: vec!["srv-".into()],
+        selector: vec!["[".into()],
         strategy: StrategyCfg {
             r#type: "leastload".into(),
             ..Default::default()
@@ -618,7 +648,7 @@ fn health_balancer_keeps_the_observatory_beside_burst() {
 
     assert_eq!(
         cfg["observatory"]["subjectSelector"],
-        json!(["srv-01234567"]),
+        json!(["[Manual] test"]),
         "the dependency forces full coverage of the profile set"
     );
     assert!(cfg.get("burstObservatory").is_some());
@@ -630,7 +660,7 @@ fn health_balancers_force_the_ordinary_observatory() {
     let servers = single_server(OutboundModel::new(Protocol::Freedom));
     let balancer = |strategy: &str, fallback: &str| Balancer {
         tag: "health".into(),
-        selector: vec!["srv-".into()],
+        selector: vec!["[".into()],
         strategy: StrategyCfg {
             r#type: strategy.into(),
             ..Default::default()
@@ -653,7 +683,7 @@ fn health_balancers_force_the_ordinary_observatory() {
         assert_eq!(
             cfg["observatory"],
             json!({
-                "subjectSelector": ["srv-01234567"],
+                "subjectSelector": ["[Manual] test"],
                 "probeURL": "https://www.google.com/generate_204",
                 "probeInterval": "10s"
             }),
@@ -676,7 +706,7 @@ fn health_balancers_force_the_ordinary_observatory() {
 
     let mut explicit_settings = base_settings();
     explicit_settings.routing.observatory.enabled = true;
-    explicit_settings.routing.observatory.subject_selector = vec!["custom-".into()];
+    explicit_settings.routing.observatory.subject_selector = vec!["[".into()];
     explicit_settings
         .routing
         .balancers
@@ -685,7 +715,7 @@ fn health_balancers_force_the_ordinary_observatory() {
         .expect("explicit observatory config with dependency");
     assert_eq!(
         cfg["observatory"]["subjectSelector"],
-        json!(["custom-"]),
+        json!(["["]),
         "an explicitly enabled observatory must preserve its user selector"
     );
 }
@@ -694,7 +724,11 @@ fn health_balancers_force_the_ordinary_observatory() {
 fn raw_override_verbatim() {
     let mut settings = base_settings();
     settings.raw_override = Some(r#"{"custom": true, "outbounds": []}"#.into());
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(cfg, json!({"custom": true, "outbounds": []}));
 }
 
@@ -735,6 +769,51 @@ fn invalid_gui_targets_and_required_fields_block_generation() {
 }
 
 #[test]
+fn disabled_entities_stay_off_the_wire() {
+    let mut settings = base_settings();
+    settings.routing.rules.push(Rule {
+        domain: vec!["domain:disabled.example".into()],
+        outbound_tag: "direct".into(),
+        enabled: false,
+        ..Default::default()
+    });
+    settings.routing.balancers.push(Balancer {
+        tag: "off".into(),
+        selector: vec!["[".into()],
+        enabled: false,
+        ..Default::default()
+    });
+    settings.dns.servers.push(crate::model::DnsServer {
+        address: "https://disabled.example/dns-query".into(),
+        enabled: false,
+        ..Default::default()
+    });
+
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
+    let rules = cfg["routing"]["rules"].as_array().expect("rules array");
+    assert!(
+        !rules
+            .iter()
+            .any(|rule| rule["domain"] == json!(["domain:disabled.example"])),
+        "a switched-off rule must not reach the document"
+    );
+    assert!(
+        cfg["routing"].get("balancers").is_none(),
+        "a switched-off balancer must not reach the document"
+    );
+    let dns = cfg["dns"]["servers"].as_array().expect("dns servers");
+    assert!(
+        !dns.iter()
+            .any(|server| server["address"] == json!("https://disabled.example/dns-query")),
+        "a switched-off DNS entry must not reach the document"
+    );
+}
+
+#[test]
 fn duplicate_profile_tag_blocks_generation() {
     let mut servers = single_server(OutboundModel::default());
     servers.active = None;
@@ -744,7 +823,7 @@ fn duplicate_profile_tag_blocks_generation() {
 
     let message = invalid_model_message(&servers);
     assert!(message.contains("duplicate outbound tag"), "{message}");
-    assert!(message.contains("srv-01234567"), "{message}");
+    assert!(message.contains("[Manual] test"), "{message}");
 }
 
 #[test]
@@ -1359,7 +1438,7 @@ fn golden_chain_dialer_proxy() {
     // golden is the shape the core oracle runs `xray run -test` over — the
     // fixture's VLESS encryption is the client shape `xray vlessenc` emits.
     let mut hop_outbound = vless_server("hop.example.com", 443);
-    hop_outbound.chain_via("srv-fedcba98");
+    hop_outbound.chain_via("[Manual] exit");
     let hop = ServerProfile {
         id: ID.into(),
         ..ServerProfile::new("hop", hop_outbound)
@@ -1372,7 +1451,7 @@ fn golden_chain_dialer_proxy() {
         version: 1,
         active: Some(hop.id.clone()),
         profiles: vec![hop, exit],
-        extra: Map::new(),
+        ..Default::default()
     };
     golden!(
         "goldens/chain_dialer_proxy.json",
@@ -1965,7 +2044,7 @@ fn retired_quic_udp_hop_key_warns_and_never_reaches_the_wire() {
         persisted["streamSettings"]["finalmask"]["quicParams"]["udpHop"],
         retired
     );
-    let wire = ob.to_wire("srv-01234567");
+    let wire = ob.to_wire("[Manual] test");
     assert!(
         wire["streamSettings"]["finalmask"]["quicParams"]
             .get("udpHop")
@@ -2138,7 +2217,7 @@ fn golden_balancer_leastload() {
     }];
     settings.routing.balancers = vec![Balancer {
         tag: "bal".into(),
-        selector: vec!["srv-".into()],
+        selector: vec!["[".into()],
         strategy: StrategyCfg {
             r#type: "leastload".into(),
             settings: Some(LeastLoadSettings {
@@ -2182,8 +2261,11 @@ fn fakedns_multiple_pools_emit_official_array_form() {
         },
     ];
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(
         generated["fakeDns"],
         json!([
@@ -2231,7 +2313,7 @@ fn the_active_balancer_is_the_last_catch_all_rule() {
     settings
         .routing
         .balancers
-        .push(Balancer::new("route".into(), "srv-".into()));
+        .push(Balancer::new("route".into(), "[".into()));
     settings.routing.active_balancer = "route".into();
     settings.routing.rules.push(Rule {
         domain: vec!["domain:blocked.example".into()],
@@ -2266,7 +2348,7 @@ fn the_active_balancer_is_the_last_catch_all_rule() {
     // The default outbound is untouched: the profile stays first, so the
     // document keeps a dial target for the balancer and for a script-free
     // default route.
-    assert_eq!(generated["outbounds"][0]["tag"], json!("srv-01234567"));
+    assert_eq!(generated["outbounds"][0]["tag"], json!("[Manual] test"));
 }
 
 #[test]
@@ -2280,8 +2362,11 @@ fn tun_user_rules_follow_the_dns_interception_rules() {
         ..Default::default()
     });
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let rules = generated["routing"]["rules"].as_array().unwrap();
     // The system rules come first — the interception rules that own DNS for
     // the intercepted inbounds (seeded DNS module: dns-in, in-tun:53,
@@ -2382,8 +2467,11 @@ fn a_user_rule_can_claim_private_destinations_ahead_of_the_direct_fallback() {
         ..Default::default()
     });
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let rules = generated["routing"]["rules"].as_array().unwrap();
     let user = rules
         .iter()
@@ -2481,7 +2569,11 @@ fn private_fallbacks_yield_to_fakedns() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.dns.fakedns.enabled = true;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let rules = cfg["routing"]["rules"].as_array().unwrap();
     assert!(
         !rules
@@ -2595,8 +2687,11 @@ fn user_port_53_rule_is_routed_after_the_dns_interception_rules() {
         ..Default::default()
     });
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let rules = generated["routing"]["rules"].as_array().unwrap();
     let user_index = rules
         .iter()
@@ -2634,8 +2729,11 @@ fn user_port_53_rule_is_routed_after_the_dns_interception_rules() {
 fn tun_routing_has_no_unconditional_catch_all_shadowing_trial_rules() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let rules = generated["routing"]["rules"].as_array().unwrap();
     assert!(
         !rules.is_empty(),
@@ -2674,8 +2772,11 @@ fn policy_emits_all_nonempty_user_levels_and_stats_flags() {
         },
     );
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(
         generated["policy"]["levels"]["7"],
         json!({
@@ -2708,8 +2809,11 @@ fn dns_and_dokodemo_use_exact_core_wire_types() {
     dokodemo.port_map.insert("5353".into(), "8.8.4.4:53".into());
     settings.dokodemo.push(dokodemo);
 
-    let generated =
-        generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let generated = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(generated["dns"]["serveExpiredTTL"], json!(30));
     // The pushed server lands after the two seeded entries.
     assert_eq!(generated["dns"]["servers"][2]["serveExpiredTTL"], json!(60));
@@ -2733,15 +2837,20 @@ fn dns_interception_wires_dns_outbound_and_socks_port53_rule() {
         address: "https://1.1.1.1/dns-query".into(),
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     // DNS outbound appended after the built-ins; default outbound unchanged.
     let out = cfg["outbounds"].as_array().unwrap();
-    assert_eq!(out.len(), 3);
-    assert_eq!(out[0]["tag"], json!("direct"));
-    assert_eq!(out[1]["tag"], json!("block"));
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[0]["tag"], json!("[Manual] test"));
+    assert_eq!(out[1]["tag"], json!("direct"));
+    assert_eq!(out[2]["tag"], json!("block"));
     assert_eq!(
-        out[2],
+        out[3],
         json!({ "protocol": "dns", "tag": DNS_OUTBOUND_TAG })
     );
 
@@ -2778,7 +2887,11 @@ fn multiple_socks_entries_all_join_the_port53_interception_rule() {
         port: 20808,
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert_eq!(
         cfg["routing"]["rules"],
@@ -2805,7 +2918,11 @@ fn multiple_socks_entries_all_join_the_port53_interception_rule() {
 fn disabled_socks_entries_stay_off_the_wire_and_out_of_interception() {
     let mut settings = base_settings();
     settings.local_inbounds[0].enabled = false; // the seeded in-socks entry
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tags: Vec<&str> = cfg["inbounds"]
         .as_array()
@@ -2845,7 +2962,11 @@ fn disabled_socks_entries_are_excluded_from_the_port53_rule() {
         port: 20808,
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tags: Vec<&str> = cfg["inbounds"]
         .as_array()
@@ -2872,7 +2993,11 @@ fn local_inbounds_emit_in_list_order() {
         port: 20809,
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tags: Vec<&str> = cfg["inbounds"]
         .as_array()
@@ -2917,9 +3042,9 @@ fn profile_outbounds_emit_in_list_order() {
     assert_eq!(
         tags(&servers),
         [
-            "srv-01234567",
-            "srv-fedcba98",
-            "srv-00112233",
+            "[Manual] server-0",
+            "[Manual] server-1",
+            "[Manual] server-2",
             "direct",
             "block",
             DNS_OUTBOUND_TAG
@@ -2934,9 +3059,9 @@ fn profile_outbounds_emit_in_list_order() {
     assert_eq!(
         tags(&servers),
         [
-            "srv-00112233",
-            "srv-01234567",
-            "srv-fedcba98",
+            "[Manual] server-2",
+            "[Manual] server-0",
+            "[Manual] server-1",
             "direct",
             "block",
             DNS_OUTBOUND_TAG
@@ -3088,7 +3213,11 @@ fn dns_takeover_switch_does_not_change_the_tun_dns_pin() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.dns_takeover = false;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     let tun = cfg["inbounds"]
         .as_array()
         .unwrap()
@@ -3118,7 +3247,11 @@ fn tun_adapter_dns_is_pinned_to_the_in_tun_gateway() {
         address: "https://1.1.1.1/dns-query".into(),
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     // The adapter DNS is contract-pinned to the in-tun listener address: the
     // core's DNS leak block permits port-53 only through the TUN interface,
@@ -3213,7 +3346,11 @@ fn tun_without_dns_module_keeps_plaintext_adapter_dns() {
     settings.tun.dns.clear();
     settings.dns.servers.clear();
     settings.dns.enable_parallel_query = false;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tun = cfg["inbounds"]
         .as_array()
@@ -3237,7 +3374,11 @@ fn tun_without_dns_module_keeps_stored_adapter_dns() {
     // list is kept instead of the in-tun pin.
     settings.dns.servers.clear();
     settings.dns.enable_parallel_query = false;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tun = cfg["inbounds"]
         .as_array()
@@ -3265,7 +3406,11 @@ fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
     // default policy keeps DNS and the unrouted family inside the tunnel.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert!(
         config_runs_tun_dns(&cfg),
@@ -3298,7 +3443,11 @@ fn tun_without_dns_module_emits_no_leak_block() {
     settings.mode = Mode::Tun;
     settings.dns.servers.clear();
     settings.dns.enable_parallel_query = false;
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert!(!config_runs_tun_dns(&cfg));
     assert!(tun_settings(&cfg).get("autoSystemWfpBlockLeak").is_none());
@@ -3312,7 +3461,11 @@ fn a_switched_off_leak_entry_leaves_the_key_without_it() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.tun.auto_system_wfp_block_leak = vec!["MisconfigTun".into()];
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert!(config_runs_tun_dns(&cfg));
     assert_eq!(
@@ -3329,7 +3482,11 @@ fn a_stored_dns_alias_is_emitted_as_the_entries_it_stands_for() {
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.tun.auto_system_wfp_block_leak = vec!["DNS".into(), "Tcp/053".into()];
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     assert_eq!(
         tun_settings(&cfg)["autoSystemWfpBlockLeak"],
@@ -3769,7 +3926,7 @@ fn chained_outbound_defers_the_bootstrap_scope_to_its_direct_dial_outbound() {
         version: 1,
         active: Some(hop.id.clone()),
         profiles: vec![hop, exit],
-        extra: Map::new(),
+        ..Default::default()
     };
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -3826,7 +3983,7 @@ fn bootstrap_scope_follows_a_transitive_chain_to_its_far_end() {
         version: 1,
         active: Some(hop.id.clone()),
         profiles: vec![hop, mid, exit],
-        extra: Map::new(),
+        ..Default::default()
     };
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -3870,7 +4027,7 @@ fn standby_profiles_keep_no_bootstrap_marking_outside_the_documents_dials() {
         version: 1,
         active: Some(active.id.clone()),
         profiles: vec![active, standby],
-        extra: Map::new(),
+        ..Default::default()
     };
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -3912,7 +4069,7 @@ fn rule_targets_and_balancer_members_keep_the_bootstrap_marking() {
         version: 1,
         active: Some(active.id.clone()),
         profiles: vec![active, ruled.clone(), balanced.clone()],
-        extra: Map::new(),
+        ..Default::default()
     };
     let mut settings = base_settings();
     settings.routing.rules.push(crate::model::Rule {
@@ -3964,11 +4121,11 @@ fn health_engine_subjects_keep_the_bootstrap_marking() {
         version: 1,
         active: Some(active.id.clone()),
         profiles: vec![active, probed],
-        extra: Map::new(),
+        ..Default::default()
     };
     let mut settings = base_settings();
     settings.routing.observatory.enabled = true;
-    settings.routing.observatory.subject_selector = vec!["srv-".into()];
+    settings.routing.observatory.subject_selector = vec!["[".into()];
 
     let cfg = generate_deterministic(&servers, &settings).expect("generate config");
     assert_eq!(
@@ -3981,7 +4138,7 @@ fn health_engine_subjects_keep_the_bootstrap_marking() {
     settings.routing.observatory.enabled = false;
     settings.routing.balancers.push(crate::model::Balancer {
         tag: "healthy".into(),
-        selector: vec!["srv-".into()],
+        selector: vec!["[".into()],
         strategy: crate::model::StrategyCfg {
             r#type: "leastping".into(),
             ..Default::default()
@@ -3998,9 +4155,9 @@ fn health_engine_subjects_keep_the_bootstrap_marking() {
     // subjects are dialed beside the ordinary observatory's.
     settings.routing.balancers.clear();
     settings.routing.observatory.enabled = true;
-    settings.routing.observatory.subject_selector = vec!["srv-01234567".into()];
+    settings.routing.observatory.subject_selector = vec!["[Manual] active".into()];
     settings.routing.burst_observatory.enabled = true;
-    settings.routing.burst_observatory.subject_selector = vec!["srv-fedcba98".into()];
+    settings.routing.burst_observatory.subject_selector = vec!["[Manual] probed".into()];
     let cfg = generate_deterministic(&servers, &settings).expect("generate config");
     assert_eq!(
         cfg["dns"]["servers"][2]["domains"],
@@ -4032,7 +4189,7 @@ fn rule_target_chain_terminal_is_the_marked_outbound() {
         version: 1,
         active: Some(active.id.clone()),
         profiles: vec![active, hop.clone(), exit],
-        extra: Map::new(),
+        ..Default::default()
     };
     let mut settings = base_settings();
     settings.routing.rules.push(crate::model::Rule {
@@ -4077,7 +4234,7 @@ fn chain_to_an_ip_literal_outbound_closes_the_bootstrap_gate() {
         version: 1,
         active: Some(hop.id.clone()),
         profiles: vec![hop, exit],
-        extra: Map::new(),
+        ..Default::default()
     };
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -4140,7 +4297,7 @@ fn a_chain_profile_emits_the_dialer_proxy_spelling_only() {
         version: 1,
         active: Some(hop.id.clone()),
         profiles: vec![hop, exit],
-        extra: Map::new(),
+        ..Default::default()
     };
 
     let cfg = generate_deterministic(&servers, &base_settings()).expect("generate config");
@@ -4184,7 +4341,11 @@ fn tun_stored_adapter_dns_is_ignored_for_in_tun_listener() {
         address: "https://1.1.1.1/dns-query".into(),
         ..Default::default()
     });
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
 
     let tun = cfg["inbounds"]
         .as_array()
@@ -4200,7 +4361,11 @@ fn geodata_geoip_url_emits_default_cron_and_single_asset() {
     let mut settings = base_settings();
     settings.geodata.geoip_url = Some(GEOIP_URL.into());
 
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(
         cfg["geodata"],
         json!({
@@ -4217,7 +4382,11 @@ fn geodata_both_urls_emit_geoip_first_then_geosite() {
     settings.geodata.geosite_url = Some(GEOSITE_URL.into());
     settings.geodata.cron = Some("17 3 * * 1".into());
 
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(cfg["geodata"]["cron"], json!("17 3 * * 1"));
     assert_eq!(
         cfg["geodata"]["assets"],
@@ -4234,7 +4403,11 @@ fn geodata_empty_cron_falls_back_to_default() {
     settings.geodata.geoip_url = Some(GEOIP_URL.into());
     settings.geodata.cron = Some(String::new());
 
-    let cfg = generate_deterministic(&ServersFile::default(), &settings).expect("generate config");
+    let cfg = generate_deterministic(
+        &single_server(OutboundModel::new(Protocol::Freedom)),
+        &settings,
+    )
+    .expect("generate config");
     assert_eq!(
         cfg["geodata"]["cron"],
         json!(crate::model::settings::DEFAULT_GEODATA_CRON)
@@ -4631,7 +4804,7 @@ fn observatory_projection_strips_enabled_and_forces_subjects() {
     };
     let wire = cfg.to_wire(None);
     assert!(wire.get("enabled").is_none());
-    assert_eq!(wire["subjectSelector"], json!(["srv-"]));
+    assert_eq!(wire["subjectSelector"], json!(["["]));
     assert_eq!(wire["probeInterval"], "30s");
 
     let forced = vec!["srv-abc".to_string(), "srv-def".to_string()];
@@ -4651,7 +4824,7 @@ fn burst_observatory_projection_strips_enabled_and_keeps_ping_config() {
     };
     let wire = cfg.to_wire();
     assert!(wire.get("enabled").is_none());
-    assert_eq!(wire["subjectSelector"], json!(["srv-"]));
+    assert_eq!(wire["subjectSelector"], json!(["["]));
     assert_eq!(
         wire["pingConfig"]["destination"],
         "https://example.com/generate_204"
@@ -4842,7 +5015,7 @@ fn golden_wireguard_remote_dns() {
         version: 1,
         active: Some(explicit.id.clone()),
         profiles: vec![explicit, zoned],
-        extra: Map::new(),
+        ..Default::default()
     };
     golden!(
         "goldens/wireguard_remote_dns.json",
@@ -4929,7 +5102,7 @@ fn golden_blackhole_custom_response() {
         version: 1,
         active: Some(custom.id.clone()),
         profiles: vec![custom, http],
-        extra: Map::new(),
+        ..Default::default()
     };
     golden!(
         "goldens/blackhole_custom_response.json",

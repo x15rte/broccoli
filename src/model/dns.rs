@@ -22,6 +22,13 @@ fn skip_default_query_strategy(s: &str) -> bool {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsServer {
+    /// Whether the entry reaches the generated `dns.servers` list. GUI-only:
+    /// the wire form strips it and omits disabled entries.
+    #[serde(
+        default = "crate::model::routing::enabled_by_default",
+        skip_serializing_if = "crate::model::routing::is_enabled"
+    )]
+    pub enabled: bool,
     /// Optional id the core hands to DNS scripts (dns.go:20; the script
     /// surface reads it in app/dns/lua.go:48-61). The core enforces no
     /// uniqueness.
@@ -63,6 +70,7 @@ pub struct DnsServer {
 impl Default for DnsServer {
     fn default() -> Self {
         Self {
+            enabled: true,
             id: String::new(),
             address: String::new(),
             port: None,
@@ -85,9 +93,11 @@ impl Default for DnsServer {
 
 impl<'de> Deserialize<'de> for DnsServer {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Default, Deserialize)]
+        #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", default)]
         struct Object {
+            #[serde(default = "crate::model::routing::enabled_by_default")]
+            enabled: bool,
             id: String,
             address: String,
             port: Option<u16>,
@@ -110,6 +120,31 @@ impl<'de> Deserialize<'de> for DnsServer {
             final_query: Option<bool>,
             #[serde(flatten)]
             extra: Map<String, Value>,
+        }
+
+        impl Default for Object {
+            fn default() -> Self {
+                Self {
+                    enabled: true,
+                    id: String::new(),
+                    address: String::new(),
+                    port: None,
+                    domains: Vec::new(),
+                    expected_ips: None,
+                    legacy_expect_ips: None,
+                    unexpected_ips: Vec::new(),
+                    skip_fallback: None,
+                    client_ip: String::new(),
+                    query_strategy: String::new(),
+                    tag: String::new(),
+                    timeout_ms: None,
+                    disable_cache: None,
+                    serve_stale: None,
+                    serve_expired_ttl: None,
+                    final_query: None,
+                    extra: Map::new(),
+                }
+            }
         }
 
         /// One entry: the plain address shorthand or the configuration
@@ -141,6 +176,7 @@ impl<'de> Deserialize<'de> for DnsServer {
                 let wire = serde::de::value::MapAccessDeserializer::new(map);
                 let object = Object::deserialize(wire)?;
                 Ok(DnsServer {
+                    enabled: object.enabled,
                     id: object.id,
                     address: object.address,
                     port: object.port,
@@ -387,7 +423,9 @@ impl DnsCfg {
     /// appends {"address":"fakedns"} (deduped) when enabled.
     pub fn to_wire(&self) -> Option<Value> {
         let fakedns = self.fakedns.enabled;
-        let mut v = serde_json::to_value(self).expect(
+        let mut enabled_only = self.clone();
+        enabled_only.servers.retain(|server| server.enabled);
+        let mut v = serde_json::to_value(&enabled_only).expect(
             "model serialization is infallible: DnsCfg/DnsServer/FakeDnsCfg fields are \
              ints, bools, strings, and string-keyed Value maps only",
         );

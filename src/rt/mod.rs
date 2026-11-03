@@ -8644,19 +8644,22 @@ mod tests {
             // The saved profiles still carry the retired spelling the pinned
             // core refuses (infra/conf/xray.go:262), so the app's own
             // generation refuses before any spawn.
-            let mut profile = ServerProfile {
-                id: "0123456789abcdef".into(),
-                name: "Stale edge".into(),
-                outbound: OutboundModel::new(Protocol::Freedom),
-                ..ServerProfile::new("Stale edge", OutboundModel::new(Protocol::Freedom))
-            };
-            profile.outbound.retired_proxy_settings = Some(serde_json::json!({"tag": "direct"}));
-            let servers = crate::model::ServersFile {
-                profiles: vec![profile.clone()],
-                active: Some(profile.id.clone()),
-                ..crate::model::ServersFile::default()
-            };
-            servers.save().expect("save the marked profile set");
+            {
+                let mut profile = ServerProfile {
+                    id: "0123456789abcdef".into(),
+                    name: "Stale edge".into(),
+                    outbound: OutboundModel::new(Protocol::Freedom),
+                    ..ServerProfile::new("Stale edge", OutboundModel::new(Protocol::Freedom))
+                };
+                profile.outbound.retired_proxy_settings =
+                    Some(serde_json::json!({"tag": "direct"}));
+                let servers = crate::model::ServersFile {
+                    profiles: vec![profile.clone()],
+                    active: Some(profile.id),
+                    ..crate::model::ServersFile::default()
+                };
+                servers.save().expect("save the marked profile set");
+            }
 
             let (mut runtime, events) = runtime_with_events();
             runtime.lifecycle.core_update.commit_candidate();
@@ -8710,18 +8713,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_start_regenerates_from_the_saved_state_over_a_stored_artefact() {
         with_appdata_async(async {
-            let profile = ServerProfile {
-                id: "0123456789abcdef".into(),
-                name: "Saved edge".into(),
-                outbound: OutboundModel::new(Protocol::Freedom),
-                ..ServerProfile::new("Saved edge", OutboundModel::new(Protocol::Freedom))
+            let tag = {
+                let profile = ServerProfile {
+                    id: "0123456789abcdef".into(),
+                    name: "Saved edge".into(),
+                    outbound: OutboundModel::new(Protocol::Freedom),
+                    ..ServerProfile::new("Saved edge", OutboundModel::new(Protocol::Freedom))
+                };
+                let servers = crate::model::ServersFile {
+                    profiles: vec![profile.clone()],
+                    active: Some(profile.id.clone()),
+                    ..crate::model::ServersFile::default()
+                };
+                servers.save().expect("save the server list");
+                profile.tag()
             };
-            let servers = crate::model::ServersFile {
-                profiles: vec![profile.clone()],
-                active: Some(profile.id.clone()),
-                ..crate::model::ServersFile::default()
-            };
-            servers.save().expect("save the server list");
             crate::model::Settings::default()
                 .save()
                 .expect("save the settings");
@@ -8756,7 +8762,6 @@ mod tests {
                 active.get("previousBuild").is_none(),
                 "the stored artefact must not be replayed: {active}"
             );
-            let tag = profile.tag();
             assert!(
                 active["outbounds"]
                     .as_array()
@@ -8773,18 +8778,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_gate_start_runs_the_app_owned_configuration_not_the_users_profiles() {
         with_appdata_async(async {
-            let profile = ServerProfile {
-                id: "0123456789abcdef".into(),
-                name: "Tokyo edge".into(),
-                outbound: OutboundModel::new(Protocol::Freedom),
-                ..ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom))
+            let seeded_tag = {
+                let profile = ServerProfile {
+                    id: "0123456789abcdef".into(),
+                    name: "Tokyo edge".into(),
+                    outbound: OutboundModel::new(Protocol::Freedom),
+                    ..ServerProfile::new("Tokyo edge", OutboundModel::new(Protocol::Freedom))
+                };
+                let servers = crate::model::ServersFile {
+                    profiles: vec![profile.clone()],
+                    active: Some(profile.id.clone()),
+                    ..crate::model::ServersFile::default()
+                };
+                servers.save().expect("save the server list");
+                profile.tag()
             };
-            let servers = crate::model::ServersFile {
-                profiles: vec![profile.clone()],
-                active: Some(profile.id.clone()),
-                ..crate::model::ServersFile::default()
-            };
-            servers.save().expect("save the server list");
 
             let (mut runtime, events) = runtime_with_events();
             runtime.lifecycle.core_update.commit_candidate();
@@ -8819,7 +8827,7 @@ mod tests {
                 "the gate serves no inbound: {active}"
             );
             assert!(
-                !active_text.contains(&profile.tag()),
+                !active_text.contains(&seeded_tag),
                 "no user profile may reach the gate configuration"
             );
             assert!(super::apply::stamp_is_current());

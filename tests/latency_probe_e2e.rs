@@ -225,10 +225,9 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
 
     let profile = one_freedom_profile();
     let servers = ServersFile {
-        version: 1,
         active: Some(profile.id.clone()),
         profiles: vec![profile.clone()],
-        extra: Default::default(),
+        ..ServersFile::default()
     };
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;

@@ -234,6 +234,9 @@ fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     // selector is judged against the tags the document actually carries.
     let outbound_tags = emit::outbound_tags(servers, settings);
     for (index, balancer) in settings.routing.balancers.iter().enumerate() {
+        if !balancer.enabled {
+            continue;
+        }
         let matched = balancer
             .selector
             .iter()
@@ -255,7 +258,16 @@ fn assess(servers: &ServersFile, settings: &Settings) -> Vec<SafetyFinding> {
     // not in the advisory half of the validation pass: the path is legal and
     // usable, and the app must not block it — it must make the user
     // acknowledge where the profile writes.
+    let emitted_tags: std::collections::BTreeSet<String> = servers
+        .emitted_set()
+        .order
+        .iter()
+        .map(|&index| servers.profiles[index].tag())
+        .collect();
     for (index, profile) in servers.profiles.iter().enumerate() {
+        if !emitted_tags.contains(&profile.tag()) {
+            continue;
+        }
         let Some(xdrive) = profile.outbound.stream.xdrive_settings.as_ref() else {
             continue;
         };
@@ -739,6 +751,8 @@ mod tests {
         ServersFile {
             profiles: vec![ServerProfile {
                 id: "0123456789abcdef".into(),
+                name: "server".into(),
+                enabled: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -833,7 +847,7 @@ mod tests {
             ServersFile::default(),
             vec![Balancer {
                 tag: "bal".into(),
-                selector: vec!["srv-".into()],
+                selector: vec!["[".into()],
                 ..Default::default()
             }],
         );
@@ -853,7 +867,7 @@ mod tests {
             profile_servers(),
             vec![Balancer {
                 tag: "bal".into(),
-                selector: vec!["srv-".into()],
+                selector: vec!["[".into()],
                 ..Default::default()
             }],
         );
@@ -902,7 +916,7 @@ mod tests {
                 },
                 Balancer {
                     tag: "broken".into(),
-                    selector: vec!["srv-".into()],
+                    selector: vec!["[".into()],
                     ..Default::default()
                 },
             ],
@@ -1013,7 +1027,7 @@ mod tests {
                 ..Default::default()
             },
             latency_ms: None,
-            extra: serde_json::Map::new(),
+            ..Default::default()
         };
 
         let servers = ServersFile {
@@ -1025,7 +1039,7 @@ mod tests {
                 profile(XDRIVE_SERVICE_DRIVE, "folder-id"),
                 profile(XDRIVE_SERVICE_TEMPLATE, "token"),
             ],
-            extra: serde_json::Map::new(),
+            ..Default::default()
         };
         let findings = SafetyVerdicts::of(&servers, &Settings::default());
         assert_eq!(findings.len(), 1, "{findings:#?}");

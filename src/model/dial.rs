@@ -32,6 +32,14 @@ use std::collections::BTreeSet;
 /// that names no profile is a built-in outbound the child resolves itself.
 pub struct DialGraph<'a> {
     profiles: &'a [ServerProfile],
+    /// The profile Xray's default route names, when the route is a server:
+    /// the settings scope reads `servers.active`, the profile-list scope
+    /// takes the list's first row.
+    default_route: Option<&'a ServerProfile>,
+    /// The tags the document actually carries, when the caller judges an
+    /// emitted set: a profile outside it is skipped, so a switched-off row's
+    /// own errors never block start.
+    available: Option<BTreeSet<String>>,
     /// The outbound tags the graph resolves chain targets against: borrowed
     /// when the caller already holds them — the validation pass judges every
     /// other reference against the same set — and owned when a constructor
@@ -47,6 +55,8 @@ impl<'a> DialGraph<'a> {
     pub fn new(profiles: &'a [ServerProfile], outbound_tags: &'a BTreeSet<String>) -> Self {
         Self {
             profiles,
+            default_route: profiles.first(),
+            available: None,
             outbound_tags: Cow::Borrowed(outbound_tags),
         }
     }
@@ -62,7 +72,25 @@ impl<'a> DialGraph<'a> {
     pub fn for_settings(servers: &'a ServersFile, settings: &Settings) -> Self {
         Self {
             profiles: &servers.profiles,
+            default_route: servers.active_profile(),
+            available: Some(crate::model::emit::outbound_tags(servers, settings)),
             outbound_tags: Cow::Owned(crate::model::emit::outbound_tags(servers, settings)),
+        }
+    }
+
+    /// The graph over `profiles`, resolved against `outbound_tags`, with
+    /// `available` naming the tags the document actually carries: a source
+    /// profile outside it is skipped by [`DialGraph::chain_findings`].
+    pub fn with_available(
+        profiles: &'a [ServerProfile],
+        outbound_tags: &'a BTreeSet<String>,
+        available: &BTreeSet<String>,
+    ) -> Self {
+        Self {
+            profiles,
+            default_route: profiles.first(),
+            available: Some(available.clone()),
+            outbound_tags: Cow::Borrowed(outbound_tags),
         }
     }
 
@@ -73,6 +101,8 @@ impl<'a> DialGraph<'a> {
     pub fn for_profiles(profiles: &'a [ServerProfile]) -> Self {
         Self {
             profiles,
+            default_route: profiles.first(),
+            available: None,
             outbound_tags: Cow::Owned(crate::model::emit::profile_outbound_tags(profiles)),
         }
     }
@@ -115,12 +145,12 @@ impl<'a> DialGraph<'a> {
     pub fn dialed_outbound_tags(&self, settings: &Settings) -> BTreeSet<String> {
         let routing = &settings.routing;
         let mut dialed = BTreeSet::new();
-        if let Some(default_route) = self.profiles.first() {
+        if let Some(default_route) = self.default_route {
             // Xray's default route is the first outbound, and the profile list
             // keeps the active one first.
             dialed.insert(self.terminal(default_route).tag());
         }
-        for rule in &routing.rules {
+        for rule in routing.rules.iter().filter(|rule| rule.enabled) {
             for profile in self
                 .profiles
                 .iter()
@@ -129,7 +159,7 @@ impl<'a> DialGraph<'a> {
                 dialed.insert(self.terminal(profile).tag());
             }
         }
-        for balancer in &routing.balancers {
+        for balancer in routing.balancers.iter().filter(|balancer| balancer.enabled) {
             for profile in self.profiles.iter().filter(|profile| {
                 balancer
                     .selector
@@ -272,6 +302,13 @@ impl<'a> DialGraph<'a> {
                 continue;
             };
             let source = profile.tag();
+            if self
+                .available
+                .as_ref()
+                .is_some_and(|available| !available.contains(&source))
+            {
+                continue;
+            }
             if !self.outbound_tags.contains(target) {
                 findings.push(ValidationIssue::error(
                     ValidationCode::OutboundChainMissing(excerpt(&source), excerpt(target)),

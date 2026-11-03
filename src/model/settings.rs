@@ -336,6 +336,14 @@ pub struct Settings {
     /// default (https://www.google.com/generate_204).
     #[serde(skip_serializing_if = "skip_blank_str")]
     pub probe_url: String,
+    /// Global User-Agent for subscription fetches. An empty value omits the
+    /// header entirely; a subscription may override it per group.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subscription_user_agent: String,
+    /// Bind subscription fetches to the physical uplink instead of following
+    /// the OS stack (which TUN intercepts).
+    #[serde(skip_serializing_if = "skip_false")]
+    pub subscription_direct_fetch: bool,
     /// when Some, the generator returns the parsed text VERBATIM
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_override: Option<String>,
@@ -366,10 +374,18 @@ impl Default for Settings {
             env: Vec::new(),
             geodata: GeodataCfg::default(),
             probe_url: String::new(),
+            subscription_user_agent: default_subscription_user_agent(),
+            subscription_direct_fetch: false,
             raw_override: None,
             extra: Map::new(),
         }
     }
+}
+
+/// The shipped User-Agent: the app name and version, so a provider can tell
+/// the client apart without a per-subscription setting.
+pub fn default_subscription_user_agent() -> String {
+    format!("broccoli/{}", env!("CARGO_PKG_VERSION"))
 }
 
 impl Settings {
@@ -405,6 +421,65 @@ impl Settings {
             &self.probe_url
         }
     }
+
+    /// Rewrite every exact outbound-tag reference named in `renames`
+    /// (old tag → new tag): routing rule targets, balancer selectors and
+    /// fallback tags, and both observatory subject selectors. Prefixes the
+    /// user wrote are left alone — only a stored spelling that names the old
+    /// tag is rewritten. Returns whether anything changed.
+    pub fn rewrite_outbound_tags(&mut self, renames: &[(String, String)]) -> bool {
+        if renames.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut rewrite = |value: &mut String| {
+            if let Some((_, new)) = renames.iter().find(|(old, _)| old == value) {
+                *value = new.clone();
+                changed = true;
+            }
+        };
+        for rule in &mut self.routing.rules {
+            rewrite(&mut rule.outbound_tag);
+        }
+        for balancer in &mut self.routing.balancers {
+            rewrite_selector(&mut balancer.selector, renames);
+            rewrite(&mut balancer.fallback_tag);
+        }
+        rewrite_selector(&mut self.routing.observatory.subject_selector, renames);
+        rewrite_selector(
+            &mut self.routing.burst_observatory.subject_selector,
+            renames,
+        );
+        changed
+    }
+}
+
+/// Rewrite one selector list: an exact old tag becomes its new tag, and a
+/// legacy `srv-` prefix expands into every new tag whose old tag it prefixed
+/// (a prefix over ids has no equivalent prefix over `[Group] Name` tags).
+fn rewrite_selector(selector: &mut Vec<String>, renames: &[(String, String)]) {
+    let mut rewritten = Vec::with_capacity(selector.len());
+    for pattern in selector.drain(..) {
+        if let Some((_, new)) = renames.iter().find(|(old, _)| *old == pattern) {
+            rewritten.push(new.clone());
+            continue;
+        }
+        if pattern.starts_with("srv-") {
+            let mut expanded: Vec<String> = renames
+                .iter()
+                .filter(|(old, _)| old.starts_with(&pattern) && old != "srv-")
+                .map(|(_, new)| new.clone())
+                .collect();
+            if expanded.is_empty() {
+                rewritten.push(pattern);
+            } else {
+                rewritten.append(&mut expanded);
+            }
+            continue;
+        }
+        rewritten.push(pattern);
+    }
+    *selector = rewritten;
 }
 
 #[cfg(test)]
@@ -412,6 +487,27 @@ mod tests {
     use super::*;
     use crate::sys::appdata::with_appdata;
     use serde_json::json;
+
+    #[test]
+    fn legacy_prefix_selectors_expand_to_the_new_tags() {
+        let mut settings = Settings::default();
+        settings.routing.balancers.push(crate::model::Balancer {
+            tag: "bal".into(),
+            selector: vec!["srv-ab".into(), "srv-".into()],
+            ..Default::default()
+        });
+        let renames = vec![
+            ("srv-abaaaaaa".to_owned(), "[Manual] A".to_owned()),
+            ("srv-abbbbbbb".to_owned(), "[Manual] B".to_owned()),
+            ("srv-c".to_owned(), "[Manual] C".to_owned()),
+            ("srv-".to_owned(), "[".to_owned()),
+        ];
+        settings.rewrite_outbound_tags(&renames);
+        assert_eq!(
+            settings.routing.balancers[0].selector,
+            ["[Manual] A", "[Manual] B", "["]
+        );
+    }
 
     #[test]
     fn legacy_persisted_api_port_is_ignored_not_an_error() {

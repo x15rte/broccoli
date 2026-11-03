@@ -904,12 +904,7 @@ fn window_close_request_hides_to_tray() {
 fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
     let mut profile = ServerProfile::new("isolated", OutboundModel::new(Protocol::Freedom));
     profile.id = "0123456789abcdef".into();
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Default::default(),
-    };
+    let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
@@ -1001,12 +996,7 @@ fn isolated_latency_probe_does_not_persist_or_create_a_candidate() {
 fn visible_delete_button_removes_selected_server() {
     let mut profile = ServerProfile::new("visible-delete", OutboundModel::new(Protocol::Freedom));
     profile.id = "0123456789abcdef".into();
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Default::default(),
-    };
+    let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
@@ -1077,7 +1067,11 @@ fn visible_delete_button_removes_selected_server() {
         serde_json::from_slice(&std::fs::read(broccoli_root.join("state/servers.json")).unwrap())
             .unwrap();
     assert!(persisted.profiles.is_empty());
-    assert!(persisted.active.is_none());
+    assert_eq!(
+        persisted.active.as_deref(),
+        Some("block"),
+        "deleting the active server lands the route on Block"
+    );
 }
 
 #[test]

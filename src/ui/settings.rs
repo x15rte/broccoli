@@ -1240,6 +1240,27 @@ impl SettingsScreen {
                     ctx.hooks.mark_dirty();
                 }
             });
+            widgets::section(ui, t(lang, Key::SettingsSubscriptions), |ui| {
+                if widgets::text_field(
+                    ui,
+                    t(lang, Key::SettingsSubscriptionUserAgent),
+                    &mut ctx.settings.subscription_user_agent,
+                    "broccoli/0.0.0",
+                ) {
+                    ctx.hooks.mark_dirty();
+                }
+                ui.label(RichText::new(t(lang, Key::SettingsSubscriptionUserAgentHint)).weak());
+                if ui
+                    .checkbox(
+                        &mut ctx.settings.subscription_direct_fetch,
+                        t(lang, Key::SettingsSubscriptionDirectFetch),
+                    )
+                    .on_hover_text(t(lang, Key::SettingsSubscriptionDirectFetchHint))
+                    .changed()
+                {
+                    ctx.hooks.mark_dirty();
+                }
+            });
             if ctx.settings.raw_override.is_some() {
                 ui.label(
                     RichText::new(t(lang, Key::SettingsRawOverrideActive))

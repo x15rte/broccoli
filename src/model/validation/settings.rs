@@ -15,7 +15,7 @@ use crate::model::inbound::{
     leak_port, listen_endpoints_conflict,
 };
 use crate::model::{
-    ServerProfile, ServersFile, Settings, TunCfg, emit, fold_lower, vocabulary_holds,
+    Group, ServerProfile, ServersFile, Settings, TunCfg, emit, fold_lower, vocabulary_holds,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -466,7 +466,7 @@ pub fn validate_profiles(
     require_nonempty: bool,
 ) -> Verdict {
     let outbound_tags = emit::profile_outbound_tags(profiles);
-    profile_set_verdict(profiles, active_id, require_nonempty, &outbound_tags)
+    profile_set_verdict(profiles, active_id, require_nonempty, &outbound_tags, None)
 }
 
 /// [`validate_profiles`]'s body: the profile-level findings, judged against
@@ -478,12 +478,15 @@ fn profile_set_verdict(
     active_id: Option<&str>,
     require_nonempty: bool,
     outbound_tags: &BTreeSet<String>,
+    emitted: Option<&BTreeSet<String>>,
 ) -> Verdict {
     let mut issues = Vec::new();
     if require_nonempty && profiles.is_empty() {
         issues.push(issue(ValidationCode::ProfilesRequired, None));
     }
-    if let Some(active_id) = active_id {
+    if let Some(active_id) = active_id
+        && !matches!(active_id, DIRECT_OUTBOUND_TAG | BLOCK_OUTBOUND_TAG)
+    {
         let active_matches = profiles
             .iter()
             .filter(|profile| profile.id == active_id)
@@ -505,6 +508,9 @@ fn profile_set_verdict(
     let mut profile_tags = BTreeMap::<String, (&str, usize)>::new();
     for (index, profile) in profiles.iter().enumerate() {
         let profile_number = index + 1;
+        if emitted.is_some_and(|emitted| !emitted.contains(&profile.tag())) {
+            continue;
+        }
         if profile.id.trim().is_empty() {
             issues.push(issue(ValidationCode::ProfileIdEmpty(profile_number), None));
         }
@@ -520,32 +526,9 @@ fn profile_set_verdict(
         }
 
         let tag = profile.tag();
-        let tag_usable = if tag.trim().is_empty() {
+        let tag_usable = if profile.name.trim().is_empty() {
             issues.push(issue(
-                ValidationCode::ProfileTagEmpty(profile_number, excerpt(&profile.id)),
-                None,
-            ));
-            false
-        } else if tag
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-        {
-            issues.push(issue(
-                ValidationCode::ProfileTagInvalid(
-                    profile_number,
-                    excerpt(&profile.id),
-                    excerpt(&tag),
-                ),
-                None,
-            ));
-            false
-        } else if matches!(tag.as_str(), DIRECT_OUTBOUND_TAG | BLOCK_OUTBOUND_TAG) {
-            issues.push(issue(
-                ValidationCode::ProfileTagReserved(
-                    profile_number,
-                    excerpt(&profile.id),
-                    excerpt(&tag),
-                ),
+                ValidationCode::ProfileNameEmpty(profile_number, excerpt(&profile.id)),
                 None,
             ));
             false
@@ -571,6 +554,9 @@ fn profile_set_verdict(
     }
 
     for profile in profiles {
+        if emitted.is_some_and(|emitted| !emitted.contains(&profile.tag())) {
+            continue;
+        }
         let location = profile_display_name(profile);
         for finding in validate_outbound(&profile.outbound) {
             issues.push(ValidationIssue {
@@ -585,9 +571,56 @@ fn profile_set_verdict(
     // The chain rules (dangling hop, cycle) belong to the dial graph, which
     // every other profile-set question reads (the generator's bootstrap
     // scope, the probe's staged child, the delete dialog's references).
-    issues.extend(crate::model::dial::DialGraph::new(profiles, outbound_tags).chain_findings());
+    let graph = match emitted {
+        Some(emitted) => {
+            crate::model::dial::DialGraph::with_available(profiles, outbound_tags, emitted)
+        }
+        None => crate::model::dial::DialGraph::new(profiles, outbound_tags),
+    };
+    issues.extend(graph.chain_findings());
 
     Verdict::from_issues(issues)
+}
+
+/// Whether any selector in `selector` matches an outbound tag by prefix, the
+/// way the core resolves selectors (`app/proxyman/outbound.Manager.Select`).
+fn selector_matches(outbound_tags: &BTreeSet<String>, selector: &[String]) -> bool {
+    selector.iter().any(|pattern| {
+        outbound_tags
+            .iter()
+            .any(|tag| tag.starts_with(pattern.as_str()))
+    })
+}
+
+/// Group records' own rules: a title must be non-empty and unique across the
+/// list, because every tag in a group is prefixed with it.
+fn group_set_findings(groups: &[Group]) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let mut titles = BTreeMap::<&str, usize>::new();
+    for (index, group) in groups.iter().enumerate() {
+        let number = index + 1;
+        if group.title.trim().is_empty() {
+            issues.push(issue(
+                ValidationCode::GroupTitleEmpty(excerpt(&group.id)),
+                None,
+            ));
+            continue;
+        }
+        if let Some(&first_number) = titles.get(group.title.as_str()) {
+            issues.push(issue(
+                ValidationCode::GroupTitleDuplicated(
+                    first_number,
+                    excerpt(&groups[first_number - 1].title),
+                    number,
+                    excerpt(&group.title),
+                ),
+                None,
+            ));
+        } else {
+            titles.insert(group.title.as_str(), number);
+        }
+    }
+    issues
 }
 
 /// One settings-level verdict for the whole configuration: the server
@@ -602,13 +635,15 @@ pub fn validate_settings(settings: &Settings, servers: &ServersFile, api_port: u
     // verdict's chain targets, the balancer fallbacks, the rules — judges the
     // tags the generated document carries.
     let outbound_tags = emit::outbound_tags(servers, settings);
-    let issues = profile_set_verdict(
+    let mut issues = profile_set_verdict(
         &servers.profiles,
         servers.active.as_deref(),
         false,
         &outbound_tags,
+        Some(&outbound_tags),
     )
     .into_issues();
+    issues.extend(group_set_findings(&servers.groups));
     SettingsWalk {
         settings,
         outbound_tags: &outbound_tags,
@@ -659,6 +694,7 @@ impl<'a> SettingsWalk<'a> {
     /// the one verdict.
     fn run(mut self) -> Verdict {
         self.balancers();
+        self.health_engines();
         self.local_inbounds();
         self.dokodemo();
         self.tun();
@@ -671,25 +707,61 @@ impl<'a> SettingsWalk<'a> {
         Verdict::from_issues(self.issues)
     }
 
+    /// The emitted health engines' subject selectors must match at least one
+    /// outbound tag the document carries. The dependency-forced observatory
+    /// replaces its selector with the emitted profile tags, so only a
+    /// user-enabled engine is judged here; an empty selector intentionally
+    /// observes nothing.
+    fn health_engines(&mut self) {
+        let routing = &self.settings.routing;
+        let mut findings = Vec::new();
+        if routing.observatory.enabled && routing.observatory_emitted() {
+            let selector = &routing.observatory.subject_selector;
+            if !selector.is_empty() && !selector_matches(self.outbound_tags, selector) {
+                findings.push(issue(
+                    ValidationCode::ObservatorySelectorNoMatch(excerpt("observatory")),
+                    None,
+                ));
+            }
+        }
+        if routing.burst_observatory_emitted() {
+            let selector = &routing.burst_observatory.subject_selector;
+            if !selector.is_empty() && !selector_matches(self.outbound_tags, selector) {
+                findings.push(issue(
+                    ValidationCode::ObservatorySelectorNoMatch(excerpt("burst observatory")),
+                    None,
+                ));
+            }
+        }
+        self.issues.extend(findings);
+    }
     /// One balancer's own rules: a missing tag skips the entry (the checks
     /// below would name a tag that does not exist), a selector of only blanks,
     /// a duplicate tag, and a `fallbackTag` outside the emitted outbound
     /// universe.
     fn balancers(&mut self) {
         for (index, balancer) in self.settings.routing.balancers.iter().enumerate() {
+            if !balancer.enabled {
+                continue;
+            }
             if balancer.tag.trim().is_empty() {
                 self.issues
                     .push(issue(ValidationCode::BalancerTagMissing(index + 1), None));
                 // The remaining checks would name a tag that does not exist.
                 continue;
             }
-            if balancer
+            let all_blank = balancer
                 .selector
                 .iter()
-                .all(|selector| selector.trim().is_empty())
-            {
+                .all(|selector| selector.trim().is_empty());
+            if all_blank {
                 self.issues.push(issue(
                     ValidationCode::BalancerSelectorMissing(excerpt(&balancer.tag)),
+                    None,
+                ));
+            } else if !selector_matches(self.outbound_tags, &balancer.selector) {
+                self.issues.push(issue(
+                    ValidationCode::BalancerSelectorNoMatch(excerpt(&balancer.tag)),
                     None,
                 ));
             }
@@ -714,6 +786,19 @@ impl<'a> SettingsWalk<'a> {
         // The Dashboard's active balancer must name one of the tags above; its
         // catch-all rule would otherwise reference a tag the core refuses.
         let active = &self.settings.routing.active_balancer;
+        if !active.is_empty()
+            && self
+                .settings
+                .routing
+                .balancers
+                .iter()
+                .any(|balancer| balancer.tag == *active && !balancer.enabled)
+        {
+            self.issues.push(issue(
+                ValidationCode::ActiveBalancerDisabled(excerpt(active)),
+                None,
+            ));
+        }
         if !active.is_empty() && !self.balancer_tags.contains(active) {
             self.issues.push(issue(
                 ValidationCode::RoutingActiveBalancerMissing(excerpt(active)),
@@ -1140,13 +1225,21 @@ impl<'a> SettingsWalk<'a> {
     fn routing_rules(&mut self) {
         for code in routing_script_issues(
             self.settings.routing.script.as_deref(),
-            self.settings.routing.rules.len(),
+            self.settings
+                .routing
+                .rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .count(),
             !self.settings.routing.active_balancer.is_empty(),
             &self.settings.routing.domain_strategy,
         ) {
             self.issues.push(issue(code, Some("routing.script".into())));
         }
         for (index, rule) in self.settings.routing.rules.iter().enumerate() {
+            if !rule.enabled {
+                continue;
+            }
             if let Some(error) = rule.target_error() {
                 self.issues.push(issue(
                     ValidationCode::RoutingRuleTarget(index + 1, error.to_string()),
@@ -1214,9 +1307,17 @@ impl<'a> SettingsWalk<'a> {
             &DNS_WIRE_KEYS,
             &mut self.issues,
         );
+        let enabled_dns: Vec<crate::model::DnsServer> = self
+            .settings
+            .dns
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .cloned()
+            .collect();
         for code in dns_script_issues(
             self.settings.dns.script.as_deref(),
-            &self.settings.dns.servers,
+            &enabled_dns,
             self.settings.dns.disable_fallback,
             self.settings.dns.disable_fallback_if_match,
         ) {
@@ -1233,6 +1334,9 @@ impl<'a> SettingsWalk<'a> {
             ));
         }
         for (index, server) in self.settings.dns.servers.iter().enumerate() {
+            if !server.enabled {
+                continue;
+            }
             if server.address.trim().is_empty() {
                 self.issues.push(issue(
                     ValidationCode::DnsServerAddressMissing(index + 1),
@@ -1302,6 +1406,7 @@ impl<'a> SettingsWalk<'a> {
 mod tests {
     use super::*;
     use crate::model::inbound::Account;
+    use crate::model::inbound::DIRECT_OUTBOUND_TAG;
     use crate::model::outbound::{OutboundModel, Protocol, ProtocolSettings};
     use crate::model::settings::Mode;
     use crate::model::validation::Severity;
@@ -1763,9 +1868,9 @@ mod tests {
         ServerProfile {
             id: id.into(),
             name: name.into(),
+            enabled: true,
             outbound,
-            latency_ms: None,
-            extra: Map::new(),
+            ..Default::default()
         }
     }
 
@@ -2087,19 +2192,20 @@ mod tests {
     fn settings_verdict_reports_profile_chains_and_the_profile_location() {
         let mut first = named_profile(
             "aaaaaaaa11111111",
-            "",
+            "first",
             OutboundModel::new(Protocol::Freedom),
         );
-        first.outbound.chain_via("srv-bbbbbbbb");
+        first.outbound.chain_via("[Manual] second");
         first.outbound.send_through = Some("bogus".into());
         let mut second = named_profile(
             "bbbbbbbb22222222",
             "second",
             OutboundModel::new(Protocol::Freedom),
         );
-        second.outbound.chain_via("srv-aaaaaaaa");
+        second.outbound.chain_via("[Manual] first");
         let servers = ServersFile {
             profiles: vec![first, second],
+            active: Some("aaaaaaaa11111111".into()),
             ..Default::default()
         };
 
@@ -2108,16 +2214,171 @@ mod tests {
             .expect("the profile's own rule must fire");
         assert_eq!(
             scoped.path.as_deref(),
-            Some("srv-aaaaaaaa"),
+            Some("first"),
             "a profile-scoped finding carries the profile's display name"
         );
         finding(
             &issues,
-            &ValidationCode::OutboundChainCycle(
-                "srv-aaaaaaaa -> srv-bbbbbbbb -> srv-aaaaaaaa".into(),
-            ),
+            &ValidationCode::OutboundChainCycle(crate::excerpt::excerpt(
+                "[Manual] first -> [Manual] second -> [Manual] first",
+            )),
         )
         .unwrap_or_else(|| panic!("the chain cycle must be reported: {issues:#?}"));
+    }
+
+    #[test]
+    fn switched_off_servers_cannot_be_rule_or_balancer_targets() {
+        let active = named_profile(
+            "aaaaaaaa11111111",
+            "active",
+            OutboundModel::new(Protocol::Freedom),
+        );
+        let mut off = named_profile(
+            "bbbbbbbb22222222",
+            "off",
+            OutboundModel::new(Protocol::Freedom),
+        );
+        off.enabled = false;
+        let mut servers = ServersFile {
+            active: Some(active.id.clone()),
+            profiles: vec![active, off],
+            ..Default::default()
+        };
+        let mut settings = Settings::default();
+        settings.routing.rules.push(crate::model::routing::Rule {
+            domain: vec!["domain:example.com".into()],
+            outbound_tag: servers.profiles[1].tag(),
+            ..Default::default()
+        });
+        settings.routing.balancers.push(crate::model::Balancer {
+            tag: "bal".into(),
+            selector: vec![servers.profiles[1].tag()],
+            ..Default::default()
+        });
+
+        let issues = validate_settings(&settings, &servers, 10853);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::RoutingRuleOutboundMissing(..))),
+            "a rule naming a switched-off server is invalid: {issues:#?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::BalancerSelectorNoMatch(..))),
+            "a selector naming only a switched-off server is invalid: {issues:#?}"
+        );
+
+        // Switching the server on makes the same references valid.
+        servers.profiles[1].enabled = true;
+        let issues = validate_settings(&settings, &servers, 10853);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue.code,
+                ValidationCode::RoutingRuleOutboundMissing(..)
+                    | ValidationCode::BalancerSelectorNoMatch(..)
+            )),
+            "an enabled server is a legal target: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn switched_off_entities_are_excluded_before_validation() {
+        let mut settings = Settings::default();
+        settings.routing.rules.push(crate::model::routing::Rule {
+            domain: vec!["domain:example.com".into()],
+            enabled: false,
+            ..Default::default()
+        });
+        settings.routing.balancers.push(crate::model::Balancer {
+            tag: "off".into(),
+            selector: vec!["missing-".into()],
+            enabled: false,
+            ..Default::default()
+        });
+        settings.dns.servers.push(crate::model::DnsServer {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue.code,
+                ValidationCode::RoutingRuleTarget(..)
+                    | ValidationCode::RoutingRuleNoMatchers(..)
+                    | ValidationCode::BalancerSelectorNoMatch(..)
+                    | ValidationCode::DnsServerAddressMissing(..)
+            )),
+            "a switched-off entity's errors must not block start: {issues:#?}"
+        );
+
+        // Switching an entity on brings its error back.
+        settings.routing.balancers[0].enabled = true;
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::BalancerSelectorNoMatch(..))),
+            "an enabled balancer is judged again: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn switched_off_profiles_are_not_validated() {
+        let active = named_profile(
+            "aaaaaaaa11111111",
+            "active",
+            OutboundModel::new(Protocol::Freedom),
+        );
+        let mut off = named_profile(
+            "bbbbbbbb22222222",
+            "off",
+            OutboundModel::new(Protocol::Freedom),
+        );
+        off.enabled = false;
+        off.outbound.send_through = Some("bogus".into());
+        let mut servers = ServersFile {
+            active: Some(active.id.clone()),
+            profiles: vec![active, off],
+            ..Default::default()
+        };
+        let issues = validate_settings(&Settings::default(), &servers, 10853);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::SendThroughInvalid),
+            "a switched-off profile's own errors do not block start: {issues:#?}"
+        );
+
+        servers.profiles[1].enabled = true;
+        let issues = validate_settings(&Settings::default(), &servers, 10853);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::SendThroughInvalid),
+            "an enabled profile is judged: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn switching_the_active_balancer_off_blocks_start() {
+        let mut settings = Settings::default();
+        settings.routing.balancers.push(crate::model::Balancer {
+            tag: "route".into(),
+            selector: vec!["[".into()],
+            enabled: false,
+            ..Default::default()
+        });
+        settings.routing.active_balancer = "route".into();
+        let issues = validate_settings(&settings, &ServersFile::default(), 10853);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue.code, ValidationCode::ActiveBalancerDisabled(..))),
+            "the active route cannot be a switched-off balancer: {issues:#?}"
+        );
     }
 
     #[test]

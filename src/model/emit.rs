@@ -24,7 +24,7 @@ use super::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_INBOUND_TAG, DNS_INBOUND_V6_TAG,
     DNS_OUTBOUND_TAG, DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, TUN_INBOUND_TAG,
 };
-use super::servers::{ServerProfile, ServersFile, TAG_PREFIX};
+use super::servers::{ServerProfile, ServersFile};
 use super::settings::{Mode, Settings};
 use serde_json::{Value, json};
 
@@ -105,13 +105,18 @@ pub fn profile_outbound_tags(profiles: &[ServerProfile]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The outbound tags the generated document carries: every profile tag (Xray's
-/// default route is the first outbound, which is why the profile list keeps the
-/// active one first, so the emitted order and the GUI list can never disagree),
-/// the built-in `direct`/`block`, and `dns-out` exactly when the DNS module
-/// intercepts local port-53 traffic. `gen::outbounds` writes this set.
+/// The outbound tags the generated document carries: the emitted servers' tags
+/// (the active route's server, every enabled server, and every chain hop they
+/// reach), the built-in `direct`/`block`, and `dns-out` exactly when the DNS
+/// module intercepts local port-53 traffic. `gen::outbounds` writes this set.
 pub fn outbound_tags(servers: &ServersFile, settings: &Settings) -> BTreeSet<String> {
-    let mut tags = profile_outbound_tags(&servers.profiles);
+    let mut tags: BTreeSet<String> = servers
+        .emitted_set()
+        .order
+        .iter()
+        .map(|&index| servers.profiles[index].tag())
+        .collect();
+    tags.extend(BUILTIN_OUTBOUNDS.iter().map(|(_, tag)| (*tag).to_string()));
     if dns_intercept(settings) {
         tags.insert(DNS_OUTBOUND_TAG.into());
     }
@@ -295,14 +300,17 @@ fn bootstrap_dns_server(settings: &Settings, domains: &[String]) -> Option<Value
 /// take (`bootstrap`, `dns_on`, `tun_on`), which a caller could swap without
 /// the compiler noticing.
 pub(crate) struct Emission {
+    /// The profiles the document carries, in wire order.
+    pub(crate) emitted: super::servers::EmittedSet,
+    /// The built-in outbound that leads the document: Direct when no route
+    /// was chosen, Block when chosen, and nothing while a balancer owns the
+    /// route (its catch-all rule decides).
+    pub(crate) route_builtin: Option<&'static str>,
     /// The tags this document dials — the default route and the profiles its
     /// rules, balancers and health engines reach, each mapped to its chain
-    /// terminal — reduced to the `srv-` id prefix every tag carries
-    /// ([`ServerProfile::tag_eq`] defines the equivalence). These are the only
-    /// profiles whose server address this machine dials, so the only ones
-    /// whose domain the bootstrap resolver may answer. Membership tests run
-    /// against the profile's own id prefix, so a non-dialed profile costs no
-    /// tag formatting.
+    /// terminal. These are the only profiles whose server address this
+    /// machine dials, so the only ones whose domain the bootstrap resolver
+    /// may answer.
     dialed: BTreeSet<String>,
     /// The scoped bootstrap resolver this document emits, if any: a DNS
     /// module exists, a dialed profile has a domain, and no DNS script owns
@@ -328,22 +336,29 @@ impl Emission {
     pub(crate) fn new(servers: &ServersFile, settings: &Settings) -> Emission {
         let fakedns = fakedns_enabled(settings);
         let dns_on = dns_module_emitted(settings);
-        // `dialed_outbound_tags` only ever inserts `ServerProfile::tag`, so
-        // every entry carries the prefix; the id behind it is what a profile
-        // can reproduce without formatting its own tag.
-        let dialed: BTreeSet<String> = DialGraph::for_profiles(&servers.profiles)
+        let route_builtin = if settings.routing.active_balancer.is_empty() {
+            servers.active_route_builtin()
+        } else {
+            None
+        };
+        // The dialed tags are the profile tags themselves (plus the built-in
+        // arms); membership is asked of each profile's own tag. Only emitted
+        // profiles count: a disabled one is not on the wire.
+        let emitted = servers.emitted_set();
+        let emitted_tags: BTreeSet<String> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].tag())
+            .collect();
+        let dialed: BTreeSet<String> = DialGraph::for_settings(servers, settings)
             .dialed_outbound_tags(settings)
             .into_iter()
-            .map(|tag| {
-                tag.strip_prefix(TAG_PREFIX)
-                    .expect("a dialed outbound tag carries the `srv-` prefix")
-                    .to_string()
-            })
+            .filter(|tag| emitted_tags.contains(tag))
             .collect();
         let mut server_domains: Vec<String> = servers
             .profiles
             .iter()
-            .filter(|profile| dialed.contains(profile.tag_id()))
+            .filter(|profile| dialed.contains(&profile.tag()))
             .filter_map(profile_server_domain)
             .collect();
         server_domains.sort();
@@ -366,6 +381,8 @@ impl Emission {
             .then(|| bootstrap_dns_server(settings, &server_domains))
             .flatten();
         Emission {
+            emitted,
+            route_builtin,
             dialed,
             bootstrap,
             dns_on,
@@ -382,7 +399,7 @@ impl Emission {
     /// on the far side, and a standby the document never dials resolves
     /// nothing before the tunnel — see [`crate::model::dial`]).
     pub(crate) fn bootstrap_reaches(&self, profile: &ServerProfile) -> bool {
-        self.bootstrap.is_some() && self.dialed.contains(profile.tag_id())
+        self.bootstrap.is_some() && self.dialed.contains(&profile.tag())
     }
 
     /// The scoped bootstrap server to append to the DNS document, if one is
@@ -401,9 +418,9 @@ mod tests {
     use crate::model::{
         Balancer, DokodemoCfg, OutboundModel, Protocol, ProtocolSettings, Rule, VlessSettings,
     };
-    use serde_json::{Map, Value};
+    use serde_json::Value;
 
-    const ID: &str = "0123456789abcdef"; // tag: srv-01234567
+    const ID: &str = "0123456789abcdef";
     /// Deterministic control-plane port, as the generator fixtures use.
     const API_PORT: u16 = 10853;
 
@@ -425,8 +442,7 @@ mod tests {
             id: id.into(),
             name: "test".into(),
             outbound,
-            latency_ms: None,
-            extra: Map::new(),
+            ..Default::default()
         }
     }
 
@@ -435,7 +451,7 @@ mod tests {
             version: 1,
             active: profiles.first().map(|profile| profile.id.clone()),
             profiles,
-            extra: Map::new(),
+            ..Default::default()
         }
     }
 
@@ -589,7 +605,7 @@ mod tests {
         seeded
             .routing
             .balancers
-            .push(Balancer::new("bal".into(), "srv-".into()));
+            .push(Balancer::new("bal".into(), "[".into()));
         states.push(("seeded", servers(vec![profile(ID)]), seeded));
 
         // The same state without the module: no dns-out, no dns-in.
@@ -675,7 +691,7 @@ mod tests {
         settings
             .routing
             .balancers
-            .push(Balancer::new("bal".into(), "srv-".into()));
+            .push(Balancer::new("bal".into(), "[".into()));
 
         // The document carries every tag the state names, and the balancer's
         // selector matches an emitted profile tag.

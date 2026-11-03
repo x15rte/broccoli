@@ -8,7 +8,7 @@
           "type": "custom"
         }
       },
-      "tag": "srv-01234567"
+      "tag": "[Manual] custom-response"
     },
     {
       "protocol": "blackhole",
@@ -17,7 +17,7 @@
           "type": "http"
         }
       },
-      "tag": "srv-fedcba98"
+      "tag": "[Manual] http-response"
     },
     {
       "protocol": "freedom",

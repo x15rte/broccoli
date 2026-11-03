@@ -27,27 +27,22 @@ use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile};
 use broccoli::rt::{CoreEvt, LatencyProbeResult, OutboundStatusView};
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
-use serde_json::Map;
 
 #[path = "common/screen.rs"]
 mod screen;
 
 mod common;
 
-/// The seeded profile's `srv-<id8>` tag, as the app derives it.
-const ALPHA_TAG: &str = "srv-aaaaaaaa";
+/// The seeded profile's tag, as the app derives it from `Manual` and its
+/// name.
+const ALPHA_TAG: &str = "[Manual] alpha";
 
 /// One seeded profile with a stable id, so the probe status can address it
-/// by the same `srv-<id8>` tag the app derives.
+/// by the same tag the app derives.
 fn seeded_servers() -> ServersFile {
     let mut alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Trojan));
     alpha.id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
-    ServersFile {
-        version: 1,
-        active: None,
-        profiles: vec![alpha],
-        extra: Map::new(),
-    }
+    ServersFile::with_profiles(None, vec![alpha])
 }
 
 /// Boot through the shared fixture, seeded with the `state/servers.json` the

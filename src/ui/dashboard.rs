@@ -128,6 +128,8 @@ impl LatencyCell {
 enum ActivePick {
     Profile(usize),
     Balancer(String),
+    Direct,
+    Block,
 }
 
 #[derive(Default)]
@@ -456,12 +458,20 @@ impl DashboardScreen {
                     |ui| {
                         let cur = match ctx.settings.routing.active_balancer_tag() {
                             Some(tag) => tag,
-                            None => ctx
-                                .servers
-                                .active_profile()
-                                .map_or(t(lang, Key::NoneSelected), |profile| {
-                                    profile.name.as_str()
-                                }),
+                            None => match ctx.servers.active.as_deref() {
+                                Some(tag) if tag == crate::model::inbound::DIRECT_OUTBOUND_TAG => {
+                                    t(lang, Key::RouteDirect)
+                                }
+                                Some(tag) if tag == crate::model::inbound::BLOCK_OUTBOUND_TAG => {
+                                    t(lang, Key::RouteBlock)
+                                }
+                                _ => ctx
+                                    .servers
+                                    .active_profile()
+                                    .map_or(t(lang, Key::NoneSelected), |profile| {
+                                        profile.name.as_str()
+                                    }),
+                            },
                         };
                         // A routing script owns every route, so the catch-all
                         // rule an active balancer needs is never emitted: the
@@ -487,6 +497,27 @@ impl DashboardScreen {
                                     {
                                         picked = Some(ActivePick::Profile(index));
                                     }
+                                }
+                                ui.separator();
+                                let route = ctx.servers.active.as_deref();
+                                let direct_selected =
+                                    ctx.settings.routing.active_balancer.is_empty()
+                                        && route
+                                            == Some(crate::model::inbound::DIRECT_OUTBOUND_TAG);
+                                if ui
+                                    .selectable_label(direct_selected, t(lang, Key::RouteDirect))
+                                    .clicked()
+                                {
+                                    picked = Some(ActivePick::Direct);
+                                }
+                                let block_selected =
+                                    ctx.settings.routing.active_balancer.is_empty()
+                                        && route == Some(crate::model::inbound::BLOCK_OUTBOUND_TAG);
+                                if ui
+                                    .selectable_label(block_selected, t(lang, Key::RouteBlock))
+                                    .clicked()
+                                {
+                                    picked = Some(ActivePick::Block);
                                 }
                                 if !ctx.settings.routing.balancers.is_empty() {
                                     ui.separator();
@@ -518,17 +549,30 @@ impl DashboardScreen {
                             });
                         match picked {
                             Some(ActivePick::Profile(index)) => {
-                                // The active profile is the list's first row
-                                // (the config's default route), so picking it
-                                // moves it there — and it takes the default
-                                // route back from an active balancer.
+                                // A server route takes the default route back
+                                // from a balancer; the row itself does not move.
                                 let id = ctx.servers.profiles[index].id.clone();
                                 ctx.settings.routing.active_balancer.clear();
                                 ctx.servers.activate(&id);
                                 ctx.hooks.mark_dirty();
                             }
                             Some(ActivePick::Balancer(tag)) => {
+                                // Exactly one route is held: the balancer's
+                                // catch-all rule owns it.
+                                ctx.servers.active = None;
                                 ctx.settings.routing.active_balancer = tag;
+                                ctx.hooks.mark_dirty();
+                            }
+                            Some(ActivePick::Direct) => {
+                                ctx.settings.routing.active_balancer.clear();
+                                ctx.servers
+                                    .activate(crate::model::inbound::DIRECT_OUTBOUND_TAG);
+                                ctx.hooks.mark_dirty();
+                            }
+                            Some(ActivePick::Block) => {
+                                ctx.settings.routing.active_balancer.clear();
+                                ctx.servers
+                                    .activate(crate::model::inbound::BLOCK_OUTBOUND_TAG);
                                 ctx.hooks.mark_dirty();
                             }
                             None => {}
@@ -1457,6 +1501,60 @@ mod tests {
         assert_eq!(
             rig.borrow().servers.active.as_deref(),
             Some(rig.borrow().servers.profiles[0].id.as_str())
+        );
+    }
+
+    /// The picker offers the two built-in routes beside the servers and the
+    /// balancers; choosing one writes the reserved value and clears the
+    /// balancer route.
+    #[test]
+    fn the_active_server_picker_offers_direct_and_block() {
+        use crate::model::Balancer;
+
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![profile("alpha", None)];
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.settings
+            .routing
+            .balancers
+            .push(Balancer::new("route".into(), "srv-".into()));
+        let rig = Rc::new(RefCell::new(rig));
+        let mut harness = harness_for(Rc::clone(&rig));
+        harness.run();
+
+        let open = |harness: &mut Harness<'static, _>, caption: &str| {
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .find(|node| node.value().as_deref() == Some(caption))
+                .unwrap_or_else(|| panic!("the caption must read {caption:?}"))
+                .click();
+            harness.run();
+        };
+        open(&mut harness, "alpha");
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::RouteDirect),
+            )
+            .click();
+        harness.run();
+        assert_eq!(
+            rig.borrow().servers.active.as_deref(),
+            Some(crate::model::inbound::DIRECT_OUTBOUND_TAG)
+        );
+        assert!(rig.borrow().settings.routing.active_balancer.is_empty());
+
+        open(&mut harness, t(Language::En, Key::RouteDirect));
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::RouteBlock),
+            )
+            .click();
+        harness.run();
+        assert_eq!(
+            rig.borrow().servers.active.as_deref(),
+            Some(crate::model::inbound::BLOCK_OUTBOUND_TAG)
         );
     }
 

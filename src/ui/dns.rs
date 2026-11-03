@@ -117,6 +117,15 @@ impl DnsScreen {
                                 ),
                                 &mut swap,
                             );
+                            let mut enabled = srv.enabled;
+                            if ui
+                                .checkbox(&mut enabled, "")
+                                .on_hover_text(t(lang, Key::Enabled))
+                                .changed()
+                            {
+                                srv.enabled = enabled;
+                                *changed = true;
+                            }
                             ui.label(
                                 RichText::new(if srv.address.is_empty() {
                                     t(lang, Key::DnsNoAddress)

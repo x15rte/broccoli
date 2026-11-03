@@ -32,7 +32,7 @@
           "domainStrategy": "useip"
         }
       },
-      "tag": "srv-01234567"
+      "tag": "[Manual] test"
     },
     {
       "protocol": "freedom",

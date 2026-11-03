@@ -134,7 +134,10 @@ fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
             *profile = ServerProfile {
                 id: profile.id.clone(),
                 name: profile.name.clone(),
+                group: profile.group.clone(),
+                enabled: profile.enabled,
                 outbound: OutboundModel::new(Protocol::Freedom),
+                group_title: profile.group_title.clone(),
                 ..ServerProfile::default()
             };
         }
@@ -315,6 +318,12 @@ impl StagingUndo {
 /// rejection applies; an accepted candidate keeps both the entry and the
 /// backfill. Only the candidate itself is cloned.
 fn stage_profile(staged: &mut ServersFile, profile: &ServerProfile) -> StagingUndo {
+    // The candidate is what the validation document must exercise: a
+    // switched-off profile would otherwise be absent from the generated
+    // config, and `xray run -test` would never see its wire shape. The flag
+    // lives only in this snapshot — the saved list keeps the user's switch.
+    let mut staged_profile = profile.clone();
+    staged_profile.enabled = true;
     let mut displaced = None;
     match staged
         .profiles
@@ -322,10 +331,10 @@ fn stage_profile(staged: &mut ServersFile, profile: &ServerProfile) -> StagingUn
         .position(|existing| existing.id == profile.id)
     {
         Some(index) => {
-            let previous = std::mem::replace(&mut staged.profiles[index], profile.clone());
+            let previous = std::mem::replace(&mut staged.profiles[index], staged_profile);
             displaced = Some((index, previous));
         }
-        None => staged.profiles.push(profile.clone()),
+        None => staged.profiles.push(staged_profile),
     }
     let filled_active = staged.active.is_none();
     if filled_active {

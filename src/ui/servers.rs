@@ -1281,8 +1281,8 @@ struct ProfileDraft {
     /// tag list) without either cloning `self.selected` per repaint or
     /// overlapping `&mut draft.profile`.
     id: String,
-    /// The `srv-<id8>` tag of the profile this draft carries, derived from
-    /// the immutable id and formatted once at creation so the editor header
+    /// The outbound tag of the profile this draft carries, derived from
+    /// the profile and formatted once at creation so the editor header
     /// row stays allocation-free on idle repaints. It is the tag the profile
     /// keeps once the draft commits; only the editor paints it.
     tag: String,
@@ -1507,7 +1507,7 @@ impl DraftGate {
 }
 
 /// The chain-target (`dialerProxy`) picker's options for one editor: every
-/// other profile's `srv-<id8>` tag in server-list order, then the built-in
+/// other profile's tag in server-list order, then the built-in
 /// `direct`/`block` targets validation accepts. Memoized per editor — a
 /// rebuild costs one tag format per profile — so it reruns only when the
 /// model generation moves (the profile set or a rename) or the rendered
@@ -1873,6 +1873,18 @@ impl StatusLine {
 enum ListAction {
     Select(String),
     SetActive(String),
+    /// Flip the profile's switch. The active profile and a chain-only hop are
+    /// locked; the handler re-checks both.
+    ToggleEnabled(String),
+    /// Collapse or expand one group.
+    ToggleGroup(String),
+    /// Move one group by `delta` positions among the non-manual groups.
+    MoveGroup {
+        group: usize,
+        delta: i32,
+    },
+    /// Append a switched-off `[Manual]` snapshot of one subscription row.
+    CopyToManual(String),
     Duplicate(String),
     Export(String),
     Delete(String),
@@ -1952,9 +1964,40 @@ struct ImportPreview {
     rows: Vec<ImportPreviewRow>,
 }
 
+/// One row of the grouped list: a group header or a profile.
+#[derive(Clone, Copy)]
+enum GroupListRow {
+    Header {
+        group: usize,
+        total: usize,
+        matched: usize,
+    },
+    Profile(usize),
+}
+
+/// The grouped row list, rebuilt only when the model, the search or the
+/// collapsed set moves.
+struct GroupRowsCache {
+    generation: u64,
+    search: String,
+    rows: std::rc::Rc<[GroupListRow]>,
+}
+
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
+    /// Groups the user collapsed, by id.
+    collapsed: std::collections::BTreeSet<String>,
+    /// The list's search text; group headers stay visible with match counts.
+    search: String,
+    group_rows_cache: Option<GroupRowsCache>,
+    /// Per-profile row detail (protocol, security, endpoint), rebuilt only
+    /// when the model generation moves.
+    row_details: Option<(u64, std::rc::Rc<std::collections::HashMap<usize, String>>)>,
+    /// The emitted set memoized for one model generation: the row switches
+    /// and their lock hints read it, and it is rebuilt only when the model
+    /// moves, never per repaint.
+    emitted_cache: Option<(u64, std::rc::Rc<crate::model::servers::EmittedSet>)>,
     /// Memoized latency badges keyed by profile id: the list
     /// paints one badge per visible row per frame, but a badge's text is a
     /// function of the row's measured latency, the language, and the status
@@ -1983,8 +2026,22 @@ pub struct ServersScreen {
     revealed_add: bool,
     import_open: bool,
     import_text: String,
-    import_parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
+    subscription_dialog: Option<SubscriptionDraft>,
+    /// The one in-flight refresh; the group it targets travels with the
+    /// result.
+    subscription_fetch: Request<SubscriptionFetchResult>,
+    /// The group the in-flight fetch targets, so deleting another group does
+    /// not cancel it.
+    subscription_fetch_group: Option<String>,
+    /// A subscription group awaiting delete confirmation.
+    subscription_delete_pending: Option<String>,
+    import_parsed: Vec<Result<links::ParsedLink, String>>,
     import_parsed_source: Option<String>,
+    import_refusals: Vec<(String, String)>,
+    import_ignored: usize,
+    import_ignored_names: Vec<String>,
+    /// The report window on screen: its title and one refresh report.
+    report_view: Option<(String, crate::model::servers::RefreshReport)>,
     /// Formatted preview of `import_parsed` (see [`ImportPreview`]), built on
     /// the first frame that shows it and reused until the parse result or the
     /// language moves.
@@ -2050,7 +2107,29 @@ pub struct ServersScreen {
 /// `parsed` for the paste it read.
 struct ImportParseResult {
     source: String,
-    parsed: Vec<Result<links::ParsedLink, links::LinkError>>,
+    parsed: Vec<Result<links::ParsedLink, String>>,
+    /// Refused items with their raw text, for the report.
+    refused: Vec<(String, String)>,
+    ignored: usize,
+    /// The ignored sections/parameters, named for the report rows.
+    ignored_names: Vec<String>,
+}
+
+/// The add-subscription dialog's fields.
+#[derive(Default)]
+struct SubscriptionDraft {
+    /// The group being edited; `None` creates a new subscription.
+    editing: Option<String>,
+    title: String,
+    url: String,
+    custom_user_agent: bool,
+    user_agent: String,
+}
+
+/// One fetch worker's terminal result.
+struct SubscriptionFetchResult {
+    group_id: String,
+    outcome: Result<crate::sys::subscription::FetchOutcome, crate::sys::subscription::FetchError>,
 }
 
 impl ServersScreen {
@@ -2098,7 +2177,7 @@ impl ServersScreen {
                     }
                 }
                 Err(error) => ImportPreviewRow {
-                    text: t_fmt(lang, Key::SrvImportErrMark, &[&error.text(lang)]),
+                    text: t_fmt(lang, Key::SrvImportErrMark, &[error]),
                     kind: ImportPreviewKind::Err,
                 },
             })
@@ -2131,10 +2210,38 @@ impl ServersScreen {
             // has already flipped the stop flag and dropped the receiver, so
             // returning early keeps the invariant that a delivered result
             // always carries `parsed`.
-            let parsed = links::parse_bulk_cancellable(&text, stop)?;
+            let mut body = links::parse_body_cancellable(&text, stop);
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let refused: Vec<(String, String)> = body
+                .refused
+                .iter()
+                .map(|refusal| (refusal.raw.clone(), refusal.error.clone()))
+                .collect();
+            let ignored = body.ignored.len();
+            let ignored_names: Vec<String> = body
+                .ignored
+                .iter()
+                .map(|section| section.name.clone())
+                .collect();
+            let mut parsed: Vec<Result<links::ParsedLink, String>> =
+                std::mem::take(&mut body.entries)
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(links::ParsedLink {
+                            profile: entry.profile,
+                            ignored: entry.ignored,
+                        })
+                    })
+                    .collect();
+            parsed.extend(body.refused.into_iter().map(|refusal| Err(refusal.error)));
             Some(ImportParseResult {
                 source: text,
                 parsed,
+                refused,
+                ignored,
+                ignored_names,
             })
         }) {
             Ok(job) => self.import_parse_job = job,
@@ -2165,6 +2272,9 @@ impl ServersScreen {
             return;
         }
         self.import_parsed = result.parsed;
+        self.import_refusals = result.refused;
+        self.import_ignored = result.ignored;
+        self.import_ignored_names = result.ignored_names;
         self.import_parsed_source = Some(result.source);
         // The formatted preview belongs to the previous result.
         self.import_preview = None;
@@ -2175,6 +2285,267 @@ impl ServersScreen {
     /// stop flag and stops listening, so its result is never applied.
     fn cancel_import_parse(&mut self) {
         self.import_parse_job.cancel();
+    }
+
+    /// Start one subscription refresh. The group's stored User-Agent wins
+    /// when set; otherwise the global one is sent (an empty global value
+    /// omits the header).
+    fn start_subscription_fetch(
+        &mut self,
+        lang: Language,
+        repaint: egui::Context,
+        uictx: &mut ServersCtx<'_>,
+        group_id: String,
+    ) {
+        let Some(group) = uictx
+            .servers
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+        else {
+            return;
+        };
+        let Some(subscription) = group.subscription.as_ref() else {
+            return;
+        };
+        let url = subscription.url.clone();
+        let user_agent = subscription.effective_user_agent(&uictx.settings.subscription_user_agent);
+        let bind = match subscription_bind_address(lang, uictx.settings, uictx.core_running) {
+            Ok(bind) => bind,
+            Err(error) => {
+                self.set_status(StatusLine::err(error));
+                return;
+            }
+        };
+        self.subscription_fetch_group = Some(group_id.clone());
+        match Request::worker("broccoli-subscription-fetch", &repaint, move |stop| {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let outcome = crate::sys::subscription::fetch(&url, &user_agent, bind);
+            Some(SubscriptionFetchResult { group_id, outcome })
+        }) {
+            Ok(job) => self.subscription_fetch = job,
+            Err(error) => self.set_status(StatusLine::err(t_fmt(
+                lang,
+                Key::SrvSubscriptionFetchFailed,
+                &[&error.to_string()],
+            ))),
+        }
+    }
+
+    /// Drain one finished fetch: reconcile the group, store the metadata and
+    /// the report, or keep the previous servers and record the error.
+    fn poll_subscription_fetch(&mut self, lang: Language, uictx: &mut ServersCtx<'_>) {
+        let Some(terminal) = self.subscription_fetch.poll() else {
+            return;
+        };
+        self.subscription_fetch_group = None;
+        let result = match terminal {
+            Terminal::Answered(result) => result,
+            Terminal::Exited => {
+                self.set_status(StatusLine::err(t(lang, Key::WorkerExitedWithoutResult)));
+                return;
+            }
+        };
+        let Some(index) = uictx
+            .servers
+            .groups
+            .iter()
+            .position(|group| group.id == result.group_id)
+        else {
+            return;
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        match result.outcome {
+            Err(error) => {
+                if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                    subscription.last_fetch = Some(crate::model::servers::FetchResult {
+                        at,
+                        ok: false,
+                        error: error.to_string(),
+                        ..Default::default()
+                    });
+                }
+                let message = t_fmt(lang, Key::SrvSubscriptionFetchFailed, &[&error.to_string()]);
+                let mut report = crate::model::servers::RefreshReport {
+                    at,
+                    refused: 1,
+                    ..Default::default()
+                };
+                crate::model::servers::push_report_row(
+                    &mut report.rows,
+                    crate::model::servers::ReportRow {
+                        kind: crate::model::servers::ReportKind::Refused,
+                        name: error.to_string(),
+                        raw: error.to_string(),
+                    },
+                );
+                let title = uictx.servers.groups[index].title.clone();
+                if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                    subscription.report = Some(report.clone());
+                }
+                self.report_view = Some((title, report));
+                self.set_status(StatusLine::err(message));
+                uictx.hooks.mark_dirty();
+            }
+            Ok(outcome) => {
+                let parsed = links::parse_body(&outcome.body);
+                if parsed.entries.is_empty() {
+                    let mut report = crate::model::servers::RefreshReport {
+                        at,
+                        refused: parsed.refused.len().max(1),
+                        ignored: parsed.ignored.len(),
+                        ..Default::default()
+                    };
+                    let mut rows = Vec::new();
+                    for refusal in &parsed.refused {
+                        crate::model::servers::push_report_row(
+                            &mut rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Refused,
+                                name: refusal.error.clone(),
+                                raw: refusal.raw.clone(),
+                            },
+                        );
+                    }
+                    for ignored in &parsed.ignored {
+                        crate::model::servers::push_report_row(
+                            &mut rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Ignored,
+                                name: ignored.name.clone(),
+                                raw: String::new(),
+                            },
+                        );
+                    }
+                    if parsed.refused.is_empty() {
+                        crate::model::servers::push_report_row(
+                            &mut rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Refused,
+                                name: t(lang, Key::SrvSubscriptionEmpty).to_owned(),
+                                raw: String::new(),
+                            },
+                        );
+                    }
+                    report.rows = rows;
+                    let title = uictx.servers.groups[index].title.clone();
+                    if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                        subscription.last_fetch = Some(crate::model::servers::FetchResult {
+                            at,
+                            ok: false,
+                            error: t(lang, Key::SrvSubscriptionEmpty).into(),
+                            ..Default::default()
+                        });
+                        subscription.report = Some(report.clone());
+                    }
+                    self.report_view = Some((title, report));
+                    self.set_status(StatusLine::err(t(lang, Key::SrvSubscriptionEmpty)));
+                    uictx.hooks.mark_dirty();
+                    return;
+                }
+                let entries: Vec<crate::model::servers::SubscriptionEntry> = parsed
+                    .entries
+                    .iter()
+                    .map(|entry| crate::model::servers::SubscriptionEntry {
+                        profile: entry.profile.clone(),
+                        content_key: links::body::content_key(&entry.profile),
+                        identity_key: links::body::identity_key(&entry.profile),
+                    })
+                    .collect();
+                let mut report = uictx.servers.refresh_subscription_group(
+                    uictx.settings,
+                    &result.group_id,
+                    entries,
+                );
+                report.refused = parsed.refused.len();
+                report.ignored = parsed.ignored.len();
+                for refusal in &parsed.refused {
+                    crate::model::servers::push_report_row(
+                        &mut report.rows,
+                        crate::model::servers::ReportRow {
+                            kind: crate::model::servers::ReportKind::Refused,
+                            name: refusal.error.clone(),
+                            raw: refusal.raw.clone(),
+                        },
+                    );
+                }
+                for ignored in &parsed.ignored {
+                    crate::model::servers::push_report_row(
+                        &mut report.rows,
+                        crate::model::servers::ReportRow {
+                            kind: crate::model::servers::ReportKind::Ignored,
+                            name: ignored.name.clone(),
+                            raw: String::new(),
+                        },
+                    );
+                }
+                let pick = |header: &str, key: &str| -> String {
+                    if header.trim().is_empty() {
+                        parsed.comments.get(key).cloned().unwrap_or_default()
+                    } else {
+                        header.to_owned()
+                    }
+                };
+                let metadata = crate::model::servers::SubscriptionMetadata::from_provider(
+                    &pick(
+                        &outcome.headers.subscription_userinfo,
+                        "subscription-userinfo",
+                    ),
+                    &pick(
+                        &outcome.headers.profile_update_interval,
+                        "profile-update-interval",
+                    ),
+                    &pick(&outcome.headers.profile_title, "profile-title"),
+                    &pick(
+                        &outcome.headers.profile_web_page_url,
+                        "profile-web-page-url",
+                    ),
+                    &pick(&outcome.headers.support_url, "support-url"),
+                    &pick(&outcome.headers.announce, "announce"),
+                );
+                // A provider title pre-fills a group the user left unnamed.
+                if let Some(title) = metadata
+                    .as_ref()
+                    .map(|metadata| metadata.title.clone())
+                    .filter(|title| !title.is_empty())
+                    && uictx.servers.groups[index]
+                        .subscription
+                        .as_ref()
+                        .is_some_and(|subscription| {
+                            subscription.report.is_none() && subscription.title_auto
+                        })
+                {
+                    crate::model::servers::rename_group(
+                        uictx.servers,
+                        uictx.settings,
+                        &result.group_id,
+                        &title,
+                    );
+                    if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                        subscription.title_auto = false;
+                    }
+                }
+                let report_view = report.clone();
+                let report_title = uictx.servers.groups[index].title.clone();
+                if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                    subscription.last_fetch = Some(crate::model::servers::FetchResult {
+                        at,
+                        ok: true,
+                        error: String::new(),
+                        ..Default::default()
+                    });
+                    subscription.metadata = metadata;
+                    subscription.report = Some(report);
+                }
+                self.report_view = Some((report_title, report_view));
+                uictx.hooks.mark_dirty();
+            }
+        }
     }
 
     fn profile_validation_in_progress(&self, origin: ProfileValidationOrigin) -> bool {
@@ -2329,7 +2700,7 @@ impl ServersScreen {
                     DraftKind::Add => {
                         let id = profile.id.clone();
                         self.add.draft = None;
-                        uictx.servers.profiles.push(profile);
+                        uictx.servers.adopt_profile(profile);
                         if uictx.servers.active.is_none() {
                             // No choice yet: the first row is the default
                             // server (see `ServersFile::activate`).
@@ -2381,17 +2752,17 @@ impl ServersScreen {
                         }
                     }
                     DraftKind::Existing => {
-                        let Some(index) = uictx
+                        let exists = uictx
                             .servers
                             .profiles
                             .iter()
-                            .position(|persisted| persisted.id == target.profile_id())
-                        else {
+                            .any(|persisted| persisted.id == target.profile_id());
+                        if !exists {
                             self.profile_validation_report =
                                 Some(t(lang, Key::SrvServerDeletedWhileValidating).into());
                             return;
-                        };
-                        uictx.servers.profiles[index] = profile;
+                        }
+                        uictx.servers.replace_profile(uictx.settings, profile);
                         self.existing.draft = None;
                         self.profile_validation_report = None;
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndSaved)));
@@ -2426,18 +2797,20 @@ impl ServersScreen {
             }
             ProfileValidationOrigin::Import => {
                 let accepted_count = result.accepted.len();
+                let mut added_names = Vec::new();
                 if accepted_count > 0 {
                     let first_id = result.accepted[0].id.clone();
                     for profile in result.accepted {
-                        if let Some(index) = uictx
+                        if uictx
                             .servers
                             .profiles
                             .iter()
-                            .position(|existing| existing.id == profile.id)
+                            .any(|existing| existing.id == profile.id)
                         {
-                            uictx.servers.profiles[index] = profile;
+                            uictx.servers.replace_profile(uictx.settings, profile);
                         } else {
-                            uictx.servers.profiles.push(profile);
+                            added_names.push(profile.name.clone());
+                            uictx.servers.adopt_profile(profile);
                         }
                     }
                     if uictx.servers.active.is_none() {
@@ -2450,6 +2823,52 @@ impl ServersScreen {
                     // leave modal instead).
                     self.guard_select(first_id);
                     uictx.hooks.mark_dirty();
+                }
+                let refusals = std::mem::take(&mut self.import_refusals);
+                let ignored = std::mem::take(&mut self.import_ignored);
+                let ignored_names = std::mem::take(&mut self.import_ignored_names);
+                if !added_names.is_empty() || !refusals.is_empty() || !ignored_names.is_empty() {
+                    let mut report = crate::model::servers::RefreshReport {
+                        at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .unwrap_or_default(),
+                        added: added_names.len(),
+                        refused: refusals.len(),
+                        ignored,
+                        ..Default::default()
+                    };
+                    for name in added_names {
+                        crate::model::servers::push_report_row(
+                            &mut report.rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Added,
+                                name,
+                                raw: String::new(),
+                            },
+                        );
+                    }
+                    for (raw, error) in refusals {
+                        crate::model::servers::push_report_row(
+                            &mut report.rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Refused,
+                                name: error,
+                                raw,
+                            },
+                        );
+                    }
+                    for name in ignored_names {
+                        crate::model::servers::push_report_row(
+                            &mut report.rows,
+                            crate::model::servers::ReportRow {
+                                kind: crate::model::servers::ReportKind::Ignored,
+                                name,
+                                raw: String::new(),
+                            },
+                        );
+                    }
+                    self.report_view = Some((t(lang, Key::SrvReportTitle).to_string(), report));
                 }
                 self.invalidate_import_preview();
                 self.profile_validation_report = report;
@@ -2848,6 +3267,7 @@ impl ServersScreen {
         let lang = ctx.settings.language;
         self.poll_profile_validation(lang, ctx);
         self.poll_import_parse(lang);
+        self.poll_subscription_fetch(lang, ctx);
         self.poll_xray_tool(lang);
         self.consume_latency_probe_result(ctx);
         // Keep the selection pointing at a real profile.
@@ -2856,6 +3276,10 @@ impl ServersScreen {
         {
             self.selected = None;
             self.existing.draft = None;
+        }
+        if ctx.servers.active_route_repaired {
+            ctx.servers.active_route_repaired = false;
+            self.set_status(StatusLine::err(t(lang, Key::SrvActiveRouteReset)));
         }
         if self.selected.is_none() {
             self.selected = ctx
@@ -2886,6 +3310,32 @@ impl ServersScreen {
         let lang = ctx.settings.language;
         ui.add_space(4.0);
         ui.heading(t(lang, Key::ScreenServers));
+        // The route is part of the screen's state: a server row, a balancer,
+        // or one of the built-in Direct/Block routes.
+        let route = if let Some(tag) = ctx.settings.routing.active_balancer_tag() {
+            tag.to_owned()
+        } else if let Some(tag) = ctx.servers.active_route_builtin() {
+            if tag == crate::model::inbound::DIRECT_OUTBOUND_TAG {
+                t(lang, Key::RouteDirect).to_owned()
+            } else {
+                t(lang, Key::RouteBlock).to_owned()
+            }
+        } else {
+            ctx.servers
+                .active_profile()
+                .map_or_else(|| t(lang, Key::NoneSelected).to_owned(), |p| p.name.clone())
+        };
+        ui.label(t_fmt(lang, Key::SrvActiveRoute, &[&route]));
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text(t(lang, Key::SrvSearch))
+                    .desired_width(180.0),
+            );
+            if !self.search.is_empty() && ui.small_button("✕").clicked() {
+                self.search.clear();
+            }
+        });
         ui.separator();
 
         // One-probe-at-a-time gate shared by the toolbar button and every
@@ -2904,6 +3354,10 @@ impl ServersScreen {
             Rung::NotRunning | Rung::Busy => (false, t(lang, Key::SrvAnotherOperationWorking)),
         };
         let mut action: Option<ListAction> = None;
+        let mut refresh_group: Option<String> = None;
+        let mut delete_group: Option<String> = None;
+        let mut report_group: Option<String> = None;
+        let mut edit_group: Option<String> = None;
         let list_height = (ui.available_height() - 120.0).max(80.0);
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
@@ -2921,19 +3375,78 @@ impl ServersScreen {
         // id (same `id_salt` as the empty-state `show` below), so the scroll
         // offset is preserved across the switch.
         let row_height = ui.spacing().interact_size.y;
+        let generation = ctx.hooks.model_generation();
+        let stale_rows = self
+            .group_rows_cache
+            .as_ref()
+            .is_none_or(|cache| cache.generation != generation || cache.search != self.search);
+        if stale_rows {
+            self.group_rows_cache = Some(GroupRowsCache {
+                generation,
+                search: self.search.clone(),
+                rows: std::rc::Rc::from(
+                    group_list_rows(ctx.servers, &self.collapsed, &self.search).into_boxed_slice(),
+                ),
+            });
+        }
+        let display_rows = std::rc::Rc::clone(
+            &self
+                .group_rows_cache
+                .as_ref()
+                .expect("the grouped rows were cached above")
+                .rows,
+        );
+        if self.emitted_cache.as_ref().map(|(cached, _)| *cached) != Some(generation) {
+            self.emitted_cache = Some((generation, std::rc::Rc::new(ctx.servers.emitted_set())));
+        }
+        let emitted = std::rc::Rc::clone(
+            &self
+                .emitted_cache
+                .as_ref()
+                .expect("the emitted set was cached above")
+                .1,
+        );
         let profiles = &ctx.servers.profiles;
-        if profiles.is_empty() {
+        if self.row_details.as_ref().map(|(cached, _)| *cached) != Some(generation) {
+            let hide = ctx.settings.hide_server_info;
+            let details: std::collections::HashMap<usize, String> = profiles
+                .iter()
+                .enumerate()
+                .map(|(index, profile)| (index, row_detail(profile, hide)))
+                .collect();
+            self.row_details = Some((generation, std::rc::Rc::new(details)));
+        }
+        let row_details = std::rc::Rc::clone(
+            &self
+                .row_details
+                .as_ref()
+                .expect("the row details were cached above")
+                .1,
+        );
+        if !self.search.trim().is_empty()
+            && display_rows
+                .iter()
+                .all(|row| matches!(row, GroupListRow::Header { .. }))
+        {
+            ui.label(RichText::new(t(lang, Key::SrvNoMatches)).weak());
+        }
+        if profiles.is_empty() || display_rows.is_empty() {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
                 .max_height(list_height)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(t(lang, Key::NoServersYet)).weak());
+                    let message = if profiles.is_empty() {
+                        t(lang, Key::NoServersYet)
+                    } else {
+                        t(lang, Key::SrvNoMatches)
+                    };
+                    ui.label(RichText::new(message).weak());
                 });
         } else {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
                 .max_height(list_height)
-                .show_rows(ui, row_height, profiles.len(), |ui, rows| {
+                .show_rows(ui, row_height, display_rows.len(), |ui, rows| {
                     // egui's floating (overlay) scroll bar paints and
                     // hit-tests over the band's right edge: a vertical
                     // ScrollArea shrinks horizontally to its content and the
@@ -2970,7 +3483,166 @@ impl ServersScreen {
                         .filter(|pos| viewport.contains(*pos));
                     let mut drop_mark: Option<(usize, f32)> = None;
                     let mut last_row_bottom: Option<f32> = None;
-                    for index in rows.clone() {
+                    for display in rows {
+                        let index = match display_rows[display] {
+                            GroupListRow::Profile(index) => index,
+                            GroupListRow::Header {
+                                group,
+                                total,
+                                matched,
+                            } => {
+                                let group = &ctx.servers.groups[group];
+                                let collapsed = self.collapsed.contains(&group.id);
+                                ui.horizontal(|ui| {
+                                    if ui.small_button(if collapsed { "▸" } else { "▾" }).clicked()
+                                    {
+                                        action = Some(ListAction::ToggleGroup(group.id.clone()));
+                                    }
+                                    if group.is_manual() {
+                                        ui.label(egui::RichText::new(&group.title).strong());
+                                    } else if ui
+                                        .button(egui::RichText::new(&group.title).strong())
+                                        .on_hover_text(t(lang, Key::SrvEditSubscription))
+                                        .clicked()
+                                    {
+                                        edit_group = Some(group.id.clone());
+                                    }
+                                    if self.search.trim().is_empty() {
+                                        ui.weak(format!("({total})"));
+                                    } else {
+                                        ui.weak(format!("{matched}/{total}"));
+                                    }
+                                    if let Some(metadata) = group
+                                        .subscription
+                                        .as_ref()
+                                        .and_then(|subscription| subscription.metadata.as_ref())
+                                    {
+                                        let unit = ctx.settings.traffic_unit;
+                                        let used =
+                                            metadata.upload.saturating_add(metadata.download);
+                                        let has_quota = metadata.total > 0
+                                            || metadata.upload > 0
+                                            || metadata.download > 0;
+                                        if !has_quota {
+                                            // A title-only snapshot has no
+                                            // quota widget.
+                                        } else if metadata.total > 0 {
+                                            let percent = used
+                                                .saturating_mul(100)
+                                                .checked_div(metadata.total)
+                                                .unwrap_or_default();
+                                            ui.weak(t_fmt(
+                                                lang,
+                                                Key::SrvQuotaUsed,
+                                                &[
+                                                    &crate::ui::dashboard::format_bytes(used, unit),
+                                                    &crate::ui::dashboard::format_bytes(
+                                                        metadata.total,
+                                                        unit,
+                                                    ),
+                                                    &percent,
+                                                ],
+                                            ));
+                                        } else {
+                                            ui.weak(t_fmt(
+                                                lang,
+                                                Key::SrvQuotaUnlimited,
+                                                &[&crate::ui::dashboard::format_bytes(used, unit)],
+                                            ));
+                                        }
+                                        if metadata.expire > 0 {
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|duration| duration.as_secs())
+                                                .unwrap_or_default();
+                                            if now >= metadata.expire {
+                                                ui.colored_label(
+                                                    status_colors_of(ui).err,
+                                                    t(lang, Key::SrvSubscriptionExpired),
+                                                );
+                                            } else {
+                                                let days = (metadata.expire - now).div_ceil(86_400);
+                                                ui.weak(t_fmt(
+                                                    lang,
+                                                    Key::SrvSubscriptionExpiresIn,
+                                                    &[&days, &unix_date(metadata.expire)],
+                                                ));
+                                            }
+                                        }
+                                        if metadata.update_interval > 0 {
+                                            ui.weak(t_fmt(
+                                                lang,
+                                                Key::SrvSubscriptionUpdateHint,
+                                                &[&metadata.update_interval],
+                                            ));
+                                        }
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if group.subscription.is_some() {
+                                                if ui
+                                                    .small_button(t(
+                                                        lang,
+                                                        Key::SrvRefreshSubscription,
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    refresh_group = Some(group.id.clone());
+                                                }
+                                                if group.subscription.as_ref().is_some_and(
+                                                    |subscription| subscription.report.is_some(),
+                                                ) && ui
+                                                    .small_button(t(lang, Key::SrvShowReport))
+                                                    .clicked()
+                                                {
+                                                    report_group = Some(group.id.clone());
+                                                }
+                                                if ui
+                                                    .small_button(t(
+                                                        lang,
+                                                        Key::SrvDeleteSubscription,
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    delete_group = Some(group.id.clone());
+                                                }
+                                            }
+                                            if !group.is_manual() {
+                                                let position = ctx
+                                                    .servers
+                                                    .groups
+                                                    .iter()
+                                                    .position(|candidate| candidate.id == group.id)
+                                                    .unwrap_or_default();
+                                                if ui
+                                                    .small_button("▼")
+                                                    .on_hover_text(t(lang, Key::RoutingMoveDown))
+                                                    .clicked()
+                                                {
+                                                    action = Some(ListAction::MoveGroup {
+                                                        group: position,
+                                                        delta: 1,
+                                                    });
+                                                }
+                                                if ui
+                                                    .small_button("▲")
+                                                    .on_hover_text(t(lang, Key::RoutingMoveUp))
+                                                    .clicked()
+                                                {
+                                                    action = Some(ListAction::MoveGroup {
+                                                        group: position,
+                                                        delta: -1,
+                                                    });
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                                last_row_bottom = Some(ui.min_rect().bottom());
+                                continue;
+                            }
+                        };
                         let p = &profiles[index];
                         let is_sel = self.selected.as_deref() == Some(p.id.as_str());
                         let is_active = ctx.servers.active.as_deref() == Some(p.id.as_str());
@@ -3001,17 +3673,31 @@ impl ServersScreen {
                         if lifted == Some(index) {
                             ui.multiply_opacity(DRAGGED_ROW_OPACITY);
                         }
+                        let detail = row_details.get(&index).map_or("", String::as_str);
                         let clicks = server_list_row(
                             ui,
                             lang,
                             &p.name,
-                            is_sel,
-                            is_active,
-                            badge,
-                            RowProbeState {
-                                enabled: probe_gate.0,
-                                disabled_hint: probe_gate.1,
+                            detail,
+                            RowState {
+                                selected: is_sel,
+                                active: is_active,
+                                switch: RowSwitch {
+                                    checked: is_active || p.enabled,
+                                    locked_hint: if is_active {
+                                        Some(t(lang, Key::SrvActiveAlwaysEmitted))
+                                    } else if emitted.chain_only.contains(&index) {
+                                        Some(t(lang, Key::SrvChainOnlyHint))
+                                    } else {
+                                        None
+                                    },
+                                },
+                                probe: RowProbeState {
+                                    enabled: probe_gate.0,
+                                    disabled_hint: probe_gate.1,
+                                },
                             },
+                            badge,
                         );
                         ui.set_opacity(previous_opacity);
                         // A primary press that grows past egui's click
@@ -3023,7 +3709,9 @@ impl ServersScreen {
                         if clicks.row.drag_started_by(egui::PointerButton::Primary) {
                             egui::DragAndDrop::set_payload(ui.ctx(), DragRow(index));
                         }
-                        if clicks.probe {
+                        if clicks.toggle {
+                            action = Some(ListAction::ToggleEnabled(p.id.clone()));
+                        } else if clicks.probe {
                             action = Some(ListAction::ProbeLatency(p.id.clone()));
                         } else if clicks.delete {
                             action = Some(ListAction::Delete(p.id.clone()));
@@ -3048,6 +3736,12 @@ impl ServersScreen {
                         let mut menu = |ui: &mut egui::Ui| {
                             if ui.button(t(lang, Key::SrvSetActive)).clicked() {
                                 action = Some(ListAction::SetActive(id.clone()));
+                                ui.close();
+                            }
+                            if p.group_id() != crate::model::servers::MANUAL_GROUP_ID
+                                && ui.button(t(lang, Key::SrvCopyToManual)).clicked()
+                            {
+                                action = Some(ListAction::CopyToManual(id.clone()));
                                 ui.close();
                             }
                             if ui.button(t(lang, Key::SrvDuplicate)).clicked() {
@@ -3076,7 +3770,7 @@ impl ServersScreen {
                         && drop_mark.is_none()
                         && let Some(bottom) = last_row_bottom
                     {
-                        drop_mark = Some((rows.end, bottom + spacing * 0.5));
+                        drop_mark = Some((profiles.len(), bottom + spacing * 0.5));
                     }
                     // The release ends the gesture: egui hands back the
                     // lifted row's index, and the drop lands it at the gap
@@ -3147,6 +3841,9 @@ impl ServersScreen {
             self.import_open = true;
             self.profile_validation_report = None;
         }
+        if ui.button(t(lang, Key::SrvAddSubscription)).clicked() {
+            self.subscription_dialog = Some(SubscriptionDraft::default());
+        }
         // The toolbar button is gated like the rows, plus the no-profiles case.
         let can_test_latency = if !probe_gate.0 {
             probe_gate
@@ -3185,19 +3882,43 @@ impl ServersScreen {
             ui.colored_label(color, message);
         }
         if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
-            // Ascending latency; timeouts and never-measured last. The first
-            // row is the default server (the config's first outbound), so it
-            // keeps its slot: a sort must not hand the default route to
-            // another server.
-            let default = ctx.servers.profiles.first().map(|p| p.id.clone());
+            // Ascending latency; timeouts and never-measured last. A sort
+            // reorders rows only: the active route names a server id and does
+            // not follow the row order.
             ctx.servers.profiles.sort_by_key(|p| match p.latency_ms {
                 Some(v) if v >= 0 => (0, v),
                 _ => (1, i64::MAX),
             });
-            if let Some(id) = default {
-                ctx.servers.activate(&id);
-            }
             ctx.hooks.mark_dirty();
+        }
+
+        if let Some(id) = delete_group {
+            self.subscription_delete_pending = Some(id);
+        }
+        if let Some(id) = report_group
+            && let Some(group) = ctx.servers.groups.iter().find(|group| group.id == id)
+            && let Some(report) = group
+                .subscription
+                .as_ref()
+                .and_then(|subscription| subscription.report.clone())
+        {
+            self.report_view = Some((group.title.clone(), report));
+        }
+        if let Some(id) = refresh_group {
+            let repaint = ui.ctx().clone();
+            self.start_subscription_fetch(lang, repaint, ctx, id);
+        }
+        if let Some(id) = edit_group
+            && let Some(group) = ctx.servers.groups.iter().find(|group| group.id == id)
+        {
+            let subscription = group.subscription.as_ref();
+            self.subscription_dialog = Some(SubscriptionDraft {
+                editing: Some(id),
+                title: group.title.clone(),
+                url: subscription.map_or_else(String::new, |s| s.url.clone()),
+                custom_user_agent: subscription.is_some_and(|s| s.user_agent_custom),
+                user_agent: subscription.map_or_else(String::new, |s| s.user_agent.clone()),
+            });
         }
 
         // apply deferred list actions (needs &mut profiles)
@@ -3232,6 +3953,37 @@ impl ServersScreen {
                 ctx.servers.activate(&id);
                 ctx.hooks.mark_dirty();
             }
+            Some(ListAction::ToggleGroup(id)) => {
+                if !self.collapsed.insert(id.clone()) {
+                    self.collapsed.remove(&id);
+                }
+                self.group_rows_cache = None;
+            }
+            Some(ListAction::MoveGroup { group, delta }) => {
+                let target = group as i32 + delta;
+                if group > 0 && target > 0 && (target as usize) < ctx.servers.groups.len() {
+                    ctx.servers.groups.swap(group, target as usize);
+                    ctx.hooks.mark_dirty();
+                }
+            }
+            Some(ListAction::CopyToManual(id)) => {
+                if ctx.servers.copy_to_manual(&id).is_some() {
+                    ctx.hooks.mark_dirty();
+                }
+            }
+            Some(ListAction::ToggleEnabled(id)) => {
+                let active = ctx.servers.active.as_deref() == Some(id.as_str());
+                if !active && let Some(index) = ctx.servers.profiles.iter().position(|p| p.id == id)
+                {
+                    // A chain-only hop is locked off: it is already on the
+                    // wire, and switching it off would not remove it.
+                    let chain_only = ctx.servers.emitted_set().chain_only.contains(&index);
+                    if !chain_only {
+                        ctx.servers.profiles[index].enabled = !ctx.servers.profiles[index].enabled;
+                        ctx.hooks.mark_dirty();
+                    }
+                }
+            }
             Some(ListAction::Reorder { from, gap }) => {
                 // The payload index was read off this frame's list; a list
                 // that shrank under the gesture (a probe that removed a
@@ -3241,12 +3993,6 @@ impl ServersScreen {
                     if to != from {
                         let profile = ctx.servers.profiles.remove(from);
                         ctx.servers.profiles.insert(to, profile);
-                        // A drop can lift a different profile into the first
-                        // slot: the top row is the default server, so the
-                        // active marker follows it.
-                        if let Some(first) = ctx.servers.profiles.first().map(|p| p.id.clone()) {
-                            ctx.servers.activate(&first);
-                        }
                         ctx.hooks.mark_dirty();
                     }
                 }
@@ -3256,6 +4002,9 @@ impl ServersScreen {
                     let mut copy = ctx.servers.profiles[idx].clone();
                     copy.id = uuid::Uuid::new_v4().simple().to_string();
                     copy.name = t_fmt(lang, Key::SrvCopySuffix, &[&copy.name]);
+                    copy.name = ctx
+                        .servers
+                        .unique_profile_name(copy.group_id(), &copy.name, None);
                     ctx.servers.profiles.insert(idx + 1, copy.clone());
                     // The switch to the copy is guarded like any other
                     // selection change (the copy is already inserted; the
@@ -3675,14 +4424,31 @@ struct RowProbeState<'a> {
     disabled_hint: &'a str,
 }
 
+/// The row's selection and emission state, grouped so the row builder keeps a
+/// readable argument list.
+struct RowState<'a> {
+    selected: bool,
+    active: bool,
+    switch: RowSwitch<'a>,
+    probe: RowProbeState<'a>,
+}
+
+/// The row's enable switch: its current state, and — for the active server or
+/// a chain-only hop — why the switch is locked.
+struct RowSwitch<'a> {
+    checked: bool,
+    locked_hint: Option<&'a str>,
+}
+
 /// What a rendered list row reported: the row's own response
 /// (click/right-click/drag anywhere on the row), the name button's response,
-/// and whether the probe or delete button was clicked.
+/// and whether the probe, delete or enable switch was clicked.
 struct RowClicks {
     row: egui::Response,
     name: egui::Response,
     delete: bool,
     probe: bool,
+    toggle: bool,
 }
 
 /// The drag payload of one server-list row: the row's index in the list as
@@ -3761,14 +4527,149 @@ fn drag_scroll_delta(viewport: egui::Rect, pos: egui::Pos2, dt: f32) -> f32 {
 /// drag-sensing widget), so on a touch screen a swipe lifts the row instead
 /// of scrolling the list; the wheel and swipes over the empty tail below the
 /// rows still scroll.
+/// One row's detail line: protocol, security when it is not plain, and the
+/// endpoint (masked when the user hid server information).
+fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> String {
+    let protocol = profile.outbound.protocol.as_str();
+    if hide_server_info {
+        return protocol.to_owned();
+    }
+    let security = profile.outbound.stream.security.as_str();
+    let address = profile.server_address().unwrap_or_default();
+    if security == "none" {
+        format!("{protocol} · {address}")
+    } else {
+        format!("{protocol} · {security} · {address}")
+    }
+}
+
+/// The grouped list: `Manual` first, then groups in stored order, one header
+/// per group and its matching rows. A collapsed group keeps its header but
+/// sheds its rows. `search` filters rows by name or address, case-insensitively;
+/// headers stay with their match counts.
+fn group_list_rows(
+    servers: &crate::model::ServersFile,
+    collapsed: &std::collections::BTreeSet<String>,
+    search: &str,
+) -> Vec<GroupListRow> {
+    let needle = search.trim().to_lowercase();
+    let mut rows = Vec::new();
+    let manual = servers.groups.iter().position(|group| group.is_manual());
+    let order: Vec<usize> = manual
+        .into_iter()
+        .chain((0..servers.groups.len()).filter(|index| Some(*index) != manual))
+        .collect();
+    for group_index in order {
+        let group = &servers.groups[group_index];
+        let members: Vec<usize> = servers
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| profile.group_id() == group.id)
+            .map(|(index, _)| index)
+            .collect();
+        let matched: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&index| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let profile = &servers.profiles[index];
+                profile.name.to_lowercase().contains(&needle)
+                    || profile
+                        .server_address()
+                        .is_some_and(|address| address.to_lowercase().contains(&needle))
+            })
+            .collect();
+        rows.push(GroupListRow::Header {
+            group: group_index,
+            total: members.len(),
+            matched: matched.len(),
+        });
+        if !collapsed.contains(&group.id) {
+            rows.extend(matched.into_iter().map(GroupListRow::Profile));
+        }
+    }
+    rows
+}
+
+/// A Unix time as `YYYY-MM-DD` (UTC), for an expiry caption. No calendar
+/// dependency: days since the epoch → civil date (proleptic Gregorian).
+fn unix_date(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The source address a direct subscription fetch binds: the uplink adapter
+/// the latency probe resolves, reduced to its first IPv4 (else IPv6) address,
+/// because the HTTP client binds an address rather than an adapter.
+fn subscription_bind_address(
+    lang: Language,
+    settings: &crate::model::Settings,
+    core_running: bool,
+) -> Result<Option<std::net::IpAddr>, String> {
+    if !settings.subscription_direct_fetch {
+        return Ok(None);
+    }
+    let interfaces = crate::sys::netif::list_all();
+    let tun_name = settings.tun.effective_name();
+    let tun_index = interfaces
+        .iter()
+        .find(|interface| interface.name == tun_name)
+        .map(|interface| interface.index);
+    let tun_active = settings.mode == crate::model::Mode::Tun && core_running;
+    match crate::sys::netif::resolve_probe_uplink(
+        Some(&settings.tun.auto_outbounds_interface),
+        tun_active,
+        tun_index,
+        &interfaces,
+    ) {
+        crate::sys::netif::ProbeUplink::Unbound => Ok(None),
+        crate::sys::netif::ProbeUplink::Interface(name) => {
+            let address = interfaces
+                .iter()
+                .find(|interface| interface.name == name)
+                .and_then(|interface| {
+                    interface
+                        .ips
+                        .iter()
+                        .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+                        .min_by_key(|address| !address.is_ipv4())
+                });
+            address
+                .map(Some)
+                .ok_or_else(|| t_fmt(lang, Key::SrvSubscriptionNoUplinkAddress, &[&name]))
+        }
+        crate::sys::netif::ProbeUplink::TunSelf { name } => {
+            Err(t_fmt(lang, Key::ProbeInterfaceTunSelf, &[&name]))
+        }
+        crate::sys::netif::ProbeUplink::Down { name } => {
+            Err(t_fmt(lang, Key::ProbeInterfaceDown, &[&name]))
+        }
+        crate::sys::netif::ProbeUplink::Missing { name } => {
+            Err(t_fmt(lang, Key::ProbeInterfaceMissing, &[&name]))
+        }
+    }
+}
+
 fn server_list_row(
     ui: &mut egui::Ui,
     lang: Language,
     name: &str,
-    selected: bool,
-    active: bool,
+    detail: &str,
+    row: RowState<'_>,
     latency: &LatencyBadge,
-    probe: RowProbeState<'_>,
 ) -> RowClicks {
     let inner = ui.horizontal(|ui| {
         egui::containers::Sides::new()
@@ -3777,31 +4678,46 @@ fn server_list_row(
             .show(
                 ui,
                 |ui| {
+                    let mut checked = row.switch.checked;
+                    let response = ui.add_enabled(
+                        row.switch.locked_hint.is_none(),
+                        egui::Checkbox::without_text(&mut checked),
+                    );
+                    let response = match row.switch.locked_hint {
+                        Some(hint) => response.on_disabled_hover_text(hint),
+                        None => response.on_hover_text(t(lang, Key::Enabled)),
+                    };
+                    let toggled = response.clicked();
                     // Text atoms instead of `format!("● {name}")` /
                     // `name.to_string()`: no heap allocation per row per
                     // repaint. The atoms render as one adjacent run.
                     let button = if name.is_empty() {
-                        egui::Button::selectable(selected, t(lang, Key::SrvUnnamed))
-                    } else if active {
-                        egui::Button::selectable(selected, ("● ", name))
+                        egui::Button::selectable(row.selected, t(lang, Key::SrvUnnamed))
+                    } else if row.active {
+                        egui::Button::selectable(row.selected, ("● ", name))
                     } else {
-                        egui::Button::selectable(selected, name)
+                        egui::Button::selectable(row.selected, name)
                     };
-                    ui.add(button.truncate())
-                        .on_hover_text(t(lang, Key::SrvDragToReorder))
+                    let name_resp = ui
+                        .add(button.truncate())
+                        .on_hover_text(t(lang, Key::SrvDragToReorder));
+                    if !detail.is_empty() {
+                        ui.weak(detail);
+                    }
+                    (toggled, name_resp)
                 },
                 |ui| {
                     let delete = ui
                         .small_button(t(lang, Key::DeleteRow))
                         .on_hover_text(t(lang, Key::DeleteServer));
-                    let probe_button = if probe.enabled {
+                    let probe_button = if row.probe.enabled {
                         ui.small_button(t(lang, Key::ProbeRow))
                             .on_hover_text(t(lang, Key::SrvProbeServerLatencyHint))
                     } else {
                         // Same small sizing as the enabled variant: a gated
                         // button must not grow the row while a probe runs.
                         ui.add_enabled(false, egui::Button::new(t(lang, Key::ProbeRow)).small())
-                            .on_disabled_hover_text(probe.disabled_hint)
+                            .on_disabled_hover_text(row.probe.disabled_hint)
                     };
                     // The badge text/color come from the row's memoized
                     // [`LatencyBadge`] — borrowed, never
@@ -3819,7 +4735,7 @@ fn server_list_row(
                 },
             )
     });
-    let (name_resp, (delete_resp, probe_resp)) = inner.inner;
+    let ((toggled, name_resp), (delete_resp, probe_resp)) = inner.inner;
     let delete_clicked = delete_resp.clicked();
     let probe_clicked = probe_resp.clicked();
     let resp = inner.response.interact(egui::Sense::click_and_drag());
@@ -3828,6 +4744,7 @@ fn server_list_row(
         name: name_resp,
         delete: delete_clicked,
         probe: probe_clicked,
+        toggle: toggled,
     }
 }
 
@@ -7149,8 +8066,257 @@ impl ServersScreen {
         self.slot_mut(kind).probe.show_output = !close_requested && !close_clicked;
     }
 
+    /// Commit the add-subscription dialog: create the group and start its
+    /// first fetch.
+    fn finish_subscription_dialog(
+        &mut self,
+        lang: Language,
+        ctx: &egui::Context,
+        uictx: &mut ServersCtx<'_>,
+    ) {
+        let Some(draft) = self.subscription_dialog.take() else {
+            return;
+        };
+        let url = draft.url.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        if let Some(id) = draft.editing.clone() {
+            let title = draft.title.trim();
+            if !title.is_empty() {
+                crate::model::servers::rename_group(uictx.servers, uictx.settings, &id, title);
+            }
+            if let Some(group) = uictx.servers.groups.iter_mut().find(|group| group.id == id)
+                && let Some(subscription) = group.subscription.as_mut()
+            {
+                subscription.url = draft.url.clone();
+                subscription.user_agent_custom = draft.custom_user_agent;
+                subscription.user_agent = if draft.custom_user_agent {
+                    draft.user_agent.trim().to_owned()
+                } else {
+                    String::new()
+                };
+                subscription.title_auto = false;
+            }
+            uictx.hooks.mark_dirty();
+            return;
+        }
+        let base = if draft.title.trim().is_empty() {
+            "Subscription"
+        } else {
+            draft.title.trim()
+        };
+        let title = uictx.servers.unique_group_title(base, None);
+        let mut group = crate::model::servers::Group::new(title);
+        group.subscription = Some(crate::model::servers::Subscription {
+            url,
+            user_agent_custom: draft.custom_user_agent,
+            user_agent: if draft.custom_user_agent {
+                draft.user_agent.trim().to_owned()
+            } else {
+                String::new()
+            },
+            title_auto: draft.title.trim().is_empty(),
+            ..Default::default()
+        });
+        let id = group.id.clone();
+        uictx.servers.groups.push(group);
+        uictx.hooks.mark_dirty();
+        self.start_subscription_fetch(lang, ctx.clone(), uictx, id);
+    }
+
     fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
         let lang = uictx.settings.language;
+        // Refresh/import report.
+        if let Some(view) = self.report_view.take() {
+            let (title, report) = (&view.0, &view.1);
+            let close_requested = popup::show(
+                ctx,
+                "servers.refresh-report",
+                title,
+                [640.0, 460.0],
+                true,
+                |ui| {
+                    ui.label(t_fmt(
+                        lang,
+                        Key::SrvReportSummary,
+                        &[
+                            &report.added,
+                            &report.updated,
+                            &report.removed,
+                            &report.refused,
+                            &report.ignored,
+                        ],
+                    ));
+                    if report.route_to_block {
+                        ui.colored_label(
+                            status_colors_of(ui).warn,
+                            t(lang, Key::SrvReportRouteBlock),
+                        );
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("servers.refresh-report.rows")
+                        .show(ui, |ui| {
+                            for (index, row) in report.rows.iter().enumerate() {
+                                let label = match row.kind {
+                                    crate::model::servers::ReportKind::Added => {
+                                        t(lang, Key::SrvReportAdded)
+                                    }
+                                    crate::model::servers::ReportKind::Updated => {
+                                        t(lang, Key::SrvReportUpdated)
+                                    }
+                                    crate::model::servers::ReportKind::Removed => {
+                                        t(lang, Key::SrvReportRemoved)
+                                    }
+                                    crate::model::servers::ReportKind::Refused => {
+                                        t(lang, Key::SrvReportRefused)
+                                    }
+                                    crate::model::servers::ReportKind::Ignored => {
+                                        t(lang, Key::SrvReportIgnored)
+                                    }
+                                };
+                                if row.kind == crate::model::servers::ReportKind::Refused {
+                                    egui::CollapsingHeader::new(label).id_salt(index).show(
+                                        ui,
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&row.raw).monospace(),
+                                                )
+                                                .selectable(true)
+                                                .wrap(),
+                                            );
+                                        },
+                                    );
+                                } else if row.name.is_empty() {
+                                    ui.label(label);
+                                } else {
+                                    ui.label(format!("{label}: {}", row.name));
+                                }
+                            }
+                        });
+                },
+            );
+            if !close_requested {
+                self.report_view = Some(view);
+            }
+        }
+        // Add-subscription dialog.
+        if self.subscription_dialog.is_some() {
+            let mut add = false;
+            let close_requested = popup::show(
+                ctx,
+                "servers.add-subscription",
+                if self
+                    .subscription_dialog
+                    .as_ref()
+                    .is_some_and(|draft| draft.editing.is_some())
+                {
+                    t(lang, Key::SrvEditSubscription)
+                } else {
+                    t(lang, Key::SrvAddSubscription)
+                },
+                [480.0, 250.0],
+                false,
+                |ui| {
+                    let draft = self
+                        .subscription_dialog
+                        .as_mut()
+                        .expect("the dialog is open");
+                    crate::ui::widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvSubscriptionUrl),
+                        &mut draft.url,
+                        "https://",
+                    );
+                    crate::ui::widgets::text_field(
+                        ui,
+                        t(lang, Key::SrvSubscriptionTitle),
+                        &mut draft.title,
+                        "",
+                    );
+                    ui.checkbox(&mut draft.custom_user_agent, t(lang, Key::SrvUseCustomUa));
+                    if draft.custom_user_agent {
+                        crate::ui::widgets::text_field(ui, "User-Agent", &mut draft.user_agent, "");
+                    }
+                    let label = if draft.editing.is_some() {
+                        t(lang, Key::SrvSaveSubscription)
+                    } else {
+                        t(lang, Key::SrvAddSubscription)
+                    };
+                    if ui
+                        .add_enabled(!draft.url.trim().is_empty(), egui::Button::new(label))
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                },
+            );
+            if add {
+                self.finish_subscription_dialog(lang, ctx, uictx);
+            } else if close_requested {
+                self.subscription_dialog = None;
+            }
+        }
+        // Delete-subscription confirmation.
+        if let Some(id) = self.subscription_delete_pending.clone() {
+            let title = uictx
+                .servers
+                .groups
+                .iter()
+                .find(|group| group.id == id)
+                .map(|group| group.title.clone())
+                .unwrap_or_default();
+            let mut confirm = false;
+            let mut cancel = false;
+            let close_requested = popup::show(
+                ctx,
+                "servers.delete-subscription",
+                t(lang, Key::SrvDeleteSubscription),
+                [440.0, 150.0],
+                false,
+                |ui| {
+                    ui.label(t_fmt(lang, Key::SrvDeleteSubscriptionConfirm, &[&title]));
+                    ui.horizontal(|ui| {
+                        if ui.button(t(lang, Key::Delete)).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button(t(lang, Key::Cancel)).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+            if confirm {
+                uictx.servers.groups.retain(|group| group.id != id);
+                uictx
+                    .servers
+                    .profiles
+                    .retain(|profile| profile.group_id() != id);
+                let active_lost = uictx.servers.active.as_deref().is_some_and(|active| {
+                    active != crate::model::inbound::DIRECT_OUTBOUND_TAG
+                        && active != crate::model::inbound::BLOCK_OUTBOUND_TAG
+                        && !uictx
+                            .servers
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.id == active)
+                });
+                if active_lost || uictx.servers.profiles.is_empty() {
+                    uictx.servers.active =
+                        Some(crate::model::inbound::BLOCK_OUTBOUND_TAG.to_owned());
+                }
+                if self.subscription_fetch_group.as_deref() == Some(id.as_str()) {
+                    self.subscription_fetch.cancel();
+                    self.subscription_fetch_group = None;
+                }
+                uictx.hooks.mark_dirty();
+                self.subscription_delete_pending = None;
+            } else if cancel || close_requested {
+                self.subscription_delete_pending = None;
+            }
+        }
         for kind in [DraftKind::Existing, DraftKind::Add] {
             self.probe_output_window(ctx, lang, kind);
         }
@@ -7417,8 +8583,13 @@ impl ServersScreen {
                 // (eviction), which the `dialog` borrow would otherwise block.
                 let deleted_id = dialog.id.clone();
                 uictx.servers.profiles.retain(|p| p.id != deleted_id);
-                if uictx.servers.active.as_deref() == Some(deleted_id.as_str()) {
-                    uictx.servers.active = uictx.servers.profiles.first().map(|p| p.id.clone());
+                if uictx.servers.active.as_deref() == Some(deleted_id.as_str())
+                    || uictx.servers.profiles.is_empty()
+                {
+                    // A deleted active server — and the last row — lands on
+                    // Block: a mistaken deletion must not leak traffic.
+                    uictx.servers.active =
+                        Some(crate::model::inbound::BLOCK_OUTBOUND_TAG.to_owned());
                 }
                 if self.selected.as_deref() == Some(deleted_id.as_str()) {
                     self.selected = None;
@@ -7723,11 +8894,12 @@ mod tests {
         AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
         EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
         FINGERPRINTS, FeedbackLevel, FieldKey, Language, LatencyBadge, LeaveAction, ProfileDraft,
-        RawField, Request, RowProbeState, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
-        ServersScreen, StatusLine, TlsProbe, TransportTabCtx, basic_tab_inline_verdict,
-        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
-        server_list_row, status_colors_of, status_toast_expired, xmux_section,
+        RawField, Request, RowProbeState, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
+        SeededBuffers, ServerProfile, ServersScreen, StatusLine, TlsProbe, TransportTabCtx,
+        basic_tab_inline_verdict, drag_scroll_delta, ech_sockopt_editor,
+        editor_validation_findings, final_rules_editor, finalmask_udp_settings_editor,
+        fingerprint_allowed, mux_tab, noises_editor, reorder_target, server_list_row,
+        status_colors_of, status_toast_expired, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -8255,6 +9427,93 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn the_report_window_lists_rows_and_keeps_refused_text() {
+        use crate::model::servers::{RefreshReport, ReportKind, ReportRow};
+
+        let report = RefreshReport {
+            added: 1,
+            refused: 1,
+            rows: vec![
+                ReportRow {
+                    kind: ReportKind::Added,
+                    name: "Tokyo".into(),
+                    raw: String::new(),
+                },
+                ReportRow {
+                    kind: ReportKind::Refused,
+                    name: "bad entry".into(),
+                    raw: "vless://broken".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let screen = ServersScreen {
+            report_view: Some(("Feed report".into(), report)),
+            ..ServersScreen::default()
+        };
+        let mut harness = screen_harness(UiTestRig::default(), screen);
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_label_contains("added: Tokyo")
+                .next()
+                .is_some()
+                || harness.get_all_by_label_contains("Tokyo").next().is_some(),
+            "an added row is named"
+        );
+        assert!(
+            harness
+                .get_all_by_label_contains("refused")
+                .next()
+                .is_some(),
+            "the refused section is present"
+        );
+        assert!(harness.query_by_label("Feed report").is_some());
+    }
+
+    #[test]
+    fn the_grouped_list_renders_headers_collapse_and_search() {
+        use crate::model::servers::Group;
+        use crate::model::{OutboundModel as Model, Protocol, ServerProfile as Profile};
+
+        let mut rig = UiTestRig::default();
+        let mut manual = Profile::new("ManualOne", Model::new(Protocol::Freedom));
+        manual.enabled = true;
+        let feed = Group::new("Feed");
+        let feed_id = feed.id.clone();
+        let mut feed_one = Profile::new("FeedOne", Model::new(Protocol::Freedom));
+        feed_one.group = feed_id;
+        feed_one.enabled = true;
+        rig.servers.profiles = vec![manual, feed_one];
+        rig.servers.groups.push(feed);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        assert!(harness.get_all_by_label_contains("Manual").next().is_some());
+        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
+        assert!(harness.query_by_label("ManualOne").is_some());
+        assert!(harness.query_by_label("FeedOne").is_some());
+
+        // Collapse the Feed header: its row goes, the header stays.
+        harness
+            .get_all_by_label("▾")
+            .nth(1)
+            .expect("the Feed header")
+            .click();
+        harness.run();
+        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
+        assert!(harness.query_by_label("FeedOne").is_none());
+
+        // Search filters rows across groups and keeps both headers.
+        harness.state_mut().0.search = "FeedOne".into();
+        harness.run();
+        assert!(harness.query_by_label("ManualOne").is_none());
+        assert!(harness.get_all_by_label_contains("Manual").next().is_some());
+        assert!(harness.get_all_by_label_contains("Feed").next().is_some());
+    }
+
+    #[test]
     fn server_row_truncates_long_name_so_right_block_stays_clear() {
         let long_name = "tokyo-edge-01.example.com very long server name that used to overlap the latency badge and the delete button";
         let mut harness = harness_builder()
@@ -8265,13 +9524,20 @@ Authentication: ML-KEM-768, Post-Quantum
                     ui,
                     Language::En,
                     long_name,
-                    false,
-                    false,
-                    &badge,
-                    RowProbeState {
-                        enabled: true,
-                        disabled_hint: "",
+                    "",
+                    RowState {
+                        selected: false,
+                        active: false,
+                        switch: RowSwitch {
+                            checked: false,
+                            locked_hint: None,
+                        },
+                        probe: RowProbeState {
+                            enabled: true,
+                            disabled_hint: "",
+                        },
                     },
+                    &badge,
                 );
             });
         harness.run();
@@ -8316,13 +9582,20 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 "A server",
-                false,
-                false,
-                &badge,
-                RowProbeState {
-                    enabled: true,
-                    disabled_hint: "",
+                "",
+                RowState {
+                    selected: false,
+                    active: false,
+                    switch: RowSwitch {
+                        checked: false,
+                        locked_hint: None,
+                    },
+                    probe: RowProbeState {
+                        enabled: true,
+                        disabled_hint: "",
+                    },
                 },
+                &badge,
             );
             let mut c = clicked_ui.borrow_mut();
             c.0 |= clicks.row.clicked() || clicks.name.clicked();
@@ -8335,6 +9608,47 @@ Authentication: ML-KEM-768, Post-Quantum
         (c.0, c.1, c.2)
     }
 
+    #[test]
+    fn the_row_switch_reports_a_toggle_and_a_locked_one_does_not() {
+        for locked in [None, Some("dialed through")] {
+            let toggled = Rc::new(RefCell::new(false));
+            let toggled_ui = Rc::clone(&toggled);
+            let mut harness = harness_builder().build_ui(move |ui| {
+                let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+                let clicks = server_list_row(
+                    ui,
+                    Language::En,
+                    "A server",
+                    "",
+                    RowState {
+                        selected: false,
+                        active: false,
+                        switch: RowSwitch {
+                            checked: false,
+                            locked_hint: locked,
+                        },
+                        probe: RowProbeState {
+                            enabled: true,
+                            disabled_hint: "",
+                        },
+                    },
+                    &badge,
+                );
+                *toggled_ui.borrow_mut() |= clicks.toggle;
+            });
+            harness.get_by_role(egui::accesskit::Role::CheckBox).click();
+            harness.run();
+            assert_eq!(
+                *toggled.borrow(),
+                locked.is_none(),
+                "a locked switch must not report a toggle (locked: {locked:?})"
+            );
+        }
+    }
+
+    /// The row's switch, probe/delete buttons and name all report through the
+    /// row: the caller reads the switch and buttons first, so a press on them
+    /// never selects the row or starts a drag.
     #[test]
     fn server_row_clicking_delete_does_not_select_the_row() {
         // Clicking "🗑" must delete, never select: the delete click wins because
@@ -8392,13 +9706,20 @@ Authentication: ML-KEM-768, Post-Quantum
                 ui,
                 Language::En,
                 "A server",
-                false,
-                false,
-                &badge,
-                RowProbeState {
-                    enabled: false,
-                    disabled_hint: "busy",
+                "",
+                RowState {
+                    selected: false,
+                    active: false,
+                    switch: RowSwitch {
+                        checked: false,
+                        locked_hint: None,
+                    },
+                    probe: RowProbeState {
+                        enabled: false,
+                        disabled_hint: "busy",
+                    },
                 },
+                &badge,
             );
             *clicked_ui.borrow_mut() |= clicks.probe;
         });
@@ -8562,7 +9883,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn dragging_the_last_row_above_the_first_inserts_before_it_and_activates_it() {
+    fn dragging_the_last_row_above_the_first_reorders_without_changing_the_route() {
         let mut harness = drag_harness(drag_rig());
         harness.run();
         let alpha = harness.get_by_label("Alpha").rect();
@@ -8578,30 +9899,27 @@ Authentication: ML-KEM-768, Post-Quantum
             ["Charlie", "Alpha", "Bravo"]
         );
         assert!(harness.state().1.requests.dirty);
-        // The first slot is the default server — the config's first outbound,
-        // Xray's default route — so the dragged row takes it.
-        let rig = &harness.state().1;
-        assert_eq!(
-            rig.servers.active.as_deref(),
-            Some(rig.servers.profiles[0].id.as_str()),
-            "the top row must be the active (default) server"
+        // Reordering is not a route choice: the active route stays where the
+        // user put it, and only the picker or Set active moves it.
+        assert!(
+            harness.state().1.servers.active.is_none(),
+            "a reorder must not choose the default route"
         );
     }
 
     #[test]
-    fn dragging_the_default_row_down_hands_the_default_to_the_new_top_row() {
-        let mut harness = drag_harness(drag_rig());
+    fn dragging_the_active_row_down_keeps_it_active_and_first_on_the_wire() {
+        let mut rig = drag_rig();
+        for profile in &mut rig.servers.profiles {
+            profile.enabled = true;
+        }
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        let active_tag = rig.servers.profiles[0].tag();
+        let active_id = rig.servers.profiles[0].id.clone();
+        let mut harness = drag_harness(rig);
         harness.run();
-        let alpha = harness.get_by_label("Alpha").rect();
+        let alpha = harness.get_by_label("●  Alpha").rect();
         let charlie = harness.get_by_label("Charlie").rect();
-        let tags_before: Vec<String> = harness
-            .state()
-            .1
-            .servers
-            .profiles
-            .iter()
-            .map(ServerProfile::tag)
-            .collect();
         // Below the last row: the leading row lands at the list's end.
         drag_list_row(
             &mut harness,
@@ -8612,12 +9930,11 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(profile_names(rig), ["Bravo", "Charlie", "Alpha"]);
         assert_eq!(
             rig.servers.active.as_deref(),
-            Some(rig.servers.profiles[0].id.as_str()),
-            "the new top row is the default server"
+            Some(active_id.as_str()),
+            "the active server keeps its route across a reorder"
         );
-        assert_eq!(rig.servers.profiles[0].name, "Bravo");
-        // ... and the config follows: the emitted outbounds lead with the new
-        // top row, so Xray's default route moved with the drop.
+        // The wire order is independent of the row order: the active server
+        // still leads, and the rest follow the grouped order.
         let config = crate::r#gen::generate_with_api_port(&rig.servers, &rig.settings, 10853)
             .expect("generate config");
         let emitted: Vec<&str> = config["outbounds"]
@@ -8630,15 +9947,16 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(
             emitted,
             [
-                tags_before[1].as_str(),
-                tags_before[2].as_str(),
-                tags_before[0].as_str()
-            ]
+                active_tag.as_str(),
+                rig.servers.profiles[0].tag().as_str(),
+                rig.servers.profiles[1].tag().as_str(),
+            ],
+            "the active server leads; the rest keep grouped order"
         );
     }
 
     #[test]
-    fn set_active_moves_the_chosen_row_to_the_front() {
+    fn set_active_changes_the_route_without_moving_the_row() {
         let mut rig = drag_rig();
         // A balancer owns the default route; choosing a server explicitly must
         // hand it back.
@@ -8654,12 +9972,12 @@ Authentication: ML-KEM-768, Post-Quantum
         let rig = &harness.state().1;
         assert_eq!(
             profile_names(rig),
-            ["Charlie", "Alpha", "Bravo"],
-            "the chosen default server leads the list"
+            ["Alpha", "Bravo", "Charlie"],
+            "choosing a server does not move its row"
         );
         assert_eq!(
             rig.servers.active.as_deref(),
-            Some(rig.servers.profiles[0].id.as_str())
+            Some(rig.servers.profiles[2].id.as_str())
         );
         assert!(
             rig.settings.routing.active_balancer.is_empty(),
@@ -8669,11 +9987,11 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn sorting_by_latency_keeps_the_default_server_in_its_slot() {
+    fn sorting_by_latency_reorders_rows_without_changing_the_route() {
         let mut rig = drag_rig();
         rig.servers.active = Some(rig.servers.profiles[0].id.clone());
-        // The default server is the slowest, so a whole-list sort would move
-        // it off the first slot and silently change the default route.
+        // The active server is the slowest; the sort moves its row like any
+        // other, and the route stays on it.
         rig.servers.profiles[0].latency_ms = Some(300);
         rig.servers.profiles[1].latency_ms = Some(40);
         rig.servers.profiles[2].latency_ms = Some(20);
@@ -8686,12 +10004,13 @@ Authentication: ML-KEM-768, Post-Quantum
         let rig = &harness.state().1;
         assert_eq!(
             profile_names(rig),
-            ["Alpha", "Charlie", "Bravo"],
-            "the default row keeps the first slot; the rest sort by latency"
+            ["Charlie", "Bravo", "Alpha"],
+            "every row sorts by latency, the active one included"
         );
         assert_eq!(
             rig.servers.active.as_deref(),
-            Some(rig.servers.profiles[0].id.as_str())
+            Some(rig.servers.profiles[2].id.as_str()),
+            "the route stays on the same server"
         );
     }
 
@@ -11959,7 +13278,10 @@ Authentication: ML-KEM-768, Post-Quantum
             import_text: paste.clone(),
             ..Default::default()
         };
-        screen.import_parsed = links::parse_bulk(&paste);
+        screen.import_parsed = links::parse_bulk(&paste)
+            .into_iter()
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect();
         screen.import_parsed_source = Some(paste);
 
         render_servers_frame(&mut screen, &mut rig);
@@ -13592,7 +14914,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let listed: Vec<&str> = button_labels
             .iter()
             .map(String::as_str)
-            .filter(|label| label.starts_with("srv-") || matches!(*label, "direct" | "block"))
+            .filter(|label| label.starts_with('[') || matches!(*label, "direct" | "block"))
             .collect();
         assert_eq!(
             listed,

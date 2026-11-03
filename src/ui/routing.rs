@@ -10,8 +10,7 @@ use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
 use crate::model::validation::{ip_rule_valid, routing_script_issues};
 use crate::model::{
-    Balancer, DurationMs, LeastLoadSettings, Rule, ServerProfile, ServersFile, Settings,
-    StrategyCost, Webhook,
+    Balancer, DurationMs, LeastLoadSettings, Rule, ServersFile, Settings, StrategyCost, Webhook,
 };
 use crate::rt::{BalancerInfoView, CoreCmd, CorePhase, RuntimeStateView, TrialRuleAddOutcome};
 use crate::sys::geodata::{GeodataCatalog, GeodataError, GeodataSnapshot};
@@ -1375,15 +1374,21 @@ impl RoutingScreen {
         // resident for the session.
         self.evict_stale_balancer_runtime(settings);
 
-        // Outbound tags offered as rule targets: every profile in list order
-        // (the document's first outbound is the active profile, so the menu
-        // and the wire order agree) then the built-in freedom "direct" and
-        // blackhole "block". Deliberately narrower than
-        // `emit::outbound_tags`: that answers which tags the *document*
-        // carries, and it also counts the internal `dns-out` DNS-module
-        // outbound — never a traffic target, the same reason the inbound
-        // lists never offer the api/in-tun/dns-in listeners.
-        let profile_tags: Vec<String> = servers.profiles.iter().map(ServerProfile::tag).collect();
+        // Outbound tags offered as rule targets: the emitted servers in wire
+        // order (the active profile first, then grouped display order) then
+        // the built-in freedom "direct" and blackhole "block". A switched-off
+        // server is not a legal target: validation refuses a rule that names
+        // one. Deliberately narrower than `emit::outbound_tags`: that answers
+        // which tags the *document* carries, and it also counts the internal
+        // `dns-out` DNS-module outbound — never a traffic target, the same
+        // reason the inbound lists never offer the api/in-tun/dns-in
+        // listeners.
+        let emitted = servers.emitted_set();
+        let profile_tags: Vec<String> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].tag())
+            .collect();
         let out_tags: Vec<String> = profile_tags
             .iter()
             .cloned()
@@ -1393,12 +1398,10 @@ impl RoutingScreen {
                     .map(|(_, tag)| (*tag).to_string()),
             )
             .collect();
-        // Whether the document carries a server outbound: every profile emits
-        // an outbound unconditionally and every profile tag is `srv-…`, so the
-        // fact is whether the state has profiles at all. The two prefix checks
-        // below ask this — a selector only ever matches a tag that reaches the
-        // wire, which the menu vector above is deliberately narrower than.
-        let server_outbound_emitted = !servers.profiles.is_empty();
+        // Whether the document carries a server outbound: a selector only
+        // ever matches a tag that reaches the wire, which the menu vector
+        // above is deliberately narrower than.
+        let server_outbound_emitted = !profile_tags.is_empty();
         let bal_tags: Vec<String> = settings
             .routing
             .balancers
@@ -1627,6 +1630,15 @@ impl RoutingScreen {
                                 ),
                                 &mut swap,
                             );
+                            let mut enabled = rule.enabled;
+                            if ui
+                                .checkbox(&mut enabled, "")
+                                .on_hover_text(t(lang, Key::Enabled))
+                                .changed()
+                            {
+                                rule.enabled = enabled;
+                                *changed = true;
+                            }
                             let row = &self
                                 .view_cache
                                 .as_ref()
@@ -2085,7 +2097,7 @@ impl RoutingScreen {
     /// The selector list's own controls: the required-list error (only for a
     /// list the core needs, the balancer's) and the "select all servers"
     /// shortcut. The shortcut stays visible while the list is not exactly the
-    /// profile tags — a fresh balancer seeds one tag, and an imported `srv-`
+    /// profile tags — a fresh balancer seeds one tag, and an imported
     /// prefix is a different set — so the all-servers form is always one click
     /// away without any typed prefix. Returns true when the click wrote the
     /// list.
@@ -2737,6 +2749,23 @@ impl RoutingScreen {
                         .reference_counts[i];
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
+                            let is_active =
+                                !active_balancer.is_empty() && bal.tag == active_balancer;
+                            let mut enabled = bal.enabled;
+                            let switch = ui.add_enabled(
+                                !is_active,
+                                egui::Checkbox::without_text(&mut enabled),
+                            );
+                            let switch = if is_active {
+                                switch
+                                    .on_disabled_hover_text(t(lang, Key::IntegrityBalancerIsActive))
+                            } else {
+                                switch.on_hover_text(t(lang, Key::Enabled))
+                            };
+                            if switch.changed() {
+                                bal.enabled = enabled;
+                                *changed = true;
+                            }
                             ui.label(
                                 RichText::new(if bal.tag.is_empty() {
                                     t(lang, Key::Untagged)
@@ -3036,7 +3065,7 @@ impl RoutingScreen {
         // Selectors are outbound tags, so the row is a picker over the tags
         // the document carries — the same shape as the servers editor's
         // `dialerProxy` field. A stored value outside the list (an imported
-        // `srv-` prefix) stays displayed and is never rewritten by rendering.
+        // foreign prefix) stays displayed and is never rewritten by rendering.
         changed |= widgets::combo_list(
             ui,
             lang,
@@ -4374,9 +4403,9 @@ mod view_cache_tests {
     fn cached_tag_vectors_match_the_model() {
         let mut screen = RoutingScreen::default();
         let mut servers = ServersFile::default();
-        servers
-            .profiles
-            .push(ServerProfile::new("alpha", OutboundModel::default()));
+        let mut alpha = ServerProfile::new("alpha", OutboundModel::default());
+        alpha.enabled = true;
+        servers.profiles.push(alpha);
         let mut settings = Settings::default();
         settings
             .routing
@@ -4391,7 +4420,7 @@ mod view_cache_tests {
         let cache = screen.view_cache.as_ref().unwrap();
 
         assert_eq!(cache.out_tags.len(), 3, "one profile + direct + block");
-        assert!(cache.out_tags[0].starts_with("srv-"));
+        assert!(cache.out_tags[0].starts_with('['));
         assert!(cache.out_tags.iter().any(|tag| tag == "direct"));
         assert!(cache.out_tags.iter().any(|tag| tag == "block"));
         assert_eq!(
@@ -4403,9 +4432,9 @@ mod view_cache_tests {
         assert_eq!(cache.balancer_tags, ["", "b1"]);
 
         // A profile-list change (persisted elsewhere) rebuilds the vectors.
-        servers
-            .profiles
-            .push(ServerProfile::new("beta", OutboundModel::default()));
+        let mut beta = ServerProfile::new("beta", OutboundModel::default());
+        beta.enabled = true;
+        servers.profiles.push(beta);
         screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert_eq!(screen.view_cache.as_ref().unwrap().out_tags.len(), 4);
     }
@@ -4425,9 +4454,9 @@ mod view_cache_tests {
         );
 
         let mut servers = ServersFile::default();
-        servers
-            .profiles
-            .push(ServerProfile::new("alpha", OutboundModel::default()));
+        let mut alpha = ServerProfile::new("alpha", OutboundModel::default());
+        alpha.enabled = true;
+        servers.profiles.push(alpha);
         screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert!(
             screen.view_cache.as_ref().unwrap().server_outbound_emitted,
@@ -4859,9 +4888,9 @@ mod routing_grammar_tests {
         settings
             .routing
             .balancers
-            .push(Balancer::new("bal-a".into(), "srv-".into()));
+            .push(Balancer::new("bal-a".into(), "[".into()));
 
-        // No profiles: "srv-" matches nothing among [direct, block].
+        // No profiles: `[` matches nothing among [direct, block].
         screen.refresh_view_cache_from_model(0, Language::En, &ServersFile::default(), &settings);
         let cache = screen.view_cache.as_ref().unwrap();
         assert!(
@@ -4872,9 +4901,9 @@ mod routing_grammar_tests {
         // An exact profile tag restores the match; the next generation
         // rebuild clears the warning.
         let mut servers = ServersFile::default();
-        servers
-            .profiles
-            .push(ServerProfile::new("alpha", OutboundModel::default()));
+        let mut alpha = ServerProfile::new("alpha", OutboundModel::default());
+        alpha.enabled = true;
+        servers.profiles.push(alpha);
         settings.routing.balancers[0].selector = vec![servers.profiles[0].tag()];
         screen.refresh_view_cache_from_model(1, Language::En, &servers, &settings);
         assert!(
@@ -7030,10 +7059,9 @@ mod routing_control_render_tests {
         use crate::model::{OutboundModel, Protocol, ServerProfile};
 
         let mut rig = UiTestRig::default();
-        rig.servers.profiles.push(ServerProfile::new(
-            "alpha",
-            OutboundModel::new(Protocol::Freedom),
-        ));
+        let mut alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom));
+        alpha.enabled = true;
+        rig.servers.profiles.push(alpha);
         rig.settings.routing.balancers.push(Balancer {
             tag: "route".into(),
             ..Default::default()
@@ -7106,7 +7134,7 @@ mod routing_control_render_tests {
     }
 
     /// The observatory's subject picker keeps the all-servers shortcut: a
-    /// stored `srv-` prefix (the model default) stays displayed, and the
+    /// stored `[` prefix (the model default) stays displayed, and the
     /// shortcut replaces it with the exact profile tags.
     #[test]
     fn the_observatory_subject_picker_keeps_the_all_servers_shortcut() {
@@ -7117,6 +7145,9 @@ mod routing_control_render_tests {
             ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom)),
             ServerProfile::new("beta", OutboundModel::new(Protocol::Freedom)),
         ];
+        for profile in &mut rig.servers.profiles {
+            profile.enabled = true;
+        }
         rig.settings.routing.observatory.enabled = true;
         let expected: Vec<String> = rig
             .servers
@@ -7129,7 +7160,7 @@ mod routing_control_render_tests {
         assert!(
             harness
                 .get_all_by_role(egui::accesskit::Role::ComboBox)
-                .any(|node| node.value().as_deref() == Some("srv-")),
+                .any(|node| node.value().as_deref() == Some("[")),
             "the stored prefix stays displayed"
         );
         let shortcut = t(Language::En, Key::SelectAllServers);
@@ -7166,6 +7197,9 @@ mod routing_control_render_tests {
             ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom)),
             ServerProfile::new("beta", OutboundModel::new(Protocol::Freedom)),
         ];
+        for profile in &mut rig.servers.profiles {
+            profile.enabled = true;
+        }
         let tags: Vec<String> = rig
             .servers
             .profiles
@@ -7220,7 +7254,7 @@ mod routing_control_render_tests {
     }
 
     /// The "select all servers" shortcut fills an emptied selector list with
-    /// every profile tag, which is the exact-tag form of the old `srv-` seed.
+    /// every profile tag, which is the exact-tag form of the all-servers seed.
     #[test]
     fn the_select_all_servers_shortcut_fills_every_profile_tag() {
         use crate::model::{OutboundModel, Protocol, ServerProfile};
@@ -7230,6 +7264,9 @@ mod routing_control_render_tests {
             ServerProfile::new("alpha", OutboundModel::new(Protocol::Freedom)),
             ServerProfile::new("beta", OutboundModel::new(Protocol::Freedom)),
         ];
+        for profile in &mut rig.servers.profiles {
+            profile.enabled = true;
+        }
         let tags: Vec<String> = rig
             .servers
             .profiles

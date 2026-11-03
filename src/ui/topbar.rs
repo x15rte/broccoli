@@ -35,6 +35,9 @@ pub(crate) struct TopbarRowState<'a> {
     /// The active balancer's tag when one owns the default route; the chip
     /// names it instead of `active_name`.
     pub(crate) active_balancer: Option<&'a str>,
+    /// The built-in route's label ("Direct" or "Block") when the active route
+    /// is not a server.
+    pub(crate) active_route: Option<&'a str>,
     pub(crate) core_version: Option<&'a str>,
     /// The model's edit generation: a rename, an added profile, a mode
     /// change or a core install moves the captions, and the memo re-derives
@@ -75,6 +78,7 @@ struct TopbarLabels {
     mode: Mode,
     active_name: Option<String>,
     active_balancer: Option<String>,
+    active_route: Option<String>,
     core_version: Option<String>,
     lang: Language,
     badge: String,
@@ -89,6 +93,7 @@ impl TopbarLabels {
             && self.mode == state.mode
             && self.active_name.as_deref() == state.active_name
             && self.active_balancer.as_deref() == state.active_balancer
+            && self.active_route.as_deref() == state.active_route
             && self.core_version.as_deref() == state.core_version
             && self.lang == state.lang
             && self.phase == *state.phase
@@ -246,10 +251,11 @@ fn refresh_labels<'a>(
         .is_some_and(|labels| labels.is_current(state));
     if !current {
         let lang = state.lang;
-        let active_caption = match (state.active_balancer, state.active_name) {
-            (Some(tag), _) => Some(t_fmt(lang, Key::TopbarActiveBalancer, &[&tag])),
-            (None, Some(name)) => Some(t_fmt(lang, Key::TopbarActiveServer, &[&name])),
-            (None, None) => None,
+        let active_caption = match (state.active_balancer, state.active_route, state.active_name) {
+            (Some(tag), _, _) => Some(t_fmt(lang, Key::TopbarActiveBalancer, &[&tag])),
+            (None, Some(route), _) => Some(t_fmt(lang, Key::TopbarActiveRoute, &[&route])),
+            (None, None, Some(name)) => Some(t_fmt(lang, Key::TopbarActiveServer, &[&name])),
+            (None, None, None) => None,
         };
         let version_caption = match state.core_version {
             // `&v` is `&&str` — `&str` implements Display, so the element
@@ -269,6 +275,7 @@ fn refresh_labels<'a>(
             mode: state.mode,
             active_name: state.active_name.map(str::to_owned),
             active_balancer: state.active_balancer.map(str::to_owned),
+            active_route: state.active_route.map(str::to_owned),
             core_version: state.core_version.map(str::to_owned),
             lang,
             badge: phase_badge_text(state.phase, lang, PhaseBadgeWording::Topbar),
@@ -568,6 +575,7 @@ mod tests {
                             mode: Mode::Off,
                             active_name: Some("alpha"),
                             active_balancer: Some("route"),
+                            active_route: None,
                             core_version: None,
                             model_generation: 0,
                             blocked_reason: None,
@@ -637,6 +645,7 @@ mod tests {
                             } else {
                                 "alpha"
                             }),
+                            active_route: None,
                             active_balancer: None,
                             core_version: Some("v26.7.28"),
                             model_generation: fixture.generation,

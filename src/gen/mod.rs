@@ -287,13 +287,14 @@ fn generate_reporting(
                 Diag::new(Key::GenObservatoryProbeHostBlocked).arg(class),
             ));
         }
-        // Dependency-forced observatory observes every profile; a
+        // Dependency-forced observatory observes every emitted profile; a
         // user-selected observatory keeps its own subjectSelector.
         let forced_subjects = (!obs.enabled).then(|| {
             servers
-                .profiles
+                .emitted_set()
+                .order
                 .iter()
-                .map(ServerProfile::tag)
+                .map(|&index| servers.profiles[index].tag())
                 .collect::<Vec<String>>()
         });
         root.insert(
@@ -671,9 +672,13 @@ fn profile_wire_outbound(profile: &ServerProfile, policy: OutboundWirePolicy<'_>
     wire
 }
 
+fn builtin_outbound(protocol: &str, tag: &str) -> Value {
+    json!({ keys::PROTOCOL: protocol, keys::TAG: tag })
+}
+
 fn append_builtin_outbounds(out: &mut Vec<Value>) {
     for (protocol, tag) in emit::BUILTIN_OUTBOUNDS {
-        out.push(json!({ keys::PROTOCOL: protocol, keys::TAG: tag }));
+        out.push(builtin_outbound(protocol, tag));
     }
 }
 
@@ -751,8 +756,20 @@ impl ControlPlane<'_> {
 /// first entry) is unchanged; it only ever receives port-53 traffic via the
 /// interception rules.
 fn outbounds(servers: &ServersFile, emission: &emit::Emission) -> Value {
-    let mut out = Vec::new();
-    for profile in &servers.profiles {
+    // Xray's default route is the first outbound. A server route is emitted
+    // first by the emitted order; a Direct/Block route puts that built-in
+    // first and lets the enabled servers follow.
+    let route_builtin = emission.route_builtin;
+    let mut out = Vec::with_capacity(emission.emitted.order.len() + 3);
+    if let Some(tag) = route_builtin
+        && let Some((protocol, _)) = emit::BUILTIN_OUTBOUNDS
+            .iter()
+            .find(|(_, builtin)| *builtin == tag)
+    {
+        out.push(builtin_outbound(protocol, tag));
+    }
+    for &index in &emission.emitted.order {
+        let profile = &servers.profiles[index];
         let policy = OutboundWirePolicy {
             // The main config must not bind dials to an interface.
             interface: None,
@@ -763,7 +780,11 @@ fn outbounds(servers: &ServersFile, emission: &emit::Emission) -> Value {
         };
         out.push(profile_wire_outbound(profile, policy));
     }
-    append_builtin_outbounds(&mut out);
+    for (protocol, tag) in emit::BUILTIN_OUTBOUNDS {
+        if Some(tag) != route_builtin {
+            out.push(builtin_outbound(protocol, tag));
+        }
+    }
     if emission.dns_intercept {
         out.push(json!({ keys::PROTOCOL: "dns", keys::TAG: DNS_OUTBOUND_TAG }));
     }
@@ -855,10 +876,15 @@ fn routing(cfg: &RoutingCfg, emission: &emit::Emission) -> Value {
             }
         }
     }
-    if !cfg.balancers.is_empty() {
+    let enabled_balancers: Vec<&crate::model::routing::Balancer> = cfg
+        .balancers
+        .iter()
+        .filter(|balancer| balancer.enabled)
+        .collect();
+    if !enabled_balancers.is_empty() {
         routing.insert(
             "balancers".into(),
-            serde_json::to_value(&cfg.balancers).expect(
+            serde_json::to_value(&enabled_balancers).expect(
                 "model serialization is infallible: Balancer fields are strings, \
                  string-keyed Value maps, and editor-range-clamped finite floats only",
             ),
@@ -981,7 +1007,7 @@ fn app_and_user_rules(cfg: &RoutingCfg, emission: &emit::Emission) -> Vec<Value>
     }
     // The user's rules, in model order, after the DNS interception — nothing
     // here may shadow it.
-    for r in &cfg.rules {
+    for r in cfg.rules.iter().filter(|rule| rule.enabled) {
         rules.push(serde_json::to_value(r).expect(
             "model serialization is infallible: routing Rule fields are strings, \
                  string vecs, and string-keyed Value maps only",

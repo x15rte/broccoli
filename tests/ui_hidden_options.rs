@@ -28,7 +28,6 @@ use broccoli::model::{
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
-use serde_json::Map;
 
 #[path = "common/screen.rs"]
 mod screen;
@@ -47,10 +46,9 @@ fn boot_servers(
     Harness<'static, BroccoliApp>,
 ) {
     let servers = ServersFile {
-        version: 1,
         active: profiles.first().map(|profile| profile.id.clone()),
         profiles,
-        extra: Map::new(),
+        ..ServersFile::default()
     };
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;

@@ -12,7 +12,7 @@
     "probeInterval": "10s",
     "probeURL": "https://www.google.com/generate_204",
     "subjectSelector": [
-      "srv-01234567"
+      "[Manual] test"
     ]
   },
   "outbounds": [
@@ -24,7 +24,7 @@
         "id": "11111111-2222-3333-4444-555555555555",
         "port": 443
       },
-      "tag": "srv-01234567"
+      "tag": "[Manual] test"
     },
     {
       "protocol": "freedom",
@@ -44,7 +44,7 @@
       {
         "fallbackTag": "direct",
         "selector": [
-          "srv-"
+          "["
         ],
         "strategy": {
           "settings": {

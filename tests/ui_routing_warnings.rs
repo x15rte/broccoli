@@ -217,7 +217,7 @@ fn combo_value(h: &Harness<'static, BroccoliApp>, value: &str) -> bool {
 
 #[test]
 fn balancer_no_match_renders_inline_warning() {
-    let (_lock, _tmp, h) = boot_routing(&settings_with_balancer("bal-a", "srv-"), None);
+    let (_lock, _tmp, h) = boot_routing(&settings_with_balancer("bal-a", "["), None);
 
     let message = breakage_message("bal-a");
     assert!(
@@ -229,9 +229,9 @@ fn balancer_no_match_renders_inline_warning() {
 #[test]
 fn balancer_matching_profile_renders_no_warning() {
     let mut servers = ServersFile::default();
-    servers
-        .profiles
-        .push(ServerProfile::new("alpha", OutboundModel::default()));
+    let mut alpha = ServerProfile::new("alpha", OutboundModel::default());
+    alpha.enabled = true;
+    servers.profiles.push(alpha);
     let selector = servers.profiles[0].tag();
     let (_lock, _tmp, h) =
         boot_routing(&settings_with_balancer("bal-a", &selector), Some(&servers));
@@ -245,7 +245,7 @@ fn balancer_matching_profile_renders_no_warning() {
 
 #[test]
 fn editing_selector_to_matching_tag_live_clears_warning() {
-    let (_lock, _tmp, mut h) = boot_routing(&settings_with_balancer("bal-a", "srv-"), None);
+    let (_lock, _tmp, mut h) = boot_routing(&settings_with_balancer("bal-a", "["), None);
     let message = breakage_message("bal-a");
     assert!(
         h.query_by_label(&message).is_some(),
@@ -258,7 +258,7 @@ fn editing_selector_to_matching_tag_live_clears_warning() {
     h.get_by_role_and_label(Role::Button, "▸").click();
     h.run();
     h.get_all_by_role(Role::ComboBox)
-        .find(|node| node.value().as_deref() == Some("srv-"))
+        .find(|node| node.value().as_deref() == Some("["))
         .expect("the selector row shows its stored value")
         .click();
     h.run();
@@ -502,7 +502,7 @@ fn balancer_tag_duplicate_verdict_follows_the_other_rows() {
 /// so the frames are bounded rather than counted.
 #[test]
 fn absent_geo_tags_render_inline_beside_the_balancer_warning() {
-    let mut settings = settings_with_balancer("bal-a", "srv-");
+    let mut settings = settings_with_balancer("bal-a", "[");
     settings.routing.rules.push(Rule {
         rule_tag: "r-geo".into(),
         outbound_tag: "direct".into(),

@@ -50,7 +50,7 @@
           "serverName": "masque.example.com"
         }
       },
-      "tag": "srv-01234567"
+      "tag": "[Manual] test"
     },
     {
       "protocol": "freedom",

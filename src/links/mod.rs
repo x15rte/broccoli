@@ -60,6 +60,14 @@
 //! `Network::parse` carries) — and canonicalizes them: export always writes
 //! the spec spelling, and RAW's is nothing at all.
 
+pub mod body;
+pub mod convert;
+
+pub use body::{
+    BodyEntry, BodyParse, BodyRefusal, IgnoredSection, content_key, decode_whole_body,
+    identity_key, origin_for, parse_body, parse_body_cancellable,
+};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, percent_encode};
@@ -6917,17 +6925,20 @@ mod tests {
         ];
         let mut servers = crate::model::ServersFile::default();
         for link in &links {
-            servers.profiles.push(parse_link(link).unwrap().profile);
+            let mut profile = parse_link(link).unwrap().profile;
+            profile.enabled = true;
+            servers.profiles.push(profile);
         }
         let cfg = crate::r#gen::generate(&servers, &crate::model::Settings::default())
             .expect("generate config");
         let outbounds = cfg["outbounds"].as_array().expect("outbounds array");
-        // 4 servers + built-in direct/block + dns-out (seeded DNS module)
+        // An unchosen route is Direct: it leads, then 4 servers, block and
+        // dns-out (seeded DNS module).
         assert_eq!(outbounds.len(), 7);
-        for outbound in &outbounds[..4] {
-            assert!(outbound["tag"].as_str().unwrap().starts_with("srv-"));
+        assert_eq!(outbounds[0]["tag"], "direct");
+        for outbound in &outbounds[1..5] {
+            assert!(outbound["tag"].as_str().unwrap().starts_with('['));
         }
-        assert_eq!(outbounds[4]["tag"], "direct");
         assert_eq!(outbounds[5]["tag"], "block");
         assert_eq!(outbounds[6]["tag"], DNS_OUTBOUND_TAG);
     }

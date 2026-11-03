@@ -49,10 +49,9 @@ fn harness_with_raw(
         extra: Default::default(),
     });
     let servers = ServersFile {
-        version: 1,
         active: Some(profile.id.clone()),
         profiles: vec![profile],
-        extra: Default::default(),
+        ..ServersFile::default()
     };
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;

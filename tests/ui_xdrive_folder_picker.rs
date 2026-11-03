@@ -31,7 +31,6 @@ use broccoli::model::{OutboundModel, Protocol, ServerProfile, ServersFile};
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
-use serde_json::Map;
 
 #[path = "common/screen.rs"]
 mod screen;
@@ -78,10 +77,9 @@ fn boot_with_service(
         ..Default::default()
     };
     let servers = ServersFile {
-        version: 1,
         active: Some(profile.id.clone()),
         profiles: vec![profile],
-        extra: Map::new(),
+        ..ServersFile::default()
     };
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;

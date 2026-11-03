@@ -25,7 +25,6 @@ use broccoli::ui::Screen;
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 use parking_lot::MutexGuard;
-use serde_json::Map;
 
 #[path = "common/screen.rs"]
 mod screen;
@@ -62,12 +61,7 @@ fn boot_servers(
         settings.address = SENTINEL_ADDRESS.into();
         settings.port = 443;
     }
-    let servers = ServersFile {
-        version: 1,
-        active: Some(profile.id.clone()),
-        profiles: vec![profile],
-        extra: Map::new(),
-    };
+    let servers = ServersFile::with_profiles(Some(profile.id.clone()), vec![profile]);
     let mut settings = Settings::default();
     settings.routing.observatory.enabled = false;
     settings.routing.burst_observatory.enabled = false;
@@ -140,12 +134,7 @@ fn boot_inbounds() -> (
     }];
     let (lock, tmp, mut h) = screen::boot_state(screen::BootState {
         settings,
-        servers: ServersFile {
-            version: 1,
-            active: None,
-            profiles: Vec::new(),
-            extra: Map::new(),
-        },
+        servers: ServersFile::default(),
     });
 
     h.set_size(egui::Vec2::new(1100.0, 720.0));

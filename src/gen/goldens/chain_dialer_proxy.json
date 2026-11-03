@@ -30,10 +30,10 @@
       "streamSettings": {
         "network": "raw",
         "sockopt": {
-          "dialerProxy": "srv-fedcba98"
+          "dialerProxy": "[Manual] exit"
         }
       },
-      "tag": "srv-01234567"
+      "tag": "[Manual] hop"
     },
     {
       "protocol": "vless",
@@ -48,7 +48,7 @@
           "domainStrategy": "useip"
         }
       },
-      "tag": "srv-fedcba98"
+      "tag": "[Manual] exit"
     },
     {
       "protocol": "freedom",

@@ -20,6 +20,10 @@ use std::fmt;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Rule {
+    /// Whether the rule reaches the generated document. GUI-only: the
+    /// generator emits enabled rules only and strips the key.
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
     /// id for runtime AddRule/RemoveRule — auto-uuid on creation
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub rule_tag: String,
@@ -76,6 +80,7 @@ pub struct Rule {
 impl Default for Rule {
     fn default() -> Self {
         Self {
+            enabled: true,
             rule_tag: uuid::Uuid::new_v4().to_string(),
             outbound_tag: String::new(),
             balancer_tag: String::new(),
@@ -160,9 +165,13 @@ pub struct Webhook {
 }
 
 /// Balancing rule (router.go:22-25 + router_strategy.go).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Balancer {
+    /// Whether the balancer reaches the generated document. GUI-only: the
+    /// generator emits enabled balancers only and strips the key.
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub tag: String,
     #[serde(skip_serializing_if = "skip_empty_vec")]
@@ -172,6 +181,30 @@ pub struct Balancer {
     pub fallback_tag: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Default for Balancer {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tag: String::new(),
+            selector: Vec::new(),
+            strategy: StrategyCfg::default(),
+            fallback_tag: String::new(),
+            extra: Map::new(),
+        }
+    }
+}
+
+/// Serde default for the GUI-only `enabled` switches: an entity written
+/// before the switch existed is on.
+pub(crate) fn enabled_by_default() -> bool {
+    true
+}
+
+/// Skip the GUI-only `enabled` key when it is on (the common case).
+pub(crate) fn is_enabled(enabled: &bool) -> bool {
+    *enabled
 }
 
 impl Balancer {
@@ -265,7 +298,7 @@ impl Default for ObservatoryCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            subject_selector: vec!["srv-".into()],
+            subject_selector: vec![crate::model::servers::ALL_SERVERS_SELECTOR.into()],
             probe_url: "https://www.google.com/generate_204".into(),
             probe_interval: DurationMs::secs(10),
             enable_concurrency: false,
@@ -323,7 +356,7 @@ impl Default for BurstObservatoryCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            subject_selector: vec!["srv-".into()],
+            subject_selector: vec![crate::model::servers::ALL_SERVERS_SELECTOR.into()],
             ping_config: PingConfig::default(),
             extra: Map::new(),
         }
