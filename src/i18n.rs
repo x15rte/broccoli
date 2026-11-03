@@ -4354,7 +4354,7 @@ mod en {
             Key::SrvSaveSubscription => "Save",
             Key::SrvReportRouteBlock => "the active route moved to Block",
             Key::SrvActiveRouteReset => {
-                "the saved active route named no server; the route is now Block"
+                "the saved active route named no server, so the route is now Block"
             }
             Key::SrvAddSubscription => "Add subscription",
             Key::SrvSubscriptionUrl => "Subscription URL",
@@ -4379,13 +4379,13 @@ mod en {
             Key::SrvReportIgnored => "ignored",
             Key::SrvSubscriptionFetchFailed => "subscription fetch failed: {}",
             Key::SrvSubscriptionEmpty => {
-                "the subscription returned no usable servers; the previous servers stay"
+                "the subscription returned no usable servers, so the previous servers stay"
             }
             Key::SrvSubscriptionNoUplinkAddress => "the uplink adapter {} has no usable address",
             Key::SettingsSubscriptions => "Subscriptions",
             Key::SettingsSubscriptionUserAgent => "Subscription User-Agent",
             Key::SettingsSubscriptionUserAgentHint => {
-                "Sent when a subscription uses the global agent; an empty value omits the header"
+                "Sent when a subscription uses the global agent. An empty value omits the header"
             }
             Key::SettingsSubscriptionDirectFetch => "Direct for subscription fetch",
             Key::SettingsSubscriptionDirectFetchHint => {
@@ -5597,18 +5597,18 @@ mod en {
             Key::SettingsProfileIdEmpty => "server profile {} has an empty or whitespace-only ID",
             Key::SettingsProfileIdDuplicated => "server profiles {} and {} have duplicate ID {}",
             Key::SettingsProfileNameEmpty => {
-                "server profile {} ({}) has an empty name; a server tag needs one"
+                "server profile {} ({}) has an empty name, and a server tag needs one"
             }
             Key::SettingsProfileTagDuplicated => {
                 "server profiles {} ({}) and {} ({}) generate duplicate outbound tag {}. Names must \
                  be unique inside their group"
             }
             Key::SettingsGroupTitleEmpty => {
-                "server group {} has an empty title; every server tag starts with it"
+                "server group {} has an empty title, and every server tag starts with it"
             }
             Key::SettingsGroupTitleDuplicated => {
-                "server groups {} ({}) and {} ({}) share a title; every tag prefixed with it would \
-                 collide"
+                "server groups {} ({}) and {} ({}) share a title, so every tag prefixed with it \
+                 would collide"
             }
             Key::SettingsOutboundChainMissing => {
                 "outbound {} references missing chained outbound {}"
@@ -5671,7 +5671,7 @@ mod en {
             }
             Key::SettingsRoutingActiveBalancerMissing => "the active balancer {} is not configured",
             Key::SettingsActiveBalancerDisabled => {
-                "the active balancer {} is switched off; choose another route or switch it on"
+                "the active balancer {} is switched off, so choose another route or switch it on"
             }
             Key::SettingsRoutingRuleOutboundMissing => {
                 "routing rule {} references missing outbound {}"
