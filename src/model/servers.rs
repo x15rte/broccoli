@@ -61,6 +61,13 @@ impl Group {
     pub fn is_manual(&self) -> bool {
         self.id == MANUAL_GROUP_ID
     }
+    /// Whether the group's tab sits in the pinned or the unpinned band: its
+    /// pin state, and never the reserved `Manual` group, whose tab is one of
+    /// the three defaults. The tab bar and
+    /// [`ServersFile::reorder_group_in_band`] both read this one definition.
+    pub fn in_band(&self, pinned: bool) -> bool {
+        !self.is_manual() && self.pinned == pinned
+    }
     /// The group's kind, derived from whether it carries feed state. A kind is
     /// fixed at creation: nothing converts a manual group into a subscription
     /// group or the reverse.
@@ -903,7 +910,7 @@ impl ServersFile {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| !group.is_manual() && group.pinned == pinned)
+            .filter(|(_, group)| group.in_band(pinned))
             .map(|(index, _)| index)
             .collect();
         let mut band: Vec<Group> = slots

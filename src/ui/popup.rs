@@ -25,10 +25,10 @@ use egui::{Context, Id, Ui, ViewportBuilder, ViewportId};
 /// open.
 ///
 /// `size` is the initial inner size in points and `resizable` the window's
-/// resize affordance, both applied when the window is created: from then on the
-/// platform owns the geometry, so a window the user moved or resized keeps what
-/// they gave it, and a window that closed starts from `size` again when it is
-/// opened next.
+/// resize affordance, both applied when the window is first created. The
+/// window's geometry is kept for the session: the size and position it last
+/// reported are what a window that closed and reopened returns to, so the
+/// caller's default never replaces what the user gave it.
 ///
 /// Returns whether the platform asked for the window to close — its title-bar
 /// close button or Alt+F4. That request is the pop-up's counterpart of the
@@ -49,51 +49,85 @@ pub(crate) fn show(
     resizable: bool,
     mut body: impl FnMut(&mut Ui),
 ) -> bool {
+    // The geometry the window last reported, kept in the context's data for
+    // the session: an immediate viewport starts from its builder every time it
+    // is shown, so the caller's default size would otherwise replace the one
+    // the user resized to.
+    let geometry_id = Id::unique(("popup-kept-geometry", &key));
+    let kept = ctx.data(|data| data.get_temp::<KeptGeometry>(geometry_id));
     let viewport_id = ViewportId::from_hash_of(key);
+    let mut viewport = ViewportBuilder::default()
+        .with_title(title)
+        .with_resizable(resizable);
+    viewport = match kept {
+        Some(kept) => viewport
+            .with_inner_size(kept.size)
+            .with_position(kept.position),
+        None => viewport.with_inner_size(size),
+    };
+    let embedded = ctx.embed_viewports();
     let mut close_requested = false;
-    ctx.show_viewport_immediate(
-        viewport_id,
-        ViewportBuilder::default()
-            .with_title(title)
-            .with_inner_size(size)
-            .with_resizable(resizable),
-        |ui, _class| {
-            // A close request is not echoed back at the window: the caller
-            // dropped it from this frame on, and the next frame's render is
-            // what the request removes.
-            if ui.input(|input| input.viewport().close_requested()) {
-                close_requested = true;
+    ctx.show_viewport_immediate(viewport_id, viewport, |ui, _class| {
+        let (requested, geometry) = ui.input(|input| {
+            let viewport = input.viewport();
+            // An embedded call reports the parent window's geometry: only
+            // a window of its own has geometry of its own to keep.
+            let geometry = (!embedded)
+                .then(|| viewport.inner_rect.zip(viewport.outer_rect))
+                .flatten()
+                .map(|(inner, outer)| KeptGeometry {
+                    size: inner.size(),
+                    position: outer.min,
+                });
+            (viewport.close_requested(), geometry)
+        });
+        close_requested = requested;
+        if let Some(geometry) = geometry
+            && ctx.data(|data| data.get_temp::<KeptGeometry>(geometry_id)) != Some(geometry)
+        {
+            ctx.data_mut(|data| data.insert_temp(geometry_id, geometry));
+        }
+        // A close request is not echoed back at the window: the caller
+        // dropped it from this frame on, and the next frame's render is
+        // what the request removes.
+        if !requested {
+            // The window's size is the platform's, while a body can
+            // outgrow it — a taller translation, a transcript, a
+            // validation report — so the body scrolls here. That is the
+            // reachability the in-window panel got for free by growing
+            // with its content, in one place instead of in every body.
+            let mut scroll = |ui: &mut Ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("popup-body")
+                    .show(ui, |ui| body(ui));
+            };
+            if ui.ctx().embed_viewports() {
+                // An embedded call renders inside an in-window
+                // `egui::Window`, whose own frame already paints the
+                // background a central panel would.
+                scroll(ui);
             } else {
-                // The window's size is the platform's and fixed by the caller's
-                // `size`, while a body can outgrow it — a taller translation, a
-                // transcript, a validation report — so the body scrolls here.
-                // That is the reachability the in-window panel got for free by
-                // growing with its content, in one place instead of in every
-                // body.
-                let mut scroll = |ui: &mut Ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("popup-body")
-                        .show(ui, |ui| body(ui));
-                };
-                if ui.ctx().embed_viewports() {
-                    // An embedded call renders inside an in-window
-                    // `egui::Window`, whose own frame already paints the
-                    // background a central panel would.
-                    scroll(ui);
-                } else {
-                    // A window of its own is a client area nothing has painted:
-                    // the platform's background would show through the app
-                    // wherever the body is shorter than the window — eframe's
-                    // default is a near-black gray — and the window would read
-                    // as a hole in the app. A central panel is what a screen of
-                    // this app looks like, so the window is filled and inset
-                    // like one.
-                    egui::CentralPanel::default().show(ui, |ui| scroll(ui));
-                }
+                // A window of its own is a client area nothing has painted:
+                // the platform's background would show through the app
+                // wherever the body is shorter than the window — eframe's
+                // default is a near-black gray — and the window would read
+                // as a hole in the app. A central panel is what a screen of
+                // this app looks like, so the window is filled and inset
+                // like one.
+                egui::CentralPanel::default().show(ui, |ui| scroll(ui));
             }
-        },
-    );
+        }
+    });
     close_requested
+}
+
+/// The geometry a pop-up window last reported: the size and position the
+/// platform gave it. Kept for the session under the window's own key, so a
+/// window that closed and reopened returns where the user left it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KeptGeometry {
+    size: egui::Vec2,
+    position: egui::Pos2,
 }
 
 /// Render the confirmation `key` (titled `title`) in `ctx`'s window for one
@@ -200,11 +234,23 @@ mod tests {
         events: Vec<Event>,
         close_requested: bool,
     ) -> Vec<Shape> {
-        let id = viewport.ids.this;
         let mut info = ViewportInfo::default();
         if close_requested {
             info.events.push(ViewportEvent::Close);
         }
+        render_info(ctx, viewport, events, info)
+    }
+
+    /// Render one child viewport with the platform's own record of it —
+    /// including the geometry the window reports, which is what the helper
+    /// keeps for the session.
+    fn render_info(
+        ctx: &Context,
+        viewport: ImmediateViewport<'_>,
+        events: Vec<Event>,
+        info: ViewportInfo,
+    ) -> Vec<Shape> {
+        let id = viewport.ids.this;
         let input = RawInput {
             viewport_id: id,
             viewports: core::iter::once((id, info)).collect(),
@@ -443,6 +489,64 @@ mod tests {
             painted,
             "the window's client area must be filled with the app's background: {:?}",
             shapes.borrow().len()
+        );
+    }
+
+    /// A window that closed and reopened keeps the geometry it had: the
+    /// caller's default size creates it, and the size and position the
+    /// platform last reported are what it returns to.
+    #[test]
+    fn a_reopened_window_keeps_the_geometry_it_had() {
+        const SIZE: egui::Vec2 = egui::Vec2 { x: 520.0, y: 333.0 };
+        const POSITION: Pos2 = Pos2 { x: 300.0, y: 200.0 };
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let builders = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&builders);
+        Context::set_immediate_viewport_renderer(move |ctx, viewport| {
+            captured.borrow_mut().push(viewport.builder.clone());
+            let info = ViewportInfo {
+                // The size and position the user gave the window.
+                inner_rect: Some(Rect::from_min_size(Pos2 { x: 40.0, y: 60.0 }, SIZE)),
+                outer_rect: Some(Rect::from_min_size(POSITION, SIZE)),
+                ..Default::default()
+            };
+            render_info(ctx, viewport, Vec::new(), info);
+        });
+
+        let frame = || {
+            let mut output = ctx.run_ui(RawInput::default(), |ui| {
+                show(
+                    ui.ctx(),
+                    "test.popup",
+                    "Pop-up",
+                    [200.0, 100.0],
+                    true,
+                    |ui| {
+                        ui.label("body");
+                    },
+                );
+            });
+            output.textures_delta.clear();
+        };
+        frame();
+        frame();
+
+        let builders = builders.borrow();
+        assert_eq!(
+            builders[0].inner_size,
+            Some(egui::vec2(200.0, 100.0)),
+            "the first open starts from the caller's default size"
+        );
+        assert_eq!(
+            builders[1].inner_size,
+            Some(SIZE),
+            "the reopened window keeps the size it had"
+        );
+        assert_eq!(
+            builders[1].position,
+            Some(POSITION),
+            "the reopened window keeps the position it had"
         );
     }
 }

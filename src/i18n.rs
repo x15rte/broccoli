@@ -1088,7 +1088,6 @@ keys! {
     SrvAddServer 0,
     SrvImportLinks 0,
     SrvTestLatencyHint 0,
-    SrvProbeServerLatencyHint 0,
     SrvLatencyTestAlreadyRunning 0,
     SrvAnotherOperationWorking 0,
     SrvAddServerBeforeLatency 0,
@@ -1157,7 +1156,6 @@ keys! {
     SettingsSubscriptionDirectFetch 0,
     SettingsSubscriptionDirectFetchHint 0,
     SrvDuplicate 0,
-    SrvExportLinkQr 0,
     SrvDeleteEllipsis 0,
     SrvEnableSelected 0,
     SrvDisableSelected 0,
@@ -4359,7 +4357,6 @@ mod en {
             Key::SrvAnotherOperationWorking => {
                 "Another lifecycle, update, or latency operation is already working"
             }
-            Key::SrvProbeServerLatencyHint => "Test this server's latency",
             Key::SrvAddServerBeforeLatency => "Add a server before testing latency",
             Key::SrvTestingLatencyIsolated => "Testing latency in isolated core…",
             Key::SrvSortByLatency => "Sort by latency",
@@ -4434,7 +4431,6 @@ mod en {
                 "Bind the physical uplink instead of following the OS stack, which TUN intercepts"
             }
             Key::SrvDuplicate => "Duplicate",
-            Key::SrvExportLinkQr => "Export link / QR",
             Key::SrvDeleteEllipsis => "Delete…",
             Key::SrvEnableSelected => "Enable",
             Key::SrvDisableSelected => "Disable",

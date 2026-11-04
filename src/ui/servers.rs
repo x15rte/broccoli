@@ -1901,6 +1901,8 @@ enum ListAction {
     SetSelectionEnabled(bool),
     /// Open the editor window on one profile.
     Edit(String),
+    /// Append a copy of one profile beside it, in the same group.
+    Duplicate(String),
     /// Share every selected row (one link per row on the clipboard).
     ExportSelection,
     /// Open the manual-group picker that copies every selected subscription
@@ -2003,19 +2005,21 @@ enum ServerTab {
     Group(String),
 }
 
-impl ServerTab {
-    /// The label on the tab. A group tab shows its group title, falling back
-    /// to the reserved `Manual` title when the record is gone.
-    fn label(&self, servers: &crate::model::ServersFile, lang: Language) -> String {
-        match self {
-            Self::Emitted => t(lang, Key::SrvTabEmitted).to_owned(),
-            Self::Manual => t(lang, Key::SrvTabManual).to_owned(),
-            Self::All => t(lang, Key::SrvTabAll).to_owned(),
-            Self::Group(id) => servers
-                .group_title_of(id)
-                .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE)
-                .to_owned(),
-        }
+/// The label on one tab: a default tab's static translation, or a group
+/// tab's stored title borrowed from the model (falling back to the reserved
+/// `Manual` title when the record is gone). Never allocates.
+fn tab_label<'a>(
+    tab: &ServerTab,
+    servers: &'a crate::model::ServersFile,
+    lang: Language,
+) -> &'a str {
+    match tab {
+        ServerTab::Emitted => t(lang, Key::SrvTabEmitted),
+        ServerTab::Manual => t(lang, Key::SrvTabManual),
+        ServerTab::All => t(lang, Key::SrvTabAll),
+        ServerTab::Group(id) => servers
+            .group_title_of(id)
+            .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE),
     }
 }
 
@@ -2077,6 +2081,109 @@ struct TabRowsCache {
     rows: std::rc::Rc<[usize]>,
 }
 
+/// The tab bar's entries for one model generation. The list moves only when
+/// the groups — their records, order or pins — do; a label is borrowed from
+/// the model (or a static translation) and formatted per frame.
+struct TabBarCache {
+    generation: u64,
+    tabs: std::rc::Rc<[ServerTab]>,
+}
+
+/// The subscription card's formatted lines: a feed's quota, expiry and update
+/// hint are formatted once per group, model generation, language and traffic
+/// unit, not per painted frame. The expiry line carries whether the feed is
+/// past its date, because that line paints in the error color, and the day it
+/// was formatted on — the remaining days change at midnight even when the
+/// model does not.
+struct SubscriptionCard {
+    group: String,
+    generation: u64,
+    lang: Language,
+    unit: crate::model::settings::TrafficUnit,
+    /// The UTC day the expiry line was formatted on (`unix seconds /
+    /// 86_400`); `None` when the feed reports no expiry.
+    day: Option<u64>,
+    quota: Option<String>,
+    expiry: Option<(String, bool)>,
+    update: Option<String>,
+}
+
+impl SubscriptionCard {
+    /// Format `subscription`'s lines once, stamped with the inputs the text
+    /// depends on.
+    fn new(
+        group: &str,
+        generation: u64,
+        lang: Language,
+        unit: crate::model::settings::TrafficUnit,
+        subscription: &crate::model::servers::Subscription,
+    ) -> Self {
+        let mut quota = None;
+        let mut expiry = None;
+        let mut update = None;
+        let mut day = None;
+        if let Some(metadata) = subscription.metadata.as_ref() {
+            let used = metadata.upload.saturating_add(metadata.download);
+            let has_quota = metadata.total > 0 || metadata.upload > 0 || metadata.download > 0;
+            if has_quota && metadata.total > 0 {
+                let percent = used
+                    .saturating_mul(100)
+                    .checked_div(metadata.total)
+                    .unwrap_or_default();
+                quota = Some(t_fmt(
+                    lang,
+                    Key::SrvQuotaUsed,
+                    &[
+                        &crate::ui::dashboard::format_bytes(used, unit),
+                        &crate::ui::dashboard::format_bytes(metadata.total, unit),
+                        &percent,
+                    ],
+                ));
+            } else if has_quota {
+                quota = Some(t_fmt(
+                    lang,
+                    Key::SrvQuotaUnlimited,
+                    &[&crate::ui::dashboard::format_bytes(used, unit)],
+                ));
+            }
+            if metadata.expire > 0 {
+                let now = unix_now();
+                day = Some(now / 86_400);
+                expiry = Some(if now >= metadata.expire {
+                    (t(lang, Key::SrvSubscriptionExpired).to_owned(), true)
+                } else {
+                    let days = (metadata.expire - now).div_ceil(86_400);
+                    (
+                        t_fmt(
+                            lang,
+                            Key::SrvSubscriptionExpiresIn,
+                            &[&days, &unix_date(metadata.expire)],
+                        ),
+                        false,
+                    )
+                });
+            }
+            if metadata.update_interval > 0 {
+                update = Some(t_fmt(
+                    lang,
+                    Key::SrvSubscriptionUpdateHint,
+                    &[&metadata.update_interval],
+                ));
+            }
+        }
+        Self {
+            group: group.to_owned(),
+            generation,
+            lang,
+            unit,
+            day,
+            quota,
+            expiry,
+            update,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
@@ -2098,6 +2205,16 @@ pub struct ServersScreen {
     /// The list's search text; it filters the current tab only.
     search: String,
     tab_rows_cache: Option<TabRowsCache>,
+    /// The tab bar's entry list, rebuilt only when the model generation
+    /// moves (see [`TabBarCache`]).
+    tab_bar_cache: Option<TabBarCache>,
+    /// The subscription card's formatted text, rebuilt only when its group,
+    /// the model generation, the language or the traffic unit moves (see
+    /// [`SubscriptionCard`]).
+    subscription_card: Option<SubscriptionCard>,
+    /// The model generation the selection was last pruned against: a stale
+    /// selection id can only come from a model change.
+    selection_generation: Option<u64>,
     /// Per-profile table cells (the protocol-and-security column and the
     /// `address:port` column), rebuilt only when the model generation moves.
     row_details: Option<(
@@ -2531,10 +2648,7 @@ impl ServersScreen {
         else {
             return;
         };
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
+        let at = unix_now();
         match result.outcome {
             Err(error) => {
                 if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
@@ -2900,35 +3014,11 @@ impl ServersScreen {
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndAdded)));
                         uictx.hooks.mark_dirty();
                         // The leave modal's Save committed the add draft:
-                        // resume the staged action. CloseAdd is fully
-                        // resolved; Quit proceeds once no dirty draft
-                        // remains (the existing draft is saved first, so
-                        // this is normally the final step). A Select staged
-                        // by the guard above stays staged — its resolution
-                        // (save the existing draft or discard) performs the
-                        // switch.
-                        let staged = self.leave_pending.clone();
-                        match staged {
-                            Some(LeaveAction::CloseAdd) => {
-                                self.leave_pending = None;
-                            }
-                            Some(LeaveAction::OpenEditor(id)) => {
-                                self.leave_pending = None;
-                                self.load_existing_draft(uictx.servers, lang, &id);
-                            }
-                            Some(LeaveAction::Quit) => {
-                                self.leave_pending = None;
-                                if self
-                                    .gate(DraftKind::Existing, uictx.busy.is_held())
-                                    .is_some_and(DraftGate::dirty)
-                                {
-                                    self.leave_pending = Some(LeaveAction::Quit);
-                                } else {
-                                    uictx.hooks.request_quit_resume();
-                                }
-                            }
-                            _ => {}
-                        }
+                        // resume the staged action (see
+                        // [`Self::resume_leave_after_commit`]). A Select
+                        // staged by the guard above stays staged until the
+                        // existing draft's question resolves it.
+                        self.resume_leave_after_commit(DraftKind::Add, uictx);
                     }
                     DraftKind::Existing => {
                         let exists = uictx
@@ -2947,39 +3037,10 @@ impl ServersScreen {
                         self.set_status(StatusLine::ok(t(lang, Key::SrvServerValidatedAndSaved)));
                         uictx.hooks.mark_dirty();
                         // The leave modal's Save committed the existing
-                        // draft: resume the staged action. Select switches
-                        // now; OpenEditor loads the profile the user asked
-                        // for; CloseExisting is already resolved by the
-                        // commit; Quit proceeds when no dirty draft remains
-                        // (otherwise the modal stays staged for the next
-                        // Save); CloseAdd keeps the modal staged so the next
-                        // Save targets the add draft.
-                        let staged = self.leave_pending.clone();
-                        match staged {
-                            Some(LeaveAction::Select(id)) => {
-                                self.leave_pending = None;
-                                self.load_existing_draft(uictx.servers, lang, &id);
-                            }
-                            Some(LeaveAction::OpenEditor(id)) => {
-                                self.leave_pending = None;
-                                self.load_existing_draft(uictx.servers, lang, &id);
-                            }
-                            Some(LeaveAction::CloseExisting) => {
-                                self.leave_pending = None;
-                            }
-                            Some(LeaveAction::Quit) => {
-                                self.leave_pending = None;
-                                if self
-                                    .gate(DraftKind::Add, uictx.busy.is_held())
-                                    .is_some_and(|gate| gate.changed_from_source)
-                                {
-                                    self.leave_pending = Some(LeaveAction::Quit);
-                                } else {
-                                    uictx.hooks.request_quit_resume();
-                                }
-                            }
-                            _ => {}
-                        }
+                        // draft: resume the staged action (see
+                        // [`Self::resume_leave_after_commit`]). A CloseAdd
+                        // stays staged for the add draft's own Save.
+                        self.resume_leave_after_commit(DraftKind::Existing, uictx);
                     }
                 }
             }
@@ -3024,10 +3085,7 @@ impl ServersScreen {
                 let ignored_names = std::mem::take(&mut self.import_ignored_names);
                 if !added_names.is_empty() || !refusals.is_empty() || !ignored_names.is_empty() {
                     let mut report = crate::model::servers::RefreshReport {
-                        at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs())
-                            .unwrap_or_default(),
+                        at: unix_now(),
                         added: added_names.len(),
                         refused: refusals.len(),
                         ignored,
@@ -3466,13 +3524,19 @@ impl ServersScreen {
         self.poll_xray_tool(lang);
         self.consume_latency_probe_result(ctx);
         // Keep the focus, the multi-selection and the open editor pointing at
-        // real profiles.
+        // real profiles. A stale selection id can only come from a model
+        // change, so the selection sweep runs when the generation moves,
+        // never on every repaint.
         if let Some(id) = &self.selected
             && !ctx.servers.profiles.iter().any(|profile| &profile.id == id)
         {
             self.selected = None;
         }
-        self.retain_existing_selection(ctx.servers);
+        let generation = ctx.hooks.model_generation();
+        if self.selection_generation != Some(generation) {
+            self.selection_generation = Some(generation);
+            self.retain_existing_selection(ctx.servers);
+        }
         if self.existing.draft().is_some_and(|draft| {
             !ctx.servers
                 .profiles
@@ -3560,19 +3624,38 @@ impl ServersScreen {
     /// undeletable; every group tab follows in its band, can be dragged inside
     /// that band, and pins or unpins from its context menu.
     fn show_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx, lang: Language) {
-        let tabs = tab_order(ctx.servers);
+        // The tab list is a function of the groups alone, so it is rebuilt
+        // with the model and borrowed every other frame: the labels come from
+        // the model (or the static translations) rather than from a
+        // per-frame String per tab.
+        let generation = ctx.hooks.model_generation();
+        if self.tab_bar_cache.as_ref().map(|cache| cache.generation) != Some(generation) {
+            self.tab_bar_cache = Some(TabBarCache {
+                generation,
+                tabs: std::rc::Rc::from(tab_order(ctx.servers).into_boxed_slice()),
+            });
+        }
+        let tabs = std::rc::Rc::clone(
+            &self
+                .tab_bar_cache
+                .as_ref()
+                .expect("the tab list was cached above")
+                .tabs,
+        );
         let mut select: Option<ServerTab> = None;
         let mut pin: Option<(String, bool)> = None;
         let mut rename: Option<String> = None;
         let mut delete: Option<String> = None;
-        let mut tab_rects: Vec<(ServerTab, egui::Rect)> = Vec::with_capacity(tabs.len());
+        // One rect per tab, by tab index: the drop half looks the target up
+        // in the cached list instead of cloning tabs into a second vector.
+        let mut tab_rects: Vec<egui::Rect> = Vec::with_capacity(tabs.len());
         ui.horizontal_wrapped(|ui| {
-            for tab in &tabs {
+            for tab in tabs.iter() {
                 let response = ui.add(egui::Button::selectable(
                     self.view == *tab,
-                    tab.label(ctx.servers, lang),
+                    tab_label(tab, ctx.servers, lang),
                 ));
-                tab_rects.push((tab.clone(), response.rect));
+                tab_rects.push(response.rect);
                 if response.clicked() {
                     select = Some(tab.clone());
                 }
@@ -3642,49 +3725,34 @@ impl ServersScreen {
             let Some(position) = ui.input(|input| input.pointer.interact_pos()) else {
                 return;
             };
-            let Some((target, rect)) = tab_rects.iter().find(|(_, rect)| rect.contains(position))
-            else {
+            let Some(target_at) = tab_rects.iter().position(|rect| rect.contains(position)) else {
                 return;
             };
-            let ServerTab::Group(target_id) = target else {
+            let ServerTab::Group(target_id) = &tabs[target_at] else {
                 return;
             };
-            let band_member = |candidate: &str, pinned: bool| {
-                ctx.servers
-                    .groups
-                    .iter()
-                    .any(|group| group.id == candidate && group.pinned == pinned)
+            let Some(dragged) = ctx.servers.groups.iter().find(|group| group.id == *id) else {
+                return;
             };
-            let dragged_pinned = ctx
+            // The band is the model's own definition of a tab row — the
+            // groups `reorder_group_in_band` moves — read in stored order.
+            let band: Vec<&str> = ctx
                 .servers
                 .groups
                 .iter()
-                .find(|group| group.id == *id)
-                .map(|group| group.pinned);
-            let Some(dragged_pinned) = dragged_pinned else {
-                return;
-            };
-            if !band_member(target_id, dragged_pinned) {
-                return;
-            }
-            let band: Vec<&str> = tabs
-                .iter()
-                .filter_map(|tab| match tab {
-                    ServerTab::Group(candidate) => Some(candidate.as_str()),
-                    _ => None,
-                })
-                .filter(|candidate| band_member(candidate, dragged_pinned))
+                .filter(|group| group.in_band(dragged.pinned))
+                .map(|group| group.id.as_str())
                 .collect();
             let Some(from) = band.iter().position(|candidate| *candidate == id.as_str()) else {
                 return;
             };
-            let Some(target_at) = band
+            let Some(target_gap) = band
                 .iter()
                 .position(|candidate| *candidate == target_id.as_str())
             else {
                 return;
             };
-            let gap = target_at + usize::from(position.x > rect.center().x);
+            let gap = target_gap + usize::from(position.x > tab_rects[target_at].center().x);
             let to = reorder_target(from, gap);
             if to != from {
                 ctx.servers.reorder_group_in_band(id, to);
@@ -3697,6 +3765,12 @@ impl ServersScreen {
     /// title, quota, expiry and update hint with its refresh, report and
     /// delete actions. Only a subscription group's tab owns a feed, so the
     /// three views and a manual group render nothing here.
+    ///
+    /// The quota and expiry lines allocate to format, and the card paints
+    /// every frame its tab is open, so they are memoized for one group, model
+    /// generation, language and traffic unit ([`SubscriptionCard`]); the
+    /// report and the edit draft are cloned only when their button is
+    /// clicked.
     fn show_subscription_card(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx, lang: Language) {
         let ServerTab::Group(view) = &self.view else {
             return;
@@ -3707,12 +3781,32 @@ impl ServersScreen {
         let Some(subscription) = group.subscription.as_ref() else {
             return;
         };
-        let id = group.id.clone();
-        let title = group.title.clone();
-        let draft = GroupDraft::editing(group);
-        let report = subscription.report.clone();
-        let metadata = subscription.metadata.as_ref();
+        let generation = ctx.hooks.model_generation();
         let unit = ctx.settings.traffic_unit;
+        let stale = self.subscription_card.as_ref().is_none_or(|card| {
+            card.generation != generation
+                || card.group != group.id
+                || card.lang != lang
+                || card.unit != unit
+                // The remaining-days line changes at midnight, so a card that
+                // carries one is rebuilt when the day moves.
+                || card.day.is_some_and(|day| day != unix_now() / 86_400)
+        });
+        if stale {
+            self.subscription_card = Some(SubscriptionCard::new(
+                &group.id,
+                generation,
+                lang,
+                unit,
+                subscription,
+            ));
+        }
+        let card = self
+            .subscription_card
+            .as_ref()
+            .expect("the card was formatted above");
+        let title = group.title.as_str();
+        let has_report = subscription.report.is_some();
         let mut refresh = false;
         let mut show_report = false;
         let mut delete = false;
@@ -3720,71 +3814,32 @@ impl ServersScreen {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .button(RichText::new(&title).strong())
+                    .button(RichText::new(title).strong())
                     .on_hover_text(t(lang, Key::SrvEditSubscription))
                     .clicked()
                 {
                     edit = true;
                 }
-                if let Some(metadata) = metadata {
-                    let used = metadata.upload.saturating_add(metadata.download);
-                    let has_quota =
-                        metadata.total > 0 || metadata.upload > 0 || metadata.download > 0;
-                    if !has_quota {
-                        // A title-only snapshot has no quota widget.
-                    } else if metadata.total > 0 {
-                        let percent = used
-                            .saturating_mul(100)
-                            .checked_div(metadata.total)
-                            .unwrap_or_default();
-                        ui.weak(t_fmt(
-                            lang,
-                            Key::SrvQuotaUsed,
-                            &[
-                                &crate::ui::dashboard::format_bytes(used, unit),
-                                &crate::ui::dashboard::format_bytes(metadata.total, unit),
-                                &percent,
-                            ],
-                        ));
-                    } else {
-                        ui.weak(t_fmt(
-                            lang,
-                            Key::SrvQuotaUnlimited,
-                            &[&crate::ui::dashboard::format_bytes(used, unit)],
-                        ));
+                if let Some(quota) = &card.quota {
+                    ui.weak(quota.as_str());
+                }
+                match &card.expiry {
+                    Some((text, true)) => {
+                        ui.colored_label(status_colors_of(ui).err, text.as_str());
                     }
-                    if metadata.expire > 0 {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs())
-                            .unwrap_or_default();
-                        if now >= metadata.expire {
-                            ui.colored_label(
-                                status_colors_of(ui).err,
-                                t(lang, Key::SrvSubscriptionExpired),
-                            );
-                        } else {
-                            let days = (metadata.expire - now).div_ceil(86_400);
-                            ui.weak(t_fmt(
-                                lang,
-                                Key::SrvSubscriptionExpiresIn,
-                                &[&days, &unix_date(metadata.expire)],
-                            ));
-                        }
+                    Some((text, false)) => {
+                        ui.weak(text.as_str());
                     }
-                    if metadata.update_interval > 0 {
-                        ui.weak(t_fmt(
-                            lang,
-                            Key::SrvSubscriptionUpdateHint,
-                            &[&metadata.update_interval],
-                        ));
-                    }
+                    None => {}
+                }
+                if let Some(update) = &card.update {
+                    ui.weak(update.as_str());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button(t(lang, Key::SrvDeleteGroup)).clicked() {
                         delete = true;
                     }
-                    let report_button = if report.is_some() {
+                    let report_button = if has_report {
                         ui.small_button(t(lang, Key::SrvShowReport))
                     } else {
                         ui.add_enabled(
@@ -3804,18 +3859,19 @@ impl ServersScreen {
                 });
             });
         });
-        if refresh {
-            let repaint = ui.ctx().clone();
-            self.start_subscription_fetch(lang, repaint, ctx, id.clone());
-        }
-        if show_report && let Some(report) = report {
-            self.report_view = Some((title.clone(), report));
-        }
         if delete {
-            self.group_delete_pending = Some(id);
+            self.group_delete_pending = Some(group.id.clone());
         }
         if edit {
-            self.group_dialog = Some(draft);
+            self.group_dialog = Some(GroupDraft::editing(group));
+        }
+        if show_report && let Some(report) = &subscription.report {
+            self.report_view = Some((group.title.clone(), report.clone()));
+        }
+        if refresh {
+            let repaint = ui.ctx().clone();
+            let id = group.id.clone();
+            self.start_subscription_fetch(lang, repaint, ctx, id);
         }
     }
 
@@ -4023,6 +4079,7 @@ impl ServersScreen {
         // offset is preserved across the switch.
         let row_height = ui.spacing().interact_size.y;
         let generation = ctx.hooks.model_generation();
+        let profiles = &ctx.servers.profiles;
         let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
             cache.generation != generation
                 || cache.tab != self.view
@@ -4048,6 +4105,13 @@ impl ServersScreen {
                 .expect("the tab rows were cached above")
                 .rows,
         );
+        // A row the tab no longer shows — filtered out, or gone with its
+        // group — leaves the selection before any command reads it. Only the
+        // row list's own rebuild can change which rows are visible, so the
+        // sweep rides on it instead of running selection × rows every frame.
+        if stale_rows {
+            self.retain_visible_selection(&display_rows, profiles);
+        }
         if self.emitted_cache.as_ref().map(|(cached, _)| *cached) != Some(generation) {
             self.emitted_cache = Some((generation, std::rc::Rc::new(ctx.servers.emitted_set())));
         }
@@ -4058,7 +4122,6 @@ impl ServersScreen {
                 .expect("the emitted set was cached above")
                 .1,
         );
-        let profiles = &ctx.servers.profiles;
         if self.row_details.as_ref().map(|(cached, _)| *cached) != Some(generation) {
             let hide = ctx.settings.hide_server_info;
             let details: std::collections::HashMap<usize, RowDetail> = profiles
@@ -4191,7 +4254,13 @@ impl ServersScreen {
                                 selected: is_sel,
                                 active: is_active,
                                 switch: RowSwitch {
-                                    checked: is_active || p.enabled,
+                                    // The active server and a chain-only hop
+                                    // are in the generated document whatever
+                                    // their own switch says, so both render
+                                    // checked and locked.
+                                    checked: is_active
+                                        || p.enabled
+                                        || emitted.chain_only.contains(&index),
                                     locked_hint: if is_active {
                                         Some(t(lang, Key::SrvActiveAlwaysEmitted))
                                     } else if emitted.chain_only.contains(&index) {
@@ -4279,6 +4348,10 @@ impl ServersScreen {
                             );
                             if set_active.clicked() {
                                 action = Some(ListAction::SetActive(id.clone()));
+                                ui.close();
+                            }
+                            if ui.button(t(lang, Key::SrvDuplicate)).clicked() {
+                                action = Some(ListAction::Duplicate(id.clone()));
                                 ui.close();
                             }
                             if ui.button(t(lang, Key::TestLatency)).clicked() {
@@ -4417,18 +4490,6 @@ impl ServersScreen {
                 action = Some(ListAction::SetActive(id.clone()));
             }
         }
-        // A row the tab no longer shows — filtered out, or gone with its
-        // group — leaves the selection before any command reads it.
-        self.retain_visible_selection(&display_rows, profiles);
-        // The selection in display order, the order every batch command
-        // applies.
-        let selected_ids: Vec<String> = display_rows
-            .iter()
-            .map(|&index| &profiles[index])
-            .filter(|profile| self.selection.contains(profile.id.as_str()))
-            .map(|profile| profile.id.clone())
-            .collect();
-
         // apply deferred list actions (needs &mut profiles)
         match action {
             Some(ListAction::Select(id)) => {
@@ -4453,7 +4514,7 @@ impl ServersScreen {
                 // selection with that row first; a menu click inside a
                 // multi-selection probes the whole selection.
                 let ids = if self.selection.len() > 1 {
-                    selected_ids.clone()
+                    self.selected_ids(&display_rows, profiles)
                 } else {
                     vec![id]
                 };
@@ -4463,27 +4524,48 @@ impl ServersScreen {
                 // The toolbar command targets the selection, or the whole
                 // current tab when nothing is selected. Its feedback always
                 // names the target count, even when the target is one row.
-                let ids = if selected_ids.is_empty() {
+                let selected = self.selected_ids(&display_rows, profiles);
+                let ids = if selected.is_empty() {
                     display_rows
                         .iter()
                         .map(|&index| profiles[index].id.clone())
                         .collect()
                 } else {
-                    selected_ids.clone()
+                    selected
                 };
                 self.probe_rows(ctx, &ids, false);
             }
             Some(ListAction::SetSelectionEnabled(enabled)) => {
-                self.set_selected_enabled(ctx, &selected_ids, enabled);
+                let ids = self.selected_ids(&display_rows, profiles);
+                self.set_selected_enabled(ctx, &ids, enabled);
             }
             Some(ListAction::ExportSelection) => {
-                self.export_rows(ui, ctx, lang, &selected_ids);
+                let ids = self.selected_ids(&display_rows, profiles);
+                self.export_rows(ui, ctx, lang, &ids);
             }
             Some(ListAction::CopySelection) => {
-                self.open_copy_dialog(&selected_ids, ctx.servers);
+                let ids = self.selected_ids(&display_rows, profiles);
+                self.open_copy_dialog(&ids, ctx.servers);
             }
             Some(ListAction::DeleteSelection) => {
-                self.open_delete_dialog(ctx.servers, ctx.settings, lang, selected_ids);
+                let ids = self.selected_ids(&display_rows, profiles);
+                self.open_delete_dialog(ctx.servers, ctx.settings, lang, ids);
+            }
+            Some(ListAction::Duplicate(id)) => {
+                if let Some(index) = ctx.servers.profiles.iter().position(|p| p.id == id) {
+                    let mut copy = ctx.servers.profiles[index].clone();
+                    copy.id = uuid::Uuid::new_v4().simple().to_string();
+                    copy.name = t_fmt(lang, Key::SrvCopySuffix, &[&copy.name]);
+                    copy.name = ctx
+                        .servers
+                        .unique_profile_name(copy.group_id(), &copy.name, None);
+                    ctx.servers.profiles.insert(index + 1, copy.clone());
+                    // The switch to the copy is guarded like any other
+                    // selection change (the copy is already inserted; the
+                    // guard only defers the selection).
+                    self.guard_select(copy.id);
+                    ctx.hooks.mark_dirty();
+                }
             }
             Some(ListAction::SetActive(id)) => {
                 // The active profile is the list's first row (the config's
@@ -4560,14 +4642,7 @@ impl ServersScreen {
         // consults the busy window. The add draft's raw-buffer half is not
         // part of its unsaved state — the dialog's own controls treat an
         // add draft as unsaved from the moment it exists.
-        if self
-            .gate(DraftKind::Existing, false)
-            .is_some_and(DraftGate::dirty)
-        {
-            return true;
-        }
-        self.gate(DraftKind::Add, false)
-            .is_some_and(|gate| gate.changed_from_source)
+        self.draft_unsaved(DraftKind::Existing, false) || self.draft_unsaved(DraftKind::Add, false)
     }
 
     /// Focus one row and make it the sole selection: the plain-click,
@@ -4607,6 +4682,17 @@ impl ServersScreen {
         {
             self.selection_anchor = None;
         }
+    }
+
+    /// The selection in display order, the order every batch command applies.
+    /// Built only by the commands that read it, so a repaint that clicks
+    /// nothing never clones the selected ids.
+    fn selected_ids(&self, rows: &[usize], profiles: &[ServerProfile]) -> Vec<String> {
+        rows.iter()
+            .map(|&index| &profiles[index])
+            .filter(|profile| self.selection.contains(profile.id.as_str()))
+            .map(|profile| profile.id.clone())
+            .collect()
     }
 
     /// Ctrl-click: add the row to the selection, or remove it.
@@ -4974,15 +5060,10 @@ impl ServersScreen {
             self.derive_dialog = None;
         }
         self.existing.hold(draft);
-        if self.delete_pending.is_none()
-            && self
-                .gate(DraftKind::Existing, busy)
-                .is_some_and(DraftGate::dirty)
-        {
+        if self.delete_pending.is_none() && self.draft_unsaved(DraftKind::Existing, busy) {
             self.stage_leave(LeaveAction::CloseExisting);
         } else {
-            self.existing.close(&mut self.seeded_buffers);
-            self.existing.probe.discard_result();
+            self.close_existing_draft();
         }
     }
 
@@ -5002,12 +5083,7 @@ impl ServersScreen {
             self.derive_dialog = None;
         }
         self.add.hold(draft);
-        if self.delete_pending.is_none()
-            && self
-                .add
-                .draft()
-                .is_some_and(ProfileDraft::changed_from_source)
-        {
+        if self.delete_pending.is_none() && self.draft_unsaved(DraftKind::Add, false) {
             self.stage_leave(LeaveAction::CloseAdd);
         } else {
             self.add.close(&mut self.seeded_buffers);
@@ -5025,44 +5101,103 @@ impl ServersScreen {
         self.profile_validation_report = None;
     }
 
-    /// Discard resolution of the leave modal: drop the staged action's
-    /// draft(s) (existing draft → revert + buffer clear; add draft → drop +
-    /// evict; Quit discards both), then perform the action.
-    fn discard_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
+    /// Drop the editor's draft with the seeded buffers and probe result that
+    /// belong to it: the window closes and nothing keeps showing the draft.
+    fn close_existing_draft(&mut self) {
+        self.existing.close(&mut self.seeded_buffers);
+        self.existing.probe.discard_result();
+    }
+
+    /// Whether `kind`'s draft is unsaved. The existing editor's raw panes can
+    /// hold text that never reached its draft, so that slot counts the raw
+    /// buffers; an add draft has no committed source, so its changed flag is
+    /// its whole unsaved state.
+    fn draft_unsaved(&self, kind: DraftKind, busy: bool) -> bool {
+        match kind {
+            DraftKind::Existing => self.gate(kind, busy).is_some_and(DraftGate::dirty),
+            DraftKind::Add => self.draft_saveable(kind, busy),
+        }
+    }
+
+    /// Whether `kind`'s draft has changes its Save would commit.
+    fn draft_saveable(&self, kind: DraftKind, busy: bool) -> bool {
+        self.gate(kind, busy)
+            .is_some_and(|gate| gate.changed_from_source)
+    }
+
+    /// Perform a leave action whose drafts are already resolved. A selection
+    /// switch only moves the selection: the editor keeps the profile it
+    /// holds, because only Edit, a double click or Add change it. OpenEditor
+    /// loads the profile the user asked for; the Close actions drop their
+    /// windows; Quit resumes the app quit.
+    fn apply_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
         match action {
-            LeaveAction::Select(id) => {
-                // A selection switch staged by an open editor keeps the
-                // editor following the selection, as the split-pane screen
-                // did; a switch staged from elsewhere only moves the
-                // selection.
-                let follows_editor = self.existing.draft.is_some();
-                self.discard_existing_draft();
-                if follows_editor {
-                    let lang = uictx.settings.language;
-                    self.load_existing_draft(uictx.servers, lang, &id);
-                } else {
-                    self.focus_row(&id);
-                }
-            }
+            LeaveAction::Select(id) => self.focus_row(&id),
             LeaveAction::OpenEditor(id) => {
-                // The question's Discard drops the dirty draft and opens the
-                // profile the user asked to edit.
-                self.existing.close(&mut self.seeded_buffers);
-                self.existing.probe.discard_result();
                 let lang = uictx.settings.language;
                 self.load_existing_draft(uictx.servers, lang, &id);
             }
-            LeaveAction::CloseExisting => {
-                self.existing.close(&mut self.seeded_buffers);
-                self.existing.probe.discard_result();
-            }
+            LeaveAction::CloseExisting => self.close_existing_draft(),
+            LeaveAction::CloseAdd => self.add.close(&mut self.seeded_buffers),
+            LeaveAction::Quit => uictx.hooks.request_quit_resume(),
+        }
+    }
+
+    /// Resume the staged leave action after `committed`'s draft was saved and
+    /// closed. An action the commit does not resolve stays staged for the
+    /// other draft's Save, or for the question the user still has to answer;
+    /// a resolved one is performed here.
+    fn resume_leave_after_commit(&mut self, committed: DraftKind, uictx: &mut ServersCtx) {
+        let Some(action) = self.leave_pending.clone() else {
+            return;
+        };
+        let other = match committed {
+            DraftKind::Existing => DraftKind::Add,
+            DraftKind::Add => DraftKind::Existing,
+        };
+        let resolved = match &action {
+            // A plain click or the editor's close is answered by the existing
+            // draft's Save; the add commit only resolves it when the guard
+            // switched immediately (which clears it before this point).
+            LeaveAction::Select(_) | LeaveAction::CloseExisting => committed == DraftKind::Existing,
+            LeaveAction::OpenEditor(_) => true,
+            LeaveAction::CloseAdd => committed == DraftKind::Add,
+            LeaveAction::Quit => !self.draft_unsaved(other, uictx.busy.is_held()),
+        };
+        if !resolved {
+            return;
+        }
+        self.leave_pending = None;
+        self.apply_leave_action(action, uictx);
+    }
+
+    /// Discard resolution of the leave modal: revert the existing draft in
+    /// place (revert + buffer clear; the actions that close the window then
+    /// drop it), drop the add draft Quit abandons, then perform the action.
+    fn discard_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
+        match &action {
             LeaveAction::CloseAdd => self.add.close(&mut self.seeded_buffers),
             LeaveAction::Quit => {
                 self.discard_existing_draft();
                 self.add.close(&mut self.seeded_buffers);
-                uictx.hooks.request_quit_resume();
+            }
+            LeaveAction::Select(_) => {
+                // A plain click only moves the selection, so Discard reverts
+                // the editor's draft in place: the window keeps the profile
+                // it holds instead of retargeting to the clicked row.
+                let editing = self.existing.draft.as_ref().map(|draft| draft.id.clone());
+                self.discard_existing_draft();
+                if let Some(editing) = editing {
+                    let lang = uictx.settings.language;
+                    self.load_existing_draft(uictx.servers, lang, &editing);
+                }
+            }
+            LeaveAction::OpenEditor(_) | LeaveAction::CloseExisting => {
+                self.discard_existing_draft();
             }
         }
+        self.leave_pending = None;
+        self.apply_leave_action(action, uictx);
     }
 
     /// Save resolution of the leave modal: start the existing validation
@@ -5077,10 +5212,7 @@ impl ServersScreen {
             let Some(draft) = self.draft(kind) else {
                 continue;
             };
-            if self
-                .gate(kind, busy)
-                .is_some_and(|gate| gate.changed_from_source)
-            {
+            if self.draft_saveable(kind, busy) {
                 staged = Some((draft.target(), draft.profile.clone()));
                 break;
             }
@@ -5088,24 +5220,8 @@ impl ServersScreen {
         let Some((target, profile)) = staged else {
             // Every dirty draft was already committed while the modal was
             // staged; the deferred action is safe to perform now.
-            match action {
-                LeaveAction::Select(id) => {
-                    if self.existing.draft.is_some() {
-                        self.load_existing_draft(uictx.servers, lang, &id);
-                    } else {
-                        self.focus_row(&id);
-                    }
-                }
-                LeaveAction::OpenEditor(id) => {
-                    self.load_existing_draft(uictx.servers, lang, &id);
-                }
-                LeaveAction::CloseExisting => {
-                    self.existing.close(&mut self.seeded_buffers);
-                    self.existing.probe.discard_result();
-                }
-                LeaveAction::CloseAdd => {}
-                LeaveAction::Quit => uictx.hooks.request_quit_resume(),
-            }
+            self.leave_pending = None;
+            self.apply_leave_action(action, uictx);
             return;
         };
         match self.start_profile_validation(
@@ -5496,8 +5612,8 @@ fn table_header(
         if let Some(width) = columns.order {
             column_header(ui, t(lang, Key::SrvTableOrder), None, width);
         }
-        column_header(ui, t(lang, Key::Enabled), None, columns.switch);
         column_header(ui, t(lang, Key::SrvTableActive), None, columns.active);
+        column_header(ui, t(lang, Key::Enabled), None, columns.switch);
         column_header(
             ui,
             t(lang, Key::SrvName),
@@ -5726,6 +5842,15 @@ fn sort_view_rows(rows: &mut [usize], profiles: &[crate::model::ServerProfile], 
     }
 }
 
+/// The current Unix time in seconds: the one clock read the screen's time
+/// stamps share.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
 /// A Unix time as `YYYY-MM-DD` (UTC), for an expiry caption. No calendar
 /// dependency: days since the epoch → civil date (proleptic Gregorian).
 fn unix_date(seconds: u64) -> String {
@@ -5795,12 +5920,12 @@ fn subscription_bind_address(
     }
 }
 
-/// One row of the servers table: the switch, the active marker, the name, the
-/// protocol-and-security column, the `address:port` column and the latency
-/// column, in that order. Returns the row [`egui::Response`] (click,
-/// right-click and drag anywhere on the row), the name button's response (it
-/// must be treated as a select target too), and whether the switch was
-/// clicked.
+/// One row of the servers table: the order number (on `Emitted`), the active
+/// marker, the switch, the name, the protocol-and-security column, the
+/// `address:port` column and the latency column, in that order. Returns the
+/// row [`egui::Response`] (click, right-click and drag anywhere on the row),
+/// the name button's response (it must be treated as a select target too), and
+/// whether the switch was clicked.
 ///
 /// The name is a truncated selectable button inside its own cell, so an
 /// over-long name ends in "…" at the column boundary instead of painting over
@@ -5828,6 +5953,12 @@ fn server_list_row(
                 ui.add(egui::Label::new(RichText::new(order.to_string()).weak()).selectable(false));
             });
         }
+        table_cell(ui, columns.active, |ui| {
+            if row.active {
+                ui.label(RichText::new("▶").color(status_colors_of(ui).ok))
+                    .on_hover_text(t(lang, Key::SrvActiveAlwaysEmitted));
+            }
+        });
         let mut checked = row.switch.checked;
         table_cell(ui, columns.switch, |ui| {
             let response = ui.add_enabled(
@@ -5844,12 +5975,6 @@ fn server_list_row(
             }
         });
         let toggled = checked != row.switch.checked;
-        table_cell(ui, columns.active, |ui| {
-            if row.active {
-                ui.label(RichText::new("▶").color(status_colors_of(ui).ok))
-                    .on_hover_text(t(lang, Key::SrvActiveAlwaysEmitted));
-            }
-        });
         let name_resp = table_cell_button(ui, columns.name, lang, name, row.selected);
         table_cell(ui, columns.protocol, |ui| {
             ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
@@ -11014,22 +11139,38 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         harness.get_by_label("Alpha").click();
         harness.run();
-        assert!(harness.state().0.selected.is_some());
+        // The clicked row is selected: the batch commands wait for one.
+        let batch_enabled = |harness: &Harness<'static, (ServersScreen, UiTestRig)>| {
+            !harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::SrvEnableSelected),
+                )
+                .accesskit_node()
+                .is_disabled()
+        };
+        assert!(batch_enabled(&harness), "the clicked row must be selected");
 
         harness
             .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
-        assert_eq!(harness.state().0.selected, None);
-        assert_eq!(harness.state().0.view_sort, None);
+        assert!(
+            !batch_enabled(&harness),
+            "a tab switch must drop the selection with the tab"
+        );
 
-        // A view sort exists while the tab shows and is dropped on the way
-        // out, so returning to the tab cannot resurrect it.
+        // A view sort exists while the tab shows — the header marks the
+        // sorted column — and is dropped on the way out, so returning to the
+        // tab cannot resurrect it.
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
             .click();
         harness.run();
-        assert!(harness.state().0.view_sort.is_some());
+        assert!(
+            harness.query_by_label("▲").is_some(),
+            "the sorted column must mark its direction"
+        );
         harness
             .get_by_role_and_label(
                 egui::accesskit::Role::Button,
@@ -11037,12 +11178,18 @@ Authentication: ML-KEM-768, Post-Quantum
             )
             .click();
         harness.run();
-        assert_eq!(harness.state().0.view_sort, None);
+        assert!(
+            harness.query_by_label("▲").is_none(),
+            "leaving the tab must drop the view sort"
+        );
         harness
             .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
-        assert_eq!(harness.state().0.view_sort, None);
+        assert!(
+            harness.query_by_label("▲").is_none(),
+            "returning to the tab must not resurrect the view sort"
+        );
     }
 
     #[test]
@@ -11816,9 +11963,36 @@ Authentication: ML-KEM-768, Post-Quantum
                 .is_none(),
             "no editor may occupy the screen when nothing is edited"
         );
+
+        // The emitted table's columns run order → active marker → switch →
+        // name, one x per column.
+        let x = |label: &str| {
+            harness
+                .query_all_by_label(label)
+                .next()
+                .unwrap_or_else(|| panic!("the table must render the {label:?} column header"))
+                .rect()
+                .center()
+                .x
+        };
+        assert!(x(t(Language::En, Key::SrvTableOrder)) < x(t(Language::En, Key::SrvTableActive)));
+        assert!(x(t(Language::En, Key::SrvTableActive)) < x(t(Language::En, Key::Enabled)));
+        assert!(x(t(Language::En, Key::Enabled)) < x(t(Language::En, Key::SrvName)));
+
+        // A plain click only selects the row: the editor window stays shut.
+        // (The disabled fixture is listed on `All`; `Emitted` carries only
+        // what the configuration emits.)
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        harness.get_by_label("Tokyo").click();
+        harness.run();
         assert!(
-            harness.state().0.existing.draft.is_none(),
-            "opening the screen must not start an editor draft"
+            harness
+                .query_by_label(t(Language::En, Key::SrvValidateAndSave))
+                .is_none(),
+            "a plain click must not open the editor window"
         );
     }
 
@@ -11840,14 +12014,19 @@ Authentication: ML-KEM-768, Post-Quantum
                 .is_some(),
             "a double click must open the editor window"
         );
+        // The window holds the clicked row's profile: its name field carries
+        // the row's name, and the table still lists the row behind it.
         assert!(
-            harness.state().0.existing.draft.is_some(),
-            "the window must hold the profile's draft"
+            harness
+                .query_all_by_role(egui::accesskit::Role::TextInput)
+                .any(|node| node.accesskit_node().value().as_deref() == Some("Tokyo")),
+            "the editor window must hold the double-clicked profile's draft"
         );
+        assert!(harness.query_by_label("Tokyo").is_some());
     }
 
     #[test]
-    fn the_row_context_menu_offers_the_five_commands_and_no_inline_icons() {
+    fn the_row_context_menu_offers_the_six_commands_and_no_inline_icons() {
         let mut rig = UiTestRig::default();
         let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         tokyo.enabled = true;
@@ -11869,6 +12048,7 @@ Authentication: ML-KEM-768, Post-Quantum
         for label in [
             t(Language::En, Key::SrvEdit),
             t(Language::En, Key::SrvSetActive),
+            t(Language::En, Key::SrvDuplicate),
             t(Language::En, Key::TestLatency),
             t(Language::En, Key::SrvShare),
             t(Language::En, Key::SrvDeleteEllipsis),
@@ -11891,6 +12071,41 @@ Authentication: ML-KEM-768, Post-Quantum
                 .query_by_label(t(Language::En, Key::SrvValidateAndSave))
                 .is_some(),
             "the Edit command must open the editor window"
+        );
+    }
+
+    #[test]
+    fn the_row_menu_duplicates_a_profile_beside_it() {
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvDuplicate))
+            .last()
+            .expect("the row menu offers Duplicate")
+            .click();
+        harness.run();
+
+        let state = harness.state();
+        let profiles = &state.1.servers.profiles;
+        assert_eq!(profiles.len(), 2, "the copy lands beside the original");
+        assert_eq!(profiles[1].name, "Tokyo copy");
+        assert_ne!(profiles[1].id, profiles[0].id, "the copy gets its own id");
+        assert_eq!(
+            profiles[1].group_id(),
+            crate::model::servers::MANUAL_GROUP_ID,
+            "the copy stays in the original's group"
+        );
+        assert!(state.1.requests.dirty, "the copy is a configuration change");
+        assert!(
+            harness.query_by_label("Tokyo copy").is_some(),
+            "the copy renders as a row"
         );
     }
 
@@ -12419,7 +12634,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn a_chain_only_hop_is_listed_and_its_switch_stays_locked_off() {
+    fn a_chain_only_hop_is_listed_with_a_checked_locked_switch() {
         let freedom = || OutboundModel::new(Protocol::Freedom);
         let mut entry = ServerProfile::new("Entry", freedom());
         entry.enabled = true;
@@ -12433,9 +12648,25 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = drag_harness(rig);
         harness.run();
         // The hop is emitted through the chain even though its own switch is
-        // off, and that switch cannot be turned on: the row says why, and the
-        // model stays put.
+        // off: the row says so — the switch renders checked and locked — and
+        // cannot be turned on, so the model stays put.
         assert!(harness.query_by_label("Hop").is_some());
+        let row_y = harness.get_by_label("Hop").rect().center().y;
+        let switch = harness
+            .get_all_by_role(egui::accesskit::Role::CheckBox)
+            .find(|node| (node.rect().center().y - row_y).abs() < 2.0)
+            .expect("the Hop row must render a switch");
+        assert!(
+            matches!(
+                switch.accesskit_node().toggled(),
+                Some(egui::accesskit::Toggled::True)
+            ),
+            "a chain-only hop is in the generated configuration, so its switch shows checked"
+        );
+        assert!(
+            switch.accesskit_node().is_disabled(),
+            "the chain-only switch is locked"
+        );
         click_row_switch(&mut harness, "Hop");
         harness.run();
         assert!(harness.query_by_label("Hop").is_some());
@@ -16556,13 +16787,13 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn select_guard_discard_drops_draft_and_switches_selection() {
+    fn select_guard_discard_reverts_the_editor_and_switches_selection() {
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        rig.servers.active = Some(tokyo.id);
+        rig.servers.active = Some(tokyo.id.clone());
         let mut harness = unsaved_harness(rig);
         harness.run();
         edit_existing_draft(&mut harness.state_mut().0);
@@ -16587,9 +16818,14 @@ Authentication: ML-KEM-768, Post-Quantum
             "Discard must switch the selection"
         );
         assert_eq!(
-            state.0.existing.draft.as_ref().unwrap().profile.id,
-            osaka.id,
-            "the editor must reopen on the newly selected profile"
+            state
+                .0
+                .existing
+                .draft
+                .as_ref()
+                .map(|draft| draft.id.as_str()),
+            Some(tokyo.id.as_str()),
+            "a plain click must not retarget the editor to the clicked row"
         );
         assert!(
             harness.query_by_label("●").is_none(),
@@ -17134,7 +17370,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn select_discard_drops_only_the_existing_draft() {
+    fn select_discard_reverts_only_the_existing_draft() {
         let mut screen = ServersScreen::default();
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
@@ -17150,9 +17386,22 @@ Authentication: ML-KEM-768, Post-Quantum
             LeaveAction::Select("osaka-target-id".into()),
             &mut rig.ctx().servers(),
         );
+        assert_eq!(
+            screen
+                .existing
+                .draft
+                .as_ref()
+                .map(|draft| (draft.id.as_str(), draft.profile.name.as_str())),
+            Some((tokyo.id.as_str(), tokyo.name.as_str())),
+            "Select discard must revert the existing draft in place"
+        );
         assert!(
-            screen.existing.draft.is_none(),
-            "Select discard must drop the existing draft"
+            screen
+                .existing
+                .draft
+                .as_ref()
+                .is_some_and(|draft| !draft.changed_from_source()),
+            "the reverted draft must be clean"
         );
         assert_eq!(
             screen.add.draft.as_ref().map(|d| d.id.as_str()),
