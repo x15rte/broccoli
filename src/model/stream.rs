@@ -577,14 +577,39 @@ pub const MASQUE_WARP_PATH: &str = "/";
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MasqueWarp {
-    #[serde(skip_serializing_if = "skip_empty_str")]
+    #[serde(
+        skip_serializing_if = "skip_empty_str",
+        serialize_with = "serialize_warp_key",
+        deserialize_with = "deserialize_warp_key"
+    )]
     pub private_key: String,
-    #[serde(skip_serializing_if = "skip_empty_str")]
+    #[serde(
+        skip_serializing_if = "skip_empty_str",
+        serialize_with = "serialize_warp_key",
+        deserialize_with = "deserialize_warp_key"
+    )]
     pub public_key: String,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub address: Vec<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// A WARP key may arrive as a PEM block pasted into a single-line field, which
+/// joins its lines with spaces. Both directions rewrite a complete block to its
+/// canonical form, so the stored value and the generated configuration always
+/// carry the PEM the core parses. A value that is not a PEM block is left as
+/// the base64 the core also accepts.
+fn serialize_warp_key<S: Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    match super::canonicalize_pem_block(value) {
+        Some(text) => serializer.serialize_str(&text),
+        None => serializer.serialize_str(value),
+    }
+}
+
+fn deserialize_warp_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(super::canonicalize_pem_block(&value).unwrap_or(value))
 }
 
 /// `masqueSettings` (infra/conf/transport_method.go:806-849). `user`/`pass`

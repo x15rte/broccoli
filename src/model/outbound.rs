@@ -570,7 +570,7 @@ pub fn masque_warp_key_shaped(key: &str) -> bool {
     if key.is_empty() {
         return false;
     }
-    if pem_block_shaped(key) {
+    if super::canonicalize_pem_block(key).is_some() {
         return true;
     }
     if !key.contains(['\r', '\n']) {
@@ -585,19 +585,6 @@ pub fn masque_warp_key_shaped(key: &str) -> bool {
     base64::engine::general_purpose::STANDARD
         .decode(compact)
         .is_ok()
-}
-
-/// True when `key` carries a PEM block with matching `BEGIN`/`END` labels.
-/// The body is not decoded: `pem.Decode` does that, and a body the core
-/// refuses is the core's config-test failure, not a shape the model can judge.
-fn pem_block_shaped(key: &str) -> bool {
-    let Some((_, after_begin)) = key.split_once("-----BEGIN ") else {
-        return false;
-    };
-    let Some((label, body)) = after_begin.split_once("-----") else {
-        return false;
-    };
-    !label.is_empty() && body.contains(&format!("-----END {label}-----"))
 }
 
 /// Match Xray's accepted WireGuard key forms while enforcing the 32-byte key

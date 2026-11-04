@@ -373,6 +373,34 @@ pub fn masked_validated_field(
     )
 }
 
+/// [`masked_validated_field`] with a multi-line text box: for a value whose
+/// grammar carries line breaks, like a PEM block. `rows` is the minimum height
+/// the box renders at; the verdict, the masking and the changed report are the
+/// single-line field's.
+pub fn masked_validated_multiline(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    rows: usize,
+    validate: impl Fn(&str) -> Option<String>,
+    masked: bool,
+) -> bool {
+    validated_field_impl(
+        ui,
+        label,
+        value,
+        hint,
+        FieldContext::default(),
+        validate,
+        FieldExtras {
+            masked,
+            rows: Some(rows),
+            ..FieldExtras::default()
+        },
+    )
+}
+
 /// [`validated_field`] whose row also carries one [`Trailing`] control after
 /// the text box: the form for a field a small button supplies the value to,
 /// a folder picker beside a folder path. The control renders at the row's
@@ -682,6 +710,9 @@ struct FieldExtras<'a> {
     /// Whether the field's value renders as the masked stand-in
     /// ([`masked_validated_field`]).
     masked: bool,
+    /// Render the text box as a multi-line editor with this many rows, for a
+    /// value whose grammar carries line breaks.
+    rows: Option<usize>,
 }
 
 /// Shared body of the [`validated_field`] family: renders the labelled field,
@@ -703,6 +734,7 @@ fn validated_field_impl(
         warning,
         trailing,
         masked,
+        rows,
     } = extras;
     let (changed, rect, error) = ui
         .horizontal(|ui| {
@@ -717,11 +749,11 @@ fn validated_field_impl(
                 let mut r = if masked {
                     masked_stand_in(ui, !value.is_empty(), hint)
                 } else {
-                    ui.add(
-                        egui::TextEdit::singleline(value)
-                            .hint_text(hint)
-                            .desired_width(f32::INFINITY),
-                    )
+                    let edit = match rows {
+                        Some(rows) => egui::TextEdit::multiline(value).desired_rows(rows),
+                        None => egui::TextEdit::singleline(value),
+                    };
+                    ui.add(edit.hint_text(hint).desired_width(f32::INFINITY))
                 };
                 // The group caption (when the caller rendered one) reads before
                 // the field's own label, so the name of a field that repeats once
@@ -1105,9 +1137,13 @@ pub fn combo_str<S: AsRef<str>>(
     changed
 }
 
-/// Optional `Int32Range`: "set" checkbox + from/to DragValues ("N" when
-/// equal, "from-to" on the wire). Enabling starts a single-value range at
-/// the lower bound; the "to" half never drops below "from".
+/// Optional `Int32Range`: a "set" checkbox and one text field in the wire
+/// grammar — `1800` or `1800-1900`. Checking the box seeds the range start,
+/// and clearing the field to empty removes the value: an optional range needs
+/// a visible way to become absent, which two drag values cannot offer because
+/// they snap back to their stored number. Text that does not parse leaves the
+/// model alone and reverts when the field loses focus. Each half is clamped to
+/// `range` on commit.
 pub fn opt_range(
     ui: &mut egui::Ui,
     label: &str,
@@ -1115,31 +1151,77 @@ pub fn opt_range(
     range: std::ops::RangeInclusive<i32>,
 ) -> bool {
     let mut changed = false;
+    let field_id = ui.make_persistent_id(("opt-range", label));
     ui.horizontal(|ui| {
         let mut set = v.is_some();
         if ui.checkbox(&mut set, label).changed() {
-            *v = if set {
-                Some(Int32Range::single(*range.start()))
-            } else {
-                None
-            };
+            *v = set.then_some(Int32Range::single(*range.start()));
+            ui.data_mut(|data| {
+                data.insert_temp(
+                    field_id,
+                    RangeField::new(&Int32Range::single(*range.start())),
+                );
+            });
             changed = true;
         }
+        let mut clear = false;
         if let Some(r) = v.as_mut() {
-            changed |= ui
-                .add(egui::DragValue::new(&mut r.from).range(range.clone()))
-                .changed();
-            ui.label("–");
-            changed |= ui
-                .add(egui::DragValue::new(&mut r.to).range(range))
-                .changed();
-            if r.to < r.from {
-                r.to = r.from;
-                changed = true;
+            let mut field = ui
+                .data(|data| data.get_temp::<RangeField>(field_id))
+                .unwrap_or_else(|| RangeField::new(r));
+            let response = ui.add(egui::TextEdit::singleline(&mut field.text).desired_width(90.0));
+            if response.changed() {
+                let trimmed = field.text.trim();
+                if trimmed.is_empty() {
+                    clear = true;
+                } else if let Some(parsed) = Int32Range::parse(trimmed) {
+                    let from = parsed.from.clamp(*range.start(), *range.end());
+                    let to = parsed.to.clamp(*range.start(), *range.end()).max(from);
+                    let next = Int32Range::new(from, to);
+                    if next != *r {
+                        *r = next;
+                        changed = true;
+                    }
+                }
             }
+            if response.lost_focus() {
+                field.text = range_text(r);
+            }
+            if !clear {
+                ui.data_mut(|data| data.insert_temp(field_id, field));
+            }
+        }
+        if clear {
+            *v = None;
+            changed = true;
         }
     });
     changed
+}
+
+/// The edit buffer one [`opt_range`] field keeps between frames, so a value the
+/// field wrote does not have to be re-formatted from the model every frame and
+/// an in-progress edit survives the next repaint.
+#[derive(Clone)]
+struct RangeField {
+    text: String,
+}
+
+impl RangeField {
+    fn new(value: &Int32Range) -> Self {
+        Self {
+            text: range_text(value),
+        }
+    }
+}
+
+/// The wire spelling of a range: one number when both halves are equal.
+fn range_text(value: &Int32Range) -> String {
+    if value.from == value.to {
+        value.from.to_string()
+    } else {
+        format!("{}-{}", value.from, value.to)
+    }
 }
 
 /// Editable list of strings: one text field per row with a 🗑 remove button,
@@ -1840,6 +1922,55 @@ mod tests {
     use super::*;
     use crate::ui::test_rig::harness_builder;
     use egui_kittest::kittest::Queryable as _;
+
+    /// One optional range rendered alone, with the harness state holding the
+    /// model value the field writes.
+    fn range_harness(
+        value: Option<Int32Range>,
+    ) -> egui_kittest::Harness<'static, Option<Int32Range>> {
+        harness_builder().build_ui_state(
+            |ui, value: &mut Option<Int32Range>| {
+                opt_range(ui, "hMaxReusableSecs", value, 1..=86_400);
+            },
+            value,
+        )
+    }
+
+    /// The field's text is the wire grammar, so a typed range commits as one
+    /// value and clearing the text is the delete gesture.
+    #[test]
+    fn an_optional_range_takes_the_wire_grammar() {
+        let mut harness = range_harness(Some(Int32Range::single(1800)));
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("1800-1900");
+        harness.run();
+        assert_eq!(*harness.state(), Some(Int32Range::new(1800, 1900)));
+    }
+
+    /// Emptying the field removes the value instead of snapping back to the
+    /// stored number, which is what the drag-value pair could not express.
+    #[test]
+    fn clearing_an_optional_range_removes_the_value() {
+        let mut harness = range_harness(Some(Int32Range::single(1800)));
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness.key_press(egui::Key::Backspace);
+        harness.run();
+        assert_eq!(*harness.state(), None);
+    }
 
     /// The launched config is laid out as JSON: the job keeps the text byte
     /// for byte and paints several classes, and the palette follows the

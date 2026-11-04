@@ -7825,19 +7825,21 @@ impl ServersScreen {
                                 ),
                             );
                         }
-                        changed |= widgets::masked_validated_field(
+                        changed |= widgets::masked_validated_multiline(
                             ui,
                             t(lang, Key::SrvMasqueWarpPrivateKey),
                             &mut warp.private_key,
                             "",
+                            4,
                             |value| v_masque_warp_private_key(lang, value),
                             masked,
                         );
-                        changed |= widgets::masked_validated_field(
+                        changed |= widgets::masked_validated_multiline(
                             ui,
                             t(lang, Key::SrvMasqueWarpPublicKey),
                             &mut warp.public_key,
                             "",
+                            4,
                             |value| v_masque_warp_public_key(lang, value),
                             masked,
                         );

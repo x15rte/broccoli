@@ -40,6 +40,59 @@ where
     );
 }
 
+/// A PEM public key pasted into a single-line field, whose newlines the paste
+/// turned into spaces — the shape that used to reach the core unchanged.
+const SPACED_WARP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY----- MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG 7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w== -----END PUBLIC KEY-----";
+
+#[test]
+fn a_whitespace_joined_pem_block_canonicalises() {
+    let canonical =
+        canonicalize_pem_block(SPACED_WARP_PUBLIC_KEY).expect("a complete PEM block canonicalises");
+    assert!(canonical.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+    assert!(canonical.ends_with("-----END PUBLIC KEY-----"));
+    assert!(
+        canonical
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .all(|line| !line.contains(' ') && line.len() <= 64)
+    );
+    assert_eq!(canonicalize_pem_block(&canonical), Some(canonical));
+
+    assert_eq!(
+        canonicalize_pem_block("-----BEGIN PUBLIC KEY----- !!! -----END PUBLIC KEY-----"),
+        None,
+        "a body that is not base64 is not a PEM block the core can read"
+    );
+    assert_eq!(canonicalize_pem_block("MFkwEwYHKoZIzj0CAQ=="), None);
+}
+
+#[test]
+fn a_masque_warp_key_normalises_on_both_model_directions() {
+    let warp = crate::model::stream::MasqueWarp {
+        public_key: SPACED_WARP_PUBLIC_KEY.to_owned(),
+        ..Default::default()
+    };
+    let written = serde_json::to_value(&warp).unwrap();
+    let key = written["publicKey"]
+        .as_str()
+        .expect("the public key serialises");
+    assert!(key.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+
+    let parsed: crate::model::stream::MasqueWarp =
+        serde_json::from_value(json!({ "publicKey": SPACED_WARP_PUBLIC_KEY })).unwrap();
+    assert_eq!(parsed.public_key, key, "a load normalises the stored form");
+}
+
+#[test]
+fn a_spaced_pem_warp_key_is_the_shape_the_core_accepts() {
+    assert!(crate::model::outbound::masque_warp_key_shaped(
+        SPACED_WARP_PUBLIC_KEY
+    ));
+    assert!(!crate::model::outbound::masque_warp_key_shaped(
+        "-----BEGIN PUBLIC KEY----- !!! -----END PUBLIC KEY-----"
+    ));
+}
+
 #[test]
 fn int32_range_forms() {
     assert_eq!(

@@ -579,6 +579,45 @@ pub(crate) fn go_std_base64_decodes(value: &str) -> bool {
     go_std_base64_decode(value).is_some()
 }
 
+/// Rewrite one PEM block into its canonical form: text outside the block is
+/// dropped, the body loses every whitespace character and is re-wrapped at 64
+/// columns, and the header/footer labels are kept. `None` when the value
+/// carries no complete block or its body is not standard base64 — which is
+/// exactly the set the core's `pem.Decode` fallback path cannot read.
+pub fn canonicalize_pem_block(value: &str) -> Option<String> {
+    use base64::Engine as _;
+    const BEGIN: &str = "-----BEGIN ";
+    let start = value.find(BEGIN)?;
+    let after = &value[start + BEGIN.len()..];
+    let (label, rest) = after.split_once("-----")?;
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let footer = format!("-----END {label}-----");
+    let end = rest.find(&footer)?;
+    let body: String = rest[..end]
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(&body)
+        .ok()?;
+    let mut out = String::with_capacity(body.len() + label.len() + 40);
+    out.push_str(BEGIN);
+    out.push_str(label);
+    out.push_str("-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).ok()?);
+        out.push('\n');
+    }
+    out.push_str(&footer);
+    Some(out)
+}
+
 impl Int32Range {
     pub fn single(v: i32) -> Self {
         Self { from: v, to: v }
