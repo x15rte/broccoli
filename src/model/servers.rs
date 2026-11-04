@@ -619,25 +619,35 @@ impl ServersFile {
         }
         true
     }
-    /// Append a switched-off `[Manual]` snapshot of `id`: the subscription
-    /// row stays untouched, the copy never takes the active route, and a
-    /// refresh cannot reach it. Returns the copy's id.
-    pub fn copy_to_manual(&mut self, id: &str) -> Option<String> {
+    /// Append a switched-off snapshot of the subscription row `id` into the
+    /// manual group `group_id`; a missing or subscription group falls back to
+    /// `Manual`, which is the reserved manual group. The subscription row
+    /// stays untouched, the copy never takes the active route, and a refresh
+    /// cannot reach it. Returns the copy's id; a manual row has no
+    /// subscription snapshot to copy.
+    pub fn copy_to_manual(&mut self, id: &str, group_id: &str) -> Option<String> {
         let source = self
             .profiles
             .iter()
-            .find(|profile| profile.id == id)?
+            .find(|profile| profile.id == id && profile.origin.is_some())?
             .clone();
-        if source.group_id() == MANUAL_GROUP_ID {
-            return None;
-        }
+        let target = self
+            .groups
+            .iter()
+            .find(|group| group.id == group_id && group.kind() == GroupKind::Manual)
+            .map(|group| group.id.clone())
+            .unwrap_or_else(|| MANUAL_GROUP_ID.to_owned());
+        let title = self
+            .group_title_of(&target)
+            .unwrap_or(MANUAL_GROUP_TITLE)
+            .to_owned();
         let mut copy = source;
         copy.id = uuid::Uuid::new_v4().simple().to_string();
-        copy.group = MANUAL_GROUP_ID.into();
-        copy.group_title = MANUAL_GROUP_TITLE.into();
+        copy.group = target.clone();
+        copy.group_title = title;
         copy.enabled = false;
         copy.origin = None;
-        copy.name = self.unique_profile_name(MANUAL_GROUP_ID, &copy.name, None);
+        copy.name = self.unique_profile_name(&target, &copy.name, None);
         let id = copy.id.clone();
         self.profiles.push(copy);
         Some(id)
@@ -1964,10 +1974,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn copy_to_manual_appends_a_switched_off_snapshot() {
-        let feed = Group::new("Feed");
+    /// A subscription row and the file around it: `Feed` holds `Tokyo`, which
+    /// is the active route, and `Backup` already holds a `Tokyo` of its own so
+    /// a copy's name has to be suffixed.
+    fn copy_fixture() -> (ServersFile, ServerProfile, String, String) {
+        let mut feed = Group::new("Feed");
+        feed.subscription = Some(Subscription::default());
         let feed_id = feed.id.clone();
+        let backup = Group::new("Backup");
+        let backup_id = backup.id.clone();
         let mut sub = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         sub.group = feed_id.clone();
         sub.enabled = true;
@@ -1976,38 +1991,129 @@ mod tests {
             identity_key: "identity".into(),
             ..Default::default()
         });
+        let mut taken = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        taken.group = backup_id.clone();
         let mut servers = ServersFile {
             active: Some(sub.id.clone()),
-            profiles: vec![sub.clone()],
+            profiles: vec![sub.clone(), taken],
+            groups: vec![Group::manual(), backup, feed],
             ..ServersFile::default()
         };
-        servers.groups.push(feed);
         servers.hydrate_group_titles();
+        (servers, sub, feed_id, backup_id)
+    }
 
-        let copy_id = servers.copy_to_manual(&sub.id).expect("copied");
+    /// Every outbound tag the generated configuration carries.
+    fn generated_tags(servers: &ServersFile) -> Vec<String> {
+        let config = crate::r#gen::generate_with_api_port(
+            servers,
+            &crate::model::Settings::default(),
+            10853,
+        )
+        .expect("generate config");
+        config["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .filter_map(|outbound| outbound["tag"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn copy_to_group_places_a_switched_off_snapshot_in_the_chosen_group() {
+        let (mut servers, sub, feed_id, backup_id) = copy_fixture();
+        let source_index = servers
+            .profiles
+            .iter()
+            .position(|profile| profile.id == sub.id)
+            .expect("the source row");
+
+        let copy_id = servers
+            .copy_to_manual(&sub.id, &backup_id)
+            .expect("a subscription row is copied");
+        let copy = servers
+            .profiles
+            .iter()
+            .find(|profile| profile.id == copy_id)
+            .expect("the copy exists");
+        assert_eq!(copy.group_id(), backup_id);
+        assert_eq!(copy.group_title, "Backup");
+        assert_eq!(copy.name, "Tokyo (1)", "a used name takes the next suffix");
+        assert_eq!(copy.tag(), "[Backup] Tokyo (1)");
+        assert!(!copy.enabled, "the copy starts switched off");
+        assert!(copy.origin.is_none(), "a copy is not a subscription row");
+        assert_eq!(
+            servers.active.as_deref(),
+            Some(sub.id.as_str()),
+            "the copy never takes the route"
+        );
+
+        // The subscription row stays exactly where it was.
+        assert_eq!(
+            servers
+                .profiles
+                .iter()
+                .position(|profile| profile.id == sub.id),
+            Some(source_index),
+            "copying appends the copy and never moves the source"
+        );
+        let original = &servers.profiles[source_index];
+        assert_eq!(original.group_id(), feed_id);
+        assert_eq!(original.name, "Tokyo");
+        assert!(original.enabled);
+        assert!(original.origin.is_some());
+        assert!(
+            servers.copy_to_manual(&copy_id, &backup_id).is_none(),
+            "a manual row has no subscription snapshot to copy"
+        );
+
+        // A refresh of the subscription neither touches nor removes the
+        // copy: the feed still owns the original, and only the original.
+        let mut settings = Settings::default();
+        let entry = SubscriptionEntry {
+            profile: sub.clone(),
+            content_key: "content".into(),
+            identity_key: "identity".into(),
+        };
+        servers.refresh_subscription_group(&mut settings, &feed_id, vec![entry]);
+        let copy = servers
+            .profiles
+            .iter()
+            .find(|profile| profile.id == copy_id)
+            .expect("the copy survives a refresh");
+        assert_eq!(copy.tag(), "[Backup] Tokyo (1)");
+        assert!(!copy.enabled);
+
+        // The copy enters the configuration only when switched on.
+        assert!(
+            !generated_tags(&servers).contains(&"[Backup] Tokyo (1)".to_owned()),
+            "a switched-off copy stays out of the configuration"
+        );
+        servers
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == copy_id)
+            .expect("the copy exists")
+            .enabled = true;
+        assert!(
+            generated_tags(&servers).contains(&"[Backup] Tokyo (1)".to_owned()),
+            "switching the copy on emits it in its group's block"
+        );
+    }
+
+    #[test]
+    fn copy_to_group_defaults_to_the_manual_group() {
+        let (mut servers, sub, _, _) = copy_fixture();
+        let copy_id = servers
+            .copy_to_manual(&sub.id, MANUAL_GROUP_ID)
+            .expect("copied");
         let copy = servers
             .profiles
             .iter()
             .find(|profile| profile.id == copy_id)
             .expect("the copy exists");
         assert_eq!(copy.group_id(), MANUAL_GROUP_ID);
-        assert_eq!(copy.name, "Tokyo");
-        assert!(!copy.enabled);
-        assert!(copy.origin.is_none());
-        assert_eq!(
-            servers.active.as_deref(),
-            Some(sub.id.as_str()),
-            "the copy never takes the route"
-        );
-        assert!(
-            servers.copy_to_manual(&copy_id).is_none(),
-            "a manual row has no manual copy"
-        );
-
-        // A refresh of the subscription leaves the copy alone.
-        let mut settings = Settings::default();
-        servers.refresh_subscription_group(&mut settings, &feed_id, Vec::new());
-        assert!(servers.profiles.iter().any(|profile| profile.id == copy_id));
+        assert_eq!(copy.tag(), "[Manual] Tokyo");
     }
 
     #[test]

@@ -1836,6 +1836,14 @@ struct DeleteDialog {
     references: Vec<String>,
 }
 
+/// The Copy to group dialog: the subscription rows the copies are made of,
+/// captured in the selection's display order, and the manual group they land
+/// in. The target starts at the reserved `Manual` group.
+struct CopyDialog {
+    ids: Vec<String>,
+    target: String,
+}
+
 struct DeriveDialog {
     target: ToolTarget,
     private_key: String,
@@ -1895,6 +1903,9 @@ enum ListAction {
     Edit(String),
     /// Share every selected row (one link per row on the clipboard).
     ExportSelection,
+    /// Open the manual-group picker that copies every selected subscription
+    /// row into it.
+    CopySelection,
     /// Delete every selected row behind one confirmation.
     DeleteSelection,
     ProbeLatency(String),
@@ -2159,6 +2170,8 @@ pub struct ServersScreen {
     /// worker failure; shown inline in the import dialog.
     import_parse_error: Option<String>,
     qr_dialog: Option<QrDialog>,
+    /// The Copy to group picker; `Some` while it is on screen.
+    copy_dialog: Option<CopyDialog>,
     delete_pending: Option<DeleteDialog>,
     derive_dialog: Option<DeriveDialog>,
     /// Staged leave action awaiting the unsaved-changes modal (see
@@ -4272,6 +4285,24 @@ impl ServersScreen {
                                 action = Some(ListAction::ProbeLatency(id.clone()));
                                 ui.close();
                             }
+                            // A copy is made of subscription rows only; a
+                            // manual row has nothing a refresh could take
+                            // away.
+                            let copyable = self.selection.iter().any(|selected| {
+                                profiles.iter().any(|profile| {
+                                    profile.id == *selected && profile.origin.is_some()
+                                })
+                            });
+                            if ui
+                                .add_enabled(
+                                    copyable,
+                                    egui::Button::new(t(lang, Key::SrvCopyToGroup)),
+                                )
+                                .clicked()
+                            {
+                                action = Some(ListAction::CopySelection);
+                                ui.close();
+                            }
                             if ui.button(t(lang, Key::SrvEnableSelected)).clicked() {
                                 action = Some(ListAction::SetSelectionEnabled(true));
                                 ui.close();
@@ -4369,6 +4400,7 @@ impl ServersScreen {
         let typing = ui.memory(|memory| memory.focused().is_some());
         let overlay_open = self.delete_pending.is_some()
             || self.group_delete_pending.is_some()
+            || self.copy_dialog.is_some()
             || self.leave_pending.is_some()
             || self.qr_dialog.is_some()
             || self.derive_dialog.is_some();
@@ -4446,6 +4478,9 @@ impl ServersScreen {
             }
             Some(ListAction::ExportSelection) => {
                 self.export_rows(ui, ctx, lang, &selected_ids);
+            }
+            Some(ListAction::CopySelection) => {
+                self.open_copy_dialog(&selected_ids, ctx.servers);
             }
             Some(ListAction::DeleteSelection) => {
                 self.open_delete_dialog(ctx.servers, ctx.settings, lang, selected_ids);
@@ -4849,6 +4884,33 @@ impl ServersScreen {
             ids,
             name,
             references,
+        });
+    }
+
+    /// Open the Copy to group picker for the selection's subscription rows,
+    /// in display order. The dialog is exclusive like the delete
+    /// confirmation; rows with no origin keys are not copies the feed could
+    /// later compete with and are skipped.
+    fn open_copy_dialog(&mut self, ids: &[String], servers: &ServersFile) {
+        if self.copy_dialog.is_some() {
+            return;
+        }
+        let ids: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                servers
+                    .profiles
+                    .iter()
+                    .any(|profile| &profile.id == *id && profile.origin.is_some())
+            })
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.copy_dialog = Some(CopyDialog {
+            ids,
+            target: crate::model::servers::MANUAL_GROUP_ID.to_owned(),
         });
     }
 
@@ -9485,6 +9547,62 @@ impl ServersScreen {
                 self.finish_group_dialog(lang, ctx, uictx);
             } else if close_requested {
                 self.group_dialog = None;
+            }
+        }
+        // Copy to group. The picker lists the manual groups only, with
+        // `Manual` preselected; the dialog is the only place a copy's target
+        // is chosen.
+        if self.copy_dialog.is_some() {
+            let mut commit = false;
+            let mut cancel = false;
+            let close_requested = popup::show(
+                ctx,
+                "servers.copy-dialog",
+                t(lang, Key::SrvCopyToGroup),
+                [420.0, 220.0],
+                false,
+                |ui| {
+                    let dialog = self.copy_dialog.as_mut().expect("the dialog is open");
+                    ui.label(t(lang, Key::SrvTableGroup));
+                    for group in &uictx.servers.groups {
+                        if group.kind() != crate::model::servers::GroupKind::Manual {
+                            continue;
+                        }
+                        ui.radio_value(&mut dialog.target, group.id.clone(), &group.title);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(t(lang, Key::SrvCopyToGroupConfirm)).clicked() {
+                            commit = true;
+                        }
+                        if ui.button(t(lang, Key::Cancel)).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+            if commit {
+                let dialog = self.copy_dialog.take().expect("the dialog is open");
+                let mut copied = 0usize;
+                for id in &dialog.ids {
+                    if uictx.servers.copy_to_manual(id, &dialog.target).is_some() {
+                        copied += 1;
+                    }
+                }
+                if copied > 0 {
+                    let title = uictx
+                        .servers
+                        .group_title_of(&dialog.target)
+                        .unwrap_or(crate::model::servers::MANUAL_GROUP_TITLE)
+                        .to_owned();
+                    uictx.hooks.mark_dirty();
+                    self.set_status(StatusLine::ok(t_fmt(
+                        lang,
+                        Key::SrvCopiedToGroup,
+                        &[&copied, &title],
+                    )));
+                }
+            } else if cancel || close_requested {
+                self.copy_dialog = None;
             }
         }
         // Delete-group confirmation. Only a group tab opens it: the default
@@ -20382,6 +20500,350 @@ Authentication: ML-KEM-768, Post-Quantum
                 .accesskit_node()
                 .is_disabled(),
             "one selected row enables Set active"
+        );
+    }
+
+    /// A subscription row `Tokyo` in `Feed` as the active route, a plain
+    /// manual `Alpha`, and a manual `Backup` group that already holds a
+    /// `Tokyo` of its own so a copy's name has to be suffixed.
+    fn copy_rig() -> (UiTestRig, String, String) {
+        use crate::model::servers::{Group, ProfileOrigin, Subscription};
+        let mut rig = UiTestRig::default();
+        let mut feed = Group::new("Feed");
+        feed.subscription = Some(Subscription::default());
+        let feed_id = feed.id.clone();
+        let backup = Group::new("Backup");
+        let backup_id = backup.id.clone();
+        let mut alpha = ServerProfile::new("Alpha", OutboundModel::new(Protocol::Freedom));
+        alpha.enabled = true;
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        tokyo.group = feed_id.clone();
+        tokyo.origin = Some(ProfileOrigin {
+            content_key: "content".into(),
+            identity_key: "identity".into(),
+            ..Default::default()
+        });
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        osaka.enabled = true;
+        osaka.group = feed_id.clone();
+        osaka.origin = Some(ProfileOrigin {
+            content_key: "osaka".into(),
+            identity_key: "osaka".into(),
+            ..Default::default()
+        });
+        let mut taken = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        taken.group = backup_id;
+        let source_id = tokyo.id.clone();
+        rig.servers.profiles = vec![alpha, tokyo, osaka, taken];
+        rig.servers.groups = vec![Group::manual(), backup, feed];
+        rig.servers.active = Some(source_id.clone());
+        rig.servers.hydrate_group_titles();
+        (rig, feed_id, source_id)
+    }
+
+    /// Whether the radio button `label` is the checked one.
+    fn radio_checked(harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str) -> bool {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::RadioButton, label)
+            .accesskit_node()
+            .toggled()
+            .is_some_and(|toggled| matches!(toggled, egui::accesskit::Toggled::True))
+    }
+
+    #[test]
+    fn copy_to_group_is_available_only_on_subscription_rows() {
+        let (rig, _, _) = copy_rig();
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+
+        // A manual row shown on `Emitted` is not a subscription row.
+        harness.get_by_label("Alpha").click_secondary();
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_label(t(Language::En, Key::SrvCopyToGroup))
+                .last()
+                .expect("the row menu offers Copy to group")
+                .accesskit_node()
+                .is_disabled(),
+            "a manual row cannot be copied"
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("Move to group")
+                .next()
+                .is_none(),
+            "the screen has no Move to group command"
+        );
+
+        // The subscription row offers it.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        assert!(
+            !harness
+                .get_all_by_label(t(Language::En, Key::SrvCopyToGroup))
+                .last()
+                .expect("the row menu offers Copy to group")
+                .accesskit_node()
+                .is_disabled(),
+            "a subscription row can be copied"
+        );
+    }
+
+    #[test]
+    fn copy_to_group_places_a_switched_off_copy_in_the_picked_group() {
+        use crate::model::servers::{GroupKind, MANUAL_GROUP_ID, SubscriptionEntry};
+        let (rig, feed_id, source_id) = copy_rig();
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+        let source_index = harness
+            .state()
+            .1
+            .servers
+            .profiles
+            .iter()
+            .position(|profile| profile.id == source_id)
+            .expect("the subscription row");
+        let rows = harness.state().1.servers.profiles.len();
+
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvCopyToGroup))
+            .last()
+            .expect("the row menu offers Copy to group")
+            .click();
+        harness.run();
+
+        // The picker opens on `Manual` and offers manual groups alone.
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .copy_dialog
+                .as_ref()
+                .expect("the picker opens")
+                .target,
+            MANUAL_GROUP_ID,
+            "Manual is preselected"
+        );
+        assert!(radio_checked(&harness, "Manual"));
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::RadioButton, "Feed")
+                .is_none(),
+            "a subscription group is not a copy target"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::RadioButton, "Backup")
+            .click();
+        harness.run();
+        assert!(radio_checked(&harness, "Backup"));
+        assert!(!radio_checked(&harness, "Manual"));
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvCopyToGroupConfirm))
+            .click();
+        harness.run();
+        assert!(
+            harness.state().0.copy_dialog.is_none(),
+            "the picker closes on Copy"
+        );
+
+        // One switched-off copy lands in `Backup`; the subscription row and
+        // the active route stay exactly as they were.
+        let state = harness.state();
+        let servers = &state.1.servers;
+        assert_eq!(servers.profiles.len(), rows + 1, "one copy per row");
+        let copy = servers
+            .profiles
+            .iter()
+            .filter(|profile| profile.name == "Tokyo (1)")
+            .collect::<Vec<_>>();
+        assert_eq!(copy.len(), 1, "the used name takes the usual suffix");
+        let copy = copy[0];
+        let backup = servers
+            .groups
+            .iter()
+            .find(|group| group.title == "Backup")
+            .expect("the target group");
+        assert_eq!(GroupKind::Manual, backup.kind());
+        assert_eq!(copy.group_id(), backup.id);
+        assert_eq!(
+            copy.tag(),
+            "[Backup] Tokyo (1)",
+            "the target title prefixes the copy"
+        );
+        assert!(!copy.enabled, "the copy starts switched off");
+        assert!(copy.origin.is_none(), "a copy is not a subscription row");
+        assert_eq!(
+            servers
+                .profiles
+                .iter()
+                .position(|profile| profile.id == source_id),
+            Some(source_index),
+            "the subscription row keeps its position"
+        );
+        let source = &servers.profiles[source_index];
+        assert_eq!(
+            source.group_id(),
+            feed_id,
+            "the subscription row keeps its group"
+        );
+        assert!(source.enabled, "the subscription row keeps its switch");
+        assert!(source.origin.is_some(), "the feed still owns the row");
+        assert_eq!(
+            servers.active.as_deref(),
+            Some(source_id.as_str()),
+            "the copy never takes the active route"
+        );
+        assert!(state.1.requests.dirty, "copying is a model edit");
+
+        // The copy shows in its target's tab and in `All`, off `Emitted`.
+        harness.run();
+        harness.get_by_label("Backup").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Tokyo (1)").is_some(),
+            "the copy appears in its target group's tab"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Tokyo (1)").is_some(),
+            "the copy appears in All"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Tokyo (1)").is_none(),
+            "a switched-off copy stays out of the configuration"
+        );
+
+        // A refresh of the subscription leaves the copy alone.
+        let entry = {
+            let source = harness
+                .state()
+                .1
+                .servers
+                .profiles
+                .iter()
+                .find(|profile| profile.id == source_id)
+                .expect("the subscription row")
+                .clone();
+            SubscriptionEntry {
+                profile: source,
+                content_key: "content".into(),
+                identity_key: "identity".into(),
+            }
+        };
+        let mut settings = crate::model::Settings::default();
+        harness.state_mut().1.servers.refresh_subscription_group(
+            &mut settings,
+            &feed_id,
+            vec![entry],
+        );
+        harness.run();
+        let state = harness.state();
+        let copy = state
+            .1
+            .servers
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "Tokyo (1)")
+            .expect("a refresh neither deletes nor renames the copy");
+        assert_eq!(copy.tag(), "[Backup] Tokyo (1)");
+        assert!(!copy.enabled, "a refresh never switches a copy on");
+    }
+
+    #[test]
+    fn copy_to_group_copies_every_selected_subscription_row() {
+        use crate::model::servers::MANUAL_GROUP_ID;
+        let (rig, feed_id, source_id) = copy_rig();
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+        let osaka_id = harness
+            .state()
+            .1
+            .servers
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "Osaka")
+            .expect("the second subscription row")
+            .id
+            .clone();
+
+        // A mixed batch: the manual row is selected too, and stays behind.
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Tokyo", egui::Modifiers::CTRL);
+        click_row_with(&mut harness, "Osaka", egui::Modifiers::CTRL);
+        assert_eq!(selected_names(&harness), ["Alpha", "Osaka", "Tokyo"]);
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvCopyToGroup))
+            .last()
+            .expect("the row menu offers Copy to group")
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvCopyToGroupConfirm))
+            .click();
+        harness.run();
+
+        let state = harness.state();
+        let servers = &state.1.servers;
+        let copies: Vec<&ServerProfile> = servers
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.group_id() == MANUAL_GROUP_ID
+                    && !profile.enabled
+                    && profile.origin.is_none()
+            })
+            .collect();
+        assert_eq!(copies.len(), 2, "one copy per selected subscription row");
+        assert_eq!(
+            copies
+                .iter()
+                .map(|copy| copy.tag())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "[Manual] Osaka".to_owned(),
+                "[Manual] Tokyo".to_owned(),
+            ]),
+            "the default target is Manual"
+        );
+        let alpha = servers
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "Alpha")
+            .expect("the manual row stays");
+        assert!(
+            alpha.enabled && alpha.group_id() == MANUAL_GROUP_ID,
+            "a manual row in the selection is neither copied nor changed"
+        );
+        for id in [&source_id, &osaka_id] {
+            let original = servers
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == id)
+                .expect("the subscription row stays");
+            assert_eq!(original.group_id(), feed_id);
+            assert!(original.enabled);
+            assert!(original.origin.is_some());
+        }
+        assert_eq!(
+            servers.active.as_deref(),
+            Some(source_id.as_str()),
+            "copying never changes the active route"
         );
     }
 
