@@ -491,13 +491,39 @@ impl<'a> ServersCtx<'a> {
     /// builtins resolve inside the child, anything else fails loudly at
     /// config generation, exactly like the all-profile probe.
     pub fn request_latency_probe_for(&mut self, profile: ServerProfile) -> Result<(), String> {
+        self.request_latency_probe_for_profiles(vec![profile])
+    }
+
+    /// Launch the same isolated probe over a selection of profiles: every
+    /// target stays first in its given order, then the chain dependencies
+    /// they need, de-duplicated by tag so a shared hop rides along once.
+    pub fn request_latency_probe_for_profiles(
+        &mut self,
+        profiles: Vec<ServerProfile>,
+    ) -> Result<(), String> {
+        if profiles.is_empty() {
+            let lang = self.settings.language;
+            return Err(t(lang, Key::LatencyRequiresProfile).to_string());
+        }
         // The chain a probe child needs is a graph question, not a walk over
         // the model: the same resolution the generator and the validation
         // pass use, so a hop a builtin resolves and a dangling reference are
         // read the same way everywhere.
         let graph = crate::model::dial::DialGraph::for_profiles(&self.servers.profiles);
-        let mut chain = vec![profile];
-        chain.extend(graph.dependencies(&chain[0].tag()).into_iter().cloned());
+        let mut seen = std::collections::HashSet::with_capacity(profiles.len());
+        let mut chain: Vec<ServerProfile> = profiles
+            .into_iter()
+            .filter(|profile| seen.insert(profile.tag()))
+            .collect();
+        let targets = chain.len();
+        for index in 0..targets {
+            let tag = chain[index].tag();
+            for dependency in graph.dependencies(&tag) {
+                if seen.insert(dependency.tag()) {
+                    chain.push(dependency.clone());
+                }
+            }
+        }
         self.send_latency_probe(chain)
     }
 

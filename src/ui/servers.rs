@@ -1824,10 +1824,14 @@ struct QrDialog {
 
 /// State captured once when the delete-confirmation dialog opens. The dialog
 /// is modal: its inputs (the profile set, routing rules, balancers) cannot
-/// change while it is open, so the name and the reference scan are computed a
+/// change while it is open, so the names and the reference scan are computed a
 /// single time instead of on every repaint.
 struct DeleteDialog {
-    id: String,
+    /// Every profile the one confirmation deletes, in the selection's display
+    /// order.
+    ids: Vec<String>,
+    /// The dialog's subject: the row's name for a single delete, or the
+    /// selected count for a batch.
     name: String,
     references: Vec<String>,
 }
@@ -1871,16 +1875,32 @@ impl StatusLine {
 }
 
 enum ListAction {
+    /// A plain click: focus and select one row, collapsing the selection.
     Select(String),
+    /// A Ctrl-click: add or remove the row from the selection.
+    ToggleSelection(String),
+    /// A Shift-click: select the visible range from the anchor to the row.
+    ExtendSelection(String),
+    /// Ctrl+A: select every row the current tab shows.
+    SelectAllVisible,
+    /// A click on empty space: drop the selection.
+    ClearSelection,
     SetActive(String),
     /// Flip the profile's switch. The active profile and a chain-only hop are
     /// locked; the handler re-checks both.
     ToggleEnabled(String),
+    /// Set the switch on every selected row, skipping locked rows.
+    SetSelectionEnabled(bool),
     /// Open the editor window on one profile.
     Edit(String),
-    Export(String),
-    Delete(String),
+    /// Share every selected row (one link per row on the clipboard).
+    ExportSelection,
+    /// Delete every selected row behind one confirmation.
+    DeleteSelection,
     ProbeLatency(String),
+    /// Probe the selection, or the whole current tab when nothing is
+    /// selected.
+    ProbeLatencySelection,
     /// Move the dragged profile (its index in the list as drawn) to a sibling
     /// inside its own group: `before` names the row it lands ahead of, or its
     /// block's tail. A cross-block drop never reaches this action.
@@ -2049,9 +2069,16 @@ struct TabRowsCache {
 #[derive(Default)]
 pub struct ServersScreen {
     selected: Option<String>,
-    /// Whether the opening selection was filled in. The screen selects the
-    /// active server (or the first row) once; switching tabs clears the
-    /// selection and does not bring it back.
+    /// The rows selected in the current tab, by profile id. Scoped to the tab
+    /// and to what the search shows: a row that leaves the visible set leaves
+    /// the selection, and a tab switch clears it.
+    selection: std::collections::BTreeSet<String>,
+    /// The row a Shift-click extends from. `None` until a plain or Ctrl click
+    /// names one.
+    selection_anchor: Option<String>,
+    /// Whether the opening focus was filled in. The screen focuses the active
+    /// server (or the first row) once; switching tabs clears the focus and
+    /// does not bring it back.
     selection_initialized: bool,
     /// The active tab. Opening the screen starts on `Emitted`.
     view: ServerTab,
@@ -3425,12 +3452,14 @@ impl ServersScreen {
         self.poll_subscription_fetch(lang, ctx);
         self.poll_xray_tool(lang);
         self.consume_latency_probe_result(ctx);
-        // Keep the selection and the open editor pointing at a real profile.
+        // Keep the focus, the multi-selection and the open editor pointing at
+        // real profiles.
         if let Some(id) = &self.selected
             && !ctx.servers.profiles.iter().any(|profile| &profile.id == id)
         {
             self.selected = None;
         }
+        self.retain_existing_selection(ctx.servers);
         if self.existing.draft().is_some_and(|draft| {
             !ctx.servers
                 .profiles
@@ -3483,6 +3512,8 @@ impl ServersScreen {
         }
         self.view = tab;
         self.selected = None;
+        self.selection.clear();
+        self.selection_anchor = None;
         self.view_sort = None;
         self.tab_rows_cache = None;
     }
@@ -3855,14 +3886,7 @@ impl ServersScreen {
                     .on_disabled_hover_text(can_test_latency.1)
             };
             if test_latency.clicked() {
-                self.latency_probe_feedback = None;
-                match ctx.request_latency_probe() {
-                    Ok(()) => {
-                        self.pending_latency_probe = Some(false);
-                        self.latency_probe = Request::park_in_shell();
-                    }
-                    Err(error) => self.latency_probe_feedback = Some((FeedbackLevel::Err, error)),
-                }
+                action = Some(ListAction::ProbeLatencySelection);
             }
             if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
                 // Ascending latency inside each group; timeouts and
@@ -3872,6 +3896,44 @@ impl ServersScreen {
                 // names a server id and does not follow the row order.
                 ctx.servers.sort_rows_by_latency();
                 ctx.hooks.mark_dirty();
+            }
+            // The batch commands act on the selection, so they wait for one.
+            let has_selection = !self.selection.is_empty();
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(t(lang, Key::SrvEnableSelected)),
+                )
+                .clicked()
+            {
+                action = Some(ListAction::SetSelectionEnabled(true));
+            }
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(t(lang, Key::SrvDisableSelected)),
+                )
+                .clicked()
+            {
+                action = Some(ListAction::SetSelectionEnabled(false));
+            }
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(t(lang, Key::SrvShareSelected)),
+                )
+                .clicked()
+            {
+                action = Some(ListAction::ExportSelection);
+            }
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(t(lang, Key::SrvDeleteSelected)),
+                )
+                .clicked()
+            {
+                action = Some(ListAction::DeleteSelection);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
@@ -4000,6 +4062,10 @@ impl ServersScreen {
                 .expect("the row details were cached above")
                 .1,
         );
+        // Whether a row took the pointer's primary click this frame: a click
+        // the rows did not take falls to the empty space below them and
+        // clears the selection.
+        let mut row_hit = false;
         if display_rows.is_empty() {
             egui::ScrollArea::vertical()
                 .id_salt(ui.auto_id_with("servers.list.scroll"))
@@ -4073,7 +4139,7 @@ impl ServersScreen {
                     for display in rows {
                         let index = display_rows[display];
                         let p = &profiles[index];
-                        let is_sel = self.selected.as_deref() == Some(p.id.as_str());
+                        let is_sel = self.selection.contains(p.id.as_str());
                         let is_active = ctx.servers.active.as_deref() == Some(p.id.as_str());
                         // Latency badge text is memoized per profile:
                         // formatting runs only when the row's latency,
@@ -4133,10 +4199,15 @@ impl ServersScreen {
                         // threshold lifts this row: the row's own drag sense
                         // hands egui the payload, whose index the drop half
                         // reads. The active server is pinned first by the
-                        // generated order, so its row never lifts. Egui clears
-                        // the payload on release or Escape, so the gesture
-                        // ends even when the window loses focus mid-drag.
+                        // generated order, so its row never lifts. A press
+                        // held with a selection modifier is a select gesture,
+                        // never a drag. Egui clears the payload on release or
+                        // Escape, so the gesture ends even when the window
+                        // loses focus mid-drag.
+                        let modifiers = ui.input(|i| i.modifiers);
+                        let modified = modifiers.command || modifiers.ctrl || modifiers.shift;
                         if clicks.row.drag_started_by(egui::PointerButton::Primary)
+                            && !modified
                             && self.view == ServerTab::Emitted
                             && !is_active
                         {
@@ -4147,7 +4218,14 @@ impl ServersScreen {
                         } else if clicks.double_clicked() {
                             action = Some(ListAction::Edit(p.id.clone()));
                         } else if clicks.name.clicked() || clicks.row.clicked() {
-                            action = Some(ListAction::Select(p.id.clone()));
+                            row_hit = true;
+                            action = Some(if modifiers.command || modifiers.ctrl {
+                                ListAction::ToggleSelection(p.id.clone())
+                            } else if modifiers.shift {
+                                ListAction::ExtendSelection(p.id.clone())
+                            } else {
+                                ListAction::Select(p.id.clone())
+                            });
                         }
                         // The row under the pointer proposes the gap: above
                         // its midline inserts before it, below inserts after
@@ -4165,16 +4243,28 @@ impl ServersScreen {
                             }
                         }
                         last_row_bottom = Some(clicks.row.rect.bottom());
-                        // The menu clones the id only when an action is actually
-                        // clicked, so borrow the row's id instead of cloning the
-                        // 36-char String on every repaint.
+                        // The menu clones the id only when an action is
+                        // actually clicked, so borrow the row's id instead of
+                        // cloning the 36-char String on every repaint. The
+                        // batch commands read the screen's selection, which the
+                        // menu replaces with this row when it opens on a row
+                        // outside it.
                         let id = &p.id;
                         let mut menu = |ui: &mut egui::Ui| {
+                            if !self.selection.contains(id.as_str()) {
+                                self.selection.clear();
+                                self.selection.insert(id.clone());
+                                self.selection_anchor = Some(id.clone());
+                            }
                             if ui.button(t(lang, Key::SrvEdit)).clicked() {
                                 action = Some(ListAction::Edit(id.clone()));
                                 ui.close();
                             }
-                            if ui.button(t(lang, Key::SrvSetActive)).clicked() {
+                            let set_active = ui.add_enabled(
+                                self.is_single_selection(id),
+                                egui::Button::new(t(lang, Key::SrvSetActive)),
+                            );
+                            if set_active.clicked() {
                                 action = Some(ListAction::SetActive(id.clone()));
                                 ui.close();
                             }
@@ -4182,12 +4272,20 @@ impl ServersScreen {
                                 action = Some(ListAction::ProbeLatency(id.clone()));
                                 ui.close();
                             }
+                            if ui.button(t(lang, Key::SrvEnableSelected)).clicked() {
+                                action = Some(ListAction::SetSelectionEnabled(true));
+                                ui.close();
+                            }
+                            if ui.button(t(lang, Key::SrvDisableSelected)).clicked() {
+                                action = Some(ListAction::SetSelectionEnabled(false));
+                                ui.close();
+                            }
                             if ui.button(t(lang, Key::SrvShare)).clicked() {
-                                action = Some(ListAction::Export(id.clone()));
+                                action = Some(ListAction::ExportSelection);
                                 ui.close();
                             }
                             if ui.button(t(lang, Key::SrvDeleteEllipsis)).clicked() {
-                                action = Some(ListAction::Delete(id.clone()));
+                                action = Some(ListAction::DeleteSelection);
                                 ui.close();
                             }
                         };
@@ -4255,6 +4353,50 @@ impl ServersScreen {
                 });
         }
 
+        // A click in the empty band below a short list clears the selection.
+        if !row_hit && self.delete_pending.is_none() {
+            let blank = ui.allocate_response(
+                egui::vec2(ui.available_width(), ui.available_height().max(0.0)),
+                egui::Sense::click(),
+            );
+            if blank.clicked() {
+                action = Some(ListAction::ClearSelection);
+            }
+        }
+        // The table owns Ctrl+A and Enter only while no text field holds
+        // focus (the search box's own select-all stays its own) and no dialog
+        // is asking a question.
+        let typing = ui.memory(|memory| memory.focused().is_some());
+        let overlay_open = self.delete_pending.is_some()
+            || self.group_delete_pending.is_some()
+            || self.leave_pending.is_some()
+            || self.qr_dialog.is_some()
+            || self.derive_dialog.is_some();
+        if !typing && !overlay_open {
+            if ui
+                .input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::A))
+            {
+                action = Some(ListAction::SelectAllVisible);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && self.selection.len() == 1
+                && let Some(id) = self.selection.iter().next()
+            {
+                action = Some(ListAction::SetActive(id.clone()));
+            }
+        }
+        // A row the tab no longer shows — filtered out, or gone with its
+        // group — leaves the selection before any command reads it.
+        self.retain_visible_selection(&display_rows, profiles);
+        // The selection in display order, the order every batch command
+        // applies.
+        let selected_ids: Vec<String> = display_rows
+            .iter()
+            .map(|&index| &profiles[index])
+            .filter(|profile| self.selection.contains(profile.id.as_str()))
+            .map(|profile| profile.id.clone())
+            .collect();
+
         // apply deferred list actions (needs &mut profiles)
         match action {
             Some(ListAction::Select(id)) => {
@@ -4262,21 +4404,51 @@ impl ServersScreen {
                 // and its resolution performs the selection.
                 self.guard_select(id);
             }
+            Some(ListAction::ToggleSelection(id)) => self.toggle_selection(&id),
+            Some(ListAction::ExtendSelection(id)) => {
+                self.extend_selection(&id, &display_rows, profiles);
+            }
+            Some(ListAction::SelectAllVisible) => {
+                self.select_all_visible(&display_rows, profiles);
+            }
+            Some(ListAction::ClearSelection) => {
+                self.selection.clear();
+                self.selection_anchor = None;
+                self.selected = None;
+            }
             Some(ListAction::ProbeLatency(id)) => {
-                // One clone ends the immutable profile borrow so the mutable
-                // request can go out; the probe owns the profile from here.
-                if let Some(profile) = ctx.servers.profiles.iter().find(|p| p.id == id).cloned() {
-                    self.latency_probe_feedback = None;
-                    match ctx.request_latency_probe_for(profile) {
-                        Ok(()) => {
-                            self.pending_latency_probe = Some(true);
-                            self.latency_probe = Request::park_in_shell();
-                        }
-                        Err(error) => {
-                            self.latency_probe_feedback = Some((FeedbackLevel::Err, error))
-                        }
-                    }
-                }
+                // A menu opened on a row outside the selection replaced the
+                // selection with that row first; a menu click inside a
+                // multi-selection probes the whole selection.
+                let ids = if self.selection.len() > 1 {
+                    selected_ids.clone()
+                } else {
+                    vec![id]
+                };
+                self.probe_rows(ctx, &ids, ids.len() == 1);
+            }
+            Some(ListAction::ProbeLatencySelection) => {
+                // The toolbar command targets the selection, or the whole
+                // current tab when nothing is selected. Its feedback always
+                // names the target count, even when the target is one row.
+                let ids = if selected_ids.is_empty() {
+                    display_rows
+                        .iter()
+                        .map(|&index| profiles[index].id.clone())
+                        .collect()
+                } else {
+                    selected_ids.clone()
+                };
+                self.probe_rows(ctx, &ids, false);
+            }
+            Some(ListAction::SetSelectionEnabled(enabled)) => {
+                self.set_selected_enabled(ctx, &selected_ids, enabled);
+            }
+            Some(ListAction::ExportSelection) => {
+                self.export_rows(ui, ctx, lang, &selected_ids);
+            }
+            Some(ListAction::DeleteSelection) => {
+                self.open_delete_dialog(ctx.servers, ctx.settings, lang, selected_ids);
             }
             Some(ListAction::SetActive(id)) => {
                 // The active profile is the list's first row (the config's
@@ -4289,17 +4461,13 @@ impl ServersScreen {
             }
             Some(ListAction::Edit(id)) => self.open_editor(ctx.servers, lang, &id),
             Some(ListAction::ToggleEnabled(id)) => {
-                let active = ctx.servers.active.as_deref() == Some(id.as_str());
-                if !active && let Some(index) = ctx.servers.profiles.iter().position(|p| p.id == id)
-                {
-                    // A chain-only hop is locked off: it is already on the
-                    // wire, and switching it off would not remove it.
-                    let chain_only = ctx.servers.emitted_set().chain_only.contains(&index);
-                    if !chain_only {
-                        ctx.servers.profiles[index].enabled = !ctx.servers.profiles[index].enabled;
-                        ctx.hooks.mark_dirty();
-                    }
-                }
+                let enabled = ctx
+                    .servers
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .is_some_and(|profile| !profile.enabled);
+                self.set_enabled_rows(ctx, std::slice::from_ref(&id), enabled);
             }
             Some(ListAction::MoveInGroup { from, before }) => {
                 // The payload index was read off this frame's list; a list
@@ -4307,50 +4475,11 @@ impl ServersScreen {
                 // profile) simply drops the move. The model refuses a
                 // destination another group owns and reports whether the
                 // stored order actually changed.
-                if ctx.servers.move_profile_in_group(from, before) {
+                let moved = ctx.servers.move_profile_in_group(from, before);
+                if moved {
                     ctx.hooks.mark_dirty();
                 }
             }
-            Some(ListAction::Export(id)) => {
-                if let Some(p) = ctx.servers.profiles.iter().find(|p| p.id == id) {
-                    match links::to_link(p) {
-                        Ok(link) => {
-                            ui.ctx().copy_text(link.clone());
-                            self.qr_dialog = Some(QrDialog {
-                                name: p.name.clone(),
-                                link,
-                                tex: None,
-                            });
-                            self.set_status(StatusLine::ok(t(lang, Key::SrvLinkCopiedToClipboard)));
-                        }
-                        Err(e) => {
-                            self.set_status(StatusLine::err(t_fmt(
-                                lang,
-                                Key::SrvExportFailed,
-                                &[&e.text(lang)],
-                            )));
-                        }
-                    }
-                }
-            }
-            Some(ListAction::Delete(id)) if self.delete_pending.is_none() => {
-                // Snapshot everything the confirmation dialog needs at open
-                // time: the dialog is modal, so its inputs (profile set,
-                // routing rules, balancers) cannot change while it is open,
-                // and the linear reference scan must not repeat per repaint.
-                self.delete_pending = Some(DeleteDialog {
-                    name: ctx
-                        .servers
-                        .profiles
-                        .iter()
-                        .find(|p| p.id == id)
-                        .map(|p| p.name.clone())
-                        .unwrap_or_default(),
-                    references: server_reference_paths(ctx.servers, ctx.settings, &id),
-                    id,
-                });
-            }
-            Some(ListAction::Delete(_)) => {}
             None => {}
         }
     }
@@ -4406,28 +4535,321 @@ impl ServersScreen {
             .is_some_and(|gate| gate.changed_from_source)
     }
 
+    /// Focus one row and make it the sole selection: the plain-click,
+    /// editor-open and resolved leave-action path.
+    fn focus_row(&mut self, id: &str) {
+        self.selected = Some(id.to_owned());
+        self.selection.clear();
+        self.selection.insert(id.to_owned());
+        self.selection_anchor = Some(id.to_owned());
+    }
+
+    /// Drop every selected id no profile backs any more, so a deleted profile
+    /// cannot be acted on through a stale selection.
+    fn retain_existing_selection(&mut self, servers: &ServersFile) {
+        self.selection
+            .retain(|id| servers.profiles.iter().any(|profile| &profile.id == id));
+        if self
+            .selection_anchor
+            .as_deref()
+            .is_some_and(|anchor| !self.selection.contains(anchor))
+        {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Keep the selection inside the rows the current tab shows: a search that
+    /// filters a row out also removes it from the selection.
+    fn retain_visible_selection(&mut self, rows: &[usize], profiles: &[ServerProfile]) {
+        self.selection.retain(|id| {
+            rows.iter()
+                .any(|&index| profiles[index].id.as_str() == id.as_str())
+        });
+        if self
+            .selection_anchor
+            .as_deref()
+            .is_some_and(|anchor| !self.selection.contains(anchor))
+        {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Ctrl-click: add the row to the selection, or remove it.
+    fn toggle_selection(&mut self, id: &str) {
+        if self.selection.remove(id) {
+            if self.selection_anchor.as_deref() == Some(id) {
+                self.selection_anchor = None;
+            }
+            if self.selected.as_deref() == Some(id) {
+                self.selected = self.selection.iter().next().cloned();
+            }
+        } else {
+            self.selection.insert(id.to_owned());
+            self.selected = Some(id.to_owned());
+            self.selection_anchor = Some(id.to_owned());
+        }
+    }
+
+    /// Shift-click: select every visible row between the anchor and `id`.
+    /// Without a usable anchor the row becomes the whole selection.
+    fn extend_selection(&mut self, id: &str, rows: &[usize], profiles: &[ServerProfile]) {
+        let Some(target) = rows
+            .iter()
+            .position(|&index| profiles[index].id.as_str() == id)
+        else {
+            return;
+        };
+        let anchor = self
+            .selection_anchor
+            .as_deref()
+            .and_then(|anchor| {
+                rows.iter()
+                    .position(|&index| profiles[index].id.as_str() == anchor)
+            })
+            .unwrap_or(target);
+        let (start, end) = if anchor <= target {
+            (anchor, target)
+        } else {
+            (target, anchor)
+        };
+        self.selection.clear();
+        for index in &rows[start..=end] {
+            self.selection.insert(profiles[*index].id.clone());
+        }
+        self.selection_anchor = Some(profiles[rows[anchor]].id.clone());
+        self.selected = Some(id.to_owned());
+    }
+
+    /// Ctrl+A: select every row the current tab shows.
+    fn select_all_visible(&mut self, rows: &[usize], profiles: &[ServerProfile]) {
+        self.selection.clear();
+        let mut first = None;
+        for &index in rows {
+            let id = &profiles[index].id;
+            self.selection.insert(id.clone());
+            first.get_or_insert_with(|| id.clone());
+        }
+        self.selection_anchor = first.clone();
+        if first.is_some() {
+            self.selected = first;
+        }
+    }
+
+    /// True when this "id" is the only selected row.
+    fn is_single_selection(&self, id: &str) -> bool {
+        self.selection.len() == 1 && self.selection.contains(id)
+    }
+
     /// Guard a selection switch to `id`: when a draft holds uncommitted
     /// changes, stage the leave modal instead of switching (the modal's
     /// Save/Discard resolution performs the switch); otherwise switch
     /// immediately. Returns true when the selection was switched now.
     /// The delete-confirmation dialog is its own gate, so while it is open
-    /// the guard never stages. A click on the already-selected profile
-    /// changes nothing and is never guarded.
+    /// the guard never stages. A click on the already-focused profile
+    /// changes nothing there, but still collapses a multi-selection to it.
     fn guard_select(&mut self, id: String) -> bool {
-        if self.selected.as_deref() == Some(id.as_str()) {
+        if self.delete_pending.is_some() {
+            self.focus_row(&id);
             return true;
         }
-        if self.delete_pending.is_some() {
-            self.selected = Some(id);
+        if self.selected.as_deref() == Some(id.as_str()) {
+            self.focus_row(&id);
             return true;
         }
         if self.unsaved_changes() {
             self.stage_leave(LeaveAction::Select(id));
             false
         } else {
-            self.selected = Some(id);
+            self.focus_row(&id);
             true
         }
+    }
+
+    /// Apply one switch state to `ids` through the same lock rules a row's
+    /// own switch follows: the active server and a chain-only hop stay put.
+    /// Returns (changed, skipped).
+    fn set_enabled_rows(
+        &mut self,
+        ctx: &mut ServersCtx,
+        ids: &[String],
+        enabled: bool,
+    ) -> (usize, usize) {
+        if ids.is_empty() {
+            return (0, 0);
+        }
+        let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let emitted = ctx.servers.emitted_set();
+        let active = ctx.servers.active.clone();
+        let mut changed = 0;
+        let mut skipped = 0;
+        for (index, profile) in ctx.servers.profiles.iter_mut().enumerate() {
+            if !wanted.contains(profile.id.as_str()) {
+                continue;
+            }
+            let locked = active.as_deref() == Some(profile.id.as_str())
+                || emitted.chain_only.contains(&index);
+            if locked {
+                skipped += 1;
+                continue;
+            }
+            if profile.enabled != enabled {
+                profile.enabled = enabled;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            ctx.hooks.mark_dirty();
+        }
+        (changed, skipped)
+    }
+
+    /// The batch Enable/Disable command: one loop over the selection, one
+    /// status line that reports the skipped locked rows.
+    fn set_selected_enabled(&mut self, ctx: &mut ServersCtx, ids: &[String], enabled: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        let (changed, skipped) = self.set_enabled_rows(ctx, ids, enabled);
+        let lang = ctx.settings.language;
+        self.set_status(StatusLine::ok(t_fmt(
+            lang,
+            if enabled {
+                Key::SrvBatchEnabled
+            } else {
+                Key::SrvBatchDisabled
+            },
+            &[&changed, &skipped],
+        )));
+    }
+
+    /// Probe `ids` with one isolated child: the batch path behind both the
+    /// toolbar command and a row menu opened inside a selection. `single`
+    /// selects the one-row feedback wording.
+    fn probe_rows(&mut self, ctx: &mut ServersCtx, ids: &[String], single: bool) {
+        let profiles: Vec<ServerProfile> = ids
+            .iter()
+            .filter_map(|id| {
+                ctx.servers
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .cloned()
+            })
+            .collect();
+        if profiles.is_empty() {
+            self.latency_probe_feedback = Some((
+                FeedbackLevel::Err,
+                t(ctx.settings.language, Key::LatencyRequiresProfile).to_owned(),
+            ));
+            return;
+        }
+        let single = single && profiles.len() == 1;
+        self.latency_probe_feedback = None;
+        match ctx.request_latency_probe_for_profiles(profiles) {
+            Ok(()) => {
+                self.pending_latency_probe = Some(single);
+                self.latency_probe = Request::park_in_shell();
+            }
+            Err(error) => self.latency_probe_feedback = Some((FeedbackLevel::Err, error)),
+        }
+    }
+
+    /// Copy the selected rows' links in display order: one row keeps the
+    /// existing link-and-QR sharing, a multi-row selection puts one link per
+    /// line on the clipboard and reports how many were copied.
+    fn export_rows(&mut self, ui: &egui::Ui, ctx: &ServersCtx, lang: Language, ids: &[String]) {
+        let mut shared = Vec::with_capacity(ids.len());
+        let mut name = None;
+        let mut failed = 0usize;
+        let mut first_error = None;
+        for id in ids {
+            let Some(profile) = ctx.servers.profiles.iter().find(|p| &p.id == id) else {
+                continue;
+            };
+            match links::to_link(profile) {
+                Ok(link) => {
+                    name.get_or_insert_with(|| profile.name.clone());
+                    shared.push(link);
+                }
+                Err(error) => {
+                    failed += 1;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let total = shared.len() + failed;
+        if shared.is_empty() {
+            if let Some(error) = first_error {
+                self.set_status(StatusLine::err(t_fmt(
+                    lang,
+                    Key::SrvExportFailed,
+                    &[&error.text(lang)],
+                )));
+            }
+            return;
+        }
+        if total == 1 {
+            let link = shared.pop().expect("one shared link");
+            ui.ctx().copy_text(link.clone());
+            self.qr_dialog = Some(QrDialog {
+                name: name.unwrap_or_default(),
+                link,
+                tex: None,
+            });
+            self.set_status(StatusLine::ok(t(lang, Key::SrvLinkCopiedToClipboard)));
+            return;
+        }
+        let copied = shared.len();
+        ui.ctx().copy_text(shared.join("\n"));
+        if first_error.is_some() {
+            self.set_status(StatusLine::err(t_fmt(
+                lang,
+                Key::SrvLinksCopiedPartial,
+                &[&copied, &total],
+            )));
+        } else {
+            self.set_status(StatusLine::ok(t_fmt(
+                lang,
+                Key::SrvLinksCopiedToClipboard,
+                &[&copied],
+            )));
+        }
+    }
+
+    /// Open the one delete confirmation for `ids`, snapshotting its names and
+    /// references now: the dialog is modal, so its inputs cannot change while
+    /// it is open, and the linear reference scan must not repeat per repaint.
+    fn open_delete_dialog(
+        &mut self,
+        servers: &ServersFile,
+        settings: &Settings,
+        lang: Language,
+        ids: Vec<String>,
+    ) {
+        if ids.is_empty() || self.delete_pending.is_some() {
+            return;
+        }
+        let mut references = Vec::new();
+        let mut name = None;
+        for id in &ids {
+            let Some(profile) = servers.profiles.iter().find(|p| &p.id == id) else {
+                continue;
+            };
+            if ids.len() == 1 {
+                name = Some(profile.name.clone());
+            }
+            for reference in server_reference_paths(servers, settings, id) {
+                if !references.contains(&reference) {
+                    references.push(reference);
+                }
+            }
+        }
+        let name = name.unwrap_or_else(|| t_fmt(lang, Key::SrvSelectedServers, &[&ids.len()]));
+        self.delete_pending = Some(DeleteDialog {
+            ids,
+            name,
+            references,
+        });
     }
 
     /// Open the editor window on `id`: a double click, the Edit command, or a
@@ -4440,7 +4862,7 @@ impl ServersScreen {
             .draft()
             .is_some_and(|draft| draft.id.as_str() == id)
         {
-            self.selected = Some(id.to_owned());
+            self.focus_row(id);
             return;
         }
         if self.unsaved_changes() {
@@ -4462,7 +4884,7 @@ impl ServersScreen {
                 self.existing.close(&mut self.seeded_buffers);
                 self.existing.probe.discard_result();
                 self.existing.hold(draft);
-                self.selected = Some(id.to_owned());
+                self.focus_row(id);
                 self.derive_dialog = None;
                 self.profile_validation_report = None;
                 self.revealed_existing = false;
@@ -4557,7 +4979,7 @@ impl ServersScreen {
                     let lang = uictx.settings.language;
                     self.load_existing_draft(uictx.servers, lang, &id);
                 } else {
-                    self.selected = Some(id);
+                    self.focus_row(&id);
                 }
             }
             LeaveAction::OpenEditor(id) => {
@@ -4609,7 +5031,7 @@ impl ServersScreen {
                     if self.existing.draft.is_some() {
                         self.load_existing_draft(uictx.servers, lang, &id);
                     } else {
-                        self.selected = Some(id);
+                        self.focus_row(&id);
                     }
                 }
                 LeaveAction::OpenEditor(id) => {
@@ -9327,25 +9749,44 @@ impl ServersScreen {
         }
 
         // Delete confirmation.
-        if self.delete_pending.as_ref().is_some_and(|dialog| {
-            !uictx
-                .servers
-                .profiles
-                .iter()
-                .any(|profile| profile.id.as_str() == dialog.id.as_str())
-        }) {
-            self.delete_pending = None;
+        if let Some(dialog) = &mut self.delete_pending {
+            dialog.ids.retain(|id| {
+                uictx
+                    .servers
+                    .profiles
+                    .iter()
+                    .any(|profile| &profile.id == id)
+            });
+            if dialog.ids.is_empty() {
+                self.delete_pending = None;
+            }
         }
         if let Some(dialog) = &self.delete_pending {
             let mut decision: Option<bool> = None;
+            let batch = dialog.ids.len() > 1;
             let declined = popup::modal(
                 ctx,
                 "servers.delete-confirm",
-                t(lang, Key::DeleteServer),
+                t(
+                    lang,
+                    if batch {
+                        Key::SrvDeleteServersTitle
+                    } else {
+                        Key::DeleteServer
+                    },
+                ),
                 460.0,
                 |ui| {
                     if dialog.references.is_empty() {
-                        ui.label(t_fmt(lang, Key::SrvDeleteCannotUndone, &[&dialog.name]));
+                        if batch {
+                            ui.label(t_fmt(
+                                lang,
+                                Key::SrvDeleteManyCannotUndone,
+                                &[&dialog.ids.len()],
+                            ));
+                        } else {
+                            ui.label(t_fmt(lang, Key::SrvDeleteCannotUndone, &[&dialog.name]));
+                        }
                         ui.horizontal(|ui| {
                             if ui.button(t(lang, Key::Delete)).clicked() {
                                 decision = Some(true);
@@ -9375,9 +9816,16 @@ impl ServersScreen {
             if decision == Some(true) {
                 // Owned copy: the confirm block also mutates `self`
                 // (eviction), which the `dialog` borrow would otherwise block.
-                let deleted_id = dialog.id.clone();
-                uictx.servers.profiles.retain(|p| p.id != deleted_id);
-                if uictx.servers.active.as_deref() == Some(deleted_id.as_str())
+                let deleted = dialog.ids.clone();
+                uictx
+                    .servers
+                    .profiles
+                    .retain(|profile| !deleted.contains(&profile.id));
+                if uictx
+                    .servers
+                    .active
+                    .as_deref()
+                    .is_some_and(|id| deleted.iter().any(|deleted| deleted == id))
                     || uictx.servers.profiles.is_empty()
                 {
                     // A deleted active server — and the last row — lands on
@@ -9385,14 +9833,28 @@ impl ServersScreen {
                     uictx.servers.active =
                         Some(crate::model::inbound::BLOCK_OUTBOUND_TAG.to_owned());
                 }
-                if self.selected.as_deref() == Some(deleted_id.as_str()) {
+                if self
+                    .selected
+                    .as_deref()
+                    .is_some_and(|id| deleted.iter().any(|deleted| deleted == id))
+                {
                     self.selected = None;
                 }
-                self.seeded_buffers.evict_owned(&deleted_id);
-                // The deleted profile's memoized latency badge is dead
-                // weight; the row loop would never re-insert it
-                // because the id no longer renders.
-                self.latency_badges.remove(&deleted_id);
+                self.selection.retain(|id| !deleted.contains(id));
+                if self
+                    .selection_anchor
+                    .as_deref()
+                    .is_some_and(|anchor| deleted.iter().any(|deleted| deleted == anchor))
+                {
+                    self.selection_anchor = None;
+                }
+                for deleted_id in &deleted {
+                    self.seeded_buffers.evict_owned(deleted_id);
+                    // The deleted profile's memoized latency badge is dead
+                    // weight; the row loop would never re-insert it
+                    // because the id no longer renders.
+                    self.latency_badges.remove(deleted_id);
+                }
                 uictx.hooks.mark_dirty();
             }
             if declined || decision.is_some() {
@@ -12316,8 +12778,12 @@ Authentication: ML-KEM-768, Post-Quantum
     #[test]
     fn toolbar_probe_requests_all_profiles_and_shows_count_feedback() {
         let mut rig = UiTestRig::default();
-        let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
-        let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        // Both rows must be on the opening Emitted tab: with nothing selected
+        // the toolbar probes the current tab, not the whole profile list.
+        tokyo.enabled = true;
+        osaka.enabled = true;
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
         let mut harness = screen_harness(rig, ServersScreen::default());
@@ -12391,7 +12857,9 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         settings.address = "1.2.3.4".into();
         settings.port = 443;
-        let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        osaka.enabled = true;
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
         let mut harness = screen_harness(rig, ServersScreen::default());
@@ -19693,6 +20161,486 @@ Authentication: ML-KEM-768, Post-Quantum
                 .expect("the transport keeps its settings")
                 .xmux
                 .is_none()
+        );
+    }
+
+    // ---------- multi-selection and batch commands ----------
+
+    /// Press a row's name with `modifiers` and release, the way the user's
+    /// Ctrl and Shift clicks arrive.
+    fn click_row_with(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        label: &str,
+        modifiers: egui::Modifiers,
+    ) {
+        let pos = harness.get_by_label(label).rect().center();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::ModifiersChanged(modifiers));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            });
+        }
+        harness.run_steps(2);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        harness.step();
+    }
+
+    /// Click the point `y` below the row labelled `last`, where a short list
+    /// leaves empty space.
+    fn click_blank_below(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>, last: &str) {
+        let bottom = harness.get_by_label(last).rect().bottom();
+        let pos = egui::pos2(240.0, bottom + 40.0);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run_steps(2);
+    }
+
+    /// The selected rows' names, sorted: the selection is a set, and the
+    /// names are what a test can compare against the table.
+    fn selected_names(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> Vec<String> {
+        let state = harness.state();
+        let mut names: Vec<String> = state
+            .0
+            .selection
+            .iter()
+            .map(|id| {
+                state
+                    .1
+                    .servers
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map_or_else(|| id.clone(), |profile| profile.name.clone())
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn id_of(rig: &UiTestRig, name: &str) -> String {
+        rig.servers
+            .profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .unwrap_or_else(|| panic!("the rig lists {name:?}"))
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn plain_ctrl_and_shift_clicks_shape_the_selection() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        assert!(
+            harness.state().0.selection.is_empty(),
+            "opening the screen focuses a row but selects none"
+        );
+
+        // A plain click replaces the selection with one row.
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        assert_eq!(selected_names(&harness), ["Alpha"]);
+        assert_eq!(
+            harness.state().0.selected.as_deref(),
+            Some(id_of(&harness.state().1, "Alpha").as_str())
+        );
+
+        // Ctrl adds another row.
+        click_row_with(&mut harness, "Charlie", egui::Modifiers::CTRL);
+        assert_eq!(selected_names(&harness), ["Alpha", "Charlie"]);
+
+        // Shift extends from the last Ctrl-clicked anchor: Charlie is the
+        // anchor, so the range back to Alpha covers all three rows.
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::SHIFT);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
+
+        // A plain click collapses the selection back to one row.
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::NONE);
+        assert_eq!(selected_names(&harness), ["Bravo"]);
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_visible_rows_and_a_blank_click_clears() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(2);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
+
+        click_blank_below(&mut harness, "Charlie");
+        assert!(
+            harness.state().0.selection.is_empty(),
+            "a click on empty space clears the selection"
+        );
+        assert_eq!(harness.state().0.selected, None);
+    }
+
+    #[test]
+    fn changing_tabs_clears_the_selection() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(2);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run_steps(2);
+        assert!(
+            harness.state().0.selection.is_empty(),
+            "a tab switch must drop the selection with the tab"
+        );
+        assert_eq!(harness.state().0.selected, None);
+        assert_eq!(harness.state().0.selection_anchor, None);
+    }
+
+    #[test]
+    fn filtering_a_row_out_drops_it_from_the_selection() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(2);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
+
+        harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("the toolbar carries the search field")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.is_focused())
+            .expect("the search field takes focus")
+            .type_text("Alpha");
+        harness.run_steps(2);
+        assert_eq!(
+            selected_names(&harness),
+            ["Alpha"],
+            "a filtered-out row must leave the selection"
+        );
+    }
+
+    #[test]
+    fn the_context_menu_replaces_a_conflicting_selection_and_gates_set_active() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo"]);
+
+        // Opening the menu on a row inside the selection keeps it, and Set
+        // active is disabled because two rows are selected.
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo"]);
+        assert!(
+            harness
+                .get_all_by_label(t(Language::En, Key::SrvSetActive))
+                .last()
+                .expect("the row menu offers Set active")
+                .accesskit_node()
+                .is_disabled(),
+            "Set active needs exactly one selected row"
+        );
+
+        // Opening it on a row outside the selection replaces the selection
+        // with that row first, which makes Set active available.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.get_by_label("Charlie").click_secondary();
+        harness.run();
+        assert_eq!(selected_names(&harness), ["Charlie"]);
+        assert!(
+            !harness
+                .get_all_by_label(t(Language::En, Key::SrvSetActive))
+                .last()
+                .expect("the row menu offers Set active")
+                .accesskit_node()
+                .is_disabled(),
+            "one selected row enables Set active"
+        );
+    }
+
+    #[test]
+    fn enter_sets_the_focused_row_active() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::NONE);
+
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        assert_eq!(
+            harness.state().1.servers.active.as_deref(),
+            Some(id_of(&harness.state().1, "Bravo").as_str()),
+            "Enter must activate the focused row"
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "activating a row is a model edit"
+        );
+    }
+
+    fn probed_names(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) -> Vec<String> {
+        let command = harness
+            .state_mut()
+            .1
+            ._cmd_rx
+            .try_recv()
+            .expect("the latency command must reach the runtime");
+        match command {
+            CoreCmd::ProbeLatency { profiles, .. } => {
+                profiles.into_iter().map(|profile| profile.name).collect()
+            }
+            other => panic!("expected a latency probe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_latency_command_targets_the_selection_or_the_current_tab() {
+        // A selection probes exactly the selected rows.
+        let mut harness = wide_table_harness(grouped_drag_rig());
+        harness.run();
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::TestLatency),
+            )
+            .click();
+        harness.run_steps(2);
+        assert_eq!(probed_names(&mut harness), ["Alpha", "Bravo"]);
+
+        // With nothing selected the command covers the current tab only:
+        // Manual shows Alpha and Bravo, while the Feed rows stay out.
+        let mut harness = wide_table_harness(grouped_drag_rig());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabManual))
+            .click();
+        harness.run_steps(2);
+        assert!(harness.state().0.selection.is_empty());
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::TestLatency),
+            )
+            .click();
+        harness.run_steps(2);
+        assert_eq!(probed_names(&mut harness), ["Alpha", "Bravo"]);
+    }
+
+    /// Alpha is the active server and Hop is a chain-only hop, so both are
+    /// locked; Bravo and Charlie are free to switch.
+    fn locked_rows_rig() -> UiTestRig {
+        let mut rig = drag_rig();
+        let mut hop = ServerProfile::new("Hop", OutboundModel::new(Protocol::Freedom));
+        hop.enabled = false;
+        let hop_tag = hop.tag();
+        rig.servers.profiles.push(hop);
+        rig.servers.profiles[1].outbound.stream.sockopt = Some(SockoptModel {
+            dialer_proxy: hop_tag,
+            ..Default::default()
+        });
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig
+    }
+
+    fn enabled_of(harness: &Harness<'static, (ServersScreen, UiTestRig)>, name: &str) -> bool {
+        harness
+            .state()
+            .1
+            .servers
+            .profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .unwrap_or_else(|| panic!("the rig lists {name:?}"))
+            .enabled
+    }
+
+    #[test]
+    fn batch_enable_and_disable_skip_locked_rows_and_report_the_count() {
+        let mut harness = wide_table_harness(locked_rows_rig());
+        harness.run();
+        // The All tab keeps every row on screen after a batch switches rows
+        // off; `Emitted` drops a switched-off row by design.
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(2);
+        assert_eq!(
+            selected_names(&harness),
+            ["Alpha", "Bravo", "Charlie", "Hop"]
+        );
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvDisableSelected),
+            )
+            .click();
+        harness.run_steps(2);
+        assert!(!enabled_of(&harness, "Bravo") && !enabled_of(&harness, "Charlie"));
+        assert!(
+            enabled_of(&harness, "Alpha"),
+            "the active server is locked on"
+        );
+        assert!(
+            !enabled_of(&harness, "Hop"),
+            "the chain-only hop stays as it was"
+        );
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .status
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some(t_fmt(Language::En, Key::SrvBatchDisabled, &[&2_u32, &2_u32]).as_str()),
+            "the batch reports what it changed and what it skipped"
+        );
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvEnableSelected),
+            )
+            .click();
+        harness.run_steps(2);
+        // Bravo's chain was switched off, so Hop is no longer emitted through
+        // it: the row is unlocked and the batch switches it on too. The
+        // active server stays locked.
+        assert!(enabled_of(&harness, "Bravo") && enabled_of(&harness, "Charlie"));
+        assert!(enabled_of(&harness, "Hop"));
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .status
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some(t_fmt(Language::En, Key::SrvBatchEnabled, &[&3_u32, &1_u32]).as_str())
+        );
+    }
+
+    #[test]
+    fn batch_delete_asks_once_for_the_whole_selection() {
+        let mut harness = wide_table_harness(drag_rig());
+        harness.run();
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvDeleteSelected),
+            )
+            .click();
+        harness.run_steps(2);
+        let dialog = harness
+            .state()
+            .0
+            .delete_pending
+            .as_ref()
+            .expect("the batch must ask for one confirmation");
+        assert_eq!(dialog.ids.len(), 2, "one dialog covers both rows");
+        assert_eq!(
+            dialog.name,
+            t_fmt(Language::En, Key::SrvSelectedServers, &[&2_u32])
+        );
+        assert!(
+            harness
+                .query_all_by_label(
+                    t_fmt(Language::En, Key::SrvDeleteManyCannotUndone, &[&2_u32]).as_str()
+                )
+                .next()
+                .is_some(),
+            "the dialog must name the batch size"
+        );
+
+        harness.get_by_label(t(Language::En, Key::Delete)).click();
+        harness.run_steps(2);
+        assert_eq!(harness.state().1.servers.profiles.len(), 1);
+        assert_eq!(
+            harness.state().1.servers.profiles[0].name,
+            "Charlie",
+            "only the unselected row survives"
+        );
+        assert!(harness.state().0.selection.is_empty());
+    }
+
+    /// Two profiles the share grammar can carry, so Share has links to copy.
+    fn shareable_rig() -> UiTestRig {
+        let mut rig = UiTestRig::default();
+        for (name, host) in [
+            ("Alpha", "alpha.example.com"),
+            ("Bravo", "bravo.example.com"),
+        ] {
+            let link = format!(
+                "vless://5783a3e7-e373-51cd-8642-c83782b807c5@{host}:443\
+                 ?encryption=none&security=tls&sni={host}&type=tcp#{name}"
+            );
+            let mut profile = links::parse_link(&link)
+                .unwrap_or_else(|error| panic!("the fixture link must parse: {error}"))
+                .profile;
+            profile.enabled = true;
+            rig.servers.profiles.push(profile);
+        }
+        rig
+    }
+
+    #[test]
+    fn batch_share_puts_every_selected_link_on_the_clipboard() {
+        let mut harness = wide_table_harness(shareable_rig());
+        harness.run();
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvShareSelected),
+            )
+            .click();
+        harness.run_steps(2);
+        assert!(
+            harness.state().0.qr_dialog.is_none(),
+            "a multi-row share does not open a single row's QR window"
+        );
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .status
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some(t_fmt(Language::En, Key::SrvLinksCopiedToClipboard, &[&2_u32]).as_str())
         );
     }
 }
