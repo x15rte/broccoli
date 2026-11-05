@@ -239,9 +239,18 @@ fn hiding_server_information_masks_the_endpoint_and_keeps_the_verdict() {
         "the masked endpoint must render the stand-in"
     );
 
-    // The one control shows the hidden endpoint as well as the credentials.
-    h.get_by_role_and_label(Role::Button, t(Language::En, Key::SrvRevealSecrets))
-        .click();
+    // Both surfaces offer the control while the setting hides information:
+    // the list's reveals the row's endpoint, the editor's reveals its fields.
+    // The editor window renders last, so it is the one this test drives.
+    let reveals: Vec<_> = h
+        .get_all_by_role_and_label(Role::Button, t(Language::En, Key::SrvRevealSecrets))
+        .collect();
+    assert_eq!(
+        reveals.len(),
+        2,
+        "the list and the editor each offer the reveal control"
+    );
+    reveals[1].click();
     h.run();
     assert!(
         tree_contains(&h, SENTINEL_ADDRESS),
