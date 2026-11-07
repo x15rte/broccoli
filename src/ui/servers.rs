@@ -4051,6 +4051,26 @@ impl ServersScreen {
                 {
                     self.fit_columns = true;
                 }
+                // The route is chosen from the selection, like the row menu's
+                // item: one selected server that is not already the route.
+                let single_selected = if self.selection.len() == 1 {
+                    self.selection.iter().next()
+                } else {
+                    None
+                };
+                let can_set_active = single_selected
+                    .is_some_and(|id| Some(id.as_str()) != ctx.servers.active.as_deref());
+                if ui
+                    .add_enabled(
+                        can_set_active,
+                        egui::Button::new(t(lang, Key::SrvSetActive)),
+                    )
+                    .on_hover_text(t(lang, Key::SrvSetActiveHint))
+                    .clicked()
+                    && let Some(id) = single_selected
+                {
+                    action = Some(ListAction::SetActive(id.clone()));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search)
@@ -4084,14 +4104,19 @@ impl ServersScreen {
                 FeedbackLevel::Warn => status_colors_of(ui).warn,
                 FeedbackLevel::Err => status_colors_of(ui).err,
             };
-            // A probe failure carries the core's diagnostics, which can run
-            // for dozens of lines and push the table off the screen. The
-            // inline line shows the verdict's first lines; the whole report
-            // stays on the hover.
+            // A probe failure carries the core's diagnostics; the inline line
+            // shows the verdict's first lines, wrapped to the row, and the
+            // whole report stays on the hover.
             let preview = feedback_preview(&message, FEEDBACK_PREVIEW_LINES);
             let mut dismiss = false;
             ui.horizontal_top(|ui| {
-                let response = ui.colored_label(color, &preview);
+                // Leave the Dismiss control its room: a label in a horizontal
+                // layout takes whatever width it wants unless the row is
+                // capped, and an unwrapped message pushed the button off the
+                // window edge.
+                ui.set_max_width((ui.available_width() - 90.0).max(200.0));
+                let response =
+                    ui.add(egui::Label::new(RichText::new(&preview).color(color)).wrap());
                 if preview.len() < message.len() {
                     response.on_hover_ui(|ui| {
                         ui.set_max_width(720.0);
@@ -6143,8 +6168,9 @@ fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) ->
 }
 
 /// How many lines a probe's status message shows before it folds; the hover
-/// carries the whole message.
-const FEEDBACK_PREVIEW_LINES: usize = 3;
+/// carries the whole message. Two keeps the verdict and the first failing
+/// server visible without moving the table.
+const FEEDBACK_PREVIEW_LINES: usize = 2;
 
 /// The first `lines` lines of `message`, with an ellipsis when more follows.
 fn feedback_preview(message: &str, lines: usize) -> String {
@@ -12973,6 +12999,7 @@ Authentication: ML-KEM-768, Post-Quantum
             t(Language::En, Key::SrvImportLinks),
             t(Language::En, Key::TestLatency),
             t(Language::En, Key::SrvFitColumns),
+            t(Language::En, Key::SrvSetActive),
         ] {
             assert!(
                 harness
@@ -14566,6 +14593,71 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(!harness.state().1.requests.dirty);
     }
 
+    /// The toolbar sets the route from a single selection: disabled with no
+    /// selection and for the row that is already the route.
+    #[test]
+    fn the_toolbar_sets_the_selected_server_active() {
+        let mut rig = drag_rig();
+        rig.settings.routing.active_balancer = "route".into();
+        let mut harness = drag_harness(rig);
+        harness.run();
+
+        assert!(
+            harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::SrvSetActive),
+                )
+                .accesskit_node()
+                .is_disabled(),
+            "no selection means no route to set"
+        );
+
+        harness.get_by_label("Charlie").click();
+        harness.run();
+        let chosen = harness
+            .state()
+            .0
+            .selection
+            .iter()
+            .next()
+            .cloned()
+            .expect("the row click selects Charlie");
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvSetActive),
+            )
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().1.servers.active.as_deref(),
+            Some(chosen.as_str()),
+            "the selected server is the route"
+        );
+        assert!(
+            harness
+                .state()
+                .1
+                .settings
+                .routing
+                .active_balancer
+                .is_empty(),
+            "choosing a server explicitly hands the route back from the balancer"
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::SrvSetActive),
+                )
+                .accesskit_node()
+                .is_disabled(),
+            "the row that is already the route needs no command"
+        );
+    }
+
     #[test]
     fn set_active_changes_the_route_without_moving_the_row() {
         let mut rig = drag_rig();
@@ -14577,7 +14669,9 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.get_by_label("Charlie").click_secondary();
         harness.run();
         harness
-            .get_by_label(t(Language::En, Key::SrvSetActive))
+            .get_all_by_label(t(Language::En, Key::SrvSetActive))
+            .last()
+            .expect("the row menu offers Set active")
             .click();
         harness.run();
         let rig = &harness.state().1;
@@ -15152,14 +15246,11 @@ Authentication: ML-KEM-768, Post-Quantum
             "an all-scope result must render the count-based toast"
         );
     }
-    /// The inline status keeps a few lines; the hover has the rest.
+    /// The inline status keeps two lines; the hover has the rest.
     #[test]
-    fn feedback_preview_folds_after_three_lines() {
-        assert_eq!(feedback_preview("one\ntwo\nthree", 3), "one\ntwo\nthree");
-        assert_eq!(
-            feedback_preview("one\ntwo\nthree\nfour\nfive", 3),
-            "one\ntwo\nthree…"
-        );
+    fn feedback_preview_folds_after_two_lines() {
+        assert_eq!(feedback_preview("one\ntwo", 2), "one\ntwo");
+        assert_eq!(feedback_preview("one\ntwo\nthree\nfour", 2), "one\ntwo…");
     }
 
     /// A probe result is a report: the Dismiss control clears it without
