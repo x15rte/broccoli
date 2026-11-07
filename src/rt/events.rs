@@ -83,6 +83,15 @@ impl EventStream {
         self.repaint.request_repaint();
     }
 
+    /// A cloneable handle for the latency-probe worker: it publishes each
+    /// arrival as its own event under the same policy as the loop.
+    pub(crate) fn probe_sink(&self) -> ProbeSink {
+        ProbeSink {
+            evt: self.evt.clone(),
+            repaint: self.repaint.clone(),
+        }
+    }
+
     /// Publish one keyed message the shell renders in the display language.
     pub(super) fn app_log(&self, message: impl Into<AppMessage>) {
         self.emit(CoreEvt::AppLog(message.into()));
@@ -108,6 +117,30 @@ impl EventStream {
 
     /// Ask the shell for one frame.
     pub(super) fn repaint_now(&self) {
+        self.repaint.request_repaint();
+    }
+}
+
+/// A cloneable handle for a latency-probe worker: it owns the event
+/// channel and the repaint boundary, so a poll's arrivals reach the shell
+/// before the run's terminal.
+#[derive(Clone)]
+pub(crate) struct ProbeSink {
+    evt: SyncSender<CoreEvt>,
+    repaint: egui::Context,
+}
+
+impl ProbeSink {
+    /// Publish one arrival and ask for the frame it needs.
+    pub(crate) fn statuses(
+        &self,
+        statuses: Vec<super::OutboundStatusView>,
+        progress: super::ProbeProgress,
+    ) {
+        queue_event(
+            CoreEvt::LatencyProbeStatus(super::LatencyProbeStatus { statuses, progress }),
+            &self.evt,
+        );
         self.repaint.request_repaint();
     }
 }

@@ -785,34 +785,6 @@ impl ServersFile {
         self.profiles.insert(insert, moved);
         changed
     }
-    /// Reorder the stored rows by measured latency, inside each group. The
-    /// blocks and their order stay put: the group tab order fixes the blocks,
-    /// and this only rewrites each group's row order, with a probe that timed
-    /// out or never ran sorting last. The active route is independent of row
-    /// order and does not move.
-    pub fn sort_rows_by_latency(&mut self) {
-        let mut block: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::with_capacity(self.groups.len() + 1);
-        block.insert(MANUAL_GROUP_ID, 0);
-        for group in &self.groups {
-            if !group.is_manual() {
-                let rank = block.len();
-                block.entry(group.id.as_str()).or_insert(rank);
-            }
-        }
-        // A profile whose group record is missing lands in the tail block of
-        // `grouped_order`, so it sorts last as one block.
-        let fallback = block.len();
-        let ranks = &block;
-        self.profiles.sort_by_key(|profile| {
-            let rank = ranks.get(profile.group_id()).copied().unwrap_or(fallback);
-            let latency = match profile.latency_ms {
-                Some(value) if value >= 0 => (0u8, value),
-                _ => (1u8, i64::MAX),
-            };
-            (rank, latency)
-        });
-    }
     /// The profiles the generated document carries: the active profile,
     /// every enabled profile, and every profile reachable transitively
     /// through a chain hop from those. The active profile leads; the rest
@@ -1136,6 +1108,64 @@ pub fn rename_group(servers: &mut ServersFile, settings: &mut Settings, id: &str
     settings.rewrite_outbound_tags(&renames);
 }
 
+/// What one latency measurement observed: a delay, or a dead outbound, with
+/// the mechanism that produced it and when. Runtime-only: the profile lets a
+/// latency test's verdict outrank background monitoring, and the settings
+/// file never carries it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeVerdict {
+    pub outcome: ProbeOutcome,
+    pub source: ProbeSource,
+    pub measured_at: std::time::SystemTime,
+    /// The captured core error for a dead verdict; absent for a delay.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Delay(i64),
+    Dead,
+}
+
+/// Which mechanism measured a verdict: the user's latency test or the
+/// background health engine's monitoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSource {
+    LatencyTest,
+    Monitoring,
+}
+
+impl ProbeVerdict {
+    /// A delay measured now by `source`.
+    pub fn delay(ms: i64, source: ProbeSource) -> Self {
+        Self {
+            outcome: ProbeOutcome::Delay(ms),
+            source,
+            measured_at: std::time::SystemTime::now(),
+            error: None,
+        }
+    }
+
+    /// A dead outbound measured now by `source`, with the core's error when
+    /// one was captured.
+    pub fn dead(source: ProbeSource, error: Option<String>) -> Self {
+        Self {
+            outcome: ProbeOutcome::Dead,
+            source,
+            measured_at: std::time::SystemTime::now(),
+            error,
+        }
+    }
+
+    /// The measured delay, when the verdict is a delay.
+    pub fn delay_ms(&self) -> Option<i64> {
+        match self.outcome {
+            ProbeOutcome::Delay(ms) => Some(ms),
+            ProbeOutcome::Dead => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServerProfile {
@@ -1151,9 +1181,9 @@ pub struct ServerProfile {
     #[serde(skip_serializing_if = "skip_false")]
     pub enabled: bool,
     pub outbound: OutboundModel,
-    /// last measured latency — runtime cache, never persisted
+    /// The last probe verdict — runtime cache, never persisted.
     #[serde(skip)]
-    pub latency_ms: Option<i64>,
+    pub verdict: Option<ProbeVerdict>,
     /// The refresh keys of a subscription import. Absent on a hand-added
     /// profile.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1175,7 +1205,7 @@ impl ServerProfile {
             group: MANUAL_GROUP_ID.into(),
             enabled: false,
             outbound,
-            latency_ms: None,
+            verdict: None,
             origin: None,
             group_title: MANUAL_GROUP_TITLE.into(),
             extra: Map::new(),
@@ -2314,61 +2344,6 @@ mod tests {
         assert_eq!(names(&servers), ["Bravo", "Alpha", "Delta", "Charlie"]);
         assert!(servers.move_profile_in_group(2, None));
         assert_eq!(names(&servers), ["Bravo", "Alpha", "Charlie", "Delta"]);
-    }
-
-    #[test]
-    fn sorting_by_latency_orders_rows_inside_each_group() {
-        let freedom = || OutboundModel::new(Protocol::Freedom);
-        let feed = Group::new("Feed");
-        let feed_id = feed.id.clone();
-        let mut alpha = ServerProfile::new("Alpha", freedom());
-        alpha.enabled = true;
-        alpha.latency_ms = Some(300);
-        let mut bravo = ServerProfile::new("Bravo", freedom());
-        bravo.enabled = true;
-        bravo.latency_ms = Some(40);
-        let mut charlie = ServerProfile::new("Charlie", freedom());
-        charlie.enabled = true;
-        charlie.latency_ms = Some(500);
-        charlie.group = feed_id.clone();
-        let mut delta = ServerProfile::new("Delta", freedom());
-        delta.enabled = true;
-        delta.latency_ms = Some(20);
-        delta.group = feed_id;
-        let mut echo = ServerProfile::new("Echo", freedom());
-        echo.enabled = true;
-        let mut servers = ServersFile {
-            active: Some(alpha.id.clone()),
-            // Stored interleaved: the blocks are group order, not list order.
-            profiles: vec![charlie, alpha, delta, echo, bravo],
-            groups: vec![Group::manual(), feed],
-            ..ServersFile::default()
-        };
-        servers.hydrate_group_titles();
-        servers.sort_rows_by_latency();
-        let names = |servers: &ServersFile| -> Vec<String> {
-            servers
-                .profiles
-                .iter()
-                .map(|profile| profile.name.clone())
-                .collect()
-        };
-        assert_eq!(
-            names(&servers),
-            ["Bravo", "Alpha", "Echo", "Delta", "Charlie"],
-            "each block sorts by latency, an unmeasured row last"
-        );
-        let emitted: Vec<&str> = servers
-            .emitted_set()
-            .order
-            .iter()
-            .map(|&index| servers.profiles[index].name.as_str())
-            .collect();
-        assert_eq!(
-            emitted,
-            ["Alpha", "Bravo", "Echo", "Delta", "Charlie"],
-            "the active server leads, then each block in its sorted row order"
-        );
     }
 
     #[test]

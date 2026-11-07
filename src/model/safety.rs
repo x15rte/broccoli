@@ -1026,7 +1026,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-            latency_ms: None,
+            verdict: None,
             ..Default::default()
         };
 

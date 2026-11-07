@@ -716,17 +716,18 @@ fn roundtrip_settings_and_servers() {
 
     let mut sf = ServersFile::default();
     let mut p = ServerProfile::new("test", OutboundModel::new(Protocol::Trojan));
-    p.latency_ms = Some(42);
+    p.verdict = Some(ProbeVerdict::delay(42, ProbeSource::LatencyTest));
     sf.active = Some(p.id.clone());
     sf.profiles.push(p);
     let v = serde_json::to_value(&sf).unwrap();
-    assert!(
-        v["profiles"][0].get("latencyMs").is_none(),
-        "latency_ms must not persist"
-    );
-    assert!(v["profiles"][0].get("latency_ms").is_none());
+    for key in ["verdict", "latencyMs", "latency_ms"] {
+        assert!(
+            v["profiles"][0].get(key).is_none(),
+            "a runtime verdict must not persist as {key}"
+        );
+    }
     let back: ServersFile = serde_json::from_value(v.clone()).unwrap();
-    assert_eq!(back.profiles[0].latency_ms, None);
+    assert_eq!(back.profiles[0].verdict, None);
     assert_eq!(serde_json::to_value(&back).unwrap(), v);
     assert!(matches!(
         back.profiles[0].outbound.settings,

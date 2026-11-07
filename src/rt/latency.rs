@@ -9,6 +9,7 @@ use crate::diag::Diag;
 use crate::r#gen;
 use crate::i18n::Key;
 use crate::model::ServerProfile;
+use crate::model::settings::Language;
 use crate::sys;
 use crate::sys::netif::ProbeUplink;
 
@@ -53,14 +54,21 @@ pub(crate) fn complete_statuses<'a>(
     statuses: &'a [OutboundStatusView],
     requested_tags: &[String],
 ) -> Option<Vec<&'a OutboundStatusView>> {
-    let mut by_tag: HashMap<&str, &OutboundStatusView> = HashMap::with_capacity(statuses.len());
-    for status in statuses {
-        by_tag.entry(status.tag.as_str()).or_insert(status);
-    }
+    let by_tag = rows_by_tag(statuses);
     requested_tags
         .iter()
         .map(|tag| by_tag.get(tag.as_str()).copied())
         .collect()
+}
+
+/// Index a snapshot by tag, the first row for a repeated tag winning. The
+/// probe's arrival bookkeeping and the completion check share this one rule.
+fn rows_by_tag(statuses: &[OutboundStatusView]) -> HashMap<&str, &OutboundStatusView> {
+    let mut by_tag: HashMap<&str, &OutboundStatusView> = HashMap::with_capacity(statuses.len());
+    for status in statuses {
+        by_tag.entry(status.tag.as_str()).or_insert(status);
+    }
+    by_tag
 }
 
 /// Stamp the probe run's captured diagnostics tail onto the dead
@@ -192,14 +200,139 @@ pub(crate) fn resolve_probe_interface(
     }
 }
 
-pub(crate) async fn run(
+/// Tracks which requested tags the probe has reported, so each arrival is
+/// delivered exactly once and a terminal count is available for the strip.
+struct ProbeDelivery<F> {
+    requested: Vec<String>,
+    answered: Vec<bool>,
+    done: usize,
+    on_status: F,
+}
+
+impl<F> ProbeDelivery<F>
+where
+    F: FnMut(Vec<OutboundStatusView>, usize),
+{
+    fn new(requested: Vec<String>, on_status: F) -> Self {
+        let answered = vec![false; requested.len()];
+        Self {
+            requested,
+            answered,
+            done: 0,
+            on_status,
+        }
+    }
+
+    /// Deliver every requested tag that now has an exact row and was not
+    /// delivered before, keeping requested order.
+    fn offer(&mut self, statuses: &[OutboundStatusView]) {
+        // One index per poll instead of a scan per requested tag: the shared
+        // first-row-for-a-repeated-tag rule lives in `rows_by_tag`.
+        let by_tag = rows_by_tag(statuses);
+        let mut fresh = Vec::new();
+        for (index, tag) in self.requested.iter().enumerate() {
+            if self.answered[index] {
+                continue;
+            }
+            if let Some(status) = by_tag.get(tag.as_str()) {
+                self.answered[index] = true;
+                fresh.push((*status).clone());
+            }
+        }
+        if !fresh.is_empty() {
+            self.done = self.answered.iter().filter(|answered| **answered).count();
+            (self.on_status)(fresh, self.done);
+        }
+    }
+
+    fn all_answered(&self) -> bool {
+        self.done == self.requested.len()
+    }
+
+    /// Fill every tag that never answered with a dead verdict carrying the
+    /// run's failure text: a timeout or an early exit keeps the arrivals and
+    /// still says the rest are dead.
+    fn report_dead_missing(&mut self, failure: &ProbeFailure) {
+        let message = failure.headline.text(Language::En);
+        let missing: Vec<OutboundStatusView> = self
+            .requested
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.answered[*index])
+            .map(|(_, tag)| OutboundStatusView {
+                tag: tag.clone(),
+                alive: false,
+                delay_ms: 0,
+                last_error: Some(message.clone()),
+                diagnostics: None,
+                health_ping: None,
+            })
+            .collect();
+        if !missing.is_empty() {
+            self.answered.fill(true);
+            self.done = self.requested.len();
+            (self.on_status)(missing, self.done);
+        }
+    }
+
+    /// Requested tags that have not answered yet, in requested order.
+    fn unanswered(&self) -> Vec<String> {
+        self.requested
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.answered[*index])
+            .map(|(_, tag)| tag.clone())
+            .collect()
+    }
+}
+
+/// Run one isolated probe and report each requested tag's status as its row
+/// appears. The run keeps going until every tag answered or the deadline
+/// expires; any tag the run cannot report — a timeout, an early exit, or a
+/// startup failure — is delivered as a dead verdict carrying the run's error,
+/// so the caller's write rule always settles every requested profile.
+pub(crate) async fn run<F>(
     profiles: &[ServerProfile],
     probe_url: String,
     tun_outbound_interface: Option<String>,
     tun_adapter_name: Option<String>,
     tun_active: bool,
     log: &AppLogSink,
-) -> Result<Vec<OutboundStatusView>, ProbeFailure> {
+    on_status: F,
+) -> Result<Vec<OutboundStatusView>, ProbeFailure>
+where
+    F: FnMut(Vec<OutboundStatusView>, usize),
+{
+    let requested: Vec<String> = profiles.iter().map(ServerProfile::tag).collect();
+    let mut delivery = ProbeDelivery::new(requested, on_status);
+    let result = run_inner(
+        profiles,
+        probe_url,
+        tun_outbound_interface,
+        tun_adapter_name,
+        tun_active,
+        log,
+        &mut delivery,
+    )
+    .await;
+    if let Err(failure) = &result {
+        delivery.report_dead_missing(failure);
+    }
+    result
+}
+
+async fn run_inner<F>(
+    profiles: &[ServerProfile],
+    probe_url: String,
+    tun_outbound_interface: Option<String>,
+    tun_adapter_name: Option<String>,
+    tun_active: bool,
+    log: &AppLogSink,
+    delivery: &mut ProbeDelivery<F>,
+) -> Result<Vec<OutboundStatusView>, ProbeFailure>
+where
+    F: FnMut(Vec<OutboundStatusView>, usize),
+{
     // Resolve the TUN outbound interface from a fresh enumeration
     // at probe time, so the binding is current even after an adapter rename.
     // Only binds while the main core is Running and owns the TUN; a fixed
@@ -228,7 +361,6 @@ pub(crate) async fn run(
         .port();
     drop(listener);
 
-    let requested_tags: Vec<String> = profiles.iter().map(ServerProfile::tag).collect();
     let config =
         r#gen::generate_latency_probe(profiles, &probe_url, api_port, interface.as_deref())
             .map_err(|error| ProbeFailure::plain(Diag::new(Key::ProbeConfigRejected).arg(error)))?;
@@ -265,7 +397,6 @@ pub(crate) async fn run(
     let grpc = GrpcClient::new(api_port);
     let deadline = Instant::now() + PROBE_DEADLINE;
     let mut delay = Duration::ZERO;
-    let mut last_statuses = Vec::new();
     let mut last_api_error = None;
 
     loop {
@@ -292,18 +423,24 @@ pub(crate) async fn run(
                 return Err(probe_failure(exit_description(&status), &diagnostics));
             }
             PollOutcome::Status(Ok(statuses)) => {
-                last_statuses = statuses;
-                if let Some(completed) = complete_statuses(&last_statuses, &requested_tags) {
-                    if stop_child(&mut child).await {
-                        child.drain_output().await;
+                delivery.offer(&statuses);
+                if delivery.all_answered() {
+                    // The count is cumulative, but the final snapshot must
+                    // carry every requested tag itself: a poll that omits a
+                    // tag reported earlier is not the closing one, so keep
+                    // polling instead of panicking on the mismatch.
+                    if let Some(completed) = complete_statuses(&statuses, &delivery.requested) {
+                        if stop_child(&mut child).await {
+                            child.drain_output().await;
+                        }
+                        // The dead rows of a completed run ride to the
+                        // log and UI with the child's captured diagnostics
+                        // tail (run-level: one probe, one child).
+                        let tail = diagnostic_tail(&diagnostics);
+                        let completed: Vec<OutboundStatusView> =
+                            completed.into_iter().cloned().collect();
+                        return Ok(with_run_diagnostics(completed, &tail));
                     }
-                    // The dead rows of a completed run ride to the
-                    // log and UI with the child's captured diagnostics tail
-                    // (run-level: one probe, one child).
-                    let tail = diagnostic_tail(&diagnostics);
-                    let completed: Vec<OutboundStatusView> =
-                        completed.into_iter().cloned().collect();
-                    return Ok(with_run_diagnostics(completed, &tail));
                 }
                 last_api_error = None;
                 delay = POLL_INTERVAL;
@@ -315,11 +452,7 @@ pub(crate) async fn run(
         }
     }
 
-    let missing: Vec<String> = requested_tags
-        .iter()
-        .filter(|tag| !last_statuses.iter().any(|status| status.tag == **tag))
-        .cloned()
-        .collect();
+    let missing = delivery.unanswered();
     // Stop the child and, once the exit is confirmed (its pipes then reach
     // EOF), join the output pumps so the failure wall carries everything the
     // child wrote before the deadline fired.
@@ -392,8 +525,9 @@ fn cleanup_stale_probe_dirs(
 #[cfg(test)]
 mod tests {
     use super::{
-        OutboundStatusView, PROBE_TEMP_MAX_AGE, PROBE_TEMP_PREFIX, cleanup_stale_probe_dirs,
-        complete_statuses, probe_failure, resolve_probe_interface, run, with_run_diagnostics,
+        OutboundStatusView, PROBE_TEMP_MAX_AGE, PROBE_TEMP_PREFIX, ProbeDelivery,
+        cleanup_stale_probe_dirs, complete_statuses, probe_failure, resolve_probe_interface, run,
+        with_run_diagnostics,
     };
     use crate::diag::Diag;
     use crate::i18n::{Key, t};
@@ -469,6 +603,63 @@ mod tests {
         assert_eq!(
             failure.full(Language::En),
             failure.headline.text(Language::En)
+        );
+    }
+
+    /// Each requested tag is delivered once, in requested order, with the
+    /// running count the strip prints — an unrelated row in the snapshot is
+    /// not a target.
+    #[test]
+    fn delivery_reports_each_requested_tag_once_in_requested_order() {
+        let mut seen: Vec<(Vec<String>, usize)> = Vec::new();
+        let mut delivery = ProbeDelivery::new(
+            vec!["a".to_string(), "b".to_string()],
+            |statuses: Vec<OutboundStatusView>, done: usize| {
+                seen.push((
+                    statuses.iter().map(|status| status.tag.clone()).collect(),
+                    done,
+                ));
+            },
+        );
+        delivery.offer(&[status("a", true, 12, None), status("zzz", true, 5, None)]);
+        delivery.offer(&[status("a", true, 12, None), status("b", true, 30, None)]);
+        delivery.offer(&[status("a", true, 12, None), status("b", true, 30, None)]);
+        assert!(delivery.all_answered());
+        drop(delivery);
+        assert_eq!(
+            seen,
+            [
+                (["a".to_string()].to_vec(), 1),
+                (["b".to_string()].to_vec(), 2)
+            ]
+        );
+    }
+
+    /// A run that ends early keeps every arrival and says only the unanswered
+    /// tags are dead, carrying the run's sentence.
+    #[test]
+    fn delivery_dead_fills_only_the_tags_that_never_answered() {
+        let mut seen: Vec<Vec<OutboundStatusView>> = Vec::new();
+        let mut delivery = ProbeDelivery::new(
+            vec!["a".to_string(), "b".to_string()],
+            |statuses: Vec<OutboundStatusView>, _done: usize| seen.push(statuses),
+        );
+        delivery.offer(&[status("a", true, 12, None)]);
+        let failure = probe_failure(
+            Diag::new(Key::ProbeExitNoStatus),
+            &Arc::new(Mutex::new(VecDeque::new())),
+        );
+        delivery.report_dead_missing(&failure);
+        assert!(delivery.all_answered());
+        drop(delivery);
+        assert_eq!(seen.len(), 2, "the arrived row is not re-delivered");
+        assert_eq!(seen[1].len(), 1, "only the unanswered tag is filled");
+        assert_eq!(seen[1][0].tag, "b");
+        assert!(!seen[1][0].alive);
+        assert_eq!(
+            seen[1][0].last_error.as_deref(),
+            Some(t(Language::En, Key::ProbeExitNoStatus)),
+            "the dead fill carries the run's sentence"
         );
     }
 
@@ -576,6 +767,7 @@ mod tests {
             id: "0123456789abcdef".into(),
             ..ServerProfile::new("probe", OutboundModel::new(Protocol::Freedom))
         }];
+        let mut delivered = Vec::new();
         let error = run(
             &profiles,
             "http://127.0.0.1:9/health".into(),
@@ -583,9 +775,26 @@ mod tests {
             None,
             false,
             &log_sink(),
+            |statuses, done| delivered.push((statuses, done)),
         )
         .await
         .expect_err("loopback probe must be rejected");
+        assert_eq!(
+            delivered.len(),
+            1,
+            "a probe that cannot start must still deliver a verdict for every target"
+        );
+        assert_eq!(delivered[0].1, 1);
+        assert_eq!(delivered[0].0[0].tag, profiles[0].tag());
+        assert!(!delivered[0].0[0].alive);
+        assert!(
+            delivered[0].0[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("loopback")),
+            "the startup error must ride the dead verdict: {:?}",
+            delivered[0].0[0]
+        );
         assert_eq!(
             error.headline.key(),
             Key::ProbeHostBlocked,

@@ -142,6 +142,7 @@ fn wait_for_latency_result(
     io: &tokio::runtime::Runtime,
     initial_uptime: u32,
     app_logs: &mut Vec<String>,
+    arrivals: &mut Vec<broccoli::rt::ProbeProgress>,
 ) -> LatencyProbeResult {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut operation_released = false;
@@ -151,9 +152,17 @@ fn wait_for_latency_result(
             assert_no_main_failure_event(event);
         }
         match event {
+            // The probe streams each answered tag, then its terminal.
+            Some(CoreEvt::LatencyProbeStatus(status)) => {
+                arrivals.push(status.progress);
+            }
             // Single-flight per child: the next LatencyProbe event is
             // this request's outcome (no correlation id).
             Some(CoreEvt::LatencyProbe(value)) => {
+                assert!(
+                    !arrivals.is_empty(),
+                    "the probe must deliver arrivals before its terminal"
+                );
                 result = Some(value);
             }
             Some(CoreEvt::Operation(None)) if result.is_some() => {
@@ -315,13 +324,21 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
             tun_adapter_name: None,
         })
         .expect("send successful isolated probe");
+    let mut success_arrivals = Vec::new();
     let success = wait_for_latency_result(
         &evt_rx,
         &main_grpc,
         &io,
         initial_uptime,
         &mut probe_app_logs,
+        &mut success_arrivals,
     );
+    assert_eq!(
+        success_arrivals.last().copied(),
+        Some(broccoli::rt::ProbeProgress { done: 1, total: 1 }),
+        "the probe must report progress over its full tag list as rows appear"
+    );
+    assert_eq!(success.progress, success_arrivals.last().copied().unwrap());
     let statuses = success.result.expect("successful probe runner result");
     let status = statuses
         .iter()
@@ -356,12 +373,19 @@ fn latency_probe_isolated_child_preserves_running_main_core() {
             tun_adapter_name: None,
         })
         .expect("send dead-target isolated probe");
+    let mut dead_arrivals = Vec::new();
     let dead = wait_for_latency_result(
         &evt_rx,
         &main_grpc,
         &io,
         initial_uptime,
         &mut probe_app_logs,
+        &mut dead_arrivals,
+    );
+    assert_eq!(
+        dead_arrivals.last().copied(),
+        Some(broccoli::rt::ProbeProgress { done: 1, total: 1 }),
+        "a dead row is still an arrival the strip can count"
     );
     let dead_status = dead
         .result

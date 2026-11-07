@@ -158,6 +158,9 @@ pub struct UiCtx<'a> {
     update_check: &'a UpdateCheckState,
     is_elevated: bool,
     probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
+    /// The in-flight latency probe's progress; the servers screen's strip
+    /// reads it and a new test resets it before its own arrivals land.
+    probe_progress: &'a mut crate::rt::ProbeProgress,
     requests: &'a mut FrameRequests,
     model_generation: &'a mut u64,
     stats_generation: u64,
@@ -465,6 +468,10 @@ pub struct ServersCtx<'a> {
     /// is exact because the probe is single-flight and the UI pending gate
     /// holds until the take.
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
+    /// The in-flight latency probe's progress over its full requested tag
+    /// list; the strip renders it and a fresh test clears it so no earlier
+    /// run's count shows.
+    pub(crate) probe_progress: &'a mut crate::rt::ProbeProgress,
     pub(crate) hooks: FrameHooks<'a>,
 }
 
@@ -603,6 +610,8 @@ pub(crate) struct UiCtxParts<'a> {
     /// so the identity changes exactly when the ring's content changes.
     pub(crate) logs_generation: u64,
     pub(crate) probe_feedback: &'a mut request::ParkedSlot<LatencyProbeResult>,
+    /// The in-flight latency probe's progress, advanced by streamed arrivals.
+    pub(crate) probe_progress: &'a mut crate::rt::ProbeProgress,
     pub(crate) requests: &'a mut FrameRequests,
     pub(crate) model_generation: &'a mut u64,
     pub(crate) connect_blocked_reason: &'a Option<String>,
@@ -696,6 +705,7 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
+            probe_progress,
             requests,
             model_generation,
             safety,
@@ -727,6 +737,7 @@ impl<'a> UiCtx<'a> {
             logs,
             logs_generation,
             probe_feedback,
+            probe_progress,
             requests,
             model_generation,
             busy: gate::BusyWindow::from_operation(operation),
@@ -876,6 +887,7 @@ impl<'a> UiCtx<'a> {
             core_running: matches!(self.phase, crate::rt::CorePhase::Running),
             busy: self.busy,
             probe_feedback: &mut *self.probe_feedback,
+            probe_progress: &mut *self.probe_progress,
             hooks: hooks_of(&mut *self.requests, self.cmd, &mut *self.model_generation),
         }
     }
@@ -1763,6 +1775,7 @@ mod tests {
         LatencyProbeResult {
             tags: vec![tag],
             result: statuses,
+            progress: crate::rt::ProbeProgress { done: 0, total: 1 },
         }
     }
 
@@ -2189,6 +2202,10 @@ mod tests {
         statuses: Result<Vec<OutboundStatusView>, ProbeFailure>,
     ) -> LatencyProbeResult {
         LatencyProbeResult {
+            progress: crate::rt::ProbeProgress {
+                done: 0,
+                total: tags.len(),
+            },
             tags,
             result: statuses,
         }

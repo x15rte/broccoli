@@ -1,9 +1,9 @@
 //! A completed latency probe must reach the dashboard's Servers latency
 //! grid, not only the Servers screen's badges.
 //!
-//! The probe writes each profile's `latency_ms` (the dashboard grid's
-//! fallback cell when no observatory entry covers the tag), so its result
-//! must advance the grid's memoization key or the table keeps rendering the
+//! The probe writes each profile's verdict (the dashboard grid's fallback
+//! cell when no observatory entry covers the tag), so its result must
+//! advance the grid's memoization key or the table keeps rendering the
 //! pre-probe cells until an unrelated persist/revision change.
 //!
 //! Each test is the smallest repro that can go red for that memoization bug:
@@ -71,11 +71,12 @@ fn inject_probe(h: &Harness<'static, BroccoliApp>, alive: bool, delay_ms: i64) {
                 last_error: Some("connection refused".into()),
                 diagnostics: None,
             }]),
+            progress: broccoli::rt::ProbeProgress { done: 1, total: 1 },
         }));
 }
 
 /// With no observatory emitted there are never observatory rows, so the
-/// dashboard's latency cells resolve from `profile.latency_ms` alone — the
+/// dashboard's latency cells resolve from the profile's verdict alone — the
 /// field a latency probe writes. The result must repaint the memoized grid.
 #[test]
 fn probe_result_refreshes_the_dashboard_latency_grid() {
@@ -92,8 +93,8 @@ fn probe_result_refreshes_the_dashboard_latency_grid() {
     );
 }
 
-/// A dead probe status must paint the dead cell: the result maps to
-/// `latency_ms = -1` and the grid's fallback cell renders it as dead.
+/// A dead probe status must paint the dead cell: the result maps to a dead
+/// verdict and the grid's fallback cell renders it as dead.
 #[test]
 fn dead_probe_result_paints_the_dead_cell() {
     let (_lock, _tmp, mut h) = harness();

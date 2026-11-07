@@ -117,6 +117,8 @@ pub(crate) struct UiTestRig {
     /// app drain: probe UI tests park results here and the servers screen
     /// adopts them through its `ShellParked` request.
     pub(crate) probe_feedback: crate::ui::request::ParkedSlot<LatencyProbeResult>,
+    /// The in-flight latency probe's progress, as the app publishes it.
+    pub(crate) probe_progress: crate::rt::ProbeProgress,
     pub(crate) stats: Option<StatsTick>,
     pub(crate) stats_history: VecDeque<TrafficSample>,
     pub(crate) observatory: Vec<OutboundStatusView>,
@@ -180,6 +182,7 @@ impl Default for UiTestRig {
             verdict: Default::default(),
             requests: crate::ui::FrameRequests::default(),
             probe_feedback: Default::default(),
+            probe_progress: Default::default(),
             stats: None,
             stats_history: VecDeque::new(),
             observatory: Vec::new(),
@@ -377,6 +380,7 @@ impl UiTestRig {
                 logs: &self.logs,
                 logs_generation: self.logs_generation,
                 probe_feedback: &mut self.probe_feedback,
+                probe_progress: &mut self.probe_progress,
                 requests: &mut self.requests,
                 model_generation: &mut self.model_generation,
                 safety: &self.safety,

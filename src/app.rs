@@ -10,11 +10,11 @@ use crate::model::inbound::API_INBOUND_TAG;
 use crate::model::safety::{SafetyFinding, SafetyVerdicts};
 use crate::model::settings::{Language, Mode};
 use crate::model::validation::{ValidationIssue, Verdict};
-use crate::model::{ServersFile, Settings};
+use crate::model::{ProbeSource, ProbeVerdict, ServersFile, Settings};
 use crate::rt::{
     AppMessage, ApplyIntent, CoreCmd, CoreEvt, CorePhase, CoreTransport, DownloadState,
-    EVT_CHANNEL_CAPACITY, JobKind, LatencyProbeResult, OutboundStatusView, RuntimeHandle,
-    StatsTick, spawn_runtime, sweep_stale_scratch_configs,
+    EVT_CHANNEL_CAPACITY, JobKind, LatencyProbeResult, OutboundStatusView, ProbeProgress,
+    RuntimeHandle, StatsTick, spawn_runtime, sweep_stale_scratch_configs,
 };
 use crate::sys::selfupd::UpdateCheckState;
 use crate::sys::{self, paths};
@@ -336,7 +336,7 @@ pub struct BroccoliApp {
     /// (dashboard plot/latency-grid caches): `stats_generation` bumps once
     /// per stats tick; `latency_generation` once per observatory tick and
     /// once per consumed latency-probe result — the two writers of profile
-    /// `latency_ms`, the grid's no-observatory-cell input.
+    /// verdicts, the grid's no-observatory-cell input.
     stats_generation: u64,
     latency_generation: u64,
     phase: CorePhase,
@@ -477,6 +477,10 @@ pub struct BroccoliApp {
     /// the single slot is exact because the probe is single-flight and the
     /// UI pending gate holds until the take.
     probe_feedback: ui::request::ParkedSlot<LatencyProbeResult>,
+    /// Progress of the in-flight latency probe, advanced by each streamed
+    /// arrival and settled by the terminal. The servers screen reads it for
+    /// the strip's count and the cancel line.
+    probe_progress: ProbeProgress,
     core_version: Option<String>,
     /// Cached fast availability state for UI render passes. Full release-pin
     /// verification remains at every launch/validation boundary.
@@ -983,6 +987,7 @@ impl BroccoliApp {
             download: DownloadState::Idle,
             update_check: UpdateCheckState::Idle,
             probe_feedback: ui::request::ParkedSlot::default(),
+            probe_progress: ProbeProgress::default(),
             core_version,
             core_available,
             core_setup,
@@ -1084,7 +1089,15 @@ impl BroccoliApp {
         });
     }
 
-    fn apply_observatory_statuses(servers: &mut ServersFile, statuses: &[OutboundStatusView]) {
+    /// Apply one batch of measured outbounds. Monitoring writes only when the
+    /// profile has no verdict or its stored verdict is monitoring, so a
+    /// latency test's result outranks monitoring on this table until the next
+    /// test. A latency test always writes.
+    fn apply_statuses(
+        servers: &mut ServersFile,
+        statuses: &[OutboundStatusView],
+        source: ProbeSource,
+    ) {
         if statuses.is_empty() {
             return;
         }
@@ -1098,10 +1111,31 @@ impl BroccoliApp {
             .collect();
         for profile in &mut servers.profiles {
             let tag = profile.tag();
-            if let Some(status) = by_tag.get(tag.as_str()) {
-                profile.latency_ms = Some(if status.alive { status.delay_ms } else { -1 });
+            let Some(status) = by_tag.get(tag.as_str()) else {
+                continue;
+            };
+            if source == ProbeSource::Monitoring
+                && profile
+                    .verdict
+                    .as_ref()
+                    .is_some_and(|verdict| verdict.source != ProbeSource::Monitoring)
+            {
+                continue;
             }
+            profile.verdict = Some(if status.alive {
+                ProbeVerdict::delay(status.delay_ms, source)
+            } else {
+                ProbeVerdict::dead(source, status.last_error.clone())
+            });
         }
+    }
+
+    fn apply_observatory_statuses(servers: &mut ServersFile, statuses: &[OutboundStatusView]) {
+        Self::apply_statuses(servers, statuses, ProbeSource::Monitoring);
+    }
+
+    fn apply_probe_statuses(servers: &mut ServersFile, statuses: &[OutboundStatusView]) {
+        Self::apply_statuses(servers, statuses, ProbeSource::LatencyTest);
     }
 
     fn replace_observatory_snapshot(
@@ -1279,19 +1313,30 @@ impl BroccoliApp {
                         },
                     ));
                 }
+                CoreEvt::LatencyProbeStatus(status) => {
+                    // Each arrival is applied as it lands, so the table shows
+                    // progress instead of waiting for the last server.
+                    if !status.statuses.is_empty() {
+                        Self::apply_probe_statuses(&mut self.servers, &status.statuses);
+                        self.latency_generation += 1;
+                    }
+                    self.probe_progress = status.progress;
+                    self.ui_ctx_dirty = true;
+                }
                 CoreEvt::LatencyProbe(result) => {
                     // Apply-then-park, byte-identical to the bus era: the
-                    // latency_ms ingestion stays in drain order, then the
+                    // verdict ingestion stays in drain order, then the
                     // outcome lands in the single probe-feedback slot for
                     // the servers screen to take.
                     if let Ok(statuses) = &result.result {
-                        Self::apply_observatory_statuses(&mut self.servers, statuses);
-                        // The probe just wrote profile latency_ms — an input
+                        Self::apply_probe_statuses(&mut self.servers, statuses);
+                        // The probe just wrote profile verdicts — an input
                         // of the dashboard grid's fallback cell — so the
                         // memoized grid rows must rebuild on this result too.
                         self.latency_generation += 1;
                         self.ui_ctx_dirty = true;
                     }
+                    self.probe_progress = result.progress;
                     self.probe_feedback.park(result);
                 }
                 CoreEvt::Download(download) => {
@@ -2566,6 +2611,7 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
+                    probe_progress: &mut self.probe_progress,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
@@ -2630,6 +2676,7 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
+                    probe_progress: &mut self.probe_progress,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
@@ -2671,6 +2718,7 @@ impl eframe::App for BroccoliApp {
                     logs: &self.logs,
                     logs_generation: self.logs.generation(),
                     probe_feedback: &mut self.probe_feedback,
+                    probe_progress: &mut self.probe_progress,
                     requests: &mut requests,
                     model_generation: &mut self.model_generation,
                     safety: cached_safety(&self.safety_cache),
@@ -3252,7 +3300,10 @@ fn validate_raw_override_candidate(
 mod safety_tests {
     use super::{Language, excerpt, generate_runtime_candidate, validate_raw_override_candidate};
     use crate::i18n::{Key, t, t_fmt};
-    use crate::model::{Mode, OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
+    use crate::model::{
+        Mode, OutboundModel, ProbeSource, ProbeVerdict, Protocol, ServerProfile, ServersFile,
+        Settings,
+    };
     use crate::rt::OutboundStatusView;
     use crate::ui::PhaseAction;
     use serde_json::json;
@@ -3314,7 +3365,13 @@ mod safety_tests {
         );
 
         assert_eq!(dashboard, [status]);
-        assert_eq!(servers.profiles[0].latency_ms, Some(23));
+        assert_eq!(
+            servers.profiles[0]
+                .verdict
+                .as_ref()
+                .and_then(ProbeVerdict::delay_ms),
+            Some(23)
+        );
     }
 
     #[test]
@@ -3349,15 +3406,112 @@ mod safety_tests {
             ],
         );
 
-        assert_eq!(servers.profiles[0].latency_ms, Some(12));
         assert_eq!(
-            servers.profiles[1].latency_ms,
-            Some(-1),
-            "a dead status records the -1 verdict, never its delay"
+            servers.profiles[0]
+                .verdict
+                .as_ref()
+                .and_then(ProbeVerdict::delay_ms),
+            Some(12)
+        );
+        let dead = servers.profiles[1]
+            .verdict
+            .as_ref()
+            .expect("a dead status records a verdict");
+        assert_eq!(dead.outcome, crate::model::ProbeOutcome::Dead);
+        assert_eq!(dead.source, ProbeSource::Monitoring);
+        assert_eq!(
+            servers.profiles[2].verdict, None,
+            "a status for another tag must leave this profile untouched"
+        );
+    }
+
+    #[test]
+    fn a_latency_test_verdict_outranks_monitoring_for_the_session() {
+        let mut profile = ServerProfile::new("first", OutboundModel::new(Protocol::Freedom));
+        profile.id = "1111111111111111".into();
+        let tag = profile.tag();
+        let mut servers = ServersFile {
+            profiles: vec![profile],
+            ..Default::default()
+        };
+        let status = |alive: bool, delay_ms: i64, last_error: Option<&str>| OutboundStatusView {
+            health_ping: None,
+            tag: tag.clone(),
+            alive,
+            delay_ms,
+            last_error: last_error.map(str::to_owned),
+            diagnostics: None,
+        };
+
+        super::BroccoliApp::apply_observatory_statuses(&mut servers, &[status(true, 80, None)]);
+        assert_eq!(
+            servers.profiles[0].verdict.as_ref().map(|v| v.source),
+            Some(ProbeSource::Monitoring)
+        );
+
+        super::BroccoliApp::apply_probe_statuses(
+            &mut servers,
+            &[status(false, 0, Some("connection refused"))],
+        );
+        let tested = servers.profiles[0]
+            .verdict
+            .as_ref()
+            .expect("a latency test always writes");
+        assert_eq!(tested.source, ProbeSource::LatencyTest);
+        assert_eq!(tested.outcome, crate::model::ProbeOutcome::Dead);
+        assert_eq!(tested.error.as_deref(), Some("connection refused"));
+
+        super::BroccoliApp::apply_observatory_statuses(&mut servers, &[status(true, 20, None)]);
+        let kept = servers.profiles[0]
+            .verdict
+            .as_ref()
+            .expect("the test verdict stays");
+        assert_eq!(kept.source, ProbeSource::LatencyTest);
+        assert_eq!(kept.outcome, crate::model::ProbeOutcome::Dead);
+        assert_eq!(
+            kept.error.as_deref(),
+            Some("connection refused"),
+            "monitoring never overwrites a test verdict for the session"
+        );
+    }
+
+    #[test]
+    fn streamed_probe_statuses_leave_untested_profiles_alone() {
+        let mut first = ServerProfile::new("first", OutboundModel::new(Protocol::Freedom));
+        first.id = "1111111111111111".into();
+        let mut second = ServerProfile::new("second", OutboundModel::new(Protocol::Freedom));
+        second.id = "2222222222222222".into();
+        second.verdict = Some(ProbeVerdict::delay(55, ProbeSource::Monitoring));
+        let first_tag = first.tag();
+        let mut servers = ServersFile {
+            profiles: vec![first, second],
+            ..Default::default()
+        };
+        super::BroccoliApp::apply_probe_statuses(
+            &mut servers,
+            &[OutboundStatusView {
+                health_ping: None,
+                tag: first_tag,
+                alive: true,
+                delay_ms: 12,
+                last_error: None,
+                diagnostics: None,
+            }],
         );
         assert_eq!(
-            servers.profiles[2].latency_ms, None,
-            "a status for another tag must leave this profile untouched"
+            servers.profiles[0]
+                .verdict
+                .as_ref()
+                .and_then(ProbeVerdict::delay_ms),
+            Some(12)
+        );
+        assert_eq!(
+            servers.profiles[1]
+                .verdict
+                .as_ref()
+                .and_then(ProbeVerdict::delay_ms),
+            Some(55),
+            "a profile the probe has not reported keeps its previous verdict"
         );
     }
 

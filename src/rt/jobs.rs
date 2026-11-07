@@ -180,6 +180,7 @@ impl super::CoreCmd {
             // must not treat the row as a promise that the runtime opened one.
             Self::SetTunMode(_) => JobKind::Restart,
             Self::ProbeLatency { .. } => JobKind::LatencyProbe,
+            Self::CancelLatencyProbe => return None,
             Self::TestRoute { .. } => JobKind::TestRoute,
             Self::GetBalancerInfo { .. }
             | Self::SetBalancerOverride { .. }
@@ -245,6 +246,8 @@ pub enum ExclusiveOutcome {
         /// verdicts to names/addresses for the warn log line.
         profiles: Vec<crate::model::ServerProfile>,
         result: Result<Vec<super::grpc::OutboundStatusView>, super::ProbeFailure>,
+        /// Tags whose verdict arrived before the run ended.
+        done: usize,
     },
     /// A profile-validation worker (`CoreCmd::ValidateProfiles`): the
     /// accepted/rejected verdict, or the cancel terminal its own cooperative
@@ -258,9 +261,10 @@ pub enum ExclusiveOutcome {
 /// outcome carry one today.
 #[derive(Debug)]
 pub enum ExclusiveSidecar {
-    /// Tags the latency-probe cancel/join-error terminal reports (probe:
-    /// single-flight, so tags pair the terminal back to its request).
-    LatencyTags(Vec<String>),
+    /// Tags and progress the latency-probe cancel/join-error terminal reports
+    /// (probe: single-flight, so tags pair the terminal back to its request;
+    /// the counter is updated by the streaming sink as verdicts land).
+    LatencyTags(super::ProbeTags),
     /// The parked reply of the in-flight TestConfig task (exactly one
     /// terminal site takes and resolves it).
     TestReply(oneshot::Sender<TestConfigReply>),

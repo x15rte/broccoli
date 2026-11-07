@@ -22,6 +22,10 @@ pub struct StatusColors {
     pub ok: Color32,
     pub warn: Color32,
     pub err: Color32,
+    /// The chain-hop outline. Not a status: it says why the row is listed —
+    /// another outbound dials through it — so it reads beside the statuses
+    /// and takes the same contrast coverage.
+    pub hop: Color32,
 }
 
 /// Palettes for the two themes. Every value passes WCAG AA (contrast ≥ 4.5:1)
@@ -33,6 +37,7 @@ pub const fn status_colors(dark: bool) -> StatusColors {
             ok: Color32::from_rgb(0x4f, 0xaf, 0x4f),
             warn: Color32::from_rgb(0xe0, 0xa0, 0x40),
             err: Color32::from_rgb(0xe0, 0x60, 0x60),
+            hop: Color32::from_rgb(0xc4, 0xa7, 0xe7),
         }
     } else {
         // White panel background.
@@ -40,6 +45,7 @@ pub const fn status_colors(dark: bool) -> StatusColors {
             ok: Color32::from_rgb(0x2e, 0x7d, 0x32),
             warn: Color32::from_rgb(0x8a, 0x5e, 0x00),
             err: Color32::from_rgb(0xb0, 0x2a, 0x2a),
+            hop: Color32::from_rgb(0x6b, 0x4f, 0xa0),
         }
     }
 }
@@ -187,6 +193,7 @@ mod tests {
                 ("ok", colors.ok),
                 ("warn", colors.warn),
                 ("err", colors.err),
+                ("hop", colors.hop),
             ] {
                 let ratio = wcag_contrast(color, bg);
                 assert!(

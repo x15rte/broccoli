@@ -13,7 +13,7 @@ use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, GeneratedSecret, MuxModel, Noise,
     VlessReverse, WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
-use crate::model::settings::{ColumnWidths, Language};
+use crate::model::settings::{ColumnWidths, Language, SortColumn, ViewSort};
 use crate::model::stream::{
     MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
     XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
@@ -34,9 +34,9 @@ use crate::model::validation::{
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
-    HttpCamouflageResponse, Int32Range, Network, OutboundModel, Protocol, ProtocolSettings,
-    RawHeader, Security, ServerProfile, ServersFile, Settings, Sniffing, SockoptModel, StreamModel,
-    WsSettings,
+    HttpCamouflageResponse, Int32Range, Network, OutboundModel, ProbeOutcome, ProbeSource,
+    ProbeVerdict, Protocol, ProtocolSettings, RawHeader, Security, ServerProfile, ServersFile,
+    Settings, Sniffing, SockoptModel, StreamModel, WsSettings,
 };
 use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
@@ -2041,21 +2041,6 @@ fn tab_order(servers: &crate::model::ServersFile) -> Vec<ServerTab> {
     tabs
 }
 
-/// A view-only sort column. It never reaches the stored order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SortColumn {
-    Name,
-    Protocol,
-    Latency,
-}
-
-/// One tab's transient view sort.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ViewSort {
-    column: SortColumn,
-    ascending: bool,
-}
-
 /// The sort a header click asks for: a new column starts ascending, the same
 /// column toggles.
 fn next_view_sort(current: Option<ViewSort>, column: SortColumn) -> ViewSort {
@@ -2200,8 +2185,12 @@ pub struct ServersScreen {
     selection_initialized: bool,
     /// The active tab. Opening the screen starts on `Emitted`.
     view: ServerTab,
-    /// The active tab's view sort; dropped whenever the tab changes.
+    /// The screen's view sort, persisted with the UI preferences: it
+    /// survives a tab switch and a restart, and never reorders stored rows.
     view_sort: Option<ViewSort>,
+    /// Whether the persisted view sort was read into this screen. The sort
+    /// ships in the settings, so the screen loads it on its first frame.
+    sort_initialized: bool,
     /// The list's search text; it filters the current tab only.
     search: String,
     tab_rows_cache: Option<TabRowsCache>,
@@ -3583,8 +3572,14 @@ impl ServersScreen {
                     });
             }
         }
+        // The view sort is a UI preference: the screen reads it once, from
+        // the settings, so the table opens in the order the user left it.
+        if !self.sort_initialized {
+            self.sort_initialized = true;
+            self.view_sort = ctx.settings.server_table_sort;
+        }
         // A group deleted under its tab falls back to the default view; the
-        // selection and the view sort belong to the tab that just went away.
+        // selection belongs to the tab that just went away.
         let stale_view = matches!(&self.view, ServerTab::Group(id)
             if !ctx.servers.groups.iter().any(|group| &group.id == id));
         if stale_view {
@@ -3597,8 +3592,9 @@ impl ServersScreen {
 
     // ---------- tab bar ----------
 
-    /// Switch tabs. The selection and the view sort belong to the tab that
-    /// was showing, so both are dropped here; the stored order never moves.
+    /// Switch tabs. The selection belongs to the tab that was showing, so it
+    /// is dropped here; the view sort is the screen's and stays, and the
+    /// stored order never moves.
     fn select_tab(&mut self, tab: ServerTab) {
         if self.view == tab {
             return;
@@ -3607,7 +3603,6 @@ impl ServersScreen {
         self.selected = None;
         self.selection.clear();
         self.selection_anchor = None;
-        self.view_sort = None;
         self.tab_rows_cache = None;
     }
 
@@ -3949,6 +3944,10 @@ impl ServersScreen {
         };
         ui.label(t_fmt(lang, Key::SrvActiveRoute, &[&route]));
         self.show_tab_bar(ui, ctx, lang);
+        // The selected tab's underline is painted three points below its
+        // label, inside the gap, so the constant is added rather than consumed:
+        // the toolbar clears the underline by twelve points, not nine.
+        ui.add_space(TAB_STRIP_TO_TOOLBAR_GAP);
         self.show_subscription_card(ui, ctx, lang);
 
         // One-probe-at-a-time gate for the toolbar command. The probe dials
@@ -3970,92 +3969,86 @@ impl ServersScreen {
         // The toolbar's commands, with search at the end of the row so
         // filtering sits beside the actions it filters.
         let mut add_proto: Option<Protocol> = None;
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
-                ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
-                    for protocol in Protocol::ALL {
-                        if ui.button(protocol.as_str()).clicked() {
-                            add_proto = Some(protocol);
-                            ui.close();
+        if probe_pending {
+            // The test owns the toolbar: progress replaces the commands so
+            // the set under test cannot change, while Cancel stays reachable.
+            ui.horizontal(|ui| {
+                ui.spinner();
+                if ctx.probe_progress.total == 0 {
+                    ui.label(t(lang, Key::SrvTesting));
+                } else {
+                    ui.label(t_fmt(
+                        lang,
+                        Key::SrvTestingProgress,
+                        &[&ctx.probe_progress.done, &ctx.probe_progress.total],
+                    ));
+                }
+                if ui.button(t(lang, Key::Cancel)).clicked() {
+                    ctx.hooks.send(CoreCmd::CancelLatencyProbe);
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
+                    ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
+                        for protocol in Protocol::ALL {
+                            if ui.button(protocol.as_str()).clicked() {
+                                add_proto = Some(protocol);
+                                ui.close();
+                            }
                         }
+                    });
+                });
+                if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
+                    self.import_open = true;
+                    self.import_group = Some(self.target_group(ctx.servers));
+                    self.profile_validation_report = None;
+                }
+                if ui.button(t(lang, Key::SrvNewGroup)).clicked() {
+                    self.group_dialog = Some(GroupDraft::default());
+                }
+                ui.separator();
+                // The latency command is gated like the table's own probe
+                // paths, plus the no-profiles case.
+                let can_test_latency = if !probe_gate.0 {
+                    probe_gate
+                } else if ctx.servers.profiles.is_empty() {
+                    (false, t(lang, Key::SrvAddServerBeforeLatency))
+                } else {
+                    (true, "")
+                };
+                let test_latency = if can_test_latency.0 {
+                    ui.button(t(lang, Key::TestLatency))
+                        .on_hover_text(t(lang, Key::SrvTestLatencyHint))
+                } else {
+                    ui.add_enabled(false, egui::Button::new(t(lang, Key::TestLatency)))
+                        .on_disabled_hover_text(can_test_latency.1)
+                };
+                if test_latency.clicked() {
+                    action = Some(ListAction::ProbeLatencySelection);
+                }
+                // The columns fit their content until a divider is dragged; this
+                // command gives the dragged widths back to the fit. It sits with
+                // the view commands because that is what it changes.
+                if ui
+                    .button(t(lang, Key::SrvFitColumns))
+                    .on_hover_text(t(lang, Key::SrvFitColumnsHint))
+                    .clicked()
+                {
+                    self.fit_columns = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text(t(lang, Key::SrvSearch))
+                            .desired_width(220.0),
+                    );
+                    if !self.search.is_empty() && ui.small_button("✕").clicked() {
+                        self.search.clear();
                     }
                 });
             });
-            if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
-                self.import_open = true;
-                self.import_group = Some(self.target_group(ctx.servers));
-                self.profile_validation_report = None;
-            }
-            if ui.button(t(lang, Key::SrvNewGroup)).clicked() {
-                self.group_dialog = Some(GroupDraft::default());
-            }
-            ui.separator();
-            // The latency command is gated like the table's own probe
-            // paths, plus the no-profiles case.
-            let can_test_latency = if !probe_gate.0 {
-                probe_gate
-            } else if ctx.servers.profiles.is_empty() {
-                (false, t(lang, Key::SrvAddServerBeforeLatency))
-            } else {
-                (true, "")
-            };
-            let test_latency = if can_test_latency.0 {
-                ui.button(t(lang, Key::TestLatency))
-                    .on_hover_text(t(lang, Key::SrvTestLatencyHint))
-            } else {
-                ui.add_enabled(false, egui::Button::new(t(lang, Key::TestLatency)))
-                    .on_disabled_hover_text(can_test_latency.1)
-            };
-            if test_latency.clicked() {
-                action = Some(ListAction::ProbeLatencySelection);
-            }
-            if ui.button(t(lang, Key::SrvSortByLatency)).clicked() {
-                // Ascending latency inside each group; timeouts and
-                // never-measured last. The sort rewrites the stored row order
-                // for real, but never moves a row into another group's block:
-                // the group tab order fixes the blocks. The active route
-                // names a server id and does not follow the row order.
-                ctx.servers.sort_rows_by_latency();
-                ctx.hooks.mark_dirty();
-            }
-            // The columns fit their content until a divider is dragged; this
-            // command gives the dragged widths back to the fit. It sits with
-            // the view commands because that is what it changes.
-            if ui
-                .button(t(lang, Key::SrvFitColumns))
-                .on_hover_text(t(lang, Key::SrvFitColumnsHint))
-                .clicked()
-            {
-                self.fit_columns = true;
-            }
-            // The batch commands exist only while a selection does: a toolbar
-            // full of buttons that cannot act is clutter, not affordance.
-            if !self.selection.is_empty() {
-                ui.separator();
-                if ui.button(t(lang, Key::SrvEnableSelected)).clicked() {
-                    action = Some(ListAction::SetSelectionEnabled(true));
-                }
-                if ui.button(t(lang, Key::SrvDisableSelected)).clicked() {
-                    action = Some(ListAction::SetSelectionEnabled(false));
-                }
-                if ui.button(t(lang, Key::SrvShareSelected)).clicked() {
-                    action = Some(ListAction::ExportSelection);
-                }
-                if ui.button(t(lang, Key::SrvDeleteSelected)).clicked() {
-                    action = Some(ListAction::DeleteSelection);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text(t(lang, Key::SrvSearch))
-                        .desired_width(220.0),
-                );
-                if !self.search.is_empty() && ui.small_button("✕").clicked() {
-                    self.search.clear();
-                }
-            });
-        });
+        }
         if let Some(protocol) = add_proto {
             self.draft_tab = EditorTab::Basic;
             let mut profile = ServerProfile::new(
@@ -4071,12 +4064,6 @@ impl ServersScreen {
             // type one.
             self.revealed_add = true;
         }
-        if self.pending_latency_probe.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(t(lang, Key::SrvTestingLatencyIsolated));
-            });
-        }
         if let Some((level, message)) = &self.latency_probe_feedback {
             let color = match level {
                 FeedbackLevel::Ok => status_colors_of(ui).ok,
@@ -4089,7 +4076,7 @@ impl ServersScreen {
         // sortable header exists only where sorting is a view: every tab but
         // `Emitted`, whose order is the outbound order.
         ui.add_space(4.0);
-        let sortable = self.view != ServerTab::Emitted;
+        let sortable = self.view != ServerTab::Emitted && !probe_pending;
         let shape = TableShape {
             order: self.view == ServerTab::Emitted,
             group: self.view == ServerTab::All,
@@ -4137,6 +4124,10 @@ impl ServersScreen {
         }
         if let Some(column) = outcome.sort {
             self.view_sort = Some(next_view_sort(self.view_sort, column));
+            // The sort is a display preference: it saves with the other UI
+            // settings and never reaches the configuration pipeline.
+            ctx.settings.server_table_sort = self.view_sort;
+            ctx.hooks.mark_ui_dirty();
         }
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
@@ -4192,6 +4183,10 @@ impl ServersScreen {
                 .expect("the emitted set was cached above")
                 .1,
         );
+        // One clone per frame instead of a lookup per row: the menu's switch
+        // label asks which selected rows are locked, and the route is one of
+        // the two locks.
+        let active_id = ctx.servers.active.clone();
         if self.row_details.as_ref().map(|(cached, _)| *cached) != Some(generation) {
             let hide = ctx.settings.hide_server_info && !self.revealed_list;
             let details: std::collections::HashMap<usize, RowDetail> = profiles
@@ -4292,14 +4287,16 @@ impl ServersScreen {
                         // the language, or the theme palette moved — a
                         // near-constant input, so idle rows pay a hash
                         // lookup plus a value compare, never a `t_fmt`.
-                        if !self
-                            .latency_badges
-                            .get(p.id.as_str())
-                            .is_some_and(|badge| badge.matches(p.latency_ms, lang, colors))
-                        {
+                        if !self.latency_badges.get(p.id.as_str()).is_some_and(|badge| {
+                            badge.matches(
+                                p.verdict.as_ref().map(|verdict| verdict.outcome),
+                                lang,
+                                colors,
+                            )
+                        }) {
                             self.latency_badges.insert(
                                 p.id.clone(),
-                                LatencyBadge::new(p.latency_ms, lang, colors),
+                                LatencyBadge::new(p.verdict.as_ref(), lang, colors),
                             );
                         }
                         let badge = self
@@ -4322,6 +4319,7 @@ impl ServersScreen {
                             RowCells {
                                 name: &p.name,
                                 detail: detail.unwrap_or(&EMPTY_ROW_DETAIL),
+                                verdict: p.verdict.as_ref(),
                                 extras: RowExtras {
                                     order: shape.order.then_some(display + 1),
                                     group: shape.group.then_some(p.group_title.as_str()),
@@ -4330,6 +4328,8 @@ impl ServersScreen {
                             RowState {
                                 selected: is_sel,
                                 active: is_active,
+                                hop: emitted.chain_only.contains(&index),
+                                frozen: probe_pending,
                                 switch: RowSwitch {
                                     // The active server and a chain-only hop
                                     // are in the generated document whatever
@@ -4362,25 +4362,28 @@ impl ServersScreen {
                         let modifiers = ui.input(|i| i.modifiers);
                         let modified = modifiers.command || modifiers.ctrl || modifiers.shift;
                         if clicks.row.drag_started_by(egui::PointerButton::Primary)
+                            && !probe_pending
                             && !modified
                             && self.view == ServerTab::Emitted
                             && !is_active
                         {
                             egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
                         }
-                        if clicks.toggle {
-                            action = Some(ListAction::ToggleEnabled(p.id.clone()));
-                        } else if clicks.double_clicked() {
-                            action = Some(ListAction::Edit(p.id.clone()));
-                        } else if clicks.name.clicked() || clicks.row.clicked() {
-                            row_hit = true;
-                            action = Some(if modifiers.command || modifiers.ctrl {
-                                ListAction::ToggleSelection(p.id.clone())
-                            } else if modifiers.shift {
-                                ListAction::ExtendSelection(p.id.clone())
-                            } else {
-                                ListAction::Select(p.id.clone())
-                            });
+                        if !probe_pending {
+                            if clicks.toggle {
+                                action = Some(ListAction::ToggleEnabled(p.id.clone()));
+                            } else if clicks.double_clicked() {
+                                action = Some(ListAction::Edit(p.id.clone()));
+                            } else if clicks.name.clicked() || clicks.row.clicked() {
+                                row_hit = true;
+                                action = Some(if modifiers.command || modifiers.ctrl {
+                                    ListAction::ToggleSelection(p.id.clone())
+                                } else if modifiers.shift {
+                                    ListAction::ExtendSelection(p.id.clone())
+                                } else {
+                                    ListAction::Select(p.id.clone())
+                                });
+                            }
                         }
                         // The row under the pointer proposes the gap: above
                         // its midline inserts before it, below inserts after
@@ -4449,12 +4452,35 @@ impl ServersScreen {
                                 action = Some(ListAction::CopySelection);
                                 ui.close();
                             }
-                            if ui.button(t(lang, Key::SrvEnableSelected)).clicked() {
-                                action = Some(ListAction::SetSelectionEnabled(true));
-                                ui.close();
+                            // One control for one state: the item offers the
+                            // switch the selection does not have yet. Locked
+                            // rows (the route and chain hops) are skipped by
+                            // the command, so they decide neither the label
+                            // nor whether the item can act.
+                            let mut has_unlocked = false;
+                            let mut any_unlocked_off = false;
+                            for (index, profile) in profiles.iter().enumerate() {
+                                if !self.selection.contains(&profile.id) {
+                                    continue;
+                                }
+                                let locked = active_id.as_deref() == Some(profile.id.as_str())
+                                    || emitted.chain_only.contains(&index);
+                                if locked {
+                                    continue;
+                                }
+                                has_unlocked = true;
+                                any_unlocked_off |= !profile.enabled;
                             }
-                            if ui.button(t(lang, Key::SrvDisableSelected)).clicked() {
-                                action = Some(ListAction::SetSelectionEnabled(false));
+                            let (enable_key, enable) = if any_unlocked_off {
+                                (Key::SrvEnableSelected, true)
+                            } else {
+                                (Key::SrvDisableSelected, false)
+                            };
+                            if ui
+                                .add_enabled(has_unlocked, egui::Button::new(t(lang, enable_key)))
+                                .clicked()
+                            {
+                                action = Some(ListAction::SetSelectionEnabled(enable));
                                 ui.close();
                             }
                             if ui.button(t(lang, Key::SrvShare)).clicked() {
@@ -4468,8 +4494,10 @@ impl ServersScreen {
                         };
                         // The name button fills its cell, so both it and the
                         // row background open the context menu.
-                        clicks.row.context_menu(|ui| menu(ui));
-                        clicks.name.context_menu(|ui| menu(ui));
+                        if !probe_pending {
+                            clicks.row.context_menu(|ui| menu(ui));
+                            clicks.name.context_menu(|ui| menu(ui));
+                        }
                     }
                     // Below every laid-out row's midline the drop lands at
                     // the band's end: the visible tail of a scrolled list, or
@@ -4492,7 +4520,8 @@ impl ServersScreen {
                     // release is seen. The rows are a view of the stored list
                     // — emitted and filtered — so the gap maps back through
                     // the row it lands before, never a raw profile index.
-                    if let Some((gap, _)) = drop_mark
+                    if !probe_pending
+                        && let Some((gap, _)) = drop_mark
                         && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
                         && let Some(lifted) = egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
                         && let Some(drop) =
@@ -4531,7 +4560,7 @@ impl ServersScreen {
         }
 
         // A click in the empty band below a short list clears the selection.
-        if !row_hit && self.delete_pending.is_none() {
+        if !probe_pending && !row_hit && self.delete_pending.is_none() {
             let blank = ui.allocate_response(
                 egui::vec2(ui.available_width(), ui.available_height().max(0.0)),
                 egui::Sense::click(),
@@ -4550,7 +4579,7 @@ impl ServersScreen {
             || self.leave_pending.is_some()
             || self.qr_dialog.is_some()
             || self.derive_dialog.is_some();
-        if !typing && !overlay_open {
+        if !probe_pending && !typing && !overlay_open {
             if ui
                 .input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::A))
             {
@@ -4681,7 +4710,21 @@ impl ServersScreen {
             return;
         };
         self.pending_latency_probe = None;
-        self.latency_probe_feedback = Some(if single {
+        let cancelled = matches!(
+            &result.result,
+            Err(failure) if failure.headline.key() == Key::ProbeCancelledByUser
+        );
+        let progress = result.progress;
+        self.latency_probe_feedback = Some(if cancelled {
+            (
+                FeedbackLevel::Warn,
+                t_fmt(
+                    ctx.settings.language,
+                    Key::SrvLatencyCancelled,
+                    &[&progress.done, &progress.total],
+                ),
+            )
+        } else if single {
             format_single_latency_probe_feedback(
                 ctx.settings.language,
                 result,
@@ -4943,6 +4986,9 @@ impl ServersScreen {
             Ok(()) => {
                 self.pending_latency_probe = Some(single);
                 self.latency_probe = Request::park_in_shell();
+                // A new test starts from zero: the previous run's count must
+                // not stand in for this one until its first arrival lands.
+                *ctx.probe_progress = crate::rt::ProbeProgress { done: 0, total: 0 };
             }
             Err(error) => self.latency_probe_feedback = Some((FeedbackLevel::Err, error)),
         }
@@ -5468,11 +5514,13 @@ impl ServersScreen {
 }
 
 /// One memoized latency badge: the badge text and color are
-/// formatted once per input change — measured latency, language, status
+/// formatted once per input change — the outcome, language, status
 /// palette — and reused by every painted row whose inputs still match.
+/// The measurement time is deliberately not part of the key: monitoring
+/// refreshes it every tick, and the cell's text would not change.
 /// [`ServersScreen::latency_badges`] holds one per listed profile.
 struct LatencyBadge {
-    latency_ms: Option<i64>,
+    outcome: Option<ProbeOutcome>,
     lang: Language,
     colors: StatusColors,
     text: String,
@@ -5480,18 +5528,23 @@ struct LatencyBadge {
 }
 
 impl LatencyBadge {
-    fn new(latency_ms: Option<i64>, lang: Language, colors: StatusColors) -> Self {
-        let (text, color) = match latency_ms {
+    fn new(verdict: Option<&ProbeVerdict>, lang: Language, colors: StatusColors) -> Self {
+        let outcome = verdict.map(|verdict| verdict.outcome);
+        let (text, color) = match outcome {
             // Never measured: an empty cell reads as "no result yet" without
             // repeating the header in every row.
             None => (String::new(), Color32::GRAY),
-            Some(v) if v < 0 => (t(lang, Key::LatencyTimeout).into(), colors.err),
-            Some(v) if v < 300 => (t_fmt(lang, Key::LatencyMs, &[&v]), colors.ok),
-            Some(v) if v < 1000 => (t_fmt(lang, Key::LatencyMs, &[&v]), colors.warn),
-            Some(v) => (t_fmt(lang, Key::LatencyMs, &[&v]), colors.err),
+            Some(ProbeOutcome::Dead) => (t(lang, Key::LatencyTimeout).into(), colors.err),
+            Some(ProbeOutcome::Delay(v)) if v < 300 => {
+                (t_fmt(lang, Key::LatencyMs, &[&v]), colors.ok)
+            }
+            Some(ProbeOutcome::Delay(v)) if v < 1000 => {
+                (t_fmt(lang, Key::LatencyMs, &[&v]), colors.warn)
+            }
+            Some(ProbeOutcome::Delay(v)) => (t_fmt(lang, Key::LatencyMs, &[&v]), colors.err),
         };
         Self {
-            latency_ms,
+            outcome,
             lang,
             colors,
             text,
@@ -5499,10 +5552,66 @@ impl LatencyBadge {
         }
     }
 
-    /// The memo still covers a row whose inputs are `latency_ms`/`lang`/
-    /// `colors` — an allocation-free per-row compare.
-    fn matches(&self, latency_ms: Option<i64>, lang: Language, colors: StatusColors) -> bool {
-        self.latency_ms == latency_ms && self.lang == lang && self.colors == colors
+    /// The memo still covers a row whose visible inputs are the outcome,
+    /// `lang` and `colors` — an allocation-free per-row compare.
+    fn matches(&self, outcome: Option<ProbeOutcome>, lang: Language, colors: StatusColors) -> bool {
+        self.outcome == outcome && self.lang == lang && self.colors == colors
+    }
+}
+
+/// The latency cell's hover: what measured it, how old the measurement is,
+/// and — for a dead verdict — the error the core reported.
+fn verdict_hover(lang: Language, verdict: &ProbeVerdict) -> String {
+    let source = match verdict.source {
+        ProbeSource::LatencyTest => t(lang, Key::SrvVerdictSourceTest),
+        ProbeSource::Monitoring => t(lang, Key::SrvVerdictSourceMonitoring),
+    };
+    let age = std::time::SystemTime::now()
+        .duration_since(verdict.measured_at)
+        .unwrap_or_default();
+    let mut text = if age < Duration::from_secs(1) {
+        t_fmt(lang, Key::SrvVerdictJustNow, &[&source])
+    } else {
+        t_fmt(lang, Key::SrvVerdictAgo, &[&age_phrase(lang, age), &source])
+    };
+    if let Some(error) = &verdict.error {
+        text.push('\n');
+        text.push_str(&t_fmt(lang, Key::SrvVerdictError, &[error]));
+    }
+    text
+}
+
+/// A duration as the largest whole unit that has passed, singular or plural.
+fn age_phrase(lang: Language, age: Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds >= 86_400 {
+        let days = seconds / 86_400;
+        return if days == 1 {
+            t(lang, Key::SrvAgeDay).to_owned()
+        } else {
+            t_fmt(lang, Key::SrvAgeDays, &[&days])
+        };
+    }
+    if seconds >= 3_600 {
+        let hours = seconds / 3_600;
+        return if hours == 1 {
+            t(lang, Key::SrvAgeHour).to_owned()
+        } else {
+            t_fmt(lang, Key::SrvAgeHours, &[&hours])
+        };
+    }
+    if seconds >= 60 {
+        let minutes = seconds / 60;
+        return if minutes == 1 {
+            t(lang, Key::SrvAgeMinute).to_owned()
+        } else {
+            t_fmt(lang, Key::SrvAgeMinutes, &[&minutes])
+        };
+    }
+    if seconds <= 1 {
+        t(lang, Key::SrvAgeSecond).to_owned()
+    } else {
+        t_fmt(lang, Key::SrvAgeSeconds, &[&seconds])
     }
 }
 
@@ -5511,6 +5620,12 @@ impl LatencyBadge {
 struct RowState<'a> {
     selected: bool,
     active: bool,
+    /// The row is a chain hop: another outbound dials through it, so the row
+    /// exists because of that reference. The paint marks it in purple.
+    hop: bool,
+    /// The latency test owns the list: row clicks, drags, the menu and the
+    /// switch are inert while it runs.
+    frozen: bool,
     switch: RowSwitch<'a>,
 }
 
@@ -5584,6 +5699,10 @@ const TABLE_ROW_HEIGHT: f32 = 26.0;
 const TABLE_CELL_INSET: f32 = 8.0;
 /// The room a sort arrow needs beside its column's label.
 const TABLE_SORT_ARROW_ROOM: f32 = 18.0;
+/// The clear space between the tab strip's underline and the toolbar's first
+/// control. The selected tab paints its rule three points below its label, so
+/// the toolbar sits fifteen points under the label and twelve under the rule.
+const TAB_STRIP_TO_TOOLBAR_GAP: f32 = 12.0;
 /// How wide the pointer's grab band on a column divider is.
 const TABLE_DIVIDER_HIT_WIDTH: f32 = 6.0;
 
@@ -5689,6 +5808,9 @@ struct RowExtras<'a> {
 struct RowCells<'a> {
     name: &'a str,
     detail: &'a RowDetail,
+    /// The live verdict behind the latency cell; the hover reads its time and
+    /// error, which the memoized badge does not keep.
+    verdict: Option<&'a ProbeVerdict>,
     extras: RowExtras<'a>,
 }
 
@@ -6231,10 +6353,18 @@ fn sort_view_rows(rows: &mut [usize], profiles: &[crate::model::ServerProfile], 
         SortColumn::Protocol => {
             rows.sort_by_cached_key(|&index| profiles[index].outbound.protocol.as_str().to_owned());
         }
-        SortColumn::Latency => rows.sort_by_cached_key(|&index| match profiles[index].latency_ms {
-            Some(value) if value >= 0 => (0u8, value),
-            _ => (1u8, i64::MAX),
-        }),
+        SortColumn::Latency => {
+            rows.sort_by_cached_key(|&index| {
+                match profiles[index]
+                    .verdict
+                    .as_ref()
+                    .and_then(ProbeVerdict::delay_ms)
+                {
+                    Some(value) => (0u8, value),
+                    None => (1u8, i64::MAX),
+                }
+            });
+        }
     }
     if !sort.ascending {
         rows.reverse();
@@ -6343,6 +6473,7 @@ fn server_list_row(
     let RowCells {
         name,
         detail,
+        verdict,
         extras,
     } = cells;
     // A row reads as a row when its band is visible: the pointer's row lifts,
@@ -6353,7 +6484,8 @@ fn server_list_row(
         ui.cursor().min,
         egui::vec2(columns.total(), TABLE_ROW_HEIGHT),
     );
-    let ok = status_colors_of(ui).ok;
+    let colors = status_colors_of(ui);
+    let ok = colors.ok;
     let fill = if row.selected {
         let accent = ui.visuals().selection.bg_fill;
         egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64)
@@ -6373,6 +6505,18 @@ fn server_list_row(
             egui::vec2(3.0, band.height() - 10.0),
         );
         ui.painter().rect_filled(bar, 1.0, ok);
+    } else if row.hop {
+        // A hop is in the list because another outbound dials through it: the
+        // outline says so. The active row keeps its green bar and takes no
+        // outline, so a route that is also a hop stays unambiguous. The
+        // stroke sits inside the band, over the selection tint, and adds no
+        // fill and no text change.
+        ui.painter().rect_stroke(
+            band,
+            0.0,
+            egui::Stroke::new(1.0, colors.hop),
+            egui::StrokeKind::Inside,
+        );
     }
     let inner = ui.horizontal(|ui| {
         // Cells abut: the gutter is each cell's own inset, so the header and
@@ -6390,7 +6534,7 @@ fn server_list_row(
         let mut checked = row.switch.checked;
         table_cell(ui, columns.switch, |ui| {
             let response = ui.add_enabled(
-                row.switch.locked_hint.is_none(),
+                !row.frozen && row.switch.locked_hint.is_none(),
                 egui::Checkbox::without_text(&mut checked),
             );
             match row.switch.locked_hint {
@@ -6403,7 +6547,7 @@ fn server_list_row(
             }
         });
         let toggled = checked != row.switch.checked;
-        let name_resp = table_cell_button(ui, columns.name, lang, name, row.selected);
+        let name_resp = table_cell_button(ui, columns.name, lang, name, row.selected, row.frozen);
         table_cell(ui, columns.protocol, |ui| {
             ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
         });
@@ -6435,10 +6579,15 @@ fn server_list_row(
             // right so the digits read as a column; an unmeasured row paints
             // nothing, which is why the badge text is empty then.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
+                let response = ui.add(
                     egui::Label::new(RichText::new(latency.text.as_str()).color(latency.color))
                         .selectable(false),
                 );
+                if let Some(verdict) = verdict {
+                    response.on_hover_ui(|ui| {
+                        ui.label(verdict_hover(lang, verdict));
+                    });
+                }
             });
         });
         if let (Some(width), Some(group)) = (columns.group, extras.group) {
@@ -6456,7 +6605,11 @@ fn server_list_row(
         band.max.y - 0.5,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
-    let resp = inner.response.interact(egui::Sense::click_and_drag());
+    let resp = if row.frozen {
+        inner.response.interact(egui::Sense::hover())
+    } else {
+        inner.response.interact(egui::Sense::click_and_drag())
+    };
     RowClicks {
         row: resp,
         name: name_resp,
@@ -6471,6 +6624,7 @@ fn table_cell_button(
     lang: Language,
     name: &str,
     selected: bool,
+    frozen: bool,
 ) -> egui::Response {
     let mut response = None;
     table_cell(ui, width, |ui| {
@@ -6484,7 +6638,7 @@ fn table_cell_button(
                 // The button's own padding would indent the name past the
                 // header above it; the cell inset is the table's only gutter.
                 ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
-                ui.add(button.truncate())
+                ui.add_enabled(!frozen, button.truncate())
                     .on_hover_text(t(lang, Key::SrvDragToReorder))
             })
             .inner,
@@ -10863,7 +11017,7 @@ mod tests {
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
     use crate::links;
-    use crate::model::settings::ColumnWidths;
+    use crate::model::settings::{ColumnWidths, SortColumn, ViewSort};
     use crate::model::stream::MasqueradeCfg;
     use crate::model::validation::{
         ValidationCode, ValidationIssue, validate_outbound, validate_sockopt,
@@ -10874,12 +11028,13 @@ mod tests {
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver, FreedomFinalRule,
         HysteriaTransport, Int32Range, MasqueTransport, MasqueWarp, Network, Noise, OutboundModel,
-        Protocol, ProtocolSettings, RealityModel, Security, SockoptModel, StreamModel, TlsCert,
-        TlsModel, WireguardPeer, WsSettings, XhttpSettings, XmuxConfig,
+        ProbeOutcome, ProbeSource, ProbeVerdict, Protocol, ProtocolSettings, RealityModel,
+        Security, SockoptModel, StreamModel, TlsCert, TlsModel, WireguardPeer, WsSettings,
+        XhttpSettings, XmuxConfig,
     };
     use crate::rt::{
-        CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProfileValidationOrigin,
-        ProfileValidationResult, ToolTarget,
+        CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProbeFailure,
+        ProfileValidationOrigin, ProfileValidationResult, ToolTarget,
     };
     use crate::ui::test_rig::harness_builder;
     use crate::ui::test_rig::{
@@ -10887,7 +11042,7 @@ mod tests {
     };
     use egui_kittest::{Harness, kittest::NodeT as _, kittest::Queryable};
     use serde_json::json;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use std::{cell::RefCell, rc::Rc};
 
     /// The codes of one finding list, in the sweep's order.
@@ -11594,39 +11749,26 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn switching_tabs_clears_the_selection_and_the_view_sort() {
+    fn switching_tabs_clears_the_selection_and_keeps_the_view_sort() {
         let (rig, _) = tab_rig(&["Alpha", "Bravo"], &["Charlie"]);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
         harness.get_by_label("Alpha").click();
         harness.run();
-        // The clicked row is selected: the batch commands appear only with a
-        // selection.
-        let batch_visible = |harness: &Harness<'static, (ServersScreen, UiTestRig)>| {
-            harness
-                .query_by_role_and_label(
-                    egui::accesskit::Role::Button,
-                    t(Language::En, Key::SrvEnableSelected),
-                )
-                .is_some()
-        };
-        assert!(
-            batch_visible(&harness),
-            "the clicked row must show the batch commands"
-        );
+        // The clicked row is selected.
+        assert_eq!(selected_names(&harness), ["Alpha"]);
 
         harness
             .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(
-            !batch_visible(&harness),
+            harness.state().0.selection.is_empty(),
             "a tab switch must drop the selection with the tab"
         );
 
-        // A view sort exists while the tab shows — the header marks the
-        // sorted column — and is dropped on the way out, so returning to the
-        // tab cannot resurrect it.
+        // The view sort is the screen's, not the tab's: the header keeps its
+        // arrow and the rows keep their order across the switch.
         harness
             .get_by_role_and_label(
                 egui::accesskit::Role::Button,
@@ -11646,26 +11788,111 @@ Authentication: ML-KEM-768, Post-Quantum
             .click();
         harness.run();
         assert!(
-            harness.query_by_label("▲").is_none(),
-            "leaving the tab must drop the view sort"
+            harness.query_by_label("▲").is_some(),
+            "the view sort survives the tab switch"
         );
         harness
             .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(
-            harness.query_by_label("▲").is_none(),
-            "returning to the tab must not resurrect the view sort"
+            harness.query_by_label("▲").is_some(),
+            "returning to the tab shows the same view sort"
+        );
+    }
+
+    #[test]
+    fn the_view_sort_saves_as_a_ui_preference_and_loads_on_open() {
+        let (rig, _) = tab_rig(&["Bravo", "Alpha"], &[]);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvColName),
+            )
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.settings.server_table_sort,
+            Some(ViewSort {
+                column: SortColumn::Name,
+                ascending: true,
+            }),
+            "a header click saves the sort with the UI preferences"
+        );
+        assert!(
+            harness.state().1.requests.ui_dirty,
+            "the sort takes the UI-only persist lane"
+        );
+        assert!(
+            !harness.state().1.requests.dirty,
+            "a view sort never reaches the configuration pipeline"
+        );
+
+        // A screen opened over those settings comes back sorted, and still
+        // leaves `Emitted` in the outbound order.
+        let settings = harness.state().1.settings.clone();
+        let servers = harness.state().1.servers.clone();
+        drop(harness);
+        let rig = UiTestRig {
+            settings,
+            servers,
+            ..UiTestRig::default()
+        };
+        let mut reopened = screen_harness(rig, ServersScreen::default());
+        reopened.run();
+        assert!(
+            reopened.query_all_by_label("▲").next().is_none(),
+            "Emitted never takes the view sort"
+        );
+        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness.get_by_label(label).rect().center().y
+        };
+        assert!(y(&reopened, "Bravo") < y(&reopened, "Alpha"));
+        reopened
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        reopened.run();
+        assert!(
+            y(&reopened, "Alpha") < y(&reopened, "Bravo"),
+            "the saved sort orders the rows on open"
+        );
+        assert!(
+            reopened.query_by_label("▲").is_some(),
+            "the saved direction comes back with the sort"
         );
     }
 
     #[test]
     fn group_tabs_sort_the_view_only_and_emitted_has_no_header_sort() {
         let mut rig = UiTestRig::default();
-        for (name, latency) in [("Bravo", 300), ("Alpha", 20), ("Charlie", 40)] {
+        for (name, verdict) in [
+            (
+                "Bravo",
+                Some(ProbeVerdict::delay(300, ProbeSource::LatencyTest)),
+            ),
+            (
+                "Alpha",
+                Some(ProbeVerdict::delay(20, ProbeSource::LatencyTest)),
+            ),
+            (
+                "Charlie",
+                Some(ProbeVerdict::delay(40, ProbeSource::LatencyTest)),
+            ),
+            (
+                "Dead",
+                Some(ProbeVerdict::dead(ProbeSource::LatencyTest, None)),
+            ),
+            ("Never", None),
+        ] {
             let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
             profile.enabled = true;
-            profile.latency_ms = Some(latency);
+            profile.verdict = verdict;
             rig.servers.profiles.push(profile);
         }
         let mut harness = screen_harness(rig, ServersScreen::default());
@@ -11739,6 +11966,10 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert!(y(&harness, "Alpha") < y(&harness, "Charlie"));
         assert!(y(&harness, "Charlie") < y(&harness, "Bravo"));
+        assert!(
+            y(&harness, "Bravo") < y(&harness, "Dead"),
+            "a dead verdict sorts after every measured delay"
+        );
         assert_eq!(
             harness
                 .state()
@@ -11753,7 +11984,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn a_group_tab_sort_is_a_view_and_leaving_the_tab_drops_it() {
+    fn a_group_tab_sort_is_a_view_and_survives_leaving_the_tab() {
         use crate::model::servers::Group;
         let mut rig = UiTestRig::default();
         let feed = Group::new("Feed");
@@ -11792,15 +12023,21 @@ Authentication: ML-KEM-768, Post-Quantum
             "the view sort never rewrites the group's stored order"
         );
 
-        // Leaving the tab drops the sort: returning shows the stored order.
+        // The sort belongs to the screen, so leaving the tab and coming back
+        // keeps it; the stored order stays as it was.
         harness
             .get_by_label(t(Language::En, Key::SrvTabEmitted))
             .click();
         harness.run();
-        assert_eq!(harness.state().0.view_sort, None);
+        assert!(harness.state().0.view_sort.is_some());
         harness.get_by_label("Feed").click();
         harness.run();
-        assert!(y(&harness, "Zulu") < y(&harness, "Alpha"));
+        assert!(y(&harness, "Alpha") < y(&harness, "Zulu"));
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Zulu", "Alpha"],
+            "the view sort never rewrites the group's stored order"
+        );
     }
 
     #[test]
@@ -12398,7 +12635,6 @@ Authentication: ML-KEM-768, Post-Quantum
             t(Language::En, Key::SrvNewGroup),
             t(Language::En, Key::SrvImportLinks),
             t(Language::En, Key::TestLatency),
-            t(Language::En, Key::SrvSortByLatency),
             t(Language::En, Key::SrvFitColumns),
         ] {
             assert!(
@@ -12471,6 +12707,76 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
+    /// The tab strip clears the toolbar: the rule under the selected tab sits
+    /// three points into the gap, so the first control is twelve points below
+    /// the rule and fifteen below the tab's label.
+    #[test]
+    fn the_tab_strip_clears_the_toolbar_by_twelve_points() {
+        let mut harness = screen_harness(drag_rig(), ServersScreen::default());
+        harness.run();
+        let tab = harness.get_by_label(t(Language::En, Key::SrvTabAll)).rect();
+        let toolbar = harness
+            .get_by_label(t(Language::En, Key::SrvAddServer))
+            .rect();
+        let gap = toolbar.top() - tab.bottom();
+        assert!(
+            (gap - 15.0).abs() <= 1.0,
+            "the toolbar must clear the tab's rule by twelve points, not {gap}"
+        );
+    }
+
+    /// The row menu is the whole command surface: a selection adds nothing to
+    /// the toolbar, and the switch lives there as one flipping item.
+    #[test]
+    fn a_selection_adds_no_toolbar_command_and_the_menu_owns_the_switch() {
+        let mut harness = screen_harness(drag_rig(), ServersScreen::default());
+        harness.run();
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo"]);
+        for key in [
+            Key::SrvEnableSelected,
+            Key::SrvDisableSelected,
+            Key::SrvShare,
+            Key::SrvDeleteEllipsis,
+        ] {
+            assert!(
+                harness
+                    .query_all_by_label(t(Language::En, key))
+                    .next()
+                    .is_none(),
+                "a selection must not add {key:?} to the toolbar"
+            );
+        }
+
+        // The menu carries every command, and the switch is one item.
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
+        for key in [
+            Key::SrvEdit,
+            Key::SrvSetActive,
+            Key::SrvDuplicate,
+            Key::SrvCopyToGroup,
+            Key::SrvShare,
+            Key::SrvDeleteEllipsis,
+        ] {
+            assert!(
+                harness
+                    .query_all_by_label(t(Language::En, key))
+                    .next()
+                    .is_some(),
+                "the row menu must offer {key:?}"
+            );
+        }
+        let switches = harness
+            .query_all_by_label(t(Language::En, Key::SrvEnableSelected))
+            .count()
+            + harness
+                .query_all_by_label(t(Language::En, Key::SrvDisableSelected))
+                .count();
+        assert_eq!(switches, 1, "the menu carries one enable/disable item");
+    }
+
     /// The list offers the same reveal control as the editor while the
     /// privacy setting hides server information, and the revealed endpoint is
     /// the one the row would otherwise hide.
@@ -12534,7 +12840,7 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         settings.address = "203.0.113.7".into();
         settings.port = 443;
-        tokyo.latency_ms = Some(12);
+        tokyo.verdict = Some(ProbeVerdict::delay(12, ProbeSource::LatencyTest));
         rig.servers.profiles.push(tokyo);
         let mut harness = wide_table_harness(rig);
         harness.run();
@@ -12863,7 +13169,11 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = harness_builder()
             .with_size(egui::vec2(width, 100.0))
             .build_ui(|ui| {
-                let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+                let badge = LatencyBadge::new(
+                    Some(&ProbeVerdict::delay(12, ProbeSource::LatencyTest)),
+                    Language::En,
+                    status_colors_of(ui),
+                );
                 let columns = table_columns(
                     ui.available_width(),
                     TableShape::default(),
@@ -12877,11 +13187,14 @@ Authentication: ML-KEM-768, Post-Quantum
                     RowCells {
                         name: long_name,
                         detail: &row_detail_fixture(),
+                        verdict: None,
                         extras: RowExtras::default(),
                     },
                     RowState {
                         selected: false,
                         active: false,
+                        hop: false,
+                        frozen: false,
                         switch: RowSwitch {
                             checked: false,
                             locked_hint: None,
@@ -12930,7 +13243,11 @@ Authentication: ML-KEM-768, Post-Quantum
         let clicked = Rc::new(RefCell::new(false));
         let clicked_ui = Rc::clone(&clicked);
         let mut harness = harness_builder().build_ui(move |ui| {
-            let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+            let badge = LatencyBadge::new(
+                Some(&ProbeVerdict::delay(12, ProbeSource::LatencyTest)),
+                Language::En,
+                status_colors_of(ui),
+            );
             let columns = table_columns(
                 ui.available_width(),
                 TableShape::default(),
@@ -12944,11 +13261,14 @@ Authentication: ML-KEM-768, Post-Quantum
                 RowCells {
                     name: "A server",
                     detail: &row_detail_fixture(),
+                    verdict: None,
                     extras: RowExtras::default(),
                 },
                 RowState {
                     selected: false,
                     active: false,
+                    hop: false,
+                    frozen: false,
                     switch: RowSwitch {
                         checked: false,
                         locked_hint: None,
@@ -12969,7 +13289,11 @@ Authentication: ML-KEM-768, Post-Quantum
             let toggled = Rc::new(RefCell::new(false));
             let toggled_ui = Rc::clone(&toggled);
             let mut harness = harness_builder().build_ui(move |ui| {
-                let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+                let badge = LatencyBadge::new(
+                    Some(&ProbeVerdict::delay(12, ProbeSource::LatencyTest)),
+                    Language::En,
+                    status_colors_of(ui),
+                );
                 let columns = table_columns(
                     ui.available_width(),
                     TableShape::default(),
@@ -12983,11 +13307,14 @@ Authentication: ML-KEM-768, Post-Quantum
                     RowCells {
                         name: "A server",
                         detail: &row_detail_fixture(),
+                        verdict: None,
                         extras: RowExtras::default(),
                     },
                     RowState {
                         selected: false,
                         active: false,
+                        hop: false,
+                        frozen: false,
                         switch: RowSwitch {
                             checked: false,
                             locked_hint: locked,
@@ -13015,7 +13342,11 @@ Authentication: ML-KEM-768, Post-Quantum
         // default quarter-second step puts two clicks outside egui's
         // double-click delay. A fifth-second step keeps the gesture inside it.
         let mut harness = harness_builder().with_step_dt(0.05).build_ui(move |ui| {
-            let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+            let badge = LatencyBadge::new(
+                Some(&ProbeVerdict::delay(12, ProbeSource::LatencyTest)),
+                Language::En,
+                status_colors_of(ui),
+            );
             let columns = table_columns(
                 ui.available_width(),
                 TableShape::default(),
@@ -13029,11 +13360,14 @@ Authentication: ML-KEM-768, Post-Quantum
                 RowCells {
                     name: "A server",
                     detail: &row_detail_fixture(),
+                    verdict: None,
                     extras: RowExtras::default(),
                 },
                 RowState {
                     selected: false,
                     active: false,
+                    hop: false,
+                    frozen: false,
                     switch: RowSwitch {
                         checked: false,
                         locked_hint: None,
@@ -13449,44 +13783,6 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn sorting_by_latency_orders_rows_inside_each_group() {
-        let mut rig = grouped_drag_rig();
-        rig.servers.profiles[0].latency_ms = Some(300); // Alpha
-        rig.servers.profiles[1].latency_ms = Some(40); // Bravo
-        rig.servers.profiles[2].latency_ms = Some(500); // Charlie
-        rig.servers.profiles[3].latency_ms = Some(20); // Delta
-        let active_id = rig.servers.profiles[0].id.clone();
-        let mut harness = drag_harness(rig);
-        harness.run();
-        harness
-            .get_by_label(t(Language::En, Key::SrvSortByLatency))
-            .click();
-        harness.run();
-        // The sort rewrites the stored row order, block by block.
-        assert_eq!(
-            profile_names(&harness.state().1),
-            ["Bravo", "Alpha", "Delta", "Charlie"]
-        );
-        assert!(harness.state().1.requests.dirty);
-        assert_eq!(
-            harness.state().1.servers.active.as_deref(),
-            Some(active_id.as_str()),
-            "the route names a server id and does not follow the row order"
-        );
-        // The active server still leads the Emitted tab, then each block in
-        // its new row order.
-        let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
-            harness.get_by_label(label).rect().center().y
-        };
-        for (upper, lower) in [("Alpha", "Bravo"), ("Bravo", "Delta"), ("Delta", "Charlie")] {
-            assert!(
-                y(&harness, upper) < y(&harness, lower),
-                "the Emitted tab must show {upper:?} above {lower:?}"
-            );
-        }
-    }
-
-    #[test]
     fn the_active_row_is_locked_first_and_never_lifts() {
         let mut rig = drag_rig();
         for profile in &mut rig.servers.profiles {
@@ -13560,34 +13856,6 @@ Authentication: ML-KEM-768, Post-Quantum
             "an explicitly chosen server takes the default route back"
         );
         assert!(rig.requests.dirty);
-    }
-
-    #[test]
-    fn sorting_by_latency_reorders_rows_without_changing_the_route() {
-        let mut rig = drag_rig();
-        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
-        // The active server is the slowest; the sort moves its row like any
-        // other, and the route stays on it.
-        rig.servers.profiles[0].latency_ms = Some(300);
-        rig.servers.profiles[1].latency_ms = Some(40);
-        rig.servers.profiles[2].latency_ms = Some(20);
-        let mut harness = drag_harness(rig);
-        harness.run();
-        harness
-            .get_by_label(t(Language::En, Key::SrvSortByLatency))
-            .click();
-        harness.run();
-        let rig = &harness.state().1;
-        assert_eq!(
-            profile_names(rig),
-            ["Charlie", "Bravo", "Alpha"],
-            "every row sorts by latency, the active one included"
-        );
-        assert_eq!(
-            rig.servers.active.as_deref(),
-            Some(rig.servers.profiles[2].id.as_str()),
-            "the route stays on the same server"
-        );
     }
 
     #[test]
@@ -13736,6 +14004,8 @@ Authentication: ML-KEM-768, Post-Quantum
         // frame to appear. The spinner repaints forever, so `run` would never
         // settle — advance the frames by hand.
         harness.run_steps(2);
+        harness.state_mut().1.probe_progress = crate::rt::ProbeProgress { done: 0, total: 1 };
+        harness.step();
 
         // The row's command sends exactly the first profile, tagged as single.
         let tag = {
@@ -13767,21 +14037,20 @@ Authentication: ML-KEM-768, Post-Quantum
             "the pending slot must record a single-scope probe"
         );
         assert!(
-            harness
-                .query_by_label(t(Language::En, Key::SrvTestingLatencyIsolated))
-                .is_some(),
-            "a pending probe must render the spinner label"
+            harness.query_by_label("Testing 0 of 1").is_some(),
+            "a pending probe must render its progress strip"
         );
-
-        // The toolbar button shares the gate: while a probe is pending it must
-        // not send a second request.
-        harness
-            .get_by_label(t(Language::En, Key::TestLatency))
-            .click();
-        harness.step();
         assert!(
-            harness.state_mut().1._cmd_rx.try_recv().is_err(),
-            "the toolbar probe must be blocked while a probe is pending"
+            harness
+                .query_by_label(t(Language::En, Key::TestLatency))
+                .is_none(),
+            "the strip replaces the toolbar's commands while a probe runs"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::Cancel))
+                .is_some(),
+            "the strip must offer Cancel"
         );
 
         // Consuming the probe slot renders the dedicated copy (the rig's
@@ -13800,6 +14069,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     last_error: None,
                     diagnostics: None,
                 }]),
+                progress: crate::rt::ProbeProgress { done: 1, total: 1 },
             });
         harness.run();
         assert!(
@@ -13809,10 +14079,183 @@ Authentication: ML-KEM-768, Post-Quantum
             "a single-probe result must render the dedicated name-based toast"
         );
         assert!(
+            harness.query_by_label("Testing 0 of 1").is_none(),
+            "the strip must clear once the result is consumed"
+        );
+    }
+
+    #[test]
+    fn a_latency_verdict_renders_its_outcome_and_hover_provenance() {
+        let mut rig = UiTestRig::default();
+        let mk = |name: &str, verdict: Option<ProbeVerdict>| {
+            let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            profile.enabled = true;
+            profile.verdict = verdict;
+            profile
+        };
+        let two_minutes_ago = SystemTime::now() - Duration::from_secs(120);
+        rig.servers.profiles.push(mk(
+            "Alive",
+            Some(ProbeVerdict {
+                outcome: ProbeOutcome::Delay(230),
+                source: ProbeSource::LatencyTest,
+                measured_at: two_minutes_ago,
+                error: None,
+            }),
+        ));
+        rig.servers.profiles.push(mk(
+            "Dead",
+            Some(ProbeVerdict {
+                outcome: ProbeOutcome::Dead,
+                source: ProbeSource::Monitoring,
+                measured_at: two_minutes_ago,
+                error: Some("connection refused".into()),
+            }),
+        ));
+        rig.servers.profiles.push(mk("Blank", None));
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        assert!(
+            harness.query_by_label("230 ms").is_some(),
+            "a delay verdict renders its number"
+        );
+        assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvTestingLatencyIsolated))
-                .is_none(),
-            "the spinner must clear once the result is consumed"
+                .query_by_label(t(Language::En, Key::LatencyTimeout))
+                .is_some(),
+            "a dead verdict renders the timeout word instead of an old delay"
+        );
+
+        harness.get_by_label("230 ms").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label("Measured 2 minutes ago by a latency test.")
+                .next()
+                .is_some(),
+            "the hover must name the source and the relative age"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::LatencyTimeout))
+            .hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_label_contains("Error: connection refused")
+                .next()
+                .is_some(),
+            "a dead verdict's hover must carry the captured core error"
+        );
+    }
+
+    #[test]
+    fn a_running_latency_test_freezes_the_list_and_cancel_restores_the_toolbar() {
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        let mut osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
+        osaka.enabled = true;
+        osaka.verdict = Some(ProbeVerdict::delay(55, ProbeSource::Monitoring));
+        rig.servers.profiles.push(tokyo.clone());
+        rig.servers.profiles.push(osaka.clone());
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::TestLatency))
+            .click();
+        harness.step();
+        assert_eq!(
+            harness.state().0.pending_latency_probe,
+            Some(false),
+            "the toolbar probe must be pending"
+        );
+        assert!(
+            matches!(
+                harness
+                    .state_mut()
+                    .1
+                    ._cmd_rx
+                    .try_recv()
+                    .expect("the probe command"),
+                CoreCmd::ProbeLatency { .. }
+            ),
+            "the test must start with the probe command"
+        );
+
+        harness.state_mut().1.probe_progress = crate::rt::ProbeProgress { done: 1, total: 2 };
+        harness.step();
+        assert!(
+            harness.query_by_label("Testing 1 of 2").is_some(),
+            "the strip must count the tags the probe reported"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::Cancel))
+                .is_some(),
+            "Cancel must stay reachable while the test runs"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TestLatency))
+                .is_none()
+                && harness
+                    .query_by_label(t(Language::En, Key::SrvAddServer))
+                    .is_none(),
+            "the strip replaces the list commands"
+        );
+
+        harness.get_by_label("Tokyo").click();
+        harness.step();
+        assert!(
+            harness.state().0.selection.is_empty(),
+            "a frozen list must not take row clicks"
+        );
+
+        harness.get_by_label(t(Language::En, Key::Cancel)).click();
+        harness.step();
+        assert!(
+            matches!(
+                harness
+                    .state_mut()
+                    .1
+                    ._cmd_rx
+                    .try_recv()
+                    .expect("the cancel command"),
+                CoreCmd::CancelLatencyProbe
+            ),
+            "Cancel must ask the runtime to end the probe"
+        );
+
+        harness
+            .state_mut()
+            .1
+            .probe_feedback
+            .park(LatencyProbeResult {
+                tags: vec![tokyo.tag(), osaka.tag()],
+                result: Err(ProbeFailure::plain(Diag::new(Key::ProbeCancelledByUser))),
+                progress: crate::rt::ProbeProgress { done: 1, total: 2 },
+            });
+        harness.run();
+        assert_eq!(
+            harness.state().0.pending_latency_probe,
+            None,
+            "the terminal returns the toolbar"
+        );
+        assert!(
+            harness
+                .query_by_label("Latency test cancelled after 1 of 2.")
+                .is_some(),
+            "the status line must report how far the cancelled test got"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TestLatency))
+                .is_some(),
+            "the toolbar's commands must be back"
         );
     }
 
@@ -13885,6 +14328,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         diagnostics: None,
                     },
                 ]),
+                progress: crate::rt::ProbeProgress { done: 1, total: 2 },
             });
         harness.run();
         assert!(
@@ -13959,6 +14403,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         diagnostics: None,
                     },
                 ]),
+                progress: crate::rt::ProbeProgress { done: 2, total: 2 },
             });
         harness.run();
         assert!(
@@ -14024,6 +14469,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         diagnostics: None,
                     },
                 ]),
+                progress: crate::rt::ProbeProgress { done: 2, total: 2 },
             });
         harness.run();
 
@@ -21965,7 +22411,7 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn batch_enable_and_disable_skip_locked_rows_and_report_the_count() {
+    fn the_one_menu_item_enables_or_disables_the_selection_and_skips_locked_rows() {
         let mut harness = wide_table_harness(locked_rows_rig());
         harness.run();
         // The All tab keeps every row on screen after a batch switches rows
@@ -21974,18 +22420,25 @@ Authentication: ML-KEM-768, Post-Quantum
             .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run_steps(2);
-        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
-        harness.run_steps(2);
-        assert_eq!(
-            selected_names(&harness),
-            ["Alpha", "Bravo", "Charlie", "Hop"]
-        );
+        // Alpha is the route and therefore locked; Bravo and Charlie follow
+        // the batch.
+        click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
+        click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
+        click_row_with(&mut harness, "Charlie", egui::Modifiers::CTRL);
+        assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
 
+        // Every selected row is on, so the one item offers to disable them.
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvEnableSelected))
+                .next()
+                .is_none(),
+            "a selection that is on offers Disable, not Enable"
+        );
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvDisableSelected),
-            )
+            .get_by_label(t(Language::En, Key::SrvDisableSelected))
             .click();
         harness.run_steps(2);
         assert!(!enabled_of(&harness, "Bravo") && !enabled_of(&harness, "Charlie"));
@@ -22004,22 +22457,22 @@ Authentication: ML-KEM-768, Post-Quantum
                 .status
                 .as_ref()
                 .map(|status| status.text.as_str()),
-            Some(t_fmt(Language::En, Key::SrvBatchDisabled, &[&2_u32, &2_u32]).as_str()),
+            Some(t_fmt(Language::En, Key::SrvBatchDisabled, &[&2_u32, &1_u32]).as_str()),
             "the batch reports what it changed and what it skipped"
         );
 
+        // A row of the selection is off now, so the item flips to Enable.
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvEnableSelected),
-            )
+            .get_by_label(t(Language::En, Key::SrvEnableSelected))
             .click();
         harness.run_steps(2);
-        // Bravo's chain was switched off, so Hop is no longer emitted through
-        // it: the row is unlocked and the batch switches it on too. The
-        // active server stays locked.
         assert!(enabled_of(&harness, "Bravo") && enabled_of(&harness, "Charlie"));
-        assert!(enabled_of(&harness, "Hop"));
+        assert!(
+            !enabled_of(&harness, "Hop"),
+            "a hop listed with a switched-off dialer is not in the selection"
+        );
         assert_eq!(
             harness
                 .state()
@@ -22027,7 +22480,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 .status
                 .as_ref()
                 .map(|status| status.text.as_str()),
-            Some(t_fmt(Language::En, Key::SrvBatchEnabled, &[&3_u32, &1_u32]).as_str())
+            Some(t_fmt(Language::En, Key::SrvBatchEnabled, &[&2_u32, &1_u32]).as_str())
         );
     }
 
@@ -22038,11 +22491,10 @@ Authentication: ML-KEM-768, Post-Quantum
         click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
         click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
 
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvDeleteSelected),
-            )
+            .get_by_label(t(Language::En, Key::SrvDeleteEllipsis))
             .click();
         harness.run_steps(2);
         let dialog = harness
@@ -22104,12 +22556,9 @@ Authentication: ML-KEM-768, Post-Quantum
         click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
         click_row_with(&mut harness, "Bravo", egui::Modifiers::CTRL);
 
-        harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvShareSelected),
-            )
-            .click();
+        harness.get_by_label("Bravo").click_secondary();
+        harness.run();
+        harness.get_by_label(t(Language::En, Key::SrvShare)).click();
         harness.run_steps(2);
         assert!(
             harness.state().0.qr_dialog.is_none(),

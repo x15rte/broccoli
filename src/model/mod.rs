@@ -42,7 +42,7 @@ pub use routing::{
     PingConfig, RoutingCfg, Rule, StrategyCfg, StrategyCost, Webhook,
 };
 pub use safety::{HazardClass, SafetyCode, SafetyFinding};
-pub use servers::{Group, ServerProfile, ServersFile};
+pub use servers::{Group, ProbeOutcome, ProbeSource, ProbeVerdict, ServerProfile, ServersFile};
 pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, Settings};
 pub use stream::{
     CustomSockopt, FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskFragment,

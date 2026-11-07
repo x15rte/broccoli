@@ -259,6 +259,18 @@ where
         .unwrap_or_else(default_local_inbounds))
 }
 
+/// Read the Servers table's view sort, degrading any unknown or malformed
+/// stored value to no sort. A hand-edited preference must never fail the
+/// settings load — that would rename the file `.broken-<ts>` and discard every
+/// other setting with it.
+fn deserialize_view_sort<'de, D>(deserializer: D) -> Result<Option<ViewSort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 /// The Servers table's column widths, in points, after the user dragged one
 /// of its dividers. The name column is stored too: a drag freezes every width
 /// it touches, and the adaptive fit is what the table returns to.
@@ -272,6 +284,26 @@ pub struct ColumnWidths {
     pub address: f32,
     pub latency: f32,
     pub group: f32,
+}
+
+/// A column the Servers table can order its rows by. The sort is a view
+/// only: it never reorders the stored rows, and `Emitted` ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SortColumn {
+    Name,
+    Protocol,
+    Latency,
+}
+
+/// The Servers table's view sort: one column and its direction. It belongs
+/// to the screen, survives a tab switch and a restart, and never reaches the
+/// generated configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSort {
+    pub column: SortColumn,
+    pub ascending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -343,6 +375,15 @@ pub struct Settings {
     /// each column to its content and header.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_table_columns: Option<ColumnWidths>,
+    /// The Servers table's view sort, the column and the direction. Absent
+    /// keeps each tab's stored order; an unknown or malformed stored value
+    /// loads as absent instead of failing the settings load.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_view_sort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_table_sort: Option<ViewSort>,
     pub policy: PolicyCfg,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub env: Vec<(String, String)>,
@@ -390,6 +431,7 @@ impl Default for Settings {
             accent_color: None,
             hide_server_info: false,
             server_table_columns: None,
+            server_table_sort: None,
             policy: PolicyCfg::default(),
             env: Vec::new(),
             geodata: GeodataCfg::default(),
@@ -621,6 +663,40 @@ mod tests {
         let restored: PolicyCfg = serde_json::from_value(value).unwrap();
         assert!(restored.levels["3"].stats_user_uplink);
         assert_eq!(restored.extra["futureRoot"], json!(true));
+    }
+
+    #[test]
+    fn the_view_sort_round_trips_and_a_malformed_value_loads_as_no_sort() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.server_table_sort, None);
+        settings.server_table_sort = Some(ViewSort {
+            column: SortColumn::Latency,
+            ascending: false,
+        });
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            value["serverTableSort"],
+            json!({ "column": "latency", "ascending": false })
+        );
+        let restored: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.server_table_sort, settings.server_table_sort);
+
+        // An unknown column, a missing direction, a wrong shape, and null
+        // each degrade to no sort instead of failing the load.
+        for raw in [
+            json!({ "column": "address", "ascending": true }),
+            json!({ "column": "name" }),
+            json!({ "ascending": true }),
+            json!("name"),
+            json!(7),
+            json!([]),
+            json!(null),
+        ] {
+            let loaded: Settings =
+                serde_json::from_value(json!({ "serverTableSort": raw, "mode": "tun" })).unwrap();
+            assert_eq!(loaded.server_table_sort, None, "{raw} must load as no sort");
+            assert_eq!(loaded.mode, Mode::Tun, "{raw} must not lose the rest");
+        }
     }
 
     #[test]

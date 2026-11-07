@@ -391,10 +391,15 @@ fn deliver_probe_failure(
     failure: ProbeFailure,
 ) {
     match sidecar {
-        Some(ExclusiveSidecar::LatencyTags(tags)) => {
+        Some(ExclusiveSidecar::LatencyTags(probe)) => {
+            let progress = super::ProbeProgress {
+                done: probe.done.load(std::sync::atomic::Ordering::Relaxed),
+                total: probe.tags.len(),
+            };
             runtime.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
-                tags,
+                tags: probe.tags,
                 result: Err(failure),
+                progress,
             }));
         }
         sidecar => unreachable!(
@@ -434,11 +439,16 @@ pub(crate) fn deliver_cancel_terminal(
                 Diag::new(Key::RtFrameConfigTestCancelled).arg_message(reason.clone()),
             )),
         ),
-        JobKind::LatencyProbe => deliver_probe_failure(
-            runtime,
-            sidecar,
-            ProbeFailure::plain(Diag::new(Key::ProbeCancelled).arg_message(reason.clone())),
-        ),
+        JobKind::LatencyProbe => {
+            // The user's own Cancel keeps a distinct terminal key: the
+            // screen renders its progress line instead of a failure reason.
+            let failure = if reason.key() == Key::RtReasonUserCancelledProbe {
+                ProbeFailure::plain(Diag::new(Key::ProbeCancelledByUser))
+            } else {
+                ProbeFailure::plain(Diag::new(Key::ProbeCancelled).arg_message(reason.clone()))
+            };
+            deliver_probe_failure(runtime, sidecar, failure);
+        }
         // Defensive: an active validation is cancelled cooperatively (its
         // worker observes the cancel signal) and is outside the exit-cancel
         // set, so no path reaches this arm today. The terminal is kept so a

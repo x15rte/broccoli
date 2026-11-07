@@ -3024,7 +3024,7 @@ fn profile_outbounds_emit_in_list_order() {
                 id: (*id).into(),
                 name: format!("server-{index}"),
                 outbound: OutboundModel::new(Protocol::Freedom),
-                latency_ms: None,
+                verdict: None,
                 ..Default::default()
             })
             .collect(),

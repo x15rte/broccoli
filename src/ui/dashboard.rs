@@ -2,6 +2,7 @@
 
 use crate::i18n::{Key, t, t_fmt};
 use crate::model::Mode;
+use crate::model::ProbeOutcome;
 use crate::model::settings::{Language, Settings, TrafficUnit};
 use crate::rt::{CorePhase, CoreTransport, DownloadState, OutboundStatusView};
 
@@ -883,12 +884,12 @@ fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
                     text: t_fmt(lang, Key::LatencyMs, &[&o.delay_ms]),
                 },
                 Some(_) => LatencyCell::DeadObservatory,
-                None => match p.latency_ms {
-                    Some(ms) if ms >= 0 => LatencyCell::Stale {
+                None => match p.verdict.as_ref().map(|verdict| verdict.outcome) {
+                    Some(ProbeOutcome::Delay(ms)) => LatencyCell::Stale {
                         ms,
                         text: t_fmt(lang, Key::LatencyMs, &[&ms]),
                     },
-                    Some(_) => LatencyCell::DeadStale,
+                    Some(ProbeOutcome::Dead) => LatencyCell::DeadStale,
                     None => LatencyCell::Unknown,
                 },
             };
@@ -1264,8 +1265,8 @@ mod tests {
     use crate::i18n::{Key, t, t_fmt};
     use crate::model::settings::{Language, TrafficUnit};
     use crate::model::{
-        DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Mode, OutboundModel, Protocol,
-        ServerProfile, ServersFile, Settings,
+        DokodemoCfg, LocalInboundCfg, LocalInboundProtocol, Mode, OutboundModel, ProbeSource,
+        ProbeVerdict, Protocol, ServerProfile, ServersFile, Settings,
     };
     use crate::rt::{CorePhase, HealthPingView, OutboundStatusView, PhaseError, StatsTick};
     use crate::ui::TerminalErrorView;
@@ -1595,9 +1596,9 @@ mod tests {
         );
     }
 
-    fn profile(name: &str, latency: Option<i64>) -> ServerProfile {
+    fn profile(name: &str, latency: Option<ProbeVerdict>) -> ServerProfile {
         let mut p = ServerProfile::new(name, OutboundModel::new(Protocol::Trojan));
-        p.latency_ms = latency;
+        p.verdict = latency;
         p
     }
 
@@ -2187,8 +2188,14 @@ mod tests {
         // and the closure re-borrows per frame.
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         rig.borrow_mut().servers.profiles = vec![
-            profile("alpha", Some(42)),
-            profile("beta", Some(-1)),
+            profile(
+                "alpha",
+                Some(ProbeVerdict::delay(42, ProbeSource::LatencyTest)),
+            ),
+            profile(
+                "beta",
+                Some(ProbeVerdict::dead(ProbeSource::LatencyTest, None)),
+            ),
             profile("gamma", None),
         ];
         rig.borrow_mut()
@@ -2512,7 +2519,13 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut r = rig.borrow_mut();
-            r.servers.profiles = vec![profile("Tokyo edge", Some(42)), profile("Oslo", None)];
+            r.servers.profiles = vec![
+                profile(
+                    "Tokyo edge",
+                    Some(ProbeVerdict::delay(42, ProbeSource::LatencyTest)),
+                ),
+                profile("Oslo", None),
+            ];
             r.latency_generation += 1;
         }
         let mut harness = harness_for(rig);

@@ -207,6 +207,11 @@ pub enum CoreCmd {
         tun_outbound_interface: Option<String>,
         tun_adapter_name: Option<String>,
     },
+    /// Ask the in-flight latency probe to stop: the exclusive task is
+    /// aborted (which kills its child), every verdict already applied stays,
+    /// and the terminal result reports the probe's progress. A no-op when no
+    /// probe holds the exclusive seat.
+    CancelLatencyProbe,
     /// Query the running core's ephemeral state for one configured balancer.
     /// The terminal result travels the request's own reply channel.
     GetBalancerInfo {
@@ -483,6 +488,10 @@ pub enum CoreEvt {
         output: ApplyOutput,
         revision: u64,
     },
+    /// One latency-probe arrival: the newly reported statuses and the
+    /// probe's progress over its full requested tag list. Emitted per poll as
+    /// rows appear, so a verdict is applied before the run ends.
+    LatencyProbeStatus(LatencyProbeStatus),
     /// Result of the one automatic last-good rollback attempt. This is
     /// deliberately separate from [`CorePhase`]: a successfully started
     /// replacement must remain `Starting`/`Running`.
@@ -557,6 +566,41 @@ struct InboundFold {
 pub struct LatencyProbeResult {
     pub tags: Vec<String>,
     pub result: Result<Vec<OutboundStatusView>, ProbeFailure>,
+    /// The terminal count: tags whose verdict arrived before the run ended.
+    pub progress: ProbeProgress,
+}
+
+/// How far one latency probe has got through its requested tag list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
+/// The probe's request identity parked on the exclusive record: the tags it
+/// reports, and a counter the streaming sink advances so a cancel terminal
+/// can say how many arrived.
+#[derive(Debug, Clone)]
+pub struct ProbeTags {
+    pub tags: Vec<String>,
+    pub done: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ProbeTags {
+    pub fn new(tags: Vec<String>) -> Self {
+        Self {
+            tags,
+            done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// One arrival of a streaming latency probe: the statuses not delivered
+/// before, plus the run's progress over the full requested tag list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyProbeStatus {
+    pub statuses: Vec<OutboundStatusView>,
+    pub progress: ProbeProgress,
 }
 
 /// Structured latency-probe failure: `headline` is the user-visible message
@@ -1288,6 +1332,7 @@ impl Runtime {
                 self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
                     tags,
                     result: Err(ProbeFailure::plain(output)),
+                    progress: ProbeProgress::default(),
                 }));
             }
             (seat::ExclusiveReject::ApplyVerdict, BusyAnswer::ApplyRevision(revision)) => {
@@ -1981,6 +2026,11 @@ impl Runtime {
                     tun_adapter_name,
                 );
             }
+            CoreCmd::CancelLatencyProbe => {
+                if self.jobs.busy_kind() == Some(JobKind::LatencyProbe) {
+                    self.cancel_exclusive(&Diag::new(Key::RtReasonUserCancelledProbe));
+                }
+            }
             CoreCmd::GetBalancerInfo {
                 reply,
                 balancer_tag,
@@ -2170,7 +2220,8 @@ impl Runtime {
 
     /// Probe work of an accepted ProbeLatency command (the record was begun
     /// by the arm). The tags are cloned into the sidecar BEFORE the spawn so
-    /// a cancel/join-error terminal can always report them.
+    /// a cancel/join-error terminal can always report them; the same sidecar
+    /// carries the arrival counter the streaming sink advances.
     fn begin_probe_work(
         &mut self,
         profiles: Vec<crate::model::ServerProfile>,
@@ -2185,12 +2236,25 @@ impl Runtime {
             self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
                 tags,
                 result: Err(failure),
+                progress: ProbeProgress::default(),
             }));
             self.release_exclusive();
             return;
         }
+        let probe_tags = ProbeTags::new(tags.clone());
+        let done_counter = Arc::clone(&probe_tags.done);
         self.jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(tags.clone()));
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(probe_tags));
+        // The strip's denominator is the full requested tag list, chain
+        // dependencies included: publish it before the first poll so the
+        // count never starts at an unknown total.
+        self.emit(CoreEvt::LatencyProbeStatus(LatencyProbeStatus {
+            statuses: Vec::new(),
+            progress: ProbeProgress {
+                done: 0,
+                total: tags.len(),
+            },
+        }));
         // The probe dials bypass the TUN only while the main core
         // is Running and owns it; with the core down or TUN off there is no
         // capture to bypass, and binding would let a stale adapter name fail
@@ -2198,6 +2262,8 @@ impl Runtime {
         let tun_active = matches!(self.lifecycle.phase, CorePhase::Running)
             && self.lifecycle.backend.is_tun_owned();
         let log = self.log_sink();
+        let status_sink = self.events.probe_sink();
+        let total = tags.len();
         let task = tokio::spawn(async move {
             let result = latency::run(
                 &profiles,
@@ -2206,12 +2272,17 @@ impl Runtime {
                 tun_adapter_name,
                 tun_active,
                 &log,
+                |statuses, done| {
+                    done_counter.store(done, Ordering::Relaxed);
+                    status_sink.statuses(statuses, ProbeProgress { done, total });
+                },
             )
             .await;
             ExclusiveOutcome::LatencyProbe {
                 tags,
                 profiles,
                 result,
+                done: done_counter.load(Ordering::Relaxed),
             }
         });
         self.jobs.attach_exclusive_task(task);
@@ -2292,6 +2363,7 @@ impl Runtime {
                 tags,
                 profiles,
                 result,
+                done,
             } => {
                 match &result {
                     Err(failure) => self.log(&failure.full(Language::En)),
@@ -2310,7 +2382,15 @@ impl Runtime {
                 // failure needed a manual reproduction). The UI formatters
                 // and the log both compose from the same `ProbeFailure`, so
                 // their text cannot drift.
-                self.emit(CoreEvt::LatencyProbe(LatencyProbeResult { tags, result }));
+                let progress = ProbeProgress {
+                    done,
+                    total: tags.len(),
+                };
+                self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
+                    tags,
+                    result,
+                    progress,
+                }));
                 self.release_exclusive();
             }
             ExclusiveOutcome::Download { state, kind } => {
@@ -6031,12 +6111,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn user_cancel_stops_the_latency_probe_and_reports_progress() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
+        let probe = super::ProbeTags::new(vec!["srv-a".into(), "srv-b".into(), "srv-c".into()]);
+        probe.done.store(2, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .jobs
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(probe));
+        park_pending_task(&mut runtime);
+
+        runtime.handle_cmd(CoreCmd::CancelLatencyProbe).await;
+
+        assert!(runtime.jobs.busy_kind().is_none());
+        flush_bookends(&mut runtime);
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            emitted.iter().any(|event| matches!(
+                event,
+                CoreEvt::LatencyProbe(result)
+                    if result.tags == ["srv-a", "srv-b", "srv-c"]
+                        && result.progress.done == 2
+                        && result.progress.total == 3
+                        && matches!(&result.result, Err(failure)
+                            if failure.headline.key() == Key::ProbeCancelledByUser)
+            )),
+            "Cancel must deliver the probe's exactly-one terminal with its progress"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stopping_latency_probe_emits_cancellation_before_release() {
         let (mut runtime, events) = runtime_with_events();
         occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(vec!["srv-probe".into()]));
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(super::ProbeTags::new(vec![
+                "srv-probe".into(),
+            ])));
         park_pending_task(&mut runtime);
 
         runtime.handle_cmd(CoreCmd::Stop).await;
@@ -6280,7 +6392,9 @@ mod tests {
         occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(vec!["srv-probe".into()]));
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(super::ProbeTags::new(vec![
+                "srv-probe".into(),
+            ])));
         park_pending_task(&mut runtime);
 
         runtime.handle_cmd(CoreCmd::Shutdown).await;
@@ -6761,7 +6875,9 @@ mod tests {
         occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(vec!["srv-probe".into()]));
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(super::ProbeTags::new(vec![
+                "srv-probe".into(),
+            ])));
         park_pending_task(&mut runtime);
 
         runtime.on_core_exit(None).await;
@@ -7655,6 +7771,7 @@ mod tests {
                 tags: vec!["srv-a".into()],
                 profiles: vec![],
                 result: Err(failure),
+                done: 0,
             })
             .await;
 
@@ -7744,6 +7861,7 @@ mod tests {
                 tags: vec![tokyo.tag(), osaka.tag()],
                 profiles: vec![tokyo.clone(), osaka.clone()],
                 result: Ok(statuses),
+                done: 2,
             })
             .await;
 
@@ -7791,6 +7909,7 @@ mod tests {
                 tags: vec![tokyo.tag(), osaka.tag()],
                 profiles: vec![tokyo.clone(), osaka.clone()],
                 result: Ok(statuses),
+                done: 2,
             })
             .await;
 
@@ -7836,6 +7955,7 @@ mod tests {
                 tags: vec![tokyo.tag()],
                 profiles: vec![tokyo.clone()],
                 result: Ok(statuses),
+                done: 1,
             })
             .await;
 
@@ -7875,6 +7995,7 @@ mod tests {
                 tags: vec![tokyo.tag()],
                 profiles: vec![tokyo.clone()],
                 result: Ok(statuses),
+                done: 1,
             })
             .await;
 
@@ -7902,6 +8023,7 @@ mod tests {
                     last_error: None,
                     diagnostics: None,
                 }]),
+                done: 1,
             })
             .await;
 
@@ -8049,6 +8171,7 @@ mod tests {
         let probe = LatencyProbeResult {
             tags: vec!["edge".into()],
             result: Err(ProbeFailure::plain(Diag::new(Key::ProbeNoProfiles))),
+            progress: super::ProbeProgress { done: 0, total: 1 },
         };
         assert_eq!(probe.tags, vec!["edge".to_string()]);
     }
@@ -8322,7 +8445,9 @@ mod tests {
         occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .jobs
-            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(vec!["srv-probe".into()]));
+            .set_exclusive_sidecar(ExclusiveSidecar::LatencyTags(super::ProbeTags::new(vec![
+                "srv-probe".into(),
+            ])));
         let task = tokio::spawn(async { panic!("deliberate probe worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
         runtime.complete_exclusive_join_error(JobKind::LatencyProbe, error);
