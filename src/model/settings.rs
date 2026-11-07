@@ -259,6 +259,21 @@ where
         .unwrap_or_else(default_local_inbounds))
 }
 
+/// The Servers table's column widths, in points, after the user dragged one
+/// of its dividers. The name column is stored too: a drag freezes every width
+/// it touches, and the adaptive fit is what the table returns to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ColumnWidths {
+    pub order: f32,
+    pub switch: f32,
+    pub name: f32,
+    pub protocol: f32,
+    pub address: f32,
+    pub latency: f32,
+    pub group: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -324,6 +339,10 @@ pub struct Settings {
     /// raises the Apply gate.
     #[serde(skip_serializing_if = "skip_false")]
     pub hide_server_info: bool,
+    /// The Servers table's column widths after a divider drag; absent fits
+    /// each column to its content and header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_table_columns: Option<ColumnWidths>,
     pub policy: PolicyCfg,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub env: Vec<(String, String)>,
@@ -370,6 +389,7 @@ impl Default for Settings {
             traffic_unit: TrafficUnit::default(),
             accent_color: None,
             hide_server_info: false,
+            server_table_columns: None,
             policy: PolicyCfg::default(),
             env: Vec::new(),
             geodata: GeodataCfg::default(),

@@ -13,7 +13,7 @@ use crate::model::outbound::{
     BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, GeneratedSecret, MuxModel, Noise,
     VlessReverse, WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
-use crate::model::settings::Language;
+use crate::model::settings::{ColumnWidths, Language};
 use crate::model::stream::{
     MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
     XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
@@ -2221,6 +2221,13 @@ pub struct ServersScreen {
         u64,
         std::rc::Rc<std::collections::HashMap<usize, RowDetail>>,
     )>,
+    /// The column widths fitted to the header and the cell text, rebuilt when
+    /// the model generation or the language moves. The table reads the
+    /// widths the user dragged from the settings and falls back to these.
+    adaptive_widths: Option<(u64, Language, ColumnWidths)>,
+    /// The toolbar's "Fit columns" command, consumed by the table on the
+    /// frame that set it.
+    fit_columns: bool,
     /// The emitted set memoized for one model generation: the row switches
     /// and their lock hints read it, and it is rebuilt only when the model
     /// moves, never per repaint.
@@ -4011,6 +4018,16 @@ impl ServersScreen {
                 ctx.servers.sort_rows_by_latency();
                 ctx.hooks.mark_dirty();
             }
+            // The columns fit their content until a divider is dragged; this
+            // command gives the dragged widths back to the fit. It sits with
+            // the view commands because that is what it changes.
+            if ui
+                .button(t(lang, Key::SrvFitColumns))
+                .on_hover_text(t(lang, Key::SrvFitColumnsHint))
+                .clicked()
+            {
+                self.fit_columns = true;
+            }
             // The batch commands exist only while a selection does: a toolbar
             // full of buttons that cannot act is clutter, not affordance.
             if !self.selection.is_empty() {
@@ -4077,14 +4094,48 @@ impl ServersScreen {
             order: self.view == ServerTab::Emitted,
             group: self.view == ServerTab::All,
         };
+        let generation = ctx.hooks.model_generation();
+        // The toolbar's fit command takes effect on the frame that asked for
+        // it, before the columns are laid out.
+        if std::mem::take(&mut self.fit_columns) && ctx.settings.server_table_columns.is_some() {
+            ctx.settings.server_table_columns = None;
+            ctx.hooks.mark_dirty();
+        }
+        if self
+            .adaptive_widths
+            .as_ref()
+            .map(|(cached, language, _)| (*cached, *language))
+            != Some((generation, lang))
+        {
+            self.adaptive_widths = Some((generation, lang, adaptive_widths(ui, lang, ctx.servers)));
+        }
+        let fitted = self
+            .adaptive_widths
+            .as_ref()
+            .map_or(TABLE_DEFAULT_WIDTHS, |(_, _, widths)| *widths);
+        let manual = ctx.settings.server_table_columns.map(sanitized_widths);
+        let widths = manual.unwrap_or(fitted);
+        // The adaptive fit lets the name column fill the band; a drag freezes
+        // every width, so the table keeps the total the user sized.
+        let flex_name = manual.is_none();
         // The table's width excludes the scroll bar's overlap, and the header
         // and every row take their columns from this one computation: width
         // computed twice is width computed differently.
         let columns = table_columns(
             (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
             shape,
+            widths,
+            flex_name,
         );
-        if let Some(column) = table_header(ui, lang, columns, sortable, self.view_sort) {
+        let outcome = table_header(ui, lang, columns, widths, sortable, self.view_sort);
+        if outcome.fit && ctx.settings.server_table_columns.is_some() {
+            ctx.settings.server_table_columns = None;
+            ctx.hooks.mark_dirty();
+        } else if let Some(resized) = outcome.resized {
+            ctx.settings.server_table_columns = Some(resized);
+            ctx.hooks.mark_dirty();
+        }
+        if let Some(column) = outcome.sort {
             self.view_sort = Some(next_view_sort(self.view_sort, column));
         }
         // Virtualized profile list: only the visible index
@@ -4098,7 +4149,6 @@ impl ServersScreen {
         // id (same `id_salt` as the empty-state `show` below), so the scroll
         // offset is preserved across the switch.
         let row_height = TABLE_ROW_HEIGHT;
-        let generation = ctx.hooks.model_generation();
         let profiles = &ctx.servers.profiles;
         let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
             cache.generation != generation
@@ -5510,17 +5560,19 @@ const EMPTY_ROW_DETAIL: RowDetail = RowDetail {
     endpoint_hidden: false,
 };
 
-/// The table's fixed column widths in points. The name column takes the rest
-/// of the band, so the header and every row place the data columns at the
-/// same x every frame — a table reads by column, not by row.
-const TABLE_SWITCH_WIDTH: f32 = 64.0;
-const TABLE_PROTOCOL_WIDTH: f32 = 128.0;
-const TABLE_ADDRESS_WIDTH: f32 = 240.0;
-const TABLE_LATENCY_WIDTH: f32 = 84.0;
-/// The order number and group name columns, present only on the tabs that
-/// carry them.
-const TABLE_ORDER_WIDTH: f32 = 56.0;
-const TABLE_GROUP_WIDTH: f32 = 160.0;
+/// The widths a table starts from before the user drags a divider: the wide
+/// address column and the room a checkbox and a latency badge need. The name
+/// column takes the rest of the band, so the header and every row place the
+/// data columns at the same x every frame.
+const TABLE_DEFAULT_WIDTHS: ColumnWidths = ColumnWidths {
+    order: 56.0,
+    switch: 64.0,
+    name: 0.0,
+    protocol: 128.0,
+    address: 240.0,
+    latency: 84.0,
+    group: 160.0,
+};
 /// The smallest width the name column keeps: a narrower band truncates the
 /// name rather than pushing the fixed columns past the viewport.
 const TABLE_MIN_NAME_WIDTH: f32 = 160.0;
@@ -5530,6 +5582,89 @@ const TABLE_ROW_HEIGHT: f32 = 26.0;
 /// The inset every cell keeps from its column edge. Without it the header
 /// words run together into one line and the table reads as prose.
 const TABLE_CELL_INSET: f32 = 8.0;
+/// The room a sort arrow needs beside its column's label.
+const TABLE_SORT_ARROW_ROOM: f32 = 18.0;
+/// How wide the pointer's grab band on a column divider is.
+const TABLE_DIVIDER_HIT_WIDTH: f32 = 6.0;
+
+/// One column of the servers table, in draw order. Every column but the name
+/// stores its width; the name column takes what the table width leaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Order,
+    Switch,
+    Name,
+    Protocol,
+    Address,
+    Latency,
+    Group,
+}
+
+/// The narrowest and widest each resizable column gets. The name column takes
+/// no maximum: it absorbs whatever the fixed columns do not use.
+fn column_bounds(column: Column) -> (f32, f32) {
+    match column {
+        Column::Order => (40.0, 96.0),
+        Column::Switch => (48.0, 96.0),
+        Column::Name => (TABLE_MIN_NAME_WIDTH, f32::INFINITY),
+        Column::Protocol => (80.0, 280.0),
+        Column::Address => (120.0, 480.0),
+        Column::Latency => (64.0, 140.0),
+        Column::Group => (80.0, 320.0),
+    }
+}
+
+/// The stored width of `column`, or `None` for the flexible name column.
+fn stored_width(widths: ColumnWidths, column: Column) -> Option<f32> {
+    match column {
+        Column::Order => Some(widths.order),
+        Column::Switch => Some(widths.switch),
+        Column::Name => Some(widths.name),
+        Column::Protocol => Some(widths.protocol),
+        Column::Address => Some(widths.address),
+        Column::Latency => Some(widths.latency),
+        Column::Group => Some(widths.group),
+    }
+}
+
+fn set_stored_width(widths: &mut ColumnWidths, column: Column, width: f32) {
+    match column {
+        Column::Order => widths.order = width,
+        Column::Switch => widths.switch = width,
+        Column::Name => widths.name = width,
+        Column::Protocol => widths.protocol = width,
+        Column::Address => widths.address = width,
+        Column::Latency => widths.latency = width,
+        Column::Group => widths.group = width,
+    }
+}
+
+/// The widths the table can use: a hand-edited settings file may carry a
+/// negative, a zero from a partial object or a NaN, and each lands on the
+/// adaptive default rather than drawing a column nothing can read.
+fn sanitized_widths(widths: ColumnWidths) -> ColumnWidths {
+    let mut out = TABLE_DEFAULT_WIDTHS;
+    for column in [
+        Column::Order,
+        Column::Switch,
+        Column::Name,
+        Column::Protocol,
+        Column::Address,
+        Column::Latency,
+        Column::Group,
+    ] {
+        let (low, high) = column_bounds(column);
+        let fallback = stored_width(TABLE_DEFAULT_WIDTHS, column).unwrap_or(low);
+        let value = stored_width(widths, column).unwrap_or(fallback);
+        let value = if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            fallback
+        };
+        set_stored_width(&mut out, column, value.clamp(low, high));
+    }
+    out
+}
 
 /// Which optional columns a tab carries: `Emitted` numbers its rows in
 /// outbound order, and `All` names each row's group.
@@ -5570,24 +5705,122 @@ struct TableColumns {
     group: Option<f32>,
 }
 
-fn table_columns(available: f32, shape: TableShape) -> TableColumns {
-    let order = shape.order.then_some(TABLE_ORDER_WIDTH);
-    let group = shape.group.then_some(TABLE_GROUP_WIDTH);
-    let fixed = TABLE_SWITCH_WIDTH
-        + TABLE_PROTOCOL_WIDTH
-        + TABLE_ADDRESS_WIDTH
-        + TABLE_LATENCY_WIDTH
+fn table_columns(
+    available: f32,
+    shape: TableShape,
+    widths: ColumnWidths,
+    flex_name: bool,
+) -> TableColumns {
+    let order = shape.order.then_some(widths.order);
+    let group = shape.group.then_some(widths.group);
+    let fixed = widths.switch
+        + widths.protocol
+        + widths.address
+        + widths.latency
         + order.unwrap_or(0.0)
         + group.unwrap_or(0.0);
+    let name = if flex_name {
+        (available - fixed).max(TABLE_MIN_NAME_WIDTH)
+    } else {
+        widths.name.max(TABLE_MIN_NAME_WIDTH)
+    };
     TableColumns {
         order,
-        switch: TABLE_SWITCH_WIDTH,
-        name: (available - fixed).max(TABLE_MIN_NAME_WIDTH),
-        protocol: TABLE_PROTOCOL_WIDTH,
-        address: TABLE_ADDRESS_WIDTH,
-        latency: TABLE_LATENCY_WIDTH,
+        switch: widths.switch,
+        name,
+        protocol: widths.protocol,
+        address: widths.address,
+        latency: widths.latency,
         group,
     }
+}
+
+/// Fit each column to the wider of its header and its widest cell, so the
+/// adaptive layout never clips a value it could hold. Measured from the same
+/// strings the rows paint, once per model generation rather than per frame.
+fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> ColumnWidths {
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let measure = |text: &str, font: &egui::FontId| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    let cell = |text: &str, font: &egui::FontId| measure(text, font) + 2.0 * TABLE_CELL_INSET;
+    let header = |text: &str, sortable: bool| {
+        cell(text, &body) + if sortable { TABLE_SORT_ARROW_ROOM } else { 0.0 }
+    };
+
+    let mut widths = ColumnWidths {
+        order: header(t(lang, Key::SrvColOrder), false),
+        switch: header(t(lang, Key::SrvColEnabled), false),
+        name: 0.0,
+        protocol: header(t(lang, Key::SrvColProtocol), true),
+        address: header(t(lang, Key::SrvColAddress), false),
+        latency: header(t(lang, Key::SrvColLatency), true),
+        group: header(t(lang, Key::SrvColGroup), false),
+    };
+    // The latency column shows a result, a timeout or nothing: its widest
+    // value is one of the two words, never a row's own number.
+    let latency_text = [
+        t_fmt(lang, Key::LatencyMs, &[&9999i64]),
+        t(lang, Key::LatencyTimeout).to_owned(),
+    ];
+    for text in &latency_text {
+        widths.latency = widths.latency.max(cell(text, &body));
+    }
+    for (index, profile) in servers.profiles.iter().enumerate() {
+        widths.order = widths.order.max(cell(&(index + 1).to_string(), &body));
+        widths.protocol = widths
+            .protocol
+            .max(cell(&row_detail(profile, false).protocol, &body));
+        widths.address = widths
+            .address
+            .max(cell(&profile.server_address().unwrap_or_default(), &mono));
+        widths.group = widths.group.max(cell(&profile.group_title, &body));
+    }
+    for group in &servers.groups {
+        widths.group = widths.group.max(cell(&group.title, &body));
+    }
+    sanitized_widths(widths)
+}
+
+/// One drag step on the divider between `left` and `right`: the column on the
+/// left grows by `dx` and the one on its right gives the width up, so the
+/// divider follows the pointer and the table keeps its total width. A drag
+/// that starts from the adaptive fit freezes the name column at the width it
+/// has on screen.
+fn drag_divider(
+    widths: ColumnWidths,
+    columns: TableColumns,
+    left: Column,
+    right: Column,
+    dx: f32,
+) -> Option<ColumnWidths> {
+    let mut next = widths;
+    next.name = columns.name;
+    let left_width = stored_width(next, left)?;
+    let right_width = stored_width(next, right)?;
+    let left_min_max = column_bounds(left);
+    let right_min_max = column_bounds(right);
+    let (left_min, left_max) = left_min_max;
+    let (right_min, right_max) = right_min_max;
+    // The left column takes the drag, the right one hands the width over. A
+    // floor on either side hands the remainder back, so a drag stopping at a
+    // bound does not jump.
+    let left_first = (left_width + dx).clamp(left_min, left_max) - left_width;
+    let right_first = (right_width - left_first).clamp(right_min, right_max);
+    let right_shift = right_width - right_first;
+    let proposed_left = (left_width + right_shift).clamp(left_min, left_max);
+    let left_shift = proposed_left - left_width;
+    let proposed_right = (right_width - left_shift).clamp(right_min, right_max);
+    if left_shift.abs() < 0.01 && (proposed_right - right_width).abs() < 0.01 {
+        return None;
+    }
+    set_stored_width(&mut next, left, proposed_left);
+    set_stored_width(&mut next, right, proposed_right);
+    Some(next)
 }
 
 impl TableColumns {
@@ -5638,20 +5871,34 @@ fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     add(&mut child);
 }
 
+/// What the table header reported this frame: a sort command, the widths
+/// after a divider drag, or a request to fit the columns again.
+#[derive(Default)]
+struct HeaderOutcome {
+    sort: Option<SortColumn>,
+    resized: Option<ColumnWidths>,
+    fit: bool,
+}
+
 /// The table's header row: the tab's columns, and — where the tab is a view —
 /// name, protocol and latency as sort controls. `Emitted`'s order is the
 /// outbound order, so its header never offers a sort.
+///
+/// The dividers between columns are drag handles: a drag trades width between
+/// that column and the flexible name column, and a double click asks for the
+/// adaptive widths back.
 fn table_header(
     ui: &mut egui::Ui,
     lang: Language,
     columns: TableColumns,
+    widths: ColumnWidths,
     sortable: bool,
     sort: Option<ViewSort>,
-) -> Option<SortColumn> {
+) -> HeaderOutcome {
     let weak = |ui: &mut egui::Ui, text: &str| {
         ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
     };
-    let mut clicked = None;
+    let mut outcome = HeaderOutcome::default();
     // The header is a line of column names over their own columns, closed by
     // one rule. A filled band with column separators reads as a title bar and
     // separates the names from the data they name.
@@ -5676,7 +5923,7 @@ fn table_header(
                             .add(egui::Button::new(RichText::new(text).weak()).frame(false))
                             .clicked()
                         {
-                            clicked = Some(column);
+                            outcome.sort = Some(column);
                         }
                     });
                     if let Some(current) = sort.filter(|current| current.column == column) {
@@ -5734,7 +5981,58 @@ fn table_header(
         band.max.y - 0.5,
         egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
     );
-    clicked
+
+    let mut spans = [(Column::Switch, 0.0); 7];
+    let mut count = 0;
+    for (column, width) in [
+        (Column::Order, columns.order),
+        (Column::Switch, Some(columns.switch)),
+        (Column::Name, Some(columns.name)),
+        (Column::Protocol, Some(columns.protocol)),
+        (Column::Address, Some(columns.address)),
+        (Column::Latency, Some(columns.latency)),
+        (Column::Group, columns.group),
+    ] {
+        if let Some(width) = width {
+            spans[count] = (column, width);
+            count += 1;
+        }
+    }
+    let mut x = band.left();
+    for index in 0..count.saturating_sub(1) {
+        let (left, width) = spans[index];
+        x += width;
+        let hit = egui::Rect::from_min_max(
+            egui::pos2(x - TABLE_DIVIDER_HIT_WIDTH / 2.0, band.top()),
+            egui::pos2(x + TABLE_DIVIDER_HIT_WIDTH / 2.0, band.max.y),
+        );
+        let response = ui.interact(
+            hit,
+            ui.auto_id_with(("servers.column-divider", index)),
+            egui::Sense::click_and_drag(),
+        );
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.painter().vline(
+                x,
+                band.y_range(),
+                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            );
+        }
+        if response.double_clicked() {
+            outcome.fit = true;
+        }
+        if response.dragged() {
+            outcome.resized = drag_divider(
+                widths,
+                columns,
+                left,
+                spans[index + 1].0,
+                response.drag_delta().x,
+            );
+        }
+    }
+    outcome
 }
 
 /// The drag payload of one server-list row: the row's index in the list as
@@ -10550,13 +10848,14 @@ mod tests {
     use super::keygen::{keygen_value, redacted_tool_args};
     use super::raw_editor::JsonBuf;
     use super::{
-        AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
-        EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
-        FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language, LatencyBadge, LeaveAction,
-        ProfileDraft, RawField, Request, RowCells, RowDetail, RowExtras, RowState, RowSwitch,
-        STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab, ServersScreen,
-        StatusLine, TableShape, TlsProbe, TransportTabCtx, basic_tab_inline_verdict,
-        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        AdvancedTabCtx, Column, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind,
+        DraftTarget, EditorTab, EditorValidationCache, EditorValidationFindings,
+        EditorValidationRender, FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language,
+        LatencyBadge, LeaveAction, ProfileDraft, RawField, Request, RowCells, RowDetail, RowExtras,
+        RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab,
+        ServersScreen, StatusLine, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
+        TransportTabCtx, basic_tab_inline_verdict, drag_divider, drag_scroll_delta,
+        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
         finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
         server_list_row, status_colors_of, status_toast_expired, tab_order, table_columns,
         xmux_section,
@@ -10564,6 +10863,7 @@ mod tests {
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
     use crate::links;
+    use crate::model::settings::ColumnWidths;
     use crate::model::stream::MasqueradeCfg;
     use crate::model::validation::{
         ValidationCode, ValidationIssue, validate_outbound, validate_sockopt,
@@ -12099,6 +12399,7 @@ Authentication: ML-KEM-768, Post-Quantum
             t(Language::En, Key::SrvImportLinks),
             t(Language::En, Key::TestLatency),
             t(Language::En, Key::SrvSortByLatency),
+            t(Language::En, Key::SrvFitColumns),
         ] {
             assert!(
                 harness
@@ -12288,6 +12589,147 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
+    /// A divider drag trades width between the two columns it sits between,
+    /// so the divider follows the pointer; the name column is stored too, and
+    /// a drag that starts from the adaptive fit freezes it at the width the
+    /// fit gave it.
+    #[test]
+    fn dragging_a_column_divider_trades_width_between_neighbours() {
+        let widths = ColumnWidths {
+            name: 400.0,
+            ..TABLE_DEFAULT_WIDTHS
+        };
+        let columns = table_columns(900.0, TableShape::default(), widths, false);
+        let resized = drag_divider(widths, columns, Column::Protocol, Column::Address, 20.0)
+            .expect("a small drag stays inside the column bounds");
+        assert!((resized.protocol - (widths.protocol + 20.0)).abs() < 0.01);
+        assert!((resized.address - (widths.address - 20.0)).abs() < 0.01);
+        assert!(
+            (resized.name - widths.name).abs() < 0.01,
+            "a drag between two columns must leave the name column alone"
+        );
+        let after = table_columns(900.0, TableShape::default(), resized, false);
+        assert!(
+            (after.protocol - (columns.protocol + 20.0)).abs() < 0.01,
+            "the protocol column must widen by the dragged distance"
+        );
+
+        // The divider on the name column's right edge widens the name.
+        let resized = drag_divider(widths, columns, Column::Name, Column::Protocol, 20.0)
+            .expect("the name column takes width from the protocol column");
+        assert!((resized.name - (widths.name + 20.0)).abs() < 0.01);
+        assert!((resized.protocol - (widths.protocol - 20.0)).abs() < 0.01);
+
+        // A drag that starts from the fit stores the fitted columns and the
+        // name width the fit gave it.
+        let fitted = ColumnWidths {
+            name: 0.0,
+            ..TABLE_DEFAULT_WIDTHS
+        };
+        let flex = table_columns(900.0, TableShape::default(), fitted, true);
+        let resized = drag_divider(fitted, flex, Column::Protocol, Column::Address, 12.0)
+            .expect("a drag from the fit is stored");
+        assert!(
+            (resized.name - flex.name).abs() < 0.01,
+            "the fit's name width must be frozen by the first drag"
+        );
+    }
+
+    /// A drag stops at a column's floor instead of squeezing it out of
+    /// existence.
+    #[test]
+    fn a_drag_stops_at_a_columns_floor() {
+        let widths = ColumnWidths {
+            address: 120.0,
+            ..TABLE_DEFAULT_WIDTHS
+        };
+        let columns = table_columns(900.0, TableShape::default(), widths, false);
+        assert_eq!(columns.address, 120.0);
+        assert_eq!(
+            drag_divider(widths, columns, Column::Protocol, Column::Address, 10.0),
+            None,
+            "the address column must not shrink below its floor"
+        );
+    }
+
+    /// The toolbar's fit command gives the dragged widths back to the
+    /// adaptive fit, and the setting it changes is the one the table reads.
+    #[test]
+    fn the_fit_columns_command_restores_the_adaptive_widths() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        rig.settings.server_table_columns = Some(ColumnWidths {
+            order: 60.0,
+            switch: 70.0,
+            protocol: 200.0,
+            address: 300.0,
+            latency: 90.0,
+            name: 400.0,
+            group: 150.0,
+        });
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvFitColumns))
+            .click();
+        harness.run();
+        assert!(
+            harness.state().1.settings.server_table_columns.is_none(),
+            "Fit columns must drop the widths a divider drag stored"
+        );
+    }
+
+    /// A drag on a header divider moves the columns after it and stores the
+    /// widths the user chose, so the next frame lays the table out from them.
+    #[test]
+    fn dragging_a_divider_shifts_the_columns_and_stores_the_widths() {
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Vless));
+        let ProtocolSettings::Vless(settings) = &mut tokyo.outbound.settings else {
+            unreachable!("Vless is the default protocol");
+        };
+        settings.address = "203.0.113.7".into();
+        settings.port = 443;
+        rig.servers.profiles.push(tokyo);
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+        let header = harness
+            .query_all_by_label(t(Language::En, Key::SrvColAddress))
+            .next()
+            .expect("the table renders its Address header")
+            .rect();
+        // The divider before the address column sits one cell inset left of
+        // the header's text.
+        let divider = egui::pos2(header.left() - TABLE_CELL_INSET, header.center().y);
+        harness.hover_at(divider);
+        harness.step();
+        harness.drag_at(divider);
+        harness.step();
+        harness.hover_at(divider + egui::vec2(10.0, 0.0));
+        harness.step();
+        harness.drop_at(divider + egui::vec2(10.0, 0.0));
+        harness.step();
+
+        let moved = harness
+            .query_all_by_label(t(Language::En, Key::SrvColAddress))
+            .next()
+            .expect("the table renders its Address header")
+            .rect()
+            .left();
+        assert!(
+            (moved - header.left() - 10.0).abs() < 2.0,
+            "the protocol column must widen by the dragged distance (moved {:.1})",
+            moved - header.left()
+        );
+        assert!(
+            harness.state().1.settings.server_table_columns.is_some(),
+            "a divider drag must store the widths it made"
+        );
+    }
+
     #[test]
     fn double_clicking_a_row_opens_the_editor_window() {
         let mut rig = UiTestRig::default();
@@ -12422,7 +12864,12 @@ Authentication: ML-KEM-768, Post-Quantum
             .with_size(egui::vec2(width, 100.0))
             .build_ui(|ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
-                let columns = table_columns(ui.available_width(), TableShape::default());
+                let columns = table_columns(
+                    ui.available_width(),
+                    TableShape::default(),
+                    TABLE_DEFAULT_WIDTHS,
+                    true,
+                );
                 let _ = server_list_row(
                     ui,
                     Language::En,
@@ -12484,7 +12931,12 @@ Authentication: ML-KEM-768, Post-Quantum
         let clicked_ui = Rc::clone(&clicked);
         let mut harness = harness_builder().build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
-            let columns = table_columns(ui.available_width(), TableShape::default());
+            let columns = table_columns(
+                ui.available_width(),
+                TableShape::default(),
+                TABLE_DEFAULT_WIDTHS,
+                true,
+            );
             let clicks = server_list_row(
                 ui,
                 Language::En,
@@ -12518,7 +12970,12 @@ Authentication: ML-KEM-768, Post-Quantum
             let toggled_ui = Rc::clone(&toggled);
             let mut harness = harness_builder().build_ui(move |ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
-                let columns = table_columns(ui.available_width(), TableShape::default());
+                let columns = table_columns(
+                    ui.available_width(),
+                    TableShape::default(),
+                    TABLE_DEFAULT_WIDTHS,
+                    true,
+                );
                 let clicks = server_list_row(
                     ui,
                     Language::En,
@@ -12559,7 +13016,12 @@ Authentication: ML-KEM-768, Post-Quantum
         // double-click delay. A fifth-second step keeps the gesture inside it.
         let mut harness = harness_builder().with_step_dt(0.05).build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
-            let columns = table_columns(ui.available_width(), TableShape::default());
+            let columns = table_columns(
+                ui.available_width(),
+                TableShape::default(),
+                TABLE_DEFAULT_WIDTHS,
+                true,
+            );
             let clicks = server_list_row(
                 ui,
                 Language::En,
