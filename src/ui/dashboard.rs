@@ -178,8 +178,9 @@ impl DashboardScreen {
     /// The latency grid's memoized rows for this frame: one pass per
     /// `(model generation, latency_generation, language)` change, zero
     /// per-row lookups or formatting on idle frames. The model generation is
-    /// the edit signal (a rename or an added profile); the latency generation
-    /// carries the observatory and probe results the rows render.
+    /// the edit signal (a rename, an added profile, or a switched-off
+    /// server); the latency generation carries the observatory and probe
+    /// results the rows render.
     fn latency_rows(&mut self, ctx: &DashboardCtx<'_>) -> &[LatencyRow] {
         let key = (
             ctx.hooks.model_generation(),
@@ -857,9 +858,12 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     let short = chars.by_ref().take(max_chars).collect();
     (short, chars.next().is_some())
 }
-/// One pass over profiles + observatory: per-row lookup, latency formatting,
-/// and detail truncation for the latency grid. Run only when the grid's
-/// generation key changes, never per frame.
+/// One pass over the emitted set + observatory: per-row lookup, latency
+/// formatting, and detail truncation for the latency grid. Run only when the
+/// grid's generation key changes, never per frame. Rows are the configuration's
+/// emitted profiles in emitted order — the active server first, then the
+/// enabled servers, with chain hops where the model places them — so a
+/// profile the generated document never carries has no row.
 fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
     let lang = ctx.settings.language;
     // One index for the whole pass instead of a linear scan per profile: the
@@ -872,9 +876,14 @@ fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
         // overwrite that choice.
         by_tag.entry(status.tag.as_str()).or_insert(status);
     }
+    // The set is derived from the same profile list the indices point into,
+    // so every index resolves; the lookup keeps a stale index from panicking
+    // if that invariant ever moves.
     ctx.servers
-        .profiles
+        .emitted_set()
+        .order
         .iter()
+        .filter_map(|&index| ctx.servers.profiles.get(index))
         .map(|p| {
             let tag = p.tag();
             let status = by_tag.get(tag.as_str()).copied();
@@ -1602,6 +1611,14 @@ mod tests {
         p
     }
 
+    /// A profile the configuration carries: `ServerProfile::new` starts
+    /// switched off, and an off profile without a chain is not emitted.
+    fn enabled_profile(name: &str, latency: Option<ProbeVerdict>) -> ServerProfile {
+        let mut p = profile(name, latency);
+        p.enabled = true;
+        p
+    }
+
     /// The listener-traffic table renders one row per inbound tag from the
     /// stats tick, with the per-tag rates, and stays hidden with no data.
     #[test]
@@ -1665,6 +1682,26 @@ mod tests {
                 },
                 DashboardScreen::default(),
             )
+    }
+
+    /// The latency grid's rows, as the profile names `names` in display
+    /// order: the labels are read top-to-bottom, so an assertion states the
+    /// order a user sees rather than the accessibility tree's traversal
+    /// order.
+    fn latency_row_names(
+        harness: &Harness<'static, DashboardScreen>,
+        names: &[&str],
+    ) -> Vec<String> {
+        let mut rows: Vec<(f32, String)> = harness
+            .query_all_by(|node| node.role() == egui::accesskit::Role::Label)
+            .filter_map(|node| {
+                let value = node.accesskit_node().value()?;
+                Some((node.rect().top(), value))
+            })
+            .filter(|(_, value)| names.contains(&value.as_str()))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, value)| value).collect()
     }
 
     /// Drop every local endpoint: the settings state of a user who never
@@ -2188,15 +2225,15 @@ mod tests {
         // and the closure re-borrows per frame.
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         rig.borrow_mut().servers.profiles = vec![
-            profile(
+            enabled_profile(
                 "alpha",
                 Some(ProbeVerdict::delay(42, ProbeSource::LatencyTest)),
             ),
-            profile(
+            enabled_profile(
                 "beta",
                 Some(ProbeVerdict::dead(ProbeSource::LatencyTest, None)),
             ),
-            profile("gamma", None),
+            enabled_profile("gamma", None),
         ];
         rig.borrow_mut()
             .stats_history
@@ -2268,6 +2305,72 @@ mod tests {
             .expect("a model change re-renders the row");
     }
 
+    /// The latency table lists exactly the configuration's emitted set, in
+    /// emitted order, while the core is stopped: the active server leads,
+    /// then the enabled servers in stored order. A profile the configuration
+    /// never carries has no row, and switching a server off drops its row on
+    /// the next frame.
+    #[test]
+    fn latency_grid_lists_the_emitted_set_in_emitted_order() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        {
+            let mut r = rig.borrow_mut();
+            // Stored order is First, Active, Disabled, Second. The active
+            // server leads even with its own switch off; the disabled
+            // profile is not emitted at all.
+            let mut active = profile("Active", None);
+            active.enabled = false;
+            let first = enabled_profile("First", None);
+            let second = enabled_profile("Second", None);
+            let disabled = profile("Disabled", None);
+            r.servers.active = Some(active.id.clone());
+            r.servers.profiles = vec![first, active, disabled, second];
+            r.phase = CorePhase::Stopped;
+        }
+        let mut harness = harness_for(Rc::clone(&rig));
+        harness.run();
+
+        let names = ["Active", "First", "Second", "Disabled"];
+        assert_eq!(
+            latency_row_names(&harness, &names),
+            ["Active", "First", "Second"],
+            "the active server leads, then the enabled servers in stored order"
+        );
+
+        // Unchecking a server drops its row on the next frame.
+        rig.borrow_mut().servers.profiles[0].enabled = false;
+        rig.borrow_mut().edit();
+        harness.run();
+        assert_eq!(
+            latency_row_names(&harness, &names),
+            ["Active", "Second"],
+            "a switched-off server leaves the table"
+        );
+    }
+
+    /// Profiles with no emission — every switch off and nothing active — are
+    /// still a valid, empty route: the table keeps its header and only the
+    /// no-profiles state is suppressed.
+    #[test]
+    fn latency_grid_keeps_its_header_when_nothing_is_emitted() {
+        let rig = Rc::new(RefCell::new(UiTestRig::default()));
+        rig.borrow_mut().servers.profiles = vec![profile("Idle", None)];
+        let mut harness = harness_for(rig);
+        harness.run();
+
+        harness
+            .get_all_by_label(t(Language::En, Key::GridName))
+            .next()
+            .expect("the grid header renders for an empty emitted set");
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::DashboardNoServers))
+                .next()
+                .is_none(),
+            "the no-profiles empty state must not replace a valid empty route"
+        );
+    }
+
     /// Long observatory last-error text is truncated to 60 chars in the
     /// memoized row, and the hover text is composed from the stored pieces
     /// when the tooltip opens.
@@ -2280,7 +2383,7 @@ mod tests {
             // The rig ships no profiles; a grid row only exists for a
             // profile, so the test seeds one (UiTestRig::default leaves
             // ServersFile::default — empty).
-            rig.servers.profiles = vec![profile("Tokyo edge", None)];
+            rig.servers.profiles = vec![enabled_profile("Tokyo edge", None)];
             let tag = rig.servers.profiles[0].tag();
             rig.observatory = vec![OutboundStatusView {
                 health_ping: None,
@@ -2328,7 +2431,7 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut rig = rig.borrow_mut();
-            rig.servers.profiles = vec![profile("Tokyo edge", None)];
+            rig.servers.profiles = vec![enabled_profile("Tokyo edge", None)];
             let tag = rig.servers.profiles[0].tag();
             rig.observatory = vec![OutboundStatusView {
                 health_ping: None,
@@ -2360,7 +2463,7 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut rig = rig.borrow_mut();
-            rig.servers.profiles = vec![profile("Tokyo edge", None)];
+            rig.servers.profiles = vec![enabled_profile("Tokyo edge", None)];
             let tag = rig.servers.profiles[0].tag();
             rig.observatory = vec![OutboundStatusView {
                 health_ping: None,
@@ -2386,7 +2489,10 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut rig = rig.borrow_mut();
-            rig.servers.profiles = vec![profile("Tokyo edge", None), profile("Osaka", None)];
+            rig.servers.profiles = vec![
+                enabled_profile("Tokyo edge", None),
+                enabled_profile("Osaka", None),
+            ];
             let dead_tag = rig.servers.profiles[0].tag();
             let alive_tag = rig.servers.profiles[1].tag();
             rig.observatory = vec![
@@ -2428,7 +2534,7 @@ mod tests {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut rig = rig.borrow_mut();
-            rig.servers.profiles = vec![profile("Tokyo edge", None)];
+            rig.servers.profiles = vec![enabled_profile("Tokyo edge", None)];
             let tag = rig.servers.profiles[0].tag();
             rig.observatory = vec![OutboundStatusView {
                 health_ping: Some(HealthPingView {
@@ -2520,11 +2626,11 @@ mod tests {
         {
             let mut r = rig.borrow_mut();
             r.servers.profiles = vec![
-                profile(
+                enabled_profile(
                     "Tokyo edge",
                     Some(ProbeVerdict::delay(42, ProbeSource::LatencyTest)),
                 ),
-                profile("Oslo", None),
+                enabled_profile("Oslo", None),
             ];
             r.latency_generation += 1;
         }

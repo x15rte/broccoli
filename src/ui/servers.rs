@@ -2064,6 +2064,11 @@ struct TabRowsCache {
     search: String,
     sort: Option<ViewSort>,
     rows: std::rc::Rc<[usize]>,
+    /// The display rows a drag may lift or land on: the hops are not drag
+    /// places, so they are left out here rather than filtered per frame.
+    seeds: std::rc::Rc<[usize]>,
+    /// `seeds_before[i]`: how many seed rows precede display index `i`.
+    seeds_before: std::rc::Rc<[usize]>,
 }
 
 /// The tab bar's entries for one model generation. The list moves only when
@@ -2217,6 +2222,10 @@ pub struct ServersScreen {
     /// The toolbar's "Fit columns" command, consumed by the table on the
     /// frame that set it.
     fit_columns: bool,
+    /// The widths a divider drag works from, with the divider the pointer
+    /// grabbed. Held across frames so each frame lays the column out from the
+    /// press, not from the previous frame's stored widths.
+    column_drag: Option<ColumnDrag>,
     /// The emitted set memoized for one model generation: the row switches
     /// and their lock hints read it, and it is rebuilt only when the model
     /// moves, never per repaint.
@@ -4102,33 +4111,19 @@ impl ServersScreen {
             .map_or(TABLE_DEFAULT_WIDTHS, |(_, _, widths)| *widths);
         let manual = ctx.settings.server_table_columns.map(sanitized_widths);
         let widths = manual.unwrap_or(fitted);
-        // The adaptive fit lets the name column fill the band; a drag freezes
-        // every width, so the table keeps the total the user sized.
-        let flex_name = manual.is_none();
-        // The table's width excludes the scroll bar's overlap, and the header
-        // and every row take their columns from this one computation: width
-        // computed twice is width computed differently.
-        let columns = table_columns(
-            (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
-            shape,
-            widths,
-            flex_name,
+        // The adaptive fit puts every column at its measured width: the tag
+        // keeps its own width and the spare band stays to the right of the
+        // table instead of being absorbed by the tag.
+        let columns = table_columns(shape, widths);
+        // The header's band is reserved here and painted after the rows: the
+        // rows own the horizontal scroll bar, and the header is translated by
+        // the offset they report on this same frame, so the two can never
+        // disagree while the bar is dragged.
+        let (header_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), TABLE_ROW_HEIGHT),
+            egui::Sense::hover(),
         );
-        let outcome = table_header(ui, lang, columns, widths, sortable, self.view_sort);
-        if outcome.fit && ctx.settings.server_table_columns.is_some() {
-            ctx.settings.server_table_columns = None;
-            ctx.hooks.mark_dirty();
-        } else if let Some(resized) = outcome.resized {
-            ctx.settings.server_table_columns = Some(resized);
-            ctx.hooks.mark_dirty();
-        }
-        if let Some(column) = outcome.sort {
-            self.view_sort = Some(next_view_sort(self.view_sort, column));
-            // The sort is a display preference: it saves with the other UI
-            // settings and never reaches the configuration pipeline.
-            ctx.settings.server_table_sort = self.view_sort;
-            ctx.hooks.mark_ui_dirty();
-        }
+
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
         // is not layout. Rows are uniform single-line rows at `TABLE_ROW_HEIGHT`,
@@ -4141,38 +4136,6 @@ impl ServersScreen {
         // offset is preserved across the switch.
         let row_height = TABLE_ROW_HEIGHT;
         let profiles = &ctx.servers.profiles;
-        let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
-            cache.generation != generation
-                || cache.tab != self.view
-                || cache.search != self.search
-                || cache.sort != self.view_sort
-        });
-        if stale_rows {
-            self.tab_rows_cache = Some(TabRowsCache {
-                generation,
-                tab: self.view.clone(),
-                search: self.search.clone(),
-                sort: self.view_sort,
-                rows: std::rc::Rc::from(
-                    tab_rows(ctx.servers, &self.view, &self.search, self.view_sort)
-                        .into_boxed_slice(),
-                ),
-            });
-        }
-        let display_rows = std::rc::Rc::clone(
-            &self
-                .tab_rows_cache
-                .as_ref()
-                .expect("the tab rows were cached above")
-                .rows,
-        );
-        // A row the tab no longer shows — filtered out, or gone with its
-        // group — leaves the selection before any command reads it. Only the
-        // row list's own rebuild can change which rows are visible, so the
-        // sweep rides on it instead of running selection × rows every frame.
-        if stale_rows {
-            self.retain_visible_selection(&display_rows, profiles);
-        }
         if self.emitted_cache.as_ref().map(|(cached, _)| *cached) != Some(generation) {
             self.emitted_cache = Some((generation, std::rc::Rc::new(ctx.servers.emitted_set())));
         }
@@ -4183,6 +4146,67 @@ impl ServersScreen {
                 .expect("the emitted set was cached above")
                 .1,
         );
+        let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
+            cache.generation != generation
+                || cache.tab != self.view
+                || cache.search != self.search
+                || cache.sort != self.view_sort
+        });
+        if stale_rows {
+            let rows: Box<[usize]> =
+                tab_rows(ctx.servers, &self.view, &self.search, self.view_sort).into_boxed_slice();
+            // The rows a drag may lift or land on: this tab's display rows
+            // without the chain hops, and for every display index the count
+            // of seed rows before it. Both are derived with the row list so a
+            // drag reads them in O(1) instead of filtering and scanning every
+            // row on each frame of the gesture.
+            let mut seeds = Vec::with_capacity(rows.len());
+            let mut seeds_before = Vec::with_capacity(rows.len() + 1);
+            for &index in &rows {
+                seeds_before.push(seeds.len());
+                if !emitted.chain_only.contains(&index) {
+                    seeds.push(index);
+                }
+            }
+            seeds_before.push(seeds.len());
+            self.tab_rows_cache = Some(TabRowsCache {
+                generation,
+                tab: self.view.clone(),
+                search: self.search.clone(),
+                sort: self.view_sort,
+                rows: std::rc::Rc::from(rows),
+                seeds: std::rc::Rc::from(seeds.into_boxed_slice()),
+                seeds_before: std::rc::Rc::from(seeds_before.into_boxed_slice()),
+            });
+        }
+        let display_rows = std::rc::Rc::clone(
+            &self
+                .tab_rows_cache
+                .as_ref()
+                .expect("the tab rows were cached above")
+                .rows,
+        );
+        let seed_rows = std::rc::Rc::clone(
+            &self
+                .tab_rows_cache
+                .as_ref()
+                .expect("the tab rows were cached above")
+                .seeds,
+        );
+        let seeds_before = std::rc::Rc::clone(
+            &self
+                .tab_rows_cache
+                .as_ref()
+                .expect("the tab rows were cached above")
+                .seeds_before,
+        );
+        // A row the tab no longer shows — filtered out, or gone with its
+        // group — leaves the selection before any command reads it. Only the
+        // row list's own rebuild can change which rows are visible, so the
+        // sweep rides on it instead of running selection × rows every frame.
+        if stale_rows {
+            self.retain_visible_selection(&display_rows, profiles);
+        }
         // One clone per frame instead of a lookup per row: the menu's switch
         // label asks which selected rows are locked, and the route is one of
         // the two locks.
@@ -4207,368 +4231,462 @@ impl ServersScreen {
         // the rows did not take falls to the empty space below them and
         // clears the selection.
         let mut row_hit = false;
-        if display_rows.is_empty() {
-            egui::ScrollArea::vertical()
-                .id_salt(ui.auto_id_with("servers.list.scroll"))
-                .max_height(ui.available_height().max(80.0))
-                .show(ui, |ui| {
-                    let message = if self.search.trim().is_empty() {
-                        t(lang, Key::NoServersYet)
-                    } else {
-                        t(lang, Key::SrvNoMatches)
-                    };
-                    ui.label(RichText::new(message).weak());
-                });
-        } else {
-            egui::ScrollArea::vertical()
-                .id_salt(ui.auto_id_with("servers.list.scroll"))
-                .max_height(ui.available_height().max(80.0))
-                .show_rows(ui, row_height, display_rows.len(), |ui, rows| {
-                    // egui's floating (overlay) scroll bar paints and
-                    // hit-tests over the band's right edge: a vertical
-                    // ScrollArea shrinks horizontally to its content and the
-                    // bar hugs that edge, reserving no space of its own
-                    // (`ScrollStyle::allocated_width` is the floating
-                    // allocation, zero by default). A row fills the band, so
-                    // its trailing delete button would sit under the track
-                    // and a press on its right part would grab the bar
-                    // instead. Reserve the bar's overlap — computed once per
-                    // frame from the style, since every row shares the band —
-                    // and report the full band width again at the end so the
-                    // bar stays pinned to the edge the rows stop short of.
-                    let band_right = ui.max_rect().right();
-                    ui.set_max_width(columns.total());
-                    let colors = status_colors_of(ui);
-                    // One frame of drag-reorder state: the pointer (only
-                    // while a row is lifted and the pointer is inside the
-                    // list viewport), the proposed drop — its gap index and
-                    // the y its insertion line paints at. egui owns the
-                    // gesture ([`egui::DragAndDrop`]): a row's payload is what
-                    // says a lift is in flight, and recomputing the gap from
-                    // the laid-out band every frame keeps a scrolled
-                    // virtualized list dropping at real row boundaries.
-                    let viewport = ui.clip_rect();
-                    let spacing = ui.spacing().item_spacing.y;
-                    let lifted =
-                        egui::DragAndDrop::payload::<DragRow>(ui.ctx()).map(|payload| payload.0);
-                    let drag_pos = lifted
-                        .is_some()
-                        .then(|| ui.input(|i| i.pointer.interact_pos()))
-                        .flatten()
-                        .filter(|pos| viewport.contains(*pos));
-                    // The generated order pins the active server first, so its
-                    // row is a block of its own and accepts no drop.
-                    let active_index = ctx
-                        .servers
-                        .active
-                        .as_deref()
-                        .and_then(|id| profiles.iter().position(|profile| profile.id == id));
-                    // Only a gap inside the lifted row's own block proposes a
-                    // drop: another group's block would silently rewrite the
-                    // wrong group's row order.
-                    let droppable = |gap: usize| {
-                        lifted.is_some_and(|from| {
-                            block_drop(&display_rows, profiles, active_index, from, gap).is_some()
-                        })
-                    };
-                    let mut drop_mark: Option<(usize, f32)> = None;
-                    // Whether the row under the pointer already named the
-                    // gap: a refused gap proposes nothing, and no later
-                    // block's gap may claim a drop the pointer never aimed at.
-                    let mut gap_decided = false;
-                    let mut last_row_bottom: Option<f32> = None;
-                    for display in rows {
-                        let index = display_rows[display];
-                        let p = &profiles[index];
-                        let is_sel = self.selection.contains(p.id.as_str());
-                        // The neighbours decide where the selection band
-                        // opens and closes: the outline omits an edge shared
-                        // with another selected row.
-                        let selected_at = |position: usize| {
-                            display_rows.get(position).is_some_and(|&other| {
-                                self.selection.contains(profiles[other].id.as_str())
-                            })
-                        };
-                        let joined_above = display > 0 && selected_at(display - 1);
-                        let joined_below = selected_at(display + 1);
-                        let is_active = ctx.servers.active.as_deref() == Some(p.id.as_str());
-                        // Latency badge text is memoized per profile:
-                        // formatting runs only when the row's latency,
-                        // the language, or the theme palette moved — a
-                        // near-constant input, so idle rows pay a hash
-                        // lookup plus a value compare, never a `t_fmt`.
-                        if !self.latency_badges.get(p.id.as_str()).is_some_and(|badge| {
-                            badge.matches(
-                                p.verdict.as_ref().map(|verdict| verdict.outcome),
-                                lang,
-                                colors,
-                            )
-                        }) {
-                            self.latency_badges.insert(
-                                p.id.clone(),
-                                LatencyBadge::new(p.verdict.as_ref(), lang, colors),
-                            );
-                        }
-                        let badge = self
-                            .latency_badges
-                            .get(p.id.as_str())
-                            .expect("badge inserted above");
-                        // The lifted row dims in place; the insertion line
-                        // carries the drop position. The opacity round-trips
-                        // through this ui's painter, so the rows around it
-                        // paint untouched.
-                        let previous_opacity = ui.opacity();
-                        if lifted == Some(display) {
-                            ui.multiply_opacity(DRAGGED_ROW_OPACITY);
-                        }
-                        let detail = row_details.get(&index);
-                        let clicks = server_list_row(
-                            ui,
-                            lang,
-                            columns,
-                            RowCells {
-                                name: &p.name,
-                                detail: detail.unwrap_or(&EMPTY_ROW_DETAIL),
-                                verdict: p.verdict.as_ref(),
-                                extras: RowExtras {
-                                    order: shape.order.then_some(display + 1),
-                                    group: shape.group.then_some(p.group_title.as_str()),
-                                },
-                            },
-                            RowState {
-                                selected: is_sel,
-                                joined_above,
-                                joined_below,
-                                active: is_active,
-                                hop: emitted.chain_only.contains(&index),
-                                frozen: probe_pending,
-                                switch: RowSwitch {
-                                    // The active server and a chain-only hop
-                                    // are in the generated document whatever
-                                    // their own switch says, so both render
-                                    // checked and locked.
-                                    checked: is_active
-                                        || p.enabled
-                                        || emitted.chain_only.contains(&index),
-                                    locked_hint: if is_active {
-                                        Some(t(lang, Key::SrvActiveAlwaysEmitted))
-                                    } else if emitted.chain_only.contains(&index) {
-                                        Some(t(lang, Key::SrvChainOnlyHint))
-                                    } else {
-                                        None
+        // Solid scroll bars allocate their own strip, so the horizontal bar
+        // cannot float over the last row's cells.
+        let scroll_x = ui
+            .scope(|ui| {
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                if display_rows.is_empty() {
+                    let rows = egui::ScrollArea::both()
+                        .id_salt(ui.auto_id_with("servers.list.scroll"))
+                        .max_height(ui.available_height().max(80.0))
+                        .show(ui, |ui| {
+                            let message = if self.search.trim().is_empty() {
+                                t(lang, Key::NoServersYet)
+                            } else {
+                                t(lang, Key::SrvNoMatches)
+                            };
+                            ui.label(RichText::new(message).weak());
+                        });
+                    // No rows means nothing to scroll to; the header returns to the
+                    // table's start with them.
+                    rows.state.clamped_offset().x
+                } else {
+                    let rows = egui::ScrollArea::both()
+                        .id_salt(ui.auto_id_with("servers.list.scroll"))
+                        .max_height(ui.available_height().max(80.0))
+                        .show_rows(ui, row_height, display_rows.len(), |ui, rows| {
+                            // egui's floating (overlay) scroll bar paints and
+                            // hit-tests over the band's right edge: a vertical
+                            // ScrollArea shrinks horizontally to its content and the
+                            // bar hugs that edge, reserving no space of its own
+                            // (`ScrollStyle::allocated_width` is the floating
+                            // allocation, zero by default). A row fills the band, so
+                            // its trailing delete button would sit under the track
+                            // and a press on its right part would grab the bar
+                            // instead. Reserve the bar's overlap — computed once per
+                            // frame from the style, since every row shares the band —
+                            // and report the full band width again at the end so the
+                            // bar stays pinned to the edge the rows stop short of.
+                            let band_right = ui.max_rect().right();
+                            ui.set_max_width(columns.total());
+                            let colors = status_colors_of(ui);
+                            // One frame of drag-reorder state: the pointer (only
+                            // while a row is lifted and the pointer is inside the
+                            // list viewport), the proposed drop — its gap index and
+                            // the y its insertion line paints at. egui owns the
+                            // gesture ([`egui::DragAndDrop`]): a row's payload is what
+                            // says a lift is in flight, and recomputing the gap from
+                            // the laid-out band every frame keeps a scrolled
+                            // virtualized list dropping at real row boundaries.
+                            let viewport = ui.clip_rect();
+                            let spacing = ui.spacing().item_spacing.y;
+                            let lifted = egui::DragAndDrop::payload::<DragRow>(ui.ctx())
+                                .map(|payload| payload.0);
+                            let drag_pos = lifted
+                                .is_some()
+                                .then(|| ui.input(|i| i.pointer.interact_pos()))
+                                .flatten()
+                                .filter(|pos| viewport.contains(*pos));
+                            // The generated order pins the active server first, so its
+                            // row is a block of its own and accepts no drop.
+                            let active_index = ctx.servers.active.as_deref().and_then(|id| {
+                                profiles.iter().position(|profile| profile.id == id)
+                            });
+                            // A hop row is a consequence of the chain, not a place in
+                            // its group, so it neither lifts nor receives a drop: the
+                            // block algorithm reads the seed rows alone, and both the
+                            // seed list and the per-display seed count were derived
+                            // with the row cache, so a drag frame reads them instead
+                            // of filtering and scanning every row.
+                            let drag_rows: Option<&[usize]> = lifted.map(|_| seed_rows.as_ref());
+                            let seed_position = |display: usize| {
+                                seeds_before
+                                    .get(display)
+                                    .copied()
+                                    .unwrap_or(seeds_before.len())
+                            };
+                            let map_drop = |from: usize, gap: usize| {
+                                let rows = drag_rows?;
+                                block_drop(
+                                    rows,
+                                    profiles,
+                                    active_index,
+                                    seed_position(from),
+                                    seed_position(gap),
+                                )
+                            };
+                            // Only a gap inside the lifted row's own block proposes a
+                            // drop: another group's block would silently rewrite the
+                            // wrong group's row order.
+                            let droppable = |gap: usize| {
+                                lifted.is_some_and(|from| map_drop(from, gap).is_some())
+                            };
+                            let mut drop_mark: Option<(usize, f32)> = None;
+                            // Whether the row under the pointer already named the
+                            // gap: a refused gap proposes nothing, and no later
+                            // block's gap may claim a drop the pointer never aimed at.
+                            let mut gap_decided = false;
+                            let mut last_row_bottom: Option<f32> = None;
+                            for display in rows {
+                                let index = display_rows[display];
+                                let p = &profiles[index];
+                                let is_sel = self.selection.contains(p.id.as_str());
+                                // The neighbours decide where the selection band
+                                // opens and closes: the outline omits an edge shared
+                                // with another selected row.
+                                let selected_at = |position: usize| {
+                                    display_rows.get(position).is_some_and(|&other| {
+                                        self.selection.contains(profiles[other].id.as_str())
+                                    })
+                                };
+                                let joined_above = display > 0 && selected_at(display - 1);
+                                let joined_below = selected_at(display + 1);
+                                let is_active =
+                                    ctx.servers.active.as_deref() == Some(p.id.as_str());
+                                // Latency badge text is memoized per profile:
+                                // formatting runs only when the row's latency,
+                                // the language, or the theme palette moved — a
+                                // near-constant input, so idle rows pay a hash
+                                // lookup plus a value compare, never a `t_fmt`.
+                                if !self.latency_badges.get(p.id.as_str()).is_some_and(|badge| {
+                                    badge.matches(
+                                        p.verdict.as_ref().map(|verdict| verdict.outcome),
+                                        lang,
+                                        colors,
+                                    )
+                                }) {
+                                    self.latency_badges.insert(
+                                        p.id.clone(),
+                                        LatencyBadge::new(p.verdict.as_ref(), lang, colors),
+                                    );
+                                }
+                                let badge = self
+                                    .latency_badges
+                                    .get(p.id.as_str())
+                                    .expect("badge inserted above");
+                                // The lifted row dims in place; the insertion line
+                                // carries the drop position. The opacity round-trips
+                                // through this ui's painter, so the rows around it
+                                // paint untouched.
+                                let previous_opacity = ui.opacity();
+                                if lifted == Some(display) {
+                                    ui.multiply_opacity(DRAGGED_ROW_OPACITY);
+                                }
+                                let detail = row_details.get(&index);
+                                let clicks = server_list_row(
+                                    ui,
+                                    lang,
+                                    columns,
+                                    RowCells {
+                                        name: &p.name,
+                                        detail: detail.unwrap_or(&EMPTY_ROW_DETAIL),
+                                        verdict: p.verdict.as_ref(),
+                                        extras: RowExtras {
+                                            order: shape.order.then_some(display + 1),
+                                            group: shape.group.then_some(p.group_title.as_str()),
+                                        },
                                     },
-                                },
-                            },
-                            badge,
-                        );
-                        ui.set_opacity(previous_opacity);
-                        // A primary press that grows past egui's click
-                        // threshold lifts this row: the row's own drag sense
-                        // hands egui the payload, whose index the drop half
-                        // reads. The active server is pinned first by the
-                        // generated order, so its row never lifts. A press
-                        // held with a selection modifier is a select gesture,
-                        // never a drag. Egui clears the payload on release or
-                        // Escape, so the gesture ends even when the window
-                        // loses focus mid-drag.
-                        let modifiers = ui.input(|i| i.modifiers);
-                        let modified = modifiers.command || modifiers.ctrl || modifiers.shift;
-                        if clicks.row.drag_started_by(egui::PointerButton::Primary)
-                            && !probe_pending
-                            && !modified
-                            && self.view == ServerTab::Emitted
-                            && !is_active
-                        {
-                            egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
-                        }
-                        if !probe_pending {
-                            if clicks.toggle {
-                                action = Some(ListAction::ToggleEnabled(p.id.clone()));
-                            } else if clicks.double_clicked() {
-                                action = Some(ListAction::Edit(p.id.clone()));
-                            } else if clicks.name.clicked() || clicks.row.clicked() {
-                                row_hit = true;
-                                action = Some(if modifiers.command || modifiers.ctrl {
-                                    ListAction::ToggleSelection(p.id.clone())
-                                } else if modifiers.shift {
-                                    ListAction::ExtendSelection(p.id.clone())
-                                } else {
-                                    ListAction::Select(p.id.clone())
+                                    RowState {
+                                        selected: is_sel,
+                                        joined_above,
+                                        joined_below,
+                                        active: is_active,
+                                        hop: emitted.chain_only.contains(&index),
+                                        dialers: if emitted.chain_only.contains(&index) {
+                                            emitted
+                                                .dialers
+                                                .get(&index)
+                                                .map(Vec::as_slice)
+                                                .unwrap_or(&[])
+                                        } else {
+                                            // An enabled server that others dial through
+                                            // is a seed, not a hop: the note belongs to
+                                            // the row that exists only for the chain.
+                                            &[]
+                                        },
+                                        frozen: probe_pending,
+                                        switch: RowSwitch {
+                                            // The active server and a chain-only hop
+                                            // are in the generated document whatever
+                                            // their own switch says, so both render
+                                            // checked and locked.
+                                            checked: is_active
+                                                || p.enabled
+                                                || emitted.chain_only.contains(&index),
+                                            locked_hint: if is_active {
+                                                Some(t(lang, Key::SrvActiveAlwaysEmitted))
+                                            } else if emitted.chain_only.contains(&index) {
+                                                Some(t(lang, Key::SrvChainOnlyHint))
+                                            } else {
+                                                None
+                                            },
+                                        },
+                                    },
+                                    badge,
+                                );
+                                ui.set_opacity(previous_opacity);
+                                // A primary press that grows past egui's click
+                                // threshold lifts this row: the row's own drag sense
+                                // hands egui the payload, whose index the drop half
+                                // reads. The active server is pinned first by the
+                                // generated order, so its row never lifts, and a chain
+                                // hop's slot is a consequence of another row's chain,
+                                // so it never lifts either. A press held with a
+                                // selection modifier is a select gesture, never a
+                                // drag. Egui clears the payload on release or Escape,
+                                // so the gesture ends even when the window loses focus
+                                // mid-drag.
+                                let modifiers = ui.input(|i| i.modifiers);
+                                let modified =
+                                    modifiers.command || modifiers.ctrl || modifiers.shift;
+                                if clicks.row.drag_started_by(egui::PointerButton::Primary)
+                                    && !probe_pending
+                                    && !modified
+                                    && self.view == ServerTab::Emitted
+                                    && !is_active
+                                    && !emitted.chain_only.contains(&index)
+                                {
+                                    egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
+                                }
+                                if !probe_pending {
+                                    if clicks.toggle {
+                                        action = Some(ListAction::ToggleEnabled(p.id.clone()));
+                                    } else if clicks.double_clicked() {
+                                        action = Some(ListAction::Edit(p.id.clone()));
+                                    } else if clicks.name.clicked() || clicks.row.clicked() {
+                                        row_hit = true;
+                                        action = Some(if modifiers.command || modifiers.ctrl {
+                                            ListAction::ToggleSelection(p.id.clone())
+                                        } else if modifiers.shift {
+                                            ListAction::ExtendSelection(p.id.clone())
+                                        } else {
+                                            ListAction::Select(p.id.clone())
+                                        });
+                                    }
+                                }
+                                // The row under the pointer proposes the gap: above
+                                // its midline inserts before it, below inserts after
+                                // it. Comparing midlines (not rects) leaves no dead
+                                // band in the rows' spacing. Only the lifted row's own
+                                // block proposes one, so a cross-block drop paints no
+                                // insertion line and cannot move a row.
+                                if let Some(pos) = drag_pos
+                                    && !gap_decided
+                                    && pos.y <= clicks.row.rect.center().y
+                                {
+                                    gap_decided = true;
+                                    if droppable(display) {
+                                        drop_mark =
+                                            Some((display, clicks.row.rect.top() - spacing * 0.5));
+                                    }
+                                }
+                                last_row_bottom = Some(clicks.row.rect.bottom());
+                                // The menu clones the id only when an action is
+                                // actually clicked, so borrow the row's id instead of
+                                // cloning the 36-char String on every repaint. The
+                                // batch commands read the screen's selection, which the
+                                // menu replaces with this row when it opens on a row
+                                // outside it.
+                                let id = &p.id;
+                                let mut menu = |ui: &mut egui::Ui| {
+                                    if !self.selection.contains(id.as_str()) {
+                                        self.selection.clear();
+                                        self.selection.insert(id.clone());
+                                        self.selection_anchor = Some(id.clone());
+                                    }
+                                    if ui.button(t(lang, Key::SrvEdit)).clicked() {
+                                        action = Some(ListAction::Edit(id.clone()));
+                                        ui.close();
+                                    }
+                                    let set_active = ui.add_enabled(
+                                        self.is_single_selection(id),
+                                        egui::Button::new(t(lang, Key::SrvSetActive)),
+                                    );
+                                    if set_active.clicked() {
+                                        action = Some(ListAction::SetActive(id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(t(lang, Key::SrvDuplicate)).clicked() {
+                                        action = Some(ListAction::Duplicate(id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(t(lang, Key::TestLatency)).clicked() {
+                                        action = Some(ListAction::ProbeLatency(id.clone()));
+                                        ui.close();
+                                    }
+                                    // A copy is made of subscription rows only; a
+                                    // manual row has nothing a refresh could take
+                                    // away.
+                                    let copyable = self.selection.iter().any(|selected| {
+                                        profiles.iter().any(|profile| {
+                                            profile.id == *selected && profile.origin.is_some()
+                                        })
+                                    });
+                                    if ui
+                                        .add_enabled(
+                                            copyable,
+                                            egui::Button::new(t(lang, Key::SrvCopyToGroup)),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(ListAction::CopySelection);
+                                        ui.close();
+                                    }
+                                    // One control for one state: the item offers the
+                                    // switch the selection does not have yet. Locked
+                                    // rows (the route and chain hops) are skipped by
+                                    // the command, so they decide neither the label
+                                    // nor whether the item can act.
+                                    let mut has_unlocked = false;
+                                    let mut any_unlocked_off = false;
+                                    for (index, profile) in profiles.iter().enumerate() {
+                                        if !self.selection.contains(&profile.id) {
+                                            continue;
+                                        }
+                                        let locked = active_id.as_deref()
+                                            == Some(profile.id.as_str())
+                                            || emitted.chain_only.contains(&index);
+                                        if locked {
+                                            continue;
+                                        }
+                                        has_unlocked = true;
+                                        any_unlocked_off |= !profile.enabled;
+                                    }
+                                    let (enable_key, enable) = if any_unlocked_off {
+                                        (Key::SrvEnableSelected, true)
+                                    } else {
+                                        (Key::SrvDisableSelected, false)
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            has_unlocked,
+                                            egui::Button::new(t(lang, enable_key)),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(ListAction::SetSelectionEnabled(enable));
+                                        ui.close();
+                                    }
+                                    if ui.button(t(lang, Key::SrvShare)).clicked() {
+                                        action = Some(ListAction::ExportSelection);
+                                        ui.close();
+                                    }
+                                    if ui.button(t(lang, Key::SrvDeleteEllipsis)).clicked() {
+                                        action = Some(ListAction::DeleteSelection);
+                                        ui.close();
+                                    }
+                                };
+                                // The name button fills its cell, so both it and the
+                                // row background open the context menu.
+                                if !probe_pending {
+                                    clicks.row.context_menu(|ui| menu(ui));
+                                    clicks.name.context_menu(|ui| menu(ui));
+                                }
+                            }
+                            // Below every laid-out row's midline the drop lands at
+                            // the band's end: the visible tail of a scrolled list, or
+                            // the empty space under a short one — only while the
+                            // lifted row's block owns that tail, and only when no row
+                            // already named the gap.
+                            if drag_pos.is_some()
+                                && !gap_decided
+                                && let Some(bottom) = last_row_bottom
+                                && droppable(display_rows.len())
+                            {
+                                drop_mark = Some((display_rows.len(), bottom + spacing * 0.5));
+                            }
+                            // The release ends the gesture: egui hands back the
+                            // lifted row's display index, and the drop lands it at the
+                            // proposed gap inside its own block. A release off the
+                            // rows proposed none, so it cancels — and so does a gap
+                            // another group's block owns, because the proposal half
+                            // already refused it. Escape aborts the payload before any
+                            // release is seen. The rows are a view of the stored list
+                            // — emitted and filtered — so the gap maps back through
+                            // the seed rows, never a raw profile or display index.
+                            if !probe_pending
+                                && let Some((gap, _)) = drop_mark
+                                && ui.input(|i| {
+                                    i.pointer.button_released(egui::PointerButton::Primary)
+                                })
+                                && let Some(lifted) =
+                                    egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
+                                && let Some(drop) = map_drop(lifted.0, gap)
+                            {
+                                action = Some(ListAction::MoveInGroup {
+                                    from: drop.from,
+                                    before: drop.before,
                                 });
                             }
-                        }
-                        // The row under the pointer proposes the gap: above
-                        // its midline inserts before it, below inserts after
-                        // it. Comparing midlines (not rects) leaves no dead
-                        // band in the rows' spacing. Only the lifted row's own
-                        // block proposes one, so a cross-block drop paints no
-                        // insertion line and cannot move a row.
-                        if let Some(pos) = drag_pos
-                            && !gap_decided
-                            && pos.y <= clicks.row.rect.center().y
-                        {
-                            gap_decided = true;
-                            if droppable(display) {
-                                drop_mark = Some((display, clicks.row.rect.top() - spacing * 0.5));
+                            // The insertion line paints over the rows, clamped into
+                            // the viewport so a band-edge drop stays visible.
+                            if let Some((_, y)) = drop_mark {
+                                let y = y.clamp(viewport.top() + 1.0, viewport.bottom() - 1.0);
+                                ui.painter().hline(
+                                    ui.max_rect().x_range(),
+                                    y,
+                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                );
                             }
-                        }
-                        last_row_bottom = Some(clicks.row.rect.bottom());
-                        // The menu clones the id only when an action is
-                        // actually clicked, so borrow the row's id instead of
-                        // cloning the 36-char String on every repaint. The
-                        // batch commands read the screen's selection, which the
-                        // menu replaces with this row when it opens on a row
-                        // outside it.
-                        let id = &p.id;
-                        let mut menu = |ui: &mut egui::Ui| {
-                            if !self.selection.contains(id.as_str()) {
-                                self.selection.clear();
-                                self.selection.insert(id.clone());
-                                self.selection_anchor = Some(id.clone());
-                            }
-                            if ui.button(t(lang, Key::SrvEdit)).clicked() {
-                                action = Some(ListAction::Edit(id.clone()));
-                                ui.close();
-                            }
-                            let set_active = ui.add_enabled(
-                                self.is_single_selection(id),
-                                egui::Button::new(t(lang, Key::SrvSetActive)),
-                            );
-                            if set_active.clicked() {
-                                action = Some(ListAction::SetActive(id.clone()));
-                                ui.close();
-                            }
-                            if ui.button(t(lang, Key::SrvDuplicate)).clicked() {
-                                action = Some(ListAction::Duplicate(id.clone()));
-                                ui.close();
-                            }
-                            if ui.button(t(lang, Key::TestLatency)).clicked() {
-                                action = Some(ListAction::ProbeLatency(id.clone()));
-                                ui.close();
-                            }
-                            // A copy is made of subscription rows only; a
-                            // manual row has nothing a refresh could take
-                            // away.
-                            let copyable = self.selection.iter().any(|selected| {
-                                profiles.iter().any(|profile| {
-                                    profile.id == *selected && profile.origin.is_some()
-                                })
-                            });
-                            if ui
-                                .add_enabled(
-                                    copyable,
-                                    egui::Button::new(t(lang, Key::SrvCopyToGroup)),
-                                )
-                                .clicked()
-                            {
-                                action = Some(ListAction::CopySelection);
-                                ui.close();
-                            }
-                            // One control for one state: the item offers the
-                            // switch the selection does not have yet. Locked
-                            // rows (the route and chain hops) are skipped by
-                            // the command, so they decide neither the label
-                            // nor whether the item can act.
-                            let mut has_unlocked = false;
-                            let mut any_unlocked_off = false;
-                            for (index, profile) in profiles.iter().enumerate() {
-                                if !self.selection.contains(&profile.id) {
-                                    continue;
+                            // Edge auto-scroll keeps rows beyond the band reachable
+                            // mid-drag: the wheel is inert while a widget is dragged.
+                            if let Some(pos) = drag_pos {
+                                let delta = drag_scroll_delta(
+                                    viewport,
+                                    pos,
+                                    ui.input(|i| i.stable_dt).min(0.1),
+                                );
+                                if delta != 0.0 {
+                                    ui.scroll_with_delta(egui::vec2(0.0, delta));
+                                    ui.ctx().request_repaint();
                                 }
-                                let locked = active_id.as_deref() == Some(profile.id.as_str())
-                                    || emitted.chain_only.contains(&index);
-                                if locked {
-                                    continue;
-                                }
-                                has_unlocked = true;
-                                any_unlocked_off |= !profile.enabled;
                             }
-                            let (enable_key, enable) = if any_unlocked_off {
-                                (Key::SrvEnableSelected, true)
-                            } else {
-                                (Key::SrvDisableSelected, false)
-                            };
-                            if ui
-                                .add_enabled(has_unlocked, egui::Button::new(t(lang, enable_key)))
-                                .clicked()
-                            {
-                                action = Some(ListAction::SetSelectionEnabled(enable));
-                                ui.close();
-                            }
-                            if ui.button(t(lang, Key::SrvShare)).clicked() {
-                                action = Some(ListAction::ExportSelection);
-                                ui.close();
-                            }
-                            if ui.button(t(lang, Key::SrvDeleteEllipsis)).clicked() {
-                                action = Some(ListAction::DeleteSelection);
-                                ui.close();
-                            }
-                        };
-                        // The name button fills its cell, so both it and the
-                        // row background open the context menu.
-                        if !probe_pending {
-                            clicks.row.context_menu(|ui| menu(ui));
-                            clicks.name.context_menu(|ui| menu(ui));
-                        }
-                    }
-                    // Below every laid-out row's midline the drop lands at
-                    // the band's end: the visible tail of a scrolled list, or
-                    // the empty space under a short one — only while the
-                    // lifted row's block owns that tail, and only when no row
-                    // already named the gap.
-                    if drag_pos.is_some()
-                        && !gap_decided
-                        && let Some(bottom) = last_row_bottom
-                        && droppable(display_rows.len())
-                    {
-                        drop_mark = Some((display_rows.len(), bottom + spacing * 0.5));
-                    }
-                    // The release ends the gesture: egui hands back the
-                    // lifted row's display index, and the drop lands it at the
-                    // proposed gap inside its own block. A release off the
-                    // rows proposed none, so it cancels — and so does a gap
-                    // another group's block owns, because the proposal half
-                    // already refused it. Escape aborts the payload before any
-                    // release is seen. The rows are a view of the stored list
-                    // — emitted and filtered — so the gap maps back through
-                    // the row it lands before, never a raw profile index.
-                    if !probe_pending
-                        && let Some((gap, _)) = drop_mark
-                        && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
-                        && let Some(lifted) = egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
-                        && let Some(drop) =
-                            block_drop(&display_rows, profiles, active_index, lifted.0, gap)
-                    {
-                        action = Some(ListAction::MoveInGroup {
-                            from: drop.from,
-                            before: drop.before,
+                            // The rows stopped short of the band's right edge; report
+                            // the full width so the overlay bar stays there instead of
+                            // following the shrunken content onto the controls.
+                            ui.expand_to_include_x(band_right);
                         });
-                    }
-                    // The insertion line paints over the rows, clamped into
-                    // the viewport so a band-edge drop stays visible.
-                    if let Some((_, y)) = drop_mark {
-                        let y = y.clamp(viewport.top() + 1.0, viewport.bottom() - 1.0);
-                        ui.painter().hline(
-                            ui.max_rect().x_range(),
-                            y,
-                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
-                        );
-                    }
-                    // Edge auto-scroll keeps rows beyond the band reachable
-                    // mid-drag: the wheel is inert while a widget is dragged.
-                    if let Some(pos) = drag_pos {
-                        let delta =
-                            drag_scroll_delta(viewport, pos, ui.input(|i| i.stable_dt).min(0.1));
-                        if delta != 0.0 {
-                            ui.scroll_with_delta(egui::vec2(0.0, delta));
-                            ui.ctx().request_repaint();
-                        }
-                    }
-                    // The rows stopped short of the band's right edge; report
-                    // the full width so the overlay bar stays there instead of
-                    // following the shrunken content onto the controls.
-                    ui.expand_to_include_x(band_right);
-                });
+                    // The rows own the horizontal scroll; the header is painted below
+                    // from this frame's offset, so no repaint is needed to sync them.
+                    rows.state.clamped_offset().x
+                }
+            })
+            .inner;
+
+        // The header, translated by the offset the rows just reported. The
+        // clip is the band, so a column scrolled out of view is neither drawn
+        // nor hit-tested over the rest of the screen.
+        let mut header_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("servers.header")
+                .max_rect(header_rect.translate(egui::vec2(-scroll_x, 0.0)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        header_ui.set_max_width(columns.total());
+        header_ui.set_clip_rect(header_rect.intersect(ui.clip_rect()));
+        let outcome = table_header(
+            &mut header_ui,
+            lang,
+            columns,
+            widths,
+            sortable,
+            self.view_sort,
+            &mut self.column_drag,
+        );
+        if outcome.fit && ctx.settings.server_table_columns.is_some() {
+            ctx.settings.server_table_columns = None;
+            ctx.hooks.mark_dirty();
+        } else if let Some(resized) = outcome.resized {
+            ctx.settings.server_table_columns = Some(resized);
+            ctx.hooks.mark_dirty();
+        }
+        if let Some(column) = outcome.sort {
+            self.view_sort = Some(next_view_sort(self.view_sort, column));
+            // The sort is a display preference: it saves with the other UI
+            // settings and never reaches the configuration pipeline.
+            ctx.settings.server_table_sort = self.view_sort;
+            ctx.hooks.mark_ui_dirty();
         }
 
         // A click in the empty band below a short list clears the selection.
@@ -5639,6 +5757,10 @@ struct RowState<'a> {
     /// The row is a chain hop: another outbound dials through it, so the row
     /// exists because of that reference. The paint marks it with a blue bar.
     hop: bool,
+    /// The labels of the emitted servers that dial through this row, in
+    /// emitted order. The latency hover names them; empty for a seed nothing
+    /// dials through.
+    dialers: &'a [String],
     /// The latency test owns the list: row clicks, drags, the menu and the
     /// switch are inert while it runs.
     frozen: bool,
@@ -5691,21 +5813,22 @@ const EMPTY_ROW_DETAIL: RowDetail = RowDetail {
     endpoint_hidden: false,
 };
 
-/// The widths a table starts from before the user drags a divider: the wide
-/// address column and the room a checkbox and a latency badge need. The name
-/// column takes the rest of the band, so the header and every row place the
+/// The widths a table starts from before the fit has run: the wide address
+/// column and the room a checkbox and a latency badge need. The fit lets the
+/// tag take the rest of the band, so the header and every row place the
 /// data columns at the same x every frame.
 const TABLE_DEFAULT_WIDTHS: ColumnWidths = ColumnWidths {
     order: 56.0,
     switch: 64.0,
     name: 0.0,
+    latency: 84.0,
     protocol: 128.0,
     address: 240.0,
-    latency: 84.0,
     group: 160.0,
 };
-/// The smallest width the name column keeps: a narrower band truncates the
-/// name rather than pushing the fixed columns past the viewport.
+/// The smallest width the tag column keeps; a fit or a drag may not go under
+/// it. The table scrolls sideways past the viewport, so the floor protects the
+/// header from collapsing, not the window from overflowing.
 const TABLE_MIN_NAME_WIDTH: f32 = 160.0;
 /// The height one row keeps. Dense enough that a hundred servers read as a
 /// list, not a form.
@@ -5722,30 +5845,34 @@ const TAB_STRIP_TO_TOOLBAR_GAP: f32 = 12.0;
 /// How wide the pointer's grab band on a column divider is.
 const TABLE_DIVIDER_HIT_WIDTH: f32 = 6.0;
 
-/// One column of the servers table, in draw order. Every column but the name
-/// stores its width; the name column takes what the table width leaves.
+/// One column of the servers table, in draw order: the tag and the value
+/// read beside it come before the detail columns. Every column stores its
+/// width; the fit lets the tag take the slack when the table is narrower than
+/// the viewport.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Column {
     Order,
     Switch,
     Name,
+    Latency,
     Protocol,
     Address,
-    Latency,
     Group,
 }
 
-/// The narrowest and widest each resizable column gets. The name column takes
-/// no maximum: it absorbs whatever the fixed columns do not use.
+/// The narrowest each resizable column gets. There is no maximum: a column
+/// holds whatever its content measures or the user drags, and a table wider
+/// than the viewport scrolls instead of truncating. The tag column keeps its
+/// floor, because a tag narrower than that reads as a rule, not a column.
 fn column_bounds(column: Column) -> (f32, f32) {
     match column {
         Column::Order => (40.0, 96.0),
         Column::Switch => (48.0, 96.0),
         Column::Name => (TABLE_MIN_NAME_WIDTH, f32::INFINITY),
-        Column::Protocol => (80.0, 280.0),
-        Column::Address => (120.0, 480.0),
-        Column::Latency => (64.0, 140.0),
-        Column::Group => (80.0, 320.0),
+        Column::Latency => (64.0, f32::INFINITY),
+        Column::Protocol => (80.0, f32::INFINITY),
+        Column::Address => (120.0, f32::INFINITY),
+        Column::Group => (80.0, f32::INFINITY),
     }
 }
 
@@ -5783,9 +5910,9 @@ fn sanitized_widths(widths: ColumnWidths) -> ColumnWidths {
         Column::Order,
         Column::Switch,
         Column::Name,
+        Column::Latency,
         Column::Protocol,
         Column::Address,
-        Column::Latency,
         Column::Group,
     ] {
         let (low, high) = column_bounds(column);
@@ -5837,48 +5964,37 @@ struct TableColumns {
     order: Option<f32>,
     switch: f32,
     name: f32,
+    latency: f32,
     protocol: f32,
     address: f32,
-    latency: f32,
     group: Option<f32>,
 }
 
-fn table_columns(
-    available: f32,
-    shape: TableShape,
-    widths: ColumnWidths,
-    flex_name: bool,
-) -> TableColumns {
+fn table_columns(shape: TableShape, widths: ColumnWidths) -> TableColumns {
     let order = shape.order.then_some(widths.order);
     let group = shape.group.then_some(widths.group);
-    let fixed = widths.switch
-        + widths.protocol
-        + widths.address
-        + widths.latency
-        + order.unwrap_or(0.0)
-        + group.unwrap_or(0.0);
-    let name = if flex_name {
-        (available - fixed).max(TABLE_MIN_NAME_WIDTH)
-    } else {
-        widths.name.max(TABLE_MIN_NAME_WIDTH)
-    };
     TableColumns {
         order,
         switch: widths.switch,
-        name,
+        name: widths.name.max(TABLE_MIN_NAME_WIDTH),
+        latency: widths.latency,
         protocol: widths.protocol,
         address: widths.address,
-        latency: widths.latency,
         group,
     }
 }
 
 /// Fit each column to the wider of its header and its widest cell, so the
-/// adaptive layout never clips a value it could hold. Measured from the same
-/// strings the rows paint, once per model generation rather than per frame.
+/// fitted layout never clips a value it could hold: the widths are the
+/// measurements themselves, floored at each column's minimum and capped at
+/// nothing. The tag column is measured like any other; the table gives it
+/// the slack when the fit is narrower than the viewport. Measured from the
+/// same strings the rows paint, once per model generation rather than per
+/// frame.
 fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> ColumnWidths {
     let body = egui::TextStyle::Body.resolve(ui.style());
     let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let button = egui::TextStyle::Button.resolve(ui.style());
     let measure = |text: &str, font: &egui::FontId| {
         ui.painter()
             .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
@@ -5893,10 +6009,10 @@ fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> Colu
     let mut widths = ColumnWidths {
         order: header(t(lang, Key::SrvColOrder), false),
         switch: header(t(lang, Key::SrvColEnabled), false),
-        name: 0.0,
+        name: header(t(lang, Key::SrvColName), true),
+        latency: header(t(lang, Key::SrvColLatency), true),
         protocol: header(t(lang, Key::SrvColProtocol), true),
         address: header(t(lang, Key::SrvColAddress), false),
-        latency: header(t(lang, Key::SrvColLatency), true),
         group: header(t(lang, Key::SrvColGroup), false),
     };
     // The latency column shows a result, a timeout or nothing: its widest
@@ -5910,6 +6026,14 @@ fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> Colu
     }
     for (index, profile) in servers.profiles.iter().enumerate() {
         widths.order = widths.order.max(cell(&(index + 1).to_string(), &body));
+        // The tag cell paints the unnamed fallback for an empty name, and its
+        // button's own text style is what the column must hold.
+        let name = if profile.name.is_empty() {
+            t(lang, Key::SrvUnnamed)
+        } else {
+            profile.name.as_str()
+        };
+        widths.name = widths.name.max(cell(name, &button));
         widths.protocol = widths
             .protocol
             .max(cell(&row_detail(profile, false).protocol, &body));
@@ -5924,41 +6048,29 @@ fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> Colu
     sanitized_widths(widths)
 }
 
-/// One drag step on the divider between `left` and `right`: the column on the
-/// left grows by `dx` and the one on its right gives the width up, so the
-/// divider follows the pointer and the table keeps its total width. A drag
-/// that starts from the adaptive fit freezes the name column at the width it
-/// has on screen.
-fn drag_divider(
-    widths: ColumnWidths,
-    columns: TableColumns,
-    left: Column,
-    right: Column,
-    dx: f32,
-) -> Option<ColumnWidths> {
-    let mut next = widths;
-    next.name = columns.name;
-    let left_width = stored_width(next, left)?;
-    let right_width = stored_width(next, right)?;
-    let left_min_max = column_bounds(left);
-    let right_min_max = column_bounds(right);
-    let (left_min, left_max) = left_min_max;
-    let (right_min, right_max) = right_min_max;
-    // The left column takes the drag, the right one hands the width over. A
-    // floor on either side hands the remainder back, so a drag stopping at a
-    // bound does not jump.
-    let left_first = (left_width + dx).clamp(left_min, left_max) - left_width;
-    let right_first = (right_width - left_first).clamp(right_min, right_max);
-    let right_shift = right_width - right_first;
-    let proposed_left = (left_width + right_shift).clamp(left_min, left_max);
-    let left_shift = proposed_left - left_width;
-    let proposed_right = (right_width - left_shift).clamp(right_min, right_max);
-    if left_shift.abs() < 0.01 && (proposed_right - right_width).abs() < 0.01 {
-        return None;
-    }
-    set_stored_width(&mut next, left, proposed_left);
-    set_stored_width(&mut next, right, proposed_right);
-    Some(next)
+/// One step of a divider drag: the column on the left of the divider takes
+/// the pointer's movement since the press, and nothing else moves. The
+/// table's total changes with it, its neighbour keeps its width, and only
+/// the dragged column's own minimum stops the drag.
+fn drag_divider(widths: ColumnWidths, column: Column, dx: f32) -> ColumnWidths {
+    let Some(current) = stored_width(widths, column) else {
+        return widths;
+    };
+    let (low, high) = column_bounds(column);
+    let next = (current + dx).clamp(low, high);
+    let mut next_widths = widths;
+    set_stored_width(&mut next_widths, column, next);
+    next_widths
+}
+
+/// The widths a divider drag starts from: every stored width as it stood at
+/// the press, with the tag column frozen at the width it had on screen. The
+/// fit lets the tag take the slack, so a drag that starts from the fit must
+/// capture that width before the first stored layout replaces it.
+fn frozen_widths(widths: ColumnWidths, columns: TableColumns) -> ColumnWidths {
+    let mut frozen = widths;
+    frozen.name = columns.name;
+    frozen
 }
 
 impl TableColumns {
@@ -5969,21 +6081,11 @@ impl TableColumns {
         self.order.unwrap_or(0.0)
             + self.switch
             + self.name
+            + self.latency
             + self.protocol
             + self.address
-            + self.latency
             + self.group.unwrap_or(0.0)
     }
-}
-
-/// The width a floating scroll bar overlaps in the table's band: a vertical
-/// `ScrollArea` shrinks horizontally to its content and the bar hugs that
-/// edge, reserving no space of its own (`ScrollStyle::allocated_width` is
-/// zero by default). The header and the rows reserve the same overlap, or the
-/// columns would shift between them once the list scrolls.
-fn scrollbar_inset(style: &egui::Style) -> f32 {
-    let scroll = style.spacing.scroll;
-    (scroll.bar_width - scroll.allocated_width()).max(0.0)
 }
 
 /// One table cell: exactly `width` points wide and one control row tall,
@@ -5995,8 +6097,8 @@ fn scrollbar_inset(style: &egui::Style) -> f32 {
 /// shift every column after it by however much that content fell short, per
 /// row and per frame: the header and the rows would disagree on where each
 /// column starts.
-fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    let (rect, _) =
+fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, TABLE_ROW_HEIGHT), egui::Sense::hover());
     let inset = TABLE_CELL_INSET.min(width / 2.0);
     let content = rect.shrink2(egui::vec2(inset, 0.0));
@@ -6007,6 +6109,7 @@ fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     );
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     add(&mut child);
+    response
 }
 
 /// What the table header reported this frame: a sort command, the widths
@@ -6018,13 +6121,24 @@ struct HeaderOutcome {
     fit: bool,
 }
 
+/// The widths one divider drag works from: the divider the pointer grabbed
+/// and the widths the press found. The drag applies the pointer's movement
+/// since the press to this anchor, so every frame lays out the same width
+/// plus one total movement instead of compounding the last frame's stored
+/// result.
+#[derive(Clone, Copy)]
+struct ColumnDrag {
+    divider: usize,
+    widths: ColumnWidths,
+}
+
 /// The table's header row: the tab's columns, and — where the tab is a view —
-/// name, protocol and latency as sort controls. `Emitted`'s order is the
+/// name, latency and protocol as sort controls. `Emitted`'s order is the
 /// outbound order, so its header never offers a sort.
 ///
-/// The dividers between columns are drag handles: a drag trades width between
-/// that column and the flexible name column, and a double click asks for the
-/// adaptive widths back.
+/// The dividers between columns are drag handles: a drag resizes the column
+/// on its left and lets the table's total change, and a double click asks
+/// for the fitted widths back. `drag` carries the anchor across frames.
 fn table_header(
     ui: &mut egui::Ui,
     lang: Language,
@@ -6032,6 +6146,7 @@ fn table_header(
     widths: ColumnWidths,
     sortable: bool,
     sort: Option<ViewSort>,
+    drag: &mut Option<ColumnDrag>,
 ) -> HeaderOutcome {
     let weak = |ui: &mut egui::Ui, text: &str| {
         ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
@@ -6091,6 +6206,13 @@ fn table_header(
         );
         column_header(
             ui,
+            t(lang, Key::SrvColLatency),
+            Some(SortColumn::Latency),
+            columns.latency,
+            true,
+        );
+        column_header(
+            ui,
             t(lang, Key::SrvColProtocol),
             Some(SortColumn::Protocol),
             columns.protocol,
@@ -6102,13 +6224,6 @@ fn table_header(
             None,
             columns.address,
             false,
-        );
-        column_header(
-            ui,
-            t(lang, Key::SrvColLatency),
-            Some(SortColumn::Latency),
-            columns.latency,
-            true,
         );
         if let Some(width) = columns.group {
             column_header(ui, t(lang, Key::SrvColGroup), None, width, false);
@@ -6126,9 +6241,9 @@ fn table_header(
         (Column::Order, columns.order),
         (Column::Switch, Some(columns.switch)),
         (Column::Name, Some(columns.name)),
+        (Column::Latency, Some(columns.latency)),
         (Column::Protocol, Some(columns.protocol)),
         (Column::Address, Some(columns.address)),
-        (Column::Latency, Some(columns.latency)),
         (Column::Group, columns.group),
     ] {
         if let Some(width) = width {
@@ -6137,8 +6252,7 @@ fn table_header(
         }
     }
     let mut x = band.left();
-    for index in 0..count.saturating_sub(1) {
-        let (left, width) = spans[index];
+    for (index, &(left, width)) in spans[..count.saturating_sub(1)].iter().enumerate() {
         x += width;
         let hit = egui::Rect::from_min_max(
             egui::pos2(x - TABLE_DIVIDER_HIT_WIDTH / 2.0, band.top()),
@@ -6149,25 +6263,45 @@ fn table_header(
             ui.auto_id_with(("servers.column-divider", index)),
             egui::Sense::click_and_drag(),
         );
-        if response.hovered() || response.dragged() {
+        let hot = response.hovered() || response.dragged();
+        // Every column edge is visible, faintly: a target that only appears
+        // on hover is invisible on an empty stretch of header, which is
+        // exactly where a wide tag leaves its divider.
+        ui.painter().vline(
+            x,
+            band.y_range(),
+            egui::Stroke::new(
+                1.0,
+                if hot {
+                    ui.visuals().widgets.inactive.bg_stroke.color
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_stroke.color
+                },
+            ),
+        );
+        if hot {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            ui.painter().vline(
-                x,
-                band.y_range(),
-                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-            );
         }
         if response.double_clicked() {
             outcome.fit = true;
         }
-        if response.dragged() {
-            outcome.resized = drag_divider(
-                widths,
-                columns,
-                left,
-                spans[index + 1].0,
-                response.drag_delta().x,
-            );
+        if response.drag_started() {
+            *drag = Some(ColumnDrag {
+                divider: index,
+                widths: frozen_widths(widths, columns),
+            });
+        }
+        if response.dragged()
+            && let Some(anchor) = (*drag).filter(|anchor| anchor.divider == index)
+        {
+            // The movement since the press, applied once to the widths the
+            // press found — never the per-frame step applied to last frame's
+            // stored widths, which drifts as soon as a frame is skipped.
+            let dx = response.total_drag_delta().map_or(0.0, |total| total.x);
+            outcome.resized = Some(drag_divider(anchor.widths, left, dx));
+        }
+        if response.drag_stopped() {
+            *drag = None;
         }
     }
     outcome
@@ -6177,8 +6311,12 @@ fn table_header(
 /// drawn. An index and not the profile id, because a cloned id would allocate
 /// per row; the release reads the payload in the same frame that laid the
 /// list out, so the index still names that row. Only the `Emitted` tab lifts
-/// rows, and only a row that is not the active server: the drag rewrites that
-/// row's own group order, which is the only order the list stores.
+/// rows, and only a row that is neither the active server nor a chain hop:
+/// the active row is pinned first by the generated order, and a hop's slot is
+/// a consequence of another row's chain, while the drag rewrites that row's
+/// own group order — the only order the list stores. The drop half reads the
+/// display list with the hop rows left out, so the payload index maps to its
+/// seed position before the block algorithm sees it.
 ///
 /// The row's own response is the drag source — it hands egui the payload
 /// through [`egui::DragAndDrop::set_payload`] — instead of
@@ -6218,10 +6356,11 @@ struct BlockDrop {
 }
 
 /// Map a drop on the `Emitted` list to a move inside the dragged row's own
-/// group block. `rows` is the list as drawn (profile indices), `from` and
-/// `gap` index that list the way [`reorder_target`] reads them, and `active`
-/// is the profile the generated order pins first — that row is a block of its
-/// own and accepts no drop.
+/// group block. `rows` is the list as drawn with the hop rows left out — a
+/// hop is a consequence of the chain, not a place in its group — as profile
+/// indices, `from` and `gap` index that list the way [`reorder_target`] reads
+/// them, and `active` is the profile the generated order pins first — that
+/// row is a block of its own and accepts no drop.
 ///
 /// A gap whose neighbours are both another group's rows yields `None`, so a
 /// drop outside the row's block neither paints an insertion line nor changes
@@ -6466,15 +6605,16 @@ fn subscription_bind_address(
 }
 
 /// One row of the servers table: the order number (on `Emitted`), the active
-/// marker, the switch, the name, the protocol-and-security column, the
-/// `address:port` column and the latency column, in that order. Returns the
+/// marker, the switch, the name, the latency column, the
+/// protocol-and-security column, the `address:port` column and the tab's
+/// group column, in that order. Returns the
 /// row [`egui::Response`] (click, right-click and drag anywhere on the row),
 /// the name button's response (it must be treated as a select target too), and
 /// whether the switch was clicked.
 ///
 /// The name is a truncated selectable button inside its own cell, so an
 /// over-long name ends in "…" at the column boundary instead of painting over
-/// the protocol or address column. The row's interaction is registered by the
+/// the latency or address column. The row's interaction is registered by the
 /// surrounding `ui.horizontal` after the cells, so the switch's own click
 /// wins; every other click, double-click, right-click and drag lands on the
 /// row.
@@ -6559,6 +6699,35 @@ fn server_list_row(
         });
         let toggled = checked != row.switch.checked;
         let name_resp = table_cell_button(ui, columns.name, lang, name, row.frozen);
+        let latency_cell = table_cell(ui, columns.latency, |ui| {
+            // The badge text/color come from the row's memoized
+            // [`LatencyBadge`] — borrowed, never re-formatted per painted row.
+            // Not selectable: `interaction.selectable_labels` defaults to
+            // true, and a click-sensing label would sit on top of the row's
+            // click target, making the latency area unclickable. Values align
+            // right so the digits read as a column; an unmeasured row paints
+            // nothing, which is why the badge text is empty then.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(latency.text.as_str()).color(latency.color))
+                        .selectable(false),
+                );
+            });
+        });
+        // The hover belongs to the whole cell, not the text: a hop with no
+        // measurement paints an empty badge and must still explain itself.
+        // Both lines are composed when the tooltip opens, so an idle frame
+        // allocates nothing.
+        if verdict.is_some() || !row.dialers.is_empty() {
+            latency_cell.on_hover_ui(|ui| {
+                if let Some(verdict) = verdict {
+                    ui.label(verdict_hover(lang, verdict));
+                }
+                if !row.dialers.is_empty() {
+                    ui.label(t_fmt(lang, Key::SrvDialedBy, &[&row.dialers.join(", ")]));
+                }
+            });
+        }
         table_cell(ui, columns.protocol, |ui| {
             ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
         });
@@ -6580,26 +6749,6 @@ fn server_list_row(
                     response.on_hover_text(detail.endpoint.as_str());
                 }
             }
-        });
-        table_cell(ui, columns.latency, |ui| {
-            // The badge text/color come from the row's memoized
-            // [`LatencyBadge`] — borrowed, never re-formatted per painted row.
-            // Not selectable: `interaction.selectable_labels` defaults to
-            // true, and a click-sensing label would sit on top of the row's
-            // click target, making the latency area unclickable. Values align
-            // right so the digits read as a column; an unmeasured row paints
-            // nothing, which is why the badge text is empty then.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let response = ui.add(
-                    egui::Label::new(RichText::new(latency.text.as_str()).color(latency.color))
-                        .selectable(false),
-                );
-                if let Some(verdict) = verdict {
-                    response.on_hover_ui(|ui| {
-                        ui.label(verdict_hover(lang, verdict));
-                    });
-                }
-            });
         });
         if let (Some(width), Some(group)) = (columns.group, extras.group) {
             table_cell(ui, width, |ui| {
@@ -11056,11 +11205,11 @@ mod tests {
         LatencyBadge, LeaveAction, ProfileDraft, RawField, Request, RowCells, RowDetail, RowExtras,
         RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab,
         ServersScreen, StatusLine, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
-        TransportTabCtx, basic_tab_inline_verdict, drag_divider, drag_scroll_delta,
+        TransportTabCtx, basic_tab_inline_verdict, column_bounds, drag_divider, drag_scroll_delta,
         ech_sockopt_editor, editor_validation_findings, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
-        server_list_row, status_colors_of, status_toast_expired, tab_order, table_columns,
-        xmux_section,
+        finalmask_udp_settings_editor, fingerprint_allowed, frozen_widths, mux_tab, noises_editor,
+        reorder_target, sanitized_widths, server_list_row, status_colors_of, status_toast_expired,
+        tab_order, table_columns, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -12701,8 +12850,8 @@ Authentication: ML-KEM-768, Post-Quantum
             "search must sit at the toolbar's end, on the right of its commands"
         );
 
-        // The table names its columns: switch, name, protocol,
-        // address:port and latency.
+        // The table names its columns: switch, name, latency, protocol,
+        // address:port.
         for header in [
             t(Language::En, Key::SrvColEnabled),
             t(Language::En, Key::SrvColName),
@@ -12724,8 +12873,8 @@ Authentication: ML-KEM-768, Post-Quantum
             "no editor may occupy the screen when nothing is edited"
         );
 
-        // The emitted table's columns run order → switch → name, one x per
-        // column.
+        // The emitted table's columns run order → switch → name → latency →
+        // protocol → address, one x per column.
         let x = |label: &str| {
             harness
                 .query_all_by_label(label)
@@ -12735,8 +12884,20 @@ Authentication: ML-KEM-768, Post-Quantum
                 .center()
                 .x
         };
-        assert!(x(t(Language::En, Key::SrvColOrder)) < x(t(Language::En, Key::SrvColEnabled)));
-        assert!(x(t(Language::En, Key::SrvColEnabled)) < x(t(Language::En, Key::SrvColName)));
+        for pair in [
+            (Key::SrvColOrder, Key::SrvColEnabled),
+            (Key::SrvColEnabled, Key::SrvColName),
+            (Key::SrvColName, Key::SrvColLatency),
+            (Key::SrvColLatency, Key::SrvColProtocol),
+            (Key::SrvColProtocol, Key::SrvColAddress),
+        ] {
+            assert!(
+                x(t(Language::En, pair.0)) < x(t(Language::En, pair.1)),
+                "{:?} must sit left of {:?}",
+                t(Language::En, pair.0),
+                t(Language::En, pair.1),
+            );
+        }
 
         // A plain click only selects the row: the editor window stays shut.
         // (The disabled fixture is listed on `All`; `Emitted` carries only
@@ -12941,68 +13102,88 @@ Authentication: ML-KEM-768, Post-Quantum
             (header - switch).abs() < 0.5,
             "the switch must sit on its column header's x ({switch} vs {header})"
         );
+
+        // The latency column sits between the tag and the protocol, so its
+        // header and value end left of where the protocol column starts.
+        let latency_end = right(&harness, t(Language::En, Key::SrvColLatency));
+        let protocol_start = left(&harness, t(Language::En, Key::SrvColProtocol));
+        assert!(
+            latency_end <= protocol_start,
+            "the latency column must end left of the protocol column ({latency_end} vs {protocol_start})"
+        );
     }
 
-    /// A divider drag trades width between the two columns it sits between,
-    /// so the divider follows the pointer; the name column is stored too, and
-    /// a drag that starts from the adaptive fit freezes it at the width the
-    /// fit gave it.
+    /// A divider drag resizes the column on its left by the pointer's whole
+    /// movement and moves nothing else: the neighbour keeps its width and
+    /// the table's total absorbs the change.
     #[test]
-    fn dragging_a_column_divider_trades_width_between_neighbours() {
+    fn dragging_a_column_divider_resizes_only_its_left_column() {
         let widths = ColumnWidths {
             name: 400.0,
             ..TABLE_DEFAULT_WIDTHS
         };
-        let columns = table_columns(900.0, TableShape::default(), widths, false);
-        let resized = drag_divider(widths, columns, Column::Protocol, Column::Address, 20.0)
-            .expect("a small drag stays inside the column bounds");
+        let columns = table_columns(TableShape::default(), widths);
+        let resized = drag_divider(widths, Column::Protocol, 20.0);
         assert!((resized.protocol - (widths.protocol + 20.0)).abs() < 0.01);
-        assert!((resized.address - (widths.address - 20.0)).abs() < 0.01);
         assert!(
-            (resized.name - widths.name).abs() < 0.01,
-            "a drag between two columns must leave the name column alone"
+            (resized.address - widths.address).abs() < 0.01
+                && (resized.latency - widths.latency).abs() < 0.01
+                && (resized.name - widths.name).abs() < 0.01,
+            "a drag must leave every other column's width alone"
         );
-        let after = table_columns(900.0, TableShape::default(), resized, false);
+        let after = table_columns(TableShape::default(), resized);
         assert!(
             (after.protocol - (columns.protocol + 20.0)).abs() < 0.01,
             "the protocol column must widen by the dragged distance"
         );
+        assert!(
+            (after.total() - (columns.total() + 20.0)).abs() < 0.01,
+            "the table's total must grow with the dragged column"
+        );
 
-        // The divider on the name column's right edge widens the name.
-        let resized = drag_divider(widths, columns, Column::Name, Column::Protocol, 20.0)
-            .expect("the name column takes width from the protocol column");
+        // The divider on the name column's right edge resizes the tag alone.
+        let resized = drag_divider(widths, Column::Name, 20.0);
         assert!((resized.name - (widths.name + 20.0)).abs() < 0.01);
-        assert!((resized.protocol - (widths.protocol - 20.0)).abs() < 0.01);
+        assert!((resized.protocol - widths.protocol).abs() < 0.01);
 
-        // A drag that starts from the fit stores the fitted columns and the
-        // name width the fit gave it.
+        // A drag that starts from the fit freezes the tag at the on-screen
+        // width the fit gave it, so the stored object carries a real tag
+        // width from the very first drag.
         let fitted = ColumnWidths {
             name: 0.0,
             ..TABLE_DEFAULT_WIDTHS
         };
-        let flex = table_columns(900.0, TableShape::default(), fitted, true);
-        let resized = drag_divider(fitted, flex, Column::Protocol, Column::Address, 12.0)
-            .expect("a drag from the fit is stored");
+        let flex = table_columns(TableShape::default(), fitted);
+        let anchor = frozen_widths(fitted, flex);
+        assert!((anchor.name - flex.name).abs() < 0.01);
+        let resized = drag_divider(anchor, Column::Protocol, 12.0);
         assert!(
             (resized.name - flex.name).abs() < 0.01,
-            "the fit's name width must be frozen by the first drag"
+            "the fit's tag width must be frozen by the first drag"
         );
     }
 
-    /// A drag stops at a column's floor instead of squeezing it out of
-    /// existence.
+    /// A drag stops at the dragged column's floor instead of squeezing it out
+    /// of existence, and the column beside it keeps its width.
     #[test]
     fn a_drag_stops_at_a_columns_floor() {
         let widths = ColumnWidths {
             address: 120.0,
             ..TABLE_DEFAULT_WIDTHS
         };
-        let columns = table_columns(900.0, TableShape::default(), widths, false);
+        let columns = table_columns(TableShape::default(), widths);
         assert_eq!(columns.address, 120.0);
-        assert_eq!(
-            drag_divider(widths, columns, Column::Protocol, Column::Address, 10.0),
-            None,
+        let unchanged = drag_divider(widths, Column::Address, -10.0);
+        assert!(
+            (unchanged.address - 120.0).abs() < 0.01,
             "the address column must not shrink below its floor"
+        );
+        // A drag far past the floor lands on it rather than overshooting.
+        let resized = drag_divider(widths, Column::Protocol, -10_000.0);
+        assert!((resized.protocol - column_bounds(Column::Protocol).0).abs() < 0.01);
+        assert!(
+            (resized.address - widths.address).abs() < 0.01,
+            "the neighbour must keep its width when the drag hits a floor"
         );
     }
 
@@ -13036,10 +13217,198 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
-    /// A drag on a header divider moves the columns after it and stores the
-    /// widths the user chose, so the next frame lays the table out from them.
+    /// A widths object stored before the column move loads by column name and
+    /// applies as stored: the move reorders the display, never the fields.
     #[test]
-    fn dragging_a_divider_shifts_the_columns_and_stores_the_widths() {
+    fn a_stored_widths_object_loads_and_applies_unchanged() {
+        let settings: crate::model::Settings = serde_json::from_str(
+            r#"{"serverTableColumns":{"order":56,"switch":64,"name":400,
+                "protocol":128,"address":240,"latency":84,"group":160}}"#,
+        )
+        .expect("a stored widths object must load");
+        let stored = settings
+            .server_table_columns
+            .expect("the stored widths must load as widths");
+        assert_eq!(
+            stored,
+            ColumnWidths {
+                order: 56.0,
+                switch: 64.0,
+                name: 400.0,
+                protocol: 128.0,
+                address: 240.0,
+                latency: 84.0,
+                group: 160.0,
+            }
+        );
+        assert_eq!(
+            sanitized_widths(stored),
+            stored,
+            "a stored widths object must apply without migration"
+        );
+    }
+
+    /// The table is not clamped to the window: a stored layout wider than the
+    /// viewport lays out past its right edge, so the last column lives beyond
+    /// the window and the horizontal scrollbar is what reaches it.
+    #[test]
+    fn a_table_wider_than_the_viewport_lays_out_past_it() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        rig.settings.server_table_columns = Some(ColumnWidths {
+            order: 56.0,
+            switch: 64.0,
+            name: 240.0,
+            latency: 84.0,
+            protocol: 200.0,
+            address: 720.0,
+            group: 160.0,
+        });
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+        let address = harness
+            .query_all_by_label(t(Language::En, Key::SrvColAddress))
+            .next()
+            .expect("the table renders its Address header")
+            .rect();
+        let group = harness
+            .query_all_by_label(t(Language::En, Key::SrvColGroup))
+            .next()
+            .expect("the wide table still lays its last column out")
+            .rect();
+        assert!(
+            (group.left() - address.left() - 720.0).abs() < 2.0,
+            "the address column must hold the width it was given ({:.1})",
+            group.left() - address.left()
+        );
+        assert!(
+            group.left() > DEFAULT_TEST_VIEWPORT.x,
+            "the table must lay out past the viewport (last column at {:.1})",
+            group.left()
+        );
+    }
+
+    /// `Fit columns` measures the tag like every other column and sets the
+    /// measured widths exactly: a long hostname gets its full width (well past
+    /// the old 480-point cap), and a column stored wider than its content
+    /// shrinks back to the content on the same command.
+    #[test]
+    fn fit_columns_gives_a_long_address_its_measured_width_and_shrinks_back() {
+        let host = "edge-router-with-a-really-long-name-01.department.example.com";
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Vless));
+        let ProtocolSettings::Vless(settings) = &mut tokyo.outbound.settings else {
+            unreachable!("Vless is the default protocol");
+        };
+        settings.address = host.into();
+        settings.port = 8443;
+        rig.servers.profiles.push(tokyo);
+        // Stored wider than the address measures: the fit must shrink it.
+        rig.settings.server_table_columns = Some(ColumnWidths {
+            order: 56.0,
+            switch: 64.0,
+            name: 240.0,
+            latency: 84.0,
+            protocol: 200.0,
+            address: 1200.0,
+            group: 160.0,
+        });
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+
+        let column_width = |harness: &Harness<'static, (ServersScreen, UiTestRig)>| {
+            let left = |label: &str| {
+                harness
+                    .query_all_by_label(label)
+                    .next()
+                    .unwrap_or_else(|| panic!("the table must render the {label:?} header"))
+                    .rect()
+                    .left()
+            };
+            left(t(Language::En, Key::SrvColGroup)) - left(t(Language::En, Key::SrvColAddress))
+        };
+        assert!(
+            (column_width(&harness) - 1200.0).abs() < 2.0,
+            "the stored width must be laid out as stored"
+        );
+
+        let endpoint = harness.state().1.servers.profiles[0]
+            .server_address()
+            .expect("the profile has an address");
+        harness
+            .get_by_label(t(Language::En, Key::SrvFitColumns))
+            .click();
+        harness.run();
+
+        let style = harness.ctx.style_of(egui::Theme::Dark);
+        let font = egui::TextStyle::Monospace.resolve(&style);
+        let measured = harness.ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(endpoint.clone(), font, egui::Color32::WHITE)
+                .size()
+                .x
+        }) + 2.0 * TABLE_CELL_INSET;
+        assert!(
+            measured > 480.0,
+            "the fixture must measure past the old content cap ({measured:.1})"
+        );
+        let fitted = column_width(&harness);
+        assert!(
+            (fitted - measured).abs() < 1.5,
+            "the fitted address must hold its measured text width ({fitted:.1} vs {measured:.1})"
+        );
+        assert!(
+            harness.state().1.settings.server_table_columns.is_none(),
+            "Fit columns must clear the stored widths it replaces"
+        );
+    }
+
+    /// The fit leaves the tag at its measured width; the width the viewport
+    /// has left over stays after the table instead of stretching the tag.
+    #[test]
+    fn fit_columns_leaves_the_spare_width_after_the_table() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+
+        // The fit measures every column; the tag no longer absorbs what the
+        // viewport has left, so the table ends before the right edge and the
+        // empty band sits after it instead of between the tag and latency.
+        let address_right = harness
+            .query_all_by_label(t(Language::En, Key::SrvColAddress))
+            .next()
+            .expect("the table must render its Address header")
+            .rect()
+            .right();
+        let viewport = harness.ctx.input(|i| i.viewport_rect().right());
+        assert!(
+            viewport - address_right > 40.0,
+            "the spare width must stay to the right of the table ({:.1})",
+            viewport - address_right
+        );
+    }
+
+    /// A drag on a header divider follows the pointer and resizes only the
+    /// column left of it: the address column shifts by the whole dragged
+    /// distance while its own width, and the protocol column's start, stay
+    /// where they were.
+    #[test]
+    fn dragging_a_divider_moves_the_target_column_and_leaves_the_neighbour_alone() {
         let mut rig = UiTestRig::default();
         let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Vless));
         let ProtocolSettings::Vless(settings) = &mut tokyo.outbound.settings else {
@@ -13050,37 +13419,84 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.profiles.push(tokyo);
         let mut harness = wide_table_harness(rig);
         harness.run();
-        let header = harness
-            .query_all_by_label(t(Language::En, Key::SrvColAddress))
-            .next()
-            .expect("the table renders its Address header")
-            .rect();
+        // The `All` tab carries the group column, the address column's right
+        // edge, so the address width can be read from the header band.
+        harness
+            .get_by_label(t(Language::En, Key::SrvTabAll))
+            .click();
+        harness.run();
+
+        let rect_of = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness
+                .query_all_by_label(label)
+                .next()
+                .unwrap_or_else(|| panic!("the table must render the {label:?} header"))
+                .rect()
+        };
+        let address = rect_of(&harness, t(Language::En, Key::SrvColAddress));
+        let protocol = rect_of(&harness, t(Language::En, Key::SrvColProtocol));
+        let group = rect_of(&harness, t(Language::En, Key::SrvColGroup));
+        let address_width = group.left() - address.left();
+        let protocol_width = address.left() - protocol.left();
         // The divider before the address column sits one cell inset left of
         // the header's text.
-        let divider = egui::pos2(header.left() - TABLE_CELL_INSET, header.center().y);
+        let divider = egui::pos2(address.left() - TABLE_CELL_INSET, address.center().y);
         harness.hover_at(divider);
         harness.step();
         harness.drag_at(divider);
         harness.step();
-        harness.hover_at(divider + egui::vec2(10.0, 0.0));
+        // Two moves of ten points: the drag follows the pointer's total
+        // movement, so the column lands twenty points wider, not ten.
+        for step in 1..=2 {
+            let pos = divider + egui::vec2(10.0 * step as f32, 0.0);
+            harness.hover_at(pos);
+            harness.step();
+        }
+        // A frame where the pointer does not move adds nothing: the layout
+        // comes from the press, not from an accumulation of frames.
+        harness.hover_at(divider + egui::vec2(20.0, 0.0));
         harness.step();
-        harness.drop_at(divider + egui::vec2(10.0, 0.0));
+        let held = rect_of(&harness, t(Language::En, Key::SrvColAddress));
+        assert!(
+            (held.left() - address.left() - 20.0).abs() < 2.0,
+            "a motionless frame must not move the column again (moved {:.1})",
+            held.left() - address.left()
+        );
+        harness.drop_at(divider + egui::vec2(20.0, 0.0));
         harness.step();
 
-        let moved = harness
-            .query_all_by_label(t(Language::En, Key::SrvColAddress))
-            .next()
-            .expect("the table renders its Address header")
-            .rect()
-            .left();
+        let moved = rect_of(&harness, t(Language::En, Key::SrvColAddress));
+        let moved_protocol = rect_of(&harness, t(Language::En, Key::SrvColProtocol));
+        let moved_group = rect_of(&harness, t(Language::En, Key::SrvColGroup));
         assert!(
-            (moved - header.left() - 10.0).abs() < 2.0,
-            "the protocol column must widen by the dragged distance (moved {:.1})",
-            moved - header.left()
+            (moved.left() - address.left() - 20.0).abs() < 2.0,
+            "the address column must follow the pointer (moved {:.1})",
+            moved.left() - address.left()
         );
         assert!(
-            harness.state().1.settings.server_table_columns.is_some(),
-            "a divider drag must store the widths it made"
+            (moved_protocol.left() - protocol.left()).abs() < 0.5,
+            "the protocol column's own start must not move"
+        );
+        assert!(
+            (moved_group.left() - group.left() - 20.0).abs() < 2.0,
+            "the columns after the dragged one must shift with it (moved {:.1})",
+            moved_group.left() - group.left()
+        );
+        assert!(
+            ((moved_group.left() - moved.left()) - address_width).abs() < 2.0,
+            "the address column must keep its width ({:.1} vs {address_width:.1})",
+            moved_group.left() - moved.left()
+        );
+        let widths = harness
+            .state()
+            .1
+            .settings
+            .server_table_columns
+            .expect("a divider drag must store the widths it made");
+        assert!(
+            (widths.protocol - (protocol_width + 20.0)).abs() < 2.0,
+            "the stored protocol width must carry the dragged distance ({:.1} vs {protocol_width:.1})",
+            widths.protocol
         );
     }
 
@@ -13222,12 +13638,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     Language::En,
                     status_colors_of(ui),
                 );
-                let columns = table_columns(
-                    ui.available_width(),
-                    TableShape::default(),
-                    TABLE_DEFAULT_WIDTHS,
-                    true,
-                );
+                let columns = table_columns(TableShape::default(), TABLE_DEFAULT_WIDTHS);
                 let _ = server_list_row(
                     ui,
                     Language::En,
@@ -13244,6 +13655,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         joined_below: false,
                         active: false,
                         hop: false,
+                        dialers: &[],
                         frozen: false,
                         switch: RowSwitch {
                             checked: false,
@@ -13260,22 +13672,22 @@ Authentication: ML-KEM-768, Post-Quantum
         let endpoint = harness.get_by_label("203.0.113.7:443");
         let latency = harness.get_by_label("12 ms");
         assert!(
-            name.rect().max.x <= protocol.rect().min.x,
-            "the name must stop at its column: name ends at x={}, protocol starts at x={}",
+            name.rect().max.x <= latency.rect().min.x,
+            "the name must stop at its column: name ends at x={}, latency starts at x={}",
             name.rect().max.x,
-            protocol.rect().min.x,
+            latency.rect().min.x,
+        );
+        assert!(
+            latency.rect().max.x <= protocol.rect().min.x,
+            "the latency column must stop before the protocol column"
         );
         assert!(
             protocol.rect().max.x <= endpoint.rect().min.x,
             "the protocol column must stop before the endpoint column"
         );
         assert!(
-            endpoint.rect().max.x <= latency.rect().min.x,
-            "the endpoint column must stop before the latency column"
-        );
-        assert!(
-            latency.rect().max.x <= width + 0.5,
-            "the latency column must stay inside the band"
+            endpoint.rect().max.x <= width + 0.5,
+            "the endpoint column must stay inside the band"
         );
         assert!(
             harness.query_by_label("⚡").is_none() && harness.query_by_label("🗑").is_none(),
@@ -13298,12 +13710,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 Language::En,
                 status_colors_of(ui),
             );
-            let columns = table_columns(
-                ui.available_width(),
-                TableShape::default(),
-                TABLE_DEFAULT_WIDTHS,
-                true,
-            );
+            let columns = table_columns(TableShape::default(), TABLE_DEFAULT_WIDTHS);
             let clicks = server_list_row(
                 ui,
                 Language::En,
@@ -13320,6 +13727,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     joined_below: false,
                     active: false,
                     hop: false,
+                    dialers: &[],
                     frozen: false,
                     switch: RowSwitch {
                         checked: false,
@@ -13346,12 +13754,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     Language::En,
                     status_colors_of(ui),
                 );
-                let columns = table_columns(
-                    ui.available_width(),
-                    TableShape::default(),
-                    TABLE_DEFAULT_WIDTHS,
-                    true,
-                );
+                let columns = table_columns(TableShape::default(), TABLE_DEFAULT_WIDTHS);
                 let clicks = server_list_row(
                     ui,
                     Language::En,
@@ -13368,6 +13771,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         joined_below: false,
                         active: false,
                         hop: false,
+                        dialers: &[],
                         frozen: false,
                         switch: RowSwitch {
                             checked: false,
@@ -13401,12 +13805,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 Language::En,
                 status_colors_of(ui),
             );
-            let columns = table_columns(
-                ui.available_width(),
-                TableShape::default(),
-                TABLE_DEFAULT_WIDTHS,
-                true,
-            );
+            let columns = table_columns(TableShape::default(), TABLE_DEFAULT_WIDTHS);
             let clicks = server_list_row(
                 ui,
                 Language::En,
@@ -13423,6 +13822,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     joined_below: false,
                     active: false,
                     hop: false,
+                    dialers: &[],
                     frozen: false,
                     switch: RowSwitch {
                         checked: false,
@@ -13508,6 +13908,27 @@ Authentication: ML-KEM-768, Post-Quantum
             rig.servers.profiles.push(profile);
         }
         rig.servers.groups.push(feed);
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.servers.hydrate_group_titles();
+        rig
+    }
+
+    /// Alpha is the active route and dials through the switched-off Hop;
+    /// Bravo and Charlie are enabled siblings, so `Emitted` shows
+    /// Alpha → Hop → Bravo → Charlie — the hop between the seed rows.
+    fn hop_drag_rig() -> UiTestRig {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut alpha = ServerProfile::new("Alpha", freedom());
+        alpha.enabled = true;
+        let hop = ServerProfile::new("Hop", freedom());
+        let hop_tag = hop.tag();
+        alpha.outbound.chain_via(hop_tag);
+        let mut bravo = ServerProfile::new("Bravo", freedom());
+        bravo.enabled = true;
+        let mut charlie = ServerProfile::new("Charlie", freedom());
+        charlie.enabled = true;
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![alpha, hop, bravo, charlie];
         rig.servers.active = Some(rig.servers.profiles[0].id.clone());
         rig.servers.hydrate_group_titles();
         rig
@@ -13835,6 +14256,103 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             !harness.state().1.requests.dirty,
             "a locked switch is not a configuration change"
+        );
+    }
+
+    #[test]
+    fn a_hop_row_refuses_a_drag_and_the_view_stays_put() {
+        let mut harness = drag_harness(hop_drag_rig());
+        harness.run();
+        let hop = harness.get_by_label("Hop").rect();
+        let charlie = harness.get_by_label("Charlie").rect();
+        drag_list_row(
+            &mut harness,
+            hop.center(),
+            egui::pos2(charlie.center().x, charlie.bottom() + 8.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Hop", "Bravo", "Charlie"],
+            "a hop row never lifts, so the stored order stays put"
+        );
+        assert!(
+            !harness.state().1.requests.dirty,
+            "a refused hop drag is not a configuration change"
+        );
+        let y = |name: &str| harness.get_by_label(name).rect().center().y;
+        assert!(
+            y("Alpha") < y("Hop") && y("Hop") < y("Bravo") && y("Bravo") < y("Charlie"),
+            "the Emitted view keeps the hop directly behind its dialer"
+        );
+    }
+
+    #[test]
+    fn dragging_a_seed_left_of_a_hop_still_rewrites_its_group_order() {
+        let mut harness = drag_harness(hop_drag_rig());
+        harness.run();
+        let bravo = harness.get_by_label("Bravo").rect();
+        let charlie = harness.get_by_label("Charlie").rect();
+        // Charlie's drop point is one visible row above it, but the hop row
+        // between the seeds is skipped: the drop lands Charlie before Bravo
+        // in the group, not against the hop.
+        drag_list_row(
+            &mut harness,
+            charlie.center(),
+            egui::pos2(bravo.center().x, bravo.top() + 2.0),
+        );
+        assert_eq!(
+            profile_names(&harness.state().1),
+            ["Alpha", "Hop", "Charlie", "Bravo"],
+            "a seed drag rewrites its group's stored order"
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "a seed drag persists the new group order"
+        );
+        let y = |name: &str| harness.get_by_label(name).rect().center().y;
+        assert!(
+            y("Alpha") < y("Hop") && y("Hop") < y("Charlie") && y("Charlie") < y("Bravo"),
+            "the hop slot re-derives: it still follows its dialer, now ahead of the seeds"
+        );
+    }
+
+    #[test]
+    fn a_hops_latency_hover_names_the_servers_that_dial_through_it() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut entry = ServerProfile::new("Entry", freedom());
+        entry.enabled = true;
+        let mut hop = ServerProfile::new("Hop", freedom());
+        let hop_tag = hop.tag();
+        entry.outbound.chain_via(hop_tag);
+        hop.verdict = Some(ProbeVerdict {
+            outcome: ProbeOutcome::Delay(42),
+            source: ProbeSource::LatencyTest,
+            measured_at: SystemTime::now() - Duration::from_secs(120),
+            error: None,
+        });
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles = vec![entry, hop];
+        rig.servers.active = Some(rig.servers.profiles[0].id.clone());
+        rig.servers.hydrate_group_titles();
+        let mut harness = drag_harness(rig);
+        harness.run();
+
+        harness.get_by_label("42 ms").hover();
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .query_all_by_label("Dialed by Entry")
+                .next()
+                .is_some(),
+            "a hop's latency hover must name the server that dials through it"
+        );
+        assert!(
+            harness
+                .query_all_by_label("Measured 2 minutes ago by a latency test.")
+                .next()
+                .is_some(),
+            "the verdict line stays beside the dialer line"
         );
     }
 

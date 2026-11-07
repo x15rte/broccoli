@@ -353,7 +353,8 @@ impl Default for ServersFile {
 }
 
 /// The profiles one generated document carries, in wire order: the active
-/// route's server first, then the rest in grouped display order.
+/// route's server first, then each enabled server, with the chain hops it
+/// dials through directly behind it, depth-first through the chain.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmittedSet {
     /// Profile indices in wire order.
@@ -361,6 +362,10 @@ pub struct EmittedSet {
     /// Indices emitted only because an emitted profile dials through them:
     /// their switch stays off and locked.
     pub chain_only: std::collections::BTreeSet<usize>,
+    /// For each emitted profile another emitted profile dials through, the
+    /// labels of its dialers, in emitted order. The Emitted tab's latency
+    /// hover reads this; a shared hop names every dialer.
+    pub dialers: BTreeMap<usize, Vec<String>>,
 }
 
 /// One fetched entry, ready to reconcile: the profile and the two keys the
@@ -787,9 +792,13 @@ impl ServersFile {
     }
     /// The profiles the generated document carries: the active profile,
     /// every enabled profile, and every profile reachable transitively
-    /// through a chain hop from those. The active profile leads; the rest
-    /// follow grouped display order. A hop reached only through a chain is
-    /// reported in `chain_only`, whatever its switch says.
+    /// through a chain hop from those. The active profile leads, then the
+    /// enabled profiles in grouped display order; each seed is followed
+    /// depth-first by the hop it names, and that hop by its own hop. A
+    /// profile already placed is not placed again, so a shared hop follows
+    /// its first dialer and a cycle ends at its first repeat. A hop reached
+    /// only through a chain is reported in `chain_only`, whatever its switch
+    /// says.
     pub fn emitted_set(&self) -> EmittedSet {
         let tags: BTreeMap<String, usize> = self
             .profiles
@@ -805,8 +814,8 @@ impl ServersFile {
         if let Some(index) = active {
             seeds.push(index);
         }
-        for (index, profile) in self.profiles.iter().enumerate() {
-            if profile.enabled && Some(index) != active {
+        for index in self.grouped_order() {
+            if self.profiles[index].enabled && Some(index) != active {
                 seeds.push(index);
             }
         }
@@ -830,18 +839,64 @@ impl ServersFile {
             .copied()
             .filter(|index| !seeds.contains(index))
             .collect();
+        // Seeds keep their stored slots. A seed's hops follow it depth-first,
+        // but a hop that is itself enabled is a seed and appears at its own
+        // slot: the walk must not pull it forward, or the result would depend
+        // on where that hop happens to sit relative to its dialer. `placed`
+        // keeps a shared hop on its first dialer and ends a loop at its first
+        // repeat (validation refuses a cycle, but the order must terminate).
+        let seed_set: std::collections::BTreeSet<usize> = seeds.iter().copied().collect();
         let mut order = Vec::with_capacity(included.len());
-        if let Some(index) = active
-            && included.contains(&index)
-        {
-            order.push(index);
-        }
-        for index in self.grouped_order() {
-            if included.contains(&index) && Some(index) != active {
-                order.push(index);
+        let mut placed = std::collections::BTreeSet::new();
+        for &seed in &seeds {
+            if !placed.insert(seed) {
+                continue;
+            }
+            order.push(seed);
+            let mut cursor = seed;
+            while let Some(target) = self.profiles[cursor].chain_target() {
+                let Some(&hop) = tags.get(target) else {
+                    break;
+                };
+                if seed_set.contains(&hop) || !placed.insert(hop) {
+                    break;
+                }
+                order.push(hop);
+                cursor = hop;
             }
         }
-        EmittedSet { order, chain_only }
+        debug_assert_eq!(
+            order.len(),
+            included.len(),
+            "every included profile must be placed exactly once"
+        );
+        // The hop's hover names the servers that dial through it: the reverse
+        // edge of the chain, read in emitted order so a shared hop lists its
+        // dialers the way the list shows them.
+        let mut dialers: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for &dialer in &order {
+            let Some(target) = self.profiles[dialer].chain_target() else {
+                continue;
+            };
+            let Some(&hop) = tags.get(target) else {
+                continue;
+            };
+            if hop == dialer || !included.contains(&hop) {
+                continue;
+            }
+            let profile = &self.profiles[dialer];
+            let label = if profile.name.is_empty() {
+                profile.tag()
+            } else {
+                profile.name.clone()
+            };
+            dialers.entry(hop).or_default().push(label);
+        }
+        EmittedSet {
+            order,
+            chain_only,
+            dialers,
+        }
     }
     /// Ensure the reserved `Manual` group exists, carries its reserved title,
     /// and sorts first.
@@ -1757,8 +1812,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["A", "B", "C", "D", "E"],
-            "the active server leads, then grouped order, chain hops included"
+            ["A", "E", "C", "D", "B"],
+            "the active server leads with the hop it dials, then the enabled rows in \
+             grouped order, each followed by its hop"
         );
         let chain_only: Vec<&str> = emitted
             .chain_only
@@ -1769,6 +1825,169 @@ mod tests {
             chain_only,
             ["B", "E"],
             "a hop reached only through a chain is chain-only"
+        );
+        let labels = |index: usize| -> Vec<&str> {
+            emitted
+                .dialers
+                .get(&index)
+                .map(|labels| labels.iter().map(String::as_str).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(labels(4), ["A"], "E is dialed by A");
+        assert_eq!(labels(1), ["D"], "B is dialed by D");
+        assert!(
+            labels(0).is_empty() && labels(2).is_empty() && labels(3).is_empty(),
+            "only a dialed profile names its dialers"
+        );
+    }
+
+    #[test]
+    fn a_chain_lists_depth_first_behind_its_seed() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let a = ServerProfile::new("A", freedom());
+        let b = ServerProfile::new("B", freedom());
+        let c = ServerProfile::new("C", freedom());
+        let mut servers = ServersFile::with_profiles(Some(a.id.clone()), vec![a, b, c]);
+        let c_tag = servers.profiles[2].tag();
+        let b_tag = servers.profiles[1].tag();
+        servers.profiles[0].outbound.chain_via(b_tag);
+        servers.profiles[1].outbound.chain_via(c_tag);
+
+        let emitted = servers.emitted_set();
+        let names: Vec<&str> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["A", "B", "C"],
+            "a chain reads A -> B -> C, one hop directly behind the next"
+        );
+        assert_eq!(
+            emitted.chain_only.len(),
+            2,
+            "both hops are emitted only through the chain"
+        );
+    }
+
+    #[test]
+    fn a_shared_hop_follows_its_first_dialer_and_appears_once() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut first = ServerProfile::new("First", freedom());
+        first.enabled = true;
+        let mut second = ServerProfile::new("Second", freedom());
+        second.enabled = true;
+        let hop = ServerProfile::new("Hop", freedom());
+        let hop_tag = hop.tag();
+        first.outbound.chain_via(hop_tag.clone());
+        second.outbound.chain_via(hop_tag);
+        let mut servers = ServersFile::with_profiles(None, vec![first, second, hop]);
+        servers.hydrate_group_titles();
+
+        let emitted = servers.emitted_set();
+        let names: Vec<&str> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["First", "Hop", "Second"],
+            "the shared hop appears once, directly behind the first dialer"
+        );
+        assert_eq!(
+            emitted.dialers.get(&2).map(Vec::as_slice),
+            Some(["First".to_owned(), "Second".to_owned()].as_slice()),
+            "a shared hop's hover names both dialers in emitted order"
+        );
+    }
+
+    #[test]
+    fn an_enabled_hop_stays_at_its_seed_position() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut hop = ServerProfile::new("Hop", freedom());
+        hop.enabled = true;
+        let mut dialer = ServerProfile::new("Dialer", freedom());
+        dialer.enabled = true;
+        let hop_tag = hop.tag();
+        dialer.outbound.chain_via(hop_tag);
+        let mut servers = ServersFile::with_profiles(None, vec![hop, dialer]);
+        servers.hydrate_group_titles();
+
+        let emitted = servers.emitted_set();
+        let names: Vec<&str> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["Hop", "Dialer"],
+            "a hop that is also an enabled server keeps its seed slot and is not repeated"
+        );
+        assert!(
+            emitted.chain_only.is_empty(),
+            "an enabled hop is a seed, not a chain-only row"
+        );
+        assert_eq!(
+            emitted.dialers.get(&0).map(Vec::as_slice),
+            Some(["Dialer".to_owned()].as_slice()),
+            "the seed is still a hop, so its hover names the server that dials through it"
+        );
+    }
+
+    #[test]
+    fn a_seed_hop_later_in_the_list_is_not_pulled_to_its_dialer() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let mut hop = ServerProfile::new("Hop", freedom());
+        hop.enabled = true;
+        let mut other = ServerProfile::new("Other", freedom());
+        other.enabled = true;
+        let mut dialer = ServerProfile::new("Dialer", freedom());
+        dialer.enabled = true;
+        let hop_tag = hop.tag();
+        dialer.outbound.chain_via(hop_tag);
+        let mut servers = ServersFile::with_profiles(None, vec![dialer, other, hop]);
+        servers.hydrate_group_titles();
+
+        let emitted = servers.emitted_set();
+        let names: Vec<&str> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["Dialer", "Other", "Hop"],
+            "an enabled hop keeps its stored slot: the walk must not pull a seed forward"
+        );
+    }
+
+    #[test]
+    fn a_chain_cycle_terminates() {
+        let freedom = || OutboundModel::new(Protocol::Freedom);
+        let a = ServerProfile::new("A", freedom());
+        let b = ServerProfile::new("B", freedom());
+        let a_tag = a.tag();
+        let b_tag = b.tag();
+        let mut a = a;
+        a.outbound.chain_via(b_tag);
+        let mut b = b;
+        b.outbound.chain_via(a_tag);
+        let mut servers = ServersFile::with_profiles(Some(a.id.clone()), vec![a, b]);
+        servers.hydrate_group_titles();
+
+        let emitted = servers.emitted_set();
+        let names: Vec<&str> = emitted
+            .order
+            .iter()
+            .map(|&index| servers.profiles[index].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["A", "B"],
+            "a cycle is legal only long enough to terminate: each profile appears once"
         );
     }
 

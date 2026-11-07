@@ -38,10 +38,12 @@ mod common;
 const ALPHA_TAG: &str = "[Manual] alpha";
 
 /// One seeded profile with a stable id, so the probe status can address it
-/// by the same tag the app derives.
+/// by the same tag the app derives. It is switched on because the dashboard
+/// lists the emitted set: a disabled profile has no row to repaint.
 fn seeded_servers() -> ServersFile {
     let mut alpha = ServerProfile::new("alpha", OutboundModel::new(Protocol::Trojan));
     alpha.id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+    alpha.enabled = true;
     ServersFile::with_profiles(None, vec![alpha])
 }
 
