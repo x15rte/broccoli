@@ -26,8 +26,8 @@ pub struct StatusColors {
     /// another outbound dials through it — so it reads beside the statuses
     /// and takes the same contrast coverage.
     pub hop: Color32,
-    /// The selected row's outline. Purple is not a status either: it marks
-    /// what the user pointed at, the one row state no status colour means.
+    /// The selected row's outline. Ink, not a hue: selection is chrome, so it
+    /// must stay out of the green/blue/amber/red meanings the rows carry.
     pub selected: Color32,
 }
 
@@ -41,7 +41,7 @@ pub const fn status_colors(dark: bool) -> StatusColors {
             warn: Color32::from_rgb(0xe0, 0xa0, 0x40),
             err: Color32::from_rgb(0xe0, 0x60, 0x60),
             hop: Color32::from_rgb(0x6c, 0x9e, 0xf8),
-            selected: Color32::from_rgb(0xc4, 0xa7, 0xe7),
+            selected: Color32::from_rgb(0xc9, 0xce, 0xd6),
         }
     } else {
         // White panel background.
@@ -50,7 +50,7 @@ pub const fn status_colors(dark: bool) -> StatusColors {
             warn: Color32::from_rgb(0x8a, 0x5e, 0x00),
             err: Color32::from_rgb(0xb0, 0x2a, 0x2a),
             hop: Color32::from_rgb(0x2f, 0x5f, 0xa8),
-            selected: Color32::from_rgb(0x6b, 0x4f, 0xa0),
+            selected: Color32::from_rgb(0x44, 0x4a, 0x52),
         }
     }
 }

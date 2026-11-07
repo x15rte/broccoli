@@ -4281,6 +4281,16 @@ impl ServersScreen {
                         let index = display_rows[display];
                         let p = &profiles[index];
                         let is_sel = self.selection.contains(p.id.as_str());
+                        // The neighbours decide where the selection band
+                        // opens and closes: the outline omits an edge shared
+                        // with another selected row.
+                        let selected_at = |position: usize| {
+                            display_rows.get(position).is_some_and(|&other| {
+                                self.selection.contains(profiles[other].id.as_str())
+                            })
+                        };
+                        let joined_above = display > 0 && selected_at(display - 1);
+                        let joined_below = selected_at(display + 1);
                         let is_active = ctx.servers.active.as_deref() == Some(p.id.as_str());
                         // Latency badge text is memoized per profile:
                         // formatting runs only when the row's latency,
@@ -4327,6 +4337,8 @@ impl ServersScreen {
                             },
                             RowState {
                                 selected: is_sel,
+                                joined_above,
+                                joined_below,
                                 active: is_active,
                                 hop: emitted.chain_only.contains(&index),
                                 frozen: probe_pending,
@@ -5619,9 +5631,13 @@ fn age_phrase(lang: Language, age: Duration) -> String {
 /// readable argument list.
 struct RowState<'a> {
     selected: bool,
+    /// The adjacent displayed row is selected too. A run of selected rows
+    /// draws its outline as one band: no shared edge, no rule between them.
+    joined_above: bool,
+    joined_below: bool,
     active: bool,
     /// The row is a chain hop: another outbound dials through it, so the row
-    /// exists because of that reference. The paint marks it in purple.
+    /// exists because of that reference. The paint marks it with a blue bar.
     hop: bool,
     /// The latency test owns the list: row clicks, drags, the menu and the
     /// switch are inert while it runs.
@@ -6490,7 +6506,9 @@ fn server_list_row(
             .rect_filled(band, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
     // Selection is an outline rather than a fill: the values keep their own
-    // colour, and purple is the one row state no status colour means.
+    // colour, and a run of selected rows draws one band — the shared edges
+    // and the rule between two selected rows are omitted, so Ctrl+A reads as
+    // one rectangle instead of a stack of boxes.
     let outline = row.selected.then_some(colors.selected);
     let marker = if row.active {
         // The active route is a bar at the row's edge, not a whole column
@@ -6592,21 +6610,23 @@ fn server_list_row(
     });
     let (toggled, name_resp) = inner.inner;
     // The rule closes the row's band: with no striping it is what keeps a long
-    // list from reading as one field of text.
-    ui.painter().hline(
-        band.x_range(),
-        band.max.y - 0.5,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-    );
+    // list from reading as one field of text. Inside a selection run it is
+    // omitted — the outline carries the edge, and two selected rows must not
+    // be split by a line.
+    if !(row.selected || row.joined_below) {
+        ui.painter().hline(
+            band.x_range(),
+            band.max.y - 0.5,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+    }
     if let Some(color) = outline {
-        // All four sides, bottom included: the outline takes the place of the
-        // hairline, so a selected band is one closed rectangle rather than a
-        // tint with a rule through it.
-        ui.painter().rect_stroke(
+        draw_selection_edges(
+            ui.painter(),
             band,
-            0.0,
-            egui::Stroke::new(1.0, color),
-            egui::StrokeKind::Inside,
+            color,
+            row.joined_above,
+            row.joined_below,
         );
     }
     let resp = if row.frozen {
@@ -6618,6 +6638,28 @@ fn server_list_row(
         row: resp,
         name: name_resp,
         toggle: toggled,
+    }
+}
+
+/// The selection outline: a 1-point rectangle drawn edge by edge, so a run of
+/// selected rows omits the edge it shares with its neighbour and reads as one
+/// band. The bottom edge takes the row rule's place; the verticals run the
+/// full band so two adjacent selected rows join without a seam.
+fn draw_selection_edges(
+    painter: &egui::Painter,
+    band: egui::Rect,
+    color: egui::Color32,
+    joined_above: bool,
+    joined_below: bool,
+) {
+    let stroke = egui::Stroke::new(1.0, color);
+    painter.vline(band.left() + 0.5, band.y_range(), stroke);
+    painter.vline(band.right() - 0.5, band.y_range(), stroke);
+    if !joined_above {
+        painter.hline(band.x_range(), band.top() + 0.5, stroke);
+    }
+    if !joined_below {
+        painter.hline(band.x_range(), band.max.y - 0.5, stroke);
     }
 }
 
@@ -13196,6 +13238,8 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     RowState {
                         selected: false,
+                        joined_above: false,
+                        joined_below: false,
                         active: false,
                         hop: false,
                         frozen: false,
@@ -13270,6 +13314,8 @@ Authentication: ML-KEM-768, Post-Quantum
                 },
                 RowState {
                     selected: false,
+                    joined_above: false,
+                    joined_below: false,
                     active: false,
                     hop: false,
                     frozen: false,
@@ -13316,6 +13362,8 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                     RowState {
                         selected: false,
+                        joined_above: false,
+                        joined_below: false,
                         active: false,
                         hop: false,
                         frozen: false,
@@ -13369,6 +13417,8 @@ Authentication: ML-KEM-768, Post-Quantum
                 },
                 RowState {
                     selected: false,
+                    joined_above: false,
+                    joined_below: false,
                     active: false,
                     hop: false,
                     frozen: false,
