@@ -4429,7 +4429,7 @@ mod en {
                 "the saved active route named no server, so the route is now Block"
             }
             Key::SrvNewGroup => "New group",
-            Key::SrvGroupKind => "Kind",
+            Key::SrvGroupKind => "Type",
             Key::SrvGroupKindManual => "Manual",
             Key::SrvGroupKindSubscription => "Subscription",
             Key::SrvCreateGroup => "Create",
