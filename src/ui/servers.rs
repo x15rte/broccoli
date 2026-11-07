@@ -4068,23 +4068,25 @@ impl ServersScreen {
             };
             ui.colored_label(color, message);
         }
-        ui.separator();
         // One flat table per tab, on the same widths as every row. The
         // sortable header exists only where sorting is a view: every tab but
         // `Emitted`, whose order is the outbound order.
+        ui.add_space(4.0);
         let sortable = self.view != ServerTab::Emitted;
         let shape = TableShape {
             order: self.view == ServerTab::Emitted,
             group: self.view == ServerTab::All,
         };
-        let header_columns = table_columns(
+        // The table's width excludes the scroll bar's overlap, and the header
+        // and every row take their columns from this one computation: width
+        // computed twice is width computed differently.
+        let columns = table_columns(
             (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
             shape,
         );
-        if let Some(column) = table_header(ui, lang, header_columns, sortable, self.view_sort) {
+        if let Some(column) = table_header(ui, lang, columns, sortable, self.view_sort) {
             self.view_sort = Some(next_view_sort(self.view_sort, column));
         }
-        ui.separator();
         // Virtualized profile list: only the visible index
         // band is laid out, hit-tested, and painted per frame; egui clipping
         // is not layout. Rows are uniform single-line rows at `TABLE_ROW_HEIGHT`,
@@ -4190,7 +4192,7 @@ impl ServersScreen {
                     // and report the full band width again at the end so the
                     // bar stays pinned to the edge the rows stop short of.
                     let band_right = ui.max_rect().right();
-                    ui.set_max_width((ui.available_width() - scrollbar_inset(ui.style())).max(0.0));
+                    ui.set_max_width(columns.total());
                     let colors = status_colors_of(ui);
                     // One frame of drag-reorder state: the pointer (only
                     // while a row is lifted and the pointer is inside the
@@ -4266,8 +4268,15 @@ impl ServersScreen {
                         let clicks = server_list_row(
                             ui,
                             lang,
-                            &p.name,
-                            detail.unwrap_or(&EMPTY_ROW_DETAIL),
+                            columns,
+                            RowCells {
+                                name: &p.name,
+                                detail: detail.unwrap_or(&EMPTY_ROW_DETAIL),
+                                extras: RowExtras {
+                                    order: shape.order.then_some(display + 1),
+                                    group: shape.group.then_some(p.group_title.as_str()),
+                                },
+                            },
                             RowState {
                                 selected: is_sel,
                                 active: is_active,
@@ -4289,10 +4298,6 @@ impl ServersScreen {
                                 },
                             },
                             badge,
-                            RowExtras {
-                                order: shape.order.then_some(display + 1),
-                                group: shape.group.then_some(p.group_title.as_str()),
-                            },
                         );
                         ui.set_opacity(previous_opacity);
                         // A primary press that grows past egui's click
@@ -5508,19 +5513,20 @@ const EMPTY_ROW_DETAIL: RowDetail = RowDetail {
 /// The table's fixed column widths in points. The name column takes the rest
 /// of the band, so the header and every row place the data columns at the
 /// same x every frame — a table reads by column, not by row.
-const TABLE_SWITCH_WIDTH: f32 = 72.0;
-const TABLE_PROTOCOL_WIDTH: f32 = 140.0;
-const TABLE_ADDRESS_WIDTH: f32 = 260.0;
-const TABLE_LATENCY_WIDTH: f32 = 90.0;
+const TABLE_SWITCH_WIDTH: f32 = 64.0;
+const TABLE_PROTOCOL_WIDTH: f32 = 128.0;
+const TABLE_ADDRESS_WIDTH: f32 = 240.0;
+const TABLE_LATENCY_WIDTH: f32 = 84.0;
 /// The order number and group name columns, present only on the tabs that
 /// carry them.
-const TABLE_ORDER_WIDTH: f32 = 52.0;
+const TABLE_ORDER_WIDTH: f32 = 56.0;
 const TABLE_GROUP_WIDTH: f32 = 160.0;
 /// The smallest width the name column keeps: a narrower band truncates the
 /// name rather than pushing the fixed columns past the viewport.
-const TABLE_MIN_NAME_WIDTH: f32 = 140.0;
-/// The height one row keeps, header and body alike.
-const TABLE_ROW_HEIGHT: f32 = 30.0;
+const TABLE_MIN_NAME_WIDTH: f32 = 160.0;
+/// The height one row keeps. Dense enough that a hundred servers read as a
+/// list, not a form.
+const TABLE_ROW_HEIGHT: f32 = 26.0;
 /// The inset every cell keeps from its column edge. Without it the header
 /// words run together into one line and the table reads as prose.
 const TABLE_CELL_INSET: f32 = 8.0;
@@ -5540,6 +5546,15 @@ struct RowExtras<'a> {
     order: Option<usize>,
     /// The row's group title, shown only on `All`.
     group: Option<&'a str>,
+}
+
+/// What one row shows: the name, the formatted protocol and endpoint cells,
+/// and the tab's extra columns.
+#[derive(Clone, Copy)]
+struct RowCells<'a> {
+    name: &'a str,
+    detail: &'a RowDetail,
+    extras: RowExtras<'a>,
 }
 
 /// The six shared column widths plus the tab's optional columns, laid out in
@@ -5575,6 +5590,21 @@ fn table_columns(available: f32, shape: TableShape) -> TableColumns {
     }
 }
 
+impl TableColumns {
+    /// The width of the whole table. The header and every row draw on this
+    /// one number, so a column's edges cannot drift between the names and the
+    /// data below them.
+    fn total(self) -> f32 {
+        self.order.unwrap_or(0.0)
+            + self.switch
+            + self.name
+            + self.protocol
+            + self.address
+            + self.latency
+            + self.group.unwrap_or(0.0)
+    }
+}
+
 /// The width a floating scroll bar overlaps in the table's band: a vertical
 /// `ScrollArea` shrinks horizontally to its content and the bar hugs that
 /// edge, reserving no space of its own (`ScrollStyle::allocated_width` is
@@ -5588,17 +5618,24 @@ fn scrollbar_inset(style: &egui::Style) -> f32 {
 /// One table cell: exactly `width` points wide and one control row tall,
 /// clipped so a long value truncates inside its own column instead of
 /// painting over the next one.
+///
+/// The cell reserves its whole column width before drawing anything. A cell
+/// that sized itself to its content — a checkbox, a short endpoint — would
+/// shift every column after it by however much that content fell short, per
+/// row and per frame: the header and the rows would disagree on where each
+/// column starts.
 fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, TABLE_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_max_width((width - TABLE_CELL_INSET).max(0.0));
-            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-            ui.add_space(TABLE_CELL_INSET);
-            add(ui);
-        },
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, TABLE_ROW_HEIGHT), egui::Sense::hover());
+    let inset = TABLE_CELL_INSET.min(width / 2.0);
+    let content = rect.shrink2(egui::vec2(inset, 0.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add(&mut child);
 }
 
 /// The table's header row: the tab's columns, and — where the tab is a view —
@@ -5615,46 +5652,13 @@ fn table_header(
         ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
     };
     let mut clicked = None;
-    // The header takes a band of its own: a table's column names are a
-    // different kind of row from its data, and the fill says so without a
-    // heavier weight or a second rule.
+    // The header is a line of column names over their own columns, closed by
+    // one rule. A filled band with column separators reads as a title bar and
+    // separates the names from the data they name.
     let band = egui::Rect::from_min_size(
         ui.cursor().min,
-        egui::vec2(
-            (ui.available_width() - scrollbar_inset(ui.style())).max(0.0),
-            TABLE_ROW_HEIGHT,
-        ),
+        egui::vec2(columns.total(), TABLE_ROW_HEIGHT),
     );
-    // The header is a bar, not another row: a bounded fill with column
-    // separators is what tells the eye these words name the columns below.
-    let rule = ui.visuals().widgets.inactive.bg_stroke;
-    let painter = ui.painter().clone();
-    painter.rect_filled(band, 0.0, ui.visuals().widgets.inactive.weak_bg_fill);
-    painter.rect_stroke(
-        band,
-        0.0,
-        egui::Stroke::new(1.0, rule.color),
-        egui::StrokeKind::Inside,
-    );
-    let mut widths = Vec::with_capacity(7);
-    if let Some(width) = columns.order {
-        widths.push(width);
-    }
-    widths.extend([
-        columns.switch,
-        columns.name,
-        columns.protocol,
-        columns.address,
-        columns.latency,
-    ]);
-    if let Some(width) = columns.group {
-        widths.push(width);
-    }
-    let mut divider = band.left();
-    for width in widths.iter().take(widths.len().saturating_sub(1)) {
-        divider += *width;
-        painter.vline(divider, band.y_range(), egui::Stroke::new(1.0, rule.color));
-    }
     let mut column_header =
         |ui: &mut egui::Ui, text: &str, column: Option<SortColumn>, width: f32, right: bool| {
             table_cell(ui, width, |ui| {
@@ -5676,6 +5680,7 @@ fn table_header(
                         }
                     });
                     if let Some(current) = sort.filter(|current| current.column == column) {
+                        ui.add_space(4.0);
                         ui.label(RichText::new(if current.ascending { "▲" } else { "▼" }).weak());
                     }
                 };
@@ -5689,41 +5694,46 @@ fn table_header(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         if let Some(width) = columns.order {
-            column_header(ui, t(lang, Key::SrvTableOrder), None, width, true);
+            column_header(ui, t(lang, Key::SrvColOrder), None, width, true);
         }
-        column_header(ui, t(lang, Key::Enabled), None, columns.switch, false);
+        column_header(ui, t(lang, Key::SrvColEnabled), None, columns.switch, false);
         column_header(
             ui,
-            t(lang, Key::SrvName),
+            t(lang, Key::SrvColName),
             Some(SortColumn::Name),
             columns.name,
             false,
         );
         column_header(
             ui,
-            t(lang, Key::SrvProtocol),
+            t(lang, Key::SrvColProtocol),
             Some(SortColumn::Protocol),
             columns.protocol,
             false,
         );
         column_header(
             ui,
-            t(lang, Key::SrvTableAddress),
+            t(lang, Key::SrvColAddress),
             None,
             columns.address,
             false,
         );
         column_header(
             ui,
-            t(lang, Key::SrvTableLatency),
+            t(lang, Key::SrvColLatency),
             Some(SortColumn::Latency),
             columns.latency,
             true,
         );
         if let Some(width) = columns.group {
-            column_header(ui, t(lang, Key::SrvTableGroup), None, width, false);
+            column_header(ui, t(lang, Key::SrvColGroup), None, width, false);
         }
     });
+    ui.painter().hline(
+        band.x_range(),
+        band.max.y - 0.5,
+        egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+    );
     clicked
 }
 
@@ -6027,24 +6037,23 @@ fn subscription_bind_address(
 fn server_list_row(
     ui: &mut egui::Ui,
     lang: Language,
-    name: &str,
-    detail: &RowDetail,
+    columns: TableColumns,
+    cells: RowCells<'_>,
     row: RowState<'_>,
     latency: &LatencyBadge,
-    extras: RowExtras<'_>,
 ) -> RowClicks {
-    let shape = TableShape {
-        order: extras.order.is_some(),
-        group: extras.group.is_some(),
-    };
-    let columns = table_columns(ui.available_width(), shape);
-    // A row reads as a row when its band is visible: alternate fills give the
-    // eye a line to follow, the pointer's row lifts, and a selected row takes
-    // a tint of the selection colour. The fill is issued before the horizontal
-    // layout allocates the cells, so it stays underneath them.
+    let RowCells {
+        name,
+        detail,
+        extras,
+    } = cells;
+    // A row reads as a row when its band is visible: the pointer's row lifts,
+    // a selected row takes a tint of the selection colour, and the active row
+    // is marked at its edge. The fill is issued before the horizontal layout
+    // allocates the cells, so it stays underneath them.
     let band = egui::Rect::from_min_size(
         ui.cursor().min,
-        egui::vec2(ui.available_width(), TABLE_ROW_HEIGHT),
+        egui::vec2(columns.total(), TABLE_ROW_HEIGHT),
     );
     let ok = status_colors_of(ui).ok;
     let fill = if row.selected {
@@ -6052,8 +6061,6 @@ fn server_list_row(
         egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64)
     } else if ui.rect_contains_pointer(band) {
         ui.visuals().widgets.hovered.weak_bg_fill
-    } else if row.active {
-        egui::Color32::from_rgba_unmultiplied(ok.r(), ok.g(), ok.b(), 18)
     } else {
         egui::Color32::TRANSPARENT
     };
@@ -6064,8 +6071,8 @@ fn server_list_row(
         // The active route is a bar at the row's edge, not a whole column
         // spent on one dot.
         let bar = egui::Rect::from_min_size(
-            egui::pos2(band.left(), band.top() + 4.0),
-            egui::vec2(3.0, band.height() - 8.0),
+            egui::pos2(band.left(), band.top() + 5.0),
+            egui::vec2(3.0, band.height() - 10.0),
         );
         ui.painter().rect_filled(bar, 1.0, ok);
     }
@@ -6144,12 +6151,12 @@ fn server_list_row(
         (toggled, name_resp)
     });
     let (toggled, name_resp) = inner.inner;
-    // The rule closes the row's band; with the stripe it is what keeps a long
+    // The rule closes the row's band: with no striping it is what keeps a long
     // list from reading as one field of text.
     ui.painter().hline(
         band.x_range(),
         band.max.y - 0.5,
-        egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
     let resp = inner.response.interact(egui::Sense::click_and_drag());
     RowClicks {
@@ -9227,7 +9234,7 @@ impl ServersScreen {
                                 .desired_width(260.0),
                         );
                         ui.separator();
-                        ui.label(t(lang, Key::SrvTableGroup));
+                        ui.label(t(lang, Key::SrvGroup));
                         if group_picker(ui, uictx.servers, &mut draft.profile) {
                             draft.edited();
                         }
@@ -9841,7 +9848,7 @@ impl ServersScreen {
                 false,
                 |ui| {
                     let dialog = self.copy_dialog.as_mut().expect("the dialog is open");
-                    ui.label(t(lang, Key::SrvTableGroup));
+                    ui.label(t(lang, Key::SrvGroup));
                     for group in &uictx.servers.groups {
                         if group.kind() != crate::model::servers::GroupKind::Manual {
                             continue;
@@ -10546,12 +10553,13 @@ mod tests {
         AdvancedTabCtx, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind, DraftTarget,
         EditorTab, EditorValidationCache, EditorValidationFindings, EditorValidationRender,
         FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language, LatencyBadge, LeaveAction,
-        ProfileDraft, RawField, Request, RowDetail, RowExtras, RowState, RowSwitch,
+        ProfileDraft, RawField, Request, RowCells, RowDetail, RowExtras, RowState, RowSwitch,
         STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab, ServersScreen,
-        StatusLine, TlsProbe, TransportTabCtx, basic_tab_inline_verdict, drag_scroll_delta,
-        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        StatusLine, TableShape, TlsProbe, TransportTabCtx, basic_tab_inline_verdict,
+        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, final_rules_editor,
         finalmask_udp_settings_editor, fingerprint_allowed, mux_tab, noises_editor, reorder_target,
-        server_list_row, status_colors_of, status_toast_expired, tab_order, xmux_section,
+        server_list_row, status_colors_of, status_toast_expired, tab_order, table_columns,
+        xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -11243,7 +11251,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }
         assert!(
             harness
-                .query_all_by_label(t(Language::En, Key::SrvTableGroup))
+                .query_all_by_label(t(Language::En, Key::SrvColGroup))
                 .next()
                 .is_some(),
             "All must carry the group column"
@@ -11320,7 +11328,10 @@ Authentication: ML-KEM-768, Post-Quantum
         // sorted column — and is dropped on the way out, so returning to the
         // tab cannot resurrect it.
         harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvColName),
+            )
             .click();
         harness.run();
         assert!(
@@ -11364,7 +11375,7 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .query_by_role_and_label(
                     egui::accesskit::Role::Button,
-                    t(Language::En, Key::SrvName)
+                    t(Language::En, Key::SrvColName)
                 )
                 .is_none(),
             "the Emitted tab must not sort"
@@ -11386,7 +11397,10 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.get_by_label(label).rect().center().y
         };
         harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvColName),
+            )
             .click();
         harness.run();
         assert!(y(&harness, "Alpha") < y(&harness, "Bravo"));
@@ -11405,7 +11419,10 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvColName),
+            )
             .click();
         harness.run();
         assert!(
@@ -11416,7 +11433,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness
             .get_by_role_and_label(
                 egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTableLatency),
+                t(Language::En, Key::SrvColLatency),
             )
             .click();
         harness.run();
@@ -11459,7 +11476,10 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(y(&harness, "Zulu") < y(&harness, "Alpha"));
 
         harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, Key::SrvName))
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvColName),
+            )
             .click();
         harness.run();
         assert!(
@@ -11828,7 +11848,7 @@ Authentication: ML-KEM-768, Post-Quantum
         open_add_editor(&mut harness);
         assert!(
             harness
-                .query_by_label(t(Language::En, Key::SrvTableGroup))
+                .query_by_label(t(Language::En, Key::SrvGroup))
                 .is_some(),
             "the add editor offers a group picker"
         );
@@ -12099,11 +12119,11 @@ Authentication: ML-KEM-768, Post-Quantum
         // The table names its columns: switch, name, protocol,
         // address:port and latency.
         for header in [
-            t(Language::En, Key::Enabled),
-            t(Language::En, Key::SrvName),
-            t(Language::En, Key::SrvProtocol),
-            t(Language::En, Key::SrvTableAddress),
-            t(Language::En, Key::SrvTableLatency),
+            t(Language::En, Key::SrvColEnabled),
+            t(Language::En, Key::SrvColName),
+            t(Language::En, Key::SrvColProtocol),
+            t(Language::En, Key::SrvColAddress),
+            t(Language::En, Key::SrvColLatency),
         ] {
             assert!(
                 harness.query_all_by_label(header).next().is_some(),
@@ -12130,8 +12150,8 @@ Authentication: ML-KEM-768, Post-Quantum
                 .center()
                 .x
         };
-        assert!(x(t(Language::En, Key::SrvTableOrder)) < x(t(Language::En, Key::Enabled)));
-        assert!(x(t(Language::En, Key::Enabled)) < x(t(Language::En, Key::SrvName)));
+        assert!(x(t(Language::En, Key::SrvColOrder)) < x(t(Language::En, Key::SrvColEnabled)));
+        assert!(x(t(Language::En, Key::SrvColEnabled)) < x(t(Language::En, Key::SrvColName)));
 
         // A plain click only selects the row: the editor window stays shut.
         // (The disabled fixture is listed on `All`; `Emitted` carries only
@@ -12197,6 +12217,74 @@ Authentication: ML-KEM-768, Post-Quantum
                 .next()
                 .is_none(),
             "Hide must mask the endpoint again"
+        );
+    }
+
+    /// The header's names sit exactly over the cells they name: columns that
+    /// drift between the header and the rows make the table unreadable,
+    /// whatever its colours.
+    #[test]
+    fn every_row_cell_sits_under_its_column_header() {
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Vless));
+        tokyo.enabled = true;
+        let ProtocolSettings::Vless(settings) = &mut tokyo.outbound.settings else {
+            unreachable!("Vless is the default protocol");
+        };
+        settings.address = "203.0.113.7".into();
+        settings.port = 443;
+        tokyo.latency_ms = Some(12);
+        rig.servers.profiles.push(tokyo);
+        let mut harness = wide_table_harness(rig);
+        harness.run();
+
+        let left = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness
+                .query_all_by_label(label)
+                .next()
+                .unwrap_or_else(|| panic!("the table must render the {label:?} cell"))
+                .rect()
+                .left()
+        };
+        for (header, cell) in [
+            (Key::SrvColName, "Tokyo"),
+            (Key::SrvColProtocol, "vless"),
+            (Key::SrvColAddress, "203.0.113.7:443"),
+        ] {
+            let header_x = left(&harness, t(Language::En, header));
+            let cell_x = left(&harness, cell);
+            assert!(
+                (header_x - cell_x).abs() < 0.5,
+                "the {cell:?} cell must start on its column header's x ({cell_x} vs {header_x})"
+            );
+        }
+
+        // A right-aligned column shares its right edge, and the switch's own
+        // control sits on its column's x.
+        let right = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
+            harness
+                .query_all_by_label(label)
+                .next()
+                .unwrap_or_else(|| panic!("the table must render the {label:?} cell"))
+                .rect()
+                .right()
+        };
+        let header = right(&harness, t(Language::En, Key::SrvColLatency));
+        let cell = right(&harness, "12 ms");
+        assert!(
+            (header - cell).abs() < 0.5,
+            "the latency value must end on its column header's right edge ({cell} vs {header})"
+        );
+        let header = left(&harness, t(Language::En, Key::SrvColEnabled));
+        let switch = harness
+            .query_all_by_role(egui::accesskit::Role::CheckBox)
+            .next()
+            .expect("the row must render its switch")
+            .rect()
+            .left();
+        assert!(
+            (header - switch).abs() < 0.5,
+            "the switch must sit on its column header's x ({switch} vs {header})"
         );
     }
 
@@ -12334,11 +12422,16 @@ Authentication: ML-KEM-768, Post-Quantum
             .with_size(egui::vec2(width, 100.0))
             .build_ui(|ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+                let columns = table_columns(ui.available_width(), TableShape::default());
                 let _ = server_list_row(
                     ui,
                     Language::En,
-                    long_name,
-                    &row_detail_fixture(),
+                    columns,
+                    RowCells {
+                        name: long_name,
+                        detail: &row_detail_fixture(),
+                        extras: RowExtras::default(),
+                    },
                     RowState {
                         selected: false,
                         active: false,
@@ -12348,7 +12441,6 @@ Authentication: ML-KEM-768, Post-Quantum
                         },
                     },
                     &badge,
-                    RowExtras::default(),
                 );
             });
         harness.run();
@@ -12392,11 +12484,16 @@ Authentication: ML-KEM-768, Post-Quantum
         let clicked_ui = Rc::clone(&clicked);
         let mut harness = harness_builder().build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+            let columns = table_columns(ui.available_width(), TableShape::default());
             let clicks = server_list_row(
                 ui,
                 Language::En,
-                "A server",
-                &row_detail_fixture(),
+                columns,
+                RowCells {
+                    name: "A server",
+                    detail: &row_detail_fixture(),
+                    extras: RowExtras::default(),
+                },
                 RowState {
                     selected: false,
                     active: false,
@@ -12406,7 +12503,6 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                 },
                 &badge,
-                RowExtras::default(),
             );
             *clicked_ui.borrow_mut() |= clicks.row.clicked() || clicks.name.clicked();
         });
@@ -12422,11 +12518,16 @@ Authentication: ML-KEM-768, Post-Quantum
             let toggled_ui = Rc::clone(&toggled);
             let mut harness = harness_builder().build_ui(move |ui| {
                 let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+                let columns = table_columns(ui.available_width(), TableShape::default());
                 let clicks = server_list_row(
                     ui,
                     Language::En,
-                    "A server",
-                    &row_detail_fixture(),
+                    columns,
+                    RowCells {
+                        name: "A server",
+                        detail: &row_detail_fixture(),
+                        extras: RowExtras::default(),
+                    },
                     RowState {
                         selected: false,
                         active: false,
@@ -12436,7 +12537,6 @@ Authentication: ML-KEM-768, Post-Quantum
                         },
                     },
                     &badge,
-                    RowExtras::default(),
                 );
                 *toggled_ui.borrow_mut() |= clicks.toggle;
             });
@@ -12459,11 +12559,16 @@ Authentication: ML-KEM-768, Post-Quantum
         // double-click delay. A fifth-second step keeps the gesture inside it.
         let mut harness = harness_builder().with_step_dt(0.05).build_ui(move |ui| {
             let badge = LatencyBadge::new(Some(12), Language::En, status_colors_of(ui));
+            let columns = table_columns(ui.available_width(), TableShape::default());
             let clicks = server_list_row(
                 ui,
                 Language::En,
-                "A server",
-                &row_detail_fixture(),
+                columns,
+                RowCells {
+                    name: "A server",
+                    detail: &row_detail_fixture(),
+                    extras: RowExtras::default(),
+                },
                 RowState {
                     selected: false,
                     active: false,
@@ -12473,7 +12578,6 @@ Authentication: ML-KEM-768, Post-Quantum
                     },
                 },
                 &badge,
-                RowExtras::default(),
             );
             *doubled_ui.borrow_mut() |= clicks.double_clicked();
         });
