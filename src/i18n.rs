@@ -1649,6 +1649,7 @@ keys! {
     SrvGrpcMultiModeNote 0,
     SrvDialerProxyHint 0,
     SrvSearchTags 0,
+    SrvDismissFeedback 0,
     SrvCustomLevelHint 0,
     SrvCustomOptHint 0,
     SrvVlessEncryptionHint 0,
@@ -5129,6 +5130,7 @@ mod en {
             }
             Key::SrvDialerProxyHint => "outbound tag",
             Key::SrvSearchTags => "Search tags",
+            Key::SrvDismissFeedback => "Dismiss",
             Key::SrvCustomLevelHint => "numeric socket level",
             Key::SrvCustomOptHint => "numeric socket option",
             Key::SrvVlessEncryptionHint => "none | mlkem768x25519plus…",

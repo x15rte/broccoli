@@ -4078,13 +4078,35 @@ impl ServersScreen {
             // type one.
             self.revealed_add = true;
         }
-        if let Some((level, message)) = &self.latency_probe_feedback {
+        if let Some((level, message)) = self.latency_probe_feedback.take() {
             let color = match level {
                 FeedbackLevel::Ok => status_colors_of(ui).ok,
                 FeedbackLevel::Warn => status_colors_of(ui).warn,
                 FeedbackLevel::Err => status_colors_of(ui).err,
             };
-            ui.colored_label(color, message);
+            // A probe failure carries the core's diagnostics, which can run
+            // for dozens of lines and push the table off the screen. The
+            // inline line shows the verdict's first lines; the whole report
+            // stays on the hover.
+            let preview = feedback_preview(&message, FEEDBACK_PREVIEW_LINES);
+            let mut dismiss = false;
+            ui.horizontal_top(|ui| {
+                let response = ui.colored_label(color, &preview);
+                if preview.len() < message.len() {
+                    response.on_hover_ui(|ui| {
+                        ui.set_max_width(720.0);
+                        ui.label(&message);
+                    });
+                }
+                // The result is a report, not a mode: it stays until it is
+                // read or the next test replaces it, whichever comes first.
+                if ui.small_button(t(lang, Key::SrvDismissFeedback)).clicked() {
+                    dismiss = true;
+                }
+            });
+            if !dismiss {
+                self.latency_probe_feedback = Some((level, message));
+            }
         }
         // One flat table per tab, on the same widths as every row. The
         // sortable header exists only where sorting is a view: every tab but
@@ -6120,7 +6142,27 @@ fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) ->
     response
 }
 
-/// What the table header reported this frame: a sort command, the widths
+/// How many lines a probe's status message shows before it folds; the hover
+/// carries the whole message.
+const FEEDBACK_PREVIEW_LINES: usize = 3;
+
+/// The first `lines` lines of `message`, with an ellipsis when more follows.
+fn feedback_preview(message: &str, lines: usize) -> String {
+    let mut preview = String::new();
+    for (index, line) in message.lines().enumerate() {
+        if index == lines {
+            preview.push('…');
+            break;
+        }
+        if index > 0 {
+            preview.push('\n');
+        }
+        preview.push_str(line);
+    }
+    preview
+}
+
+/// What the table's header reported this frame: a sort command, the widths
 /// after a divider drag, or a request to fit the columns again.
 #[derive(Default)]
 struct HeaderOutcome {
@@ -11238,7 +11280,7 @@ mod tests {
         RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab,
         ServersScreen, StatusLine, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
         TransportTabCtx, basic_tab_inline_verdict, column_bounds, drag_divider, drag_scroll_delta,
-        ech_sockopt_editor, editor_validation_findings, final_rules_editor,
+        ech_sockopt_editor, editor_validation_findings, feedback_preview, final_rules_editor,
         finalmask_udp_settings_editor, fingerprint_allowed, frozen_widths, mux_tab, noises_editor,
         reorder_target, sanitized_widths, server_list_row, status_colors_of, status_toast_expired,
         tab_order, table_columns, xmux_section,
@@ -15110,6 +15152,44 @@ Authentication: ML-KEM-768, Post-Quantum
             "an all-scope result must render the count-based toast"
         );
     }
+    /// The inline status keeps a few lines; the hover has the rest.
+    #[test]
+    fn feedback_preview_folds_after_three_lines() {
+        assert_eq!(feedback_preview("one\ntwo\nthree", 3), "one\ntwo\nthree");
+        assert_eq!(
+            feedback_preview("one\ntwo\nthree\nfour\nfive", 3),
+            "one\ntwo\nthree…"
+        );
+    }
+
+    /// A probe result is a report: the Dismiss control clears it without
+    /// waiting for another test.
+    #[test]
+    fn the_dismiss_control_clears_the_probe_feedback() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(ServerProfile::new(
+            "Tokyo",
+            OutboundModel::new(Protocol::Freedom),
+        ));
+        let screen = ServersScreen {
+            latency_probe_feedback: Some((
+                FeedbackLevel::Warn,
+                "probe failed\nline two\nline three".to_owned(),
+            )),
+            ..ServersScreen::default()
+        };
+        let mut harness = screen_harness(rig, screen);
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvDismissFeedback))
+            .click();
+        harness.run();
+        assert!(
+            harness.state().0.latency_probe_feedback.is_none(),
+            "Dismiss must clear the probe result"
+        );
+    }
+
     #[test]
     fn toolbar_probe_with_dead_verdicts_renders_warn_summary() {
         let mut rig = UiTestRig::default();
