@@ -6477,46 +6477,39 @@ fn server_list_row(
         extras,
     } = cells;
     // A row reads as a row when its band is visible: the pointer's row lifts,
-    // a selected row takes a tint of the selection colour, and the active row
-    // is marked at its edge. The fill is issued before the horizontal layout
-    // allocates the cells, so it stays underneath them.
+    // a selected row is outlined, and the route or a server another outbound
+    // dials through is marked at the row's edge. The fill is issued before the
+    // horizontal layout allocates the cells, so it stays underneath them.
     let band = egui::Rect::from_min_size(
         ui.cursor().min,
         egui::vec2(columns.total(), TABLE_ROW_HEIGHT),
     );
     let colors = status_colors_of(ui);
-    let ok = colors.ok;
-    let fill = if row.selected {
-        let accent = ui.visuals().selection.bg_fill;
-        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64)
-    } else if ui.rect_contains_pointer(band) {
-        ui.visuals().widgets.hovered.weak_bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if fill != egui::Color32::TRANSPARENT {
-        ui.painter().rect_filled(band, 0.0, fill);
+    if ui.rect_contains_pointer(band) {
+        ui.painter()
+            .rect_filled(band, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    if row.active {
+    // Selection is an outline rather than a fill: the values keep their own
+    // colour, and purple is the one row state no status colour means.
+    let outline = row.selected.then_some(colors.selected);
+    let marker = if row.active {
         // The active route is a bar at the row's edge, not a whole column
         // spent on one dot.
+        Some(colors.ok)
+    } else if row.hop {
+        // A hop is in the list because another outbound dials through it. The
+        // blue bar takes the active row's place and shape, so one mark answers
+        // "why is this row here"; a route that is also a hop keeps green.
+        Some(colors.hop)
+    } else {
+        None
+    };
+    if let Some(color) = marker {
         let bar = egui::Rect::from_min_size(
             egui::pos2(band.left(), band.top() + 5.0),
             egui::vec2(3.0, band.height() - 10.0),
         );
-        ui.painter().rect_filled(bar, 1.0, ok);
-    } else if row.hop {
-        // A hop is in the list because another outbound dials through it: the
-        // outline says so. The active row keeps its green bar and takes no
-        // outline, so a route that is also a hop stays unambiguous. The
-        // stroke sits inside the band, over the selection tint, and adds no
-        // fill and no text change.
-        ui.painter().rect_stroke(
-            band,
-            0.0,
-            egui::Stroke::new(1.0, colors.hop),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter().rect_filled(bar, 1.0, color);
     }
     let inner = ui.horizontal(|ui| {
         // Cells abut: the gutter is each cell's own inset, so the header and
@@ -6605,6 +6598,17 @@ fn server_list_row(
         band.max.y - 0.5,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
+    if let Some(color) = outline {
+        // All four sides, bottom included: the outline takes the place of the
+        // hairline, so a selected band is one closed rectangle rather than a
+        // tint with a rule through it.
+        ui.painter().rect_stroke(
+            band,
+            0.0,
+            egui::Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+    }
     let resp = if row.frozen {
         inner.response.interact(egui::Sense::hover())
     } else {
