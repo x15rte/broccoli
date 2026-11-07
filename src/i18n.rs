@@ -1648,6 +1648,7 @@ keys! {
     SrvGrpcMuxNote 0,
     SrvGrpcMultiModeNote 0,
     SrvDialerProxyHint 0,
+    SrvSearchTags 0,
     SrvCustomLevelHint 0,
     SrvCustomOptHint 0,
     SrvVlessEncryptionHint 0,
@@ -4429,7 +4430,7 @@ mod en {
                 "the saved active route named no server, so the route is now Block"
             }
             Key::SrvNewGroup => "New group",
-            Key::SrvGroupKind => "Kind",
+            Key::SrvGroupKind => "Type",
             Key::SrvGroupKindManual => "Manual",
             Key::SrvGroupKindSubscription => "Subscription",
             Key::SrvCreateGroup => "Create",
@@ -5127,6 +5128,7 @@ mod en {
                  versions"
             }
             Key::SrvDialerProxyHint => "outbound tag",
+            Key::SrvSearchTags => "Search tags",
             Key::SrvCustomLevelHint => "numeric socket level",
             Key::SrvCustomOptHint => "numeric socket option",
             Key::SrvVlessEncryptionHint => "none | mlkem768x25519plus…",

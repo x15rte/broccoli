@@ -832,7 +832,31 @@ fn validate_url_query(
             "encryption" => matches!(proto, Protocol::Vless | Protocol::Vmess),
             "flow" => proto == Protocol::Vless,
             "sni" | "fp" => matches!(security, "tls" | "reality"),
-            "alpn" | "ech" | "pcs" | "vcn" => security == "tls",
+            "alpn" | "ech" => security == "tls",
+            // Upstream clients stamp the TLS pin fields on REALITY links,
+            // usually empty, because the template is shared with TLS. The
+            // model has no REALITY field to carry them, so the link stays and
+            // a value that carries something is reported as dropped.
+            "pcs" | "vcn" => {
+                if security != "tls" && !value.is_empty() && ignored_value_is_reported(value) {
+                    record_ignored(ignored, key);
+                }
+                true
+            }
+            "quicSecurity" | "serviceName" => {
+                // QUIC transport parameters travelling on a link whose
+                // transport is something else: the sender's template writes
+                // them `none`/empty. The selected transport's own row answers
+                // them when it does use QUIC, so only a value nobody will read
+                // is reported.
+                if spec.field(key).is_none()
+                    && !value.is_empty()
+                    && ignored_value_is_reported(value)
+                {
+                    record_ignored(ignored, key);
+                }
+                true
+            }
             "pbk" | "sid" | "pqv" | "mldsa65Verify" | "spx" => security == "reality",
             "seed" => {
                 // The pinned core parses the key and ignores it
@@ -4179,6 +4203,53 @@ mod tests {
         assert_eq!(r.spider_x, "/");
         assert!(canonical.contains("spx=%2F"));
         assert!(canonical.contains("security=reality"));
+    }
+
+    /// A subscription template shared with QUIC writes `quicSecurity` and
+    /// `serviceName` onto links whose transport is TCP. Those fields belong to
+    /// the selected transport's row, so on another transport they are
+    /// compatibility parameters: the node imports, an empty one is silent, and
+    /// a value is reported as dropped.
+    #[test]
+    fn tcp_links_tolerate_quic_params() {
+        let link = format!(
+            "vless://{UUID}@r.example.com:26001?type=tcp&encryption=none&host=&path=\
+             &headerType=none&quicSecurity=none&serviceName=&security=reality\
+             &flow=xtls-rprx-vision&fp=chrome&insecure=0&pcs=&sni=www.example.com\
+             &pbk={}&sid=aa7b51143f71f491#Reality",
+            reality_public_key()
+        );
+        let parsed = parse_link(&link).expect("the QUIC leftovers must not refuse the node");
+        assert_eq!(parsed.outbound.stream.security, Security::Reality);
+        assert!(
+            parsed.ignored.contains(&"quicSecurity".to_string()),
+            "the value nobody reads is reported, got {:?}",
+            parsed.ignored
+        );
+    }
+
+    /// Upstream clients stamp the TLS pin fields (`pcs`, `vcn`) on REALITY
+    /// links because the template is shared with TLS. An empty pin names
+    /// nothing and must not refuse the node; a valued one is reported as
+    /// dropped, since REALITY has no field to carry it.
+    #[test]
+    fn reality_links_tolerate_tls_pin_params() {
+        let public_key = reality_public_key();
+        let link = format!(
+            "vless://{UUID}@r.example.com:26001?type=tcp&encryption=none&headerType=none\
+             &security=reality&flow=xtls-rprx-vision&fp=chrome&pcs=&sni=www.example.com\
+             &pbk={public_key}&sid=aa7b51143f71f491#Reality"
+        );
+        let parsed = parse_link(&link).expect("an empty pin must not refuse the node");
+        assert!(
+            parsed.ignored.is_empty(),
+            "an empty pin names nothing to report"
+        );
+        assert_eq!(parsed.outbound.stream.security, Security::Reality);
+
+        let valued = link.replace("pcs=&", "pcs=abcd&");
+        let parsed = parse_link(&valued).expect("a valued pin must not refuse the node");
+        assert_eq!(parsed.ignored, vec!["pcs".to_string()]);
     }
 
     /// The editor's REALITY fingerprint option list is trimmed; the share
