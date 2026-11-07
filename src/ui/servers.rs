@@ -6558,7 +6558,7 @@ fn server_list_row(
             }
         });
         let toggled = checked != row.switch.checked;
-        let name_resp = table_cell_button(ui, columns.name, lang, name, row.selected, row.frozen);
+        let name_resp = table_cell_button(ui, columns.name, lang, name, row.frozen);
         table_cell(ui, columns.protocol, |ui| {
             ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
         });
@@ -6663,28 +6663,30 @@ fn draw_selection_edges(
     }
 }
 
-/// The name cell: a selectable button truncated at the column boundary.
+/// The name cell: a frame-less button truncated at the column boundary. The
+/// click target stays for opening the editor and starting a drag, but the
+/// cell paints no highlight of its own — the row's outline carries selection,
+/// and an accent-filled name inside it would say the same thing twice.
 fn table_cell_button(
     ui: &mut egui::Ui,
     width: f32,
     lang: Language,
     name: &str,
-    selected: bool,
     frozen: bool,
 ) -> egui::Response {
     let mut response = None;
     table_cell(ui, width, |ui| {
-        let button = if name.is_empty() {
-            egui::Button::selectable(selected, t(lang, Key::SrvUnnamed))
+        let text = if name.is_empty() {
+            t(lang, Key::SrvUnnamed).to_owned()
         } else {
-            egui::Button::selectable(selected, name)
+            name.to_owned()
         };
         response = Some(
             ui.scope(|ui| {
                 // The button's own padding would indent the name past the
                 // header above it; the cell inset is the table's only gutter.
                 ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
-                ui.add_enabled(!frozen, button.truncate())
+                ui.add_enabled(!frozen, egui::Button::new(text).frame(false).truncate())
                     .on_hover_text(t(lang, Key::SrvDragToReorder))
             })
             .inner,
