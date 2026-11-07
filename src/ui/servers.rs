@@ -4041,9 +4041,20 @@ impl ServersScreen {
                 if test_latency.clicked() {
                     action = Some(ListAction::ProbeLatencySelection);
                 }
-                // The columns fit their content until a divider is dragged; this
-                // command gives the dragged widths back to the fit. It sits with
-                // the view commands because that is what it changes.
+                // The binding choice belongs to the run: around the tunnel
+                // (the TUN screen's outbound interface) or through it.
+                if ui
+                    .checkbox(
+                        &mut ctx.settings.latency_test_bind_interface,
+                        t(lang, Key::SrvBindProbeInterface),
+                    )
+                    .on_hover_text(t(lang, Key::SrvBindProbeInterfaceHint))
+                    .changed()
+                {
+                    ctx.hooks.mark_ui_dirty();
+                }
+                // The columns fit their content until a divider is dragged;
+                // this command gives the dragged widths back to the fit.
                 if ui
                     .button(t(lang, Key::SrvFitColumns))
                     .on_hover_text(t(lang, Key::SrvFitColumnsHint))
@@ -13267,9 +13278,11 @@ Authentication: ML-KEM-768, Post-Quantum
             "the latency value must end on its column header's right edge ({cell} vs {header})"
         );
         let header = left(&harness, t(Language::En, Key::SrvColEnabled));
+        // The toolbar carries checkboxes too (the probe options), and they
+        // render before the table: the row's switch is the last one.
         let switch = harness
             .query_all_by_role(egui::accesskit::Role::CheckBox)
-            .next()
+            .last()
             .expect("the row must render its switch")
             .rect()
             .left();
@@ -14591,6 +14604,22 @@ Authentication: ML-KEM-768, Post-Quantum
             ["Alpha", "Bravo", "Charlie"]
         );
         assert!(!harness.state().1.requests.dirty);
+    }
+
+    /// The binding switch saves with the UI settings.
+    #[test]
+    fn the_toolbar_switch_turns_the_interface_binding_off() {
+        let mut harness = screen_harness(drag_rig(), ServersScreen::default());
+        harness.run();
+        assert!(harness.state().1.settings.latency_test_bind_interface);
+        harness
+            .get_by_label(t(Language::En, Key::SrvBindProbeInterface))
+            .click();
+        harness.run();
+        assert!(
+            !harness.state().1.settings.latency_test_bind_interface,
+            "the checkbox must flip the saved option"
+        );
     }
 
     /// The toolbar sets the route from a single selection: disabled with no

@@ -405,6 +405,11 @@ pub struct Settings {
     /// the OS stack (which TUN intercepts).
     #[serde(skip_serializing_if = "skip_false")]
     pub subscription_direct_fetch: bool,
+    /// Bind the latency test's dials to the TUN screen's outbound interface
+    /// while the tunnel runs, so its traffic bypasses the capture. Off lets
+    /// the tunnel capture them; the probe then measures through the tunnel.
+    #[serde(skip_serializing_if = "skip_true")]
+    pub latency_test_bind_interface: bool,
     /// when Some, the generator returns the parsed text VERBATIM
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_override: Option<String>,
@@ -439,6 +444,7 @@ impl Default for Settings {
             probe_url: String::new(),
             subscription_user_agent: default_subscription_user_agent(),
             subscription_direct_fetch: false,
+            latency_test_bind_interface: true,
             raw_override: None,
             extra: Map::new(),
         }

@@ -1651,6 +1651,8 @@ keys! {
     SrvSearchTags 0,
     SrvDismissFeedback 0,
     SrvSetActiveHint 0,
+    SrvBindProbeInterface 0,
+    SrvBindProbeInterfaceHint 0,
     SrvCustomLevelHint 0,
     SrvCustomOptHint 0,
     SrvVlessEncryptionHint 0,
@@ -5133,6 +5135,10 @@ mod en {
             Key::SrvSearchTags => "Search tags",
             Key::SrvDismissFeedback => "Dismiss",
             Key::SrvSetActiveHint => "Make this server the default route",
+            Key::SrvBindProbeInterface => "Use outbound interface",
+            Key::SrvBindProbeInterfaceHint => {
+                "Send the test's dials around the tunnel, through the TUN screen's outbound interface"
+            }
             Key::SrvCustomLevelHint => "numeric socket level",
             Key::SrvCustomOptHint => "numeric socket option",
             Key::SrvVlessEncryptionHint => "none | mlkem768x25519plus…",

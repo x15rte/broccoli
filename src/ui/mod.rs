@@ -538,13 +538,17 @@ impl<'a> ServersCtx<'a> {
     fn send_latency_probe(&mut self, profiles: Vec<ServerProfile>) -> Result<(), String> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
-        // The probe carries the TUN outbound interface setting and the TUN
-        // adapter's own name so its dials can bypass the capture and its
-        // resolution exclude the adapter. Whether either is *used* is the
-        // runtime's decision — its own backend's transport ownership — so the
-        // request does not re-derive it from the mode setting: one decision,
-        // taken where the live backend is known.
-        let tun_outbound_interface = Some(self.settings.tun.auto_outbounds_interface.clone());
+        // The probe carries the TUN adapter's own name so its resolution can
+        // exclude that adapter, and — when "Use outbound interface" is on —
+        // the TUN screen's outbound interface, so its dials bypass the
+        // capture. Whether the TUN is actually up is the runtime's decision
+        // (its backend's transport ownership), so the request does not
+        // re-derive it from the mode setting: one decision, taken where the
+        // live backend is known.
+        let tun_outbound_interface = self
+            .settings
+            .latency_test_bind_interface
+            .then(|| self.settings.tun.auto_outbounds_interface.clone());
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
         let sent = self.hooks.send(CoreCmd::ProbeLatency {
             profiles,
@@ -2371,6 +2375,47 @@ mod tests {
         if let CoreCmd::ProbeLatency { profiles, .. } = cmd {
             let tags: Vec<String> = profiles.iter().map(ServerProfile::tag).collect();
             assert_eq!(tags, vec![main.tag(), middle.tag(), leaf.tag()]);
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+    }
+
+    /// The probe carries the outbound interface only while the switch is on;
+    /// the runtime decides whether the TUN is actually there.
+    #[test]
+    fn request_latency_probe_follows_the_outbound_interface_switch() {
+        let mut rig = UiTestRig::default();
+        let profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        rig.servers.profiles.push(profile.clone());
+
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile.clone())
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(tun_outbound_interface.as_deref(), Some("auto"));
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+
+        rig.settings.latency_test_bind_interface = false;
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile)
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(
+                tun_outbound_interface, None,
+                "the switch off sends the probe through the tunnel"
+            );
         } else {
             panic!("expected ProbeLatency, got a different command");
         }
