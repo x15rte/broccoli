@@ -602,14 +602,13 @@ fn sockopt_editor(
         false,
     );
     changed |= match dialer_proxy_options {
-        Some(options) => widgets::combo_search_labeled(
+        Some(options) => widgets::combo_str_labeled(
             ui,
             "dialerProxy",
             &mut sockopt.dialer_proxy,
             options,
             t(lang, Key::NoneSelected),
             true,
-            t(lang, Key::SrvSearchTags),
         ),
         None => widgets::text_field(
             ui,
@@ -4093,10 +4092,7 @@ impl ServersScreen {
         let sortable = self.view != ServerTab::Emitted && !probe_pending;
         let shape = TableShape {
             order: self.view == ServerTab::Emitted,
-            // The group names where a server came from, which matters most on
-            // the emitted list: a chain hop can sit in a different group from
-            // its dialer.
-            group: matches!(self.view, ServerTab::All | ServerTab::Emitted),
+            group: self.view == ServerTab::All,
         };
         let generation = ctx.hooks.model_generation();
         // The toolbar's fit command takes effect on the frame that asked for
@@ -11893,23 +11889,13 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.query_by_label("Disabled").is_none(),
             "a switched-off server is not emitted"
         );
-        assert!(
-            harness
-                .query_all_by_label(t(Language::En, Key::SrvColGroup))
-                .next()
-                .is_some(),
-            "Emitted carries the group column too"
-        );
         let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
             harness.get_by_label(label).rect().center().y
         };
         assert!(y(&harness, "Active") < y(&harness, "Fed"));
 
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert_eq!(harness.state().0.view, ServerTab::All);
@@ -11934,9 +11920,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         assert_eq!(harness.state().0.view, ServerTab::Group(feed_id));
         assert!(harness.query_by_label("Bravo").is_some());
@@ -11954,10 +11938,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(harness.query_by_label("Alpha").is_none());
 
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabManual),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabManual))
             .click();
         harness.state_mut().0.search = "Bravo".into();
         harness.run();
@@ -11979,10 +11960,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(selected_names(&harness), ["Alpha"]);
 
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(
@@ -12015,10 +11993,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the view sort survives the tab switch"
         );
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(
@@ -12033,10 +12008,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         harness
@@ -12084,10 +12056,7 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         assert!(y(&reopened, "Bravo") < y(&reopened, "Alpha"));
         reopened
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         reopened.run();
         assert!(
@@ -12141,10 +12110,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         let stored: Vec<String> = harness
@@ -12234,9 +12200,7 @@ Authentication: ML-KEM-768, Post-Quantum
         rig.servers.hydrate_group_titles();
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         let y = |harness: &Harness<'static, (ServersScreen, UiTestRig)>, label: &str| {
             harness.get_by_label(label).rect().center().y
@@ -12263,16 +12227,11 @@ Authentication: ML-KEM-768, Post-Quantum
         // The sort belongs to the screen, so leaving the tab and coming back
         // keeps it; the stored order stays as it was.
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabEmitted),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
             .click();
         harness.run();
         assert!(harness.state().0.view_sort.is_some());
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         assert!(y(&harness, "Alpha") < y(&harness, "Zulu"));
         assert_eq!(
@@ -12506,9 +12465,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
 
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click_secondary();
+        harness.get_by_label("Feed").click_secondary();
         harness.run();
         harness
             .get_by_label(t(Language::En, Key::SrvRenameGroup))
@@ -12535,7 +12492,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the rename rewrites every tag the group prefixes"
         );
         assert!(
-            harness.query_all_by_label("Mine").next().is_some(),
+            harness.query_by_label("Mine").is_some(),
             "the tab shows the new title"
         );
     }
@@ -12558,9 +12515,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
 
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click_secondary();
+        harness.get_by_label("Feed").click_secondary();
         harness.run();
         harness
             .get_by_label(t(Language::En, Key::SrvDeleteGroup))
@@ -12605,9 +12560,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
         for tab in [Key::SrvTabEmitted, Key::SrvTabManual, Key::SrvTabAll] {
-            harness
-                .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, tab))
-                .click_secondary();
+            harness.get_by_label(t(Language::En, tab)).click_secondary();
             harness.run();
             assert!(
                 harness
@@ -12653,9 +12606,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         open_add_editor(&mut harness);
         let draft = harness
@@ -12673,9 +12624,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let (rig, feed_id) = tab_rig(&["Alpha"], &["Bravo"]);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         harness
             .get_by_label(t(Language::En, Key::SrvImportLinks))
@@ -12838,10 +12787,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the Emitted view owns no feed"
         );
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabManual),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabManual))
             .click();
         harness.run();
         assert!(
@@ -12851,9 +12797,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a manual group owns no feed"
         );
 
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         for label in [
             Key::SrvRefreshSubscription,
@@ -12977,10 +12921,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // (The disabled fixture is listed on `All`; `Emitted` carries only
         // what the configuration emits.)
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         harness.get_by_label("Tokyo").click();
@@ -13000,12 +12941,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn the_tab_strip_clears_the_toolbar_by_twelve_points() {
         let mut harness = screen_harness(drag_rig(), ServersScreen::default());
         harness.run();
-        let tab = harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
-            .rect();
+        let tab = harness.get_by_label(t(Language::En, Key::SrvTabAll)).rect();
         let toolbar = harness
             .get_by_label(t(Language::En, Key::SrvAddServer))
             .rect();
@@ -13352,10 +13288,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         let address = harness
@@ -13408,10 +13341,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = wide_table_harness(rig);
         harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
 
@@ -13510,10 +13440,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The `All` tab carries the group column, the address column's right
         // edge, so the address width can be read from the header band.
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
 
@@ -14285,17 +14212,12 @@ Authentication: ML-KEM-768, Post-Quantum
     fn switching_a_group_rows_switch_off_drops_it_from_emitted_too() {
         let mut harness = drag_harness(grouped_drag_rig());
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
-            .click();
+        harness.get_by_label("Feed").click();
         harness.run();
         click_row_switch(&mut harness, "Charlie");
         harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabEmitted),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
             .click();
         harness.run();
         assert!(
@@ -14305,10 +14227,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(harness.query_by_label("Delta").is_some());
         // The row still exists, switched off, in `All`.
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(harness.query_by_label("Charlie").is_some());
@@ -22563,10 +22482,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(selected_names(&harness), ["Alpha", "Bravo", "Charlie"]);
 
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run_steps(2);
         assert!(
@@ -22853,10 +22769,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the copy appears in its target group's tab"
         );
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run();
         assert!(
@@ -22864,10 +22777,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the copy appears in All"
         );
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabEmitted),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabEmitted))
             .click();
         harness.run();
         assert!(
@@ -23050,10 +22960,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = wide_table_harness(grouped_drag_rig());
         harness.run();
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabManual),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabManual))
             .click();
         harness.run_steps(2);
         assert!(harness.state().0.selection.is_empty());
@@ -23102,10 +23009,7 @@ Authentication: ML-KEM-768, Post-Quantum
         // The All tab keeps every row on screen after a batch switches rows
         // off; `Emitted` drops a switched-off row by design.
         harness
-            .get_by_role_and_label(
-                egui::accesskit::Role::Button,
-                t(Language::En, Key::SrvTabAll),
-            )
+            .get_by_label(t(Language::En, Key::SrvTabAll))
             .click();
         harness.run_steps(2);
         // Alpha is the route and therefore locked; Bravo and Charlie follow
