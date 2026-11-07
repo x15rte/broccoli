@@ -396,9 +396,10 @@ pub struct Settings {
     /// default (https://www.google.com/generate_204).
     #[serde(skip_serializing_if = "skip_blank_str")]
     pub probe_url: String,
-    /// Global User-Agent for subscription fetches. An empty value omits the
-    /// header entirely; a subscription may override it per group.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// The global User-Agent subscription fetches send; a group without a
+    /// custom one uses it verbatim, and an empty value omits the header. It is
+    /// written even when empty: the default belongs to a setting the file
+    /// never had, not to one the user cleared.
     pub subscription_user_agent: String,
     /// Bind subscription fetches to the physical uplink instead of following
     /// the OS stack (which TUN intercepts).
@@ -954,6 +955,28 @@ mod tests {
         assert!(
             empty.local_inbounds.is_empty(),
             "an empty localInbounds list must stay empty"
+        );
+    }
+
+    /// Clearing the global User-Agent means "send none", so the empty string
+    /// must survive the file: the default is a property of an absent setting,
+    /// not of one the user emptied.
+    #[test]
+    fn an_empty_global_user_agent_survives_the_settings_json_path() {
+        let settings = Settings {
+            subscription_user_agent: String::new(),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&settings).expect("settings serialize");
+        assert_eq!(wire["subscriptionUserAgent"], "");
+        let loaded: Settings = serde_json::from_value(wire).expect("settings load");
+        assert_eq!(loaded.subscription_user_agent, "");
+
+        // A file that never carried the field still gets the client default.
+        let absent: Settings = serde_json::from_value(json!({})).expect("settings load");
+        assert_eq!(
+            absent.subscription_user_agent,
+            default_subscription_user_agent()
         );
     }
 
